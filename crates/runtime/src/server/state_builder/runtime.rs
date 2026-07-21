@@ -83,7 +83,6 @@ pub(super) async fn build_runtime_wiring(
     astra_turn_core::ws_user_prompt_gate::set_ws_user_prompt_metrics_registry(
         state.metrics_registry(),
     );
-    crate::turn::llm::client::set_llm_nonstream_fallback_metrics_registry(state.metrics_registry());
     crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
         state.metrics_registry(),
     );
@@ -131,7 +130,6 @@ pub(super) async fn build_runtime_wiring(
     .with_model_service(state.model_service.clone())
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
-    .with_model_gateway_service(state.model_gateway_service.clone())
     .with_reflect_service(state.reflect_service.clone())
     .with_hook_db_writer(state.turn_persistence.hook_db_writer.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())

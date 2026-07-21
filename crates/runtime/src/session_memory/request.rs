@@ -8,12 +8,28 @@ use astra_turn_types::session_facts::SessionFacts;
 /// cross a `tokio::spawn` boundary without borrowing from turn state.
 #[derive(Debug, Clone)]
 pub struct ExtractionRequest {
-    pub session_id: String,
+    pub inference_scope: astra_turn_types::InferenceInvocationScope,
     pub messages: Vec<Value>,
     pub session_facts: SessionFacts,
     pub had_error: bool,
     pub reanchors_current_objective: bool,
-    pub turn_number: u32,
+}
+
+impl ExtractionRequest {
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.inference_scope.session_id()
+    }
+
+    #[must_use]
+    pub fn turn_number(&self) -> Option<u32> {
+        self.inference_scope.turn()
+    }
+
+    #[must_use]
+    pub fn session_coordinates(&self) -> Option<(&str, u32)> {
+        self.session_id().zip(self.turn_number())
+    }
 }
 
 /// Synchronous result returned to the caller immediately after

@@ -47,6 +47,30 @@ const SUBRUN_MAX_TURNS: usize = 25;
 /// Caps total (prompt + completion) across all rounds to prevent runaway cost.
 const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 120_000;
 
+pub(crate) async fn resolve_subrun_model_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: Option<&str>,
+) -> Result<crate::cli::session::session_runtime::ServerModelSelection, String> {
+    if let Some(model) = model {
+        return crate::cli::session::session_runtime::resolve_server_model_selection(
+            api, token, model,
+        )
+        .await;
+    }
+    match crate::cli::session::session_runtime::resolve_server_default_model(api, token).await {
+        crate::cli::session::session_runtime::ServerDefaultModel::Selected(selection) => {
+            Ok(selection)
+        }
+        crate::cli::session::session_runtime::ServerDefaultModel::NoModels => {
+            Err("no active model Offering is available for the sub-run".to_string())
+        }
+        crate::cli::session::session_runtime::ServerDefaultModel::Unavailable => {
+            Err("the Server model registry is unavailable for the sub-run".to_string())
+        }
+    }
+}
+
 // ─── SubRunHost ──────────────────────────────────────────────────────────────
 
 /// Minimal agentic loop host for fork sub-runs.
@@ -59,6 +83,7 @@ pub(crate) struct SubRunHost {
     pub(crate) api: astra_thin_client::ThinClient,
     pub(crate) token: String,
     pub(crate) model: Option<String>,
+    pub(crate) offering_id: String,
     pub(crate) project_root: PathBuf,
     pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
@@ -386,11 +411,8 @@ impl AgenticLoopHost for SubRunHost {
         // and makes soft runtime evidence look like user content.
         let runtime_volatile_injections = state.take_volatile_pending();
 
-        let effective_model = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model.as_deref());
+        let effective_model = self.model.as_deref();
+        let effective_offering_id = self.offering_id.clone();
         let thinking = effective_model
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
@@ -409,8 +431,9 @@ impl AgenticLoopHost for SubRunHost {
             user_intent: Some(runtime_decision_user_intent.as_str()),
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
-            model: effective_model,
-            model_id: None,
+            inference_purpose: state.inference_purpose,
+            round_index: state.current_round_index,
+            offering_id: Some(effective_offering_id.as_str()),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
@@ -618,6 +641,7 @@ impl AgenticLoopHost for SubRunHost {
                     state.current_round_index.saturating_add(1),
                 );
                 buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+                    purpose: round_summary.purpose,
                     duration_ms: round_summary.duration_ms,
                     prompt_tokens: round_summary.prompt_tokens,
                     completion_tokens: round_summary.completion_tokens,
@@ -636,7 +660,9 @@ impl AgenticLoopHost for SubRunHost {
                         .as_ref()
                         .and_then(|identity| identity.parent_run_id.clone()),
                     agent_id: Some(self.agent_id.clone()),
-                    ..Default::default()
+                    ttft_ms: None,
+                    agentic_step: None,
+                    tool_calls: None,
                 });
                 let events = buf.drain();
                 crate::cli::cli_config::cli_utils::append_bulk_journal_events_no_sync_or_warn(
@@ -718,7 +744,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         skill_name: &str,
         instructions: &str,
         task_context: &str,
-        model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
         parent_recursion_depth: u8,
@@ -729,9 +754,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
-        let effective_model = model
-            .map(String::from)
-            .or_else(|| self.default_model.clone());
+        let effective_model = self.default_model.clone();
+        let model_selection =
+            resolve_subrun_model_selection(&self.api, &self.token, effective_model.as_deref())
+                .await?;
+        let effective_model = Some(model_selection.name);
         let thinking = effective_model
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
@@ -778,6 +805,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
+            offering_id: model_selection.offering_id,
             project_root: self.project_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -853,9 +881,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
@@ -1192,6 +1220,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1255,6 +1284,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1287,6 +1317,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1401,6 +1432,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1434,6 +1466,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1680,7 +1713,6 @@ mod tests {
                 "depth-test",
                 "Do work",
                 "task",
-                None,
                 None,
                 &allowed_tools,
                 astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,

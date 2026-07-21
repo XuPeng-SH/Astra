@@ -959,9 +959,6 @@ pub struct SkillState {
     /// Optional skill executor for fork-context skills. When set, skills with
     /// `execution_context: Fork` are executed via this executor (sub-agent loop).
     pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
-    /// Model override from the most recently activated skill.
-    /// When set, the host should use this model instead of the default.
-    pub model_override: Option<String>,
     /// Effort level override from the most recently activated skill.
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type hint from the most recently activated skill.
@@ -1019,7 +1016,6 @@ impl Default for SkillState {
             registry_for_activation: None,
             resolver: None,
             executor: None,
-            model_override: None,
             effort: None,
             agent_type: None,
             allowed_tools: None,
@@ -1641,7 +1637,7 @@ pub struct StopHookState {
     /// Header names are normalized to lowercase.
     pub forward_headers: HashMap<String, String>,
     /// Request-scoped LLM token service config propagated to nested sub-runs.
-    pub llm_token_service: Option<astra_services::LlmTokenServiceConfig>,
+    pub admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     /// Shared session task board handle, when available.
     pub task_board_monitor: Option<Arc<TaskManager>>,
     /// Cached view of unfinished task-board work for completion gating.
@@ -1738,8 +1734,9 @@ pub struct VolatileInjection {
 /// requiring `full_llm_capture=true` and on-disk I/O. Capped to a
 /// small ring (latest [`RECENT_ROUNDS_RING_CAPACITY`] entries) to keep
 /// state size bounded.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RecentRoundSummary {
+    pub purpose: astra_turn_types::InferencePurpose,
     pub turn: u32,
     pub round: u32,
     pub provider: String,
@@ -1996,6 +1993,10 @@ pub struct AgenticLoopState {
     pub tool_results: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
+    /// Why this loop is allowed to consume model capacity. This is set by the
+    /// run owner before execution and remains stable for the lifetime of the
+    /// loop; provider, access source, and model selection are separate facts.
+    pub inference_purpose: astra_turn_types::InferencePurpose,
     pub context_manifest_pool: Option<astra_core::SharedPool>,
     pub context_manifest_user_id: Option<String>,
     pub context_manifest_model_name: Option<String>,
@@ -2333,14 +2334,6 @@ pub struct AgenticLoopState {
     pub session_memory_state: std::sync::Arc<
         std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
     >,
-
-    /// Resolved selector-model params used by the background memory
-    /// extraction runner (see `turn::memory_extraction_runner`). Shared
-    /// with `memory_relevance` and lesson synthesis — same "cheap
-    /// background LLM" resolved once per session via
-    /// `resolve_memory_model`. `None` → extraction falls back to the
-    /// rule-based L1 builder.
-    pub session_memory_llm_params: Option<crate::memory_hooks::relevance::LlmConnParams>,
 
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
@@ -2815,15 +2808,9 @@ impl AgenticLoopState {
     }
 
     /// Best-effort model id for sizing per-turn budgets (e.g. skill listing
-    /// budget). Resolution order:
-    ///   1. `skills.model_override` — the active skill's pinned model
-    ///   2. The model used in the most recent LLM round
-    ///   3. `None` (caller should fall back to a sensible default)
+    /// budget), taken from the most recent LLM round.
     pub fn current_model_hint(&self) -> Option<&str> {
-        self.skills
-            .model_override
-            .as_deref()
-            .or_else(|| self.recent_rounds.last().map(|r| r.model.as_str()))
+        self.recent_rounds.last().map(|round| round.model.as_str())
     }
 
     /// 1-based session turn number for the turn currently in progress.
@@ -2847,19 +2834,14 @@ impl AgenticLoopState {
     }
 
     /// Answers "which model is running this session/turn?" and must not
-    /// fall back to symbolic values such as `default`. Skill model overrides
-    /// remain secondary because they are transient execution hints; the
-    /// selected/context-manifest model is the user's chosen model identity.
+    /// fall back to symbolic values such as `default`.
     pub fn current_model_identity(&self) -> Option<&str> {
-        self.context_manifest_model_name
-            .as_deref()
-            .or(self.skills.model_override.as_deref())
-            .or_else(|| {
-                self.recent_rounds
-                    .last()
-                    .map(|r| r.model.as_str())
-                    .filter(|model| !model.is_empty())
-            })
+        self.context_manifest_model_name.as_deref().or_else(|| {
+            self.recent_rounds
+                .last()
+                .map(|r| r.model.as_str())
+                .filter(|model| !model.is_empty())
+        })
     }
 }
 
@@ -3513,6 +3495,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         tool_results: Vec::new(),
         current_session_id: None,
         current_run_id: None,
+        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: None,
         context_manifest_model_name: None,
@@ -3610,7 +3593,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         session_facts: Default::default(),
         memory_extraction_service: None,
         session_memory_state: Default::default(),
-        session_memory_llm_params: None,
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -4252,6 +4234,7 @@ pub(crate) mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
@@ -4351,7 +4334,6 @@ pub(crate) mod tests {
             session_facts: Default::default(),
             memory_extraction_service: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -6723,8 +6705,10 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine()
-    -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) async fn make_test_delegation_engine(
+        parent_run_id: &str,
+        session_id: &str,
+    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
@@ -6746,9 +6730,14 @@ pub(crate) mod tests {
         let _ = registry.register(reviewer);
 
         let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        run_engine
+            .start_run(parent_run_id, "system", session_id)
+            .await
+            .expect("test delegation parent should persist");
         Arc::new(DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
-            Arc::new(RunEngine::new(run_store)),
+            run_engine,
             Arc::new(DelegationTracker::new()),
             Arc::new(StubSubRunExecutor),
         ))
@@ -6813,7 +6802,8 @@ pub(crate) mod tests {
         state.current_session_id = Some("test-session-e2e".to_string());
 
         // Wire delegation engine
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine =
+            Some(make_test_delegation_engine("test-run-e2e", "test-session-e2e").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop should complete: {outcome:?}");
@@ -6918,7 +6908,7 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "review and list files"}));
         state.current_run_id = Some("run-mix".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("run-mix", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -6948,7 +6938,7 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "delegate something"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -6992,7 +6982,7 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "implement and review"}));
         state.current_run_id = Some("run-fanout".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("run-fanout", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -7064,7 +7054,8 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "write and review auth"}));
         state.current_run_id = Some("run-adversarial".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine =
+            Some(make_test_delegation_engine("run-adversarial", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -7085,7 +7076,7 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "list files"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -7094,67 +7085,11 @@ pub(crate) mod tests {
         assert_eq!(host.injected_schemas.len(), 0);
     }
 
-    // ── is_valid_model_string tests ──────────────────────────────────────
-
-    #[test]
-    fn valid_model_strings() {
-        assert!(crate::turn::agentic::tool_interception::is_valid_model_string("gpt-4o"));
-        assert!(
-            crate::turn::agentic::tool_interception::is_valid_model_string(
-                "claude-sonnet-4-20250514"
-            )
-        );
-        assert!(
-            crate::turn::agentic::tool_interception::is_valid_model_string("claude-3.5-sonnet")
-        );
-        assert!(crate::turn::agentic::tool_interception::is_valid_model_string("openai/gpt-4o"));
-        assert!(
-            crate::turn::agentic::tool_interception::is_valid_model_string("anthropic:claude-3")
-        );
-        assert!(crate::turn::agentic::tool_interception::is_valid_model_string("m0"));
-    }
-
-    #[test]
-    fn invalid_model_strings() {
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string(""));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("x")); // too short
-        assert!(
-            !crate::turn::agentic::tool_interception::is_valid_model_string("model with spaces")
-        );
-        assert!(
-            !crate::turn::agentic::tool_interception::is_valid_model_string("-starts-with-dash")
-        );
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("has;semicolon"));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("has$dollar"));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("has`backtick`"));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("has\nnewline"));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string("has\ttab"));
-        assert!(!crate::turn::agentic::tool_interception::is_valid_model_string(&"a".repeat(129)));
-        // too long
-    }
-
-    #[test]
-    fn model_string_boundary_lengths() {
-        assert!(crate::turn::agentic::tool_interception::is_valid_model_string("ab")); // min valid
-        assert!(
-            crate::turn::agentic::tool_interception::is_valid_model_string(&format!(
-                "m{}",
-                "a".repeat(127)
-            ))
-        ); // 128 = max
-        assert!(
-            !crate::turn::agentic::tool_interception::is_valid_model_string(&format!(
-                "m{}",
-                "a".repeat(128)
-            ))
-        ); // 129 = over
-    }
-
     // ── Skill pipeline integration tests ─────────────────────────────────
 
     /// Stub SkillResolver for agentic loop integration tests.
     struct StubSkillResolver {
-        skills: Vec<(String, String, String, Option<String>, Vec<String>)>,
+        skills: Vec<(String, String, String, Vec<String>)>,
     }
 
     impl StubSkillResolver {
@@ -7164,19 +7099,13 @@ pub(crate) mod tests {
                     "test-skill".into(),
                     "A test skill".into(),
                     "Follow these instructions carefully.".into(),
-                    None,
                     vec![],
                 )],
             }
         }
 
-        fn with_model(mut self, model: &str) -> Self {
-            self.skills[0].3 = Some(model.to_string());
-            self
-        }
-
         fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
-            self.skills[0].4 = tools;
+            self.skills[0].3 = tools;
             self
         }
     }
@@ -7188,12 +7117,11 @@ pub(crate) mod tests {
         ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
             self.skills
                 .iter()
-                .find(|(n, _, _, _, _)| n == name)
+                .find(|(n, _, _, _)| n == name)
                 .map(
-                    |(n, _, inst, model, tools)| crate::turn::skill_tool::ResolvedSkill {
+                    |(n, _, inst, tools)| crate::turn::skill_tool::ResolvedSkill {
                         name: n.clone(),
                         instructions: inst.clone(),
-                        model: model.clone(),
                         max_tokens: None,
                         allowed_tools: tools.clone(),
                         execution_context: crate::skills::manifest::ExecutionContext::Inline,
@@ -7222,7 +7150,7 @@ pub(crate) mod tests {
         fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
             self.skills
                 .iter()
-                .map(|(n, d, _, _, _)| crate::turn::skill_tool::SkillToolInfo {
+                .map(|(n, d, _, _)| crate::turn::skill_tool::SkillToolInfo {
                     name: n.clone(),
                     description: d.clone(),
                     when_to_use: None,
@@ -7330,51 +7258,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_model_override_applied_and_cleared() {
-        let resolver = StubSkillResolver::new().with_model("claude-sonnet-4-20250514");
-        let turns = vec![
-            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
-            text_result("Done with skill.", 80, 30, None),
-        ];
-
-        let mut host = MockHost::new(turns);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "use skill"}));
-        state.skills.resolver = Some(Arc::new(resolver));
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        // Model override should be set after skill activation
-        assert_eq!(
-            state.skills.model_override.as_deref(),
-            Some("claude-sonnet-4-20250514")
-        );
-    }
-
-    #[tokio::test]
-    async fn skill_model_override_rejected_for_invalid_string() {
-        let resolver = StubSkillResolver::new().with_model("model; rm -rf /");
-        let turns = vec![
-            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
-            text_result("Done.", 80, 30, None),
-        ];
-
-        let mut host = MockHost::new(turns);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "use skill"}));
-        state.skills.resolver = Some(Arc::new(resolver));
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        // Invalid model string should be rejected
-        assert!(state.skills.model_override.is_none());
-    }
-
-    #[tokio::test]
     async fn skill_allowed_tools_set_and_cleared() {
         let resolver =
             StubSkillResolver::new().with_allowed_tools(vec!["bash".into(), "grep".into()]);
@@ -7400,13 +7283,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unrestricted_skill_clears_prior_overrides() {
-        // Simulate: first skill sets overrides, second skill is unrestricted
+        // Simulate: first skill sets tool hints, second skill is unrestricted.
         let mut state = make_state();
-        state.skills.model_override = Some("old-model".into());
         state.skills.allowed_tools = Some(["bash".into()].into_iter().collect());
 
-        // An unrestricted skill (no model, no tools) should clear both
-        let resolver = StubSkillResolver::new(); // no model, no tools
+        let resolver = StubSkillResolver::new();
         let turns = vec![
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done.", 80, 30, None),
@@ -7420,8 +7301,6 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // Both should be cleared
-        assert!(state.skills.model_override.is_none());
         assert!(state.skills.allowed_tools.is_none());
     }
 
@@ -7786,7 +7665,6 @@ pub(crate) mod tests {
             "other-skill".into(),
             "Another skill".into(),
             "Other instructions.".into(),
-            None,
             vec![],
         ));
         let turns = vec![

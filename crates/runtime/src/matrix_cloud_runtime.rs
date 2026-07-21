@@ -43,46 +43,73 @@ pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
 /// from the `infra_llm_models` registry. Used to feed
 /// [`crate::session_memory::MemoryExtractionService`] without pulling
 /// the full MatrixCloudRuntime into every caller.
-pub struct PoolSelectorResolver {
+pub struct PoolMemoryInferenceResolver {
     pool: SharedPool,
     encryptor: Arc<astra_services::FernetTokenEncryptor>,
 }
 
-impl PoolSelectorResolver {
+impl PoolMemoryInferenceResolver {
     pub fn new(pool: SharedPool, encryptor: Arc<astra_services::FernetTokenEncryptor>) -> Self {
         Self { pool, encryptor }
     }
 }
 
-impl std::fmt::Debug for PoolSelectorResolver {
+impl std::fmt::Debug for PoolMemoryInferenceResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PoolSelectorResolver").finish()
+        f.debug_struct("PoolMemoryInferenceResolver").finish()
     }
 }
 
 #[async_trait::async_trait]
-impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
-    async fn resolve(&self) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
-        self.resolve_candidates().await.into_iter().next()
-    }
-
-    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
+impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResolver {
+    async fn resolve_candidates(
+        &self,
+        user_id: &str,
+    ) -> Vec<crate::memory_hooks::MemoryInferenceClient> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
-        let resolved =
-            astra_services::models::resolve_memory_models(settings, &self.encryptor, Some(pool))
-                .await
-                .unwrap_or_default();
-        resolved
+        let offerings = match astra_services::models::resolve_memory_offerings(
+            settings,
+            &self.encryptor,
+            Some(pool),
+        )
+        .await
+        {
+            Ok(offerings) => offerings,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::memory_model",
+                    %error,
+                    "memory model resolution failed"
+                );
+                return Vec::new();
+            }
+        };
+        offerings
             .into_iter()
-            .map(|model| crate::memory_hooks::relevance::LlmConnParams {
-                base_url: model.base_url,
-                api_key: model.api_key,
-                model_name: model.model_name,
-                wire_model_name: model.wire_model_name,
-                provider: model.provider,
-                request_body_overrides: model.request_body_overrides,
-                thinking_capability: model.thinking_capability,
+            .filter_map(|offering| {
+                let offering_id = offering.offering_id.clone();
+                let model_name = offering.model.model_name.clone();
+                match crate::memory_hooks::DurableMemoryInferenceClient::from_offering(
+                    offering,
+                    self.pool.clone(),
+                    user_id,
+                ) {
+                    Ok(client) => {
+                        Some(std::sync::Arc::new(client)
+                            as crate::memory_hooks::MemoryInferenceClient)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::memory_model",
+                            %offering_id,
+                            %model_name,
+                            %error,
+                            "memory model execution configuration is invalid"
+                        );
+                        None
+                    }
+                }
             })
             .collect()
     }
@@ -184,8 +211,8 @@ impl MatrixCloudRuntime {
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
         let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env();
         if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
-            let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
-                Arc::new(PoolSelectorResolver {
+            let resolver: Arc<dyn crate::session_memory::MemoryInferenceResolver> =
+                Arc::new(PoolMemoryInferenceResolver {
                     pool: self.shared_pool.clone(),
                     encryptor: Arc::clone(&enc),
                 });
@@ -212,28 +239,6 @@ impl MatrixCloudRuntime {
         &self,
     ) -> Option<Arc<crate::session_memory::MemoryExtractionService>> {
         self.memory_extraction_service.clone()
-    }
-
-    /// Resolve the cheapest memory-tagged model from the registry.
-    /// Returns `None` if no encryptor is configured or resolution fails.
-    pub async fn resolve_memory_model(
-        &self,
-    ) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
-        let enc = self.encryptor.as_ref()?;
-        let settings = self.shared_pool.settings();
-        let pool = self.shared_pool.get();
-        let resolved = astra_services::models::resolve_memory_model(settings, enc, Some(pool))
-            .await
-            .ok()?;
-        Some(crate::memory_hooks::relevance::LlmConnParams {
-            base_url: resolved.base_url,
-            api_key: resolved.api_key,
-            model_name: resolved.model_name,
-            wire_model_name: resolved.wire_model_name,
-            provider: resolved.provider,
-            request_body_overrides: resolved.request_body_overrides,
-            thinking_capability: resolved.thinking_capability,
-        })
     }
 
     pub fn edge_agent_id(&self) -> &str {

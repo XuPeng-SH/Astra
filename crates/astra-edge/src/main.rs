@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
-    tungstenite::Message,
+    tungstenite::Message, tungstenite::client::IntoClientRequest,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -95,6 +95,32 @@ struct EdgeConfig {
     workspace_dir: PathBuf,
     edge_id: String,
     reconnect: bool,
+}
+
+#[derive(Debug)]
+struct PermanentEdgeConnectionError(String);
+
+impl std::fmt::Display for PermanentEdgeConnectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentEdgeConnectionError {}
+
+fn is_permanent_connection_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error
+        .downcast_ref::<PermanentEdgeConnectionError>()
+        .is_some()
+        || error.downcast_ref::<ProxyConfigError>().is_some()
+    {
+        return true;
+    }
+    matches!(
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(tokio_tungstenite::tungstenite::Error::Http(response))
+            if matches!(response.status().as_u16(), 401 | 403)
+    )
 }
 
 struct CompletedEdgeInvocation {
@@ -361,26 +387,52 @@ fn first_nonempty_env(names: &[&str]) -> Option<String> {
     first_nonempty(names.iter().filter_map(|name| std::env::var(name).ok()))
 }
 
-fn select_proxy_candidate(values: impl IntoIterator<Item = String>) -> Option<String> {
-    let mut first_unsupported = None;
-    for value in values {
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            continue;
-        }
-        if value.starts_with("http://") {
-            return Some(value);
-        }
-        if first_unsupported.is_none() {
-            first_unsupported = Some(value);
-        }
-    }
-    // Preserve the explicit unsupported-proxy error instead of silently
-    // bypassing egress policy when no HTTP fallback exists.
-    first_unsupported
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyConfigError {
+    InvalidUrl { url: String, reason: String },
+    UnsupportedScheme(String),
+    MissingHost(String),
 }
 
-fn select_proxy_candidate_from_env(names: &[&str]) -> Option<String> {
+impl std::fmt::Display for ProxyConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl { url, reason } => {
+                write!(formatter, "invalid proxy URL '{url}': {reason}")
+            }
+            Self::UnsupportedScheme(scheme) => write!(
+                formatter,
+                "unsupported proxy URL scheme '{scheme}'; configure an http:// CONNECT proxy"
+            ),
+            Self::MissingHost(url) => write!(formatter, "proxy URL has no host: {url}"),
+        }
+    }
+}
+
+impl std::error::Error for ProxyConfigError {}
+
+fn select_proxy_candidate(
+    values: impl IntoIterator<Item = String>,
+) -> Result<Option<String>, ProxyConfigError> {
+    let Some(value) = first_nonempty(values) else {
+        return Ok(None);
+    };
+    let parsed = reqwest::Url::parse(&value).map_err(|error| ProxyConfigError::InvalidUrl {
+        url: redact_proxy_url(&value),
+        reason: error.to_string(),
+    })?;
+    if parsed.scheme() != "http" {
+        return Err(ProxyConfigError::UnsupportedScheme(
+            parsed.scheme().to_string(),
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ProxyConfigError::MissingHost(redact_proxy_url(&value)));
+    }
+    Ok(Some(value))
+}
+
+fn select_proxy_candidate_from_env(names: &[&str]) -> Result<Option<String>, ProxyConfigError> {
     select_proxy_candidate(names.iter().filter_map(|name| std::env::var(name).ok()))
 }
 
@@ -415,26 +467,39 @@ fn ws_target_is_loopback(ws_url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Parse `host`, `port`, and optional `userinfo` from an HTTP(S) proxy URL.
+/// Parse `host`, `port`, and optional `userinfo` from an HTTP proxy URL.
 ///
-/// Accepts `http://` and `https://` schemes, strips userinfo (e.g.
+/// Accepts the supported `http://` scheme, strips userinfo (e.g.
 /// `user:pass@`), handles IPv6 bracket notation, and defaults to port 3128
 /// when no explicit port is present.
 ///
 /// Returns `(host, port, Option<userinfo>)`.
-fn parse_proxy_addr(proxy_url: &str) -> Option<(String, u16, Option<String>)> {
-    let rest = proxy_url
-        .strip_prefix("http://")
-        .or_else(|| proxy_url.strip_prefix("https://"))?;
-    // Drop path/query/fragment.
-    let authority = rest.split('/').next()?;
-    // Split optional userinfo (`user:pass@`).
-    let (userinfo, host_port) = match authority.rfind('@') {
-        Some(at) => (Some(authority[..at].to_string()), &authority[at + 1..]),
-        None => (None, authority),
+fn parse_proxy_addr(proxy_url: &str) -> Result<(String, u16, Option<String>), ProxyConfigError> {
+    let parsed = reqwest::Url::parse(proxy_url).map_err(|error| ProxyConfigError::InvalidUrl {
+        url: redact_proxy_url(proxy_url),
+        reason: error.to_string(),
+    })?;
+    if parsed.scheme() != "http" {
+        return Err(ProxyConfigError::UnsupportedScheme(
+            parsed.scheme().to_string(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| ProxyConfigError::MissingHost(redact_proxy_url(proxy_url)))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = parsed.port().unwrap_or(3128);
+    let userinfo = if parsed.username().is_empty() && parsed.password().is_none() {
+        None
+    } else {
+        Some(match parsed.password() {
+            Some(password) => format!("{}:{password}", parsed.username()),
+            None => parsed.username().to_string(),
+        })
     };
-    let (host, port) = parse_host_port(host_port, 3128)?;
-    Some((host, port, userinfo))
+    Ok((host, port, userinfo))
 }
 
 /// Returns `true` when `host` matches the NO_PROXY/no_proxy exclusion list.
@@ -575,20 +640,11 @@ const PROXY_CONNECT_TIMEOUT_SECS: u64 = 30;
 async fn connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
+    token: &str,
 ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
-    if proxy_url.starts_with("https://") {
-        return Err(format!(
-            "HTTPS proxies are not supported for WebSocket CONNECT \
-             (the CONNECT handshake is sent in plaintext over a raw TCP connection). \
-             Configure an http:// proxy instead: {}",
-            redact_proxy_url(proxy_url)
-        )
-        .into());
-    }
     let (ws_host, ws_port) =
         parse_ws_target(ws_url).ok_or_else(|| format!("Cannot parse WebSocket URL: {ws_url}"))?;
-    let (proxy_host, proxy_port, userinfo) = parse_proxy_addr(proxy_url)
-        .ok_or_else(|| format!("Cannot parse proxy URL: {}", redact_proxy_url(proxy_url)))?;
+    let (proxy_host, proxy_port, userinfo) = parse_proxy_addr(proxy_url)?;
 
     tracing::info!(proxy_host = %proxy_host, proxy_port, target = %format!("{ws_host}:{ws_port}"), "CONNECT via proxy");
 
@@ -651,18 +707,32 @@ async fn connect_via_proxy(
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let connector = Connector::Rustls(std::sync::Arc::new(tls_config));
-        let tls_and_ws = client_async_tls_with_config(ws_url, tcp, None, Some(connector));
+        let request = edge_ws_request(ws_url, token)?;
+        let tls_and_ws = client_async_tls_with_config(request, tcp, None, Some(connector));
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
             .await
             .map_err(|_| "TLS+WebSocket upgrade timed out")??;
         Ok(ws_stream)
     } else {
-        let ws_upgrade = tokio_tungstenite::client_async(ws_url, MaybeTlsStream::Plain(tcp));
+        let request = edge_ws_request(ws_url, token)?;
+        let ws_upgrade = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp));
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, ws_upgrade)
             .await
             .map_err(|_| "WebSocket upgrade timed out")??;
         Ok(ws_stream)
     }
+}
+
+fn edge_ws_request(
+    ws_url: &str,
+    token: &str,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, Box<dyn std::error::Error>> {
+    let mut request = ws_url.into_client_request()?;
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    Ok(request)
 }
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
@@ -680,9 +750,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     } else {
         &["http_proxy", "HTTP_PROXY"]
     };
-    let proxy = select_proxy_candidate_from_env(proxy_names)
-        .filter(|_| !ws_target_is_loopback(&url))
-        .and_then(|proxy_url| {
+    let proxy = if ws_target_is_loopback(&url) {
+        None
+    } else {
+        select_proxy_candidate_from_env(proxy_names)?.and_then(|proxy_url| {
             // Extract the WS target host for NO_PROXY matching.
             let (ws_host, _) = parse_ws_target(&url)?;
             let no_proxy = first_nonempty_env(&["no_proxy", "NO_PROXY"]).unwrap_or_default();
@@ -695,22 +766,26 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 return None;
             }
             Some(proxy_url)
-        });
+        })
+    };
 
     let ws_stream = if let Some(ref proxy_url) = proxy {
-        connect_via_proxy(&url, proxy_url).await.map_err(|e| {
-            tracing::error!(
-                target: "astra.edge",
-                edge_id = %config.edge_id,
-                url = %url,
-                proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
-                error = %e,
-                "WebSocket connect via proxy failed"
-            );
-            e
-        })?
+        connect_via_proxy(&url, proxy_url, &config.token)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "astra.edge",
+                    edge_id = %config.edge_id,
+                    url = %url,
+                    proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
+                    error = %e,
+                    "WebSocket connect via proxy failed"
+                );
+                e
+            })?
     } else {
-        let (ws, _) = connect_async(&url).await.map_err(|e| {
+        let request = edge_ws_request(&url, &config.token)?;
+        let (ws, _) = connect_async(request).await.map_err(|e| {
             tracing::error!(
                 target: "astra.edge",
                 edge_id = %config.edge_id,
@@ -732,7 +807,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
     })?;
     let auth_msg = EdgeClientMessage::Auth {
-        token: config.token.clone(),
         edge_agent_id: config.edge_id.clone(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
@@ -762,7 +836,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                     detail = %message,
                     "server rejected edge authentication"
                 );
-                return Err(format!("Authentication failed: {message}").into());
+                return Err(PermanentEdgeConnectionError(format!(
+                    "Authentication failed: {message}"
+                ))
+                .into());
             }
             _ => {
                 tracing::error!(
@@ -1112,13 +1189,7 @@ async fn main() {
                 );
             }
             Err(e) => {
-                let err_str = e.to_string();
-                // Permanent errors: authentication failures, invalid config
-                let is_permanent = err_str.contains("Authentication failed")
-                    || err_str.contains("401")
-                    || err_str.contains("403")
-                    || err_str.contains("invalid token");
-                if is_permanent {
+                if is_permanent_connection_error(e.as_ref()) {
                     tracing::error!(
                         error = %e,
                         "Permanent authentication failure — not retrying"
@@ -1165,6 +1236,31 @@ mod tests {
         tracker.begin("request-1", next_generation).unwrap();
         assert!(!tracker.finish_if_current("request-1", generation));
         assert!(tracker.finish_if_current("request-1", next_generation));
+    }
+
+    #[test]
+    fn permanent_connection_errors_are_classified_by_type_and_http_status() {
+        let authentication = PermanentEdgeConnectionError("denied".to_string());
+        assert!(is_permanent_connection_error(&authentication));
+
+        let proxy = ProxyConfigError::UnsupportedScheme("https".to_string());
+        assert!(is_permanent_connection_error(&proxy));
+
+        let unauthorized = tokio_tungstenite::tungstenite::Error::Http(
+            tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(401)
+                .body(None)
+                .unwrap(),
+        );
+        assert!(is_permanent_connection_error(&unauthorized));
+
+        let unavailable = tokio_tungstenite::tungstenite::Error::Http(
+            tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(503)
+                .body(None)
+                .unwrap(),
+        );
+        assert!(!is_permanent_connection_error(&unavailable));
     }
 
     #[test]
@@ -1334,18 +1430,24 @@ mod tests {
     }
 
     #[test]
-    fn proxy_selection_skips_unsupported_https_proxy_and_uses_http_fallback() {
+    fn proxy_selection_rejects_the_first_configured_unsupported_scheme() {
+        let error = select_proxy_candidate([
+            "https://unsupported.example:8443".to_string(),
+            "http://fallback.example:8080".to_string(),
+        ])
+        .expect_err("an unsupported configured proxy must not be bypassed");
         assert_eq!(
-            select_proxy_candidate([
-                "https://unsupported.example:8443".to_string(),
-                "  ".to_string(),
-                "http://fallback.example:8080".to_string(),
-            ]),
+            error,
+            ProxyConfigError::UnsupportedScheme("https".to_string())
+        );
+        assert_eq!(
+            select_proxy_candidate(["  ".to_string(), "http://fallback.example:8080".to_string(),])
+                .unwrap(),
             Some("http://fallback.example:8080".to_string())
         );
         assert_eq!(
-            select_proxy_candidate(["https://unsupported.example:8443".to_string()]),
-            Some("https://unsupported.example:8443".to_string())
+            parse_proxy_addr("HTTP://user:pass@[::1]:8080/path").unwrap(),
+            ("::1".to_string(), 8080, Some("user:pass".to_string()))
         );
     }
 

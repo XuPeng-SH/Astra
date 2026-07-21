@@ -19,9 +19,6 @@ import type {
   EventResponse,
   MemoryEntry,
   MemorySearchResult,
-  ModelGatewayCreateRequest,
-  ModelGatewayCreateResponse,
-  ModelGatewayRecord,
   ReflectQueryParams,
   ReflectReport,
   RegisterSkillBody,
@@ -38,6 +35,7 @@ import type {
   RuntimeArtifactListParams,
   RuntimeArtifactListResponse,
   RuntimeModelListItem,
+  RuntimeModelAccessProjection,
   RuntimeModelListResponse,
   RuntimeSessionCreateBody,
   RuntimeSessionListParams,
@@ -81,7 +79,7 @@ import {
   PATH_MEMORY_SEARCH,
   PATH_MEMORY_STORE,
   PATH_MODELS,
-  PATH_MODEL_GATEWAYS,
+  PATH_MODEL_ACCESS,
   PATH_RUNS,
   PATH_SESSIONS,
   PATH_SKILLS,
@@ -106,8 +104,6 @@ import {
   eventsCausalChainPath,
   eventsSessionPath,
   joinApiPath,
-  modelGatewayDisablePath,
-  modelGatewayPath,
   sessionActivityPath,
   sessionArtifactsPath,
   sessionAuditSummaryPath,
@@ -125,7 +121,7 @@ import {
 } from "./paths";
 import { SSEClient, parseSseDataEvents } from "./sse-client";
 import { headersInitToRecord, readAstraErrorDetail } from "./http";
-import { selectedModelToWire } from "./wire";
+import { modelSelectionToWire } from "./wire";
 
 type SessionWire = RuntimeSessionResponse;
 type SessionListWire = RuntimeSessionListResponse;
@@ -284,7 +280,7 @@ function normalizeReflectReport(
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
-    selected_model: selectedModelToWire(req.selectedModel),
+    model_selection: modelSelectionToWire(req.modelSelection),
   };
   if (req.parts) body.parts = req.parts;
   if (req.attachments) body.attachments = req.attachments;
@@ -951,18 +947,11 @@ export class AstraClient {
   // ─── Models ─────────────────────────────────────────────────────────
 
   async listModels(): Promise<RuntimeModelListItem[]> {
-    const payload = await this.fetch<RuntimeModelListResponse>(PATH_MODELS);
-    if (Array.isArray(payload)) {
-      return payload.filter(
-        (model): model is RuntimeModelListItem =>
-          Boolean(model) && typeof model === "object",
-      );
-    }
-    const items = payload.items ?? payload.models ?? [];
-    return items.filter(
-      (model): model is RuntimeModelListItem =>
-        Boolean(model) && typeof model === "object",
-    );
+    return this.fetch<RuntimeModelListResponse>(PATH_MODELS);
+  }
+
+  async getModelAccess(): Promise<RuntimeModelAccessProjection> {
+    return this.fetch<RuntimeModelAccessProjection>(PATH_MODEL_ACCESS);
   }
 
   // ─── Agent Binding Registry ───────────────────────────────────────
@@ -982,27 +971,6 @@ export class AstraClient {
   ): Promise<AgentBindingRecord> {
     return this.post<AgentBindingRecord>(
       agentBindingDisablePath(agentBindingId),
-      {},
-    );
-  }
-
-  // ─── Model Gateway Registry ───────────────────────────────────────
-
-  async createModelGateway(
-    body: ModelGatewayCreateRequest,
-  ): Promise<ModelGatewayCreateResponse> {
-    return this.post<ModelGatewayCreateResponse>(PATH_MODEL_GATEWAYS, body);
-  }
-
-  async getModelGateway(modelGatewayId: string): Promise<ModelGatewayRecord> {
-    return this.fetch<ModelGatewayRecord>(modelGatewayPath(modelGatewayId));
-  }
-
-  async disableModelGateway(
-    modelGatewayId: string,
-  ): Promise<ModelGatewayRecord> {
-    return this.post<ModelGatewayRecord>(
-      modelGatewayDisablePath(modelGatewayId),
       {},
     );
   }

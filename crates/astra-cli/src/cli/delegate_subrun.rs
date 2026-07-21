@@ -267,10 +267,22 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 "delegated agent start was not delivered to the live workbench"
             );
         }
-        let effective_model = profile
-            .model_override
-            .clone()
-            .or_else(|| self.default_model.clone());
+        let model_selection = if let Some(selection) = profile.model_selection.as_ref() {
+            crate::cli::session::session_runtime::resolve_server_offering_selection(
+                &self.api,
+                &self.token,
+                &selection.offering_id,
+            )
+            .await?
+        } else {
+            crate::cli::skill_subrun::resolve_subrun_model_selection(
+                &self.api,
+                &self.token,
+                self.default_model.as_deref(),
+            )
+            .await?
+        };
+        let effective_model = Some(model_selection.name.clone());
         let child_thinking = effective_model
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
@@ -283,7 +295,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
-
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
@@ -342,6 +353,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
+            offering_id: model_selection.offering_id,
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -461,9 +473,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
@@ -801,7 +813,7 @@ pub(crate) fn register_default_agents(
             tier: AgentTier::Orchestrator,
             system_prompt: None,
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: true,
             delegate_to: Vec::new(), // empty = all
             max_delegation_depth: 3,
@@ -820,7 +832,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,
@@ -839,7 +851,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,
@@ -858,7 +870,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,

@@ -21,6 +21,7 @@ pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
 pub mod harness;
+pub mod inference_execution;
 pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
@@ -28,7 +29,6 @@ pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
-pub mod model_gateways;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
@@ -111,7 +111,7 @@ pub use admin::{
     AdminUserRoleRequestData, AuthenticatedUser,
 };
 pub use admin_config::{
-    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
+    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_OFFERING, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
 pub use agent_bindings::{
@@ -202,6 +202,13 @@ pub use harness::{
     SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
+pub use inference_execution::{
+    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
+    InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
+    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
+    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlements,
+};
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
     InteractionStatus, approval_decision_status, ask_user_response_status, edge_dispatch_status,
@@ -231,17 +238,17 @@ pub use mcp_registry::{
     McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
     UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
 };
-pub use model_gateways::{
-    DatabaseModelGatewayService, InMemoryModelGatewayService, ModelGatewayCreateRequestData,
-    ModelGatewayRecord, ModelGatewayService, ModelGatewayStatus, ModelProtocol,
-    UnconfiguredModelGatewayService,
-};
 pub use models::{
-    DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
+    AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
+    ModelAccessAvailability, ModelAccessKind, ModelAccessProjectionResponse, ModelAccessReason,
+    ModelAccessStatus, ModelAccessViewResponse, ModelCreateRequestData, ModelExecutionPlacement,
+    ModelListItem, ModelListItemResponse, ModelOfferingResolutionError, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
     PromptCacheReuseScopeData, PromptCacheVolatilePlacementData, QuirksData,
-    ResolvedActiveLlmModel, UnconfiguredModelService, prompt_cache_capability_from_models_yaml,
-    resolve_active_llm_model, resolve_memory_model, resolve_reasoning_model,
+    ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService, project_model_access,
+    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
+    resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
+    revalidate_active_llm_offering, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
@@ -274,11 +281,11 @@ pub use reflect::{
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig,
-    LlmTokenServiceRequest, RunContinuationRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationDisposition, RunMutationRecord, RunStateStore, RunStatusRecord,
-    UnconfiguredRunLifecycleService, extract_event_type, run_list_cursor_db_updated_at,
-    run_list_cursor_run_id, transform_run_event_for_client, validate_run_list_limit,
+    DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, RunContinuationRecord,
+    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunStateStore, RunStatusRecord, UnconfiguredRunLifecycleService, extract_event_type,
+    run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
+    validate_run_list_limit,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,

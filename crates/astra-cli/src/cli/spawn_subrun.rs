@@ -671,6 +671,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             }
         };
         let effective_model = self.resolve_effective_model(config.model.as_deref());
+        let model_selection = crate::cli::skill_subrun::resolve_subrun_model_selection(
+            &self.api,
+            &token,
+            effective_model.as_deref(),
+        )
+        .await?;
+        let effective_model = Some(model_selection.name);
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &token)
@@ -697,6 +704,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             api: self.api.clone(),
             token: token.clone(),
             model: effective_model.clone(),
+            offering_id: model_selection.offering_id,
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -864,9 +872,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model,

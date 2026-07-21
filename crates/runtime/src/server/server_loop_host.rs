@@ -52,15 +52,14 @@ use crate::turn::agentic_loop::host::{
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge::llm_stream::rate_limit_cooldown;
 use crate::turn::llm::client::{
-    LlmCallResult, LlmCancel, LlmStreamUpdate, call_llm_and_collect_with_request_overrides,
-    call_llm_and_collect_with_request_overrides_and_stream_callback,
-    call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
-    sleep_ms_or_llm_cancel,
+    LlmCall, LlmCallResult, LlmCancel, LlmExecutionRoute, LlmStreamUpdate, OwnedLlmExecutionRoute,
+    call_llm_and_collect_with_stream_callback, sleep_ms_or_llm_cancel,
 };
+use crate::turn::llm::summary_client::RuntimeSummaryClient;
 use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
-use astra_services::LlmTokenServiceConfig;
+use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
@@ -68,7 +67,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
-    FallbackOutcome, RateLimitAction, try_resolve_fallback,
+    CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
@@ -284,21 +283,6 @@ impl RunScopedAgentProgressFilter {
             return vec![event];
         }
         Vec::new()
-    }
-}
-
-fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    match CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(llm_connect_timeout())
-            .timeout(llm_fallback_timeout())
-            .build()
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(client) => Ok(client.clone()),
-        Err(error) => Err(error.clone()),
     }
 }
 
@@ -520,7 +504,7 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
         .map(ToString::to_string)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
@@ -541,80 +525,59 @@ struct ResolvedTurnLlmConfig {
     context_window: Option<u32>,
 }
 
-type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
+impl ResolvedTurnLlmConfig {
+    fn execution_route(&self) -> OwnedLlmExecutionRoute {
+        OwnedLlmExecutionRoute {
+            model_name: self.model_name.clone(),
+            wire_model_name: self.wire_model_name.clone(),
+            api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+            provider: self.provider.clone(),
+            header_overrides: self.header_overrides.clone(),
+            request_body_overrides: self.request_body_overrides.clone(),
+            completions_url_override: self.completions_url_override.clone(),
+            request_timeout: self.request_timeout,
+        }
+    }
 
-#[derive(Debug, Clone)]
-struct RequestAwareSummaryClient {
-    model_name: String,
-    wire_model_name: Option<String>,
-    api_key: String,
-    base_url: String,
-    provider: String,
-    max_output_tokens: usize,
-    header_overrides: HashMap<String, String>,
-    request_body_overrides: Option<Map<String, Value>>,
-    completions_url_override: Option<String>,
-    request_timeout: Option<Duration>,
+    fn shares_credential_owner_with(&self, candidate: &Self) -> bool {
+        self.provider == candidate.provider
+            && self.api_key == candidate.api_key
+            && self.base_url == candidate.base_url
+            && self.header_overrides == candidate.header_overrides
+            && self.completions_url_override == candidate.completions_url_override
+    }
 }
 
-#[async_trait]
-impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryClient {
-    async fn summarize(
-        &self,
-        messages: &[Value],
-    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        let client = request_aware_summary_http_client()?;
-
-        match call_llm_nonstream_fallback_with_request_overrides(
-            &client,
-            messages,
-            &[],
-            &self.model_name,
-            &self.api_key,
-            &self.base_url,
-            &self.provider,
-            Some(self.max_output_tokens),
-            llm_fallback_timeout(),
-            self.wire_model_name.as_deref(),
-            (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
-            self.request_body_overrides.as_ref(),
-            self.completions_url_override.as_deref(),
-            self.request_timeout,
-            &ThinkingConfig::Off,
+async fn try_resolve_same_owner_fallback(
+    cooldown: &PerModelCooldown,
+    chain: &[String],
+    reason: CooldownReason,
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+    credential_owner: &ResolvedTurnLlmConfig,
+) -> FallbackOutcome<ResolvedTurnLlmConfig> {
+    try_resolve_fallback(cooldown, chain, reason, |fallback_name| async move {
+        let candidate = resolve_llm_model_for_turn(
+            matrixone,
+            encryptor,
+            Some(fallback_name.as_str()),
+            pool,
+            None,
         )
-        .await
-        {
-            Ok(result) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
-                text: result.full_text,
-                is_ptl_error: false,
-            }),
-            Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
-                Ok(astra_turn_core::cloud_summary::SummaryResponse {
-                    text: String::new(),
-                    is_ptl_error: true,
-                })
-            }
-            Err(error) => Err(error.to_string()),
+        .await?;
+        if !credential_owner.shares_credential_owner_with(&candidate) {
+            return Err(
+                "fallback Offering belongs to a different provider credential owner".to_string(),
+            );
         }
-    }
+        Ok(candidate)
+    })
+    .await
 }
 
-impl RequestAwareSummaryClient {
-    fn from_resolved_config(llm_cfg: &ResolvedTurnLlmConfig, max_output_tokens: usize) -> Self {
-        Self {
-            model_name: llm_cfg.model_name.clone(),
-            wire_model_name: llm_cfg.wire_model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens,
-            header_overrides: llm_cfg.header_overrides.clone(),
-            request_body_overrides: llm_cfg.request_body_overrides.clone(),
-            completions_url_override: llm_cfg.completions_url_override.clone(),
-            request_timeout: llm_cfg.request_timeout,
-        }
-    }
-}
+type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 
 struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
@@ -635,7 +598,7 @@ impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
         let messages = astra_services::turn_intent_judge_messages(ctx);
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(astra_services::TurnIntentJudgeError::Transport)?;
         astra_services::parse_turn_intent_response(response.text.as_str())
@@ -656,7 +619,7 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
             .collect::<Vec<_>>();
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(SkillAutoRouteJudgeError::Transport)?;
         astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
@@ -681,36 +644,34 @@ fn skill_auto_route_service_context(
     }
 }
 
-fn normalize_request_model(preferred_model: Option<&str>) -> Option<String> {
-    preferred_model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(String::from)
-}
-
 async fn resolve_llm_model_for_turn(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     preferred_model: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-    llm_token_service: Option<&LlmTokenServiceConfig>,
-    forward_headers: &HashMap<String, String>,
+    admitted_execution: Option<&astra_services::AdmittedModelExecution>,
 ) -> Result<ResolvedTurnLlmConfig, String> {
-    if let Some(config) = llm_token_service {
+    if let Some(execution) = admitted_execution {
+        if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
+            return Err(
+                "model override does not match the Offering admitted for this run".to_string(),
+            );
+        }
         return Ok(ResolvedTurnLlmConfig {
-            model_name: normalize_request_model(preferred_model)
-                .unwrap_or_else(|| "gpt-4o-mini".to_string()),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            provider: "openai".to_string(),
-            cache_capability: None,
+            model_name: execution.model_name.clone(),
+            wire_model_name: execution.wire_model_name.clone(),
+            api_key: execution.api_key.clone(),
+            base_url: execution.base_url.clone(),
+            provider: execution.provider.clone(),
+            cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
+                execution.cache_capability,
+            ),
             fallback_chain: Vec::new(),
-            header_overrides: forward_headers.clone(),
-            request_body_overrides: None,
-            completions_url_override: Some(config.url.clone()),
-            request_timeout: config.timeout_ms.map(Duration::from_millis),
-            context_window: None,
+            header_overrides: execution.header_overrides.clone(),
+            request_body_overrides: execution.request_body_overrides.clone(),
+            completions_url_override: execution.completions_url_override.clone(),
+            request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
+            context_window: execution.context_window,
         });
     }
     let resolved =
@@ -1053,16 +1014,11 @@ pub struct ServerAgenticLoopHost {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
-    /// Cached LLM connection params from the last successful model resolution.
-    /// Used by `summary_client()` to construct the compact-summary client
-    /// without re-resolving (model resolution requires async DB call).
-    resolved_llm_params: Option<astra_turn_core::cloud_summary::LlmConnParams>,
     /// Full resolved config from the last successful model resolution.
-    /// Summary-classifier calls need completion overrides and forwarded
-    /// headers, which `LlmConnParams` intentionally does not carry.
+    /// Auxiliary inference must use this same admitted execution route.
     resolved_llm_config: Option<ResolvedTurnLlmConfig>,
     resolved_llm_config_at: Option<Instant>,
 
@@ -1319,7 +1275,7 @@ pub struct ServerAgenticLoopHostBuilder {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
@@ -1378,7 +1334,7 @@ impl ServerAgenticLoopHostBuilder {
             encryptor,
             shared_pool: None,
             model_override: None,
-            llm_token_service: None,
+            admitted_model_execution: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_bindings: None,
@@ -1476,11 +1432,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_llm_token_service(
+    pub fn with_admitted_model_execution(
         mut self,
-        llm_token_service: Option<LlmTokenServiceConfig>,
+        execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Self {
-        self.llm_token_service = llm_token_service;
+        self.admitted_model_execution = execution;
         self
     }
 
@@ -1755,10 +1711,9 @@ impl ServerAgenticLoopHostBuilder {
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
             model_override: self.model_override,
-            llm_token_service: self.llm_token_service,
+            admitted_model_execution: self.admitted_model_execution,
             resolved_model_name: None,
             resolved_context_window: None,
-            resolved_llm_params: None,
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             tool_schemas,
@@ -2068,6 +2023,7 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        self.revalidate_catalog_execution().await?;
         if let Some(config) = self.resolved_llm_config.as_ref() {
             if self.cached_llm_config_matches_state(state) {
                 return Ok(config.clone());
@@ -2085,23 +2041,42 @@ impl ServerAgenticLoopHost {
             self.encryptor.as_ref(),
             effective_model_override.as_deref(),
             pool_ref,
-            self.llm_token_service.as_ref(),
-            &state.hooks.forward_headers,
+            self.admitted_model_execution.as_ref(),
         )
         .await?;
         self.remember_resolved_llm_config(&llm_cfg);
         Ok(llm_cfg)
     }
 
+    async fn revalidate_catalog_execution(&mut self) -> Result<(), String> {
+        let Some(admitted) = self.admitted_model_execution.as_ref() else {
+            return Ok(());
+        };
+        if admitted.execution_placement != astra_services::ModelExecutionPlacement::Server {
+            // Edge execution material was authenticated from the current
+            // client request, not resolved from the Server catalog. There is
+            // no Server-owned route or secret to refresh at this boundary.
+            return Ok(());
+        }
+        let offering = astra_services::revalidate_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &admitted.offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let execution = astra_services::AdmittedModelExecution::from_offering(offering)?;
+        self.admitted_model_execution = Some(execution);
+        self.clear_resolved_llm_config();
+        Ok(())
+    }
+
     fn effective_model_override_for_state<'a>(
         &'a self,
-        state: &'a AgenticLoopState,
+        _state: &'a AgenticLoopState,
     ) -> Option<&'a str> {
-        state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref())
+        self.model_override.as_deref()
     }
 
     fn cached_llm_config_matches_state(&self, state: &AgenticLoopState) -> bool {
@@ -2114,13 +2089,8 @@ impl ServerAgenticLoopHost {
         if inserted_at.elapsed() > RESOLVED_TURN_LLM_CONFIG_CACHE_TTL {
             return false;
         }
-        if self.llm_token_service.is_some()
-            && config.header_overrides != state.hooks.forward_headers
-        {
-            return false;
-        }
         match self.effective_model_override_for_state(state) {
-            Some(requested) => config.model_name.eq_ignore_ascii_case(requested),
+            Some(requested) => config.model_name == requested,
             None => true,
         }
     }
@@ -2128,7 +2098,6 @@ impl ServerAgenticLoopHost {
     fn clear_resolved_llm_config(&mut self) {
         self.resolved_model_name = None;
         self.resolved_context_window = None;
-        self.resolved_llm_params = None;
         self.resolved_llm_config = None;
         self.resolved_llm_config_at = None;
     }
@@ -2136,13 +2105,6 @@ impl ServerAgenticLoopHost {
     fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
         self.resolved_context_window = llm_cfg.context_window;
-        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: llm_cfg.model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens: 4096,
-        });
         self.resolved_llm_config = Some(llm_cfg.clone());
         self.resolved_llm_config_at = Some(Instant::now());
     }
@@ -2150,35 +2112,69 @@ impl ServerAgenticLoopHost {
     async fn turn_intent_summary_client(
         &mut self,
         state: &AgenticLoopState,
+        operation_id: &'static str,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
         if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
             self.clear_resolved_llm_config();
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                config, 256,
-            )));
+            return self
+                .durable_summary_client(config, 256, state, operation_id)
+                .map(|client| Box::new(client) as Box<_>);
         }
 
-        if self.resolved_llm_params.is_none() {
-            let llm_cfg = match self.resolve_llm_config_for_state(state).await {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "astra::turn_intent",
-                        error = %error,
-                        "turn intent judge skipped because model resolution is unavailable"
-                    );
-                    return None;
-                }
-            };
-            self.remember_resolved_llm_config(&llm_cfg);
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                &llm_cfg, 256,
-            )));
-        }
+        let llm_cfg = match self.resolve_llm_config_for_state(state).await {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::debug!(
+                    target: "astra::turn_intent",
+                    error = %error,
+                    "turn intent judge skipped because model resolution is unavailable"
+                );
+                return None;
+            }
+        };
+        self.remember_resolved_llm_config(&llm_cfg);
+        self.durable_summary_client(&llm_cfg, 256, state, operation_id)
+            .map(|client| Box::new(client) as Box<_>)
+    }
 
-        self.summary_client()
+    fn durable_summary_client(
+        &self,
+        config: &ResolvedTurnLlmConfig,
+        max_output_tokens: usize,
+        state: &AgenticLoopState,
+        operation_id: &'static str,
+    ) -> Option<RuntimeSummaryClient> {
+        let ledger = match crate::turn::llm::durable::DurableInferenceLedger::from_optional(
+            self.shared_pool.as_ref(),
+            self.admitted_model_execution.as_ref(),
+            &self.user_id,
+        ) {
+            Ok(Some(ledger)) => ledger,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::inference",
+                    operation_id,
+                    error = %error,
+                    "auxiliary inference skipped because durable admission material is unavailable"
+                );
+                return None;
+            }
+        };
+        Some(RuntimeSummaryClient::new(
+            config.execution_route(),
+            max_output_tokens,
+            ledger,
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: self.session_id.clone(),
+                turn: state.session_turn,
+                round: state.llm_rounds_completed,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+        ))
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -4796,26 +4792,20 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = RequestAwareSummaryClient {
-            model_name: llm_cfg.model_name.clone(),
-            wire_model_name: llm_cfg.wire_model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens: compact_config.summary_token_budget,
-            header_overrides: llm_cfg.header_overrides.clone(),
-            request_body_overrides: llm_cfg.request_body_overrides.clone(),
-            completions_url_override: llm_cfg.completions_url_override.clone(),
-            request_timeout: llm_cfg.request_timeout,
-        };
+        let summary_client = self.durable_summary_client(
+            llm_cfg,
+            compact_config.summary_token_budget,
+            state,
+            "required_compaction",
+        );
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
             context_window: llm_cfg.context_window,
             memoria_client: self.memoria_client.as_deref(),
-            summary_client: Some(
-                &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-            ),
+            summary_client: summary_client
+                .as_ref()
+                .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
             tier,
             session_facts: None,
         };
@@ -4949,7 +4939,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         let phase_started_at = Instant::now();
         let model_resolution_started_at = Instant::now();
-        let Some(client) = self.turn_intent_summary_client(state).await else {
+        let Some(client) = self.turn_intent_summary_client(state, "turn_intent").await else {
             let duration_ms = phase_started_at.elapsed().as_millis() as u64;
             tracing::info!(
                 target: "astra::turn_intent",
@@ -4967,11 +4957,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .resolved_llm_config
             .as_ref()
             .map(|config| (config.model_name.clone(), config.provider.clone()))
-            .or_else(|| {
-                self.resolved_llm_params
-                    .as_ref()
-                    .map(|params| (params.model_name.clone(), params.provider.clone()))
-            })
             .unwrap_or_default();
         let judge = SummaryClientTurnIntentJudge { client };
         let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
@@ -5026,7 +5011,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 return None;
             }
-            let client = self.turn_intent_summary_client(state).await?;
+            let client = self
+                .turn_intent_summary_client(state, "skill_auto_route")
+                .await?;
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
         };
@@ -5191,7 +5178,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ));
             }
         };
-        let has_fallback = !llm_cfg.fallback_chain.is_empty();
+        let fallback_chain = llm_cfg.fallback_chain.clone();
+        let credential_owner = llm_cfg.clone();
+        let has_fallback = !fallback_chain.is_empty();
 
         // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
         let cooldown = rate_limit_cooldown();
@@ -5207,24 +5196,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             RateLimitAction::UseFallback { reason } => {
                 let mx = &self.matrixone;
                 let enc = self.encryptor.as_ref();
-                let lts = self.llm_token_service.as_ref();
-                let fwd = &state.hooks.forward_headers;
                 let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-                match try_resolve_fallback(
+                match try_resolve_same_owner_fallback(
                     cooldown,
-                    &llm_cfg.fallback_chain,
+                    &fallback_chain,
                     reason,
-                    |fb_name| async move {
-                        resolve_llm_model_for_turn(
-                            mx,
-                            enc,
-                            Some(fb_name.as_str()),
-                            pool_ref,
-                            lts,
-                            fwd,
-                        )
-                        .await
-                    },
+                    mx,
+                    enc,
+                    pool_ref,
+                    &credential_owner,
                 )
                 .await
                 {
@@ -5239,12 +5219,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         );
                     }
                     FallbackOutcome::AllExhausted { chain_len } => {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "rate-limit cooldown: all {} fallback models exhausted ({})",
-                            chain_len,
-                            reason.as_str()
-                        );
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::RateLimit,
+                            format!(
+                                "Rate limit cooldown requires a same-owner fallback, but all {chain_len} configured candidates are unavailable ({})",
+                                reason.as_str()
+                            ),
+                        ));
                     }
                 }
             }
@@ -5568,7 +5549,46 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     prompt_request_plan.clone(),
                 );
             }
-            state.step_recorder.begin_llm_round(&llm_cfg.model_name);
+            let durable_ledger = crate::turn::llm::durable::DurableInferenceLedger::from_optional(
+                self.shared_pool.as_ref(),
+                self.admitted_model_execution.as_ref(),
+                &self.user_id,
+            )?;
+            let durable_invocation = match durable_ledger {
+                Some(ledger) => {
+                    let run_id = state.current_run_id.clone().ok_or_else(|| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "durable inference admission failed: Server execution has no durable run identity",
+                        )
+                    })?;
+                    Some(
+                        ledger
+                            .admit(
+                                astra_turn_types::InferenceInvocationScope::Run {
+                                    session_id: self.session_id.clone(),
+                                    run_id,
+                                    turn: state.session_turn,
+                                    round: prompt_round,
+                                    operation_id: "agent_turn".to_string(),
+                                    logical_attempt: attempt_in_round,
+                                },
+                                state.inference_purpose,
+                                &llm_cfg.model_name,
+                                llm_cfg
+                                    .wire_model_name
+                                    .as_deref()
+                                    .unwrap_or(&llm_cfg.model_name),
+                                &llm_cfg.provider,
+                            )
+                            .await?,
+                    )
+                }
+                None => None,
+            };
+            state
+                .step_recorder
+                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
             let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
             let mut attempt_first_stream_update_ms: Option<u64> = None;
@@ -5687,23 +5707,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                 };
-                call_llm_and_collect_with_request_overrides_and_stream_callback(
-                    &llm_messages,
-                    &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.wire_model_name.as_deref(),
-                    &llm_cfg.api_key,
-                    &llm_cfg.base_url,
-                    &llm_cfg.provider,
-                    Some(effective_max_output),
-                    has_fallback,
+                call_llm_and_collect_with_stream_callback(
+                    LlmCall {
+                        purpose: state.inference_purpose,
+                        messages: &llm_messages,
+                        tools: &final_tools,
+                        route: LlmExecutionRoute {
+                            model_name: &llm_cfg.model_name,
+                            wire_model_name: llm_cfg.wire_model_name.as_deref(),
+                            api_key: &llm_cfg.api_key,
+                            base_url: &llm_cfg.base_url,
+                            provider: &llm_cfg.provider,
+                            header_overrides: (!llm_cfg.header_overrides.is_empty())
+                                .then_some(&llm_cfg.header_overrides),
+                            request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
+                            completions_url_override: llm_cfg.completions_url_override.as_deref(),
+                            request_timeout: llm_cfg.request_timeout,
+                        },
+                        max_output_tokens: Some(effective_max_output),
+                        temperature: None,
+                        has_fallback,
+                        thinking: &state.thinking,
+                    },
                     llm_cancel,
-                    (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
-                    llm_cfg.request_body_overrides.as_ref(),
-                    llm_cfg.completions_url_override.as_deref(),
-                    llm_cfg.request_timeout,
-                    &state.thinking,
                     Some(&mut on_stream_update),
+                    durable_invocation
+                        .as_ref()
+                        .map(|invocation| invocation.attempt_observer()),
                 )
                 .await
             };
@@ -5712,7 +5742,58 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // Fatal handler can trigger auto-compaction + retry.
             let r = match r {
                 Ok(r) => r,
+                Err(e)
+                    if let Some(reason) =
+                        crate::turn::bridge::llm_stream::fallback_required_reason(&e) =>
+                {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(&e),
+                        admission_estimated_tokens as u64,
+                    );
+                    record_full_llm_response_event(
+                        state,
+                        self.full_llm_capture,
+                        &self.session_id,
+                        "server_loop_host",
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        attempt_in_round,
+                        "fallback_required",
+                        llm_capture_error_response(&e),
+                    );
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(&e).await?;
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "admitted Offering attempted to cross its credential-owner boundary",
+                        ));
+                    }
+                    match try_resolve_same_owner_fallback(
+                        rate_limit_cooldown(),
+                        &fallback_chain,
+                        reason,
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        self.shared_pool.as_ref().map(SharedPool::get),
+                        &credential_owner,
+                    )
+                    .await
+                    {
+                        FallbackOutcome::Resolved(fallback) => {
+                            llm_cfg = fallback;
+                            attempt_in_round = attempt_in_round.saturating_add(1);
+                            continue;
+                        }
+                        FallbackOutcome::NoFallbackConfigured
+                        | FallbackOutcome::AllExhausted { .. } => return Err(e),
+                    }
+                }
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(e).await?;
+                    }
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -5800,6 +5881,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(&e).await?;
+                    }
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -5874,12 +5958,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
+                if let Some(invocation) = durable_invocation.as_ref() {
+                    invocation.finish_result(&r).await?;
+                }
                 crate::llm_provider_admission::record_llm_provider_admission_calibration(
                     admission_estimated_tokens as u64,
                     &r.usage,
                 );
                 state.step_recorder.end_llm_round(
                     &llm_cfg.model_name,
+                    state.inference_purpose,
                     u.input_tokens,
                     u.output_tokens,
                     u.cached_input_tokens,
@@ -6122,8 +6210,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return;
         }
-        let Some(params) = self.resolved_llm_params.clone() else {
-            return;
+        let config = match self.resolve_llm_config_for_state(state).await {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::pre_turn_compaction",
+                    %error,
+                    "pre-turn LLM compaction skipped because Offering revalidation failed"
+                );
+                return;
+            }
         };
 
         let user_content = state
@@ -6142,8 +6238,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let system_messages = match self.run_turn_pipeline(
             state,
             &visible_tools,
-            &params.provider,
-            &params.model_name,
+            &config.provider,
+            &config.model_name,
             &user_content,
         ) {
             Ok(outcome) => outcome.system_messages,
@@ -6156,15 +6252,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return;
             }
         };
-        // Use the trait's summary_client() so gateway overrides and forwarded
-        // auth headers are respected, rather than constructing a plain client inline.
-        let Some(client) = self.summary_client() else {
+        let Some(client) = self.durable_summary_client(&config, 4096, state, "pre_turn_compaction")
+        else {
             return;
         };
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages,
-            client.as_ref(),
+            &client,
         )
         .await
         {
@@ -6220,23 +6315,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ),
             );
         }
-    }
-
-    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
-        // LLM config is resolved per-turn inside execute_turn. Prefer the full
-        // config because gateway completion overrides and forwarded auth
-        // headers are part of the runtime contract for all auxiliary LLM calls.
-        if let Some(config) = self.resolved_llm_config.as_ref() {
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                config, 4096,
-            )));
-        }
-
-        // Older tests can still seed the minimal params directly.
-        let params = self.resolved_llm_params.as_ref()?;
-        Some(Box::new(
-            astra_turn_core::cloud_summary::HttpSummaryClient::new(params.clone()),
-        ))
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -6958,6 +7036,37 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn test_gateway_execution(
+        url: impl Into<String>,
+        timeout_ms: Option<u64>,
+    ) -> AdmittedModelExecution {
+        AdmittedModelExecution::from_endpoint(
+            "offer-gateway".to_string(),
+            "gpt-5-mini".to_string(),
+            "openai".to_string(),
+            url.into(),
+            "Bearer forwarded-token".to_string(),
+            timeout_ms,
+        )
+    }
+
+    fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
+        ResolvedTurnLlmConfig {
+            model_name: "gpt-4o-mini".to_string(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url,
+            provider: "openai".to_string(),
+            cache_capability: None,
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+            context_window: None,
+        }
     }
 
     #[derive(Default)]
@@ -9103,6 +9212,7 @@ mod tests {
     #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
+            response_id: None,
             full_text: "Hello world".to_string(),
             reasoning: "thinking...".to_string(),
             reasoning_signature: String::new(),
@@ -10458,6 +10568,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
@@ -10555,7 +10666,6 @@ mod tests {
             session_facts: Default::default(),
             memory_extraction_service: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -11606,29 +11716,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_token_service_uses_gateway_url_and_forwarded_headers() {
-        let mut forward_headers = HashMap::new();
-        forward_headers.insert("authorization".to_string(), "Bearer moi-token".to_string());
-        forward_headers.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
+    async fn admitted_model_execution_uses_its_normalized_url_and_headers() {
+        let mut execution =
+            test_gateway_execution("http://catalog:8081/api/v1/chat/completions", Some(2000));
+        execution
+            .header_overrides
+            .insert("authorization".to_string(), "Bearer moi-token".to_string());
+        execution
+            .header_overrides
+            .insert("x-workspace-id".to_string(), "ws-001".to_string());
 
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             Some("gpt-5-mini"),
             None,
-            Some(&LlmTokenServiceConfig {
-                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-                timeout_ms: Some(2000),
-            }),
-            &forward_headers,
+            Some(&execution),
         )
         .await
-        .expect("resolve via llm token service gateway");
+        .expect("resolve admitted execution");
 
         assert_eq!(resolved.model_name, "gpt-5-mini");
         assert_eq!(resolved.provider, "openai");
-        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert!(resolved.base_url.is_empty());
         assert_eq!(
             resolved.completions_url_override.as_deref(),
             Some("http://catalog:8081/api/v1/chat/completions")
@@ -11651,31 +11761,249 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_token_service_without_model_uses_default_model_name() {
+    async fn admitted_model_execution_supplies_model_when_no_override_is_requested() {
+        let execution = test_gateway_execution("http://catalog:8081/api/v1/chat/completions", None);
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             None,
             None,
-            Some(&LlmTokenServiceConfig {
-                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-                timeout_ms: None,
-            }),
-            &HashMap::new(),
+            Some(&execution),
         )
         .await
-        .expect("resolve via llm token service gateway");
-        assert_eq!(resolved.model_name, "gpt-4o-mini");
+        .expect("resolve admitted execution");
+        assert_eq!(resolved.model_name, "gpt-5-mini");
         assert!(resolved.request_timeout.is_none());
     }
 
+    fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
+        astra_services::ResolvedModelOffering {
+            offering_id: "offer-primary".to_string(),
+            model: astra_services::ResolvedActiveLlmModel {
+                model_name: "catalog-model".to_string(),
+                wire_model_name: Some("upstream-model".to_string()),
+                api_key: "provider-secret".to_string(),
+                base_url: "https://provider.example/v1".to_string(),
+                provider: "openai".to_string(),
+                fallback_chain: vec!["legacy-model-name".to_string()],
+                tags: Vec::new(),
+                request_body_overrides: None,
+                prompt_cache_capability: None,
+                thinking_capability: None,
+                context_window: Some(64_000),
+                request_headers: Some(serde_json::Map::from_iter([(
+                    "x-provider-mode".to_string(),
+                    Value::String("coding".to_string()),
+                )])),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn host_model_resolution_reuses_cached_config_for_same_forward_headers() {
-        let mut state = create_test_state();
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer first".to_string());
+    async fn admitted_offering_material_drives_turn_without_model_name_resolution() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let resolved = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            Some("catalog-model"),
+            None,
+            Some(&execution),
+        )
+        .await
+        .expect("admitted material should not require a database lookup");
+
+        assert_eq!(resolved.model_name, "catalog-model");
+        assert_eq!(resolved.wire_model_name.as_deref(), Some("upstream-model"));
+        assert_eq!(resolved.api_key, "provider-secret");
+        assert_eq!(resolved.context_window, Some(64_000));
+        assert_eq!(
+            resolved
+                .header_overrides
+                .get("x-provider-mode")
+                .map(String::as_str),
+            Some("coding")
+        );
+        assert!(
+            resolved.fallback_chain.is_empty(),
+            "legacy model-name fallback must not bypass Offering admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_route_cannot_change_credential_owner_material() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let primary = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            None,
+            None,
+            Some(&execution),
+        )
+        .await
+        .expect("resolve credential owner");
+        let mut same_owner = primary.clone();
+        same_owner.model_name = "alternate-model".to_string();
+        same_owner.wire_model_name = Some("alternate-upstream".to_string());
+        assert!(primary.shares_credential_owner_with(&same_owner));
+
+        for candidate in [
+            ResolvedTurnLlmConfig {
+                api_key: "different-secret".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                provider: "anthropic".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                base_url: "https://other-provider.example/v1".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                completions_url_override: Some(
+                    "https://other-gateway.example/v1/chat/completions".to_string(),
+                ),
+                ..same_owner.clone()
+            },
+        ] {
+            assert!(
+                !primary.shares_credential_owner_with(&candidate),
+                "fallback must never change the provider credential owner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial]
+    async fn catalog_execution_refreshes_route_material_before_each_provider_request() {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        let settings = MatrixOneSettings::from_env();
+        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        astra_services::ensure_core_schema(&settings, &catalog)
+            .await
+            .expect("ensure canonical core schema");
+        let shared_pool = SharedPool::new(&settings)
+            .await
+            .expect("connect to MatrixOne");
+        let pool = shared_pool.get();
+        let encryptor = Arc::new(
+            FernetTokenEncryptor::new("runtime-offering-refresh-test").expect("test encryptor"),
+        );
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let offering_id = format!("refresh-{suffix}");
+        let model_name = format!("refresh-model-{suffix}");
+        let initial_secret = encryptor.encrypt("initial-secret").expect("encrypt key");
+        sqlx::query(
+            "INSERT INTO infra_llm_models
+             (model_id, model_name, provider, api_key_encrypted, base_url, is_active,
+              context_window, input_modalities, output_modalities, supported_parameters,
+              pricing, tags, quirks)
+             VALUES (?, ?, 'openai', ?, 'https://provider-a.example/v1', 1, 128000,
+                     ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(initial_secret)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .expect("seed catalog Offering");
+
+        let offering = astra_services::resolve_active_llm_offering(
+            &settings,
+            encryptor.as_ref(),
+            &offering_id,
+            Some(pool),
+        )
+        .await
+        .expect("initial Offering admission");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            settings.clone(),
+            encryptor.clone(),
+            format!("user-{suffix}"),
+            format!("session-{suffix}"),
+        )
+        .with_model(Some(model_name))
+        .with_pool(shared_pool.clone())
+        .with_admitted_model_execution(Some(
+            AdmittedModelExecution::from_offering(offering).expect("admitted Offering"),
+        ))
+        .build();
+        let state = create_test_state();
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first request material");
+        assert_eq!(first.api_key, "initial-secret");
+
+        let rotated_secret = encryptor.encrypt("rotated-secret").expect("encrypt key");
+        sqlx::query(
+            "UPDATE infra_llm_models
+             SET api_key_encrypted = ?, base_url = 'https://provider-b.example/v1'
+             WHERE model_id = ?",
+        )
+        .bind(rotated_secret)
+        .bind(&offering_id)
+        .execute(pool)
+        .await
+        .expect("rotate catalog Offering");
+
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second request material");
+        assert_eq!(second.api_key, "rotated-secret");
+        assert_eq!(second.base_url, "https://provider-b.example/v1");
+
+        sqlx::query("UPDATE infra_llm_models SET is_active = 0 WHERE model_id = ?")
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("disable catalog Offering");
+        host.resolve_llm_config_for_state(&state)
+            .await
+            .expect_err("revoked Offering must block the next provider request");
+
+        sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("clean catalog Offering");
+        astra_services::models::invalidate_active_llm_model_resolution_cache();
+    }
+
+    #[tokio::test]
+    async fn admitted_offering_rejects_unresolved_model_override() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let result = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            Some("other-model"),
+            None,
+            Some(&execution),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_reuses_cached_admitted_execution() {
+        let state = create_test_state();
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -11683,20 +12011,20 @@ mod tests {
             "session-model-cache".to_string(),
         )
         .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            "http://catalog-a/api/v1/chat/completions".to_string(),
+            Some(1000),
+        )))
         .build();
 
         let first = host
             .resolve_llm_config_for_state(&state)
             .await
             .expect("first resolution");
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
+        host.admitted_model_execution = Some(test_gateway_execution(
+            "http://catalog-b/api/v1/chat/completions".to_string(),
+            Some(2000),
+        ));
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -11716,62 +12044,7 @@ mod tests {
                 .header_overrides
                 .get("authorization")
                 .map(String::as_str),
-            Some("Bearer first")
-        );
-    }
-
-    #[tokio::test]
-    async fn host_model_resolution_invalidates_cached_token_config_when_headers_change() {
-        let mut state = create_test_state();
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer first".to_string());
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-model-cache".to_string(),
-            "session-model-cache".to_string(),
-        )
-        .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
-        .build();
-
-        let first = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("first resolution");
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer second".to_string());
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
-        let second = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("second resolution");
-
-        assert_ne!(
-            second.completions_url_override,
-            first.completions_url_override
-        );
-        assert_eq!(
-            second.completions_url_override,
-            Some("http://catalog-b/api/v1/chat/completions".to_string())
-        );
-        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
-        assert_eq!(
-            second
-                .header_overrides
-                .get("authorization")
-                .map(String::as_str),
-            Some("Bearer second")
+            Some("Bearer forwarded-token")
         );
     }
 
@@ -11785,10 +12058,10 @@ mod tests {
             "session-model-cache".to_string(),
         )
         .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            "http://catalog-a/api/v1/chat/completions".to_string(),
+            Some(1000),
+        )))
         .build();
 
         let first = host
@@ -11797,10 +12070,10 @@ mod tests {
             .expect("first resolution");
         host.resolved_llm_config_at =
             Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
+        host.admitted_model_execution = Some(test_gateway_execution(
+            "http://catalog-b/api/v1/chat/completions".to_string(),
+            Some(2000),
+        ));
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -11998,10 +12271,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -12105,10 +12375,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![
@@ -12214,10 +12481,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -12294,10 +12558,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -12435,10 +12696,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -12533,10 +12791,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -12673,24 +12928,29 @@ mod tests {
         let mut forwarded = HashMap::new();
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        let client = RequestAwareSummaryClient {
-            model_name: "gpt-4o-mini".to_string(),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-            header_overrides: forwarded,
-            request_body_overrides: None,
-            completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
-            request_timeout: Some(Duration::from_secs(2)),
-        };
+        let client = RuntimeSummaryClient::new_direct_for_test(
+            OwnedLlmExecutionRoute {
+                model_name: "gpt-4o-mini".to_string(),
+                wire_model_name: None,
+                api_key: String::new(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                provider: "openai".to_string(),
+                header_overrides: forwarded,
+                request_body_overrides: None,
+                completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
+                request_timeout: Some(Duration::from_secs(2)),
+            },
+            128,
+        );
 
         let response = client
-            .summarize(&[
-                json!({"role": "system", "content": "summarize"}),
-                json!({"role": "user", "content": "payload"}),
-            ])
+            .summarize(
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+                &[
+                    json!({"role": "system", "content": "summarize"}),
+                    json!({"role": "user", "content": "payload"}),
+                ],
+            )
             .await
             .expect("summary should succeed");
         assert_eq!(response.text, "gateway summary");
@@ -12711,40 +12971,31 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
-        use axum::{Router, extract::State, routing::post};
+    async fn maybe_pre_turn_compact_requires_a_durable_inference_ledger() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use tokio::net::TcpListener;
 
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
-        #[derive(Default)]
-        struct RequestCapture {
-            body: tokio::sync::Mutex<Option<Value>>,
-        }
-
-        async fn handler(
-            State(capture): State<Arc<RequestCapture>>,
-            request: axum::extract::Request,
-        ) -> axum::Json<Value> {
-            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                .await
-                .expect("read request body");
-            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
-            axum::Json(json!({
-                "choices": [
-                    {
-                        "message": { "content": "inline summary" },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }))
-        }
-
-        let capture = Arc::new(RequestCapture::default());
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(capture.clone());
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": { "content": "inline summary" },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -12764,13 +13015,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
+        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
@@ -12794,55 +13039,13 @@ mod tests {
         .await;
         assert_eq!(
             state.compact_tier_applied,
-            CompactionTier::CompactHistory,
-            "pre-turn compact should bump tier to CompactHistory",
-        );
-
-        let body = capture
-            .body
-            .lock()
-            .await
-            .clone()
-            .expect("summary request should be captured");
-        let messages = body["messages"]
-            .as_array()
-            .expect("openai request should contain messages");
-
-        assert!(
-            messages.len() > state.messages.len() / 2,
-            "inline summary request should include system prompt plus much of the original history"
+            CompactionTier::Normal,
+            "auxiliary inference must not bypass its durable admission ledger",
         );
         assert_eq!(
-            messages
-                .first()
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str),
-            Some("system"),
-            "inline summary request should begin with main-turn system messages"
-        );
-        assert!(
-            messages.iter().any(|m| {
-                m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("question 0"))
-            }),
-            "expected original conversation history in inline summary request"
-        );
-        assert_eq!(
-            messages
-                .last()
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str),
-            Some(astra_turn_core::cloud_summary::INLINE_COMPACT_INSTRUCTION),
-            "expected trailing inline compact instruction"
-        );
-        assert!(
-            !messages.iter().any(|m| {
-                m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("You are a conversation summarizer"))
-            }),
-            "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "provider I/O must not begin without durable admission material",
         );
 
         server.abort();
@@ -12896,13 +13099,7 @@ mod tests {
             "session-inline".to_string(),
         )
         .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
+        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
@@ -14247,7 +14444,7 @@ mod tests {
         use astra_config::user_profile::{Scenario, TurnIntent};
         use astra_services::runs::TurnIntentExecutionPolicy;
         use astra_services::{
-            LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+            AdmittedModelExecution, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
             TurnIntentJudgeError,
         };
@@ -14567,56 +14764,31 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
-            use axum::{Router, extract::State, routing::post};
+        async fn builtin_turn_intent_judge_requires_a_durable_inference_ledger() {
+            use axum::{Router, routing::post};
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
             use tokio::net::TcpListener;
 
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
-            #[derive(Default)]
-            struct RequestCapture {
-                authorization: tokio::sync::Mutex<Option<String>>,
-                workspace_id: tokio::sync::Mutex<Option<String>>,
-                body: tokio::sync::Mutex<Option<Value>>,
-            }
-
-            async fn handler(
-                State(capture): State<Arc<RequestCapture>>,
-                headers: axum::http::HeaderMap,
-                request: axum::extract::Request,
-            ) -> axum::Json<Value> {
-                *capture.authorization.lock().await = headers
-                    .get("authorization")
-                    .and_then(|value| value.to_str().ok())
-                    .map(String::from);
-                *capture.workspace_id.lock().await = headers
-                    .get("x-workspace-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(String::from);
-
-                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("read request body");
-                *capture.body.lock().await =
-                    Some(serde_json::from_slice(&bytes).expect("json body"));
-
-                axum::Json(json!({
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                }))
-            }
-
-            let capture = Arc::new(RequestCapture::default());
-            let app = Router::new()
-                .route("/gateway/chat/completions", post(handler))
-                .with_state(capture.clone());
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_handler = request_count.clone();
+            let app = Router::new().route(
+                "/gateway/chat/completions",
+                post(move || {
+                    let request_count = request_count_for_handler.clone();
+                    async move {
+                        request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {"content": "{}"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            );
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind listener");
@@ -14633,70 +14805,24 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
-            .with_llm_token_service(Some(LlmTokenServiceConfig {
-                url: format!("http://{addr}/gateway/chat/completions"),
-                timeout_ms: Some(2_000),
-            }))
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("http://{addr}/gateway/chat/completions"),
+                Some(2_000),
+            )))
             .build();
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "不对，我要的是系统性修复，不是临时补丁".to_string();
             state.user_intent = state.message.clone();
-            state.messages = vec![
-                serde_json::json!({"role": "user", "content": "earlier"}),
-                serde_json::json!({"role": "assistant", "content": "ok"}),
-            ];
-            state.hooks.forward_headers.insert(
-                "authorization".to_string(),
-                "Bearer forwarded-token".to_string(),
-            );
-            state
-                .hooks
-                .forward_headers
-                .insert("x-workspace-id".to_string(), "ws-judge".to_string());
-
-            let crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(intent) =
-                host.judge_turn_intent(&state).await
-            else {
-                panic!("gateway judge should return intent");
-            };
-
-            assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
-            assert_eq!(intent.objective_relation, ObjectiveRelation::Correct);
-            assert!(intent.reanchors_current_objective());
             assert_eq!(
-                intent.workspace_mutation,
-                astra_config::user_profile::WorkspaceMutationIntent::MustMutate
-            );
-            assert!(!intent.browser_verification_required);
-            assert_eq!(
-                capture.authorization.lock().await.as_deref(),
-                Some("Bearer forwarded-token")
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable,
+                "built-in intent inference must not bypass its durable ledger"
             );
             assert_eq!(
-                capture.workspace_id.lock().await.as_deref(),
-                Some("ws-judge")
-            );
-
-            let body = capture.body.lock().await.clone().expect("judge request");
-            let messages = body["messages"].as_array().expect("messages");
-            assert_eq!(messages.len(), 2);
-            let prompt = messages[1]["content"].as_str().expect("user prompt");
-            assert!(
-                prompt.contains("objective_relation"),
-                "judge prompt must request the structured objective relation"
-            );
-            assert!(
-                prompt.contains("workspace_mutation"),
-                "judge prompt must request the structured workspace mutation field"
-            );
-            assert!(
-                prompt.contains("browser_verification_required"),
-                "judge prompt must request the structured browser verification field"
-            );
-            assert!(
-                prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
-                "judge prompt must include the current user message as data"
+                request_count.load(AtomicOrdering::SeqCst),
+                0,
+                "provider I/O must not begin without durable admission material"
             );
 
             server.abort();
@@ -14749,10 +14875,10 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
-            .with_llm_token_service(Some(LlmTokenServiceConfig {
-                url: format!("http://{addr}/gateway/chat/completions"),
-                timeout_ms: Some(2_000),
-            }))
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("http://{addr}/gateway/chat/completions"),
+                Some(2_000),
+            )))
             .build();
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();

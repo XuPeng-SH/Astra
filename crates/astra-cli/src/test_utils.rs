@@ -7,6 +7,67 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+pub(crate) fn mock_model_catalog_json(names: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "offering_id": format!("offer-{name}"),
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": name,
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 200_000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
+    let offerings = mock_model_catalog_json(names);
+    let default_offering_id = offerings
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("offering_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "accesses": [{
+            "id": "self-hosted",
+            "kind": "self_hosted",
+            "label": "Self-hosted",
+            "execution_placement": "server",
+            "status": if names.is_empty() { "action_required" } else { "ready" },
+            "reason": if names.is_empty() {
+                serde_json::Value::String("no_eligible_offerings".to_string())
+            } else {
+                serde_json::Value::Null
+            },
+            "usable": !names.is_empty(),
+            "retry_after_seconds": null,
+            "available_model_count": names.len(),
+            "actions": if names.is_empty() {
+                serde_json::json!(["contact_administrator"])
+            } else {
+                serde_json::json!([])
+            }
+        }],
+        "offerings": offerings,
+        "default_offering_id": default_offering_id,
+        "catalog_revision": "sha256:test-catalog",
+        "observed_at": "2026-07-20T00:00:00Z"
+    })
+}
+
 // ── Safe env helpers ───────────────────────────────────────────────────
 //
 // Centralised wrappers for `std::env::set_var` and `std::env::remove_var`.

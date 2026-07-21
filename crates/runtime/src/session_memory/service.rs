@@ -13,9 +13,9 @@
 //!
 //! Ownership model:
 //!
-//! * [`SelectorParamsResolver`] + [`Arc<dyn MemoriaPort>`] are the
+//! * [`MemoryInferenceResolver`] + [`Arc<dyn MemoriaPort>`] are the
 //!   only production dependencies. Both are injected at construction.
-//!   Tests swap in [`ConstSelectorResolver`] and a minimal capturing
+//!   Tests swap in [`ConstMemoryInferenceResolver`] and a minimal capturing
 //!   mock client.
 //! * [`SelectorHealth`] and the in-flight session set live as per-
 //!   service fields — no process globals. Multi-tenant servers or
@@ -39,7 +39,7 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
 use astra_turn_types::is_runtime_owned_message;
 
-use crate::memory_hooks::relevance::LlmConnParams;
+use crate::memory_hooks::MemoryInferenceClient;
 use crate::turn::cloud::memoria_compact::MemoriaPort;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
@@ -68,28 +68,24 @@ pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
 pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 2048;
 
 // ───────────────────────────────────────────────────────────────────────
-// Selector-params resolution (async trait so tests can swap in a const)
+// Memory-inference resolution (async trait so tests can swap in a const)
 // ───────────────────────────────────────────────────────────────────────
 
-/// Resolve the cheap selector-tagged LLM params used by the extractor.
+/// Resolve the cheap selector-tagged inference clients used by the extractor.
 /// Called once per extraction attempt.
 #[async_trait]
-pub trait SelectorParamsResolver: Send + Sync + std::fmt::Debug {
-    async fn resolve(&self) -> Option<LlmConnParams>;
-
-    async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
-        self.resolve().await.into_iter().collect()
-    }
+pub trait MemoryInferenceResolver: Send + Sync + std::fmt::Debug {
+    async fn resolve_candidates(&self, user_id: &str) -> Vec<MemoryInferenceClient>;
 }
 
-/// Always returns the same params. Unit tests.
+/// Always returns the same client. Unit tests.
 #[derive(Debug)]
-pub struct ConstSelectorResolver(pub Option<LlmConnParams>);
+pub struct ConstMemoryInferenceResolver(pub Option<MemoryInferenceClient>);
 
 #[async_trait]
-impl SelectorParamsResolver for ConstSelectorResolver {
-    async fn resolve(&self) -> Option<LlmConnParams> {
-        self.0.clone()
+impl MemoryInferenceResolver for ConstMemoryInferenceResolver {
+    async fn resolve_candidates(&self, _user_id: &str) -> Vec<MemoryInferenceClient> {
+        self.0.iter().cloned().collect()
     }
 }
 
@@ -101,7 +97,7 @@ impl SelectorParamsResolver for ConstSelectorResolver {
 /// server/CLI boot, hold an [`Arc`] on
 /// [`crate::turn::agentic_loop::host::AgenticLoopState`].
 pub struct MemoryExtractionService {
-    selector_resolver: Arc<dyn SelectorParamsResolver>,
+    inference_resolver: Arc<dyn MemoryInferenceResolver>,
     memoria_client: Arc<dyn MemoriaPort>,
     ingestion: IngestionSender,
     /// Authenticated owner for an executable service. The process-wide
@@ -159,14 +155,14 @@ impl MemoryExtractionService {
     /// simply skip constructing the service and leave
     /// `AgenticLoopState::memory_extraction_service = None`.
     pub fn new(
-        selector_resolver: Arc<dyn SelectorParamsResolver>,
+        inference_resolver: Arc<dyn MemoryInferenceResolver>,
         memoria_client: Arc<dyn MemoriaPort>,
         ingestion: IngestionSender,
         user_id: impl Into<Arc<str>>,
         broker: Arc<BackgroundActivityBroker>,
     ) -> Self {
         Self::new_with_owner(
-            selector_resolver,
+            inference_resolver,
             memoria_client,
             ingestion,
             Some(user_id.into()),
@@ -177,23 +173,23 @@ impl MemoryExtractionService {
     /// Build an owner-neutral process template. It cannot execute extraction
     /// itself; callers must bind it to an authenticated owner first.
     pub(crate) fn new_owner_scoped_template(
-        selector_resolver: Arc<dyn SelectorParamsResolver>,
+        inference_resolver: Arc<dyn MemoryInferenceResolver>,
         memoria_client: Arc<dyn MemoriaPort>,
         ingestion: IngestionSender,
         broker: Arc<BackgroundActivityBroker>,
     ) -> Self {
-        Self::new_with_owner(selector_resolver, memoria_client, ingestion, None, broker)
+        Self::new_with_owner(inference_resolver, memoria_client, ingestion, None, broker)
     }
 
     fn new_with_owner(
-        selector_resolver: Arc<dyn SelectorParamsResolver>,
+        inference_resolver: Arc<dyn MemoryInferenceResolver>,
         memoria_client: Arc<dyn MemoriaPort>,
         ingestion: IngestionSender,
         user_id: Option<Arc<str>>,
         broker: Arc<BackgroundActivityBroker>,
     ) -> Self {
         Self {
-            selector_resolver,
+            inference_resolver,
             memoria_client,
             ingestion,
             user_id,
@@ -258,7 +254,7 @@ impl MemoryExtractionService {
         }
 
         let service = Arc::new(Self {
-            selector_resolver: Arc::clone(&self.selector_resolver),
+            inference_resolver: Arc::clone(&self.inference_resolver),
             memoria_client: self.memoria_client.bind_owner(&scope.user_id)?,
             ingestion: self.ingestion.clone(),
             user_id: Some(Arc::from(scope.user_id.as_str())),
@@ -423,9 +419,17 @@ impl MemoryExtractionService {
     ///
     /// **Must run inside a Tokio runtime.**
     pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
+        let Some((session_id, turn)) = req.session_coordinates() else {
+            tracing::error!(
+                scope_kind = req.inference_scope.kind(),
+                "refusing session-memory extraction without session coordinates"
+            );
+            return SpawnDecision::Skipped;
+        };
+        let session_id = session_id.to_string();
         let Some(user_id) = self.user_id.as_deref() else {
             tracing::error!(
-                session_id = %req.session_id,
+                session_id = %session_id,
                 "refusing session-memory extraction from an owner-neutral service template"
             );
             return SpawnDecision::Skipped;
@@ -458,7 +462,7 @@ impl MemoryExtractionService {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
-            let state_ref = map.get(&req.session_id);
+            let state_ref = map.get(&session_id);
             let default_state;
             let state = match state_ref {
                 Some(s) => s,
@@ -467,7 +471,7 @@ impl MemoryExtractionService {
                     &default_state
                 }
             };
-            let dec = evaluate(state, &req.session_id, content_fingerprint);
+            let dec = evaluate(state, &session_id, content_fingerprint);
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip(reason)
@@ -481,15 +485,15 @@ impl MemoryExtractionService {
                             .work
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match work.active_fingerprints.get(&req.session_id).copied() {
+                        match work.active_fingerprints.get(&session_id).copied() {
                             None => {
                                 work.active_fingerprints
-                                    .insert(req.session_id.clone(), content_fingerprint);
+                                    .insert(session_id.clone(), content_fingerprint);
                                 Admission::Spawn
                             }
                             Some(active_fingerprint)
                                 if active_fingerprint == content_fingerprint
-                                    || work.queued_latest.get(&req.session_id).is_some_and(
+                                    || work.queued_latest.get(&session_id).is_some_and(
                                         |(_, queued_fingerprint)| {
                                             *queued_fingerprint == content_fingerprint
                                         },
@@ -498,10 +502,8 @@ impl MemoryExtractionService {
                                 Admission::Skip(SessionMemoryExtractionSkipReason::InFlight)
                             }
                             Some(_) => {
-                                work.queued_latest.insert(
-                                    req.session_id.clone(),
-                                    (req.clone(), content_fingerprint),
-                                );
+                                work.queued_latest
+                                    .insert(session_id.clone(), (req.clone(), content_fingerprint));
                                 Admission::Queue
                             }
                         }
@@ -514,12 +516,12 @@ impl MemoryExtractionService {
             Admission::Spawn => {}
             Admission::Queue => return SpawnDecision::Queued,
             Admission::Skip(reason) => {
-                let sid_opt = if req.session_id.is_empty() {
+                let sid_opt = if session_id.is_empty() {
                     None
                 } else {
-                    Some(req.session_id.as_str())
+                    Some(session_id.as_str())
                 };
-                self.emit_skip_event(user_id, sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.emit_skip_event(user_id, sid_opt, turn, reason, &skip_breadcrumbs);
                 return SpawnDecision::Skipped;
             }
         }
@@ -536,7 +538,6 @@ impl MemoryExtractionService {
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
         let pending_guard = PendingGuard::new(pending, pending_done);
-        let session_id = req.session_id.clone();
         let work_guard = SessionWorkGuard::new(Arc::clone(&self.work), session_id.clone());
         tokio::spawn(async move {
             let _pending_guard = pending_guard;
@@ -553,7 +554,14 @@ impl MemoryExtractionService {
     // ── internals ─────────────────────────────────────────────────────
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
-        let session_id = req.session_id.clone();
+        let Some((session_id, turn)) = req.session_coordinates() else {
+            tracing::error!(
+                scope_kind = req.inference_scope.kind(),
+                "refusing session-memory worker without session coordinates"
+            );
+            return;
+        };
+        let session_id = session_id.to_string();
         let Some(user_id) = self.user_id.as_deref().map(str::to_string) else {
             tracing::error!(
                 session_id = %session_id,
@@ -561,7 +569,6 @@ impl MemoryExtractionService {
             );
             return;
         };
-        let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
         // Process-local admission cannot see a worker that completed in a
@@ -595,13 +602,13 @@ impl MemoryExtractionService {
             return;
         }
         let current_memory = current.map(|loaded| loaded.content).unwrap_or_default();
-        let selector_candidates = self.selector_resolver.resolve_candidates().await;
+        let selector_candidates = self.inference_resolver.resolve_candidates(&user_id).await;
         let resolved_selector_model = selector_candidates
             .first()
-            .map(|candidate| candidate.model_name.clone());
-        let effective_selectors: Vec<LlmConnParams> = selector_candidates
+            .map(|candidate| candidate.model_name().to_string());
+        let effective_selectors: Vec<MemoryInferenceClient> = selector_candidates
             .into_iter()
-            .filter(|candidate| self.health.is_healthy(&candidate.model_name))
+            .filter(|candidate| self.health.is_healthy(candidate.model_name()))
             .collect();
         if resolved_selector_model.is_some() && effective_selectors.is_empty() {
             let cooldown_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
@@ -629,7 +636,7 @@ impl MemoryExtractionService {
 
         let artifacts = run_extraction(
             &self.memoria_client,
-            &session_id,
+            &req.inference_scope,
             &req.messages,
             turn as usize,
             &current_memory,
@@ -698,7 +705,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number);
+                self.mark_session_extracted(&session_id, content_fingerprint, turn);
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -774,7 +781,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number);
+                self.mark_session_extracted(&session_id, content_fingerprint, turn);
                 // LLM failed but rule-based content did land. Surface
                 // the error live, but record the journal outcome as a
                 // successful fallback write so postmortems stop reading
@@ -1137,11 +1144,25 @@ impl MemoryExtractionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_hooks::DirectMemoryInferenceClient;
     use crate::turn::cloud::memoria_compact::MemoriaMemory;
     use astra_services::event_ingestion::IngestionEvent;
     use serde_json::json;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn extraction_scope(
+        session_id: impl Into<String>,
+        turn: u32,
+    ) -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: session_id.into(),
+            turn,
+            round: 0,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        }
+    }
 
     /// Minimal capturing mock — records every `store` for assertion.
     #[derive(Default)]
@@ -1256,7 +1277,7 @@ mod tests {
         let bindings = Arc::clone(&port.bindings);
         let (tx, _rx) = IngestionSender::for_tests(16);
         let root = Arc::new(MemoryExtractionService::new_owner_scoped_template(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             port,
             tx,
             Arc::new(BackgroundActivityBroker::new()),
@@ -1284,7 +1305,7 @@ mod tests {
         let port = Arc::new(OwnerBindingMemoria::default());
         let (tx, _rx) = IngestionSender::for_tests(16);
         let root = Arc::new(MemoryExtractionService::new_owner_scoped_template(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             port,
             tx,
             Arc::new(BackgroundActivityBroker::new()),
@@ -1342,12 +1363,20 @@ mod tests {
         memoria: Arc<CapturingMemoria>,
     }
 
-    fn build_ctx(selector: Option<LlmConnParams>) -> TestCtx {
+    fn boxed_inference_client(
+        selector: Option<DirectMemoryInferenceClient>,
+    ) -> Option<MemoryInferenceClient> {
+        selector.map(|client| Arc::new(client) as MemoryInferenceClient)
+    }
+
+    fn build_ctx(selector: Option<DirectMemoryInferenceClient>) -> TestCtx {
         let (ingestion, rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let memoria = Arc::new(CapturingMemoria::default());
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(selector)),
+            Arc::new(ConstMemoryInferenceResolver(boxed_inference_client(
+                selector,
+            ))),
             Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "test-user",
@@ -1356,13 +1385,15 @@ mod tests {
         TestCtx { svc, rx, memoria }
     }
 
-    fn build_ctx_with_local_snapshot(selector: Option<LlmConnParams>) -> TestCtx {
+    fn build_ctx_with_local_snapshot(selector: Option<DirectMemoryInferenceClient>) -> TestCtx {
         let (ingestion, rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let memoria = Arc::new(CapturingMemoria::default());
         let svc = Arc::new(
             MemoryExtractionService::new(
-                Arc::new(ConstSelectorResolver(selector)),
+                Arc::new(ConstMemoryInferenceResolver(boxed_inference_client(
+                    selector,
+                ))),
                 Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
                 ingestion,
                 "test-user",
@@ -1375,7 +1406,7 @@ mod tests {
 
     fn sample_req(session_id: &str, _tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "Design a durable runtime history boundary that separates root conversation history from child agent artifacts and keeps prompt cache stable."}),
                 json!({"role": "assistant", "content": "I will inspect the restore path, session history tool, and event persistence boundary, then update the shared runtime code and regression tests."}),
@@ -1383,7 +1414,6 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
@@ -1392,7 +1422,7 @@ mod tests {
         let memoria = Arc::new(OwnerBindingMemoria::default());
         let (ingestion, _rx) = IngestionSender::for_tests(16);
         let template = Arc::new(MemoryExtractionService::new_owner_scoped_template(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             memoria,
             ingestion,
             Arc::new(BackgroundActivityBroker::new()),
@@ -1411,7 +1441,7 @@ mod tests {
 
     fn meaningful_shutdown_req(session_id: &str, _tokens: usize) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
                 json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
@@ -1419,13 +1449,12 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
     fn short_conversation_req(session_id: &str) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "1+1"}),
                 json!({"role": "assistant", "content": "2"}),
@@ -1433,7 +1462,6 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
@@ -1441,7 +1469,7 @@ mod tests {
     fn extraction_fingerprint_ignores_turn_counter() {
         let mut first = sample_req("fingerprint", 1_000, false);
         let mut second = first.clone();
-        second.turn_number = 42;
+        second.inference_scope = extraction_scope("fingerprint", 42);
 
         assert_eq!(
             extraction_input_fingerprint(&first),
@@ -1557,7 +1585,7 @@ mod tests {
         let broker = Arc::new(BackgroundActivityBroker::new());
         let memoria = Arc::new(CapturingMemoria::default());
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             memoria,
             ingestion,
             "service-owner",
@@ -1581,14 +1609,14 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (ingestion_a, _rx_a) = IngestionSender::for_tests(16);
         let service_a = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion_a,
             "test-user",
             Arc::new(BackgroundActivityBroker::new()),
         ));
         let mut first = sample_req("restart-idempotent", 1_000, false);
-        first.turn_number = 7;
+        first.inference_scope = extraction_scope("restart-idempotent", 7);
         assert_eq!(service_a.maybe_spawn(first.clone()), SpawnDecision::Spawned);
         assert_eq!(service_a.wait_for_pending(Duration::from_secs(2)).await, 0);
         assert_eq!(memoria.stored.lock().unwrap().len(), 1);
@@ -1597,7 +1625,7 @@ mod tests {
         // still observe the durable snapshot and avoid a second selector/store.
         let (ingestion_b, mut rx_b) = IngestionSender::for_tests(16);
         let service_b = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion_b,
             "test-user",
@@ -1717,7 +1745,7 @@ mod tests {
     async fn shutdown_flush_skips_an_unchanged_canonical_snapshot() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
-            session_id: format!("shutdown-trivial-{}", nanos()),
+            inference_scope: extraction_scope(format!("shutdown-trivial-{}", nanos()), 1),
             messages: vec![
                 json!({"role": "user", "content": "hi"}),
                 json!({"role": "assistant", "content": "hello"}),
@@ -1725,11 +1753,13 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         };
         let fingerprint = extraction_input_fingerprint(&req);
+        let (session_id, turn) = req
+            .session_coordinates()
+            .expect("test request has session coordinates");
         ctx.svc
-            .mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
+            .mark_session_extracted(session_id, fingerprint, turn);
         assert_eq!(
             ctx.svc.maybe_spawn_shutdown_flush(req),
             SpawnDecision::Skipped
@@ -1839,7 +1869,7 @@ mod tests {
         memoria.first_started.notified().await;
 
         let mut latest = first;
-        latest.turn_number = 2;
+        latest.inference_scope = extraction_scope(&sid, 2);
         latest
             .session_facts
             .active_files
@@ -1901,7 +1931,7 @@ mod tests {
         let (ingestion, _rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             Arc::new(PanickingMemoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "panic-cleanup-test",
@@ -1993,7 +2023,7 @@ mod tests {
     }
 
     fn build_ctx_with_memoria(
-        selector: Option<LlmConnParams>,
+        selector: Option<DirectMemoryInferenceClient>,
         memoria: Arc<dyn MemoriaPort>,
     ) -> (
         Arc<MemoryExtractionService>,
@@ -2003,7 +2033,9 @@ mod tests {
         let (ingestion, rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(selector)),
+            Arc::new(ConstMemoryInferenceResolver(boxed_inference_client(
+                selector,
+            ))),
             memoria,
             ingestion,
             "test-user",
@@ -2013,21 +2045,21 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct OrderedSelectorResolver(Vec<LlmConnParams>);
+    struct OrderedMemoryInferenceResolver(Vec<DirectMemoryInferenceClient>);
 
     #[async_trait]
-    impl SelectorParamsResolver for OrderedSelectorResolver {
-        async fn resolve(&self) -> Option<LlmConnParams> {
-            self.0.first().cloned()
-        }
-
-        async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
-            self.0.clone()
+    impl MemoryInferenceResolver for OrderedMemoryInferenceResolver {
+        async fn resolve_candidates(&self, _user_id: &str) -> Vec<MemoryInferenceClient> {
+            self.0
+                .iter()
+                .cloned()
+                .map(|client| Arc::new(client) as MemoryInferenceClient)
+                .collect()
         }
     }
 
     fn build_ctx_with_resolver(
-        resolver: Arc<dyn SelectorParamsResolver>,
+        resolver: Arc<dyn MemoryInferenceResolver>,
         memoria: Arc<dyn MemoriaPort>,
     ) -> (
         Arc<MemoryExtractionService>,
@@ -2123,14 +2155,16 @@ mod tests {
         // An unhealthy selector should no longer leave session memory
         // empty. We degrade to the deterministic rule-fallback path and
         // persist a session-memory snapshot instead of skipping the whole run.
-        let selector_params = LlmConnParams {
+        let selector_params = DirectMemoryInferenceClient {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector".to_string(),
             wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_memoria(
@@ -2201,23 +2235,28 @@ mod tests {
             }),
         )
         .await;
-        let first = LlmConnParams {
+        let first = DirectMemoryInferenceClient {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "selector-first".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
-        let second = LlmConnParams {
+        let second = DirectMemoryInferenceClient {
             base_url: format!("{failing_url}/v1"),
             model_name: "selector-second".to_string(),
             ..first.clone()
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_resolver(
-            Arc::new(OrderedSelectorResolver(vec![first.clone(), second.clone()])),
+            Arc::new(OrderedMemoryInferenceResolver(vec![
+                first.clone(),
+                second.clone(),
+            ])),
             Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
         );
         svc.health.mark_failed(&first.model_name);
@@ -2357,7 +2396,7 @@ mod tests {
         // Override: low threshold (2 failures) + short cooldown so the
         // test can exercise the Open → HalfOpen transition.
         let mut svc = MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "breaker-test",
@@ -2460,19 +2499,23 @@ mod tests {
         // driven by `record_failure` we call directly (no network in
         // the test).
         let memoria = Arc::new(CapturingMemoria::default());
-        let selector_params = LlmConnParams {
+        let selector_params = DirectMemoryInferenceClient {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector-leak".to_string(),
             wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let (ingestion, _rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let mut svc = MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(Some(selector_params.clone()))),
+            Arc::new(ConstMemoryInferenceResolver(boxed_inference_client(Some(
+                selector_params.clone(),
+            )))),
             Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "probe-leak-test",
@@ -2579,15 +2622,17 @@ mod tests {
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("bc-skip-{}", nanos());
         let req = ExtractionRequest {
-            session_id: sid,
+            inference_scope: extraction_scope(sid, 1),
             messages: vec![json!({"role": "user", "content": "x"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         };
         let fingerprint = extraction_input_fingerprint(&req);
-        svc.mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
+        let (session_id, turn) = req
+            .session_coordinates()
+            .expect("test request has session coordinates");
+        svc.mark_session_extracted(session_id, fingerprint, turn);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut rx);

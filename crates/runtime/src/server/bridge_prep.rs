@@ -1,5 +1,5 @@
 use super::*;
-use astra_services::runs::SelectedModelRequest;
+use astra_turn_types::ModelSelection;
 
 // ─── Typed request body ──────────────────────────────────────────────────────
 
@@ -27,7 +27,11 @@ pub(super) struct ChatTurnRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_rules: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    selected_model: Option<serde_json::Value>,
+    model_selection: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inference_purpose: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    round_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,18 +93,12 @@ impl ChatTurnRequestBody {
         self.session_id = Some(serde_json::Value::String(id.to_string()));
     }
 
-    fn selected_model_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
-        self.selected_model.as_ref()?.as_object()
+    fn model_selection_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.model_selection.as_ref()?.as_object()
     }
 
-    fn selected_model_name(&self) -> Option<&str> {
-        self.selected_model_obj()?.get("model")?.as_str()
-    }
-
-    fn selected_model_gateway(&self) -> Option<&str> {
-        self.selected_model_obj()?
-            .get("gateway")
-            .and_then(serde_json::Value::as_str)
+    fn offering_id(&self) -> Option<&str> {
+        self.model_selection_obj()?.get("offering_id")?.as_str()
     }
 
     fn execution_state_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -203,84 +201,92 @@ fn validate_session_id_shape(
     Ok(())
 }
 
-fn validate_exact_bridge_string(
-    field: &'static str,
-    value: &str,
-    code: &'static str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{field} must be a non-empty exact string without leading/trailing whitespace or control characters"
-            ),
-            code,
-        ));
-    }
-    Ok(())
-}
-
-fn validate_selected_model_shape(
+fn validate_model_selection_shape(
     request: &ChatTurnRequestBody,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if request.extra.contains_key("model") {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "legacy top-level model is not accepted on /chat/turn; use selected_model.model",
-            "selected_model_invalid",
+            "clients must select an Offering with model_selection.offering_id",
+            "model_selection_invalid",
         ));
     }
-    let Some(selected_model) = request.selected_model.as_ref() else {
+    let Some(model_selection) = request.model_selection.as_ref() else {
         tracing::warn!(
             target: "astra_runtime::server::chat_turn_bridge",
             reason = "missing_model_selection",
-            "selected_model.model is required before /chat/turn can create or bind a session"
+            "model_selection.offering_id is required before /chat/turn can create or bind a session"
         );
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
+            "model_selection.offering_id is required",
             "missing_model_selection",
         ));
     };
-    let Some(obj) = selected_model.as_object() else {
+    if model_selection.as_object().is_none() {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "selected_model must be an object",
-            "selected_model_invalid",
+            "model_selection must be an object",
+            "model_selection_invalid",
         ));
     };
-    // Delegate field whitelist to SelectedModelRequest's deny_unknown_fields.
-    if serde_json::from_value::<SelectedModelRequest>(selected_model.clone()).is_err() {
+    if serde_json::from_value::<ModelSelection>(model_selection.clone()).is_err() {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "selected_model must match {model: string, gateway?: string}",
-            "selected_model_invalid",
+            "model_selection must match {offering_id: string}",
+            "model_selection_invalid",
         ));
     }
-    let Some(model) = request.selected_model_name() else {
+    let Some(offering_id) = request.offering_id() else {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "selected_model.model is required",
-            "selected_model_invalid",
+            "model_selection.offering_id is required",
+            "model_selection_invalid",
         ));
     };
-    validate_exact_bridge_string("selected_model.model", model, "selected_model_invalid")?;
-    if obj.get("gateway").is_some_and(|value| !value.is_null()) {
-        let Some(gateway) = request.selected_model_gateway() else {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "selected_model.gateway must be a string when provided",
-                "selected_model_invalid",
-            ));
-        };
-        validate_exact_bridge_string("selected_model.gateway", gateway, "selected_model_invalid")?;
-    }
+    astra_services::validate_model_offering_id(offering_id).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model_selection.offering_id must be an exact non-empty identifier of at most 64 bytes",
+            "model_selection_invalid",
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_inference_purpose_shape(
+    request: &ChatTurnRequestBody,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = request.inference_purpose.as_ref() else {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "inference_purpose is required",
+            "missing_inference_purpose",
+        ));
+    };
+    serde_json::from_value::<astra_turn_types::InferencePurpose>(value.clone()).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "inference_purpose must be a supported inference purpose",
+            "inference_purpose_invalid",
+        )
+    })?;
     Ok(())
 }
 
 fn validate_bridge_payload_fields(
     payload: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(field) = astra_turn_types::client_direct_execution_field(payload) {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "client field `{field}` cannot select an execution endpoint, credential, or placement"
+            ),
+            "client_execution_override_forbidden",
+        ));
+    }
+
     match payload.get("messages") {
         Some(serde_json::Value::Array(_)) => {}
         Some(_) => {
@@ -375,10 +381,15 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_bridge_payload_fields(payload_object)?;
-    let Ok(mut request) = serde_json::from_value::<ChatTurnRequestBody>(payload) else {
-        return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
-    };
-    validate_selected_model_shape(&request)?;
+    let mut request = serde_json::from_value::<ChatTurnRequestBody>(payload).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "chat turn request contains a field with an invalid type",
+            "chat_turn_request_invalid",
+        )
+    })?;
+    validate_model_selection_shape(&request)?;
+    validate_inference_purpose_shape(&request)?;
     validate_session_id_shape(&request)?;
     let explicit_turn_identity = validate_explicit_turn_identity(&request)?;
 
@@ -477,8 +488,8 @@ pub(super) async fn prepare_chat_turn_bridge_body(
 
     // ── Metadata extraction ─────────────────────────────────────────────
     let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
-    let routing_meta_b64 = request.selected_model_name().map(|_| {
-        let meta = serde_json::Value::Object(build_skipped_routing_metadata("selected_model"));
+    let routing_meta_b64 = request.offering_id().map(|_| {
+        let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_selection"));
         URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
     });
     let force_intent = inferred_force_intent_for_bridge_user_query(&user_query);
@@ -892,8 +903,8 @@ mod tests {
         json!({ "type": "function", "function": { "name": name } })
     }
 
-    fn selected_model() -> serde_json::Value {
-        json!({"model": "deepseek-v4-pro-official"})
+    fn model_selection() -> serde_json::Value {
+        json!({"offering_id": "offer-deepseek-v4-pro"})
     }
 
     #[derive(Clone)]
@@ -1172,7 +1183,9 @@ mod tests {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
+                "round_index": 4,
                 "messages": [{"role": "user", "content": "hello"}]
             }))
             .expect("body should serialize"),
@@ -1194,14 +1207,47 @@ mod tests {
             serde_json::from_slice(&prepared.body).expect("prepared body should be valid json");
         assert_eq!(payload["session_id"], "bound-session");
         assert_eq!(
-            payload["selected_model"]["model"],
-            "deepseek-v4-pro-official"
+            payload["model_selection"]["offering_id"],
+            "offer-deepseek-v4-pro"
         );
+        assert_eq!(payload["inference_purpose"], "primary_agent");
+        assert_eq!(payload["round_index"], 4);
         assert!(payload.get("model").is_none());
     }
 
     #[tokio::test]
-    async fn prepare_body_rejects_missing_selected_model_before_session_side_effects() {
+    async fn prepare_body_rejects_invalid_round_before_session_side_effects() {
+        let sessions = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(sessions.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "session_id": "bound-session",
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::SubAgent,
+                "round_index": -1,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, error) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                Ok(_) => panic!("negative round must fail at the typed request boundary"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.0.error_code.as_deref(),
+            Some("chat_turn_request_invalid")
+        );
+        assert_eq!(sessions.create_calls(), 0);
+        assert_eq!(sessions.get_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_missing_model_selection_before_session_side_effects() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
@@ -1214,7 +1260,7 @@ mod tests {
             match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
                 .await
             {
-                Ok(_) => panic!("missing selected_model must fail before session preparation"),
+                Ok(_) => panic!("missing model selection must fail before session preparation"),
                 Err(error) => error,
             };
 
@@ -1224,7 +1270,9 @@ mod tests {
             Some("missing_model_selection")
         );
         assert!(
-            body.0.detail.contains("Model selection is required"),
+            body.0
+                .detail
+                .contains("model_selection.offering_id is required"),
             "{}",
             body.0.detail
         );
@@ -1245,13 +1293,48 @@ mod tests {
             match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
                 .await
             {
-                Ok(_) => panic!("legacy model must not be accepted as selected_model"),
+                Ok(_) => panic!("legacy model must not be accepted as model selection"),
                 Err(error) => error,
             };
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.0.error_code.as_deref(), Some("selected_model_invalid"));
-        assert!(body.0.detail.contains("legacy top-level model"));
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("model_selection_invalid")
+        );
+        assert!(body.0.detail.contains("select an Offering"));
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_missing_or_invalid_inference_purpose_before_session_access() {
+        for (purpose, expected_code) in [
+            (None, "missing_inference_purpose"),
+            (Some(json!("unknown")), "inference_purpose_invalid"),
+            (Some(json!(42)), "inference_purpose_invalid"),
+        ] {
+            let session_service = CountingSessionService::default();
+            let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_session_service(Arc::new(session_service.clone()));
+            let mut payload = json!({
+                "model_selection": model_selection(),
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            if let Some(purpose) = purpose {
+                payload["inference_purpose"] = purpose;
+            }
+            let body = Bytes::from(serde_json::to_vec(&payload).expect("serialize request"));
+
+            let (status, error) =
+                match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                    Ok(_) => panic!("invalid inference purpose must fail admission"),
+                    Err(error) => error,
+                };
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.0.error_code.as_deref(), Some(expected_code));
+            assert_eq!(session_service.create_calls(), 0);
+            assert_eq!(session_service.get_calls(), 0);
+        }
     }
 
     #[tokio::test]
@@ -1261,7 +1344,8 @@ mod tests {
             .with_session_service(Arc::new(session_service.clone()));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model()
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent
             }))
             .expect("body should serialize"),
         );
@@ -1289,7 +1373,8 @@ mod tests {
             .with_session_service(Arc::new(session_service.clone()));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_id": "existing-session",
                 "messages": [{"role": "user", "content": "hello"}],
                 "edge_tools": {"name": "bash"}
@@ -1313,6 +1398,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_body_rejects_request_scoped_credentials_before_session_lookup() {
+        let session_service = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
+                "session_id": "existing-session",
+                "messages": [{"role": "user", "content": "hello"}],
+                "runtime_bindings": {
+                    "memory": {
+                        "provider": "memoria",
+                        "base_url": "https://untrusted.invalid",
+                        "api_key": "must-not-cross-the-boundary"
+                    }
+                }
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                Ok(_) => panic!("request-scoped credentials must be rejected"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("client_execution_override_forbidden")
+        );
+        assert_eq!(session_service.create_calls(), 0);
+        assert_eq!(session_service.get_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn prepare_body_reuses_cached_session_turn_for_continuation() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
@@ -1326,7 +1448,8 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1360,7 +1483,8 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1396,7 +1520,8 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1434,7 +1559,8 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 10,
                 "turn_chain_id": "root-chain",
                 "user_query_event_id": "root-query",
@@ -1467,7 +1593,8 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 1,
                 "turn_chain_id": "new-chain",
                 "user_query_event_id": "new-query",
@@ -1511,7 +1638,8 @@ mod tests {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 2,
                 "messages": [{"role": "user", "content": "review local changes"}]
             }))
@@ -1534,7 +1662,8 @@ mod tests {
             .with_session_service(Arc::new(CaptureEnabledSessionService));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "selected_model": selected_model(),
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_id": "capture-session",
                 "messages": [{"role": "user", "content": "hello"}]
             }))
@@ -1751,7 +1880,9 @@ mod tests {
             "edge_tools": [tool_value("bash"), tool_value("grep")],
             "edge_profile": {"cwd": "/tmp"},
             "project_rules": {"max_tokens": 1000},
-            "selected_model": {"model": "gpt-4", "gateway": null},
+            "model_selection": {"offering_id": "offer-gpt-4"},
+            "inference_purpose": "sub_agent",
+            "round_index": 3,
             "execution_state": {"pending_tools": []},
             "custom_field": "preserved"
         });
@@ -1764,12 +1895,14 @@ mod tests {
         assert_eq!(request.messages_slice().len(), 1);
         assert!(request.has_tool_results());
         assert_eq!(request.edge_tools_vec().unwrap().len(), 2);
-        assert_eq!(request.selected_model_name(), Some("gpt-4"));
+        assert_eq!(request.offering_id(), Some("offer-gpt-4"));
+        assert_eq!(request.round_index, Some(3));
         assert!(serialized.get("model").is_none());
         assert!(request.execution_state_obj().is_some());
 
         // Forward-compat: unknown fields preserved
         assert_eq!(serialized.get("custom_field").unwrap(), &json!("preserved"));
+        assert_eq!(serialized.get("round_index"), Some(&json!(3)));
     }
 
     #[test]
@@ -1800,56 +1933,48 @@ mod tests {
     }
 
     #[test]
-    fn selected_model_shape_validation_contract() {
+    fn model_selection_shape_validation_contract() {
         for (raw, expected_code) in [
             (r#"{}"#, Some("missing_model_selection")),
             (
-                r#"{"selected_model":"gpt-4"}"#,
-                Some("selected_model_invalid"),
+                r#"{"model_selection":"offer-gpt-4"}"#,
+                Some("model_selection_invalid"),
             ),
-            (r#"{"selected_model":{}}"#, Some("selected_model_invalid")),
+            (r#"{"model_selection":{}}"#, Some("model_selection_invalid")),
             (
-                r#"{"selected_model":{"model":""}}"#,
-                Some("selected_model_invalid"),
-            ),
-            (
-                r#"{"selected_model":{"model":" gpt-4"}}"#,
-                Some("selected_model_invalid"),
+                r#"{"model_selection":{"offering_id":""}}"#,
+                Some("model_selection_invalid"),
             ),
             (
-                "{\"selected_model\":{\"model\":\"gpt\\n4\"}}",
-                Some("selected_model_invalid"),
+                r#"{"model_selection":{"offering_id":" offer-gpt-4"}}"#,
+                Some("model_selection_invalid"),
             ),
             (
-                r#"{"selected_model":{"model":"gpt-4","gateway":42}}"#,
-                Some("selected_model_invalid"),
+                "{\"model_selection\":{\"offering_id\":\"offer\\n4\"}}",
+                Some("model_selection_invalid"),
             ),
             (
-                r#"{"selected_model":{"model":"gpt-4","provider":"openai"}}"#,
-                Some("selected_model_invalid"),
+                r#"{"model_selection":{"offering_id":"offer-gpt-4","gateway":"gw-1"}}"#,
+                Some("model_selection_invalid"),
             ),
             (
-                r#"{"selected_model":{"model":"gpt-4"},"model":"gpt-4"}"#,
-                Some("selected_model_invalid"),
-            ),
-            (r#"{"selected_model":{"model":"gpt-4"}}"#, None),
-            (
-                r#"{"selected_model":{"model":"gpt-4","gateway":null}}"#,
-                None,
+                r#"{"model_selection":{"offering_id":"offer-gpt-4","model":"gpt-4"}}"#,
+                Some("model_selection_invalid"),
             ),
             (
-                r#"{"selected_model":{"model":"gpt-4","gateway":"gw-1"}}"#,
-                None,
+                r#"{"model_selection":{"offering_id":"offer-gpt-4"},"model":"gpt-4"}"#,
+                Some("model_selection_invalid"),
             ),
+            (r#"{"model_selection":{"offering_id":"offer-gpt-4"}}"#, None),
         ] {
             let request: ChatTurnRequestBody = serde_json::from_str(raw).unwrap();
             match expected_code {
                 Some(code) => {
-                    let (status, body) = validate_selected_model_shape(&request).unwrap_err();
+                    let (status, body) = validate_model_selection_shape(&request).unwrap_err();
                     assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
                     assert_eq!(body.0.error_code.as_deref(), Some(code), "{raw}");
                 }
-                None => validate_selected_model_shape(&request).unwrap_or_else(|err| {
+                None => validate_model_selection_shape(&request).unwrap_or_else(|err| {
                     panic!("{raw} should be valid, got {:?}", err.1.0.detail)
                 }),
             }
@@ -1898,6 +2023,21 @@ mod tests {
                     panic!("{raw} should be valid, got {:?}", err.1.0.detail)
                 }),
             }
+        }
+    }
+
+    #[test]
+    fn bridge_payload_rejects_every_client_execution_override_field() {
+        for field in astra_turn_types::CLIENT_DIRECT_EXECUTION_FIELDS {
+            let payload = serde_json::Map::from_iter([(field.to_string(), json!({}))]);
+            let (status, body) = validate_bridge_payload_fields(&payload)
+                .expect_err("client execution overrides must fail closed");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "field={field}");
+            assert_eq!(
+                body.0.error_code.as_deref(),
+                Some("client_execution_override_forbidden"),
+                "field={field}"
+            );
         }
     }
 

@@ -5,9 +5,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::chat_turn_edge_profile::{
-    build_base_edge_profile_value, build_runtime_memory_binding_value,
-};
+use crate::chat_turn_edge_profile::build_base_edge_profile_value;
 use crate::chat_turn_explain_wire::chat_turn_explain_field_json;
 use crate::edge_prompt_context::detect_workspace_context;
 use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
@@ -18,8 +16,13 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub user_intent: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
-    pub model_id: Option<&'a str>,
-    pub model: Option<&'a str>,
+    pub inference_purpose: astra_turn_types::InferencePurpose,
+    /// Producer-owned index of the current model invocation within the
+    /// agentic turn. Durable inference admission uses this coordinate to
+    /// distinguish adjacent tool rounds while keeping transport retries of
+    /// the same round idempotent.
+    pub round_index: u32,
+    pub offering_id: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
     pub explain_on: bool,
@@ -41,8 +44,9 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         user_intent,
         session_id,
         agent_id,
-        model_id,
-        model,
+        inference_purpose,
+        round_index,
+        offering_id,
         interaction_mode,
         explain_verbose,
         explain_on,
@@ -57,28 +61,25 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "user_intent": user_intent,
         "session_id": session_id,
         "agent_id": agent_id,
+        "inference_purpose": inference_purpose,
+        "round_index": round_index,
         "interaction_mode": interaction_mode,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
         "capabilities": capabilities,
-        "runtime_bindings": {
-            "memory": build_runtime_memory_binding_value(),
-        },
         "edge_profile": build_base_edge_profile_value(
             project_root.to_string_lossy().as_ref(),
             git_branch,
             detect_workspace_context(project_root),
         ),
     });
-    if let Some(model) = model
+    if let Some(offering_id) = offering_id
         && let Some(obj) = payload.as_object_mut()
     {
-        let mut selected_model = serde_json::Map::new();
-        if let Some(model_id) = model_id {
-            selected_model.insert("id".to_string(), json!(model_id));
-        }
-        selected_model.insert("model".to_string(), json!(model));
-        obj.insert("selected_model".to_string(), Value::Object(selected_model));
+        obj.insert(
+            "model_selection".to_string(),
+            json!({"offering_id": offering_id}),
+        );
     }
     if thinking.is_enabled() {
         if let Some(obj) = payload.as_object_mut() {
@@ -176,8 +177,9 @@ mod tests {
             user_intent: Some("hi"),
             session_id: None,
             agent_id: Some("test-agent"),
-            model_id: Some("model-gpt-test"),
-            model: Some("gpt-test"),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
+            round_index: 7,
+            offering_id: Some("offer-gpt-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
             explain_on: true,
@@ -191,9 +193,10 @@ mod tests {
         assert_eq!(p["user_intent"], "hi");
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
+        assert_eq!(p["inference_purpose"], "sub_agent");
+        assert_eq!(p["round_index"], 7);
         assert!(p.get("model").is_none());
-        assert_eq!(p["selected_model"]["id"], "model-gpt-test");
-        assert_eq!(p["selected_model"]["model"], "gpt-test");
+        assert_eq!(p["model_selection"]["offering_id"], "offer-gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");
@@ -202,9 +205,10 @@ mod tests {
         assert_eq!(p["edge_profile"]["cwd"], "/tmp");
         assert_eq!(p["edge_profile"]["git_branch"], "main");
         assert!(p["edge_profile"].get("memoria_url").is_none());
-        assert_eq!(p["runtime_bindings"]["memory"]["provider"], "memoria");
-        assert!(p["runtime_bindings"]["memory"].get("base_url").is_some());
-        assert!(p["runtime_bindings"]["memory"].get("api_key").is_some());
+        assert!(
+            p.get("runtime_bindings").is_none(),
+            "request payloads must not carry execution endpoints or credentials"
+        );
         // thinking = Off → field absent
         assert!(p.get("thinking").is_none());
     }
@@ -216,8 +220,9 @@ mod tests {
             user_intent: None,
             session_id: Some("sess-1"),
             agent_id: None,
-            model_id: None,
-            model: Some("m"),
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
+            offering_id: None,
             interaction_mode: None,
             explain_verbose: true,
             explain_on: false,
@@ -240,8 +245,9 @@ mod tests {
             user_intent: None,
             session_id: None,
             agent_id: None,
-            model_id: None,
-            model: Some("claude-thinking"),
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
+            offering_id: None,
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
             explain_on: false,
@@ -264,8 +270,9 @@ mod tests {
             user_intent: None,
             session_id: None,
             agent_id: None,
-            model_id: None,
-            model: Some("gpt-4o"),
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
+            offering_id: None,
             interaction_mode: None,
             explain_verbose: false,
             explain_on: false,

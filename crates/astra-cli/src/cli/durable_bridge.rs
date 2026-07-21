@@ -12,6 +12,7 @@ use astra_services::{
 };
 use crossterm::style::Stylize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::cli::theme;
 
@@ -814,6 +815,25 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 
 // ─── Server Proxy LLM Judge ──────────────────────────────────────────────────
 
+struct ProxyInferenceSequence {
+    base_scope: astra_turn_types::InferenceInvocationScope,
+    next_logical_attempt: AtomicU32,
+}
+
+impl ProxyInferenceSequence {
+    fn new(base_scope: astra_turn_types::InferenceInvocationScope) -> Self {
+        Self {
+            base_scope,
+            next_logical_attempt: AtomicU32::new(0),
+        }
+    }
+
+    fn next_scope(&self) -> astra_turn_types::InferenceInvocationScope {
+        self.base_scope
+            .with_logical_attempt(self.next_logical_attempt.fetch_add(1, Ordering::AcqRel))
+    }
+}
+
 /// [`LlmJudge`] that routes through the API server's `/v1/chat/completions` proxy.
 ///
 /// Uses the same authentication (bearer token) and model resolution as the main
@@ -822,12 +842,20 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 pub struct ServerProxyLlmJudge {
     api: astra_thin_client::ThinClient,
     token: String,
-    model: Option<String>,
+    inference: ProxyInferenceSequence,
 }
 
 impl ServerProxyLlmJudge {
-    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
-        Self { api, token, model }
+    pub fn new(
+        api: astra_thin_client::ThinClient,
+        token: String,
+        inference_scope: astra_turn_types::InferenceInvocationScope,
+    ) -> Self {
+        Self {
+            api,
+            token,
+            inference: ProxyInferenceSequence::new(inference_scope),
+        }
     }
 }
 
@@ -849,83 +877,23 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
             )
         });
 
-        let mut body = serde_json::json!({
-            "messages": [system_msg, user_msg],
-            "max_tokens": 2000,
-            "temperature": 0.1,
-        });
-        if let Some(ref m) = self.model {
-            body["model"] = serde_json::json!(m);
-        }
-
+        let mut request = astra_thin_client::CompletionRequest::from_session_scope(
+            astra_thin_client::CompletionOperation::VerificationJudge,
+            &self.inference.next_scope(),
+            vec![system_msg, user_msg],
+        )
+        .map_err(str::to_string)?;
+        request.max_tokens = 2_000;
+        request.temperature = 0.1;
         let resp = self
             .api
-            .post_completions(&self.token, &body)
+            .post_completions(&self.token, &request)
             .await
             .map_err(|e| format!("Server proxy judge error: {e}"))?;
 
-        let content = resp["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("");
+        let content = resp.first_text().unwrap_or("");
 
         parse_judge_score(content)
-    }
-}
-
-// ─── Server Proxy Turn Intent Judge ──────────────────────────────────────────
-
-/// [`astra_services::TurnIntentJudge`] routed through the API server's
-/// `/v1/chat/completions` proxy.
-///
-/// Mirrors [`ServerProxyLlmJudge`] (verification): same auth, same model
-/// resolution, no extra credentials. It can be injected through
-/// `ServerAgenticLoopHost::set_turn_intent_judge` when a caller wants an
-/// explicit proxy-backed judge instead of the host's built-in summary-client
-/// judge path. On any error (transport, malformed output, rejection), the host
-/// proceeds without explicit turn intent so a transient outage never blocks
-/// the user's session.
-pub struct ServerProxyTurnIntentJudge {
-    api: astra_thin_client::ThinClient,
-    token: String,
-    model: Option<String>,
-}
-
-impl ServerProxyTurnIntentJudge {
-    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
-        Self { api, token, model }
-    }
-}
-
-#[async_trait::async_trait]
-impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
-    async fn judge(
-        &self,
-        ctx: &astra_services::TurnIntentJudgeContext,
-    ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
-        let mut body = serde_json::json!({
-            "messages": astra_services::turn_intent_judge_messages(ctx),
-            // Keep judge replies tight — the schema is fixed and small.
-            "max_tokens": 256,
-            // Low temperature for deterministic classification.
-            "temperature": 0.0,
-        });
-        if let Some(ref m) = self.model {
-            body["model"] = serde_json::json!(m);
-        }
-
-        let resp = self
-            .api
-            .post_completions(&self.token, &body)
-            .await
-            .map_err(|e| astra_services::TurnIntentJudgeError::Transport(e.to_string()))?;
-
-        let content = resp["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| astra_services::TurnIntentJudgeError::Malformed {
-                raw: format!("missing content in response: {resp}"),
-            })?;
-
-        astra_services::parse_turn_intent_response(content)
     }
 }
 
@@ -950,6 +918,16 @@ mod tests {
         TaskScope, VerificationCriterion, VerificationResult, VerifierKind,
     };
     use std::sync::Arc;
+
+    fn proxy_inference_scope() -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "session-judge".to_string(),
+            turn: 7,
+            round: 0,
+            operation_id: "plan_verification".to_string(),
+            logical_attempt: 0,
+        }
+    }
 
     fn service_error(message: impl Into<String>) -> ServiceError {
         ServiceError::internal(message)
@@ -2565,6 +2543,7 @@ mod tests {
                     Json(serde_json::json!({
                         "id": "mock-1",
                         "object": "chat.completion",
+                        "offering_id": "offer-default",
                         "model": "mock-model",
                         "choices": [{
                             "index": 0,
@@ -2589,7 +2568,7 @@ mod tests {
     async fn server_proxy_judge_returns_high_score_on_positive() {
         let (base_url, server) = mock_completions_server(0.95, "criterion fully met").await;
         let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), proxy_inference_scope());
 
         let score = judge
             .evaluate(
@@ -2607,7 +2586,7 @@ mod tests {
     async fn server_proxy_judge_returns_low_score_on_negative() {
         let (base_url, server) = mock_completions_server(0.1, "no error handling").await;
         let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), proxy_inference_scope());
 
         let score = judge
             .evaluate(
@@ -2622,24 +2601,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_proxy_judge_includes_model_override() {
+    async fn server_proxy_judge_sends_typed_operation_and_session_coordinates() {
         use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
 
-        let captured = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::new(Mutex::new(None));
         let captured_clone = captured.clone();
 
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
+            post(move |Json(body): Json<astra_thin_client::CompletionRequest>| {
                 let cap = captured_clone.clone();
                 async move {
-                    // Capture the model field from the request
-                    if let Some(m) = body["model"].as_str() {
-                        *cap.lock_recover() = m.to_string();
-                    }
+                    *cap.lock_recover() = Some(body);
                     Json(serde_json::json!({
                         "id": "mock-1",
+                        "object": "chat.completion",
+                        "offering_id": "offer-default",
+                        "model": "mock-model",
                         "choices": [{
                             "index": 0,
                             "message": { "role": "assistant", "content": r#"{"score": 0.8}"# },
@@ -2658,11 +2637,32 @@ mod tests {
         });
 
         let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
-        let judge =
-            ServerProxyLlmJudge::new(api, "fake-token".into(), Some("custom-model-v2".into()));
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), proxy_inference_scope());
 
         let _score = judge.evaluate("test", "test context").await.unwrap();
-        assert_eq!(*captured.lock_recover(), "custom-model-v2");
+        let body = captured
+            .lock_recover()
+            .take()
+            .expect("completion request captured");
+        assert_eq!(
+            body.operation,
+            astra_thin_client::CompletionOperation::VerificationJudge
+        );
+        assert!(body.model_selection.is_none());
+        assert_eq!(body.session_id, "session-judge");
+        assert_eq!(body.turn, 7);
+        assert_eq!(body.round, 0);
+        assert_eq!(body.logical_attempt, 0);
+        assert_eq!(
+            body.invocation_scope(),
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-judge".to_string(),
+                turn: 7,
+                round: 0,
+                operation_id: "completion_proxy:verification_judge".to_string(),
+                logical_attempt: 0,
+            }
+        );
         server.abort();
     }
 
@@ -2670,7 +2670,7 @@ mod tests {
     async fn server_proxy_judge_handles_connection_error() {
         // Point to a port nothing is listening on
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:19999", None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), proxy_inference_scope());
 
         let result: Result<f64, String> = judge.evaluate("test criterion", "test context").await;
         assert!(result.is_err(), "should fail on connection error");

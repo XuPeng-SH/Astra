@@ -26,6 +26,7 @@ use super::version::{Dependency, Version};
 ///
 /// Skill manifest loaded from YAML/JSON.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFrontmatter {
     name: String,
     #[serde(default)]
@@ -40,8 +41,6 @@ struct RawFrontmatter {
     allowed_tools: Vec<String>,
     #[serde(default)]
     when_to_use: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     max_tokens: Option<u32>,
     // New framework fields
@@ -163,7 +162,6 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         user_invocable: raw.user_invocable,
         allowed_tools: raw.allowed_tools,
         when_to_use: raw.when_to_use,
-        model: raw.model,
         max_tokens: raw.max_tokens,
         hooks: raw.hooks,
         paths: raw.paths,
@@ -483,11 +481,11 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 /// Standard skill directory search order (high -> low priority):
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
-/// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
-/// 3. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
+/// 2. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
+/// 3. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
 /// 4. `~/.astra/skills/`      — user-level global skills
-/// 5. `~/.claude/skills/`     — user-level Agent Skills compatibility path
-/// 6. `~/.agent/skills/`      — user-level Agent-compatible path
+/// 5. `~/.agent/skills/`      — user-level Agent-compatible path
+/// 6. `~/.claude/skills/`     — user-level Claude-compatible path
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
@@ -502,8 +500,8 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
     let mut paths = vec![
         PathBuf::from(".astra/skills"),
-        PathBuf::from(".claude/skills"),
         PathBuf::from(".agent/skills"),
+        PathBuf::from(".claude/skills"),
     ];
     if let Some(home) = home {
         for global in home_skill_search_paths_from(&home) {
@@ -524,13 +522,13 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(12);
 
-    // Single walk-up collecting .astra/skills/, .claude/skills/, and
-    // .agent/skills/. Native .astra paths keep priority over compatibility
-    // roots when names collide.
+    // Single walk-up collecting native .astra/skills/, Astra-agent
+    // .agent/skills/, and Claude-compatible .claude/skills/. Native contracts
+    // keep priority over compatibility roots when names collide.
     let (astra, claude, agent) = walk_up_skill_paths_from(cwd, home);
     paths.extend(astra);
-    paths.extend(claude);
     paths.extend(agent);
+    paths.extend(claude);
 
     if let Some(home) = home {
         for global in home_skill_search_paths_from(home) {
@@ -554,8 +552,8 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
 pub fn home_skill_search_paths_from(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".astra").join("skills"),
-        home.join(".claude").join("skills"),
         home.join(".agent").join("skills"),
+        home.join(".claude").join("skills"),
     ]
 }
 
@@ -658,7 +656,6 @@ version: "2.1.0"
 author: "astra-team"
 user_invocable: true
 context: fork
-model: "claude-sonnet-4-20250514"
 max_tokens: 16384
 when_to_use: "Use for thorough code reviews"
 allowed_tools:
@@ -695,7 +692,6 @@ Analyze the code thoroughly.
         assert_eq!(manifest.version.patch, 0);
         assert_eq!(manifest.author.as_deref(), Some("astra-team"));
         assert_eq!(manifest.execution_context, ExecutionContext::Fork);
-        assert_eq!(manifest.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert_eq!(manifest.max_tokens, Some(16384));
         assert!(manifest.is_isolated());
         assert!(manifest.is_conditional());
@@ -1006,8 +1002,8 @@ Hooked body."#;
             paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills"),
-                home.join(".agent").join("skills")
+                home.join(".agent").join("skills"),
+                home.join(".claude").join("skills")
             ],
             "api-server local skill discovery must be restricted to HOME-level catalogs"
         );
@@ -1065,8 +1061,8 @@ Hooked body."#;
             server_paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills"),
-                home.join(".agent").join("skills")
+                home.join(".agent").join("skills"),
+                home.join(".claude").join("skills")
             ],
             "Web/server discovery must be restricted to API-server HOME catalogs"
         );
@@ -1395,6 +1391,14 @@ Hooked body."#;
     // ── Aliases / effort / agent_type frontmatter tests ─────────────────
 
     #[test]
+    fn skill_manifest_rejects_model_selection_authority() {
+        parse_skill_md(
+            "---\nname: governed-skill\ndescription: uses product policy\nmodel: provider-model\n---\nInstructions.",
+        )
+        .expect_err("skills declare requirements; they cannot select model execution");
+    }
+
+    #[test]
     fn parse_cc_fields() {
         // Parse individual & combined CC-compatible fields
         #[allow(clippy::type_complexity)]
@@ -1429,12 +1433,11 @@ Hooked body."#;
             ),
             // all CC fields together
             (
-                "name: cc-5\ndescription: \"x\"\naliases: [fc, full]\neffort: max\nagent_type: coder\nmodel: \"claude-sonnet-4-20250514\"\n",
+                "name: cc-5\ndescription: \"x\"\naliases: [fc, full]\neffort: max\nagent_type: coder\n",
                 |m: &SkillManifest| {
                     assert_eq!(m.aliases, vec!["fc", "full"]);
                     assert!(matches!(m.effort, Some(EffortLevel::Max)));
                     assert_eq!(m.agent_type.as_deref(), Some("coder"));
-                    assert_eq!(m.model.as_deref(), Some("claude-sonnet-4-20250514"));
                 },
             ),
         ];

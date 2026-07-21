@@ -546,6 +546,9 @@ pub struct SpawnContext {
     pub parent_run_id: String,
     /// The parent's agent ID (for tracking delegation chains).
     pub parent_agent_id: String,
+    /// Provider model name already resolved from the parent's admitted
+    /// Offering. This is execution material, never a child policy choice.
+    pub resolved_model_name: Option<String>,
     /// Current nested agent/sub-run depth of the parent.
     pub recursion_depth: u8,
     /// Whether the parent is itself a fork child. Fork children must
@@ -2364,10 +2367,7 @@ impl DynamicAgentSpawner {
         let agent_id = format!("{}@{}", agent_name, run_id);
 
         // 3. Determine model and turns
-        let model = input
-            .model
-            .clone()
-            .or_else(|| agent_def.default_model.clone());
+        let model = context.resolved_model_name.clone();
         // Budget resolution composes numeric and complexity ceilings by
         // taking the smaller value; with only one constraint, that constraint
         // is authoritative. See `resolve_turn_budget`.
@@ -4159,9 +4159,8 @@ mod tests {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: Vec::new(),
@@ -4340,6 +4339,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -4372,6 +4372,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -4447,6 +4448,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -4501,6 +4503,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -4556,6 +4559,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -4609,6 +4613,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5200,6 +5205,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5264,6 +5270,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 2,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5302,6 +5309,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5339,6 +5347,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth:
                 astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
             parent_is_fork_child: false,
@@ -5376,6 +5385,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5481,6 +5491,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5522,6 +5533,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -5577,6 +5589,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -5606,6 +5619,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "run-1".to_string(),
             parent_agent_id: "agent-1".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -5684,6 +5698,7 @@ mod tests {
         SpawnContext {
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -7861,6 +7876,7 @@ mod tests {
         SpawnContext {
             parent_run_id: run_id.to_string(),
             parent_agent_id: "parent".to_string(),
+            resolved_model_name: Some(TEST_CHILD_MODEL.to_string()),
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -7880,10 +7896,6 @@ mod tests {
             description: "child".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
-            // Match the captured parent's model/thinking. Keep this
-            // explicit so the test stays stable even though built-in
-            // agent types now inherit the server default model.
-            model: Some(TEST_CHILD_MODEL.into()),
             inherit_prefix: Some(InheritPrefixSpec {
                 from_run_id: None, // use caller's run id
                 required,

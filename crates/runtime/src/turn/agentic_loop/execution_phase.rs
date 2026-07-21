@@ -424,6 +424,7 @@ fn record_early_exit_llm_round(
     let run_id = state.current_run_id.clone();
     let duration_ms = turn_start.elapsed().as_millis() as u64;
     state.push_recent_round(super::host::RecentRoundSummary {
+        purpose: state.inference_purpose,
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
@@ -439,6 +440,7 @@ fn record_early_exit_llm_round(
     });
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            purpose: state.inference_purpose,
             ttft_ms: turn_result.ttft_ms,
             duration_ms,
             prompt_tokens: turn_result.accum.prompt_tokens,
@@ -451,8 +453,9 @@ fn record_early_exit_llm_round(
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
+            parent_run_id: None,
             tool_calls: None,
-            ..Default::default()
+            agent_id: None,
         });
     }
 }
@@ -2250,9 +2253,6 @@ pub(crate) fn should_emit_search_fanout_advisory(
     if state.stall.search_fanout_advisory_emitted {
         return false;
     }
-    if !state.task_profile.mutates_workspace {
-        return false;
-    }
     astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records) >= threshold
 }
 
@@ -2280,7 +2280,7 @@ pub(crate) fn cache_waste_advisory_message(
 pub(crate) fn search_fanout_advisory_message(count: usize, original_query: &str) -> String {
     format!(
         "{SEARCH_FANOUT_MARKER}\n\
-         Observation: {count} grep/rg/find-like search calls occurred in an implementation turn. \
+         Observation: {count} grep/rg/find-like search calls occurred in the current investigation. \
          Broad search has crossed the low-yield threshold: more search is likely to expand context instead of finishing the task.\n\n\
          Recommendation: consider synthesizing the current evidence before widening \
          discovery. A specific edit, narrow validation, exact file/range read, or final \
@@ -4991,7 +4991,7 @@ mod tests {
     }
 
     #[test]
-    fn search_fanout_advisory_skips_read_only_review() {
+    fn search_fanout_advisory_fires_for_read_only_review() {
         let mut state = make_state();
         state.message = "review the branch".into();
         state.user_intent = state.message.clone();
@@ -5000,7 +5000,7 @@ mod tests {
             push_search_call(&mut state, idx);
         }
 
-        assert!(!should_emit_search_fanout_advisory(&state, 8));
+        assert!(should_emit_search_fanout_advisory(&state, 8));
     }
 
     #[test]

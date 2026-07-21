@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_REGISTRY_UNREGISTER_ATTEMPTS: usize = 3;
+const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -53,7 +54,37 @@ fn try_acquire_edge_ws_connection() -> Option<EdgeWsConnectionPermit> {
 pub(crate) async fn edge_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let token = match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(token) => token.to_string(),
+        None => {
+            return (axum::http::StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+        }
+    };
+    let principal = match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            astra_services::ProviderRequestDescriptor {
+                method: "GET".to_string(),
+                path: "/edge/ws".to_string(),
+                route: Some("/edge/ws".to_string()),
+                request_id: None,
+                body_digest: None,
+            },
+        )
+        .await
+    {
+        Ok(principal) => principal,
+        Err(error) => return error.into_response(),
+    };
     let Some(permit) = try_acquire_edge_ws_connection() else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -65,7 +96,7 @@ pub(crate) async fn edge_ws_handler(
         .on_failed_upgrade(|error| {
             tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
         })
-        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit))
+        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit, principal, token))
         .into_response()
 }
 
@@ -74,6 +105,8 @@ async fn handle_edge_connection(
     socket: WebSocket,
     state: AppState,
     _permit: EdgeWsConnectionPermit,
+    principal: astra_services::AuthPrincipal,
+    token: String,
 ) {
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
@@ -85,13 +118,12 @@ async fn handle_edge_connection(
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<EdgeClientMessage>(&text) {
                     Ok(EdgeClientMessage::Auth {
-                        token,
                         edge_agent_id,
                         hostname,
                         workspace_dir,
                         capabilities,
                     }) => {
-                        return Some((token, edge_agent_id, hostname, workspace_dir, capabilities));
+                        return Some((edge_agent_id, hostname, workspace_dir, capabilities));
                     }
                     _ => {
                         let _ = send_edge_msg(
@@ -110,7 +142,7 @@ async fn handle_edge_connection(
     })
     .await;
 
-    let (token, edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
+    let (edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
         Ok(Some(auth)) => auth,
         _ => {
             tracing::warn!(
@@ -143,47 +175,6 @@ async fn handle_edge_connection(
         .await;
         return;
     }
-
-    // ── Phase 1: Resolve principal (single provider call) ────────────
-    // Request-aware authentication calls the external provider once with the
-    // actual WebSocket route and stores the edge binding
-    // (edge_agent_id, provider_scope_id) in the returned AuthPrincipal.
-    // Callers here never need to inspect the raw token format.
-    let mut headers = HeaderMap::new();
-    if let Ok(hv) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
-        headers.insert(axum::http::header::AUTHORIZATION, hv);
-    }
-    let principal = match state
-        .auth_service
-        .current_principal_for_request(
-            &headers,
-            astra_services::ProviderRequestDescriptor {
-                method: "GET".to_string(),
-                path: "/edge/ws".to_string(),
-                route: Some("/edge/ws".to_string()),
-                request_id: None,
-                body_digest: None,
-            },
-        )
-        .await
-    {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                edge_agent_id = %edge_agent_id,
-                "edge WebSocket auth failed: invalid token"
-            );
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "invalid token".into(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
 
     let user_id = principal.user.user_id.clone();
 
@@ -760,6 +751,7 @@ async fn handle_edge_connection(
     // Task: read edge → server messages + heartbeat
     let read_loop = async {
         let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        let mut consecutive_heartbeat_storage_failures = 0usize;
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first tick so the first pong is sent after
         // `heartbeat_interval`, not immediately on loop entry.
@@ -951,7 +943,7 @@ async fn handle_edge_connection(
                         .heartbeat(&user_id, &edge_agent_id, &edge_id_for_registry)
                         .await
                     {
-                        Ok(()) => {}
+                        Ok(()) => consecutive_heartbeat_storage_failures = 0,
                         Err(astra_services::multi_agent::HeartbeatError::Superseded) => {
                             tracing::info!(
                                 target: "astra_runtime::edge_ws",
@@ -962,17 +954,29 @@ async fn handle_edge_connection(
                             break;
                         }
                         Err(astra_services::multi_agent::HeartbeatError::StorageFailure(e)) => {
+                            consecutive_heartbeat_storage_failures =
+                                consecutive_heartbeat_storage_failures.saturating_add(1);
                             tracing::warn!(
                                 target: "astra_runtime::edge_ws",
                                 user_id = %user_id,
                                 edge_agent_id = %edge_agent_id,
                                 error = %e,
-                                "edge WebSocket: heartbeat DB failure (transient); connection remains open"
+                                failures = consecutive_heartbeat_storage_failures,
+                                budget = EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET,
+                                "edge WebSocket: heartbeat DB failure"
                             );
-                            // Transient storage failure — do not disconnect. The
-                            // next tick will retry. Persistent failures will
-                            // eventually be caught by the sweeper's stale-record
-                            // expiry, which uses last_heartbeat_at.
+                            if consecutive_heartbeat_storage_failures
+                                >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET
+                            {
+                                let _ = send_edge_msg(
+                                    &ws_sink_write,
+                                    EdgeServerMessage::Closing {
+                                        reason: "edge registry heartbeat unavailable".into(),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
                         }
                     }
                 }

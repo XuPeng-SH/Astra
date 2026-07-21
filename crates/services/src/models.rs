@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, query};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
-    classify_model_resolution_error_message, error_response, internal_error,
+    classify_model_resolution_error_message, error_response, error_response_coded, internal_error,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -277,6 +278,16 @@ pub enum ThinkingCapability {
 }
 
 impl ThinkingCapability {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::EffortOnly => "effort_only",
+            Self::NativeOnly => "native_only",
+            Self::None => "none",
+        }
+    }
+
     pub fn from_db(s: Option<&str>) -> Option<Self> {
         match s? {
             "both" => Some(Self::Both),
@@ -343,7 +354,11 @@ pub struct ModelRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelListItem {
-    pub model_id: String,
+    pub offering_id: String,
+    pub access_id: String,
+    pub access_kind: ModelAccessKind,
+    pub access_label: String,
+    pub execution_placement: ModelExecutionPlacement,
     pub name: String,
     pub provider: String,
     pub description: Option<String>,
@@ -386,6 +401,216 @@ pub struct ResolvedActiveLlmModel {
     pub request_headers: Option<Map<String, Value>>,
 }
 
+/// An effective Offering resolved to the concrete active model used by the
+/// current Server implementation.
+///
+/// Phase 0 intentionally reuses the durable `infra_llm_models.model_id` as the
+/// Offering identity. Callers must select by this identity; model names and
+/// aliases remain internal display/provider facts and cannot choose a route.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedModelOffering {
+    pub offering_id: String,
+    pub model: ResolvedActiveLlmModel,
+}
+
+/// Product-level source that owns access to an admitted model route.
+///
+/// This is intentionally independent from provider identity. A provider model
+/// can be exposed through personal Cloud, a Workspace, a local device, or a
+/// self-hosted deployment without changing the agent runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessKind {
+    AstraCloud,
+    Workspace,
+    ThisDevice,
+    SelfHosted,
+}
+
+impl ModelAccessKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AstraCloud => "astra_cloud",
+            Self::Workspace => "workspace",
+            Self::ThisDevice => "this_device",
+            Self::SelfHosted => "self_hosted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelExecutionPlacement {
+    Server,
+    Edge,
+}
+
+impl ModelExecutionPlacement {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+/// Non-serializable execution material produced once at the trusted model
+/// admission boundary and consumed by every inference surface.
+///
+/// Credential origin is intentionally absent. Executors receive one normalized
+/// invocation shape and never branch on the product source that produced it.
+#[derive(Clone, PartialEq)]
+pub struct AdmittedModelExecution {
+    pub offering_id: String,
+    pub access_kind: ModelAccessKind,
+    pub execution_placement: ModelExecutionPlacement,
+    pub model_name: String,
+    pub wire_model_name: Option<String>,
+    pub api_key: String,
+    pub base_url: String,
+    pub provider: String,
+    pub cache_capability: Option<PromptCacheCapabilityData>,
+    pub request_body_overrides: Option<Map<String, Value>>,
+    pub context_window: Option<u32>,
+    pub header_overrides: HashMap<String, String>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+}
+
+impl AdmittedModelExecution {
+    pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
+        let header_overrides = offering.model.execution_header_overrides()?;
+        Ok(Self {
+            offering_id: offering.offering_id,
+            access_kind: ModelAccessKind::SelfHosted,
+            execution_placement: ModelExecutionPlacement::Server,
+            model_name: offering.model.model_name,
+            wire_model_name: offering.model.wire_model_name,
+            api_key: offering.model.api_key,
+            base_url: offering.model.base_url,
+            provider: offering.model.provider,
+            cache_capability: offering.model.prompt_cache_capability,
+            request_body_overrides: offering.model.request_body_overrides,
+            context_window: offering.model.context_window,
+            header_overrides,
+            completions_url_override: None,
+            request_timeout_ms: None,
+        })
+    }
+
+    pub fn from_endpoint(
+        offering_id: String,
+        model_name: String,
+        provider: String,
+        endpoint_url: String,
+        authorization: String,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            offering_id,
+            access_kind: ModelAccessKind::ThisDevice,
+            execution_placement: ModelExecutionPlacement::Edge,
+            model_name,
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            provider,
+            cache_capability: None,
+            request_body_overrides: None,
+            context_window: None,
+            header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
+            completions_url_override: Some(endpoint_url),
+            request_timeout_ms: timeout_ms,
+        }
+    }
+}
+
+impl std::fmt::Debug for AdmittedModelExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("AdmittedModelExecution")
+            .field("offering_id", &self.offering_id)
+            .field("access_kind", &self.access_kind)
+            .field("execution_placement", &self.execution_placement)
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("provider", &self.provider)
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_names", &header_names)
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelOfferingResolutionError {
+    InvalidOfferingId,
+    NotFound {
+        offering_id: String,
+    },
+    Inactive {
+        offering_id: String,
+        model_name: String,
+    },
+    Backend(String),
+}
+
+impl ModelOfferingResolutionError {
+    fn allows_stale_cache(&self) -> bool {
+        matches!(self, Self::Backend(_))
+    }
+}
+
+fn model_offering_resolution_error_response(
+    error: ModelOfferingResolutionError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let (status, code) = match &error {
+        ModelOfferingResolutionError::InvalidOfferingId => {
+            (StatusCode::BAD_REQUEST, "model_selection_invalid")
+        }
+        ModelOfferingResolutionError::NotFound { .. } => {
+            (StatusCode::NOT_FOUND, "model_offering_not_found")
+        }
+        ModelOfferingResolutionError::Inactive { .. } => {
+            (StatusCode::NOT_FOUND, "model_offering_unavailable")
+        }
+        ModelOfferingResolutionError::Backend(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
+        }
+    };
+    error_response_coded(status, error.to_string(), code)
+}
+
+impl std::fmt::Display for ModelOfferingResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOfferingId => {
+                f.write_str("offering_id must be an exact non-empty identifier of at most 64 bytes")
+            }
+            Self::NotFound { offering_id } => {
+                write!(f, "Offering '{offering_id}' is not available")
+            }
+            Self::Inactive {
+                offering_id,
+                model_name,
+            } => write!(
+                f,
+                "Offering '{offering_id}' for model '{model_name}' is disabled"
+            ),
+            Self::Backend(error) => write!(f, "Offering resolution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelOfferingResolutionError {}
+
 impl std::fmt::Debug for ResolvedActiveLlmModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedActiveLlmModel")
@@ -414,6 +639,29 @@ impl ResolvedActiveLlmModel {
     pub fn upstream_model_name(&self) -> &str {
         self.wire_model_name.as_deref().unwrap_or(&self.model_name)
     }
+
+    /// Validate and normalize configured request headers for execution.
+    /// Header values are intentionally required to be strings at the
+    /// admission boundary; executors never reinterpret arbitrary JSON.
+    pub fn execution_header_overrides(&self) -> Result<HashMap<String, String>, String> {
+        self.request_headers
+            .as_ref()
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                            .ok_or_else(|| {
+                                format!("model request header '{name}' must contain a string value")
+                            })
+                    })
+                    .collect()
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
 }
 
 const ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -424,17 +672,37 @@ struct ActiveLlmModelCacheKey {
     port: u16,
     user: String,
     database: String,
-    preferred_model: String,
+    selector: ActiveLlmModelSelector,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ActiveLlmModelSelector {
+    ModelName(String),
+    OfferingId(String),
 }
 
 impl ActiveLlmModelCacheKey {
     fn new(matrixone: &MatrixOneSettings, preferred_model: &str) -> Self {
+        Self::for_selector(
+            matrixone,
+            ActiveLlmModelSelector::ModelName(preferred_model.to_string()),
+        )
+    }
+
+    fn for_offering_id(matrixone: &MatrixOneSettings, offering_id: &str) -> Self {
+        Self::for_selector(
+            matrixone,
+            ActiveLlmModelSelector::OfferingId(offering_id.to_string()),
+        )
+    }
+
+    fn for_selector(matrixone: &MatrixOneSettings, selector: ActiveLlmModelSelector) -> Self {
         Self {
             host: matrixone.host.clone(),
             port: matrixone.port,
             user: matrixone.user.clone(),
             database: matrixone.database.clone(),
-            preferred_model: preferred_model.to_string(),
+            selector,
         }
     }
 }
@@ -516,6 +784,14 @@ fn active_llm_model_resolution_cache_store(
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
         .insert(key, model, Instant::now());
+}
+
+fn active_llm_model_resolution_cache_remove(key: &ActiveLlmModelCacheKey) {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .entries
+        .remove(key);
 }
 
 fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -932,6 +1208,153 @@ pub async fn resolve_active_llm_model(
     }
 }
 
+pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferingResolutionError> {
+    if offering_id.is_empty()
+        || offering_id.len() > 64
+        || offering_id.trim() != offering_id
+        || offering_id.chars().any(char::is_control)
+    {
+        return Err(ModelOfferingResolutionError::InvalidOfferingId);
+    }
+    Ok(offering_id)
+}
+
+/// Resolve a client-visible effective Offering by durable ID.
+///
+/// This path is deliberately stricter than [`resolve_active_llm_model`]: it
+/// performs one exact `model_id` lookup and never invokes model-name aliasing
+/// or first-active fallback. Until Offering definitions receive their own
+/// table, `infra_llm_models.model_id` is the canonical Phase 0 Offering ID.
+pub async fn resolve_active_llm_offering(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedModelOffering, ModelOfferingResolutionError> {
+    let offering_id = validate_model_offering_id(offering_id)?;
+    let pool = require_pool(pool, matrixone)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+
+    if let Some(model) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(ResolvedModelOffering {
+            offering_id: offering_id.to_string(),
+            model,
+        });
+    }
+
+    let singleflight = active_llm_model_resolution_lock(&cache_key);
+    let _singleflight_guard = singleflight.lock().await;
+    if let Some(model) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(ResolvedModelOffering {
+            offering_id: offering_id.to_string(),
+            model,
+        });
+    }
+
+    let resolved = resolve_active_llm_offering_uncached(encryptor, offering_id, &pool).await;
+    match resolved {
+        Ok(model) => {
+            active_llm_model_resolution_cache_store(cache_key.clone(), model.clone());
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Ok(ResolvedModelOffering {
+                offering_id: offering_id.to_string(),
+                model,
+            })
+        }
+        Err(error) => {
+            if error.allows_stale_cache()
+                && let Some(model) = active_llm_model_resolution_cache_stale_lookup(&cache_key)
+            {
+                tracing::warn!(
+                    target: "astra_services::models",
+                    offering_id,
+                    error = %error,
+                    "Offering refresh failed; using stale cached model"
+                );
+                remove_active_llm_model_resolution_lock(&cache_key);
+                return Ok(ResolvedModelOffering {
+                    offering_id: offering_id.to_string(),
+                    model,
+                });
+            }
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Err(error)
+        }
+    }
+}
+
+/// Revalidate an Offering immediately before provider I/O.
+///
+/// Unlike catalog browsing and initial selection, this execution boundary
+/// never accepts a process-local cache hit or stale fallback. One exact DB
+/// read makes revocation and route/credential rotation visible across Server
+/// processes on the next provider request. The fresh result replaces the
+/// catalog cache; a failed revalidation evicts the corresponding entry.
+pub async fn revalidate_active_llm_offering(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedModelOffering, ModelOfferingResolutionError> {
+    let offering_id = validate_model_offering_id(offering_id)?;
+    let pool = require_pool(pool, matrixone)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+    match resolve_active_llm_offering_uncached(encryptor, offering_id, &pool).await {
+        Ok(model) => {
+            active_llm_model_resolution_cache_store(cache_key, model.clone());
+            Ok(ResolvedModelOffering {
+                offering_id: offering_id.to_string(),
+                model,
+            })
+        }
+        Err(error) => {
+            active_llm_model_resolution_cache_remove(&cache_key);
+            Err(error)
+        }
+    }
+}
+
+async fn resolve_active_llm_offering_uncached(
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<ResolvedActiveLlmModel, ModelOfferingResolutionError> {
+    let row = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id = ? LIMIT 1"
+    ))
+    .bind(offering_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+    .ok_or_else(|| ModelOfferingResolutionError::NotFound {
+        offering_id: offering_id.to_string(),
+    })?;
+
+    let is_active: i16 = row.try_get("is_active").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid infra_llm_models.is_active: {error}"
+        ))
+    })?;
+    if is_active == 0 {
+        let model_name: String = row.try_get("model_name").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid infra_llm_models.model_name: {error}"
+            ))
+        })?;
+        return Err(ModelOfferingResolutionError::Inactive {
+            offering_id: offering_id.to_string(),
+            model_name,
+        });
+    }
+
+    build_resolved_active_llm_from_row(&row, encryptor)
+        .map_err(ModelOfferingResolutionError::Backend)
+}
+
 async fn resolve_active_llm_model_uncached(
     encryptor: &FernetTokenEncryptor,
     name: &str,
@@ -947,12 +1370,10 @@ async fn resolve_active_llm_model_uncached(
     .await
     .map_err(|e| format!("DB query: {e}"))?;
 
-    // Class C fix: fall through to the alias resolver when exact
-    // match fails. The LLM often produces short names like
-    // `claude-sonnet` for `spawn_agent`'s `model_override`; doing
-    // a deterministic substring / case-insensitive match against
-    // active rows lets those calls succeed without forcing every
-    // case author to retrain the prompt. Ambiguity still errors.
+    // Legacy root-model selection may still arrive as a provider display
+    // name rather than an Offering id. Keep that compatibility inside the
+    // root selection adapter; child/skill/completion boundaries never call
+    // this alias resolver. Ambiguity still errors.
     //
     // Track canonical name separately so the `is_active` error
     // message below can name BOTH the requested alias and the
@@ -1003,29 +1424,28 @@ async fn resolve_active_llm_model_uncached(
     build_resolved_active_llm_from_row(&row, encryptor)
 }
 
-/// Resolve the model used for reasoning / judge / summary tasks.
+/// Resolve the governed Offering used for reasoning / judge / summary tasks.
 ///
 /// Resolution order:
-/// 1. If `admin_config.reasoning_model_name` is set, resolve that model (strict — errors
-///    if the named model is missing or inactive).
+/// 1. If `admin_config.reasoning_offering_id` is set, resolve that exact
+///    Offering (strict — errors if it is invalid, missing, or inactive).
 /// 2. Otherwise, pick the cheapest active model by `pricing.completion` (falls back to
 ///    lexicographic `model_name` ordering among rows with equal or missing pricing).
 /// 3. Otherwise, returns `Err`.
-pub async fn resolve_reasoning_model(
+pub async fn resolve_reasoning_offering(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     admin_config: &dyn crate::admin_config::AdminConfigService,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
+) -> Result<ResolvedModelOffering, String> {
     // 1. Admin override
-    if let Some(name) = admin_config
-        .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_MODEL)
+    if let Some(offering_id) = admin_config
+        .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_OFFERING)
         .await?
     {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return resolve_active_llm_model(matrixone, encryptor, Some(trimmed), pool).await;
-        }
+        return resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
+            .await
+            .map_err(|error| error.to_string());
     }
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
@@ -1033,7 +1453,7 @@ pub async fn resolve_reasoning_model(
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
     ))
     .fetch_all(&pool)
     .await
@@ -1042,7 +1462,7 @@ pub async fn resolve_reasoning_model(
     if rows.is_empty() {
         return Err(
             "No active LLM model configured. Run `astra admin model add` then \
-             `astra admin model check`, or `astra admin config set reasoning_model <name>`."
+             `astra admin model check`, or set `reasoning_offering_id` to an active Offering."
                 .to_string(),
         );
     }
@@ -1061,7 +1481,13 @@ pub async fn resolve_reasoning_model(
         .collect::<Result<_, String>>()?;
     // Pick the row with the lowest completion price. See [`rank_cheapest_index`].
     let best_idx = rank_cheapest_index(&entries);
-    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+    let offering_id: String = rows[best_idx]
+        .try_get("model_id")
+        .map_err(|error| format!("invalid infra_llm_models.model_id: {error}"))?;
+    Ok(ResolvedModelOffering {
+        offering_id,
+        model: build_resolved_active_llm_from_row(&rows[best_idx], encryptor)?,
+    })
 }
 
 fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> Result<bool, String> {
@@ -1163,15 +1589,15 @@ fn rank_memory_model_candidate_indices(
 /// 5. thinking-only models as a last resort
 ///
 /// Within each bucket, cheaper completion pricing wins.
-pub async fn resolve_memory_models(
+pub async fn resolve_memory_offerings(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<Vec<ResolvedActiveLlmModel>, String> {
+) -> Result<Vec<ResolvedModelOffering>, String> {
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
     ))
     .fetch_all(&pool)
     .await
@@ -1183,21 +1609,16 @@ pub async fn resolve_memory_models(
 
     rank_memory_model_candidate_indices(&rows)?
         .into_iter()
-        .map(|index| build_resolved_active_llm_from_row(&rows[index], encryptor))
+        .map(|index| {
+            let offering_id: String = rows[index]
+                .try_get("model_id")
+                .map_err(|error| format!("invalid infra_llm_models.model_id: {error}"))?;
+            Ok(ResolvedModelOffering {
+                offering_id,
+                model: build_resolved_active_llm_from_row(&rows[index], encryptor)?,
+            })
+        })
         .collect()
-}
-
-/// Resolve the best memory-model candidate.
-pub async fn resolve_memory_model(
-    matrixone: &MatrixOneSettings,
-    encryptor: &FernetTokenEncryptor,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
-    resolve_memory_models(matrixone, encryptor, pool)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No active LLM model configured.".to_string())
 }
 
 /// Return the index of the cheapest entry by `pricing.completion`.
@@ -1299,6 +1720,23 @@ pub trait ModelService: Send + Sync {
         &self,
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Resolve one exact active Offering into short-lived execution material.
+    /// Implementations must not fall back to model names or alternate rows.
+    async fn resolve_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Resolve execution material without accepting a catalog cache hit.
+    /// Provider request boundaries call this method so revocation, credential
+    /// rotation, and route rotation become visible before network I/O.
+    async fn revalidate_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        self.resolve_model_offering(offering_id).await
+    }
 
     async fn update_model(
         &self,
@@ -1599,7 +2037,11 @@ impl ModelService for DatabaseModelService {
             let context_window =
                 model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
             models.push(ModelListItem {
-                model_id: row.try_get("model_id").map_err(internal_error)?,
+                offering_id: row.try_get("model_id").map_err(internal_error)?,
+                access_id: "self-hosted".to_string(),
+                access_kind: ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".to_string(),
+                execution_placement: ModelExecutionPlacement::Server,
                 name,
                 provider: row.try_get("provider").map_err(internal_error)?,
                 description: row.try_get("description").map_err(internal_error)?,
@@ -1641,6 +2083,34 @@ impl ModelService for DatabaseModelService {
             )
         })?;
         Self::model_record_from_row(row)
+    }
+
+    async fn resolve_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        resolve_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn revalidate_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
     }
 
     async fn update_model(
@@ -2518,6 +2988,12 @@ impl ModelService for UnconfiguredModelService {
     async fn get_model(&self, _: String) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("model service not configured"))
     }
+    async fn resolve_model_offering(
+        &self,
+        _: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("model service not configured"))
+    }
     async fn update_model(
         &self,
         _: String,
@@ -2608,9 +3084,14 @@ pub struct ModelResponse {
     pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelListItemResponse {
-    pub model_id: String,
+    pub offering_id: String,
+    pub access_id: String,
+    pub access_kind: ModelAccessKind,
+    pub access_label: String,
+    pub execution_placement: ModelExecutionPlacement,
     pub name: String,
     pub provider: String,
     pub description: Option<String>,
@@ -2618,7 +3099,6 @@ pub struct ModelListItemResponse {
     pub context_window: i32,
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_capability: Option<ThinkingCapability>,
 }
 
@@ -2650,7 +3130,11 @@ impl From<ModelRecord> for ModelResponse {
 impl From<ModelListItem> for ModelListItemResponse {
     fn from(r: ModelListItem) -> Self {
         Self {
-            model_id: r.model_id,
+            offering_id: r.offering_id,
+            access_id: r.access_id,
+            access_kind: r.access_kind,
+            access_label: r.access_label,
+            execution_placement: r.execution_placement,
             name: r.name,
             provider: r.provider,
             description: r.description,
@@ -2663,6 +3147,404 @@ impl From<ModelListItem> for ModelListItemResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredModelAccess {
+    pub id: String,
+    pub kind: ModelAccessKind,
+    pub label: String,
+    pub execution_placement: ModelExecutionPlacement,
+    pub availability: ModelAccessAvailability,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessStatus {
+    SettingUp,
+    Ready,
+    Degraded,
+    ActionRequired,
+    Unavailable,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessReason {
+    Provisioning,
+    NoEligibleOfferings,
+    ReauthenticationRequired,
+    BillingActionRequired,
+    ConnectionDegraded,
+    ConnectionUnavailable,
+    DeviceOffline,
+    PolicyDisabled,
+}
+
+/// Source-owned availability facts used to build the user-facing projection.
+///
+/// Effective Offerings remain a separate fact: `Ready` without any eligible
+/// Offering projects to `ActionRequired`, while non-usable states must not
+/// expose an Offering that clients could select.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelAccessAvailability {
+    Ready,
+    SettingUp {
+        reason: ModelAccessReason,
+    },
+    Degraded {
+        reason: ModelAccessReason,
+        usable: bool,
+        retry_after_seconds: Option<u32>,
+    },
+    ActionRequired {
+        reason: ModelAccessReason,
+    },
+    Unavailable {
+        reason: ModelAccessReason,
+        retry_after_seconds: Option<u32>,
+    },
+    Disabled {
+        reason: ModelAccessReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessAction {
+    ContactAdministrator,
+    ReconnectDevice,
+    ConfigureDeviceModels,
+    Reauthenticate,
+    ManageBilling,
+    Retry,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAccessViewResponse {
+    pub id: String,
+    pub kind: ModelAccessKind,
+    pub label: String,
+    pub execution_placement: ModelExecutionPlacement,
+    pub status: ModelAccessStatus,
+    pub reason: Option<ModelAccessReason>,
+    pub usable: bool,
+    pub retry_after_seconds: Option<u32>,
+    pub available_model_count: u32,
+    pub actions: Vec<ModelAccessAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAccessProjectionResponse {
+    pub accesses: Vec<ModelAccessViewResponse>,
+    pub offerings: Vec<ModelListItemResponse>,
+    pub default_offering_id: Option<String>,
+    pub catalog_revision: String,
+    pub observed_at: String,
+}
+
+struct ProjectedModelAccessAvailability {
+    status: ModelAccessStatus,
+    reason: Option<ModelAccessReason>,
+    usable: bool,
+    retry_after_seconds: Option<u32>,
+    actions: Vec<ModelAccessAction>,
+}
+
+fn model_access_projection_conflict(
+    access: &DeclaredModelAccess,
+    detail: &str,
+) -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::conflict(format!(
+        "Model Access '{}' has inconsistent availability: {detail}",
+        access.id
+    ))
+}
+
+fn validate_retry_after(
+    access: &DeclaredModelAccess,
+    retry_after_seconds: Option<u32>,
+) -> crate::service_error::ServiceResult<()> {
+    if retry_after_seconds == Some(0) {
+        return Err(model_access_projection_conflict(
+            access,
+            "retry_after_seconds must be positive when present",
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_actions(
+    kind: ModelAccessKind,
+    status: ModelAccessStatus,
+    reason: Option<ModelAccessReason>,
+) -> Vec<ModelAccessAction> {
+    match (status, reason, kind) {
+        (ModelAccessStatus::Ready | ModelAccessStatus::SettingUp, _, _) => Vec::new(),
+        (_, Some(ModelAccessReason::ReauthenticationRequired), _) => {
+            vec![ModelAccessAction::Reauthenticate]
+        }
+        (_, Some(ModelAccessReason::BillingActionRequired), _) => {
+            vec![ModelAccessAction::ManageBilling]
+        }
+        (_, Some(ModelAccessReason::DeviceOffline), _) => {
+            vec![ModelAccessAction::ReconnectDevice]
+        }
+        (_, Some(ModelAccessReason::NoEligibleOfferings), ModelAccessKind::ThisDevice) => {
+            vec![ModelAccessAction::ConfigureDeviceModels]
+        }
+        (
+            _,
+            Some(ModelAccessReason::NoEligibleOfferings | ModelAccessReason::PolicyDisabled),
+            _,
+        ) => {
+            vec![ModelAccessAction::ContactAdministrator]
+        }
+        (
+            ModelAccessStatus::Degraded | ModelAccessStatus::Unavailable,
+            Some(ModelAccessReason::ConnectionDegraded | ModelAccessReason::ConnectionUnavailable),
+            _,
+        ) => vec![ModelAccessAction::Retry],
+        _ => Vec::new(),
+    }
+}
+
+fn project_access_availability(
+    access: &DeclaredModelAccess,
+    available_model_count: u32,
+) -> crate::service_error::ServiceResult<ProjectedModelAccessAvailability> {
+    let has_offerings = available_model_count > 0;
+    let (status, reason, usable, retry_after_seconds) = match &access.availability {
+        ModelAccessAvailability::Ready if has_offerings => {
+            (ModelAccessStatus::Ready, None, true, None)
+        }
+        ModelAccessAvailability::Ready => (
+            ModelAccessStatus::ActionRequired,
+            Some(ModelAccessReason::NoEligibleOfferings),
+            false,
+            None,
+        ),
+        ModelAccessAvailability::SettingUp { reason } => {
+            if *reason != ModelAccessReason::Provisioning || has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "setting_up requires provisioning with no effective Offerings",
+                ));
+            }
+            (ModelAccessStatus::SettingUp, Some(*reason), false, None)
+        }
+        ModelAccessAvailability::Degraded {
+            reason,
+            usable,
+            retry_after_seconds,
+        } => {
+            if *reason != ModelAccessReason::ConnectionDegraded || *usable != has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "degraded requires a connection_degraded reason and usable must match effective Offering availability",
+                ));
+            }
+            validate_retry_after(access, *retry_after_seconds)?;
+            (
+                ModelAccessStatus::Degraded,
+                Some(*reason),
+                *usable,
+                *retry_after_seconds,
+            )
+        }
+        ModelAccessAvailability::ActionRequired { reason } => {
+            if has_offerings
+                || !matches!(
+                    reason,
+                    ModelAccessReason::NoEligibleOfferings
+                        | ModelAccessReason::ReauthenticationRequired
+                        | ModelAccessReason::BillingActionRequired
+                )
+            {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "action_required has an invalid reason or still exposes an effective Offering",
+                ));
+            }
+            (
+                ModelAccessStatus::ActionRequired,
+                Some(*reason),
+                false,
+                None,
+            )
+        }
+        ModelAccessAvailability::Unavailable {
+            reason,
+            retry_after_seconds,
+        } => {
+            if has_offerings
+                || !matches!(
+                    reason,
+                    ModelAccessReason::ConnectionUnavailable | ModelAccessReason::DeviceOffline
+                )
+            {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "unavailable has an invalid reason or still exposes an effective Offering",
+                ));
+            }
+            validate_retry_after(access, *retry_after_seconds)?;
+            (
+                ModelAccessStatus::Unavailable,
+                Some(*reason),
+                false,
+                *retry_after_seconds,
+            )
+        }
+        ModelAccessAvailability::Disabled { reason } => {
+            if *reason != ModelAccessReason::PolicyDisabled || has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "disabled requires policy_disabled with no effective Offerings",
+                ));
+            }
+            (ModelAccessStatus::Disabled, Some(*reason), false, None)
+        }
+    };
+    let actions = recovery_actions(access.kind, status, reason);
+    Ok(ProjectedModelAccessAvailability {
+        status,
+        reason,
+        usable,
+        retry_after_seconds,
+        actions,
+    })
+}
+
+/// Build the user-facing Model Access projection from declared product
+/// sources and the effective Offerings admitted for this principal.
+///
+/// An Offering cannot silently redefine the kind, label, or placement of its
+/// access source. That mismatch is a contract error rather than a UI guess.
+pub fn project_model_access(
+    declared: Vec<DeclaredModelAccess>,
+    mut offerings: Vec<ModelListItemResponse>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    let mut accesses = BTreeMap::new();
+    for access in declared {
+        if let Some(existing) = accesses.insert(access.id.clone(), access.clone())
+            && existing != access
+        {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "Model Access '{}' was declared with inconsistent product facts",
+                access.id
+            )));
+        }
+    }
+
+    offerings.sort_by_cached_key(|offering| {
+        (
+            offering.access_id.clone(),
+            offering.name.to_ascii_lowercase(),
+            offering.offering_id.clone(),
+        )
+    });
+
+    let mut offering_ids = BTreeSet::new();
+    let mut counts = BTreeMap::<String, u32>::new();
+    for offering in &offerings {
+        validate_model_offering_id(&offering.offering_id).map_err(|_| {
+            crate::service_error::ServiceError::invalid(format!(
+                "effective Offering has invalid identity: {:?}",
+                offering.offering_id
+            ))
+        })?;
+        if !offering.is_active {
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "inactive Offering '{}' cannot appear in the effective catalog",
+                offering.offering_id
+            )));
+        }
+        if !offering_ids.insert(offering.offering_id.clone()) {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "effective Offering '{}' was projected more than once",
+                offering.offering_id
+            )));
+        }
+        let Some(access) = accesses.get(&offering.access_id) else {
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "Offering '{}' references undeclared Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        };
+        if access.kind != offering.access_kind
+            || access.label != offering.access_label
+            || access.execution_placement != offering.execution_placement
+        {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "Offering '{}' conflicts with Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        }
+        let count = counts.entry(offering.access_id.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    let accesses: Vec<ModelAccessViewResponse> = accesses
+        .into_values()
+        .map(|access| {
+            let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
+            let availability = project_access_availability(&access, available_model_count)?;
+            Ok(ModelAccessViewResponse {
+                id: access.id,
+                kind: access.kind,
+                label: access.label,
+                execution_placement: access.execution_placement,
+                status: availability.status,
+                reason: availability.reason,
+                usable: availability.usable,
+                retry_after_seconds: availability.retry_after_seconds,
+                available_model_count,
+                actions: availability.actions,
+            })
+        })
+        .collect::<crate::service_error::ServiceResult<_>>()?;
+
+    // Phase 0 has one deterministic Server-owned default policy: the first
+    // canonical active Offering. Clients receive the decision and never
+    // recreate this ordering rule locally.
+    let default_offering_id = offerings
+        .first()
+        .map(|offering| offering.offering_id.clone());
+
+    #[derive(Serialize)]
+    struct CatalogRevisionFacts<'a> {
+        accesses: &'a [ModelAccessViewResponse],
+        offerings: &'a [ModelListItemResponse],
+        default_offering_id: &'a Option<String>,
+    }
+    let revision_bytes = serde_json::to_vec(&CatalogRevisionFacts {
+        accesses: &accesses,
+        offerings: &offerings,
+        default_offering_id: &default_offering_id,
+    })
+    .map_err(|error| {
+        crate::service_error::ServiceError::with_source(
+            crate::service_error::ServiceErrorKind::Internal,
+            "failed to serialize Model Access catalog revision facts",
+            error,
+        )
+    })?;
+    let catalog_revision = format!("sha256:{:x}", Sha256::digest(revision_bytes));
+
+    Ok(ModelAccessProjectionResponse {
+        accesses,
+        offerings,
+        default_offering_id,
+        catalog_revision,
+        observed_at,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2670,6 +3552,86 @@ impl From<ModelListItem> for ModelListItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offering_identity_is_exact_and_bounded() {
+        assert_eq!(validate_model_offering_id("model-123"), Ok("model-123"));
+        for invalid in ["", " model-123", "model-123 ", "model\n123"] {
+            assert_eq!(
+                validate_model_offering_id(invalid),
+                Err(ModelOfferingResolutionError::InvalidOfferingId)
+            );
+        }
+        let too_long = "x".repeat(65);
+        assert_eq!(
+            validate_model_offering_id(&too_long),
+            Err(ModelOfferingResolutionError::InvalidOfferingId)
+        );
+    }
+
+    #[test]
+    fn offering_resolution_failures_have_stable_machine_codes() {
+        let cases = [
+            (
+                ModelOfferingResolutionError::InvalidOfferingId,
+                StatusCode::BAD_REQUEST,
+                "model_selection_invalid",
+            ),
+            (
+                ModelOfferingResolutionError::NotFound {
+                    offering_id: "offer-missing".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "model_offering_not_found",
+            ),
+            (
+                ModelOfferingResolutionError::Inactive {
+                    offering_id: "offer-offline".into(),
+                    model_name: "display-model".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "model_offering_unavailable",
+            ),
+            (
+                ModelOfferingResolutionError::Backend("database unavailable".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_catalog_unavailable",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let (status, body) = model_offering_resolution_error_response(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body.error_code.as_deref(), Some(expected_code));
+        }
+    }
+
+    #[test]
+    fn cache_identity_separates_model_names_from_offering_ids() {
+        let matrixone = MatrixOneSettings::mock();
+        assert_ne!(
+            ActiveLlmModelCacheKey::new(&matrixone, "same-value"),
+            ActiveLlmModelCacheKey::for_offering_id(&matrixone, "same-value")
+        );
+    }
+
+    #[test]
+    fn admitted_execution_debug_output_redacts_credentials_and_endpoint() {
+        let execution = AdmittedModelExecution::from_endpoint(
+            "offer-private".to_string(),
+            "private-model".to_string(),
+            "openai".to_string(),
+            "https://private.example/v1/chat/completions".to_string(),
+            "Bearer top-secret".to_string(),
+            Some(2_500),
+        );
+
+        let debug = format!("{execution:?}");
+        assert!(!debug.contains("top-secret"));
+        assert!(!debug.contains("private.example"));
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("completions_url_override_present: true"));
+    }
 
     // ── resolve_model_alias ──
     //
@@ -3479,7 +4441,11 @@ mod tests {
     #[test]
     fn model_list_item_to_response_preserves_fields() {
         let item = ModelListItem {
-            model_id: "m1".into(),
+            offering_id: "m1".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "gpt-4o".into(),
             provider: "openai".into(),
             description: Some("fast".into()),
@@ -3490,7 +4456,9 @@ mod tests {
             thinking_capability: Some(ThinkingCapability::Both),
         };
         let resp = ModelListItemResponse::from(item.clone());
-        assert_eq!(resp.model_id, item.model_id);
+        assert_eq!(resp.offering_id, item.offering_id);
+        assert_eq!(resp.access_id, "self-hosted");
+        assert_eq!(resp.execution_placement, ModelExecutionPlacement::Server);
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
         assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
@@ -3499,7 +4467,11 @@ mod tests {
     #[test]
     fn model_list_item_with_none_optionals() {
         let item = ModelListItem {
-            model_id: "m2".into(),
+            offering_id: "m2".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "test".into(),
             provider: "local".into(),
             description: None,
@@ -3514,6 +4486,283 @@ mod tests {
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
         assert!(resp.thinking_capability.is_none());
+    }
+
+    #[test]
+    fn model_access_projection_reports_effective_offerings_and_recovery() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = ModelListItemResponse::from(ModelListItem {
+            offering_id: "offer-1".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Model One".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: Some(8_192),
+            architecture: None,
+            thinking_capability: None,
+        });
+
+        let ready = project_model_access(
+            vec![declared.clone()],
+            vec![offering],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("ready projection");
+        assert_eq!(ready.accesses.len(), 1);
+        assert_eq!(ready.accesses[0].status, ModelAccessStatus::Ready);
+        assert_eq!(ready.accesses[0].reason, None);
+        assert!(ready.accesses[0].usable);
+        assert_eq!(ready.accesses[0].retry_after_seconds, None);
+        assert_eq!(ready.accesses[0].available_model_count, 1);
+        assert!(ready.accesses[0].actions.is_empty());
+        assert_eq!(ready.offerings[0].offering_id, "offer-1");
+        assert_eq!(ready.default_offering_id.as_deref(), Some("offer-1"));
+        assert!(ready.catalog_revision.starts_with("sha256:"));
+
+        let same_catalog_later = project_model_access(
+            vec![declared.clone()],
+            ready.offerings.clone(),
+            "2026-07-20T01:00:00Z".into(),
+        )
+        .expect("same catalog at a later observation time");
+        assert_eq!(same_catalog_later.catalog_revision, ready.catalog_revision);
+        assert_ne!(same_catalog_later.observed_at, ready.observed_at);
+
+        let action_required =
+            project_model_access(vec![declared], Vec::new(), "2026-07-20T00:00:01Z".into())
+                .expect("action-required projection");
+        assert_eq!(
+            action_required.accesses[0].status,
+            ModelAccessStatus::ActionRequired
+        );
+        assert_eq!(
+            action_required.accesses[0].reason,
+            Some(ModelAccessReason::NoEligibleOfferings)
+        );
+        assert!(!action_required.accesses[0].usable);
+        assert_eq!(
+            action_required.accesses[0].actions,
+            vec![ModelAccessAction::ContactAdministrator]
+        );
+        assert!(action_required.default_offering_id.is_none());
+        assert_ne!(action_required.catalog_revision, ready.catalog_revision);
+
+        let device = project_model_access(
+            vec![DeclaredModelAccess {
+                id: "this-device".into(),
+                kind: ModelAccessKind::ThisDevice,
+                label: "This device".into(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
+            }],
+            Vec::new(),
+            "2026-07-20T00:00:02Z".into(),
+        )
+        .expect("device without models is repairable configuration state");
+        assert_eq!(
+            device.accesses[0].actions,
+            vec![ModelAccessAction::ConfigureDeviceModels]
+        );
+    }
+
+    #[test]
+    fn model_access_projection_preserves_typed_recovery_without_fake_offerings() {
+        let access = |availability| DeclaredModelAccess {
+            id: "access-1".into(),
+            kind: ModelAccessKind::AstraCloud,
+            label: "Astra Cloud".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability,
+        };
+
+        for (availability, status, reason, action, retry_after_seconds) in [
+            (
+                ModelAccessAvailability::SettingUp {
+                    reason: ModelAccessReason::Provisioning,
+                },
+                ModelAccessStatus::SettingUp,
+                ModelAccessReason::Provisioning,
+                None,
+                None,
+            ),
+            (
+                ModelAccessAvailability::ActionRequired {
+                    reason: ModelAccessReason::ReauthenticationRequired,
+                },
+                ModelAccessStatus::ActionRequired,
+                ModelAccessReason::ReauthenticationRequired,
+                Some(ModelAccessAction::Reauthenticate),
+                None,
+            ),
+            (
+                ModelAccessAvailability::ActionRequired {
+                    reason: ModelAccessReason::BillingActionRequired,
+                },
+                ModelAccessStatus::ActionRequired,
+                ModelAccessReason::BillingActionRequired,
+                Some(ModelAccessAction::ManageBilling),
+                None,
+            ),
+            (
+                ModelAccessAvailability::Unavailable {
+                    reason: ModelAccessReason::ConnectionUnavailable,
+                    retry_after_seconds: Some(30),
+                },
+                ModelAccessStatus::Unavailable,
+                ModelAccessReason::ConnectionUnavailable,
+                Some(ModelAccessAction::Retry),
+                Some(30),
+            ),
+            (
+                ModelAccessAvailability::Disabled {
+                    reason: ModelAccessReason::PolicyDisabled,
+                },
+                ModelAccessStatus::Disabled,
+                ModelAccessReason::PolicyDisabled,
+                Some(ModelAccessAction::ContactAdministrator),
+                None,
+            ),
+        ] {
+            let projection = project_model_access(
+                vec![access(availability)],
+                Vec::new(),
+                "2026-07-20T00:00:00Z".into(),
+            )
+            .expect("valid source state");
+            let projected = &projection.accesses[0];
+            assert_eq!(projected.status, status);
+            assert_eq!(projected.reason, Some(reason));
+            assert!(!projected.usable);
+            assert_eq!(projected.actions.first().copied(), action);
+            assert_eq!(projected.retry_after_seconds, retry_after_seconds);
+            assert!(projection.offerings.is_empty());
+            assert!(projection.default_offering_id.is_none());
+        }
+    }
+
+    #[test]
+    fn model_access_projection_rejects_non_usable_source_with_effective_offering() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Disabled {
+                reason: ModelAccessReason::PolicyDisabled,
+            },
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-1".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Model One".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+
+        let error = project_model_access(
+            vec![declared],
+            vec![offering],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect_err("disabled access cannot expose a selectable Offering");
+        assert_eq!(error.kind, crate::service_error::ServiceErrorKind::Conflict);
+    }
+
+    #[test]
+    fn model_access_projection_has_order_independent_default_and_revision() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = |id: &str, name: &str| ModelListItemResponse {
+            offering_id: id.into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: name.into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let alpha = offering("offer-alpha", "Alpha");
+        let beta = offering("offer-beta", "Beta");
+
+        let forward = project_model_access(
+            vec![declared.clone()],
+            vec![alpha.clone(), beta.clone()],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("forward catalog");
+        let reverse = project_model_access(
+            vec![declared],
+            vec![beta, alpha],
+            "2026-07-20T00:00:01Z".into(),
+        )
+        .expect("reverse catalog");
+
+        assert_eq!(forward.default_offering_id.as_deref(), Some("offer-alpha"));
+        assert_eq!(reverse.default_offering_id, forward.default_offering_id);
+        assert_eq!(reverse.catalog_revision, forward.catalog_revision);
+        assert_eq!(reverse.offerings, forward.offerings);
+    }
+
+    #[test]
+    fn model_access_projection_rejects_offering_scope_drift() {
+        let error = project_model_access(
+            vec![DeclaredModelAccess {
+                id: "self-hosted".into(),
+                kind: ModelAccessKind::SelfHosted,
+                label: "Self-hosted".into(),
+                execution_placement: ModelExecutionPlacement::Server,
+                availability: ModelAccessAvailability::Ready,
+            }],
+            vec![ModelListItemResponse {
+                offering_id: "offer-1".into(),
+                access_id: "self-hosted".into(),
+                access_kind: ModelAccessKind::ThisDevice,
+                access_label: "This device".into(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                name: "Drifted".into(),
+                provider: "openai".into(),
+                description: None,
+                is_active: true,
+                context_window: 8_192,
+                max_completion_tokens: None,
+                architecture: None,
+                thinking_capability: None,
+            }],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect_err("Offering cannot redefine its access boundary");
+
+        assert_eq!(error.kind, crate::service_error::ServiceErrorKind::Conflict);
     }
 
     /// After the thinking probe UPDATE writes `thinking_capability` and
@@ -3753,7 +5002,11 @@ mod tests {
     #[test]
     fn model_list_item_response_json_uses_is_active_snake_case() {
         let item = ModelListItem {
-            model_id: "m3".into(),
+            offering_id: "m3".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "probe".into(),
             provider: "openai".into(),
             description: None,
@@ -3848,11 +5101,11 @@ mod tests {
         assert!(msg.contains("Invalid base_url"), "got: {msg}");
     }
 
-    // ── resolve_memory_model: selector tag preference ──────────────────
+    // ── memory model ranking: selector tag preference ──────────────────
 
     #[test]
     fn selector_tag_detected_in_tags_json() {
-        // Simulates the tag matching logic from resolve_memory_model.
+        // Simulates the tag matching logic from memory model ranking.
         let with_selector = r#"["chat", "selector"]"#;
         let without_selector = r#"["chat", "reasoning"]"#;
         let empty = "[]";

@@ -1573,7 +1573,7 @@ async fn plan_executor_task(
                     input_work_unit_observations: &[],
                     semantic_query_override: None,
                     session_id: ctx.session_id.as_deref(),
-                    model_id: None,
+                    offering_id: None,
                     model: ctx.model.as_deref(),
                     provider: None,
                     explain: crate::cli::session::session_state::ExplainMode::Off,
@@ -3685,7 +3685,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -3734,7 +3734,7 @@ All acceptance checks pass:
                 source: None,
                 run_id: None,
                 tool_calls: None,
-                ..Default::default()
+                ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
             });
         }
         // Emit observability events first (mirrors Ok(result) branch).
@@ -3801,7 +3801,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
         });
 
         // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.

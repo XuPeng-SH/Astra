@@ -16,10 +16,11 @@ use serde_json::{Map, Value};
 
 use crate::models::ModelListItem;
 use crate::runs::{
-    RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
-    RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
-    SelectedModelRequest,
+    ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
+    RuntimeCapabilityDescriptorsRequest, RuntimeMcpBindingRequest,
+    RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
 };
+use astra_turn_types::ModelSelection;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalProviderPublicRecord {
@@ -149,7 +150,11 @@ pub struct ExternalCatalogModel {
 impl ExternalCatalogModel {
     fn into_model_list_item(self) -> ModelListItem {
         ModelListItem {
-            model_id: self.id,
+            offering_id: self.id,
+            access_id: "this-device".to_string(),
+            access_kind: crate::models::ModelAccessKind::ThisDevice,
+            access_label: "This device".to_string(),
+            execution_placement: crate::models::ModelExecutionPlacement::Edge,
             name: self.display_name.unwrap_or(self.name),
             provider: self.provider_ref.unwrap_or_default(),
             description: string_value(&self.metadata, "description"),
@@ -433,11 +438,16 @@ pub struct ExternalSelectedModelResponse {
 }
 
 impl ExternalSelectedModelResponse {
-    pub fn to_selected_model_request(&self) -> SelectedModelRequest {
-        SelectedModelRequest {
-            id: Some(self.id.clone()),
-            model: self.model.clone(),
-            gateway: None,
+    pub fn to_model_selection(&self) -> ModelSelection {
+        ModelSelection {
+            offering_id: self.id.clone(),
+        }
+    }
+
+    pub fn to_resolved_model_selection(&self) -> ResolvedModelSelection {
+        ResolvedModelSelection {
+            offering_id: self.id.clone(),
+            model_name: self.model.clone(),
         }
     }
 }
@@ -1299,7 +1309,15 @@ mod tests {
             .expect("list_catalog should parse MOI catalog");
         assert_eq!(catalog.models[0].id, "model-qwen");
         let model = ModelListItem::from(catalog.models.into_iter().next().unwrap());
-        assert_eq!(model.model_id, "model-qwen");
+        assert_eq!(model.offering_id, "model-qwen");
+        assert_eq!(
+            model.access_kind,
+            crate::models::ModelAccessKind::ThisDevice
+        );
+        assert_eq!(
+            model.execution_placement,
+            crate::models::ModelExecutionPlacement::Edge
+        );
         assert_eq!(model.name, "Qwen 2.5");
 
         let runtime_context = client
@@ -1574,7 +1592,7 @@ mod tests {
                     "type": "model_gateway",
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
-                    "protocol": "openai_responses",
+                    "protocol": "openai_chat_completions",
                     "metadata": {}
                 }
             },
@@ -1595,7 +1613,7 @@ mod tests {
             .capability_descriptors
             .model_gateway
             .expect("model gateway");
-        assert_eq!(model_gateway.protocol, "openai_responses");
+        assert_eq!(model_gateway.protocol, "openai_chat_completions");
         assert_eq!(
             model_gateway.endpoint_url,
             "http://127.0.0.1/api/v1/models/openai/chat/completions"
@@ -1689,7 +1707,7 @@ mod tests {
                     "type": "model_gateway",
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
-                    "protocol": "openai_responses",
+                    "protocol": "openai_chat_completions",
                     "metadata": {}
                 },
                 "mcp": {

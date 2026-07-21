@@ -96,14 +96,34 @@ pub struct ReconnectReservation {
     /// connection existed), held alive across the DB await so a concurrent
     /// cleanup of the previous connection cannot drop its waiters.
     pending: Option<Arc<DashMap<String, PendingEdgeResult>>>,
+    connections: Arc<DashMap<String, EdgeConnection>>,
     intents: Arc<DashMap<String, ()>>,
 }
 
 impl Drop for ReconnectReservation {
     fn drop(&mut self) {
-        // Backstop: always clear the intent so a leaked reservation cannot
-        // permanently suppress pending-map cleanup for this key.
-        self.intents.remove(&self.key);
+        // Resolve the reservation and clear its intent under the same
+        // connection-shard lock used by registration and cleanup. If another
+        // registration won the race but did not inherit this reservation's
+        // pending map, those waiters have no delivery owner and must fail now.
+        match self.connections.entry(self.key.clone()) {
+            Entry::Occupied(connection) => {
+                let inherited = self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &connection.get().pending_results));
+                if !inherited && let Some(pending) = &self.pending {
+                    pending.clear();
+                }
+                self.intents.remove(&self.key);
+            }
+            Entry::Vacant(_) => {
+                if let Some(pending) = &self.pending {
+                    pending.clear();
+                }
+                self.intents.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -335,6 +355,7 @@ impl EdgeConnectionPool {
         ReconnectReservation {
             key,
             pending,
+            connections: self.connections.clone(),
             intents: self.reconnect_intents.clone(),
         }
     }
@@ -394,13 +415,11 @@ impl EdgeConnectionPool {
         user_id: &str,
         edge_agent_id: &str,
     ) {
-        let key = pool_key(user_id, edge_agent_id);
-        if !self.connections.contains_key(&key)
-            && let Some(pending) = &reservation.pending
-        {
-            pending.clear();
-        }
-        // `reservation` drops here, clearing the intent.
+        debug_assert_eq!(reservation.key, pool_key(user_id, edge_agent_id));
+        // `ReconnectReservation::drop` performs the atomic abort and clears the
+        // intent. Keeping the failure behavior on the reservation also covers
+        // early returns and panics that bypass this explicit method.
+        drop(reservation);
     }
 
     /// Remove only the connection incarnation registered by the caller.
@@ -1068,7 +1087,7 @@ mod tests {
     /// delivery_generation) once the ToolRequest reaches the socket.
     async fn admit_on_edge_a(
         pool: &EdgeConnectionPool,
-        label: &'static str,
+        label: &str,
         socket_rx: &mut mpsc::Receiver<EdgeServerMessage>,
     ) -> (tokio::task::JoinHandle<Option<EdgeToolResult>>, String, u64) {
         let identity = admitted_identity(label);
@@ -1233,6 +1252,47 @@ mod tests {
         assert!(!pool.has_connected_edge("user-1"));
         // The caller resolves to a failure promptly (sender dropped), not a hang.
         assert!(caller.await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_abort_racing_with_plain_registration_never_strands_waiters() {
+        for iteration in 0..64 {
+            let pool = EdgeConnectionPool::new();
+            let (old_tx, mut old_rx) = mpsc::channel(1);
+            let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+            let (caller, _, _) =
+                admit_on_edge_a(&pool, &format!("abort-race-{iteration}"), &mut old_rx).await;
+
+            let reservation = pool.begin_reconnect("user-1", "edge-a");
+            assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let abort_barrier = barrier.clone();
+            let abort = std::thread::spawn(move || {
+                abort_barrier.wait();
+                drop(reservation);
+            });
+
+            let register_pool = pool.clone();
+            let register_barrier = barrier.clone();
+            let (new_tx, _new_rx) = mpsc::channel(1);
+            let register = std::thread::spawn(move || {
+                register_barrier.wait();
+                register_pool
+                    .register_with_capabilities("user-1", "edge-a", None, None, None, None, new_tx)
+            });
+
+            abort.join().expect("abort thread");
+            register.join().expect("registration thread");
+            let result = tokio::time::timeout(Duration::from_secs(1), caller)
+                .await
+                .expect("aborted waiter must resolve")
+                .expect("tool task must not panic");
+            assert!(
+                result.is_none(),
+                "iteration {iteration}: a non-inheriting registration cannot own the old waiter"
+            );
+        }
     }
 
     #[tokio::test]

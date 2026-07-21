@@ -51,31 +51,41 @@ const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 struct CliServerProxySummaryClient {
     api: astra_thin_client::ThinClient,
     token: String,
-    model: Option<String>,
+    base_scope: astra_turn_types::InferenceInvocationScope,
+    next_logical_attempt: std::sync::atomic::AtomicU32,
 }
 
 #[async_trait]
 impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryClient {
     async fn summarize(
         &self,
+        purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        let mut body = serde_json::json!({
-            "messages": messages,
-            "max_tokens": 256,
-            "temperature": 0.0,
-        });
-        if let Some(model) = self.model.as_deref() {
-            body["model"] = serde_json::json!(model);
+        if purpose != astra_turn_types::InferencePurpose::Introspection {
+            return Err(format!(
+                "skill auto-route proxy received unsupported inference purpose {purpose}"
+            ));
         }
+        let logical_attempt = self
+            .next_logical_attempt
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut request = astra_thin_client::CompletionRequest::from_session_scope(
+            astra_thin_client::CompletionOperation::SkillAutoRoute,
+            &self.base_scope.with_logical_attempt(logical_attempt),
+            messages.to_vec(),
+        )
+        .map_err(str::to_string)?;
+        request.max_tokens = 256;
+        request.temperature = 0.0;
         let response = self
             .api
-            .post_completions(&self.token, &body)
+            .post_completions(&self.token, &request)
             .await
             .map_err(|error| error.to_string())?;
-        let text = response["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| format!("missing completion content in response: {response}"))?
+        let text = response
+            .first_text()
+            .ok_or_else(|| "Astra Server returned a completion without choices".to_string())?
             .to_string();
         Ok(astra_turn_core::cloud_summary::SummaryResponse {
             text,
@@ -102,7 +112,7 @@ impl astra_services::SkillAutoRouteJudge for CliSummaryClientSkillAutoRouteJudge
             .collect::<Vec<_>>();
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(astra_services::SkillAutoRouteJudgeError::Transport)?;
         astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
@@ -215,7 +225,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
     pub auth_profile: Option<&'a str>,
-    pub model_id: Option<String>,
+    pub offering_id: Option<String>,
     pub model: Option<&'a str>,
     pub context_window_tokens: u32,
     pub explain: ExplainMode,
@@ -630,18 +640,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // but do not inline it into `messages[]`. The server resolves the
         // concrete model row and applies prompt-cache capability metadata before
         // deciding whether this lane is safe to inject.
-        // If a skill activation overrode the model, use that; otherwise fall back to host default.
-        let effective_model_owned = state
-            .skills
-            .model_override
-            .clone()
-            .or_else(|| self.model.map(str::to_owned));
+        let effective_model_owned = self.model.map(str::to_owned);
         let effective_model = effective_model_owned.as_deref();
-        let effective_model_id = if state.skills.model_override.is_some() {
-            None
-        } else {
-            self.model_id.as_deref()
-        };
+        let effective_offering_id = self.offering_id.as_deref();
         let runtime_volatile_injections = state.take_volatile_pending();
         let runtime_volatile_texts = self
             .input_runtime_volatile_texts
@@ -734,7 +735,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     api: self.api,
                     token: self.token.as_str(),
                     auth_profile: self.auth_profile,
-                    model_id: effective_model_id,
+                    offering_id: effective_offering_id,
                     model: effective_model,
                     context_window_tokens: self.context_window_tokens,
                     effective_input_budget_tokens: state.max_turn_input_tokens,
@@ -934,15 +935,19 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
             return None;
         }
+        let session_id = state.current_session_id.as_ref()?.clone();
         let service_ctx = cli_skill_auto_route_service_context(ctx);
         let client = CliServerProxySummaryClient {
             api: self.api.clone(),
             token: self.token.clone(),
-            model: state
-                .skills
-                .model_override
-                .clone()
-                .or_else(|| self.model.map(str::to_string)),
+            base_scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id,
+                turn: state.session_turn,
+                round: state.current_round_index,
+                operation_id: "skill_auto_route".to_string(),
+                logical_attempt: 0,
+            },
+            next_logical_attempt: std::sync::atomic::AtomicU32::new(0),
         };
         let judge = CliSummaryClientSkillAutoRouteJudge {
             client: Box::new(client),
@@ -1343,12 +1348,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return,
         };
-        let model_selector = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model)
-            .unwrap_or("");
+        let model_selector = self.model.unwrap_or("");
         let model_id = model_selector.to_string();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();
@@ -1514,6 +1514,7 @@ mod tests {
     impl astra_turn_core::cloud_summary::SummaryLlmClient for ScriptedSummaryClient {
         async fn summarize(
             &self,
+            _purpose: astra_turn_types::InferencePurpose,
             _messages: &[serde_json::Value],
         ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
             Ok(astra_turn_core::cloud_summary::SummaryResponse {

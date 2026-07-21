@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -330,8 +330,15 @@ fn body_fail(_agent_id: &str, turn: u32) -> String {
     s
 }
 
-async fn body_slow(agent_id: &str, turn: u32) -> String {
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+async fn body_slow(
+    agent_id: &str,
+    turn: u32,
+    held_response_release: Option<&tokio::sync::Notify>,
+) -> String {
+    match held_response_release {
+        Some(release) => release.notified().await,
+        None => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
+    }
     body_complete(agent_id, turn)
 }
 
@@ -491,20 +498,28 @@ fn fanout_journey_child_index(body: &Value) -> Option<usize> {
         .position(|candidate| *candidate == prompt)
 }
 
-async fn body_fanout_then_complete(body: &Value, failed_child: Option<usize>) -> String {
+async fn body_fanout_then_complete(
+    body: &Value,
+    failed_child: Option<usize>,
+    completed_children: &AtomicU8,
+    held_response_release: Option<&tokio::sync::Notify>,
+) -> String {
     if let Some(index) = fanout_journey_child_index(body) {
-        tokio::time::sleep(std::time::Duration::from_millis(match index {
-            0 => 250,
-            1 => 700,
-            _ => 6_000,
-        }))
-        .await;
+        match index {
+            0 => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            1 => tokio::time::sleep(std::time::Duration::from_millis(700)).await,
+            _ => match held_response_release {
+                Some(release) => release.notified().await,
+                None => tokio::time::sleep(std::time::Duration::from_secs(6)).await,
+            },
+        }
         if failed_child == Some(index) {
             let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
             stream.push_str(&error_event(&format!(
                 "fanout_child_{}_failed_with_distinct_cause",
                 index + 1
             )));
+            completed_children.fetch_or(1 << index, Ordering::Release);
             return stream;
         }
         let message = format!("fanout_child_{}_evidence_visible", index + 1);
@@ -512,6 +527,7 @@ async fn body_fanout_then_complete(body: &Value, failed_child: Option<usize>) ->
         stream.push_str(&text_delta(&message));
         stream.push_str(&text_done(&message));
         stream.push_str(&done_event(100));
+        completed_children.fetch_or(1 << index, Ordering::Release);
         return stream;
     }
 
@@ -743,6 +759,8 @@ struct ServerState {
     scenario: MockScenario,
     call_count: Arc<AtomicU32>,
     received_requests: Arc<Mutex<Vec<Value>>>,
+    completed_fanout_children: Arc<AtomicU8>,
+    held_response_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 async fn handle_chat_turn(
@@ -771,12 +789,28 @@ async fn handle_chat_turn(
         MockScenario::ToolThenComplete => body_tool_then_complete(&agent_id, turn),
         MockScenario::MultiTurn => body_multi_turn(&agent_id, turn),
         MockScenario::Fail => body_fail(&agent_id, turn),
-        MockScenario::Slow => body_slow(&agent_id, turn).await,
+        MockScenario::Slow => {
+            body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
+        }
         MockScenario::CancellationPending => body_cancellation_pending(&agent_id, turn).await,
         MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
-        MockScenario::FanoutThenComplete => body_fanout_then_complete(&request_body, None).await,
+        MockScenario::FanoutThenComplete => {
+            body_fanout_then_complete(
+                &request_body,
+                None,
+                &state.completed_fanout_children,
+                state.held_response_release.as_deref(),
+            )
+            .await
+        }
         MockScenario::FanoutPartialThenComplete => {
-            body_fanout_then_complete(&request_body, Some(1)).await
+            body_fanout_then_complete(
+                &request_body,
+                Some(1),
+                &state.completed_fanout_children,
+                state.held_response_release.as_deref(),
+            )
+            .await
         }
         MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
         MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
@@ -799,25 +833,54 @@ async fn handle_chat_turn(
         .expect("valid HTTP response")
 }
 
+fn mock_model_catalog_entry(name: &str) -> Value {
+    serde_json::json!({
+        "offering_id": format!("offer-{name}"),
+        "access_id": "self-hosted",
+        "access_kind": "self_hosted",
+        "access_label": "Self-hosted",
+        "execution_placement": "server",
+        "name": name,
+        "provider": "mock",
+        "description": null,
+        "is_active": true,
+        "context_window": 200_000,
+        "max_completion_tokens": null,
+        "architecture": null,
+        "thinking_capability": null
+    })
+}
+
 async fn handle_models() -> axum::Json<Value> {
+    axum::Json(Value::Array(mock_model_catalog()))
+}
+
+fn mock_model_catalog() -> Vec<Value> {
+    ["gpt-5", "test-model", "mock-model"]
+        .into_iter()
+        .map(mock_model_catalog_entry)
+        .collect()
+}
+
+async fn handle_model_access() -> axum::Json<Value> {
+    let offerings = mock_model_catalog();
     axum::Json(serde_json::json!({
-        "models": [
-            {
-                "name": "gpt-5",
-                "is_active": true,
-                "context_window": 200_000
-            },
-            {
-                "name": "test-model",
-                "is_active": true,
-                "context_window": 200_000
-            },
-            {
-                "name": "mock-model",
-                "is_active": true,
-                "context_window": 200_000
-            }
-        ]
+        "accesses": [{
+            "id": "self-hosted",
+            "kind": "self_hosted",
+            "label": "Self-hosted",
+            "execution_placement": "server",
+            "status": "ready",
+            "reason": null,
+            "usable": true,
+            "retry_after_seconds": null,
+            "available_model_count": offerings.len(),
+            "actions": []
+        }],
+        "default_offering_id": "offer-gpt-5",
+        "catalog_revision": "sha256:mock-catalog",
+        "observed_at": "2026-07-20T00:00:00Z",
+        "offerings": offerings
     }))
 }
 
@@ -831,12 +894,38 @@ async fn handle_tool_result() -> axum::Json<Value> {
 pub struct MockLlmServer {
     pub base_url: String,
     received_requests: Arc<Mutex<Vec<Value>>>,
+    completed_fanout_children: Arc<AtomicU8>,
+    held_response_release: Option<Arc<tokio::sync::Notify>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
+        Self::start_inner(scenario, false).await
+    }
+
+    /// Start a fanout fixture whose final child remains live until explicitly
+    /// released. This gives lifecycle journeys an authoritative concurrency
+    /// boundary instead of racing a wall-clock delay.
+    pub async fn start_with_held_fanout_child(scenario: MockScenario) -> Result<Self, String> {
+        if !matches!(
+            scenario,
+            MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete
+        ) {
+            return Err("held fanout child requires a fanout scenario".to_string());
+        }
+        Self::start_inner(scenario, true).await
+    }
+
+    /// Start the slow-response fixture at an explicit provider boundary.
+    /// The test releases the response only after it has observed the UI state
+    /// under test, so cancellation coverage cannot race a fixed sleep.
+    pub async fn start_with_held_slow_response() -> Result<Self, String> {
+        Self::start_inner(MockScenario::Slow, true).await
+    }
+
+    async fn start_inner(scenario: MockScenario, hold_response: bool) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("mock server bind failed: {e}"))?;
@@ -844,16 +933,21 @@ impl MockLlmServer {
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         let received_requests = Arc::new(Mutex::new(Vec::new()));
+        let completed_fanout_children = Arc::new(AtomicU8::new(0));
+        let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
             received_requests: received_requests.clone(),
+            completed_fanout_children: completed_fanout_children.clone(),
+            held_response_release: held_response_release.clone(),
         };
 
         let app = Router::new()
             .route("/chat/turn", post(handle_chat_turn))
             .route("/tools/result", post(handle_tool_result))
             .route("/models", get(handle_models))
+            .route("/model-access", get(handle_model_access))
             .with_state(state);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -879,6 +973,8 @@ impl MockLlmServer {
         Ok(Self {
             base_url,
             received_requests,
+            completed_fanout_children,
+            held_response_release,
             _shutdown: tx,
         })
     }
@@ -889,6 +985,19 @@ impl MockLlmServer {
             .lock()
             .map(|requests| requests.clone())
             .unwrap_or_default()
+    }
+
+    pub fn completed_fanout_children(&self) -> u32 {
+        self.completed_fanout_children
+            .load(Ordering::Acquire)
+            .count_ones()
+    }
+
+    pub fn release_held_response(&self) {
+        self.held_response_release
+            .as_ref()
+            .expect("mock server was not started with a held response")
+            .notify_one();
     }
 }
 

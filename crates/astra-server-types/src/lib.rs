@@ -1,5 +1,6 @@
 #[cfg(feature = "server")]
 mod chat_route;
+mod completions;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;
 #[cfg(feature = "server")]
@@ -36,6 +37,10 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
 pub use chat_route::{ChatRouteResponse, classify_chat_route};
+pub use completions::{
+    CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
+    CompletionResponse, CompletionUsage, MAX_COMPLETION_OUTPUT_TOKENS,
+};
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
     EdgeClientMessage, EdgeServerMessage,
@@ -99,7 +104,7 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     #[serde(default)]
-    pub selected_model: Option<astra_services::runs::SelectedModelRequest>,
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
     #[serde(default)]
     pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
@@ -108,8 +113,6 @@ pub struct ChatRequest {
     pub runtime_auth: Option<astra_services::runs::RuntimeAuthRequest>,
     #[serde(default)]
     pub runtime_profile: Option<astra_services::runs::RuntimeProfileRequest>,
-    #[serde(default)]
-    pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
     #[serde(default)]
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
@@ -709,7 +712,7 @@ pub enum WsClientMessage {
         session_id: Option<String>,
         #[serde(default)]
         agent_id: Option<String>,
-        selected_model: astra_services::runs::SelectedModelRequest,
+        model_selection: astra_turn_types::ModelSelection,
         #[serde(default)]
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
@@ -1224,18 +1227,16 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         full_llm_capture: false,
         agent_id: request.agent_id,
-        model: request
-            .selected_model
-            .as_ref()
-            .map(|selected| selected.model.clone()),
-        selected_model: request.selected_model,
+        model: None,
+        model_selection: request.model_selection,
+        resolved_model_selection: None,
+        admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,
         provider_runtime_authorized: false,
         agent_binding: request.agent_binding,
         runtime_auth: request.runtime_auth,
         runtime_skill_binding: None,
         runtime_profile: request.runtime_profile,
-        llm_token_service: request.llm_token_service.map(Into::into),
         skill_search: request.skill_search,
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,

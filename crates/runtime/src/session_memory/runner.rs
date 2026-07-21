@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,14 +12,11 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::{is_runtime_owned_message, session_facts::SessionFacts};
+use astra_turn_types::{InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts};
 
-use crate::memory_hooks::relevance::LlmConnParams;
+use crate::memory_hooks::{MemoryInferencePort, MemoryInferenceRequest};
 use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
-use crate::turn::llm::client::{
-    apply_provider_auth, build_provider_request_body_with_overrides, global_llm_client,
-    llm_request_url_for_provider, parse_nonstream_response_for_provider,
-};
+use crate::turn::llm::client::redact_provider_secrets;
 
 pub const SESSION_MEMORY_PREFIX: &str = "[@session/active]";
 pub const SESSION_MEMORY_MEMORIA_TYPE: &str = "working";
@@ -385,17 +382,29 @@ pub(crate) struct LlmCandidateFailure {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_extraction(
+pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     memoria: &Arc<dyn MemoriaPort>,
-    session_id: &str,
+    inference_scope: &astra_turn_types::InferenceInvocationScope,
     messages: &[Value],
     turn_number: usize,
     current_memory: &str,
     session_facts: &SessionFacts,
-    memory_model_params: &[LlmConnParams],
+    memory_clients: &[C],
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
+    let Some(session_id) = inference_scope.session_id() else {
+        return ExtractionArtifacts::PersistFailed {
+            error_reason: SessionMemoryExtractionErrorReason::InvalidScope,
+            persist_error_detail: Some(
+                "session-memory extraction requires a session-owned inference scope".to_string(),
+            ),
+            llm_error_reason: None,
+            llm_error_detail: None,
+            selector_model: None,
+            failed_candidates: Vec::new(),
+        };
+    };
     let filtered_messages = session_memory_extraction_messages(messages);
     let messages = filtered_messages.as_slice();
     let base_memory = if current_memory.trim().is_empty() {
@@ -405,7 +414,7 @@ pub(crate) async fn run_extraction(
     };
     let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number);
 
-    if memory_model_params.is_empty() {
+    if memory_clients.is_empty() {
         let fallback = canonicalize_session_memory_markdown(
             session_id,
             &fallback,
@@ -441,11 +450,16 @@ pub(crate) async fn run_extraction(
     }
 
     let mut failed_candidates = Vec::new();
-    for params in memory_model_params {
+    for (candidate_index, client) in memory_clients.iter().enumerate() {
+        let Ok(logical_attempt) = u32::try_from(candidate_index) else {
+            break;
+        };
+        let candidate_scope = inference_scope.with_logical_attempt(logical_attempt);
         match update_memory_with_llm(
             &base_memory,
             messages,
-            params,
+            client,
+            &candidate_scope,
             llm_timeout,
             max_output_tokens,
         )
@@ -473,7 +487,7 @@ pub(crate) async fn run_extraction(
                             bytes_written,
                             store_attempt,
                             content: updated,
-                            selector_model: Some(params.model_name.clone()),
+                            selector_model: Some(client.model_name().to_string()),
                             failed_candidates,
                         };
                     }
@@ -483,14 +497,14 @@ pub(crate) async fn run_extraction(
                             persist_error_detail: error.detail,
                             llm_error_reason: None,
                             llm_error_detail: None,
-                            selector_model: Some(params.model_name.clone()),
+                            selector_model: Some(client.model_name().to_string()),
                             failed_candidates,
                         };
                     }
                 }
             }
             Err(error) => failed_candidates.push(LlmCandidateFailure {
-                model_name: params.model_name.clone(),
+                model_name: client.model_name().to_string(),
                 reason: error.reason,
                 detail: error.detail,
             }),
@@ -928,98 +942,36 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 async fn update_memory_with_llm(
     current_memory: &str,
     messages: &[Value],
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> Result<String, LlmExtractionFailure> {
-    let upstream_model_name = params
-        .wire_model_name
-        .as_deref()
-        .unwrap_or(&params.model_name);
     let prompt = build_extraction_prompt(current_memory, messages);
-    let body = build_provider_request_body_with_overrides(
-        &prompt,
-        &[],
-        upstream_model_name,
-        &params.provider,
-        Some(max_output_tokens),
-        Some(0.0),
-        false,
-        &astra_turn_core::thinking_config::ThinkingConfig::Off,
-        params.request_body_overrides.as_ref(),
-    );
-    let url = llm_request_url_for_provider(
-        &params.base_url,
-        &params.provider,
-        upstream_model_name,
-        false,
-    );
-    let request = global_llm_client()
-        .post(url)
-        .timeout(llm_timeout)
-        .header("content-type", "application/json");
-    let request = apply_provider_auth(request, &params.provider, &params.api_key, None).json(&body);
-
-    let response = match tokio::time::timeout(llm_timeout, request.send()).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(error)) if error.is_timeout() => {
+    let call = client.complete(MemoryInferenceRequest {
+        purpose: InferencePurpose::MemoryExtraction,
+        invocation_scope,
+        messages: &prompt,
+        max_output_tokens,
+        temperature: 0.0,
+        deadline: llm_timeout,
+    });
+    let parsed = match call.await {
+        Err(error) => {
             return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
-                detail: None,
+                reason: if error.kind == astra_core::ErrorKind::StreamIdle {
+                    SessionMemoryExtractionErrorReason::LlmTimeout
+                } else {
+                    SessionMemoryExtractionErrorReason::LlmError
+                },
+                detail: Some(summarize_llm_detail(&redact_provider_secrets(
+                    &error.message,
+                ))),
             });
         }
-        Ok(Err(error)) => {
-            return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmError,
-                detail: Some(summarize_llm_detail(&error.to_string())),
-            });
-        }
-        Err(_) => {
-            return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
-                detail: None,
-            });
-        }
+        Ok(result) => result,
     };
-
-    let status = response.status();
-    let body_text = response
-        .text()
-        .await
-        .map_err(|error| LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: failed to read body: {error}",
-                status.as_u16()
-            ))),
-        })?;
-    let payload: Value =
-        serde_json::from_str(&body_text).map_err(|error| LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: invalid json body ({error}): {}",
-                status.as_u16(),
-                extract_llm_error_detail(&body_text)
-            ))),
-        })?;
-    if !status.is_success() {
-        return Err(LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: {}",
-                status.as_u16(),
-                extract_llm_error_detail_from_json(&payload)
-            ))),
-        });
-    }
-
-    let parsed = parse_nonstream_response_for_provider(
-        &payload,
-        &params.provider,
-        &params.model_name,
-        Instant::now(),
-    );
-    let content = parsed.full_text.trim();
+    let content = parsed.trim();
     if content.is_empty() {
         return Err(LlmExtractionFailure {
             reason: SessionMemoryExtractionErrorReason::EmptyResponse,
@@ -1036,7 +988,7 @@ async fn update_memory_with_llm(
     if !normalized_scalar_lists.is_empty() {
         tracing::warn!(
             target: "astra_runtime::session_memory",
-            selector_model = %params.model_name,
+            selector_model = %client.model_name(),
             fields = %normalized_scalar_lists.join(","),
             "normalized scalar session-memory fields to singleton lists"
         );
@@ -1090,23 +1042,6 @@ fn parse_session_narrative_patch(
 
 fn summarize_llm_detail(text: &str) -> String {
     truncate_chars(&text.split_whitespace().collect::<Vec<_>>().join(" "), 220)
-}
-
-fn extract_llm_error_detail(body_text: &str) -> String {
-    match serde_json::from_str::<Value>(body_text) {
-        Ok(payload) => extract_llm_error_detail_from_json(&payload),
-        Err(_) => summarize_llm_detail(body_text),
-    }
-}
-
-fn extract_llm_error_detail_from_json(payload: &Value) -> String {
-    payload
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/message").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/error/type").and_then(Value::as_str))
-        .map(summarize_llm_detail)
-        .unwrap_or_else(|| summarize_llm_detail(&payload.to_string()))
 }
 
 async fn store_session_memory(
@@ -1510,10 +1445,21 @@ fn truncate(text: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_hooks::DirectMemoryInferenceClient;
     use std::sync::{Arc, Mutex};
 
     use crate::turn::cloud::memoria_compact::MemoriaMemory;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_scope(session_id: &str) -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: session_id.to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "memory_extraction_test".to_string(),
+            logical_attempt: 0,
+        }
+    }
 
     #[derive(Default)]
     struct CapturingMemoria {
@@ -1807,6 +1753,69 @@ mod tests {
         ]
     }
 
+    #[derive(Debug)]
+    struct CapturingMemoryInference {
+        purposes: Arc<Mutex<Vec<InferencePurpose>>>,
+        scopes: Arc<Mutex<Vec<astra_turn_types::InferenceInvocationScope>>>,
+        deadlines: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for CapturingMemoryInference {
+        fn model_name(&self) -> &str {
+            "capturing-memory-model"
+        }
+
+        async fn complete(
+            &self,
+            request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.purposes.lock().unwrap().push(request.purpose);
+            self.scopes
+                .lock()
+                .unwrap()
+                .push(request.invocation_scope.clone());
+            self.deadlines.lock().unwrap().push(request.deadline);
+            Ok(r#"{"session_title":"Captured purpose"}"#.to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeadlineExpiredMemoryInference;
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for DeadlineExpiredMemoryInference {
+        fn model_name(&self) -> &str {
+            "deadline-expired"
+        }
+
+        async fn complete(
+            &self,
+            _request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamIdle,
+                "provider request deadline expired",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_owned_deadline_preserves_timeout_classification() {
+        let error = update_memory_with_llm(
+            "",
+            &sample_messages(),
+            &DeadlineExpiredMemoryInference,
+            &test_scope("sess-provider-deadline"),
+            Duration::from_millis(20),
+            128,
+        )
+        .await
+        .expect_err("provider deadline must remain a typed extraction timeout");
+
+        assert_eq!(error.reason, SessionMemoryExtractionErrorReason::LlmTimeout);
+    }
+
     #[test]
     fn rule_fallback_records_only_live_resumable_state() {
         let content = build_rule_fallback_memory("", &sample_messages(), 3);
@@ -1859,12 +1868,12 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -1879,6 +1888,96 @@ mod tests {
             }
             _ => panic!("expected fallback persistence"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_extraction_rejects_harness_scope_before_provider_or_memoria_io() {
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingMemoryInference {
+            purposes: Arc::clone(&purposes),
+            scopes: Arc::clone(&scopes),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
+        let scope = astra_turn_types::InferenceInvocationScope::HarnessRun {
+            harness_run_id: "harness-not-a-session".to_string(),
+            operation_id: "skill_synthesis".to_string(),
+            logical_attempt: 0,
+        };
+
+        let artifacts = run_extraction(
+            &memoria_port,
+            &scope,
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[client],
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::PersistFailed {
+                error_reason: SessionMemoryExtractionErrorReason::InvalidScope,
+                ..
+            }
+        ));
+        assert!(purposes.lock().unwrap().is_empty());
+        assert!(scopes.lock().unwrap().is_empty());
+        assert!(memoria.operations.lock().unwrap().is_empty());
+        assert!(memoria.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_extraction_attributes_the_call_as_memory_extraction() {
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingMemoryInference {
+            purposes: Arc::clone(&purposes),
+            scopes: Arc::clone(&scopes),
+            deadlines: Arc::clone(&deadlines),
+        };
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
+
+        let artifacts = run_extraction(
+            &memoria,
+            &test_scope("sess-purpose"),
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[client],
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::Persisted {
+                source: SessionMemoryExtractionSource::Llm,
+                ..
+            }
+        ));
+        assert_eq!(
+            *purposes.lock().unwrap(),
+            vec![InferencePurpose::MemoryExtraction]
+        );
+        assert_eq!(
+            scopes.lock().unwrap()[0].operation_id(),
+            "memory_extraction_test"
+        );
+        assert_eq!(scopes.lock().unwrap()[0].logical_attempt(), 0);
+        assert_eq!(
+            deadlines.lock().unwrap().as_slice(),
+            &[Duration::from_secs(3)]
+        );
     }
 
     #[tokio::test]
@@ -1899,18 +1998,20 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-openai",
+            &test_scope("sess-openai"),
             &sample_messages(),
             1,
             "",
@@ -1950,18 +2051,20 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-scalar-selector",
+            &test_scope("sess-scalar-selector"),
             &sample_messages(),
             1,
             "",
@@ -2014,19 +2117,21 @@ mod tests {
             json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-selector",
+            &test_scope("sess-filtered-selector"),
             &messages,
             4,
             "",
@@ -2086,19 +2191,21 @@ mod tests {
             ),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-scaffolding",
+            &test_scope("sess-filtered-scaffolding"),
             &messages,
             4,
             "",
@@ -2159,19 +2266,21 @@ mod tests {
             json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-transient-status",
+            &test_scope("sess-filtered-transient-status"),
             &messages,
             4,
             "",
@@ -2212,18 +2321,20 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: server_url,
             api_key: "anthropic-key".to_string(),
             model_name: "deepseek-v4-flash-anthropic".to_string(),
             wire_model_name: Some("deepseek-v4-flash".to_string()),
             provider: "anthropic".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-anthropic",
+            &test_scope("sess-anthropic"),
             &sample_messages(),
             1,
             "",
@@ -2263,18 +2374,20 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: server_url,
             api_key: "bedrock-key".to_string(),
             model_name: "anthropic.claude".to_string(),
             wire_model_name: None,
             provider: "bedrock".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-bedrock",
+            &test_scope("sess-bedrock"),
             &sample_messages(),
             1,
             "",
@@ -2311,18 +2424,20 @@ mod tests {
         .await;
 
         let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-double-fail",
+            &test_scope("sess-double-fail"),
             &sample_messages(),
             1,
             "",
@@ -2356,7 +2471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_captures_http_error_detail_on_fallback() {
+    async fn run_extraction_persists_fallback_and_redacts_provider_failure_detail() {
         let (server_url, server_handle) = spawn_json_server_with_status(
             Arc::new(|request: &str| {
                 assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
@@ -2365,25 +2480,27 @@ mod tests {
             "Bad Gateway",
             json!({
                 "error": {
-                    "message": "upstream model gateway timed out"
+                    "message": "upstream model gateway rejected sk-secret-value"
                 }
             }),
         )
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-http-detail",
+            &test_scope("sess-http-detail"),
             &sample_messages(),
             1,
             "",
@@ -2401,10 +2518,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(error_reason, SessionMemoryExtractionErrorReason::LlmError);
-                assert_eq!(
-                    error_detail,
-                    Some("http 502: upstream model gateway timed out".to_string())
-                );
+                let detail = error_detail.expect("classified provider failure detail");
+                assert!(!detail.trim().is_empty());
+                assert!(!detail.contains("sk-secret-value"));
             }
             _ => panic!("expected llm-failed fallback persistence"),
         }
@@ -2441,27 +2557,31 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let first = LlmConnParams {
+        let first = DirectMemoryInferenceClient {
             base_url: format!("{failing_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-1".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
-        let second = LlmConnParams {
+        let second = DirectMemoryInferenceClient {
             base_url: format!("{success_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-2".to_string(),
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-retry",
+            &test_scope("sess-retry"),
             &sample_messages(),
             1,
             "",
@@ -2519,12 +2639,12 @@ mod tests {
 
         let artifacts = run_extraction(
             &memoria_dyn,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2652,12 +2772,12 @@ mod tests {
         }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2676,12 +2796,12 @@ mod tests {
         }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-overflow",
+            &test_scope("sess-overflow"),
             &sample_messages(),
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2702,12 +2822,12 @@ mod tests {
         let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria_dyn,
-            "sess-bounded",
+            &test_scope("sess-bounded"),
             &sample_messages(),
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )

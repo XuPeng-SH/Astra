@@ -51,12 +51,16 @@ const deepseekModels = [
     name: "deepseek-v4-flash-anthropic",
     subtitle: "anthropic",
     tier: "included" as const,
+    accessLabel: "Self-hosted",
+    executionPlacement: "server" as const,
   },
   {
     id: "deepseek-v4-pro-official",
     name: "deepseek-v4-pro-official",
     subtitle: "openai",
     tier: "included" as const,
+    accessLabel: "Self-hosted",
+    executionPlacement: "server" as const,
   },
 ];
 
@@ -68,7 +72,14 @@ describe("Composer model selection", () => {
 
   it("blocks submit for an unavailable persisted model until a canonical model is selected", async () => {
     window.localStorage.setItem("astra.composer.model", "deepseek-v4-pro");
-    mockListModels.mockResolvedValue({ items: deepseekModels });
+    mockListModels.mockResolvedValue({
+      items: deepseekModels,
+      accesses: [],
+      defaultOfferingId: "deepseek-v4-flash-anthropic",
+      catalogRevision: "sha256:catalog",
+      observedAt: "2026-07-20T00:00:00Z",
+      source: "astra",
+    });
     const onSubmit = vi.fn().mockResolvedValue(undefined);
 
     render(<Composer onSubmit={onSubmit} />);

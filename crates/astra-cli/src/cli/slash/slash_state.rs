@@ -133,7 +133,7 @@ impl<'a> CompactCtx<'a> {
             input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id: self.state.session_id.as_deref(),
-            model_id: None,
+            offering_id: None,
             model: self.state.model.as_deref(),
             provider: None,
             explain: ExplainMode::Off,
@@ -375,12 +375,17 @@ async fn persist_history_edit_state(
             .and_then(|event| event.error.as_ref())
             .is_some();
         let _ = service.maybe_spawn(astra_runtime::session_memory::ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id: session_id.to_string(),
+                turn: state.turn,
+                round: 0,
+                operation_id: "memory_extraction_history_edit".to_string(),
+                logical_attempt: 0,
+            },
             messages: crate::cli::session::session_projection::history_as_messages(&state.history),
             session_facts: crate::cli::session::session_cleanup::shutdown_session_facts(state),
             had_error,
             reanchors_current_objective: matches!(action, "/undo" | "/redo"),
-            turn_number: state.turn,
         });
     }
     Ok(())

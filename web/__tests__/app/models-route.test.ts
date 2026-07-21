@@ -1,34 +1,21 @@
 // @vitest-environment node
 
-vi.mock("@/lib/api/web-store", () => ({
-  listModelSummaries: vi.fn(() => [
-    {
-      id: "static-model",
-      name: "Static Model",
-      subtitle: "Static fallback",
-      tier: "included",
-    },
-  ]),
-}));
-
 vi.mock("@/lib/runtime-client", () => ({
   requireRuntimeClient: vi.fn(),
 }));
 
-import { listModelSummaries } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { GET } from "@/app/api/models/route";
 
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
-const mockListModelSummaries = vi.mocked(listModelSummaries);
 
 function runtimeClient(
   accessToken: string | undefined,
-  listModels: ReturnType<typeof vi.fn>,
+  getModelAccess: ReturnType<typeof vi.fn>,
 ) {
   return {
     config: { accessToken },
-    sdk: { listModels },
+    sdk: { getModelAccess },
   };
 }
 
@@ -37,7 +24,7 @@ describe("/api/models route", () => {
     vi.clearAllMocks();
   });
 
-  it("does not return fallback models when authenticated listModels fails", async () => {
+  it("does not return fallback models when Model Access fails", async () => {
     mockRequireRuntimeClient.mockResolvedValue(
       runtimeClient(
         "astra-access",
@@ -48,36 +35,34 @@ describe("/api/models route", () => {
     const response = await GET();
     const body = await response.json();
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(503);
     expect(body).toEqual({
-      error: "runtime_models_unavailable",
+      error: "model_access_unavailable",
       detail: "provider catalog down",
+      action: "sign_in_or_retry",
     });
-    expect(mockListModelSummaries).not.toHaveBeenCalled();
   });
 
-  it("does not return fallback models when authenticated listModels is empty", async () => {
+  it("returns typed recovery when no Offering is eligible", async () => {
     mockRequireRuntimeClient.mockResolvedValue(
-      runtimeClient("astra-access", vi.fn().mockResolvedValue([])) as never,
-    );
-
-    const response = await GET();
-    const body = await response.json();
-
-    expect(response.status).toBe(502);
-    expect(body).toEqual({
-      error: "runtime_models_unavailable",
-      detail: "Runtime returned no active models for the authenticated user.",
-    });
-    expect(mockListModelSummaries).not.toHaveBeenCalled();
-  });
-
-  it("keeps static models for unauthenticated listModels failures", async () => {
-    mockRequireRuntimeClient.mockResolvedValue(
-      runtimeClient(
-        undefined,
-        vi.fn().mockRejectedValue(new Error("runtime unavailable")),
-      ) as never,
+      runtimeClient("astra-access", vi.fn().mockResolvedValue({
+        accesses: [{
+          id: "self-hosted",
+          kind: "self_hosted",
+          label: "Self-hosted",
+          execution_placement: "server",
+          status: "action_required",
+          reason: "no_eligible_offerings",
+          usable: false,
+          retry_after_seconds: null,
+          available_model_count: 0,
+          actions: ["contact_administrator"],
+        }],
+        offerings: [],
+        default_offering_id: null,
+        catalog_revision: "sha256:empty",
+        observed_at: "2026-07-20T00:00:00Z",
+      })) as never,
     );
 
     const response = await GET();
@@ -85,16 +70,37 @@ describe("/api/models route", () => {
 
     expect(response.status).toBe(200);
     expect(body).toEqual({
-      items: [
-        {
-          id: "static-model",
-          name: "Static Model",
-          subtitle: "Static fallback",
-          tier: "included",
-        },
-      ],
-      source: "fallback",
+      items: [],
+      accesses: [{
+        id: "self-hosted",
+        kind: "self_hosted",
+        label: "Self-hosted",
+        execution_placement: "server",
+        status: "action_required",
+        reason: "no_eligible_offerings",
+        usable: false,
+        retry_after_seconds: null,
+        available_model_count: 0,
+        actions: ["contact_administrator"],
+      }],
+      defaultOfferingId: null,
+      catalogRevision: "sha256:empty",
+      observedAt: "2026-07-20T00:00:00Z",
+      source: "astra",
     });
-    expect(mockListModelSummaries).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not advertise fake models when authentication is unavailable", async () => {
+    mockRequireRuntimeClient.mockRejectedValue(new Error("sign in required"));
+
+    const response = await GET();
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      error: "model_access_unavailable",
+      detail: "sign in required",
+      action: "sign_in_or_retry",
+    });
   });
 });

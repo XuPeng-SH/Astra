@@ -5679,7 +5679,7 @@ async fn apply_restored_session(
         }
     }
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
-    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
+    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
 
     if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
         state.history = prepared_history.history;
@@ -5748,13 +5748,23 @@ async fn apply_restored_session(
     {
         let work_dir = std::env::current_dir().unwrap_or_default();
         // Verification judge runs server-side via server_proxy_judge; the server resolves
-        // the reasoning model via admin_config.reasoning_model_name → cheapest active
+        // the reasoning Offering via reasoning_offering_id → governed default
         // fallback. No local cloud judge.
         let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
         let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
             match get_profile_and_token(profile) {
                 Ok((_, _, _, token)) => Some(std::sync::Arc::new(
-                    durable_bridge::ServerProxyLlmJudge::new(api.clone(), token, None),
+                    durable_bridge::ServerProxyLlmJudge::new(
+                        api.clone(),
+                        token,
+                        astra_turn_types::InferenceInvocationScope::Session {
+                            session_id: restored.session_id.clone(),
+                            turn: state.turn,
+                            round: 0,
+                            operation_id: "plan_verification".to_string(),
+                            logical_attempt: 0,
+                        },
+                    ),
                 )),
                 Err(_) => None,
             };

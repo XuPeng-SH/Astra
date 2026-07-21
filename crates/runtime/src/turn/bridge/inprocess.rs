@@ -5,17 +5,17 @@
 /// | Behavior | Implementation |
 /// |------------------------|------|
 /// | Long-lived stream "stall" / no chunks | [`super::llm::client::stream_idle_timeout`] on SSE `next()` (5 min default; shortened only by the `bridge-e2e-hooks` test hook) |
-/// | Recover via one-shot completion | [`super::llm::client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
+/// | Provider delivery becomes uncertain | Preserve streamed evidence, emit a typed error, and terminalize the physical attempt as `delivery_unknown`; never hide a second inference request |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
-/// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm::client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm::client::wait_until_cancelled_or_pending) in the bridge stream |
+/// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm::client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`super::llm_stream::call_llm_stream_with_attempt_observer`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm::client::wait_until_cancelled_or_pending) in the bridge stream |
 /// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. "resolve once" matches ledger single-shot semantics |
 ///
 /// # Adapter Status
 ///
 /// This module is the remaining HTTP `/chat/turn` single-turn transport adapter.
-/// It still has its own `for round_ix..` loop inside `stream!` and does NOT use
-/// [`run_agentic_loop_with_host`], so semantic dedup and full step recording are
-/// still absent here. It must not present itself as a separate agent runtime:
+/// It executes one LLM round per HTTP request and does NOT use
+/// [`run_agentic_loop_with_host`], so full unified-loop step recording is still
+/// absent here. It must not present itself as a separate agent runtime:
 /// public runtime metadata is expressed as CLI local capacity, while
 /// implementation-specific provenance such as `BRIDGE_CACHE_SOURCE` stays
 /// internal for prompt-cache continuity and journal diagnostics.
@@ -55,6 +55,7 @@ use axum::response::Response;
 use futures_util::StreamExt;
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -73,6 +74,77 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
+
+type ActiveBridgeInference =
+    Arc<tokio::sync::Mutex<Option<Arc<crate::turn::llm::durable::DurableInferenceInvocation>>>>;
+
+async fn settle_active_bridge_inference<T, F, Fut, E>(
+    active: &Arc<tokio::sync::Mutex<Option<T>>>,
+    settle: F,
+) -> Result<(), E>
+where
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let Some(invocation) = active.lock().await.take() else {
+        return Ok(());
+    };
+    settle(invocation).await
+}
+
+fn bridge_inference_operation_id(user_query_event_id: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(user_query_event_id.as_bytes()));
+    format!("bridge_chat_{}", &digest[..32])
+}
+
+fn bridge_client_disconnect_error() -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::StreamTransport,
+        "LLM result delivery became unknown after the client disconnected",
+    )
+}
+
+fn bridge_stream_terminal_error(
+    kind: astra_core::ErrorKind,
+    message: impl Into<String>,
+) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(kind, message)
+}
+
+async fn finish_active_bridge_inference_error(
+    active: &ActiveBridgeInference,
+    error: &astra_core::ClassifiedError,
+) -> Result<(), astra_core::ClassifiedError> {
+    settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish_error(error).await
+    })
+    .await
+}
+
+async fn finish_active_bridge_inference(
+    active: &ActiveBridgeInference,
+    terminal: &astra_services::InferenceInvocationTerminal,
+) -> Result<(), astra_core::ClassifiedError> {
+    settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish(terminal).await
+    })
+    .await
+}
+
+async fn finish_disconnected_bridge_inference(active: &ActiveBridgeInference) {
+    let terminal =
+        crate::turn::llm::durable::terminal_from_error(&bridge_client_disconnect_error());
+    if let Err(error) = settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish_after_disconnect(&terminal).await
+    })
+    .await
+    {
+        astra_core::agent_error!(
+            "bridge",
+            "failed to converge inference invocation after client disconnect: {error}"
+        );
+    }
+}
 
 /// Completion link in a per-session asynchronous persistence chain. The link
 /// is completed from `Drop` as well as the normal path, so a cancelled or
@@ -148,77 +220,11 @@ fn track_ordered_bridge_persist<F>(
     }
 }
 
-fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
-    payload
-        .get("selected_model")
-        .and_then(Value::as_object)
-        .and_then(|selected_model| selected_model.get("model"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProviderModelGatewayInvocation {
-    model: String,
-    endpoint_url: String,
-    authorization: String,
-}
-
-fn provider_model_gateway_invocation_from_payload(
-    payload: &Value,
-) -> Result<Option<ProviderModelGatewayInvocation>, String> {
-    let Some(model_gateway) = payload
-        .get("capability_descriptors")
-        .and_then(Value::as_object)
-        .and_then(|descriptors| descriptors.get("model_gateway"))
-        .and_then(Value::as_object)
-    else {
-        return Ok(None);
-    };
-    let selected_model = payload
-        .get("selected_model")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            "selected_model is required with capability_descriptors.model_gateway".to_string()
-        })?;
-    let model = selected_model
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "selected_model.model is required with capability_descriptors.model_gateway".to_string()
-        })?
-        .to_string();
-    let endpoint_url = model_gateway
-        .get("endpoint_url")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "capability_descriptors.model_gateway.endpoint_url is required".to_string())?
-        .to_string();
-    let authorization = payload
-        .get("runtime_auth")
-        .and_then(Value::as_object)
-        .and_then(|runtime_auth| runtime_auth.get("authorization"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "runtime_auth.authorization is required with capability_descriptors.model_gateway"
-                .to_string()
-        })?
-        .to_string();
-    Ok(Some(ProviderModelGatewayInvocation {
-        model,
-        endpoint_url,
-        authorization,
-    }))
-}
-
 fn rewrite_bridge_runtime_manifest_model_resolution(
     trace: &mut Value,
-    requested_model: Option<&str>,
+    offering_id: Option<&str>,
     resolved_model: &str,
     provider: &str,
-    fallback_trace: Option<&Value>,
 ) {
     let Some(trace_obj) = trace.as_object_mut() else {
         return;
@@ -229,23 +235,14 @@ fn rewrite_bridge_runtime_manifest_model_resolution(
     if !manifest.is_object() {
         *manifest = json!({});
     }
-    let selected_model = requested_model.unwrap_or(resolved_model);
-    let source = if fallback_trace.is_some() {
-        "rate_limit_fallback"
-    } else {
-        "bridge_request"
-    };
     manifest["schema_version"] = json!("astra_runtime_manifest.v1");
-    manifest["selected_model"] = json!({
-        "model": selected_model,
-    });
+    manifest["model_selection"] = json!({ "offering_id": offering_id });
     manifest["model_resolution"] = json!({
-        "source": source,
-        "requested_model": requested_model,
+        "source": "catalog_offering",
+        "offering_id": offering_id,
         "model": resolved_model,
         "provider": provider,
         "resolved": true,
-        "fallback": fallback_trace,
     });
     manifest["runtime_profile"] = json!(astra_runtime_env::CapacityProviderType::CliLocal.as_str());
 }
@@ -263,44 +260,6 @@ impl CachedSessionStartMemory {
             fetch_ms: session_start.fetch_ms,
         }
     }
-}
-
-fn resolve_bridge_memory_provider(
-    server_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
-    request_binding: &Map<String, Value>,
-) -> (
-    Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
-    Option<&'static str>,
-) {
-    if let Some(client) = server_client {
-        return (Some(client), Some("server_config"));
-    }
-    if request_binding.get("provider").and_then(Value::as_str) != Some("memoria") {
-        return (None, None);
-    }
-    let Some(base_url) = request_binding
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-    let Some(api_key) = request_binding
-        .get("api_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-    (
-        Some(crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
-            base_url.to_string(),
-            api_key.to_string(),
-        )),
-        Some("request_binding"),
-    )
 }
 
 async fn cached_first_turn_session_start_memory<F, Fut>(
@@ -701,7 +660,7 @@ fn bridge_prompt_snapshot_from_messages(
 // ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
 use super::sse_helpers::{
     extend_forward_from_validated_sse_block, flush_tail_buf_into_llm_forward,
-    reasoning_done_sse_bytes_if_needed, render_sse, render_sse_map,
+    reasoning_done_sse_bytes_if_needed, render_classified_error_sse, render_sse, render_sse_map,
 };
 
 fn preview_chars(value: &str, limit: usize) -> String {
@@ -1228,11 +1187,11 @@ fn flush_turn_event_buffer_or_warn(
 use super::observability::{build_context_trace_signal, persist_legacy_bridge_trace_and_quality};
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
-use super::llm_stream::call_llm_stream_with_request_overrides;
+use super::llm_stream::call_llm_stream_with_attempt_observer;
 use super::llm_stream::rate_limit_cooldown;
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    FallbackOutcome, RateLimitAction, try_resolve_fallback,
-};
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, OwnedLlmExecutionRoute};
+use crate::turn::llm::summary_client::RuntimeSummaryClient;
+use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
@@ -1575,6 +1534,7 @@ impl InProcessChatTurnBridge {
         &self,
         headers: &HeaderMap,
         body: Bytes,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
         turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
         turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
         turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
@@ -1606,6 +1566,23 @@ impl InProcessChatTurnBridge {
             .get("agent_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let inference_purpose = payload
+            .get("inference_purpose")
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "inference_purpose is required".to_string(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<astra_turn_types::InferencePurpose>(value).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "inference_purpose is invalid".to_string(),
+                    )
+                })
+            })?;
         let (messages, recovered_required_runtime_texts) =
             normalize_bridge_prompt_messages(optional_payload_array(&payload, "messages")?);
         let tool_results = optional_payload_array(&payload, "tool_results")?;
@@ -1627,25 +1604,16 @@ impl InProcessChatTurnBridge {
                 )
                 .and_then(Value::as_array)
                 .is_some_and(|texts| !texts.is_empty());
-        let runtime_memory_binding =
-            optional_nested_payload_object(&payload, "runtime_bindings", "memory")?;
         let explain = explain_requested(&payload);
-        let selected_model_name = selected_model_name_from_payload(&payload);
+        let model_offering_id = Some(admitted_model_execution.offering_id.clone());
         let round_index = bridge_round_index(&payload)?;
-        let provider_model_gateway_invocation =
-            provider_model_gateway_invocation_from_payload(&payload);
 
-        let _agent_id = payload
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
         let thinking_config = payload
             .get("thinking")
             .map(astra_turn_core::thinking_config::ThinkingConfig::from_payload_value)
             .unwrap_or_default();
 
         let matrixone = self.matrixone.clone();
-        let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
         let session_start_memory_cache = self.session_start_memory_cache.clone();
         let (trace_turn, trace_turn_source) = if let Some(turn) = header_session_turn {
@@ -1737,7 +1705,13 @@ impl InProcessChatTurnBridge {
 
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
         let bridge_e2e_stream_blocks_capture = bridge_e2e_stream_blocks_for_stream.clone();
-        let client_cancel_capture = client_cancel.clone();
+        // Every response stream owns a cancellation token, including direct
+        // callers that did not supply one. The drop guard below therefore has
+        // one uniform way to terminate provider work and durable state.
+        let response_cancel = client_cancel
+            .clone()
+            .unwrap_or_else(|| Arc::new(CancellationToken::new()));
+        let client_cancel_capture = response_cancel.clone();
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
@@ -1749,12 +1723,16 @@ impl InProcessChatTurnBridge {
         }
         let remote_artifact_store = Arc::new(remote_artifact_store);
         let disconnect_capture_state = Arc::new(Mutex::new(DisconnectCaptureSnapshot::default()));
-        if let Some(cancel_token) = client_cancel.clone() {
+        let active_inference: ActiveBridgeInference = Arc::new(tokio::sync::Mutex::new(None));
+        {
+            let cancel_token = client_cancel_capture.clone();
             let disconnect_state = disconnect_capture_state.clone();
             let disconnect_store = remote_artifact_store.clone();
             let disconnect_full_llm_capture = full_llm_capture;
+            let disconnect_inference = active_inference.clone();
             tokio::spawn(async move {
                 cancel_token.cancelled().await;
+                finish_disconnected_bridge_inference(&disconnect_inference).await;
                 let snapshot = match disconnect_state.lock() {
                     Ok(guard) => guard.clone(),
                     Err(_) => return,
@@ -1798,9 +1776,7 @@ impl InProcessChatTurnBridge {
             let cc = client_cancel_capture.clone();
             let remote_artifact_store = remote_artifact_store.clone();
             let disconnect_capture_state = disconnect_capture_state.clone();
-            let _client_disconnect_guard = cc
-                .as_ref()
-                .map(|t| crate::turn::llm::client::CancelOnClientDisconnect::new(t.clone()));
+            let active_inference = active_inference.clone();
             let turn_started = Instant::now();
             tracing::debug!(target: "astra_timing", "bridge stream started");
             let run_id = uuid::Uuid::new_v4().to_string();
@@ -1824,40 +1800,10 @@ impl InProcessChatTurnBridge {
                     .as_ref()
                     .map(|blocks| !blocks.is_empty())
                     .unwrap_or(false);
-            let provider_model_gateway_invocation = match provider_model_gateway_invocation {
-                Ok(invocation) => invocation,
-                Err(error) => {
-                    yield render_sse_map(&build_stream_error_event(
-                        &error,
-                        "PROVIDER_RUNTIME_CONTEXT_INVALID",
-                        false,
-                    ));
-                    mark_disconnect_capture_finalized(&disconnect_capture_state);
-                    return;
-                }
-            };
-
-            // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
-            // Also capture fallback_chain for rate-limit-triggered fallback.
-            let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let requested_model_override =
-                astra_core::model_override::normalize_model_override(selected_model_name.as_deref());
-            let requested_model_name = requested_model_override.map(str::to_string);
-            let mut rate_limit_fallback_trace: Option<Value> = None;
-            if !use_e2e_llm && requested_model_override.is_none() {
-                tracing::warn!(
-                    target: "astra_runtime::bridge_inprocess",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    turn = trace_turn,
-                    round = round_index,
-                    reason = "missing_model_selection",
-                    "missing selected_model.model; refusing implicit model fallback"
-                );
-            }
-            let mut llm_header_overrides: Option<HashMap<String, String>> = None;
-            let mut completions_url_override: Option<String> = None;
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, mut model_context_window, fallback_chain) = if use_e2e_llm {
+            // Every production route reaches the adapter as the same admitted,
+            // non-serializable execution material. The E2E hook only replaces
+            // the physical provider call; it does not define another route.
+            let (model_name, wire_model_name, api_key, base_url, provider, request_body_overrides, cache_capability, model_context_window) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
@@ -1867,72 +1813,77 @@ impl InProcessChatTurnBridge {
                     None,
                     None,
                     None,
-                    Vec::<String>::new(),
-                )
-            } else if let Some(invocation) = provider_model_gateway_invocation {
-                let mut headers = HashMap::new();
-                headers.insert("authorization".to_string(), invocation.authorization);
-                llm_header_overrides = Some(headers);
-                completions_url_override = Some(invocation.endpoint_url);
-                (
-                    invocation.model,
-                    None::<String>,
-                    "provider-runtime".to_string(),
-                    "http://127.0.0.1".to_string(),
-                    "openai".to_string(),
-                    None,
-                    None,
-                    None,
-                    Vec::<String>::new(),
                 )
             } else {
-                match astra_services::resolve_active_llm_model(
-                    &matrixone,
-                    encryptor.as_ref(),
-                    requested_model_override,
-                    pool_ref,
-                )
-                .await
-                {
-                    Ok(m) => (
-                        m.model_name,
-                        m.wire_model_name,
-                        m.api_key,
-                        m.base_url,
-                        m.provider,
-                        m.request_body_overrides,
-                        crate::turn::llm::context::cache_capability_from_model_metadata(
-                            m.prompt_cache_capability,
-                        ),
-                        m.context_window,
-                        m.fallback_chain,
+                (
+                    admitted_model_execution.model_name.clone(),
+                    admitted_model_execution.wire_model_name.clone(),
+                    admitted_model_execution.api_key.clone(),
+                    admitted_model_execution.base_url.clone(),
+                    admitted_model_execution.provider.clone(),
+                    admitted_model_execution.request_body_overrides.clone(),
+                    crate::turn::llm::context::cache_capability_from_model_metadata(
+                        admitted_model_execution.cache_capability,
                     ),
-                    Err(e) => {
-                        let message = format!("Model resolution failed: {e}");
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::classify_model_resolution_error_message(&message),
-                            message,
-                        );
-                        yield render_sse_map(&build_stream_error_event(
-                            &error.message,
-                            error.kind.as_str(),
-                            error.kind.is_retryable(),
-                        ));
-                        mark_disconnect_capture_finalized(&disconnect_capture_state);
-                        return;
-                    }
-                }
+                    admitted_model_execution.context_window,
+                )
             };
-            let has_fallback = !fallback_chain.is_empty();
+            let (llm_header_overrides, completions_url_override, request_timeout) = if use_e2e_llm
+            {
+                (None, None, None)
+            } else {
+                (
+                    (!admitted_model_execution.header_overrides.is_empty())
+                        .then(|| admitted_model_execution.header_overrides.clone()),
+                    admitted_model_execution.completions_url_override.clone(),
+                    admitted_model_execution
+                        .request_timeout_ms
+                        .map(std::time::Duration::from_millis),
+                )
+            };
+            let compact_config = crate::prompts::CompactConfig::from_env();
+            let summary_route = OwnedLlmExecutionRoute {
+                    model_name: model_name.clone(),
+                    wire_model_name: wire_model_name.clone(),
+                    api_key: api_key.clone(),
+                    base_url: base_url.clone(),
+                    provider: provider.clone(),
+                    header_overrides: llm_header_overrides.clone().unwrap_or_default(),
+                    request_body_overrides: request_body_overrides.clone(),
+                    completions_url_override: completions_url_override.clone(),
+                    request_timeout,
+                };
+            let summary_client = (!use_e2e_llm && !session_id.is_empty())
+                .then(|| shared_pool.clone())
+                .flatten()
+                .map(|pool| {
+                    RuntimeSummaryClient::new(
+                        summary_route,
+                        compact_config.summary_token_budget,
+                        crate::turn::llm::durable::DurableInferenceLedger::new(
+                            pool,
+                            user_id.clone(),
+                            admitted_model_execution.clone(),
+                        ),
+                        astra_turn_types::InferenceInvocationScope::Session {
+                            session_id: session_id.clone(),
+                            turn: trace_turn,
+                            round: round_index,
+                            operation_id: "bridge_compaction".to_string(),
+                            logical_attempt: 0,
+                        },
+                    )
+                });
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
             let cache_cfg =
                 PromptCacheConfig::from_cache_capability(cache_capability, &provider, &model_name);
 
-            // Check rate-limit cooldown and handle fallback model resolution
+            // Offering admission is the routing and billing boundary. Legacy
+            // model-name fallback chains cannot cross it.
             let cooldown = rate_limit_cooldown();
-            match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
+            match cooldown.with(&model_name, |c| c.check_request(false)) {
                 RateLimitAction::Proceed => {}
                 RateLimitAction::WaitAndRetry { delay_ms } => {
                     astra_core::agent_info!(
@@ -1941,7 +1892,7 @@ impl InProcessChatTurnBridge {
                     );
                     tokio::select! {
                         biased;
-                        _ = crate::turn::llm::client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                        _ = crate::turn::llm::client::wait_until_cancelled_or_pending(Some(cc.as_ref())) => {
                             yield render_sse_map(&build_stream_error_event(
                                 "Request cancelled (client disconnected)",
                                 "CLIENT_DISCONNECT",
@@ -1954,69 +1905,11 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    let mx = &matrixone;
-                    let enc = encryptor.as_ref();
-                    match try_resolve_fallback(
-                        cooldown,
-                        &fallback_chain,
-                        reason,
-                        |fb_name| {
-                            async move {
-                                astra_services::resolve_active_llm_model(
-                                    mx,
-                                    enc,
-                                    Some(fb_name.as_str()),
-                                    pool_ref,
-                                )
-                                .await
-                            }
-                        },
-                    )
-                    .await
-                    {
-                        FallbackOutcome::Resolved(fb) => {
-                            let from_model = model_name.clone();
-                            let to_model = fb.model_name.clone();
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit fallback: {} -> {} ({})",
-                                from_model,
-                                to_model,
-                                reason.as_str()
-                            );
-                            rate_limit_fallback_trace = Some(json!({
-                                "from_model": from_model,
-                                "to_model": to_model,
-                                "reason": reason.as_str(),
-                            }));
-                            model_name = fb.model_name;
-                            wire_model_name = fb.wire_model_name;
-                            api_key = fb.api_key;
-                            base_url = fb.base_url;
-                            provider = fb.provider;
-                            request_body_overrides = fb.request_body_overrides;
-                            model_context_window = fb.context_window;
-                            cache_capability =
-                                crate::turn::llm::context::cache_capability_from_model_metadata(
-                                    fb.prompt_cache_capability,
-                                );
-                        }
-                        FallbackOutcome::NoFallbackConfigured => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit cooldown: fallback requested ({}) but no fallback configured",
-                                reason.as_str()
-                            );
-                        }
-                        FallbackOutcome::AllExhausted { chain_len } => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit cooldown: all {} fallback models exhausted ({})",
-                                chain_len,
-                                reason.as_str()
-                            );
-                        }
-                    }
+                    astra_core::agent_warn!(
+                        "llm",
+                        "rate-limit controller requested a fallback without an admitted fallback Offering ({})",
+                        reason.as_str()
+                    );
                 }
                 RateLimitAction::Reject {
                     reason,
@@ -2096,16 +1989,12 @@ impl InProcessChatTurnBridge {
             // CLI-local recall may still inform tool selection, but it does
             // not provide an alternate prompt-text format.
             let mut memoria_prefetch_entries = Vec::new();
-            // Runtime configuration owns the provider. A server-configured
-            // client covers Server Only and takes precedence; an edge-
-            // supplied runtime binding is a capability fallback for
-            // CLI+Server / Edge+Server. Credentials never enter prompt
-            // assembly.
-            let (memoria_client_for_turn, memory_provider_source) =
-                resolve_bridge_memory_provider(
-                    memoria_client_owned.clone(),
-                    &runtime_memory_binding,
-                );
+            // Runtime configuration owns the memory provider. Client and Edge
+            // requests may contribute typed memory evidence, but cannot supply
+            // an endpoint or credential for Server to execute.
+            let memoria_client_for_turn = memoria_client_owned.clone();
+            let memory_provider_source =
+                memoria_client_for_turn.as_ref().map(|_| "server_config");
             // First-turn profile/episode prewarm and query-relevant per-turn
             // recall both enter the same typed Memory lane. Recall never
             // becomes a rendered stable-prefix block.
@@ -2122,10 +2011,10 @@ impl InProcessChatTurnBridge {
                     .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
                     .and_then(|m| m.get("content").and_then(Value::as_str))
                     .unwrap_or("");
-                let top_k = runtime_memory_binding
-                    .get("retrieval_top_k")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(5) as u32;
+                let top_k = astra_config::runtime_config::RuntimeConfig::cached()
+                    .memory
+                    .retrieval_top_k
+                    .clamp(1, 20);
 
                 // Per-turn hybrid recall runs every turn; session-start
                 // (profile + episodes) only on turn 1.
@@ -2443,10 +2332,9 @@ impl InProcessChatTurnBridge {
             let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
             rewrite_bridge_runtime_manifest_model_resolution(
                 &mut bridge_manifest_trace_json,
-                requested_model_name.as_deref(),
+                model_offering_id.as_deref(),
                 &model_name,
                 &provider,
-                rate_limit_fallback_trace.as_ref(),
             );
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
@@ -2497,21 +2385,11 @@ impl InProcessChatTurnBridge {
             //
             // Phase 3/Convergence: both the bridge and `ServerAgenticLoopHost`
             // now route through the shared `wire_assembly::MemoriaContext`.
-            // The summary client still constructs here (it captures the
-            // current request's auth headers + overrides) and is injected.
+            // The summary adapter uses the same admitted route as the main
+            // request, including forwarded headers and endpoint overrides.
             let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
 
-                let compact_config = crate::prompts::CompactConfig::from_env();
-                let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
-                    astra_turn_core::cloud_summary::LlmConnParams {
-                        model_name: model_name.clone(),
-                        api_key: api_key.clone(),
-                        base_url: base_url.clone(),
-                        provider: provider.clone(),
-                        max_output_tokens: compact_config.summary_token_budget,
-                    },
-                );
                 let memoria_client = memoria_client_shared.clone();
 
                 let ctx = crate::turn::wire_assembly::MemoriaContext {
@@ -2521,10 +2399,9 @@ impl InProcessChatTurnBridge {
                     memoria_client: memoria_client.as_ref().map(|c| {
                         c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                     }),
-                    summary_client: Some(
-                        &summary_client
-                            as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-                    ),
+                    summary_client: summary_client.as_ref().map(|client| {
+                        client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient
+                    }),
                     tier: pipeline_tier,
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
@@ -2587,10 +2464,9 @@ impl InProcessChatTurnBridge {
                     bridge_manifest_trace_json = bridge_manifest_trace.to_json();
                     rewrite_bridge_runtime_manifest_model_resolution(
                         &mut bridge_manifest_trace_json,
-                        requested_model_name.as_deref(),
+                        model_offering_id.as_deref(),
                         &model_name,
                         &provider,
-                        rate_limit_fallback_trace.as_ref(),
                     );
                     llm_messages.clear();
                     llm_messages.push(system_msg.clone());
@@ -2639,6 +2515,7 @@ impl InProcessChatTurnBridge {
             let mut reasoning = String::new();
             let mut usage = Map::new();
             let mut resolved_model = model_name.clone();
+            let mut provider_response_id: Option<String> = None;
             let mut cloud_loop_turns: i64 = 0;
             let mut llm_steps: Vec<Value> = Vec::new();
 
@@ -3053,34 +2930,140 @@ impl InProcessChatTurnBridge {
                         model = %model_name,
                         "context assembled, starting LLM call"
                     );
-                    let mut client_stopped = false;
                     let llm_stream = if let Some(blocks) = bridge_e2e_stream_blocks
                         .clone()
                         .filter(|blocks| !blocks.is_empty() && round_ix == 0)
                     {
                         futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
                     } else {
-                        match call_llm_stream_with_request_overrides(
-                            &llm_messages,
-                            &pruned_tools,
-                            &model_name,
-                            wire_model_name.as_deref(),
-                            &api_key,
-                            &base_url,
-                            &provider,
-                            Some(max_output_tokens),
-                            has_fallback,
-                            cc.clone(),
-                            &thinking_config,
-                            request_body_overrides.as_ref(),
-                            llm_header_overrides.as_ref(),
-                            completions_url_override.as_deref(),
-                            None,
+                        let Some(pool) = shared_pool.clone() else {
+                            let error = bridge_stream_terminal_error(
+                                astra_core::ErrorKind::DatabaseError,
+                                "Durable inference storage is unavailable",
+                            );
+                            yield render_classified_error_sse(
+                                &error,
+                                "inference_ledger",
+                                error.kind.is_retryable(),
+                            );
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
+                            return;
+                        };
+                        let ledger = crate::turn::llm::durable::DurableInferenceLedger::new(
+                            pool,
+                            user_id.clone(),
+                            admitted_model_execution.clone(),
+                        );
+                        let scope = astra_turn_types::InferenceInvocationScope::Session {
+                            session_id: session_id.clone(),
+                            turn: trace_turn,
+                            round: round_index,
+                            operation_id: bridge_inference_operation_id(&user_query_event_id),
+                            logical_attempt: 0,
+                        };
+                        let resolved_model_for_admission = model_name.clone();
+                        let upstream_model_for_admission = wire_model_name
+                            .clone()
+                            .unwrap_or_else(|| model_name.clone());
+                        let provider_for_admission = provider.clone();
+                        let admission_active = active_inference.clone();
+                        let admission_cancel = cc.clone();
+                        // Admission is detached from response-body polling. If
+                        // the client drops the body while the commit is in
+                        // flight, this task still observes the commit result
+                        // and closes it before any provider request can start.
+                        let admission = tokio::spawn(async move {
+                            let invocation = match ledger
+                                .admit(
+                                    scope,
+                                    inference_purpose,
+                                    &resolved_model_for_admission,
+                                    &upstream_model_for_admission,
+                                    &provider_for_admission,
+                                )
+                                .await
+                            {
+                                Ok(invocation) => Arc::new(invocation),
+                                Err(error) => {
+                                    astra_core::agent_error!(
+                                        "bridge",
+                                        "durable inference admission failed: {error}"
+                                    );
+                                    return Err(error);
+                                }
+                            };
+                            *admission_active.lock().await = Some(invocation.clone());
+                            if admission_cancel.is_cancelled() {
+                                finish_disconnected_bridge_inference(&admission_active).await;
+                                return Err(bridge_client_disconnect_error());
+                            }
+                            Ok::<_, astra_core::ClassifiedError>(invocation)
+                        });
+                        let admission_result = match admission.await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                let error = bridge_stream_terminal_error(
+                                    astra_core::ErrorKind::ContractViolation,
+                                    format!("durable inference admission task failed: {error}"),
+                                );
+                                yield render_classified_error_sse(
+                                    &error,
+                                    "inference_ledger",
+                                    error.kind.is_retryable(),
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                        };
+                        let invocation = match admission_result {
+                            Ok(invocation) => invocation,
+                            Err(error) => {
+                                let code = if crate::turn::llm::durable::is_ledger_error(&error) {
+                                    "inference_ledger"
+                                } else if cc.is_cancelled() {
+                                    "client_disconnect"
+                                } else {
+                                    error.kind.as_str()
+                                };
+                                yield render_classified_error_sse(
+                                    &error,
+                                    code,
+                                    error.kind.is_retryable(),
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                        };
+                        let attempt_observer = invocation.attempt_observer_arc();
+
+                        match call_llm_stream_with_attempt_observer(
+                            LlmCall {
+                                purpose: inference_purpose,
+                                messages: &llm_messages,
+                                tools: &pruned_tools,
+                                route: LlmExecutionRoute {
+                                    model_name: &model_name,
+                                    wire_model_name: wire_model_name.as_deref(),
+                                    api_key: &api_key,
+                                    base_url: &base_url,
+                                    provider: &provider,
+                                    header_overrides: llm_header_overrides.as_ref(),
+                                    request_body_overrides: request_body_overrides.as_ref(),
+                                    completions_url_override: completions_url_override.as_deref(),
+                                    request_timeout,
+                                },
+                                max_output_tokens: Some(max_output_tokens),
+                                temperature: None,
+                                has_fallback: false,
+                                thinking: &thinking_config,
+                            },
+                            Some(cc.clone()),
+                            Some(attempt_observer.clone()),
                         )
                         .await
                         {
                             Ok(s) => s.boxed(),
-                            Err(e) if astra_core::is_llm_context_window_error(&e) => {
+                            Err(e) if e.kind == astra_core::ErrorKind::ContextWindow => {
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3093,8 +3076,8 @@ impl InProcessChatTurnBridge {
                                 attempt_in_round,
                                 "context_window_error",
                                 json!({
-                                    "error": e.clone(),
-                                    "kind": "context_window",
+                                    "error": e.message,
+                                    "kind": e.kind.as_str(),
                                 }),
                             );
                             // Context-window error: force aggressive compaction and retry once
@@ -3110,16 +3093,6 @@ impl InProcessChatTurnBridge {
                                 Some(&model_name),
                                 model_context_window,
                             );
-                            let compact_config = crate::prompts::CompactConfig::from_env();
-                            let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
-                                astra_turn_core::cloud_summary::LlmConnParams {
-                                    model_name: model_name.clone(),
-                                    api_key: api_key.clone(),
-                                    base_url: base_url.clone(),
-                                    provider: provider.clone(),
-                                    max_output_tokens: compact_config.summary_token_budget,
-                                },
-                            );
                             let memoria_client = memoria_client_owned.clone();
 
                             let aggressive_ctx = crate::turn::wire_assembly::MemoriaContext {
@@ -3129,10 +3102,9 @@ impl InProcessChatTurnBridge {
                                 memoria_client: memoria_client.as_ref().map(|c| {
                                     c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                                 }),
-                                summary_client: Some(
-                                    &summary_client
-                                        as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-                                ),
+                                summary_client: summary_client.as_ref().map(|client| {
+                                    client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient
+                                }),
                                 tier: crate::prompts::CompactionTier::AggressivePrune,
                                 session_facts: session_facts_shared
                                     .lock()
@@ -3260,27 +3232,48 @@ impl InProcessChatTurnBridge {
                             }
 
                             // Retry LLM call
-                            match call_llm_stream_with_request_overrides(
-                                &llm_messages,
-                                &pruned_tools,
-                                &model_name,
-                                wire_model_name.as_deref(),
-                                &api_key,
-                                &base_url,
-                                &provider,
-                                Some(max_output_tokens / 2), // reduce output budget too
-                                has_fallback,
-                                cc.clone(),
-                                &thinking_config,
-                                request_body_overrides.as_ref(),
-                                llm_header_overrides.as_ref(),
-                                completions_url_override.as_deref(),
-                                None,
+                            match call_llm_stream_with_attempt_observer(
+                                LlmCall {
+                                    purpose: inference_purpose,
+                                    messages: &llm_messages,
+                                    tools: &pruned_tools,
+                                    route: LlmExecutionRoute {
+                                        model_name: &model_name,
+                                        wire_model_name: wire_model_name.as_deref(),
+                                        api_key: &api_key,
+                                        base_url: &base_url,
+                                        provider: &provider,
+                                        header_overrides: llm_header_overrides.as_ref(),
+                                        request_body_overrides: request_body_overrides.as_ref(),
+                                        completions_url_override: completions_url_override.as_deref(),
+                                        request_timeout,
+                                    },
+                                    max_output_tokens: Some(max_output_tokens / 2),
+                                    temperature: None,
+                                    has_fallback: false,
+                                    thinking: &thinking_config,
+                                },
+                                Some(cc.clone()),
+                                Some(attempt_observer.clone()),
                             )
                             .await
                             {
                                 Ok(s) => s.boxed(),
                                 Err(e2) => {
+                                    if let Err(ledger_error) =
+                                        finish_active_bridge_inference_error(&active_inference, &e2)
+                                            .await
+                                    {
+                                        yield render_classified_error_sse(
+                                            &ledger_error,
+                                            "inference_ledger",
+                                            false,
+                                        );
+                                        mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                        return;
+                                    }
+                                    let kind = e2.kind;
+                                    let error_message = e2.message.clone();
                                     record_full_llm_response_event(
                                         &mut turn_event_buffer,
                                         full_llm_capture,
@@ -3293,14 +3286,13 @@ impl InProcessChatTurnBridge {
                                         attempt_in_round,
                                         "context_window_error",
                                         json!({
-                                            "error": e2.clone(),
-                                            "kind": "context_window",
+                                            "error": error_message.clone(),
+                                            "kind": kind.as_str(),
                                         }),
                                     );
-                                    let kind = astra_core::classify_llm_error_message(&e2);
                                     let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
-                                        &e2, &llm_messages, &pruned_tools,
+                                        &e2.message, &llm_messages, &pruned_tools,
                                         capture_round_ix, Some(max_output_tokens / 2),
                                     );
                                     if let Err(error) =
@@ -3328,14 +3320,14 @@ impl InProcessChatTurnBridge {
                                         Some(max_output_tokens / 2),
                                         "context_window_error",
                                         json!({
-                                            "error": e2,
-                                            "kind": "context_window",
+                                            "error": error_message.clone(),
+                                            "kind": kind.as_str(),
                                         }),
                                         Some(trace_correlation.as_capture_trace()),
                                     )
                                     .await;
                                     yield render_sse_map(&build_stream_error_event(
-                                        &format!("Context window exceeded even after aggressive compaction: {e2}"),
+                                        &format!("Context window exceeded even after aggressive compaction: {error_message}"),
                                         kind.as_str(),
                                         false, // not retryable
                                     ));
@@ -3350,6 +3342,19 @@ impl InProcessChatTurnBridge {
                             }
                         }
                             Err(e) => {
+                            if let Err(ledger_error) =
+                                finish_active_bridge_inference_error(&active_inference, &e).await
+                            {
+                                yield render_classified_error_sse(
+                                    &ledger_error,
+                                    "inference_ledger",
+                                    false,
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                            let kind = e.kind;
+                            let error_message = e.message.clone();
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3362,14 +3367,13 @@ impl InProcessChatTurnBridge {
                                 attempt_in_round,
                                 "error",
                                 json!({
-                                    "error": e.clone(),
-                                    "kind": astra_core::classify_llm_error_message(&e).as_str(),
+                                    "error": error_message.clone(),
+                                    "kind": kind.as_str(),
                                 }),
                             );
-                            let kind = astra_core::classify_llm_error_message(&e);
                             let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
-                                &e, &llm_messages, &pruned_tools,
+                                &e.message, &llm_messages, &pruned_tools,
                                 capture_round_ix, Some(max_output_tokens),
                             );
                             if let Err(error) =
@@ -3397,13 +3401,17 @@ impl InProcessChatTurnBridge {
                                 Some(max_output_tokens),
                                 "error",
                                 json!({
-                                    "error": e,
+                                    "error": error_message.clone(),
                                     "kind": kind.as_str(),
                                 }),
                                 Some(trace_correlation.as_capture_trace()),
                             )
                             .await;
-                            yield render_sse_map(&build_stream_error_event(&e, kind.as_str(), kind.is_retryable()));
+                            yield render_sse_map(&build_stream_error_event(
+                                &error_message,
+                                kind.as_str(),
+                                kind.is_retryable(),
+                            ));
                             flush_turn_event_buffer_or_warn(
                                 &mut turn_event_buffer,
                                 &session_id,
@@ -3454,15 +3462,6 @@ impl InProcessChatTurnBridge {
 
                     loop {
                         tokio::select! {
-                            biased;
-                            _ = crate::turn::llm::client::wait_until_cancelled_or_pending(cc.as_deref()) => {
-                                astra_core::agent_warn!(
-                                    "bridge",
-                                    "chat turn cancelled — stopping LLM byte forward"
-                                );
-                                client_stopped = true;
-                                break;
-                            }
                             item = llm_stream.next() => {
                                 keepalive_deadline = tokio::time::Instant::now() + keepalive;
                                 let Some(bytes) = item else { break };
@@ -3485,6 +3484,7 @@ impl InProcessChatTurnBridge {
                                         &mut loop_tool_calls,
                                         &mut usage,
                                         &mut resolved_model,
+                                        &mut provider_response_id,
                                     ) {
                                         Ok(chunks) => {
                                             for b in chunks {
@@ -3528,6 +3528,25 @@ impl InProcessChatTurnBridge {
                                             );
                                         }
                                         Err(msg) => {
+                                            let inference_error = bridge_stream_terminal_error(
+                                                astra_core::ErrorKind::StreamTransport,
+                                                format!("invalid provider SSE block: {msg}"),
+                                            );
+                                            if let Err(ledger_error) =
+                                                finish_active_bridge_inference_error(
+                                                    &active_inference,
+                                                    &inference_error,
+                                                )
+                                                .await
+                                            {
+                                                yield render_classified_error_sse(
+                                                    &ledger_error,
+                                                    "inference_ledger",
+                                                    false,
+                                                );
+                                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                                return;
+                                            }
                                             record_full_llm_response_event(
                                                 &mut turn_event_buffer,
                                                 full_llm_capture,
@@ -3601,70 +3620,6 @@ impl InProcessChatTurnBridge {
                         }
                     }
 
-                    if client_stopped {
-                        record_full_llm_response_event(
-                            &mut turn_event_buffer,
-                            full_llm_capture,
-                            &session_id,
-                            trace_turn,
-                            &trace_correlation,
-                            "bridge_inprocess",
-                            if resolved_model.is_empty() {
-                                model_name.as_str()
-                            } else {
-                                resolved_model.as_str()
-                            },
-                            &provider,
-                            attempt_in_round,
-                            "client_disconnect",
-                            bridge_error_response_payload(
-                                "Request cancelled (client disconnected)",
-                                "CLIENT_DISCONNECT",
-                                &loop_text,
-                                &loop_reasoning,
-                                &loop_tool_calls,
-                                &usage,
-                            ),
-                        );
-                        persist_bridge_stream_failure_capture(
-                            "bridge_inprocess client disconnect capture",
-                            full_llm_capture,
-                            remote_artifact_store.as_ref(),
-                            &session_id,
-                            &user_id,
-                            trace_turn,
-                            &trace_correlation,
-                            capture_round_ix,
-                            agent_id.as_deref(),
-                            &model_name,
-                            &resolved_model,
-                            &provider,
-                            &llm_messages,
-                            &pruned_tools,
-                            Some(max_output_tokens),
-                            "client_disconnect",
-                            "Request cancelled (client disconnected)",
-                            "CLIENT_DISCONNECT",
-                            &loop_text,
-                            &loop_reasoning,
-                            &loop_tool_calls,
-                            &usage,
-                        )
-                        .await;
-                        yield render_sse_map(&build_stream_error_event(
-                            "Request cancelled (client disconnected)",
-                            "CLIENT_DISCONNECT",
-                            false,
-                        ));
-                        flush_turn_event_buffer_or_warn(
-                            &mut turn_event_buffer,
-                            &session_id,
-                            "bridge client disconnect",
-                        );
-                        mark_disconnect_capture_finalized(&disconnect_capture_state);
-                        return;
-                    }
-
                     let tail_result = match stream_parse_error {
                         Some(error) => Err(error),
                         None => match sse_buf.into_inner() {
@@ -3677,6 +3632,7 @@ impl InProcessChatTurnBridge {
                                 &mut loop_tool_calls,
                                 &mut usage,
                                 &mut resolved_model,
+                                &mut provider_response_id,
                             ),
                             Err(error) => Err(format!(
                                 "invalid UTF-8 in model SSE response: {error}"
@@ -3718,6 +3674,24 @@ impl InProcessChatTurnBridge {
                             );
                         }
                         Err(msg) => {
+                            let inference_error = bridge_stream_terminal_error(
+                                astra_core::ErrorKind::StreamTransport,
+                                format!("invalid provider SSE tail: {msg}"),
+                            );
+                            if let Err(ledger_error) = finish_active_bridge_inference_error(
+                                &active_inference,
+                                &inference_error,
+                            )
+                            .await
+                            {
+                                yield render_classified_error_sse(
+                                    &ledger_error,
+                                    "inference_ledger",
+                                    false,
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3787,11 +3761,37 @@ impl InProcessChatTurnBridge {
                         let error_message = error_event
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("bridge stream failed");
+                            .unwrap_or("bridge stream failed")
+                            .to_string();
                         let error_code = error_event
                             .get("code")
                             .and_then(Value::as_str)
-                            .unwrap_or("stream_error");
+                            .unwrap_or("stream_error")
+                            .to_string();
+                        if error_code != "inference_ledger" {
+                            let inference_error = if cc.is_cancelled() {
+                                bridge_client_disconnect_error()
+                            } else {
+                                bridge_stream_terminal_error(
+                                    forwarded_sse_error_kind(&error_event),
+                                    error_message.clone(),
+                                )
+                            };
+                            if let Err(ledger_error) = finish_active_bridge_inference_error(
+                                &active_inference,
+                                &inference_error,
+                            )
+                            .await
+                            {
+                                yield render_classified_error_sse(
+                                    &ledger_error,
+                                    "inference_ledger",
+                                    false,
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                        }
                         record_full_llm_response_event(
                             &mut turn_event_buffer,
                             full_llm_capture,
@@ -3808,8 +3808,8 @@ impl InProcessChatTurnBridge {
                             attempt_in_round,
                             "error",
                             bridge_error_response_payload(
-                                error_message,
-                                error_code,
+                                &error_message,
+                                &error_code,
                                 &loop_text,
                                 &loop_reasoning,
                                 &loop_tool_calls,
@@ -3833,8 +3833,8 @@ impl InProcessChatTurnBridge {
                             &pruned_tools,
                             Some(max_output_tokens),
                             "error",
-                            error_message,
-                            error_code,
+                            &error_message,
+                            &error_code,
                             &loop_text,
                             &loop_reasoning,
                             &loop_tool_calls,
@@ -3851,6 +3851,24 @@ impl InProcessChatTurnBridge {
                     }
 
                     if !saw_inprocess_summary {
+                        let inference_error = bridge_stream_terminal_error(
+                            astra_core::ErrorKind::StreamTransport,
+                            "LLM stream ended without a completion summary",
+                        );
+                        if let Err(ledger_error) = finish_active_bridge_inference_error(
+                            &active_inference,
+                            &inference_error,
+                        )
+                        .await
+                        {
+                            yield render_classified_error_sse(
+                                &ledger_error,
+                                "inference_ledger",
+                                false,
+                            );
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
+                            return;
+                        }
                         record_full_llm_response_event(
                             &mut turn_event_buffer,
                             full_llm_capture,
@@ -3903,12 +3921,35 @@ impl InProcessChatTurnBridge {
                         yield render_sse_map(&build_stream_error_event(
                             "LLM stream ended without completion summary from provider",
                             "STREAM_INCOMPLETE",
-                            true,
+                            false,
                         ));
                         flush_turn_event_buffer_or_warn(
                             &mut turn_event_buffer,
                             &session_id,
                             "bridge stream incomplete failure",
+                        );
+                        mark_disconnect_capture_finalized(&disconnect_capture_state);
+                        return;
+                    }
+
+                    let successful_usage =
+                        crate::turn::token_usage::TokenUsage::from_partial_json_map(&usage);
+                    let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+                        astra_services::InferenceUsage {
+                            input_tokens: successful_usage.input_tokens,
+                            output_tokens: successful_usage.output_tokens,
+                            cache_read_tokens: successful_usage.cached_input_tokens,
+                            cache_creation_tokens: successful_usage.cache_creation_tokens,
+                        },
+                        provider_response_id.clone(),
+                    );
+                    if let Err(ledger_error) =
+                        finish_active_bridge_inference(&active_inference, &terminal).await
+                    {
+                        yield render_classified_error_sse(
+                            &ledger_error,
+                            "inference_ledger",
+                            false,
                         );
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
@@ -4018,6 +4059,7 @@ impl InProcessChatTurnBridge {
                     && let Some(buf) = turn_event_buffer.as_mut()
                 {
                     buf.record_llm_round(LlmRoundRecord {
+                        purpose: inference_purpose,
                         ttft_ms: None,
                         duration_ms: round_ms as u64,
                         prompt_tokens: usage_snapshot.input_tokens,
@@ -4038,8 +4080,9 @@ impl InProcessChatTurnBridge {
                         agentic_step: u32::try_from(capture_round_ix).ok(),
                         source: Some("bridge_inprocess".to_string()),
                         run_id: Some(run_id.clone()),
+                        parent_run_id: None,
                         tool_calls: None,
-                        ..Default::default()
+                        agent_id: agent_id.clone(),
                     });
                 }
 
@@ -4462,7 +4505,7 @@ impl InProcessChatTurnBridge {
                     &all_round_tool_calls,
                     None, // context_capture_id
                     Some(&resolved_model),
-                    _agent_id.as_deref(),
+                    agent_id.as_deref(),
                     Some(&user_query_event_id),
                     trace_turn as i64,
                     None, // session_start
@@ -4470,13 +4513,16 @@ impl InProcessChatTurnBridge {
                     false, // run_observer = false → triggers observer
                     false, // run_reflection_learning = false → triggers reflection
                 );
-                crate::bridge::side_effects::run_bridge_hook_side_effects(
+                let hook_receipt = crate::bridge::side_effects::run_bridge_hook_side_effects(
                     Some(Value::Object(hook_payload)),
                     turn_hook_db_writer.clone(),
                     turn_reflection_state_store.clone(),
                     turn_reflection_lesson_writer.clone(),
                     turn_observer_worker.clone(),
                 );
+                if let Some(tracker) = persist_tracker_shared.clone() {
+                    tracker.track_persist_task(Box::pin(hook_receipt.wait()));
+                }
             }
 
             // Build request_id → (round, tools_in_round) for observability.
@@ -4659,8 +4705,8 @@ impl InProcessChatTurnBridge {
                     "tier": 0,
                     "latency_ms": 0,
                     "estimated_tokens": final_usage.total_tokens() as i64,
-                    "skipped": selected_model_name.is_some(),
-                    "reason": selected_model_name.as_ref().map(|_| "selected_model").unwrap_or(""),
+                    "skipped": model_offering_id.is_some(),
+                    "reason": model_offering_id.as_ref().map(|_| "model_selection").unwrap_or(""),
                     "cloud_loop_turns": cloud_loop_turns,
                 }));
                 let explain_event = build_explain_event(
@@ -4714,7 +4760,7 @@ impl InProcessChatTurnBridge {
             ));
         };
 
-        let cancel_on_drop = CancelOnDrop(client_cancel.clone());
+        let cancel_on_drop = CancelOnDrop(Some(response_cancel));
         let body_stream = stream! {
             let _cancel_on_drop = cancel_on_drop;
             for await chunk in stream {
@@ -4781,14 +4827,13 @@ fn parse_bridge_payload(body: &Bytes) -> Result<Value, (StatusCode, String)> {
             format!("invalid bridge request JSON: {error}"),
         )
     })?;
-    if payload.is_object() {
-        Ok(payload)
-    } else {
-        Err((
+    if !payload.is_object() {
+        return Err((
             StatusCode::BAD_REQUEST,
             "bridge request body must be a JSON object".to_string(),
-        ))
+        ));
     }
+    Ok(payload)
 }
 
 fn bridge_round_index(payload: &Value) -> Result<u32, (StatusCode, String)> {
@@ -4832,22 +4877,6 @@ fn optional_payload_object(
     }
 }
 
-fn optional_nested_payload_object(
-    payload: &Value,
-    parent_field: &'static str,
-    field: &'static str,
-) -> Result<Map<String, Value>, (StatusCode, String)> {
-    let parent = optional_payload_object(payload, parent_field)?;
-    match parent.get(field) {
-        Some(Value::Object(values)) => Ok(values.clone()),
-        Some(_) => Err((
-            StatusCode::BAD_REQUEST,
-            format!("bridge payload field `{parent_field}.{field}` must be an object"),
-        )),
-        None => Ok(Map::new()),
-    }
-}
-
 fn explain_requested(payload: &Value) -> bool {
     match payload.get("explain") {
         Some(Value::Bool(enabled)) => *enabled,
@@ -4861,6 +4890,14 @@ fn forwarded_sse_error_event(bytes: &Bytes) -> Option<Value> {
     let json_line = raw.strip_prefix("data: ")?;
     let event: Value = serde_json::from_str(json_line).ok()?;
     (event.get("type").and_then(Value::as_str) == Some("error")).then_some(event)
+}
+
+fn forwarded_sse_error_kind(event: &Value) -> astra_core::ErrorKind {
+    event
+        .get("error_kind")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(astra_core::ErrorKind::StreamTransport)
 }
 
 struct CancelOnDrop(Option<Arc<CancellationToken>>);
@@ -4989,6 +5026,10 @@ pub mod bridge_inprocess_test_helpers {
 }
 
 #[cfg(test)]
+#[path = "inprocess_live_tests.rs"]
+mod live_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
@@ -5005,6 +5046,24 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[tokio::test]
+    async fn active_inference_is_transferred_before_terminal_io() {
+        let active = Arc::new(tokio::sync::Mutex::new(Some("invocation")));
+
+        let settlement = settle_active_bridge_inference(&active, |owned| async move {
+            assert_eq!(owned, "invocation");
+            Err::<(), _>("database unavailable")
+        })
+        .await
+        .expect_err("settlement failure must remain observable");
+
+        assert_eq!(settlement, "database unavailable");
+        assert!(
+            active.lock().await.is_none(),
+            "a failed terminal write must not leave a stale invocation in the session slot"
+        );
+    }
+
     fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
         crate::turn::prompt_cache::resolve_always_load_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
@@ -5012,96 +5071,40 @@ mod tests {
     }
 
     #[test]
-    fn selected_model_name_from_payload_ignores_legacy_top_level_model() {
-        assert_eq!(
-            selected_model_name_from_payload(&json!({
-                "selected_model": {"model": "deepseek-v4-pro-official"},
-                "model": "deepseek-v4-flash",
-            }))
-            .as_deref(),
-            Some("deepseek-v4-pro-official")
-        );
-        assert_eq!(
-            selected_model_name_from_payload(&json!({
-                "model": "deepseek-v4-flash",
-            })),
-            None
-        );
+    fn bridge_inference_operation_identity_is_stable_bounded_and_query_specific() {
+        let first = bridge_inference_operation_id("query-event-1");
+        let replay = bridge_inference_operation_id("query-event-1");
+        let second = bridge_inference_operation_id("query-event-2");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, second);
+        assert!(first.starts_with("bridge_chat_"));
+        assert_eq!(first.len(), "bridge_chat_".len() + 32);
     }
 
     #[test]
-    fn provider_model_gateway_invocation_from_payload_reads_provider_runtime_context() {
-        let invocation = provider_model_gateway_invocation_from_payload(&json!({
-            "selected_model": {"id": "model-qwen", "model": "qwen3.5-flash"},
-            "runtime_auth": {"authorization": "Bearer runtime-grant"},
-            "capability_descriptors": {
-                "model_gateway": {
-                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
-                }
-            }
-        }))
-        .expect("valid provider runtime context")
-        .expect("provider model gateway invocation");
-
-        assert_eq!(invocation.model, "qwen3.5-flash");
-        assert_eq!(
-            invocation.endpoint_url,
-            "http://catalog.local/api/v1/models/openai/chat/completions"
-        );
-        assert_eq!(invocation.authorization, "Bearer runtime-grant");
-    }
-
-    #[test]
-    fn provider_model_gateway_invocation_allows_missing_provider_model_id() {
-        let invocation = provider_model_gateway_invocation_from_payload(&json!({
-            "selected_model": {"model": "qwen3.5-flash"},
-            "runtime_auth": {"authorization": "Bearer runtime-grant"},
-            "capability_descriptors": {
-                "model_gateway": {
-                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
-                }
-            }
-        }))
-        .expect("valid provider runtime context")
-        .expect("provider model gateway invocation");
-
-        assert_eq!(invocation.model, "qwen3.5-flash");
-    }
-
-    #[test]
-    fn bridge_runtime_manifest_distinguishes_requested_and_fallback_model() {
+    fn bridge_runtime_manifest_records_offering_and_resolved_model() {
         let mut trace = json!({
             "source": "llm_context_bridge",
             "runtime_manifest": {
                 "schema_version": "astra_runtime_manifest.v1"
             }
         });
-        let fallback = json!({
-            "from_model": "deepseek-v4-pro-official",
-            "to_model": "deepseek-v4-flash",
-            "reason": "rate_limit",
-        });
-
         rewrite_bridge_runtime_manifest_model_resolution(
             &mut trace,
-            Some("deepseek-v4-pro-official"),
-            "deepseek-v4-flash",
+            Some("offer-deepseek-v4-pro"),
+            "deepseek-v4-pro-official",
             "openai",
-            Some(&fallback),
         );
 
         let manifest = &trace["runtime_manifest"];
         assert_eq!(
-            manifest["selected_model"]["model"],
-            "deepseek-v4-pro-official"
+            manifest["model_selection"]["offering_id"],
+            "offer-deepseek-v4-pro"
         );
+        assert_eq!(manifest["model_resolution"]["source"], "catalog_offering");
         assert_eq!(
-            manifest["model_resolution"]["source"],
-            "rate_limit_fallback"
-        );
-        assert_eq!(manifest["model_resolution"]["model"], "deepseek-v4-flash");
-        assert_eq!(
-            manifest["model_resolution"]["fallback"]["from_model"],
+            manifest["model_resolution"]["model"],
             "deepseek-v4-pro-official"
         );
         assert_eq!(
@@ -5186,41 +5189,6 @@ mod tests {
         assert_eq!(second, first);
     }
 
-    #[test]
-    fn bridge_memory_provider_supports_request_binding_and_prefers_server_config() {
-        let request_binding = json!({
-            "provider": "memoria",
-            "base_url": "http://request-memory",
-            "api_key": "request-key",
-            "retrieval_top_k": 7,
-        })
-        .as_object()
-        .expect("binding")
-        .clone();
-
-        let (request_client, request_source) =
-            resolve_bridge_memory_provider(None, &request_binding);
-        assert!(request_client.is_some());
-        assert_eq!(request_source, Some("request_binding"));
-
-        let server_client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
-            "http://server-memory".into(),
-            "server-key".into(),
-        );
-        let (resolved, source) =
-            resolve_bridge_memory_provider(Some(server_client), &request_binding);
-        assert!(resolved.is_some());
-        assert_eq!(source, Some("server_config"));
-
-        let invalid = json!({"provider": "memoria", "base_url": "http://memory"})
-            .as_object()
-            .expect("invalid binding")
-            .clone();
-        let (missing, source) = resolve_bridge_memory_provider(None, &invalid);
-        assert!(missing.is_none());
-        assert!(source.is_none());
-    }
-
     #[tokio::test]
     async fn later_turn_clears_cached_session_start_memory_snapshot() {
         let cache = tokio::sync::Mutex::new(HashMap::new());
@@ -5266,6 +5234,18 @@ mod tests {
         Arc::new(
             FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
                 .expect("valid fernet key"),
+        )
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    fn bridge_test_model_execution() -> astra_services::AdmittedModelExecution {
+        astra_services::AdmittedModelExecution::from_endpoint(
+            "offer-bridge-e2e".to_string(),
+            "bridge-e2e-mock".to_string(),
+            "openai".to_string(),
+            "http://bridge-e2e.invalid/chat/completions".to_string(),
+            "Bearer bridge-e2e".to_string(),
+            None,
         )
     }
 
@@ -7615,6 +7595,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal success"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -7628,6 +7609,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7705,6 +7687,15 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        let round = journal
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("llm_round"))
+            .expect("bridge LLM round event");
+        let purpose = serde_json::from_value::<astra_turn_types::InferencePurpose>(
+            round["metadata"]["purpose"].clone(),
+        )
+        .expect("typed round purpose");
+        assert_eq!(purpose, astra_turn_types::InferencePurpose::PrimaryAgent);
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -7719,6 +7710,7 @@ mod tests {
         let mut headers = bridge_test_headers(session_id, true);
         headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "root_turn_journal_owned": true,
             "messages": [{"role": "user", "content": "root-owned bridge capture"}],
             "edge_tools": [],
@@ -7733,6 +7725,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7791,6 +7784,7 @@ mod tests {
 
         for (round_index, reply) in [(0_u32, "bridge round zero"), (1_u32, "bridge round one")] {
             let payload = json!({
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [{"role": "user", "content": format!("bridge round {round_index}")}],
                 "edge_tools": [],
                 "round_index": round_index,
@@ -7805,6 +7799,7 @@ mod tests {
                 .forward(
                     &headers,
                     Bytes::from(payload.to_string()),
+                    bridge_test_model_execution(),
                     Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                     Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                     Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7879,6 +7874,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal partial error"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -7891,6 +7887,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7950,6 +7947,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, false);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal disabled"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -7963,6 +7961,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -8275,6 +8274,7 @@ mod tests {
             && let Some(buf) = turn_event_buffer.as_mut()
         {
             buf.record_llm_round(LlmRoundRecord {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 cache_read_tokens: 0,
@@ -8287,8 +8287,9 @@ mod tests {
                 agentic_step: Some(3),
                 source: Some("bridge_inprocess".to_string()),
                 run_id: None,
+                parent_run_id: None,
                 tool_calls: None,
-                ..Default::default()
+                agent_id: None,
             });
         }
         record_full_llm_response_event(

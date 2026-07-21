@@ -1,9 +1,9 @@
-//! `GET /admin/tokens` — 403 without `astra_admin`, then 200 JSON array after role grant.
+//! Global admin control-plane routes reject normal users and remain usable
+//! after the same principal receives `astra_admin`.
+use super::harness::{bootstrap, get_json, grant_astra_admin_role, revoke_astra_admin_role};
 use axum::http::StatusCode;
 
-use super::harness::{bootstrap, get_json, grant_astra_admin_role, revoke_astra_admin_role};
-
-pub async fn run_admin_tokens_smoke() {
+pub async fn run_admin_control_plane_rbac() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let auth = &b.auth_header;
@@ -19,7 +19,6 @@ pub async fn run_admin_tokens_smoke() {
         StatusCode::FORBIDDEN,
         "admin tokens without role: {denied_j}"
     );
-
     grant_astra_admin_role(pool, user_id).await;
 
     let (st_ok, body) = get_json(app, "/admin/tokens", Some(auth.as_str()), &[]).await;

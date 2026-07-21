@@ -848,10 +848,60 @@ async fn edge_registry_two_phase_registration_keeps_pending_metadata_unroutable(
         "finalized generation stays unroutable until pool commit releases the claim"
     );
     assert!(svc.release_registration(&pending).await.unwrap());
+    assert!(
+        !svc.release_registration(&pending).await.unwrap(),
+        "a committed claim cannot be released twice"
+    );
     let current = svc.list_by_user(&user_id).await.unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].edge_id, "edge-new");
     assert_eq!(current[0].workspace_id.as_deref(), Some("workspace-new"));
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_agent_lookup_isolated_by_workspace() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let svc = DatabaseEdgeRegistryService::new(pool);
+    let user_id = format!("user_{}", unique_suffix());
+    let edge_agent_id = format!("agent_{}", unique_suffix());
+
+    let lease = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-workspace-owner",
+            None,
+            Some("/workspace/a"),
+            None,
+            Some("workspace-a"),
+        )
+        .await
+        .expect("claim workspace-bound edge");
+    assert!(svc.finalize_registration(&lease).await.unwrap());
+    assert!(svc.release_registration(&lease).await.unwrap());
+
+    assert!(
+        svc.find_by_agent_id_and_workspace(&edge_agent_id, Some("workspace-a"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        svc.find_by_agent_id_and_workspace(&edge_agent_id, Some("workspace-b"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a foreign workspace must not resolve the edge"
+    );
+    assert!(
+        svc.find_by_agent_id_and_workspace(&edge_agent_id, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "missing workspace context must not resolve a workspace-bound edge"
+    );
 }
 
 #[tokio::test]

@@ -9,8 +9,8 @@ import {
   beginStreamingMessage,
   ensureChatBackendSession,
   getChat,
-  resolveBackendModelName,
-  selectedWebModel,
+  resolveModelOfferingSelection,
+  requireSelectedOfferingId,
   setChatActiveRun,
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
@@ -602,15 +602,15 @@ export async function POST(
       const workspaceBindings = resolveWorkspaceBindings(
         effectiveWorkspaceSelection,
       );
-      const requestedModel = selectedWebModel(
+      const requestedModel = requireSelectedOfferingId(
         body.options?.model ?? chat.chat.model,
       );
-      const [ensuredSessionId, selectedModel] = await Promise.all([
+      const [ensuredSessionId, modelSelection] = await Promise.all([
         ensureChatBackendSession(ownerUserId, chatId, {
           model: requestedModel,
           runtime,
         }),
-        resolveBackendModelName(runtime, requestedModel),
+        resolveModelOfferingSelection(runtime, requestedModel),
       ]);
       runtimeSessionId = ensuredSessionId;
       emit({
@@ -637,7 +637,7 @@ export async function POST(
           parts: [],
           attachments: body.attachments ?? [],
           session_id: runtimeSessionId,
-          selected_model: selectedModel,
+          model_selection: { offering_id: modelSelection.offeringId },
           allow_skills: activeSkills.length ? activeSkills : undefined,
           enabled_tools: activeTools,
           workspace_binding: workspaceBindings.workspaceBinding,

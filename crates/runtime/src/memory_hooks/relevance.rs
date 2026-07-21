@@ -3,11 +3,15 @@
 //! Filters retrieved memories/lessons to only those clearly relevant
 //! to the current task, reducing prompt noise and token waste.
 //! Uses the cheapest `selector`-tagged model from the registry
-//! (resolved via `resolve_memory_model` from the model DB).
+//! (resolved via `resolve_memory_offerings` from the model DB).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use astra_text_utils::text_tokenize::tokenize;
+use astra_turn_types::InferencePurpose;
+
+use super::inference::{MemoryInferencePort, MemoryInferenceRequest};
 
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "\
@@ -50,31 +54,18 @@ pub fn build_memory_feedback_query(user_message: &str, memories: &[String]) -> S
     prompt
 }
 
-/// Parse the selector model's response into a list of indices.
-/// Handles: `[0, 2]`, `[0,2]`, bare `0, 2`, and markdown-wrapped responses.
-#[must_use]
-pub fn parse_relevance_response(response: &str, memory_count: usize) -> Vec<usize> {
-    let trimmed = response.trim();
-
-    // Strip markdown code fences if present
-    let clean = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(trimmed)
-        .trim();
-
-    // Try JSON array parse
-    if let Ok(indices) = serde_json::from_str::<Vec<usize>>(clean) {
-        return indices.into_iter().filter(|&i| i < memory_count).collect();
-    }
-
-    // Fallback: extract numbers from the string
-    clean
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|s| s.parse::<usize>().ok())
-        .filter(|&i| i < memory_count)
-        .collect()
+/// Parse the selector's strict JSON response, dropping out-of-range and
+/// duplicate indices while preserving the model's order.
+fn parse_relevance_response(
+    response: &str,
+    memory_count: usize,
+) -> Result<Vec<usize>, serde_json::Error> {
+    let indices = serde_json::from_str::<Vec<usize>>(response.trim())?;
+    let mut seen = HashSet::new();
+    Ok(indices
+        .into_iter()
+        .filter(|index| *index < memory_count && seen.insert(*index))
+        .collect())
 }
 
 /// Filter memories by the indices returned from the selector model.
@@ -212,19 +203,6 @@ fn is_meaningful_term(term: &str) -> bool {
     true
 }
 
-/// Connection parameters for an OpenAI-compatible LLM endpoint.
-/// Resolved from the model registry via `resolve_memory_model`.
-#[derive(Debug, Clone)]
-pub struct LlmConnParams {
-    pub base_url: String,
-    pub api_key: String,
-    pub model_name: String,
-    pub wire_model_name: Option<String>,
-    pub provider: String,
-    pub request_body_overrides: Option<serde_json::Map<String, serde_json::Value>>,
-    pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
-}
-
 /// Filter a list of text items through the selector model.
 /// Returns only items deemed relevant to `user_message`.
 ///
@@ -232,7 +210,8 @@ pub struct LlmConnParams {
 /// If the selector explicitly returns no relevant indices, returns an empty
 /// list. Prompt noise is more harmful than a missed memory.
 pub async fn filter_memories(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     user_message: &str,
     items: &[String],
 ) -> Vec<String> {
@@ -240,71 +219,32 @@ pub async fn filter_memories(
         return Vec::new();
     }
     let query = build_relevance_query(user_message, items);
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
+    let text = match run_selector_prompt(
+        client,
+        invocation_scope,
+        InferencePurpose::MemoryRetrievalRerank,
+        RELEVANCE_FILTER_PROMPT,
+        query,
+    )
+    .await
     {
-        Ok(c) => c,
-        Err(_) => return lexical_filter_memories(user_message, items),
+        Some(text) => text,
+        None => return lexical_filter_memories(user_message, items),
     };
 
-    let mut req_body = serde_json::json!({
-        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
-        "messages": [
-            {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
-            {"role": "user", "content": query},
-        ],
-        "max_tokens": 50,
-        "temperature": 0.0,
-    });
-    // Always suppress thinking for selector/memory calls — no point
-    // spending tokens on reasoning for simple JSON tasks.
-    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
-        &mut req_body,
-        &params.provider,
-        &params.base_url,
-    );
-
-    let resp = match client
-        .post(format!("{}/chat/completions", params.base_url))
-        .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&req_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return lexical_filter_memories(user_message, items),
+    let indices = match parse_relevance_response(&text, items.len()) {
+        Ok(indices) => indices,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %client.model_name(),
+                purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
+                %error,
+                "memory selector returned an invalid response"
+            );
+            return lexical_filter_memories(user_message, items);
+        }
     };
-
-    let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })
-        .unwrap_or_default();
-
-    if text.is_empty() {
-        return lexical_filter_memories(user_message, items);
-    }
-
-    // Safety net: strip <think> tags that native thinkers may emit despite suppression.
-    // If stripping empties the text, fall back to the original.
-    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
-    let text = if stripped.trim().is_empty() {
-        text
-    } else {
-        stripped
-    };
-
-    let indices = parse_relevance_response(&text, items.len());
     if indices.is_empty() {
         return Vec::new();
     }
@@ -316,7 +256,8 @@ pub async fn filter_memories(
 /// user is explicitly rejecting. On any failure, returns an empty set rather
 /// than guessing from surface words.
 pub async fn select_dismissed_memory_indices(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     user_message: &str,
     items: &[String],
 ) -> Vec<usize> {
@@ -324,58 +265,68 @@ pub async fn select_dismissed_memory_indices(
         return Vec::new();
     }
     let query = build_memory_feedback_query(user_message, items);
-    let text = match run_selector_prompt(params, MEMORY_FEEDBACK_FILTER_PROMPT, query).await {
+    let text = match run_selector_prompt(
+        client,
+        invocation_scope,
+        InferencePurpose::MemoryRetrievalRerank,
+        MEMORY_FEEDBACK_FILTER_PROMPT,
+        query,
+    )
+    .await
+    {
         Some(text) => text,
         None => return Vec::new(),
     };
-    parse_relevance_response(&text, items.len())
+    match parse_relevance_response(&text, items.len()) {
+        Ok(indices) => indices,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %client.model_name(),
+                purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
+                %error,
+                "memory feedback selector returned an invalid response"
+            );
+            Vec::new()
+        }
+    }
 }
 
 async fn run_selector_prompt(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
+    purpose: InferencePurpose,
     system_prompt: &str,
     user_content: String,
 ) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .ok()?;
-
-    let mut req_body = serde_json::json!({
-        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": 50,
-        "temperature": 0.0,
-    });
-    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
-        &mut req_body,
-        &params.provider,
-        &params.base_url,
-    );
-
-    let resp = client
-        .post(format!("{}/chat/completions", params.base_url))
-        .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&req_body)
-        .send()
-        .await
-        .ok()?;
-
-    let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })?;
+    let messages = [
+        serde_json::json!({"role": "system", "content": system_prompt}),
+        serde_json::json!({"role": "user", "content": user_content}),
+    ];
+    let result = client
+        .complete(MemoryInferenceRequest {
+            purpose,
+            invocation_scope,
+            messages: &messages,
+            max_output_tokens: 50,
+            temperature: 0.0,
+            deadline: Duration::from_secs(3),
+        })
+        .await;
+    let text = match result {
+        Ok(result) if !result.trim().is_empty() => result,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %client.model_name(),
+                purpose = purpose.as_str(),
+                error_kind = %error.kind,
+                "memory selector model call unavailable"
+            );
+            return None;
+        }
+    };
     if text.trim().is_empty() {
         return None;
     }
@@ -401,29 +352,59 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_hooks::DirectMemoryInferenceClient;
+    use async_trait::async_trait;
+
+    fn test_scope() -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "session-memory-test".to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "memory_rerank_test".to_string(),
+            logical_attempt: 0,
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingInference {
+        purposes: Arc<std::sync::Mutex<Vec<InferencePurpose>>>,
+    }
+
+    #[async_trait]
+    impl MemoryInferencePort for CapturingInference {
+        fn model_name(&self) -> &str {
+            "capturing-reranker"
+        }
+
+        async fn complete(
+            &self,
+            request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.purposes.lock().unwrap().push(request.purpose);
+            Ok("[0]".to_string())
+        }
+    }
 
     #[test]
-    fn test_parse_relevance_response() {
-        // (input, max_items) → expected
+    fn relevance_response_requires_a_json_index_array() {
         let cases: &[(&str, usize, &[usize])] = &[
             ("[0, 2, 4]", 5, &[0, 2, 4]),
             ("[0, 2, 10]", 3, &[0, 2]),
-            ("```json\n[1, 3]\n```", 5, &[1, 3]),
-            ("0, 2", 5, &[0, 2]),
+            ("[1, 1, 3]", 5, &[1, 3]),
             ("[]", 5, &[]),
-            ("no relevant memories", 5, &[]),
             ("[10, 20, 30]", 5, &[]),
             ("[0, 99, 2, 150]", 5, &[0, 2]),
         ];
         for (input, max, expected) in cases {
             assert_eq!(
-                parse_relevance_response(input, *max),
+                parse_relevance_response(input, *max).unwrap(),
                 *expected,
                 "input={input:?}, max={max}"
             );
         }
-        // Negative indices: JSON parse fails, fallback digit extraction yields [1,0,2]
-        assert_eq!(parse_relevance_response("[-1, 0, 2]", 5), vec![1, 0, 2]);
+        for invalid in ["0, 2", "```json\n[1, 3]\n```", "[-1, 0, 2]"] {
+            assert!(parse_relevance_response(invalid, 5).is_err());
+        }
     }
 
     #[test]
@@ -451,6 +432,23 @@ mod tests {
         let items = vec!["不要用bash执行git命令".into(), "always run clippy".into()];
         let result = lexical_filter_memories("用bash运行测试", &items);
         assert_eq!(result, vec!["不要用bash执行git命令".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn relevance_filter_attributes_the_call_as_memory_rerank() {
+        let purposes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = CapturingInference {
+            purposes: Arc::clone(&purposes),
+        };
+        let items = vec!["Prefer cargo test for Rust changes".to_string()];
+
+        let filtered = filter_memories(&client, &test_scope(), "review Rust", &items).await;
+
+        assert_eq!(filtered, items);
+        assert_eq!(
+            *purposes.lock().unwrap(),
+            vec![InferencePurpose::MemoryRetrievalRerank]
+        );
     }
 
     #[test]
@@ -484,79 +482,43 @@ mod tests {
         assert!(query.len() < 500 + 200); // truncated message + memory
     }
 
-    // ── parse_relevance_response edge cases (negatives) ──
-    // Negative in JSON: JSON parse fails (usize can't be negative),
-    // fallback digit extraction: "-1" splits on '-' → "1", so [1,0,2].
-    // This case is included in test_parse_relevance_response above.
-
-    // ── LlmConnParams tests ──
-
-    #[test]
-    fn llm_conn_params_clone() {
-        let params = LlmConnParams {
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "sk-test".into(),
-            model_name: "qwen-flash".into(),
-            wire_model_name: None,
-            provider: "openai".into(),
-            request_body_overrides: None,
-            thinking_capability: None,
-        };
-        let cloned = params.clone();
-        assert_eq!(cloned.base_url, "https://api.example.com/v1");
-        assert_eq!(cloned.api_key, "sk-test");
-        assert_eq!(cloned.model_name, "qwen-flash");
-    }
-
-    #[test]
-    fn llm_conn_params_debug_format() {
-        let params = LlmConnParams {
-            base_url: "http://localhost:8080".into(),
-            api_key: "key".into(),
-            model_name: "model".into(),
-            wire_model_name: None,
-            provider: "openai".into(),
-            request_body_overrides: None,
-            thinking_capability: None,
-        };
-        let debug = format!("{params:?}");
-        assert!(debug.contains("LlmConnParams"));
-        assert!(debug.contains("localhost"));
-    }
-
     // ── filter_memories tests ──
 
     #[tokio::test]
     async fn filter_memories_empty_input_returns_empty() {
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: "http://nonexistent:9999".into(),
             api_key: "key".into(),
             model_name: "model".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
-        let result = filter_memories(&params, "query", &[]).await;
+        let result = filter_memories(&params, &test_scope(), "query", &[]).await;
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn filter_memories_unreachable_server_uses_lexical_fallback() {
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
             model_name: "model".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec![
             "browser verification for html pages".into(),
             "cargo test for rust executor changes".into(),
         ];
-        let result = filter_memories(&params, "rust executor review", &items).await;
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert_eq!(
             result,
             vec!["cargo test for rust executor changes".to_string()],
@@ -591,7 +553,6 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         format!("http://{addr}")
     }
 
@@ -599,17 +560,19 @@ mod tests {
     async fn filter_memories_native_thinker_sends_suppression() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "qwen3.5-flash".into(),
             wire_model_name: None,
             provider: "dashscope".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["mem-a".into(), "mem-b".into()];
-        let _ = filter_memories(&params, "test query", &items).await;
+        let _ = filter_memories(&params, &test_scope(), "test query", &items).await;
 
         let body = captured.lock().unwrap().take().expect("request captured");
         assert_eq!(
@@ -622,17 +585,19 @@ mod tests {
     async fn filter_memories_non_native_does_not_send_suppression() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "gpt-4o-mini".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["mem-a".into()];
-        let _ = filter_memories(&params, "test", &items).await;
+        let _ = filter_memories(&params, &test_scope(), "test", &items).await;
 
         let body = captured.lock().unwrap().take().expect("request captured");
         assert!(
@@ -645,56 +610,65 @@ mod tests {
     async fn filter_memories_strips_think_tags_from_response() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>reasoning</think>[0, 2]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
-        let result = filter_memories(&params, "query", &items).await;
+        let result = filter_memories(&params, &test_scope(), "query", &items).await;
         assert_eq!(result, vec!["mem-0", "mem-2"]);
     }
 
     #[tokio::test]
-    async fn filter_memories_think_wrapping_json_falls_back_to_original() {
+    async fn filter_memories_malformed_selector_output_uses_lexical_fallback() {
         let captured = Arc::new(Mutex::new(None));
-        // Model wraps JSON inside think tags — strip would empty it
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
-        let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
-        let result = filter_memories(&params, "query", &items).await;
-        // Fallback to original text which contains the think-wrapped JSON
-        // parse_relevance_response will extract digits from "<think>[0, 1]</think>"
-        assert!(!result.is_empty(), "should fall back and parse something");
+        let items = vec![
+            "cargo test for rust executor changes".to_string(),
+            "browser verification for html pages".to_string(),
+        ];
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
+        assert_eq!(
+            result,
+            vec!["cargo test for rust executor changes".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn filter_memories_successful_filtering() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[1]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
-        let result = filter_memories(&params, "query", &items).await;
+        let result = filter_memories(&params, &test_scope(), "query", &items).await;
         assert_eq!(result, vec!["relevant"]);
     }
 
@@ -702,17 +676,19 @@ mod tests {
     async fn filter_memories_selector_empty_means_no_injection() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["cargo test for rust executor changes".into()];
-        let result = filter_memories(&params, "rust executor review", &items).await;
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert!(
             result.is_empty(),
             "selector's explicit empty relevance result should be respected"
@@ -723,14 +699,16 @@ mod tests {
     async fn select_dismissed_memory_indices_uses_selector_output() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec![
             "candidate about browser verification".into(),
@@ -738,6 +716,7 @@ mod tests {
         ];
         let dismissed = select_dismissed_memory_indices(
             &params,
+            &test_scope(),
             "the first candidate should not apply",
             &items,
         )

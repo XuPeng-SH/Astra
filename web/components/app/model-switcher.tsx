@@ -1,18 +1,83 @@
 'use client';
 
 import { Check, ChevronDown, Circle } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Popover } from '@/components/ui/popover';
-import { listModels } from '@/lib/api/models';
+import { listModels, type ModelCatalogResponse } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
 
-const fallbackModels: ModelSummary[] = [
-  { id: 'sonnet-4.6-adaptive', name: 'Sonnet 4.6', subtitle: 'Responsive everyday work', tier: 'included' },
-  { id: 'opus-4.7', name: 'Opus 4.7', subtitle: 'Most capable for ambitious work', tier: 'upgrade' },
-  { id: 'haiku-4.5', name: 'Haiku 4.5', subtitle: 'Fastest and most efficient', tier: 'included' },
-];
-const fallbackModelIds = new Set(fallbackModels.map((model) => model.id));
+type CatalogLoadState =
+  | { kind: 'loading' }
+  | { kind: 'loaded'; catalog: ModelCatalogResponse }
+  | { kind: 'error' };
+
+const ACCESS_STATUS_PRIORITY = {
+  action_required: 0,
+  disabled: 1,
+  unavailable: 2,
+  degraded: 3,
+  setting_up: 4,
+  ready: 5,
+} satisfies Record<ModelCatalogResponse['accesses'][number]['status'], number>;
+
+function primaryUnavailableAccess(catalog: ModelCatalogResponse) {
+  return catalog.accesses
+    .filter((access) => !access.usable)
+    .sort(
+      (left, right) =>
+        ACCESS_STATUS_PRIORITY[left.status] - ACCESS_STATUS_PRIORITY[right.status],
+    )[0];
+}
+
+function unavailableMessage(catalog: ModelCatalogResponse) {
+  const access = primaryUnavailableAccess(catalog);
+  if (!access) return 'No eligible models are available.';
+
+  if (access.status === 'setting_up') {
+    return `${access.label} is being set up. Models will appear when it is ready.`;
+  }
+  if (access.actions.includes('reauthenticate')) {
+    return `Reconnect ${access.label} to continue.`;
+  }
+  if (access.actions.includes('manage_billing')) {
+    return `Update billing for ${access.label} to continue.`;
+  }
+  if (access.actions.includes('configure_device_models')) {
+    return 'Add an eligible model on this device.';
+  }
+  if (access.actions.includes('reconnect_device')) {
+    return 'Reconnect this device to use its models.';
+  }
+  if (access.actions.includes('contact_administrator')) {
+    return access.status === 'disabled'
+      ? `${access.label} is disabled by policy.`
+      : 'Ask an administrator to enable an eligible model.';
+  }
+  if (access.actions.includes('retry')) {
+    return access.retry_after_seconds
+      ? `${access.label} is temporarily unavailable. Try again in ${access.retry_after_seconds}s.`
+      : `${access.label} is temporarily unavailable. Try again.`;
+  }
+  return 'No eligible models are available.';
+}
+
+function emptyCatalogLabel(catalog: ModelCatalogResponse) {
+  const status = primaryUnavailableAccess(catalog)?.status;
+  switch (status) {
+    case 'setting_up':
+      return 'Setting up model access';
+    case 'action_required':
+      return 'Model access needs attention';
+    case 'disabled':
+      return 'Model access disabled';
+    case 'degraded':
+    case 'unavailable':
+      return 'Models temporarily unavailable';
+    default:
+      return 'No models available';
+  }
+}
 
 export function ModelSwitcher({
   value,
@@ -27,28 +92,32 @@ export function ModelSwitcher({
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
-  const [models, setModels] = useState<ModelSummary[]>(fallbackModels);
-  const [loadedModels, setLoadedModels] = useState(false);
+  const [catalogState, setCatalogState] = useState<CatalogLoadState>({
+    kind: 'loading',
+  });
 
-  useEffect(() => {
+  const loadCatalog = useCallback(() => {
+    setCatalogState({ kind: 'loading' });
     listModels()
-      .then((result) => {
-        setModels(result.items);
-        setLoadedModels(true);
-      })
+      .then((catalog) => setCatalogState({ kind: 'loaded', catalog }))
       .catch(() => {
-        setModels(fallbackModels);
-        setLoadedModels(true);
+        setCatalogState({ kind: 'error' });
       });
   }, []);
 
+  useEffect(() => {
+    loadCatalog();
+  }, [loadCatalog]);
+
+  const catalog = catalogState.kind === 'loaded' ? catalogState.catalog : undefined;
+  const models: ModelSummary[] = catalog?.items ?? [];
   const selected = models.find((model) => model.id === value);
-  const defaultModel = loadedModels ? models[0] : undefined;
-  const shouldSelectDefault =
-    Boolean(defaultModel) &&
-    (!value || (!selected && fallbackModelIds.has(value)));
+  const defaultModel = catalog?.defaultOfferingId
+    ? models.find((model) => model.id === catalog.defaultOfferingId)
+    : undefined;
+  const shouldSelectDefault = Boolean(defaultModel) && !value;
   const visibleSelected = selected ?? (shouldSelectDefault ? defaultModel : undefined);
-  const modelUnavailable = loadedModels && Boolean(value) && !visibleSelected;
+  const modelUnavailable = Boolean(catalog) && Boolean(value) && !visibleSelected;
 
   useEffect(() => {
     if (!defaultModel || !shouldSelectDefault || value === defaultModel.id) {
@@ -58,8 +127,10 @@ export function ModelSwitcher({
   }, [defaultModel, onChange, shouldSelectDefault, value]);
 
   useEffect(() => {
-    onModelAvailabilityChange?.(loadedModels && Boolean(visibleSelected) && !modelUnavailable);
-  }, [loadedModels, modelUnavailable, onModelAvailabilityChange, visibleSelected]);
+    onModelAvailabilityChange?.(
+      Boolean(catalog) && Boolean(visibleSelected) && !modelUnavailable,
+    );
+  }, [catalog, modelUnavailable, onModelAvailabilityChange, visibleSelected]);
 
   return (
     <Popover
@@ -73,7 +144,15 @@ export function ModelSwitcher({
         >
           <span className="truncate">
             {visibleSelected?.name ??
-              (modelUnavailable ? 'Unavailable model' : value || 'Model')}
+              (modelUnavailable
+                ? 'Unavailable model'
+                : catalogState.kind === 'loading'
+                  ? 'Loading models…'
+                  : catalogState.kind === 'error'
+                    ? 'Model access unavailable'
+                  : catalog
+                    ? emptyCatalogLabel(catalog)
+                    : 'No models available')}
           </span>
           <ChevronDown className="size-4" />
         </button>
@@ -82,6 +161,37 @@ export function ModelSwitcher({
     >
       <div className="flex flex-col">
         <div className="max-h-[25vh] min-h-0 space-y-1 overflow-y-auto overscroll-contain p-2 pr-1">
+          {catalogState.kind === 'error' ? (
+            <div className="space-y-3 px-3 py-4 text-sm text-text-muted">
+              <p>Model Access could not be loaded. Sign in again or retry.</p>
+              <button
+                type="button"
+                onClick={loadCatalog}
+                className="font-medium text-text hover:text-accent"
+              >
+                Retry
+              </button>
+            </div>
+          ) : null}
+          {catalogState.kind === 'loading' ? (
+            <div className="px-3 py-4 text-sm text-text-muted">
+              Loading model access…
+            </div>
+          ) : null}
+          {catalog && models.length === 0 ? (
+            <div className="space-y-3 px-3 py-4 text-sm text-text-muted">
+              <p>{unavailableMessage(catalog)}</p>
+              {primaryUnavailableAccess(catalog)?.actions.includes('retry') ? (
+                <button
+                  type="button"
+                  onClick={loadCatalog}
+                  className="font-medium text-text hover:text-accent"
+                >
+                  Retry
+                </button>
+              ) : null}
+            </div>
+          ) : null}
           {models.map((model) => {
             const checked = model.id === (visibleSelected?.id ?? value);
             return (

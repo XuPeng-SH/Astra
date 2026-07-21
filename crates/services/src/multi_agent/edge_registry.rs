@@ -20,7 +20,7 @@ pub struct EdgeAgentRecord {
     pub worktree_path: Option<String>,
     pub capabilities: Option<serde_json::Value>,
     /// Owning workspace (provider_scope_id from edge-registration token binding).
-    /// None for legacy rows written before this field was added.
+    /// None only for explicitly unscoped first-party registrations.
     pub workspace_id: Option<String>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
@@ -163,7 +163,7 @@ pub trait EdgeRegistryService: Send + Sync {
     ///
     /// Workspace isolation is fail-closed:
     /// - `Some(ws)` only matches rows with the same `workspace_id = ws`.
-    /// - `None` only matches legacy/unscoped rows where `workspace_id IS NULL`.
+    /// - `None` only matches explicitly unscoped rows where `workspace_id IS NULL`.
     ///
     /// A request without workspace context cannot resolve a workspace-bound
     /// sandbox edge; pass `Some` whenever workspace context is available.
@@ -271,6 +271,11 @@ impl DatabaseEdgeRegistryService {
                     .await;
             }
 
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| format!("edge_registry lease begin (attempt {attempt}): {e}"))?;
             let row = sqlx::query(
                 "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
                  capabilities_json, workspace_id, registration_state, \
@@ -280,7 +285,7 @@ impl DatabaseEdgeRegistryService {
             )
             .bind(user_id)
             .bind(edge_agent_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|e| format!("edge_registry lease lookup (attempt {attempt}): {e}"))?;
             let previous = row.as_ref().map(decode_edge_agent_record).transpose()?;
@@ -310,11 +315,14 @@ impl DatabaseEdgeRegistryService {
                 .bind(user_id)
                 .bind(&previous.registry_id)
                 .bind(&previous.edge_id)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|e| format!("edge_registry lease update (attempt {attempt}): {e}"))?
                 .rows_affected();
                 if updated == 0 {
+                    transaction.rollback().await.map_err(|e| {
+                        format!("edge_registry lease rollback (attempt {attempt}): {e}")
+                    })?;
                     continue;
                 }
 
@@ -342,11 +350,16 @@ impl DatabaseEdgeRegistryService {
                     registered_at: previous.registered_at.clone(),
                     last_heartbeat_at: now,
                 };
-                return Ok(EdgeRegistrationLease {
+                let lease = EdgeRegistrationLease {
                     current,
                     previous: published_previous,
                     claim_id: Some(claim_id),
-                });
+                };
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| format!("edge_registry lease commit (attempt {attempt}): {e}"))?;
+                return Ok(lease);
             }
 
             let registry_id = uuid::Uuid::new_v4().to_string();
@@ -367,14 +380,14 @@ impl DatabaseEdgeRegistryService {
             .bind(&cap_json)
             .bind(workspace_id)
             .bind(&claim_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await;
             match inserted {
                 Ok(_) => {
                     let now = chrono::Utc::now()
                         .format("%Y-%m-%d %H:%M:%S%.6f")
                         .to_string();
-                    return Ok(EdgeRegistrationLease {
+                    let lease = EdgeRegistrationLease {
                         current: EdgeAgentRecord {
                             registry_id,
                             user_id: user_id.to_string(),
@@ -389,11 +402,17 @@ impl DatabaseEdgeRegistryService {
                         },
                         previous: None,
                         claim_id: Some(claim_id),
-                    });
+                    };
+                    transaction.commit().await.map_err(|e| {
+                        format!("edge_registry lease commit (attempt {attempt}): {e}")
+                    })?;
+                    return Ok(lease);
                 }
                 Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("1062") || message.contains("Duplicate entry") {
+                    transaction.rollback().await.map_err(|e| {
+                        format!("edge_registry lease rollback (attempt {attempt}): {e}")
+                    })?;
+                    if is_duplicate_key_error(&error) {
                         continue;
                     }
                     return Err(format!("edge_registry lease insert: {error}"));
@@ -403,6 +422,15 @@ impl DatabaseEdgeRegistryService {
 
         Err("edge_registry: exhausted generation-claim retries".to_string())
     }
+}
+
+fn is_duplicate_key_error(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database) = error else {
+        return false;
+    };
+    database
+        .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        .is_some_and(|error| error.number() == 1062)
 }
 
 fn edge_registry_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
@@ -492,6 +520,11 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                 ))
                 .await;
             }
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| format!("edge_registry begin (attempt {attempt}): {e}"))?;
             // Fetch registry_id + registered_at in one query; construct the
             // response from in-memory data to eliminate the TOCTOU final SELECT.
             let existing: Option<(String, String)> = sqlx::query_as(
@@ -500,7 +533,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             )
             .bind(user_id)
             .bind(edge_agent_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|e| format!("edge_registry lookup (attempt {attempt}): {e}"))?;
 
@@ -524,17 +557,21 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                 .bind(workspace_id)
                 .bind(user_id)
                 .bind(&reg_id)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|e| format!("edge_registry update (attempt {attempt}): {e}"))?
                 .rows_affected();
                 if n == 0 {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(|e| format!("edge_registry rollback (attempt {attempt}): {e}"))?;
                     continue; // deleted between SELECT and UPDATE
                 }
                 let now = chrono::Utc::now()
                     .format("%Y-%m-%d %H:%M:%S%.6f")
                     .to_string();
-                return Ok(EdgeAgentRecord {
+                let record = EdgeAgentRecord {
                     registry_id: reg_id,
                     user_id: user_id.to_string(),
                     edge_agent_id: edge_agent_id.to_string(),
@@ -545,7 +582,12 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     workspace_id: workspace_id.map(|s| s.to_string()),
                     registered_at,
                     last_heartbeat_at: now,
-                });
+                };
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| format!("edge_registry commit (attempt {attempt}): {e}"))?;
+                return Ok(record);
             }
 
             // No existing row — try INSERT.
@@ -564,7 +606,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .bind(worktree_path)
             .bind(&cap_json)
             .bind(workspace_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             {
                 Ok(_) => {
@@ -585,7 +627,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     )
                     .bind(user_id)
                     .bind(&registry_id)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *transaction)
                     .await
                     {
                         Ok(timestamps) => timestamps,
@@ -604,7 +646,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                             (now.clone(), now)
                         }
                     };
-                    return Ok(EdgeAgentRecord {
+                    let record = EdgeAgentRecord {
                         registry_id,
                         user_id: user_id.to_string(),
                         edge_agent_id: edge_agent_id.to_string(),
@@ -615,11 +657,20 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                         workspace_id: workspace_id.map(|s| s.to_string()),
                         registered_at,
                         last_heartbeat_at,
-                    });
+                    };
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|e| format!("edge_registry commit (attempt {attempt}): {e}"))?;
+                    return Ok(record);
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("1062") || msg.contains("Duplicate entry") {
+                    transaction.rollback().await.map_err(|rollback_error| {
+                        format!(
+                            "edge_registry rollback after insert failure (attempt {attempt}): {rollback_error}"
+                        )
+                    })?;
+                    if is_duplicate_key_error(&e) {
                         continue; // raced with concurrent insert
                     }
                     return Err(format!("edge_registry insert: {e}"));

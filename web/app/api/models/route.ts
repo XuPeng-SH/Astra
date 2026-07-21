@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import type { RuntimeModelListItem } from "@astra/sdk";
 import type { ModelSummary } from "@/lib/api/types";
-import { listModelSummaries } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 
 export const dynamic = "force-dynamic";
@@ -17,87 +16,77 @@ function formatTokens(tokens?: number) {
 }
 
 function formatThinking(value: RuntimeModelListItem["thinking_capability"]) {
-  if (!value) {
-    return null;
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  const kind = value.kind;
-  return typeof kind === "string" ? kind : "thinking";
+  return value;
 }
 
 function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
-  const id = model.model_id ?? model.name;
-  if (!id) {
+  const id = model.offering_id;
+  const name = model.name.trim();
+  if (!id || !name) {
     return null;
   }
 
   const parts = [
-    model.provider,
+    model.access_label,
+    model.execution_placement === "edge" ? "Runs on this device" : "Runs on server",
     model.description,
-    model.architecture,
+    typeof model.architecture === "string" ? model.architecture : null,
     formatTokens(model.context_window),
     formatThinking(model.thinking_capability),
   ].filter((part): part is string => Boolean(part));
 
   return {
     id,
-    name: model.name ?? id,
-    subtitle: parts.length > 0 ? parts.join(" · ") : "Imported Astra model",
+    name,
+    subtitle: parts.join(" · "),
     tier: "included",
+    accessLabel: model.access_label,
+    executionPlacement: model.execution_placement,
   };
 }
 
 export async function GET() {
-  let runtime: Awaited<ReturnType<typeof requireRuntimeClient>>;
   try {
-    runtime = await requireRuntimeClient({
-      auth: "optional",
+    const runtime = await requireRuntimeClient({
+      auth: "required",
       operation: "list runtime models",
     });
-  } catch {
-    return NextResponse.json({
-      items: listModelSummaries(),
-      source: "fallback",
-    });
-  }
-
-  const authenticated = Boolean(runtime.config.accessToken);
-  try {
-    const items = (await runtime.sdk.listModels())
-      .filter((model) => model.is_active !== false)
+    const projection = await runtime.sdk.getModelAccess();
+    const items = projection.offerings
+      .filter((model) => model.is_active)
       .map(toModelSummary)
       .filter((model): model is ModelSummary => model !== null);
-
-    if (items.length > 0) {
-      return NextResponse.json({ items, source: "astra" });
-    }
-
-    if (authenticated) {
-      return NextResponse.json(
-        {
-          error: "runtime_models_unavailable",
-          detail:
-            "Runtime returned no active models for the authenticated user.",
-        },
-        { status: 502 },
+    const defaultOfferingId = projection.default_offering_id;
+    if (
+      (items.length === 0 && defaultOfferingId !== null) ||
+      (items.length > 0 &&
+        (!defaultOfferingId ||
+          !items.some((model) => model.id === defaultOfferingId)))
+    ) {
+      throw new Error(
+        "Model Access returned a default outside the effective Offering catalog.",
       );
     }
+
+    return NextResponse.json({
+      items,
+      accesses: projection.accesses,
+      defaultOfferingId,
+      catalogRevision: projection.catalog_revision,
+      observedAt: projection.observed_at,
+      source: "astra",
+    });
   } catch (error) {
-    if (authenticated) {
-      return NextResponse.json(
-        {
-          error: "runtime_models_unavailable",
-          detail:
-            error instanceof Error
-              ? error.message
-              : "Failed to list runtime models.",
-        },
-        { status: 502 },
-      );
-    }
+    return NextResponse.json(
+      {
+        error: "model_access_unavailable",
+        detail:
+          error instanceof Error
+            ? error.message
+            : "Failed to load Model Access.",
+        action: "sign_in_or_retry",
+      },
+      { status: 503 },
+    );
   }
-
-  return NextResponse.json({ items: listModelSummaries(), source: "fallback" });
 }

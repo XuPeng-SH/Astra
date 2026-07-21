@@ -11,7 +11,7 @@ use super::harness::{
     E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
     durable_interaction_event_count, get_json, grant_astra_admin_role,
     maybe_tool_result_payload_from_sse, post_empty, post_json, put_json, seed_pending_approval,
-    seeded_selected_model, tool_result_payload,
+    seeded_model_selection, tool_result_payload,
 };
 use axum::{body::Body, http::Request};
 use tower::util::ServiceExt;
@@ -233,7 +233,7 @@ pub async fn run_chat_stream_session_info_smoke() {
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "execution_budget": {
             "initial_turns": 1,
             "hard_turn_limit": 1
@@ -394,9 +394,10 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
     let tool_output = "duplicate tool result ok";
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read the duplicate path" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -556,9 +557,10 @@ pub async fn run_chat_turn_partial_batch_failure() {
     let err_output = "partial batch second failed";
     let payload = json!({
         "agent_id": "system-matrix-partial-batch-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read two files and continue even if one fails" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -725,9 +727,10 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
     let second_output = "race second ok";
     let payload = json!({
         "agent_id": "system-matrix-race-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read two files even if callbacks arrive out of order" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -893,18 +896,20 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     let session_id = ctx.session_id.clone();
     let payload_a = json!({
         "agent_id": "system-matrix-overlap-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "same-session overlap request A" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response A"
         }]
     });
     let payload_b = json!({
         "agent_id": "system-matrix-overlap-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "same-session overlap request B" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response B"
         }]
@@ -1033,9 +1038,10 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
     let tool_output = "waiting overlap tool ok";
     let tool_turn_payload = json!({
         "agent_id": "system-matrix-overlap-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "waiting overlap tool turn" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -1144,9 +1150,10 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                 b.auth_header.clone(),
                 json!({
                     "agent_id": "system-matrix-overlap-agent",
+                    "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                     "session_id": ctx.session_id,
                     "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
-                    "selected_model": seeded_selected_model(ctx),
+                    "model_selection": seeded_model_selection(ctx),
                     "test_llm_rounds": [{
                         "full_text": "Waiting overlap plain turn finished."
                     }]

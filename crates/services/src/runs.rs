@@ -4,7 +4,7 @@ use astra_core::{
     error_response_coded,
 };
 use astra_turn_types::{
-    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
+    ModelSelection, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
     ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
 };
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::db_row::RowExt as RunStateDbRow;
+use crate::models::AdmittedModelExecution;
 use crate::pagination::MAX_API_LIST_LIMIT;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
@@ -240,38 +241,6 @@ pub trait RunLifecycleService: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmTokenServiceConfig {
-    pub url: String,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmTokenServiceRequest {
-    pub url: String,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-}
-
-impl From<LlmTokenServiceRequest> for LlmTokenServiceConfig {
-    fn from(value: LlmTokenServiceRequest) -> Self {
-        Self {
-            url: value.url,
-            timeout_ms: value.timeout_ms,
-        }
-    }
-}
-
-impl From<LlmTokenServiceConfig> for LlmTokenServiceRequest {
-    fn from(value: LlmTokenServiceConfig) -> Self {
-        Self {
-            url: value.url,
-            timeout_ms: value.timeout_ms,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBudget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,14 +419,16 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
     }
 }
 
+/// Server-resolved model identity for one admitted Offering selection.
+///
+/// This is internal runtime context, not a client wire shape. The model name
+/// is derived from the catalog row selected by `offering_id` or from an
+/// authenticated external provider context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SelectedModelRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway: Option<String>,
+pub struct ResolvedModelSelection {
+    pub offering_id: String,
+    pub model_name: String,
 }
 
 pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
@@ -566,14 +537,17 @@ pub struct ChatRequestData {
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
-    pub selected_model: Option<SelectedModelRequest>,
+    pub model_selection: Option<ModelSelection>,
+    pub resolved_model_selection: Option<ResolvedModelSelection>,
+    /// Short-lived execution material for the admitted Offering.
+    /// This value is never client supplied, serialized, persisted, or logged.
+    pub admitted_model_execution: Option<AdmittedModelExecution>,
     pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     pub provider_runtime_authorized: bool,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_skill_binding: Option<RuntimeSkillBindingRequest>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
-    pub llm_token_service: Option<LlmTokenServiceConfig>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
@@ -633,7 +607,12 @@ impl std::fmt::Debug for ChatRequestData {
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
-            .field("selected_model", &self.selected_model)
+            .field("model_selection", &self.model_selection)
+            .field("resolved_model_selection", &self.resolved_model_selection)
+            .field(
+                "admitted_model_execution_present",
+                &self.admitted_model_execution.is_some(),
+            )
             .field("capability_descriptors", &self.capability_descriptors)
             .field(
                 "provider_runtime_authorized",
@@ -643,7 +622,6 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_skill_binding", &self.runtime_skill_binding)
             .field("runtime_profile", &self.runtime_profile)
-            .field("llm_token_service", &self.llm_token_service)
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
@@ -973,9 +951,11 @@ pub struct DurableRunRecord {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
-    pub selected_model_json: Option<String>,
-    pub selected_model_name: Option<String>,
-    pub selected_model_gateway: Option<String>,
+    /// Effective Offering selected for this run. This is an authorization
+    /// identity, not a display model name or provider route.
+    pub model_offering_id: Option<String>,
+    /// Concrete model identity resolved when the run was admitted.
+    pub resolved_model_name: Option<String>,
     pub capability_server_refs_json: Option<String>,
     pub runtime_profile: Option<String>,
     pub events: Vec<serde_json::Value>,
@@ -1152,8 +1132,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, \
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
-     agent_binding_schema_version, selected_model_json, selected_model_name, \
-     selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+     agent_binding_schema_version, model_offering_id, resolved_model_name, \
+     capability_server_refs_json, runtime_profile, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
 const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
@@ -4003,9 +3983,9 @@ impl RunStateStore for DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  selected_model_json, selected_model_name, selected_model_gateway,
+                  model_offering_id, resolved_model_name,
                   capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&record.run_id)
             .bind(&record.user_id)
@@ -4035,9 +4015,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.agent_binding_id)
             .bind(&record.agent_binding_name)
             .bind(&record.agent_binding_schema_version)
-            .bind(&record.selected_model_json)
-            .bind(&record.selected_model_name)
-            .bind(&record.selected_model_gateway)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
             .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
             .execute(&mut *tx)
@@ -4056,9 +4035,9 @@ impl RunStateStore for DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  selected_model_json, selected_model_name, selected_model_gateway,
+                  model_offering_id, resolved_model_name,
                   capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
                  ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
             )
             .bind(&record.run_id)
@@ -4089,9 +4068,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.agent_binding_id)
             .bind(&record.agent_binding_name)
             .bind(&record.agent_binding_schema_version)
-            .bind(&record.selected_model_json)
-            .bind(&record.selected_model_name)
-            .bind(&record.selected_model_gateway)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
             .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
             .execute(self.pool.get())
@@ -6497,14 +6475,8 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             table,
             "agent_binding_schema_version",
         )?,
-        selected_model_json: run_row_optional_string(row, operation, table, "selected_model_json")?,
-        selected_model_name: run_row_optional_string(row, operation, table, "selected_model_name")?,
-        selected_model_gateway: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "selected_model_gateway",
-        )?,
+        model_offering_id: run_row_optional_string(row, operation, table, "model_offering_id")?,
+        resolved_model_name: run_row_optional_string(row, operation, table, "resolved_model_name")?,
         capability_server_refs_json: run_row_optional_string(
             row,
             operation,
@@ -7444,9 +7416,8 @@ mod tests {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![],
@@ -7573,9 +7544,8 @@ mod tests {
                 "agent_binding_id" => Some("binding-1".to_string()),
                 "agent_binding_name" => Some("binding".to_string()),
                 "agent_binding_schema_version" => Some("v1".to_string()),
-                "selected_model_json" => Some(r#"{"name":"model"}"#.to_string()),
-                "selected_model_name" => Some("model".to_string()),
-                "selected_model_gateway" => Some("gateway".to_string()),
+                "model_offering_id" => Some("offer-model".to_string()),
+                "resolved_model_name" => Some("model".to_string()),
                 "capability_server_refs_json" => Some("[]".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "latest_event_type" => Some("text_delta".to_string()),
@@ -7901,9 +7871,8 @@ mod tests {
             "agent_binding_id",
             "agent_binding_name",
             "agent_binding_schema_version",
-            "selected_model_json",
-            "selected_model_name",
-            "selected_model_gateway",
+            "model_offering_id",
+            "resolved_model_name",
             "capability_server_refs_json",
             "runtime_profile",
             "created_at",
@@ -10419,14 +10388,30 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
-            selected_model: None,
+            model_selection: None,
+            resolved_model_selection: None,
+            admitted_model_execution: Some(AdmittedModelExecution {
+                offering_id: "offer-gpt-4".to_string(),
+                access_kind: crate::ModelAccessKind::SelfHosted,
+                execution_placement: crate::ModelExecutionPlacement::Server,
+                model_name: "gpt-4".to_string(),
+                wire_model_name: None,
+                api_key: "provider-api-secret".to_string(),
+                base_url: "https://models.example.com/v1".to_string(),
+                provider: "openai".to_string(),
+                cache_capability: None,
+                request_body_overrides: None,
+                context_window: Some(128_000),
+                header_overrides: HashMap::new(),
+                completions_url_override: None,
+                request_timeout_ms: None,
+            }),
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: None,
             runtime_skill_binding: None,
             runtime_profile: None,
-            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
@@ -10458,6 +10443,8 @@ mod tests {
         assert!(!rendered.contains("Bearer secret-token"));
         assert!(!rendered.contains("ws-123"));
         assert!(!rendered.contains("__astra_connection_tokens"));
+        assert!(!rendered.contains("provider-api-secret"));
+        assert!(rendered.contains("admitted_model_execution_present: true"));
     }
 
     #[test]
@@ -10483,12 +10470,15 @@ mod tests {
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
-            model: None,
-            selected_model: Some(SelectedModelRequest {
-                id: None,
-                model: "gpt-4".to_string(),
-                gateway: Some("primary-gateway".to_string()),
+            model: Some("gpt-4".to_string()),
+            model_selection: Some(ModelSelection {
+                offering_id: "offer-gpt-4".to_string(),
             }),
+            resolved_model_selection: Some(ResolvedModelSelection {
+                offering_id: "offer-gpt-4".to_string(),
+                model_name: "gpt-4".to_string(),
+            }),
+            admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
@@ -10497,7 +10487,6 @@ mod tests {
             }),
             runtime_skill_binding: None,
             runtime_profile: None,
-            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
@@ -10574,14 +10563,15 @@ mod tests {
                     session_id: None,
                     agent_id: None,
                     model: None,
-                    selected_model: None,
+                    model_selection: None,
+                    resolved_model_selection: None,
+                    admitted_model_execution: None,
                     capability_descriptors: None,
                     provider_runtime_authorized: false,
                     agent_binding: None,
                     runtime_auth: None,
                     runtime_skill_binding: None,
                     runtime_profile: None,
-                    llm_token_service: None,
                     skill_search: None,
                     allow_skills: None,
                     allow_skill_sources: None,
@@ -10657,9 +10647,8 @@ mod tests {
                     agent_binding_id: None,
                     agent_binding_name: None,
                     agent_binding_schema_version: None,
-                    selected_model_json: None,
-                    selected_model_name: None,
-                    selected_model_gateway: None,
+                    model_offering_id: None,
+                    resolved_model_name: None,
                     capability_server_refs_json: None,
                     runtime_profile: None,
                     events: vec![],

@@ -784,7 +784,8 @@ export type ChatConfig = {
   apiUrl?: string;
   sessionId?: string;
   agentId?: string;
-  model?: string;
+  /** Effective Offering selected from Astra's model-access projection. */
+  offeringId?: string;
   /** Durable binding for external MCP and skill capability servers. */
   agentBinding?: AgentBindingSelection;
   /** Runtime capability resolution mode used for this chat surface. */
@@ -856,10 +857,8 @@ export type ChatRequest = {
   attachments?: unknown[];
   sessionId?: string;
   agentId?: string;
-  selectedModel: {
-    id?: string;
-    model: string;
-    gateway?: string;
+  modelSelection: {
+    offeringId: string;
   };
   agentBinding?: AgentBindingSelection;
   runtimeAuth?: {
@@ -933,32 +932,6 @@ export type AgentBindingRecord = {
   metadata?: Record<string, unknown> | null;
   binding_schema_version: string;
   created_at: string;
-  disabled_at?: string | null;
-};
-
-export type ModelProtocol = "openai_chat_completions";
-export type ModelGatewayStatus = "active" | "disabled" | "invalid";
-
-export type ModelGatewayCreateRequest = {
-  id: string;
-  resolve_url: string;
-  model_protocol: ModelProtocol;
-  metadata?: Record<string, unknown> | null;
-};
-
-export type ModelGatewayCreateResponse = {
-  id: string;
-  status: ModelGatewayStatus;
-};
-
-export type ModelGatewayRecord = {
-  id: string;
-  resolve_url: string;
-  model_protocol: ModelProtocol;
-  status: ModelGatewayStatus;
-  metadata?: Record<string, unknown> | null;
-  created_at: string;
-  updated_at: string;
   disabled_at?: string | null;
 };
 
@@ -1127,24 +1100,78 @@ export type RuntimeTranscriptParams = {
   limit?: number;
 };
 
+export type RuntimeModelAccessKind =
+  | "astra_cloud"
+  | "workspace"
+  | "this_device"
+  | "self_hosted";
+
+export type RuntimeModelExecutionPlacement = "server" | "edge";
+
 export type RuntimeModelListItem = {
-  model_id?: string;
-  name?: string;
-  provider?: string;
-  description?: string | null;
-  is_active?: boolean;
-  context_window?: number;
-  max_completion_tokens?: number | null;
-  architecture?: string | null;
-  thinking_capability?: string | Record<string, unknown> | null;
+  offering_id: string;
+  access_id: string;
+  access_kind: RuntimeModelAccessKind;
+  access_label: string;
+  execution_placement: RuntimeModelExecutionPlacement;
+  name: string;
+  provider: string;
+  description: string | null;
+  is_active: boolean;
+  context_window: number;
+  max_completion_tokens: number | null;
+  architecture: unknown | null;
+  thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
 };
 
-export type RuntimeModelListResponse =
-  | RuntimeModelListItem[]
-  | {
-      items?: RuntimeModelListItem[];
-      models?: RuntimeModelListItem[];
-    };
+export type RuntimeModelListResponse = RuntimeModelListItem[];
+
+export type RuntimeModelAccessStatus =
+  | "setting_up"
+  | "ready"
+  | "degraded"
+  | "action_required"
+  | "unavailable"
+  | "disabled";
+
+export type RuntimeModelAccessReason =
+  | "provisioning"
+  | "no_eligible_offerings"
+  | "reauthentication_required"
+  | "billing_action_required"
+  | "connection_degraded"
+  | "connection_unavailable"
+  | "device_offline"
+  | "policy_disabled";
+
+export type RuntimeModelAccessAction =
+  | "contact_administrator"
+  | "reconnect_device"
+  | "configure_device_models"
+  | "reauthenticate"
+  | "manage_billing"
+  | "retry";
+
+export type RuntimeModelAccessView = {
+  id: string;
+  kind: RuntimeModelAccessKind;
+  label: string;
+  execution_placement: RuntimeModelExecutionPlacement;
+  status: RuntimeModelAccessStatus;
+  reason: RuntimeModelAccessReason | null;
+  usable: boolean;
+  retry_after_seconds: number | null;
+  available_model_count: number;
+  actions: RuntimeModelAccessAction[];
+};
+
+export type RuntimeModelAccessProjection = {
+  accesses: RuntimeModelAccessView[];
+  offerings: RuntimeModelListItem[];
+  default_offering_id: string | null;
+  catalog_revision: string;
+  observed_at: string;
+};
 
 export type RuntimeArtifactResponse = {
   artifact_id?: string;

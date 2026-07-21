@@ -292,7 +292,7 @@ describe("AstraClient — Runs", () => {
 
     const result = await createClient().createRun({
       message: "hello",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(result.runId).toBe("r1");
     expect(result.sessionId).toBe("s1");
@@ -917,10 +917,23 @@ describe("AstraClient — Memory", () => {
 // ─── Skills ─────────────────────────────────────────────────────────
 
 describe("AstraClient — Models", () => {
-  test("listModels accepts array payloads", async () => {
+  test("listModels uses the canonical Offering array", async () => {
     globalThis.fetch = mockFetch(200, [
-      { name: "m1", provider: "p1", is_active: true },
-      null,
+      {
+        offering_id: "m1",
+        access_id: "self-hosted",
+        access_kind: "self_hosted",
+        access_label: "Self-hosted",
+        execution_placement: "server",
+        name: "m1",
+        provider: "p1",
+        description: null,
+        is_active: true,
+        context_window: 8192,
+        max_completion_tokens: null,
+        architecture: null,
+        thinking_capability: null,
+      },
     ]);
 
     const result = await createClient().listModels();
@@ -931,13 +944,40 @@ describe("AstraClient — Models", () => {
     ).toContain("/models");
   });
 
-  test("listModels accepts envelope payloads", async () => {
+  test("getModelAccess preserves product source and execution placement", async () => {
     globalThis.fetch = mockFetch(200, {
-      models: [{ model_id: "m2", provider: "p2" }],
+      accesses: [
+        {
+          id: "self-hosted",
+          kind: "self_hosted",
+          label: "Self-hosted",
+          execution_placement: "server",
+          status: "action_required",
+          reason: "no_eligible_offerings",
+          usable: false,
+          retry_after_seconds: null,
+          available_model_count: 0,
+          actions: ["contact_administrator"],
+        },
+      ],
+      offerings: [],
+      default_offering_id: null,
+      catalog_revision: "sha256:catalog",
+      observed_at: "2026-07-20T00:00:00Z",
     });
 
-    const result = await createClient().listModels();
-    expect(result[0].model_id).toBe("m2");
+    const result = await createClient().getModelAccess();
+    expect(result.accesses[0].execution_placement).toBe("server");
+    expect(result.accesses[0]).toMatchObject({
+      status: "action_required",
+      reason: "no_eligible_offerings",
+      usable: false,
+    });
+    expect(result.default_offering_id).toBeNull();
+    expect(result.catalog_revision).toBe("sha256:catalog");
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/model-access");
   });
 });
 
@@ -1218,7 +1258,7 @@ describe("chatRequestToWire", () => {
   test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       allowSkills: ["a", "b"],
       allowTools: ["t1"],
       enabledTools: ["web_search", "web_fetch"],
@@ -1241,7 +1281,7 @@ describe("chatRequestToWire", () => {
   test("omits allow lists when empty", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       allowSkills: [],
       allowTools: [],
     });
@@ -1252,7 +1292,7 @@ describe("chatRequestToWire", () => {
   test("preserves an empty optional-tool set as an explicit disablement", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       enabledTools: [],
     });
     expect(body.enabled_tools).toEqual([]);
@@ -1261,27 +1301,16 @@ describe("chatRequestToWire", () => {
   test("default request omits execution_budget", () => {
     const body = chatRequestToWire({
       message: "m",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(body.execution_budget).toBeUndefined();
   });
 
-  test("preserves empty selectedModel.gateway for server-side validation", () => {
-    const body = chatRequestToWire({
+  test("rejects route fields instead of forwarding client authority", () => {
+    expect(() => chatRequestToWire({
       message: "m",
-      selectedModel: { model: "kimi", gateway: "" },
-    });
-
-    expect(body.selected_model).toEqual({ model: "kimi", gateway: "" });
-  });
-
-  test("preserves selectedModel.id for external runtime context", () => {
-    const body = chatRequestToWire({
-      message: "m",
-      selectedModel: { id: "model-kimi", model: "kimi" },
-    });
-
-    expect(body.selected_model).toEqual({ id: "model-kimi", model: "kimi" });
+      modelSelection: { offeringId: "offer-kimi", gateway: "primary" } as any,
+    })).toThrow("modelSelection contains unsupported field 'gateway'");
   });
 
   test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
@@ -1295,7 +1324,7 @@ describe("chatRequestToWire", () => {
       },
       sessionId: "sess-1",
       agentId: "ag-1",
-      selectedModel: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
+      modelSelection: { offeringId: "offer-kimi" },
       agentBinding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capabilityServerRefs: {
@@ -1338,7 +1367,7 @@ describe("chatRequestToWire", () => {
       },
       session_id: "sess-1",
       agent_id: "ag-1",
-      selected_model: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
+      model_selection: { offering_id: "offer-kimi" },
       agent_binding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capability_server_refs: {
@@ -1376,10 +1405,10 @@ describe("chatRequestToWire", () => {
   test("omits undefined optional fields", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(Object.keys(body).sort()).toEqual(
-      ["message", "selected_model"].sort(),
+      ["message", "model_selection"].sort(),
     );
   });
 });
@@ -1481,72 +1510,6 @@ describe("AstraClient — Agent Binding registry", () => {
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe(
       "http://localhost:8000/agent-bindings/ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391/disable",
-    );
-    expect(call[1].method).toBe("POST");
-    expect(JSON.parse(call[1].body)).toEqual({});
-  });
-});
-
-// ─── Model Gateway Registry ───────────────────────────────────────
-
-describe("AstraClient — Model Gateway registry", () => {
-  const createBody = {
-    id: "gateway-a",
-    resolve_url: "https://models.example.com/resolve",
-    model_protocol: "openai_chat_completions" as const,
-    metadata: { owner: "platform" },
-  };
-
-  test("createModelGateway POST /model-gateways with body", async () => {
-    const response = { id: "gateway-a", status: "active" };
-    globalThis.fetch = mockFetch(200, response);
-
-    const client = createClient();
-    const out = await client.createModelGateway(createBody);
-
-    expect(out).toEqual(response);
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toBe("http://localhost:8000/model-gateways");
-    expect(call[1].method).toBe("POST");
-    expect(JSON.parse(call[1].body)).toEqual(createBody);
-  });
-
-  test("getModelGateway GET /model-gateways/{id}", async () => {
-    const record = {
-      ...createBody,
-      status: "active",
-      created_at: "2026-06-18T00:00:00",
-      updated_at: "2026-06-18T00:00:00",
-      disabled_at: null,
-    };
-    globalThis.fetch = mockFetch(200, record);
-
-    const client = createClient();
-    const out = await client.getModelGateway("gateway-a");
-
-    expect(out).toEqual(record);
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toBe("http://localhost:8000/model-gateways/gateway-a");
-    expect(call[1].method).toBeUndefined();
-  });
-
-  test("disableModelGateway POST /model-gateways/{id}/disable", async () => {
-    const record = {
-      ...createBody,
-      status: "disabled",
-      created_at: "2026-06-18T00:00:00",
-      updated_at: "2026-06-18T00:01:00",
-      disabled_at: "2026-06-18T00:01:00",
-    };
-    globalThis.fetch = mockFetch(200, record);
-
-    const client = createClient();
-    const out = await client.disableModelGateway("gateway-a");
-
-    expect(out).toEqual(record);
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toBe(
-      "http://localhost:8000/model-gateways/gateway-a/disable",
     );
     expect(call[1].method).toBe("POST");
     expect(JSON.parse(call[1].body)).toEqual({});

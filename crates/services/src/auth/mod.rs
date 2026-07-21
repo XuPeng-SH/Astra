@@ -1758,9 +1758,9 @@ impl AuthService for DatabaseAuthService {
         if !token.starts_with(MOI_USER_TOKEN_PREFIX) {
             return Ok(EdgeTokenBinding::NotEdgeToken);
         }
-        // Resolve the MOI external provider. Without one configured we cannot
-        // verify the binding via authorize_request; impose none rather than
-        // failing closed (matches deployments where external auth is disabled).
+        // Resolve the MOI external provider. An edge-token-shaped credential
+        // cannot be downgraded to an unbound first-party token when its verifier
+        // is unavailable; that would turn configuration loss into authorization.
         let provider = match self
             .ext_providers
             .iter()
@@ -1769,11 +1769,14 @@ impl AuthService for DatabaseAuthService {
         {
             Some(provider) => provider.clone(),
             None => {
-                tracing::warn!(
+                tracing::error!(
                     target: "astra_services::auth",
                     "edge_registration_binding: no external provider configured; cannot verify edge binding"
                 );
-                return Ok(EdgeTokenBinding::NotEdgeToken);
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "No external provider configured for edge token auth",
+                ));
             }
         };
         // authorize_request verifies the token (signature, expiry, jti
@@ -2264,6 +2267,25 @@ mod tests {
             err.1.error_code.as_deref(),
             Some("edge_token_request_context_required")
         );
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_fails_closed_without_provider() {
+        let service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        );
+
+        let error = service
+            .edge_registration_binding("moi-user-token-v1.payload.signature")
+            .await
+            .expect_err("an unverifiable edge token must be rejected");
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
