@@ -1064,6 +1064,13 @@ mod tests {
             })
         }
 
+        async fn upsert_json_artifact_projection(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
+            self.persist_json_artifact(record).await
+        }
+
         async fn load_json_artifact(
             &self,
             _user_id: &str,
@@ -1620,15 +1627,19 @@ mod tests {
     fn finalize_workspace_on_end_with_compact_summary() {
         use crate::session_journal;
 
-        let sid = format!("test-finalize-{}", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize";
         // Create workspace
-        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        let ws = WorkspaceMetadata::new(sid, "test-model");
         write_workspace(&ws).unwrap();
 
         // Write a compact event with summary
-        let journal = session_journal::JournalWriter::new(&sid).unwrap();
+        let journal = session_journal::JournalWriter::new(sid).unwrap();
         let evt = session_journal::JournalEvent::compact_with_summary(
-            Some(&sid),
+            Some(sid),
             5,
             3,
             1,
@@ -1637,56 +1648,55 @@ mod tests {
         journal.append(&evt).unwrap();
 
         // Finalize
-        let summary = finalize_workspace_on_end(&sid);
+        let summary = finalize_workspace_on_end(sid);
         assert_eq!(summary.as_deref(), Some("User implemented auth system"));
 
         // Verify workspace was updated
-        let ws2 = read_workspace(&sid).unwrap();
+        let ws2 = read_workspace(sid).unwrap();
         assert_eq!(ws2.status, "completed");
         assert_eq!(ws2.summary.as_deref(), Some("User implemented auth system"));
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]
     fn finalize_workspace_on_end_no_compact_no_summary() {
-        let sid = format!("test-finalize-empty-{}", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize-empty";
         // Create workspace with no journal events
-        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        let ws = WorkspaceMetadata::new(sid, "test-model");
         write_workspace(&ws).unwrap();
 
         // Finalize: no compact events → no summary
-        let summary = finalize_workspace_on_end(&sid);
+        let summary = finalize_workspace_on_end(sid);
         assert!(summary.is_none());
 
         // Verify workspace was marked completed but has no summary
-        let ws2 = read_workspace(&sid).unwrap();
+        let ws2 = read_workspace(sid).unwrap();
         assert_eq!(ws2.status, "completed");
         assert!(ws2.summary.is_none());
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]
     fn finalize_workspace_on_end_ignores_invalid_workspace_without_overwriting() {
-        let sid = format!("test-finalize-invalid-{}", std::process::id());
-        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize-invalid";
+        let ws = WorkspaceMetadata::new(sid, "test-model");
         write_workspace(&ws).unwrap();
 
-        let workspace_path = workspace_file_path(&sid).unwrap();
+        let workspace_path = workspace_file_path(sid).unwrap();
         std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
 
-        let summary = finalize_workspace_on_end(&sid);
+        let summary = finalize_workspace_on_end(sid);
         assert!(summary.is_none());
         assert_eq!(
             std::fs::read_to_string(&workspace_path).unwrap(),
             ":\nnot-valid-yaml"
         );
-
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]

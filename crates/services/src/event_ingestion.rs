@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
-use astra_core::canonical_names::normalize_optional_name;
+use astra_core::canonical_names::{
+    metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
+};
 
 const SESSION_END_EVENT_TYPE: &str = "session_end";
 pub const MIN_INGESTION_BATCH_SIZE: usize = 1;
@@ -314,6 +316,20 @@ impl IngestionEvent {
         user_id: &str,
         redact_content: bool,
     ) -> Result<Self, String> {
+        if event.event_type == crate::session_journal::JournalEventType::ToolCallError {
+            return Err(
+                "tool_call_error journal envelopes must be expanded into canonical tool lifecycle events"
+                    .to_string(),
+            );
+        }
+        Self::from_journal_event_raw_with_redact(event, user_id, redact_content)
+    }
+
+    fn from_journal_event_raw_with_redact(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+        redact_content: bool,
+    ) -> Result<Self, String> {
         let session_id = event
             .session_id
             .as_deref()
@@ -393,7 +409,7 @@ impl IngestionEvent {
     ///
     /// For Turn events that contain tool_call_records, this produces:
     /// 1. The main turn event (same as `from_journal_event`)
-    /// 2. One `tool_call` event per tool execution record
+    /// 2. One canonical terminal/disposition event per tool record
     ///
     /// This ensures tool-level granularity reaches the DB regardless of
     /// whether the request came through the HTTP bridge or CLI path.
@@ -411,24 +427,37 @@ impl IngestionEvent {
         user_id: &str,
         redact_content: bool,
     ) -> Result<Vec<Self>, String> {
-        let main_event = Self::from_journal_event_with_redact(event, user_id, redact_content)?;
+        let main_event = Self::from_journal_event_raw_with_redact(event, user_id, redact_content)?;
         let session_id = main_event.session_id.clone();
         let uid = main_event.user_id.clone();
         let main_event_id = main_event.event_id.clone();
+        let main_parent_event_id = main_event.parent_event_id.clone();
+        let main_parent_event_ids = main_event.parent_event_ids.clone();
 
         let mut events = vec![main_event];
 
-        // Expand embedded tool_call_records into individual tool_call events
+        // Expand embedded records into the same canonical lifecycle dialect
+        // emitted by the live runtime. A journal record is already terminal,
+        // so synthesizing a second `started` event would be inaccurate.
         if let Some(ref tool_calls) = event.tool_calls {
             for (i, tc) in tool_calls.iter().enumerate() {
                 let Some(tool_name) = normalize_optional_name(Some(tc.name.clone())) else {
                     continue;
                 };
-                let index = i.to_string();
-                let tc_event_id =
-                    stable_event_id(&["tool_call", &main_event_id, &index, &tool_name]);
-
                 let disposition = tc.effective_disposition();
+                let event_type = tc.canonical_terminal_event_type();
+                let index = i.to_string();
+                let tool_call_id = tc
+                    .tool_call_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        stable_event_id(&["tool_call", &main_event_id, &index, &tool_name])
+                    });
+                let tc_event_id =
+                    stable_event_id(&[event_type, &main_event_id, &index, &tool_name]);
                 let raw_content = match disposition {
                     crate::session_journal::ToolCallDisposition::Executed if tc.ok => {
                         format!("{} completed in {}ms", tool_name, tc.ms)
@@ -460,6 +489,7 @@ impl IngestionEvent {
 
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("tool_name".into(), Value::String(tool_name.clone()));
+                metadata.insert("tool_call_id".into(), Value::String(tool_call_id));
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
                 metadata.insert("duration_ms".into(), Value::from(tc.ms));
                 metadata.insert(
@@ -500,14 +530,7 @@ impl IngestionEvent {
                     event_id: tc_event_id,
                     session_id: session_id.clone(),
                     user_id: uid.clone(),
-                    event_type: if disposition
-                        == crate::session_journal::ToolCallDisposition::Executed
-                        && !tc.ok
-                    {
-                        "tool_error".to_string()
-                    } else {
-                        "tool_call".to_string()
-                    },
+                    event_type: event_type.to_string(),
                     content: Some(content),
                     token_usage: None,
                     llm_model_used: None,
@@ -519,6 +542,25 @@ impl IngestionEvent {
                     causal_chain_id: Some(main_event_id.clone()),
                 });
             }
+        }
+
+        // `ToolCallError` is a journal envelope around exactly the same
+        // failed call represented by its embedded record. Persist only the
+        // canonical terminal child; retaining the envelope in `agent_events`
+        // would double-count failures in reflection and error analytics.
+        if event.event_type == crate::session_journal::JournalEventType::ToolCallError {
+            if events.len() == 1 {
+                return Err(
+                    "tool_call_error journal envelope has no valid canonical terminal record"
+                        .to_string(),
+                );
+            }
+            let mut terminals = events.split_off(1);
+            for terminal in &mut terminals {
+                terminal.parent_event_id = main_parent_event_id.clone();
+                terminal.parent_event_ids = main_parent_event_ids.clone();
+            }
+            return Ok(terminals);
         }
 
         Ok(events)
@@ -934,6 +976,9 @@ struct IngestionEventInsertValues<'a> {
     token_usage_json: Option<String>,
     metadata_json: Option<String>,
     skill_name: Option<String>,
+    tool_call_id: Option<String>,
+    meta_tool_name: Option<String>,
+    meta_duration_ms: Option<i32>,
     token_input: Option<i64>,
     token_output: Option<i64>,
     token_total: Option<i64>,
@@ -983,11 +1028,24 @@ impl<'a> IngestionEventInsertValues<'a> {
                 TokenUsageDbFields::default()
             }
         };
+        let metadata = event.metadata.as_ref();
+        let tool_call_id = metadata_tool_call_id(metadata);
+        let meta_tool_name = metadata_tool_name(metadata).or_else(|| {
+            event
+                .event_type
+                .starts_with("tool_call_")
+                .then(|| normalize_optional_name(event.skill_name.clone()))
+                .flatten()
+        });
+        let meta_duration_ms = metadata_duration_ms(metadata);
         Ok(Self {
             event,
             token_usage_json: token_fields.token_usage_json,
-            metadata_json: event.metadata.as_ref().map(Value::to_string),
+            metadata_json: metadata.map(Value::to_string),
             skill_name: normalize_optional_name(event.skill_name.clone()),
+            tool_call_id,
+            meta_tool_name,
+            meta_duration_ms,
             token_input: token_fields.token_input,
             token_output: token_fields.token_output,
             token_total: token_fields.token_total,
@@ -1040,6 +1098,9 @@ fn bind_ingestion_event<'q>(
         .bind(&values.created_at)
         .bind(&event.parent_event_id)
         .bind(&event.causal_chain_id)
+        .bind(&values.tool_call_id)
+        .bind(&values.meta_tool_name)
+        .bind(values.meta_duration_ms)
         .bind(values.token_input)
         .bind(values.token_output)
         .bind(values.token_total);
@@ -1420,6 +1481,7 @@ impl EventIngestionWorker {
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
                       created_at, parent_event_id, causal_chain_id, \
+                      tool_call_id, meta_tool_name, meta_duration_ms, \
                       token_input, token_output, token_total) ",
                 );
                 builder.push_values(plain_event_rows.iter(), |mut row, values| {
@@ -1436,6 +1498,9 @@ impl EventIngestionWorker {
                         .push_bind(&values.created_at)
                         .push_bind(&event.parent_event_id)
                         .push_bind(&event.causal_chain_id)
+                        .push_bind(&values.tool_call_id)
+                        .push_bind(&values.meta_tool_name)
+                        .push_bind(values.meta_duration_ms)
                         .push_bind(values.token_input)
                         .push_bind(values.token_output)
                         .push_bind(values.token_total);
@@ -1461,8 +1526,9 @@ impl EventIngestionWorker {
                          (event_id, session_id, user_id, event_type, content, \
                           token_usage, llm_model_used, skill_name, metadata, \
                           created_at, parent_event_id, causal_chain_id, \
+                          tool_call_id, meta_tool_name, meta_duration_ms, \
                           token_input, token_output, token_total) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     ),
                     &values,
                 )
@@ -1809,8 +1875,10 @@ mod tests {
             SESSION_END_EVENT_TYPE,
             "turn",
             "turn_error",
-            "tool_call",
-            "tool_error",
+            "tool_call_started",
+            "tool_call_completed",
+            "tool_call_failed",
+            "tool_call_rejected",
             "approval_required",
             "approval_decision",
             "agent_spawned",
@@ -2294,6 +2362,69 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_error_envelope_collapses_to_one_canonical_failed_event() {
+        let journal = crate::session_journal::JournalEvent::tool_call_error(
+            Some("session-1"),
+            3,
+            "bash",
+            "exit 7",
+            crate::session_journal::ToolCallRecord {
+                tool_call_id: Some("call-1".into()),
+                name: "bash".into(),
+                ok: false,
+                ms: 12,
+                error: Some("exit 7".into()),
+                ..Default::default()
+            },
+        );
+
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "user-1").expect("valid tool error");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "tool_call_failed");
+        assert_eq!(events[0].parent_event_id, None);
+        assert!(events[0].parent_event_ids.is_empty());
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["tool_call_id"],
+            "call-1"
+        );
+    }
+
+    #[test]
+    fn tool_call_error_envelope_cannot_bypass_canonical_expansion() {
+        let mut journal = crate::session_journal::JournalEvent::tool_call_error(
+            Some("session-1"),
+            3,
+            "bash",
+            "exit 7",
+            crate::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                error: Some("exit 7".into()),
+                ..Default::default()
+            },
+        );
+
+        let direct = IngestionEvent::from_journal_event(&journal, "user-1");
+        assert!(
+            direct.is_err(),
+            "old tool_call_error events must be rejected"
+        );
+
+        journal.tool_calls = Some(vec![crate::session_journal::ToolCallRecord {
+            name: " ".into(),
+            ok: false,
+            ..Default::default()
+        }]);
+        let malformed = IngestionEvent::expand_journal_event(&journal, "user-1");
+        assert!(
+            malformed.is_err(),
+            "an invalid error envelope must not fall back to the old event dialect"
+        );
+    }
+
+    #[test]
     fn expand_turn_with_tool_calls_returns_extra_events() {
         let mut journal = make_turn_event();
         journal.tool_calls = Some(vec![
@@ -2315,6 +2446,7 @@ mod tests {
                 name: " git ".into(),
                 ok: true,
                 ms: 150,
+                tool_call_id: Some(" call-git ".into()),
                 error: None,
                 input_bytes: None,
                 output_bytes: None,
@@ -2349,8 +2481,8 @@ mod tests {
         // First is the main turn event
         assert!(events[0].event_type.contains("turn"));
 
-        // Second is successful tool_call
-        assert_eq!(events[1].event_type, "tool_call");
+        // Second is a successful terminal tool event.
+        assert_eq!(events[1].event_type, "tool_call_completed");
         assert_eq!(events[1].skill_name.as_deref(), Some("git"));
         assert_eq!(
             events[1].metadata.as_ref().unwrap()["tool_name"],
@@ -2370,10 +2502,20 @@ mod tests {
             Some(events[0].event_id.as_str())
         );
         assert_eq!(events[1].created_at, events[0].created_at);
+        let completed_values = IngestionEventInsertValues::from_event(&events[1])
+            .expect("completed tool event projection");
+        assert_eq!(completed_values.tool_call_id.as_deref(), Some("call-git"));
+        assert_eq!(completed_values.meta_tool_name.as_deref(), Some("git"));
+        assert_eq!(completed_values.meta_duration_ms, Some(150));
 
-        // Third is failed tool → tool_error
-        assert_eq!(events[2].event_type, "tool_error");
+        // Third is a failed terminal tool event.
+        assert_eq!(events[2].event_type, "tool_call_failed");
         assert_eq!(events[2].skill_name.as_deref(), Some("read_file"));
+        let failed_values = IngestionEventInsertValues::from_event(&events[2])
+            .expect("failed tool event projection");
+        assert!(failed_values.tool_call_id.is_some());
+        assert_eq!(failed_values.meta_tool_name.as_deref(), Some("read_file"));
+        assert_eq!(failed_values.meta_duration_ms, Some(20));
         assert!(
             events[2].content.as_ref().unwrap().contains("not found"),
             "got: {:?}",
@@ -2435,7 +2577,7 @@ mod tests {
         assert_eq!(main_metadata["tool_outcomes"]["rejected"], 1);
 
         let request = &events[1];
-        assert_eq!(request.event_type, "tool_call");
+        assert_eq!(request.event_type, "tool_call_rejected");
         let metadata = request.metadata.as_ref().expect("tool metadata");
         assert_eq!(metadata["disposition"], "rejected");
         assert_eq!(metadata["error_kind"], "tool_invalid_args");
@@ -2841,7 +2983,7 @@ mod tests {
 
     #[test]
     fn insert_values_canonicalize_skill_name() {
-        let mut event = test_event("evt-skill-name", "sess-1", "tool_call");
+        let mut event = test_event("evt-skill-name", "sess-1", "tool_call_completed");
         event.skill_name = Some(" skill ".to_string());
         let values = IngestionEventInsertValues::from_event(&event).expect("valid event");
         assert_eq!(values.skill_name.as_deref(), Some("skill"));

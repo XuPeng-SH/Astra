@@ -215,6 +215,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::Network => "error_network",
         astra_core::ErrorKind::ToolNotFound => "error_tool_not_found",
         astra_core::ErrorKind::ToolInvalidArgs => "error_tool_invalid_args",
+        astra_core::ErrorKind::PolicyDenied => "error_policy_denied",
         astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
         astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
         astra_core::ErrorKind::ToolBinding => "error_tool_binding",
@@ -440,26 +441,7 @@ fn record_full_llm_response_event(
 
 #[cfg(feature = "bridge-e2e-hooks")]
 fn mock_error_kind_from_str(kind: &str) -> astra_core::ErrorKind {
-    match kind {
-        "rate_limit" => astra_core::ErrorKind::RateLimit,
-        "server_error" => astra_core::ErrorKind::ServerError,
-        "auth" => astra_core::ErrorKind::Auth,
-        "context_window" => astra_core::ErrorKind::ContextWindow,
-        "invalid_request" => astra_core::ErrorKind::InvalidRequest,
-        "contract_violation" => astra_core::ErrorKind::ContractViolation,
-        "stream_idle" => astra_core::ErrorKind::StreamIdle,
-        "stream_transport" => astra_core::ErrorKind::StreamTransport,
-        "budget_exhausted" => astra_core::ErrorKind::BudgetExhausted,
-        "tool_rounds_exhausted" => astra_core::ErrorKind::ToolRoundsExhausted,
-        "network" => astra_core::ErrorKind::Network,
-        "tool_not_found" => astra_core::ErrorKind::ToolNotFound,
-        "tool_invalid_args" => astra_core::ErrorKind::ToolInvalidArgs,
-        "tool_timeout" => astra_core::ErrorKind::ToolTimeout,
-        "tool_unavailable" => astra_core::ErrorKind::ToolUnavailable,
-        "resource_limit" => astra_core::ErrorKind::ResourceLimit,
-        "cancelled" => astra_core::ErrorKind::Cancelled,
-        _ => astra_core::ErrorKind::Unknown,
-    }
+    astra_core::ErrorKind::parse_tag(kind).unwrap_or(astra_core::ErrorKind::Unknown)
 }
 
 #[cfg(feature = "bridge-e2e-hooks")]
@@ -6992,6 +6974,23 @@ mod tests {
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
 
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn mock_error_kind_uses_the_canonical_tag_parser() {
+        assert_eq!(
+            mock_error_kind_from_str("policy_denied"),
+            astra_core::ErrorKind::PolicyDenied
+        );
+        assert_eq!(
+            mock_error_kind_from_str("tool_binding"),
+            astra_core::ErrorKind::ToolBinding
+        );
+        assert_eq!(
+            mock_error_kind_from_str("not_a_real_kind"),
+            astra_core::ErrorKind::Unknown
+        );
+    }
+
     #[test]
     fn ttft_prefers_the_first_stream_update_including_reasoning() {
         assert_eq!(observed_ttft_ms(Some(240), Some(900), 1_600), 240);
@@ -10835,8 +10834,8 @@ mod tests {
         )
     }
 
-    fn read_journal_events(session_id: &str) -> Vec<Value> {
-        let path = astra_services::session_journal::JournalWriter::new(session_id)
+    fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
+        let path = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
             .expect("journal writer")
             .path()
             .clone();
@@ -12131,8 +12130,9 @@ mod tests {
             .await
             .expect("mock turn");
 
+        let owner = astra_services::OwnerScope::user("user-capture").expect("capture owner");
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
+            .session_dir_for_owner(&owner, session_id)
             .expect("session dir");
         let files: Vec<_> = std::fs::read_dir(session_dir)
             .expect("capture dir")
@@ -12577,12 +12577,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {
@@ -12719,12 +12722,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {
@@ -12810,12 +12816,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {

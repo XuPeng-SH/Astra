@@ -100,7 +100,7 @@ use astra_turn_core::agent_live_event::{
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnSkillSelectionRecord,
 };
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -1738,6 +1738,7 @@ fn build_server_skill_executor(
     inherited_permissions: InheritedPermissions,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
+    user_id: &str,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
@@ -1753,6 +1754,7 @@ fn build_server_skill_executor(
     let mut subrun_executor = ServerSkillSubRunExecutor::new(
         matrixone.clone(),
         Arc::clone(encryptor),
+        user_id.to_string(),
         session_id.to_string(),
     )
     .with_pool(shared_pool.cloned())
@@ -1787,10 +1789,12 @@ fn build_server_skill_executor(
     // This allows skills to resume from their last checkpoint instead of starting over.
     #[cfg(feature = "crash-recovery")]
     let isolated = {
-        let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("skill_checkpoints");
+        let checkpoint_dir =
+            astra_services::session_journal::journal_file_path_for_user(user_id, session_id)
+                .expect("authenticated skill session must resolve owner-scoped journal path")
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("skill_checkpoints");
         let checkpoint_manager = Arc::new(TokioMutex::new(
             astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
         ));
@@ -1846,13 +1850,18 @@ fn build_runtime_turn_evaluation_event(
     )
 }
 
-fn persist_turn_evaluation_journal(session_id: &str, source: &str, state: &AgenticLoopState) {
+fn persist_turn_evaluation_journal(
+    user_id: &str,
+    session_id: &str,
+    source: &str,
+    state: &AgenticLoopState,
+) {
     if session_id.is_empty() {
         return;
     }
 
     let event = build_runtime_turn_evaluation_event(session_id, source, state);
-    match astra_services::session_journal::JournalWriter::new(session_id) {
+    match astra_services::session_journal::JournalWriter::for_user(user_id, session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
                 tracing::warn!(
@@ -1873,14 +1882,20 @@ fn persist_turn_evaluation_journal(session_id: &str, source: &str, state: &Agent
 }
 
 /// Best-effort flush of turn observability events to local journal.
-fn flush_turn_observability(state: &mut AgenticLoopState, session_id: &str, interrupted: bool) {
+fn flush_turn_observability(
+    state: &mut AgenticLoopState,
+    user_id: &str,
+    session_id: &str,
+    interrupted: bool,
+) {
     let Some(buf) = state.turn_event_buffer.as_mut() else {
         return;
     };
     if buf.is_empty() {
         return;
     }
-    let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
+    let Ok(writer) = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+    else {
         tracing::warn!(
             session_id,
             "flush_turn_observability: failed to create journal writer"
@@ -2335,8 +2350,6 @@ pub struct AgenticRunLifecycleService {
     hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
-    /// Tool event writer for persisting tool_call events to agent_events.
-    tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Counter of in-flight background agentic loop tasks.
@@ -2398,7 +2411,6 @@ impl AgenticRunLifecycleService {
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             hook_db_writer: None,
             observer_worker: None,
-            tool_event_writer: None,
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
@@ -2536,11 +2548,6 @@ impl AgenticRunLifecycleService {
 
     pub fn with_observer_worker(mut self, worker: Arc<dyn TurnObserverWorker>) -> Self {
         self.observer_worker = Some(worker);
-        self
-    }
-
-    pub fn with_tool_event_writer(mut self, writer: Arc<dyn TurnToolEventWriter>) -> Self {
-        self.tool_event_writer = Some(writer);
         self
     }
 
@@ -5761,6 +5768,7 @@ impl AgenticRunLifecycleService {
             root_permissions.clone(),
             skill_resolver.clone(),
             Arc::clone(&self.reflect_service),
+            user_id,
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
@@ -5857,7 +5865,9 @@ impl AgenticRunLifecycleService {
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date(session_id),
+                    crate::turn::session_current_date::resolve_session_current_date_for_user(
+                        user_id, session_id,
+                    ),
                 ),
             ),
             message: prompt_user_message.clone(),
@@ -7286,7 +7296,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .as_ref()
             .map(|session| session.current_date().to_string())
             .unwrap_or_else(|| {
-                crate::turn::session_current_date::resolve_session_current_date(&session_id)
+                crate::turn::session_current_date::resolve_session_current_date_for_user(
+                    &user_id,
+                    &session_id,
+                )
             });
 
         // ── Runtime warm-start: restore loop state from checkpoint ──
@@ -7590,7 +7603,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
-            tool_event_writer: self.tool_event_writer.clone(),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -7749,7 +7761,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if final_status != RunStatus::Waiting {
                             run.live_tx = None;
                         }
-                        flush_turn_observability(&mut loop_state, &bg_session_id, true);
+                        flush_turn_observability(
+                            &mut loop_state,
+                            &bg_user_id,
+                            &bg_session_id,
+                            true,
+                        );
                     } else {
                         run.events.extend(events);
                         if should_preserve_manual_pause_on_completion(&run.status, &final_status) {
@@ -7958,8 +7975,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 drop(_owner_lease_heartbeat);
 
                 if persist_terminal_events {
-                    flush_turn_observability(&mut loop_state, &bg_session_id, false);
-                    persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
+                    flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
+                    persist_turn_evaluation_journal(
+                        &bg_user_id,
+                        &bg_session_id,
+                        "server_runtime",
+                        &loop_state,
+                    );
                 }
 
                 // Best-effort post-loop persistence (core events, tool events,
@@ -8312,7 +8334,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .as_ref()
             .map(|session| session.current_date().to_string())
             .unwrap_or_else(|| {
-                crate::turn::session_current_date::resolve_session_current_date(&session_id)
+                crate::turn::session_current_date::resolve_session_current_date_for_user(
+                    &user_id,
+                    &session_id,
+                )
             });
 
         // ── Runtime warm-start from step checkpoint ────────────────
@@ -8843,7 +8868,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
-            tool_event_writer: self.tool_event_writer.clone(),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -9071,7 +9095,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "planned",
                     &streaming_events_for_durable,
                 );
-                persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
+                persist_turn_evaluation_journal(
+                    &bg_user_id,
+                    &bg_session_id,
+                    "server_runtime",
+                    &state,
+                );
                 let mut terminal_state_events = streaming_final_events;
 
                 let mut persisted_status = final_status;
@@ -9088,7 +9117,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if final_status != RunStatus::Waiting {
                             run.live_tx = None;
                         }
-                        flush_turn_observability(&mut state, &bg_session_id, true);
+                        flush_turn_observability(&mut state, &bg_user_id, &bg_session_id, true);
                     } else {
                         run.events.append(&mut terminal_state_events);
                         if should_preserve_manual_pause_on_completion(&run.status, &final_status) {
@@ -9103,7 +9132,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if !run.status.is_resumable() {
                             run.live_tx = None;
                         }
-                        flush_turn_observability(&mut state, &bg_session_id, false);
+                        flush_turn_observability(&mut state, &bg_user_id, &bg_session_id, false);
                     }
                 }
 
@@ -11657,7 +11686,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date(
+                    crate::turn::session_current_date::resolve_session_current_date_for_user(
+                        &config.user_id,
                         &config.session_id,
                     ),
                 ),
@@ -11943,8 +11973,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &loop_state.telemetry.promotion_events,
         )
         .await?;
-        persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
-        flush_turn_observability(&mut loop_state, &config.session_id, false);
+        persist_turn_evaluation_journal(
+            &config.user_id,
+            &config.session_id,
+            "server_subrun",
+            &loop_state,
+        );
+        flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id, false);
 
         // Persist core events for delegation sub-runs.
         persist_server_loop_core_events(

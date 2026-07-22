@@ -460,7 +460,7 @@ fn event_matches_bridge_cache_source(
     event_source(event).is_none_or(|source| source == BRIDGE_CACHE_SOURCE)
 }
 
-fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
+fn load_bridge_pipeline_baseline(user_id: &str, session_id: &str) -> BridgePipelineBaseline {
     if session_id.is_empty() {
         return BridgePipelineBaseline {
             #[cfg(test)]
@@ -469,7 +469,9 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
         };
     }
     let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
-    let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
+    let Ok(events) =
+        astra_services::session_journal::read_journal_tail_for_user(user_id, session_id, 500)
+    else {
         return BridgePipelineBaseline {
             #[cfg(test)]
             next_turn: 1,
@@ -556,7 +558,10 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     // Replaying the journal reconstructs detector state; it is not a new live
     // cache break. Enable artifact emission only after replay so every HTTP turn
     // does not rewrite historical diagnostics with reset sequence numbers.
-    if let Ok(session_dir) = astra_services::local_session_artifact_store().session_dir(session_id)
+    let owner = astra_services::OwnerScope::user(user_id).ok();
+    if let Some(owner) = owner.as_ref()
+        && let Ok(session_dir) =
+            astra_services::local_session_artifact_store().session_dir_for_owner(owner, session_id)
     {
         cache_detector.set_diff_dir(session_dir.join("prompt-cache-diffs"));
     }
@@ -730,6 +735,51 @@ fn bridge_tool_result_ok(
     !transport_error && !output_semantic_error
 }
 
+fn bridge_tool_result_map_ok(
+    tool_result: &Map<String, Value>,
+    output_semantic_error: bool,
+) -> bool {
+    let status = match tool_result.get("status") {
+        None | Some(Value::Null) => "ok",
+        Some(Value::String(status)) => status,
+        Some(_) => return false,
+    };
+    let exit_semantics = tool_result
+        .get("exit_semantics")
+        .and_then(Value::as_str)
+        .and_then(parse_exit_semantics_tag);
+    let result_class = tool_result
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(parse_result_class_tag);
+    let has_explicit_error = match tool_result.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(error)) => !error.trim().is_empty(),
+        Some(_) => true,
+    };
+    !has_explicit_error
+        && bridge_tool_result_ok(status, exit_semantics, result_class, output_semantic_error)
+}
+
+fn canonical_bridge_tool_result_event_type(tool_result: &Map<String, Value>) -> &'static str {
+    let output_semantic_error = tool_result
+        .get("output")
+        .or_else(|| tool_result.get("result"))
+        .is_some_and(|output| {
+            let output = match output {
+                Value::String(output) => output.clone(),
+                Value::Null => String::new(),
+                output => output.to_string(),
+            };
+            astra_turn_core::tool_result_semantics::is_tool_error(&output)
+        });
+    if bridge_tool_result_map_ok(tool_result, output_semantic_error) {
+        "tool_call_completed"
+    } else {
+        "tool_call_failed"
+    }
+}
+
 #[cfg(test)]
 mod exit_semantics_tests {
     use super::normalize_exit_semantics_tag;
@@ -814,18 +864,6 @@ fn build_bridge_tool_call_records(
             .get(&request_id)
             .cloned()
             .unwrap_or((fallback_name, None, None));
-        let status = tool_result
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("ok");
-        let exit_semantics_value = tool_result
-            .get("exit_semantics")
-            .and_then(Value::as_str)
-            .and_then(parse_exit_semantics_tag);
-        let result_class_value = tool_result
-            .get("result_class")
-            .and_then(Value::as_str)
-            .and_then(parse_result_class_tag);
         let output = tool_result.get("output").map(|output| match output {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
@@ -883,17 +921,22 @@ fn build_bridge_tool_call_records(
         let output_semantic_error = output
             .as_deref()
             .is_some_and(astra_turn_core::tool_result_semantics::is_tool_error);
-        let ok = bridge_tool_result_ok(
-            status,
-            exit_semantics_value,
-            result_class_value,
-            output_semantic_error,
-        );
+        let ok = bridge_tool_result_map_ok(tool_result, output_semantic_error);
         let error = tool_result
             .get("error")
             .and_then(Value::as_str)
             .map(ToString::to_string)
-            .or_else(|| (!ok).then(|| output.clone().unwrap_or_else(|| status.to_string())));
+            .or_else(|| {
+                (!ok).then(|| {
+                    output.clone().unwrap_or_else(|| {
+                        tool_result
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("failed")
+                            .to_string()
+                    })
+                })
+            });
         let output_bytes = output
             .as_ref()
             .map(|output| output.len().min(u32::MAX as usize) as u32);
@@ -1149,6 +1192,7 @@ fn bridge_error_response_payload(
 
 fn flush_turn_event_buffer_or_warn(
     turn_event_buffer: &mut Option<TurnEventBuffer>,
+    user_id: &str,
     session_id: &str,
     stage: &str,
 ) {
@@ -1161,7 +1205,7 @@ fn flush_turn_event_buffer_or_warn(
     if buf.is_empty() {
         return;
     }
-    let writer = match JournalWriter::new(session_id) {
+    let writer = match JournalWriter::for_user(user_id, session_id) {
         Ok(writer) => writer,
         Err(error) => {
             astra_core::agent_warn!(
@@ -2239,7 +2283,10 @@ impl InProcessChatTurnBridge {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
             let bridge_session_current_date =
-                crate::turn::session_current_date::resolve_session_current_date(&session_id);
+                crate::turn::session_current_date::resolve_session_current_date_for_user(
+                    &user_id,
+                    &session_id,
+                );
             // Provider-aware volatile gating — see
             // `effective_volatile_sections_for_round` for the full rationale.
             // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
@@ -2527,7 +2574,8 @@ impl InProcessChatTurnBridge {
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
+            let mut bridge_pipeline_baseline =
+                load_bridge_pipeline_baseline(&user_id, &session_id);
 
 
             // Single LLM call per HTTP request (no multi-round tool loop).
@@ -3333,6 +3381,7 @@ impl InProcessChatTurnBridge {
                                     ));
                                     flush_turn_event_buffer_or_warn(
                                         &mut turn_event_buffer,
+                                        &user_id,
                                         &session_id,
                                         "bridge compacted context-window failure",
                                     );
@@ -3414,6 +3463,7 @@ impl InProcessChatTurnBridge {
                             ));
                             flush_turn_event_buffer_or_warn(
                                 &mut turn_event_buffer,
+                                &user_id,
                                 &session_id,
                                 "bridge llm error",
                             );
@@ -3604,6 +3654,7 @@ impl InProcessChatTurnBridge {
                                             ));
                                             flush_turn_event_buffer_or_warn(
                                                 &mut turn_event_buffer,
+                                                &user_id,
                                                 &session_id,
                                                 "bridge stream block parse failure",
                                             );
@@ -3749,6 +3800,7 @@ impl InProcessChatTurnBridge {
                             ));
                             flush_turn_event_buffer_or_warn(
                                 &mut turn_event_buffer,
+                                &user_id,
                                 &session_id,
                                 "bridge stream tail parse failure",
                             );
@@ -3843,6 +3895,7 @@ impl InProcessChatTurnBridge {
                         .await;
                         flush_turn_event_buffer_or_warn(
                             &mut turn_event_buffer,
+                            &user_id,
                             &session_id,
                             "bridge streamed terminal error",
                         );
@@ -3925,6 +3978,7 @@ impl InProcessChatTurnBridge {
                         ));
                         flush_turn_event_buffer_or_warn(
                             &mut turn_event_buffer,
+                            &user_id,
                             &session_id,
                             "bridge stream incomplete failure",
                         );
@@ -4298,7 +4352,7 @@ impl InProcessChatTurnBridge {
                             run_id: Some(run_id.clone()),
                             tool_call_id,
                             agent_id: agent_id.clone(),
-                            event_type: "tool_call".to_string(),
+                            event_type: "tool_call_started".to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
                                 v => serde_json::to_string(&v).unwrap_or_default(),
@@ -4334,7 +4388,7 @@ impl InProcessChatTurnBridge {
                             run_id: Some(run_id.clone()),
                             tool_call_id,
                             agent_id: agent_id.clone(),
-                            event_type: "tool_result".to_string(),
+                            event_type: canonical_bridge_tool_result_event_type(tr).to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
                                 v => serde_json::to_string(&v).unwrap_or_default(),
@@ -4470,7 +4524,7 @@ impl InProcessChatTurnBridge {
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
             {
                 let journal_sid = session_id.clone();
-                let writer = match JournalWriter::new(&journal_sid) {
+                let writer = match JournalWriter::for_user(&user_id, &journal_sid) {
                     Ok(writer) => writer,
                     Err(error) => {
                         astra_core::agent_warn!(
@@ -5270,19 +5324,11 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     fn read_journal_events(session_id: &str) -> Vec<Value> {
-        let path = JournalWriter::new(session_id)
-            .expect("journal writer")
-            .path()
-            .clone();
-        match std::fs::read_to_string(path) {
-            Ok(contents) => contents
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| serde_json::from_str::<Value>(line).expect("journal event json"))
-                .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => panic!("read journal: {error}"),
-        }
+        astra_services::session_journal::read_journal_for_user("user-bridge-journal", session_id)
+            .expect("read owner journal")
+            .into_iter()
+            .map(|event| serde_json::to_value(event).expect("journal event json"))
+            .collect()
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -5346,6 +5392,13 @@ mod tests {
                 referenced_by_durable_count: 0,
                 created_at: None,
             })
+        }
+
+        async fn upsert_json_artifact_projection(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, astra_services::SessionArtifactStoreError> {
+            self.persist_json_artifact(record).await
         }
 
         async fn load_json_artifact(
@@ -7277,8 +7330,9 @@ mod tests {
     fn load_bridge_pipeline_baseline_reconstructs_detector_state_from_journal() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let user_id = "bridge-test-user";
         let session_id = "00000000-0000-0000-0000-000000000188";
-        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+        let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
             .expect("journal writer");
 
         let request_metadata = |system_text: &str| {
@@ -7357,7 +7411,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        let mut baseline = load_bridge_pipeline_baseline(user_id, session_id);
         assert_eq!(baseline.next_turn, 3);
         let tool_names: Vec<&str> = baseline
             .last_tool_schemas
@@ -7410,8 +7464,9 @@ mod tests {
     fn load_bridge_pipeline_baseline_enables_prompt_cache_diff_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let user_id = "bridge-test-user";
         let session_id = "00000000-0000-0000-0000-000000000190";
-        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+        let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
             .expect("journal writer");
 
         let request_metadata = |system_prompt: &str| {
@@ -7485,9 +7540,10 @@ mod tests {
             )
             .unwrap();
 
-        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        let mut baseline = load_bridge_pipeline_baseline(user_id, session_id);
+        let owner = astra_services::OwnerScope::user(user_id).expect("owner scope");
         let diff_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
+            .session_dir_for_owner(&owner, session_id)
             .expect("session dir")
             .join("prompt-cache-diffs");
         assert!(
@@ -7544,8 +7600,9 @@ mod tests {
     fn load_bridge_pipeline_baseline_preserves_absolute_turn_when_tail_truncated() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let user_id = "bridge-test-user";
         let session_id = "00000000-0000-0000-0000-000000000189";
-        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+        let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
             .expect("journal writer");
 
         let response_metadata = |cached_input_tokens: u64| {
@@ -7577,7 +7634,7 @@ mod tests {
                 .unwrap();
         }
 
-        let baseline = load_bridge_pipeline_baseline(session_id);
+        let baseline = load_bridge_pipeline_baseline(user_id, session_id);
         assert_eq!(
             baseline.next_turn, 521,
             "tail-based reconstruction must preserve the absolute turn number"
@@ -8333,6 +8390,51 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn bridge_error_flush_isolated_to_authenticated_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let user_id = "bridge-owner";
+        let session_id = format!("bridge-error-flush-{}", uuid::Uuid::new_v4());
+        let trace = BridgeTraceCorrelation {
+            session_turn_source: "header".to_string(),
+            turn_chain_id: "chain-error".to_string(),
+            user_query_event_id: "query-error".to_string(),
+        };
+        let mut buffer = Some(TurnEventBuffer::begin_turn(Some(&session_id), 1));
+        record_full_llm_request_event(
+            &mut buffer,
+            true,
+            "root",
+            &session_id,
+            1,
+            &trace,
+            "bridge_inprocess",
+            "model",
+            "provider",
+            1,
+            &[json!({"role": "user", "content": "inspect"})],
+            &[],
+            Some(1024),
+        );
+
+        flush_turn_event_buffer_or_warn(&mut buffer, user_id, &session_id, "test error");
+
+        assert!(
+            astra_services::session_journal::read_journal_for_user(user_id, &session_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::LlmRequestFull)
+        );
+        assert!(
+            astra_services::session_journal::read_journal(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn deferred_tools_block_keeps_text_when_source_and_resolved_models_share_budget() {
         let mut ep: Map<String, Value> = Map::new();
         ep.insert(
@@ -8508,6 +8610,58 @@ mod tests {
                 .is_some_and(|error| error.contains("unknown field `slot_id`")),
             "{records:?}"
         );
+    }
+
+    #[test]
+    fn bridge_tool_result_events_use_canonical_terminal_lifecycle_types() {
+        let cases = [
+            (
+                json!({"status": "completed", "output": "ok"}),
+                "tool_call_completed",
+            ),
+            (
+                json!({"status": "failed", "output": "boom"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": "completed", "error": "transport failed"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": "completed", "error": {"code": 500}}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": 200, "output": "malformed status"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({
+                    "status": "failed",
+                    "output": "No matches",
+                    "result_class": "empty_result"
+                }),
+                "tool_call_completed",
+            ),
+            (
+                json!({
+                    "status": "completed",
+                    "output": "exit 7",
+                    "result_class": "execution_error"
+                }),
+                "tool_call_failed",
+            ),
+        ];
+
+        for (result, expected) in cases {
+            assert_eq!(
+                canonical_bridge_tool_result_event_type(
+                    result.as_object().expect("tool result object")
+                ),
+                expected,
+                "result={result}"
+            );
+        }
     }
 
     #[test]

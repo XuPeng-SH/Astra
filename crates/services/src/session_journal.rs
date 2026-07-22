@@ -1174,6 +1174,22 @@ impl ToolCallRecord {
         self.effective_disposition() == ToolCallDisposition::Executed
     }
 
+    /// Canonical terminal lifecycle event for this record.
+    ///
+    /// Keeping this mapping on the record prevents journal ingestion, live
+    /// trace persistence, transcripts, and audit analytics from inventing
+    /// incompatible interpretations of the same disposition.
+    pub fn canonical_terminal_event_type(&self) -> &'static str {
+        match self.effective_disposition() {
+            ToolCallDisposition::Executed if self.ok => "tool_call_completed",
+            ToolCallDisposition::Executed => "tool_call_failed",
+            ToolCallDisposition::Rejected => "tool_call_rejected",
+            ToolCallDisposition::Reused => "tool_call_reused",
+            ToolCallDisposition::Suppressed => "tool_call_suppressed",
+            ToolCallDisposition::Deferred => "tool_call_deferred",
+        }
+    }
+
     pub fn effective_disposition(&self) -> ToolCallDisposition {
         if let Some(disposition) = self.disposition {
             return disposition;
@@ -1747,12 +1763,29 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    /// Create a writer for the given session ID.
-    /// Creates the parent directory if needed.
+    /// Create a writer in the process-local owner scope.
+    ///
+    /// Authenticated runtimes must use [`Self::for_user`]; this constructor is
+    /// reserved for genuinely local CLI sessions and tests.
     pub fn new(session_id: &str) -> std::io::Result<Self> {
+        Self::from_path(session_id, journal_file_path(session_id))
+    }
+
+    /// Create a writer isolated to an authenticated user owner scope.
+    pub fn for_user(user_id: &str, session_id: &str) -> std::io::Result<Self> {
+        let path = journal_file_path_for_user(user_id, session_id)?;
+        Self::from_path(session_id, path)
+    }
+
+    /// Create a writer isolated to an explicit owner scope.
+    pub fn for_owner(owner_scope: &OwnerScope, session_id: &str) -> std::io::Result<Self> {
+        let path = journal_file_path_for_owner(owner_scope, session_id)?;
+        Self::from_path(session_id, path)
+    }
+
+    fn from_path(session_id: &str, path: PathBuf) -> std::io::Result<Self> {
         validate_session_id(session_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let path = journal_file_path(session_id);
         if path.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -2188,11 +2221,32 @@ fn parse_journal_text_in_append_order(content: &str) -> (Vec<JournalEvent>, usiz
 pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_file_path(session_id);
+    read_journal_from_path(&journal_file_path(session_id))
+}
+
+pub fn read_journal_for_owner(
+    owner_scope: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Vec<JournalEvent>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    read_journal_from_path(&journal_file_path_for_owner(owner_scope, session_id)?)
+}
+
+pub fn read_journal_for_user(
+    user_id: &str,
+    session_id: &str,
+) -> std::io::Result<Vec<JournalEvent>> {
+    let owner_scope = OwnerScope::user(user_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    read_journal_for_owner(&owner_scope, session_id)
+}
+
+fn read_journal_from_path(path: &Path) -> std::io::Result<Vec<JournalEvent>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     Ok(parse_journal_text(&content).0)
 }
 
@@ -2305,10 +2359,23 @@ pub fn read_durable_journal_append_delta(
 pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<JournalEvent>> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    read_journal_tail_from_path(&journal_file_path(session_id), limit)
+}
+
+pub fn read_journal_tail_for_user(
+    user_id: &str,
+    session_id: &str,
+    limit: usize,
+) -> std::io::Result<Vec<JournalEvent>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    read_journal_tail_from_path(&journal_file_path_for_user(user_id, session_id)?, limit)
+}
+
+fn read_journal_tail_from_path(path: &Path, limit: usize) -> std::io::Result<Vec<JournalEvent>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let path = journal_file_path(session_id);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -2316,7 +2383,7 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
     // Seek backwards from EOF instead of scanning the complete JSONL file.
     // Long-lived CLI sessions can accumulate hundreds of thousands of
     // events; a bounded tail read must bound I/O as well as retained memory.
-    let tail_lines = read_journal_tail_lines_exact(&path, limit)?;
+    let tail_lines = read_journal_tail_lines_exact(path, limit)?;
     let mut events = Vec::with_capacity(tail_lines.len());
     for line in tail_lines {
         if let Ok(event) = serde_json::from_str::<JournalEvent>(&line) {
@@ -2816,14 +2883,28 @@ pub fn read_journal_for_digest(
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_file_path(session_id);
+    read_journal_digest_from_path(&journal_file_path(session_id))
+}
+
+pub fn read_journal_for_digest_for_user(
+    user_id: &str,
+    session_id: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    read_journal_digest_from_path(&journal_file_path_for_user(user_id, session_id)?)
+}
+
+fn read_journal_digest_from_path(
+    path: &Path,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("session journal not found: {}", path.display()),
         ));
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     Ok(parse_journal_text(&content))
 }
 
@@ -7138,8 +7219,23 @@ mod tests {
         assert_eq!(outcomes.suppressed, 1);
         assert_eq!(outcomes.deferred, 1);
         assert!(outcomes.is_consistent());
+        let calls = parsed.tool_calls.unwrap();
         assert_eq!(
-            parsed.tool_calls.unwrap()[1].error_kind,
+            calls
+                .iter()
+                .map(ToolCallRecord::canonical_terminal_event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_call_rejected",
+                "tool_call_reused",
+                "tool_call_suppressed",
+                "tool_call_deferred",
+            ]
+        );
+        assert_eq!(
+            calls[1].error_kind,
             Some(astra_core::ErrorKind::ToolInvalidArgs)
         );
     }
@@ -7688,6 +7784,32 @@ mod tests {
         assert!(!user_a_sessions.contains(&user_b_sid));
         assert!(user_b_sessions.contains(&user_b_sid));
         assert!(!user_b_sessions.contains(&user_a_sid));
+    }
+
+    #[test]
+    fn user_scoped_writer_never_falls_back_to_local_owner() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = format!("owner-writer-{}", uuid::Uuid::new_v4());
+        let user_path = journal_file_path_for_user("user-a", &session_id).unwrap();
+        let local_path = journal_file_path(&session_id);
+
+        let writer = JournalWriter::for_user("user-a", &session_id).unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some(&session_id),
+                Some("model"),
+            ))
+            .unwrap();
+
+        assert_eq!(writer.path(), &user_path);
+        assert!(user_path.is_file());
+        assert!(!local_path.exists());
+        assert_eq!(
+            read_journal_for_user("user-a", &session_id).unwrap().len(),
+            1
+        );
+        assert!(read_journal(&session_id).unwrap().is_empty());
     }
 
     #[test]

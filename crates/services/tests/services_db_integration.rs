@@ -2785,7 +2785,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     .await
     .expect("insert session s2");
 
-    // Session s1: two turns (model m1), tool_call + tool_error on "bash", one stall.
+    // Session s1: two turns (model m1), two successful and one failed terminal
+    // tool lifecycle events on "bash", plus one stall.
     for (eid, typ, tin, tout, ttot, model, tool, ts) in [
         (
             &e_turn_a1,
@@ -2809,7 +2810,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_ok,
-            "tool_call",
+            "tool_call_completed",
             0_i64,
             0_i64,
             0_i64,
@@ -2819,7 +2820,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_err,
-            "tool_error",
+            "tool_call_failed",
             0_i64,
             0_i64,
             0_i64,
@@ -2829,7 +2830,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_call2,
-            "tool_call",
+            "tool_call_completed",
             0_i64,
             0_i64,
             0_i64,
@@ -2932,7 +2933,10 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_tokens_out, 20);
     assert_eq!(stats.total_tool_calls, 3);
     assert_eq!(stats.total_tool_failures, 1);
-    assert_eq!(stats.total_errors, 1);
+    assert_eq!(
+        stats.total_errors, 2,
+        "the canonical error set contains one failed tool lifecycle and one turn error"
+    );
     assert_eq!(stats.total_stalls, 1);
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
@@ -3479,7 +3483,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     sqlx::query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, event_type, parent_event_id, content, metadata, created_at) \
-         VALUES (?, ?, ?, 'tool_call', ?, 'tool child', CAST(? AS JSON), '2026-09-05 09:00:01.000000')",
+         VALUES (?, ?, ?, 'tool_call_completed', ?, 'tool child', CAST(? AS JSON), '2026-09-05 09:00:01.000000')",
     )
     .bind(&child_event_id)
     .bind(&session_id)
@@ -3599,7 +3603,9 @@ async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
     .bind(r#"["text"]"#)
     .bind(r#"["text"]"#)
     .bind("[]")
-    .bind(r#"{"prompt":2.0,"completion":8.0,"cache_read":0.5,"cache_write":1.5}"#)
+    .bind(
+        r#"{"prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
+    )
     .bind("[]")
     .bind("{}")
     .execute(&pool)
@@ -4737,7 +4743,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 
     let old_git_commit = "0123456789abcdef0123456789abcdef01234567";
     let new_git_commit = "fedcba9876543210fedcba9876543210fedcba98";
-    let (old_index, old_snapshot, old_data_snapshot) = build_index(
+    let (old_index, _old_snapshot, _old_data_snapshot) = build_index(
         "remote-composite-old",
         "feature/remote-composite-old",
         old_git_commit,
@@ -4769,29 +4775,30 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     )
     .await;
 
-    let (
-        expected_artifact,
-        expected_index,
-        expected_snapshot,
-        expected_data_snapshot,
-        expected_git,
-    ) = if new_artifact.artifact_id > old_artifact.artifact_id {
-        (
-            &new_artifact,
-            &new_index,
-            &new_snapshot,
-            &new_data_snapshot,
-            new_git_commit,
-        )
-    } else {
-        (
-            &old_artifact,
-            &old_index,
-            &old_snapshot,
-            &old_data_snapshot,
-            old_git_commit,
-        )
-    };
+    assert_eq!(old_artifact.artifact_id, new_artifact.artifact_id);
+    assert_eq!(
+        new_artifact.artifact_id,
+        astra_services::session_restore::COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID
+    );
+    let projection_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts \
+         WHERE user_id = ? AND session_id = ? AND artifact_kind = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("count composite snapshot projection rows");
+    assert_eq!(
+        projection_rows, 1,
+        "mutable composite snapshot state must occupy exactly one row"
+    );
+    let expected_artifact = &new_artifact;
+    let expected_index = &new_index;
+    let expected_snapshot = &new_snapshot;
+    let expected_data_snapshot = &new_data_snapshot;
+    let expected_git = new_git_commit;
 
     let latest_artifact = artifact_store
         .load_latest_json_artifact(
@@ -5456,18 +5463,50 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
                 ingestion_source: astra_services::events::EventIngestionSource::Client,
                 event_id: None,
                 session_id: session_id.clone(),
-                event_type: "owner_evt".into(),
+                event_type: "tool_call_completed".into(),
                 content: "owner visible".into(),
                 agent_id: None,
                 agent_version: None,
                 parent_event_id: None,
                 parent_event_ids: None,
                 causal_chain_id: None,
-                metadata: None,
+                metadata: Some(serde_json::json!({
+                    "tool_call_id": " call-owner-1 ",
+                    "tool_name": " bash ",
+                    "duration_ms": 17
+                })),
             },
         )
         .await
         .expect("owner can create event");
+
+    let event_projection = sqlx::query(
+        "SELECT tool_call_id, meta_tool_name, meta_duration_ms \
+         FROM agent_events WHERE event_id = ? AND user_id = ?",
+    )
+    .bind(&owner_event.record.event_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load canonical tool lifecycle projections");
+    assert_eq!(
+        event_projection
+            .try_get::<String, _>("tool_call_id")
+            .expect("decode tool_call_id"),
+        "call-owner-1"
+    );
+    assert_eq!(
+        event_projection
+            .try_get::<String, _>("meta_tool_name")
+            .expect("decode meta_tool_name"),
+        "bash"
+    );
+    assert_eq!(
+        event_projection
+            .try_get::<i32, _>("meta_duration_ms")
+            .expect("decode meta_duration_ms"),
+        17
+    );
 
     let stored_count =
         sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")

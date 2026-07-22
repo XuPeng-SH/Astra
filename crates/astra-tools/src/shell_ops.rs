@@ -18,7 +18,7 @@ use uuid::Uuid;
 use astra_core::work_unit::{
     WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
 };
-use astra_sandbox::{CommandRisk, analyze_command_risks};
+use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace};
 
 use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{
@@ -728,7 +728,10 @@ fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
     false
 }
 
-pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
+pub fn validate_execute_bash_command_in_workspace(
+    command: &str,
+    workspace_root: &Path,
+) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
@@ -789,7 +792,7 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         return Err("Error: socat/telnet networking in bash is blocked".into());
     }
 
-    for risk in analyze_command_risks(command) {
+    for risk in analyze_command_risks_in_workspace(command, workspace_root) {
         match &risk {
             // Allowed here only — still constrained by local rules + permission layer.
             CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
@@ -807,7 +810,6 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             | CommandRisk::DestructiveCommand(_)
             | CommandRisk::CredentialAccess(_)
             | CommandRisk::WorkspaceOutWrite(_)
-            | CommandRisk::InlineInterpreter(_)
             | CommandRisk::Eval
             | CommandRisk::CommandSubstitution
             | CommandRisk::ProcessSubstitution => {
@@ -872,7 +874,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
-    if let Err(reason) = validate_execute_bash_command(command) {
+    if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
         return ToolResult::error(reason);
     }
 
@@ -3839,6 +3841,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
+    fn validate_execute_bash_command(command: &str) -> Result<(), String> {
+        validate_execute_bash_command_in_workspace(command, Path::new("/workspace"))
+    }
+
     #[cfg(unix)]
     fn write_fake_rg_script(dir: &Path, body: &str) -> PathBuf {
         let script = dir.join("fake-rg");
@@ -5049,6 +5055,24 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
+    }
+
+    #[test]
+    fn validate_execute_bash_allows_benign_inline_interpreters() {
+        for command in [
+            "python3 -c 'print(1)'",
+            "node -e 'console.log(1)'",
+            "awk 'BEGIN { print 1 }'",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_ok(),
+                "permission policy, not the command validator, owns approval: {command}"
+            );
+        }
+
+        let error = validate_execute_bash_command("python3 -c \"open('/etc/shadow').read()\"")
+            .expect_err("a concrete sensitive-path access must still be rejected");
+        assert!(error.contains("sensitive path access"), "{error}");
     }
 
     #[tokio::test]

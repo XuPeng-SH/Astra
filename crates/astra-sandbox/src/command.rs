@@ -1,6 +1,7 @@
 //! Command sandboxing — wraps `std::process::Command` with security restrictions.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use super::policy::SandboxPolicy;
@@ -200,13 +201,6 @@ fn short_flag_contains(flag: &str, c: char) -> bool {
     flag.starts_with('-') && !flag.starts_with("--") && flag.chars().skip(1).any(|ch| ch == c)
 }
 
-/// Returns `true` when `cmd_name` appears as a standalone word in the
-/// lowercased command string (preceded by start-of-string or whitespace,
-/// followed by whitespace or end-of-string).
-fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
-    find_standalone_word(lower, cmd_name).is_some()
-}
-
 /// Analyze a command string for potentially dangerous patterns.
 ///
 /// Parsing uses tree-sitter-bash only (no legacy substring scanner). Unparseable input
@@ -214,6 +208,25 @@ fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
 ///
 /// This is advisory — the permission manager handles the actual allow/deny decision.
 pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(command, None)
+}
+
+/// Analyze command risks with an explicit workspace boundary.
+///
+/// Callers that enforce [`CommandRisk::WorkspaceOutWrite`] must use this
+/// variant. Whether an absolute path is inside the workspace cannot be
+/// determined from the command string alone.
+pub fn analyze_command_risks_in_workspace(
+    command: &str,
+    workspace_root: &Path,
+) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(command, Some(workspace_root))
+}
+
+fn analyze_command_risks_with_workspace(
+    command: &str,
+    workspace_root: Option<&Path>,
+) -> Vec<CommandRisk> {
     let mut risks = Vec::new();
 
     // 1) AST-level analysis (best-effort). This avoids many string-literal false positives.
@@ -249,7 +262,7 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         push_unique(&mut risks, CommandRisk::DestructiveCommand(cmd.to_string()));
     }
 
-    if let Some(target) = workspace_out_write_target(&lower) {
+    if let Some(target) = workspace_out_write_target(command, workspace_root) {
         push_unique(&mut risks, CommandRisk::WorkspaceOutWrite(target));
     }
 
@@ -304,55 +317,6 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
                 &mut risks,
                 CommandRisk::ZshDangerous(format!("{builtin} builtin")),
             );
-        }
-    }
-
-    // Inline interpreter execution (-c/-e/-r flags) can bypass AST-based bash
-    // analysis by embedding malicious commands inside string literals:
-    //   python3 -c 'import os; os.system("rm -rf /")'
-    //   perl -e 'system("reboot")'
-    //   ruby -e '`rm -rf /`'
-    //   node -e 'require("child_process").exec("reboot")'
-    //   php -r 'system("rm -rf /")'
-    //   lua -e 'os.execute("reboot")'
-    // Block these at the risk level so validate_execute_bash_command rejects them.
-    // Each tuple: (flag_byte, &[interpreter_names]) where flag_byte is the
-    // first byte of the flag (-c, -e, or -r).
-    let inline_interpreters: &[(u8, &[&str])] = &[
-        (1, &["python", "python2", "python3", "python3.12"]),
-        (b'c', &["perl"]),
-        (b'e', &["ruby", "lua"]),
-        (b'e', &["node", "nodejs"]),
-        (b'r', &["php"]),
-    ];
-    // awk is special: it accepts inline code as the first non-flag argument
-    // (e.g., `awk 'BEGIN { system("reboot") }'`). We detect it as a
-    // standalone word (not a flag-based invocation).
-    if is_standalone_command(&lower, "awk") {
-        push_unique(&mut risks, CommandRisk::InlineInterpreter("awk".into()));
-    }
-    for (_flag_byte, names) in inline_interpreters {
-        for name in *names {
-            // Match word-boundary: the interpreter name must be a standalone
-            // word followed by whitespace and -c/-e/-r.
-            if let Some(pos) = lower.find(name) {
-                let after = &lower[pos + name.len()..];
-                if let Some(rest) = after.strip_prefix(' ') {
-                    let flag = if rest.starts_with("-c ") {
-                        "-c"
-                    } else if rest.starts_with("-e ") {
-                        "-e"
-                    } else if rest.starts_with("-r ") {
-                        "-r"
-                    } else {
-                        continue;
-                    };
-                    push_unique(
-                        &mut risks,
-                        CommandRisk::InlineInterpreter(format!("{name} {flag}")),
-                    );
-                }
-            }
         }
     }
 
@@ -474,21 +438,24 @@ fn normalize_shell_token(token: &str) -> &str {
     token.trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
 
-fn workspace_out_write_target(lower: &str) -> Option<String> {
-    if let Some(target) = redirected_write_target(lower) {
+fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+    if let Some(target) = redirected_write_target(command, workspace_root) {
         return Some(target);
     }
 
-    if let Some(target) = download_output_target(lower) {
+    if let Some(target) = download_output_target(command, workspace_root) {
         return Some(target);
     }
 
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
     let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"];
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         let command = token.trim_matches([';', '|', '&']);
-        if !write_commands.contains(&command) {
+        if !write_commands
+            .iter()
+            .any(|candidate| command.eq_ignore_ascii_case(candidate))
+        {
             continue;
         }
         for arg in iter.clone() {
@@ -496,7 +463,7 @@ fn workspace_out_write_target(lower: &str) -> Option<String> {
             if target.starts_with('-') {
                 continue;
             }
-            if is_workspace_out_path(target) {
+            if is_workspace_out_path(target, workspace_root) {
                 return Some(target.to_string());
             }
         }
@@ -505,23 +472,24 @@ fn workspace_out_write_target(lower: &str) -> Option<String> {
     None
 }
 
-fn download_output_target(command: &str) -> Option<String> {
+fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         let command = token.trim_matches([';', '|', '&']);
-        if !matches!(command, "curl" | "wget") {
+        if !command.eq_ignore_ascii_case("curl") && !command.eq_ignore_ascii_case("wget") {
             continue;
         }
         while let Some(arg) = iter.next() {
             let arg = normalize_shell_token(arg);
-            let target = match arg {
-                "-o" | "-O" | "--output" => iter.next().copied(),
-                _ => None,
+            let target = if matches!(arg, "-o" | "-O" | "--output") {
+                iter.next().copied()
+            } else {
+                None
             };
             if let Some(target) = target {
                 let target = normalize_shell_token(target);
-                if is_workspace_out_path(target) {
+                if is_workspace_out_path(target, workspace_root) {
                     return Some(target.to_string());
                 }
             }
@@ -531,7 +499,7 @@ fn download_output_target(command: &str) -> Option<String> {
     None
 }
 
-fn redirected_write_target(command: &str) -> Option<String> {
+fn redirected_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
     let mut scan_from = 0;
     while let Some(op_index) = next_redirect_operator(command, scan_from) {
         let bytes = command.as_bytes();
@@ -550,7 +518,7 @@ fn redirected_write_target(command: &str) -> Option<String> {
             .find(|ch: char| ch.is_whitespace() || [';', '&', '|'].contains(&ch))
             .unwrap_or(rest.len());
         let target = rest[..target_end].trim_matches(['"', '\'']);
-        if is_workspace_out_path(target) {
+        if is_workspace_out_path(target, workspace_root) {
             return Some(target.to_string());
         }
         scan_from = target_index;
@@ -583,7 +551,7 @@ fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
     None
 }
 
-fn is_workspace_out_path(path: &str) -> bool {
+fn is_workspace_out_path(path: &str, workspace_root: Option<&Path>) -> bool {
     // Standard device sinks are part of the sandbox contract, not host-file
     // writes. Classifying `2>/dev/null` as an external mutation made harmless
     // read-only review commands require approval even though the execution
@@ -591,7 +559,65 @@ fn is_workspace_out_path(path: &str) -> bool {
     if matches!(path, "/dev/null" | "/dev/zero" | "/dev/full") {
         return false;
     }
-    path.starts_with("../") || path.starts_with("..\\") || path.starts_with('/')
+    // A static pre-execution check cannot prove where shell expansions point.
+    // Treat unresolved home, parameter, and command substitutions as external
+    // writes instead of resolving them against the workspace as literal text.
+    if path.starts_with('~') || path.contains('$') || path.contains('`') {
+        return true;
+    }
+    let candidate = Path::new(path);
+    let Some(workspace_root) = workspace_root else {
+        return path.starts_with("../") || path.starts_with("..\\") || candidate.is_absolute();
+    };
+
+    let root = canonicalize_existing_or_lexical(workspace_root);
+    let requested = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace_root.join(candidate)
+    };
+    let requested = canonicalize_existing_ancestor(&requested);
+    !requested.starts_with(&root)
+}
+
+fn canonicalize_existing_or_lexical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let normalized = lexical_normalize(path);
+    let mut ancestor = normalized.as_path();
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            return normalized;
+        };
+        ancestor = parent;
+    }
+    let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) else {
+        return normalized;
+    };
+    let Ok(suffix) = normalized.strip_prefix(ancestor) else {
+        return normalized;
+    };
+    canonical_ancestor.join(suffix)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !path.is_absolute() {
+                    normalized.push(Component::ParentDir.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn push_unique(risks: &mut Vec<CommandRisk>, risk: CommandRisk) {
@@ -633,9 +659,6 @@ pub enum CommandRisk {
     CredentialAccess(String),
     /// Command writes to a path outside the workspace boundary.
     WorkspaceOutWrite(String),
-    /// Command uses inline interpreter execution (-c/-e flags on python/perl/ruby/node)
-    /// which can bypass AST-based bash analysis by embedding commands in string literals.
-    InlineInterpreter(String),
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -656,9 +679,6 @@ impl std::fmt::Display for CommandRisk {
             Self::DestructiveCommand(cmd) => write!(f, "destructive command ({cmd})"),
             Self::CredentialAccess(path) => write!(f, "credential path access ({path})"),
             Self::WorkspaceOutWrite(path) => write!(f, "workspace-out write ({path})"),
-            Self::InlineInterpreter(cmd) => {
-                write!(f, "inline interpreter execution ({cmd})")
-            }
         }
     }
 }
@@ -892,6 +912,79 @@ mod tests {
                     .iter()
                     .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
                 "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_boundary_distinguishes_absolute_paths_by_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("Workspace-With-Case");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let inside = workspace.join("tree.py");
+        let inside_command = format!("printf ok > '{}'", inside.display());
+        let inside_risks = analyze_command_risks_in_workspace(&inside_command, &workspace);
+        assert!(
+            !inside_risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "workspace-local absolute writes must be allowed: {inside_risks:?}"
+        );
+
+        let outside = temp.path().join("outside.py");
+        let outside_command = format!("printf no > '{}'", outside.display());
+        let outside_display = outside.display().to_string();
+        let outside_risks = analyze_command_risks_in_workspace(&outside_command, &workspace);
+        assert!(
+            outside_risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(path) if path == &outside_display)),
+            "absolute writes outside the workspace must be rejected: {outside_risks:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_rejects_writes_through_an_outbound_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("external")).unwrap();
+
+        let escaped = workspace.join("external/new-file.txt");
+        let command = format!("touch '{}'", escaped.display());
+        let escaped_display = escaped.display().to_string();
+        let risks = analyze_command_risks_in_workspace(&command, &workspace);
+
+        assert!(
+            risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(path) if path == &escaped_display)),
+            "symlinks must not turn an external write into a workspace-local write: {risks:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_dynamic_write_targets_it_cannot_prove() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        for command in [
+            "touch \"$HOME/outside.txt\"",
+            "mkdir -p ~/outside-dir",
+            "printf no > \"$(pwd)/dynamic.txt\"",
+            "tee `$SHELL -c 'printf /tmp/out'`",
+        ] {
+            let risks = analyze_command_risks_in_workspace(command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "dynamic target must fail closed: {command}: {risks:?}"
             );
         }
     }
@@ -1157,36 +1250,33 @@ mod tests {
     }
 
     #[test]
-    fn detects_inline_interpreters() {
-        // Existing coverage (python, perl, ruby, node)
+    fn inline_interpreters_are_not_intrinsically_risky() {
+        for command in [
+            "python3 -c 'print(1)'",
+            "perl -e 'print 1'",
+            "ruby -e 'puts 1'",
+            "node -e 'console.log(1)'",
+            "php -r 'echo 1;'",
+            "lua -e 'print(1)'",
+            "awk 'BEGIN { print 1 }'",
+        ] {
+            assert_eq!(
+                analyze_command_risks(command),
+                Vec::<CommandRisk>::new(),
+                "inline source is not a risk without a concrete hazardous operation: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn concrete_hazards_inside_inline_source_remain_visible() {
         assert!(
-            analyze_command_risks("python -c 'import os; os.system(\"rm -rf /\")'")
-                .contains(&CommandRisk::InlineInterpreter("python -c".into()))
+            analyze_command_risks("python3 -c \"open('/etc/shadow').read()\"")
+                .contains(&CommandRisk::SensitivePathAccess("/etc/".into()))
         );
         assert!(
-            analyze_command_risks("perl -e 'system(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("perl -e".into()))
-        );
-        assert!(
-            analyze_command_risks("ruby -e '`rm -rf /`'")
-                .contains(&CommandRisk::InlineInterpreter("ruby -e".into()))
-        );
-        assert!(
-            analyze_command_risks("node -e 'require(\"child_process\").exec(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("node -e".into()))
-        );
-        // New coverage: php, lua, awk
-        assert!(
-            analyze_command_risks("php -r 'system(\"rm -rf /\")'")
-                .contains(&CommandRisk::InlineInterpreter("php -r".into()))
-        );
-        assert!(
-            analyze_command_risks("lua -e 'os.execute(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("lua -e".into()))
-        );
-        assert!(
-            analyze_command_risks("awk 'BEGIN { system(\"reboot\") }'")
-                .contains(&CommandRisk::InlineInterpreter("awk".into()))
+            analyze_command_risks("node -e 'require(\"child_process\").exec(\"dd\")'")
+                .contains(&CommandRisk::DestructiveCommand("dd".into()))
         );
     }
 }
