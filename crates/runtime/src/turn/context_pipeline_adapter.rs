@@ -127,7 +127,8 @@ pub(crate) fn build_external_sources(
         }));
     }
 
-    // Tool-conditional: cross-tool admission protocol
+    // Tool-conditional: cross-tool admission protocol. The exact visible
+    // surface versions the bytes, so it is reusable until that surface changes.
     if !tool_names.is_empty() {
         providers.push(Box::new(ToolConditionalProvider {
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
@@ -295,7 +296,10 @@ impl astra_turn_core::context_sources::ContextChannelProvider for SelfModelProvi
 }
 
 /// Tool-conditional: cross-tool admission protocol.
-/// Dynamic scope (per-turn, depends on visible tool set).
+///
+/// The section is reconstructed from the exact visible tool set each turn.
+/// Equal surfaces reuse the session prefix; a changed surface emits different
+/// bytes and naturally starts a new cache epoch.
 struct ToolConditionalProvider {
     tool_names: Vec<String>,
     cwd: String,
@@ -306,7 +310,7 @@ impl astra_turn_core::context_sources::ContextChannelProvider for ToolConditiona
         "tool_conditional"
     }
     fn cache_scope(&self) -> CacheScope {
-        CacheScope::None
+        CacheScope::Session
     }
     fn token_bucket(&self) -> PromptTokenBucket {
         PromptTokenBucket::Environment
@@ -317,7 +321,7 @@ impl astra_turn_core::context_sources::ContextChannelProvider for ToolConditiona
         if text.is_empty() {
             None
         } else {
-            Some(PromptSection::dynamic(text, PromptTokenBucket::Environment))
+            Some(PromptSection::stable(text, CacheScope::Session))
         }
     }
 }
@@ -670,12 +674,12 @@ pub(crate) fn build_turn_state(state: &AgenticLoopState, user_content: &str) -> 
     TurnState {
         messages: state.messages.clone(),
         tool_results: vec![],
-        tokens: TokenAccounting::from_fields(
-            state.total_prompt,
-            state.total_cache_read,
-            state.total_cache_creation,
-            state.total_completion,
-        ),
+        // The host totals are a lifetime billing ledger. Feeding them into
+        // context pressure makes a stable request look progressively fuller on
+        // every round. The core pipeline measures the concrete bound request;
+        // keep this hint empty unless a caller owns a per-request preflight
+        // tokenizer result.
+        tokens: TokenAccounting::default(),
         active_skills: vec![],
         recent_file_reads: std::collections::HashMap::new(),
         // Pull the real per-turn budget from the host state instead of a 20
@@ -798,18 +802,21 @@ mod tests {
     }
 
     #[test]
-    fn turn_state_tokens_reflect_host_state() {
+    fn turn_state_tokens_do_not_reuse_cumulative_session_cost_as_request_pressure() {
         let mut state = make_state();
-        state.total_prompt = 1000;
-        state.total_cache_read = 800;
-        state.total_cache_creation = 200;
-        state.total_completion = 50;
+        state.total_prompt = 100_000;
+        state.total_cache_read = 80_000;
+        state.total_cache_creation = 20_000;
+        state.total_completion = 5_000;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "small current request"}));
         let ts = build_turn_state(&state, "user message");
-        // TokenAccounting splits prompt_tokens across cache buckets — what
-        // matters is the adapter passed the right inputs. Verify via total.
-        assert!(
-            ts.tokens.total_input() > 0,
-            "token accounting must be populated from host fields"
+        assert_eq!(
+            ts.tokens.total_input(),
+            0,
+            "lifetime billing counters must never be interpreted as current \
+             context-window occupancy; the pipeline measures the bound request"
         );
     }
 
@@ -1103,10 +1110,15 @@ mod tests {
         );
 
         let tool_section = sources
-            .extra_dynamic_sections
+            .extra_stable_sections
             .iter()
             .find(|section| section.text.contains("Tool Availability Protocol"))
             .expect("tool availability protocol should be emitted for visible tools");
+        assert_eq!(
+            tool_section.scope,
+            crate::prompts::CacheScope::Session,
+            "surface-derived guidance is cacheable until the visible tool surface changes"
+        );
         assert_eq!(
             tool_section.token_bucket,
             crate::prompts::PromptTokenBucket::Environment
@@ -1134,8 +1146,33 @@ mod tests {
         }
     }
 
-    // Tool-surface volatile-lane routing is covered by the composite
-    // integration tests below.
+    #[test]
+    fn tool_surface_change_rebuilds_cacheable_guidance_without_stale_content() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let with_search = build_external_sources(&ep, &state, &["bash", "tool_search"], None, None);
+        let without_search = build_external_sources(&ep, &state, &["bash"], None, None);
+
+        let cacheable_tool_guidance =
+            |sources: &astra_turn_core::context_sources::ExternalSources| {
+                sources
+                    .extra_stable_sections
+                    .iter()
+                    .find(|section| section.text.contains("Tool Availability Protocol"))
+                    .expect("tool guidance")
+                    .text
+                    .clone()
+            };
+        let first = cacheable_tool_guidance(&with_search);
+        let second = cacheable_tool_guidance(&without_search);
+
+        assert_ne!(
+            first, second,
+            "a changed visible surface must rebuild exact cache-prefix bytes"
+        );
+        assert!(first.contains("tool_search(query=\"select:NAME\")"));
+        assert!(!second.contains("tool_search(query=\"select:NAME\")"));
+    }
 
     #[test]
     fn external_sources_empty_memory_when_edge_profile_has_none() {
@@ -1598,12 +1635,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_conditional_provider_cache_scope_is_none() {
+    fn tool_conditional_provider_cache_scope_tracks_surface_epoch() {
         let p = super::ToolConditionalProvider {
             tool_names: vec!["bash".into()],
             cwd: String::new(),
         };
-        assert_eq!(p.cache_scope(), CacheScope::None);
+        assert_eq!(p.cache_scope(), CacheScope::Session);
     }
 
     // ── EnvStaticProvider ──
@@ -2103,16 +2140,16 @@ mod tests {
         let with_tools = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(
             with_tools
-                .extra_dynamic_sections
+                .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Tool Availability Protocol")),
-            "tool_conditional emits when tools present"
+            "tool_conditional emits in the cacheable surface epoch when tools are present"
         );
 
         let without_tools = build_external_sources(&ep, &state, &[], None, None);
         assert!(
             !without_tools
-                .extra_dynamic_sections
+                .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Tool Availability Protocol")),
             "tool_conditional absent when no tools"

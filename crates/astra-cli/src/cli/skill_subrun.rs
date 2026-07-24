@@ -987,6 +987,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            context_compression_triggered: false,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
@@ -1573,13 +1574,13 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()],
-            "subrun surface assembly must not consume activation before the selected tool is called"
+            "subrun surface assembly must preserve selected schema materialization"
         );
         let _ = executor.execute("memory", &json!({})).await;
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "the accepted visible tool call consumes the matching activation"
+            vec!["memory".to_string()],
+            "a selected schema must remain materialized for the subrun after a call"
         );
     }
 

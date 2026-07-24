@@ -5,6 +5,12 @@
 
 use serde_json::{Value, json};
 
+#[derive(Debug)]
+pub(crate) struct CslContinuation {
+    pub(crate) completed_turn_count: u32,
+    pub(crate) messages: Vec<Value>,
+}
+
 /// Load prompt-facing continuation from canonical local session state.
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
@@ -43,11 +49,10 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
-            let messages =
-                match astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
-                    cp.messages,
-                    &prompt_state,
-                ) {
+            let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
+                cp.messages,
+                &prompt_state,
+            ) {
                     Ok(messages) => messages,
                     Err(error) => {
                         tracing::warn!(
@@ -112,7 +117,14 @@ fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec
     Ok((!messages.is_empty()).then_some(messages))
 }
 
-fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Value>>, String> {
+pub(crate) fn load_csl_messages_for_continuation(
+    session_id: &str,
+) -> Result<Option<Vec<Value>>, String> {
+    load_csl_continuation(session_id)
+        .map(|continuation| continuation.map(|continuation| continuation.messages))
+}
+
+pub(crate) fn load_csl_continuation(session_id: &str) -> Result<Option<CslContinuation>, String> {
     let store = astra_turn_core::conversation_log::file_store::FileCslStore::new(
         crate::cli::session::session_recovery::io::csl_store_base_dir(),
     );
@@ -122,12 +134,16 @@ fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Val
     let Some(materialized) = materialized else {
         return Ok(None);
     };
-    let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
-        materialized.messages,
-        &materialized.session_state,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok((!messages.is_empty()).then_some(messages))
+    let messages =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
+            materialized.messages,
+            &materialized.session_state,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok((!messages.is_empty()).then_some(CslContinuation {
+        completed_turn_count: materialized.last_turn,
+        messages,
+    }))
 }
 
 fn heavy_checkpoint_prompt_state(
@@ -151,10 +167,18 @@ fn heavy_checkpoint_prompt_state(
 /// turn boundaries. Without this, harness nudges (injected as "user" role)
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
-pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
-    msgs =
-        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(msgs);
-    msgs
+pub(crate) fn sanitize_continuation_messages(msgs: Vec<Value>) -> Vec<Value> {
+    let (sanitized, invalid_turn_semantics_dropped) =
+        astra_turn_core::prompt_facing::recover_canonical_continuation_messages_with_turn_semantics(
+            msgs,
+        );
+    if invalid_turn_semantics_dropped > 0 {
+        tracing::warn!(
+            invalid_turn_semantics_dropped,
+            "dropped invalid typed turn metadata while sanitizing continuation messages"
+        );
+    }
+    sanitized
 }
 
 /// Extract text content from a message regardless of format.
@@ -422,6 +446,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn load_session_messages_restores_completed_tool_evidence_from_csl() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("test-session-csl-tools-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                json!({"role": "user", "content": "inspect Cargo.toml"}),
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "[package]\nname = \"astra\""
+                }),
+                json!({"role": "assistant", "content": "done"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        let messages = super::load_session_messages_for_continuation(&session_id)
+            .expect("canonical continuation");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["content"], "[package]\nname = \"astra\"");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn csl_continuation_reports_corrupt_typed_metadata() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
@@ -491,6 +556,37 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_corrupt_turn_semantics_still_enforces_the_continuation_boundary() {
+        let corrupt_field = astra_turn_types::USER_TURN_SEMANTICS_FIELD;
+        let messages = vec![
+            json!({"role": "user", "content": "stale objective"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "runtime-only retry instruction",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            json!({
+                "role": "user",
+                "content": "current objective",
+                (corrupt_field): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "orphan result"}),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
+
+        let sanitized = super::sanitize_continuation_messages(messages);
+
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0]["content"], "current objective");
+        assert!(sanitized[0].get(corrupt_field).is_none());
+        assert_eq!(sanitized[1]["content"], "current answer");
+    }
+
+    #[test]
     fn sanitize_compaction_boundary_drops_pre_boundary_stale_goal() {
         let msgs = vec![
             json!({"role": "user", "content": "3 agents 不同角度review这个分支的所有changes"}),
@@ -541,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_compacts_trailing_completed_tool_round() {
+    fn sanitize_preserves_trailing_completed_tool_round_for_pressure_aware_optimizer() {
         let msgs = vec![
             json!({"role": "user", "content": "check status"}),
             json!({"role": "assistant", "content": "Here is the status."}),
@@ -552,8 +648,12 @@ mod tests {
             json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 7);
         assert_eq!(result[2]["content"], "hi");
+        assert_eq!(result[3]["tool_calls"][0]["id"], "1");
+        assert_eq!(result[4]["tool_call_id"], "1");
+        assert_eq!(result[5]["tool_calls"][0]["id"], "2");
+        assert_eq!(result[6]["tool_call_id"], "2");
     }
 
     #[test]

@@ -1235,7 +1235,7 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     state
         .compaction_effectiveness
         .record_compaction(outcome.total_tokens_freed);
-    if outcome.total_tokens_freed > 0 && !quiet {
+    if outcome.total_tokens_freed > 0 {
         let messages_after = state.messages.len();
         let messages_removed = messages_before.saturating_sub(messages_after);
         let layer_descriptions: Vec<String> = outcome
@@ -1243,17 +1243,26 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
             .iter()
             .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
             .collect();
-        let event = CompactionEvent::new(
-            kind,
-            pressure,
+        state.context_compression_triggered = true;
+        state.step_recorder.record_compaction_with_kind(
+            &kind.to_string(),
+            messages_removed.min(u32::MAX as usize) as u32,
             outcome.total_tokens_freed,
-            tokens_measured,
-            max_tokens,
-            messages_removed,
-            messages_after,
-            layer_descriptions,
+            pressure,
         );
-        host.on_compaction(event);
+        if !quiet {
+            let event = CompactionEvent::new(
+                kind,
+                pressure,
+                outcome.total_tokens_freed,
+                tokens_measured,
+                max_tokens,
+                messages_removed,
+                messages_after,
+                layer_descriptions,
+            );
+            host.on_compaction(event);
+        }
         if let Some(ref mut sess) = state.pipeline_session {
             sess.record_compaction_audit(
                 audit_label,
@@ -2002,6 +2011,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             )
         };
         if mc.results_compacted > 0 {
+            state.context_compression_triggered = true;
             if !quiet {
                 let event = CompactionEvent::new(
                     CompactionKind::Microcompact,
@@ -2015,7 +2025,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 );
                 host.on_compaction(event);
             }
-            state.step_recorder.record_compaction(
+            state.step_recorder.record_compaction_with_kind(
+                "microcompact",
                 mc.results_compacted as u32,
                 mc.tokens_saved as u64,
                 pressure,
@@ -4278,8 +4289,33 @@ mod tests {
         // would test the wrong layer. See compaction_engine_tests.rs for
         // typed-level boundary marker assertions.
 
-        // Emissions are suppressed when quiet=true, but the pipeline
-        // itself must execute without panicking — that's the contract.
+        assert!(
+            state.context_compression_triggered,
+            "quiet/headless rendering must not erase the turn-level compression fact"
+        );
+        let compaction_event = state
+            .step_recorder
+            .events()
+            .iter()
+            .find(|event| {
+                event.event_type == astra_pipeline::step_protocol::StepEventType::CompactionFired
+            })
+            .expect(
+                "quiet mode may suppress UI output, but durable compaction audit must be emitted",
+            );
+        let compaction_kind = compaction_event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .expect("production compaction paths must identify their strategy");
+        assert!(
+            matches!(
+                compaction_kind,
+                "proactive_default" | "proactive_aggressive"
+            ),
+            "unexpected compaction strategy: {compaction_kind}"
+        );
     }
 
     /// Resume-time compaction: when turn_index==0 and there are >10

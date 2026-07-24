@@ -16,8 +16,9 @@ pub use astra_prompts::skills::{
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget,
     DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_SYSTEM_PROMPT_TOKENS, budget_for_model,
-    budget_for_model_with_override, capped_output_tokens, estimate_str_tokens, estimate_tokens,
-    estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
+    budget_for_model_with_override, capped_output_tokens, estimate_json_value_tokens,
+    estimate_str_tokens, estimate_tokens, estimate_tokens_cache_aware,
+    estimate_tokens_cache_aware_split,
 };
 pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
 pub use system::{
@@ -64,7 +65,7 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("check history"),
+            p.contains("Reuse history"),
             "should include history awareness"
         );
         assert!(

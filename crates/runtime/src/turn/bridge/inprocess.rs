@@ -296,24 +296,18 @@ where
     Some(snapshot)
 }
 
-/// Build a prompt section for the CLI-injected skill listing.
+/// Normalize the CLI-injected skill listing for the typed session channel.
 ///
 /// Returns `None` when the CLI didn't include a listing (no skills loaded
-/// this session). Returns a `CacheScope::Session` section otherwise, so
-/// the Anthropic prompt cache hits the full block. This was previously a
-/// `CacheScope::None` volatile section, which meant CLI users paid the
-/// ~2.5KB skill listing cost every turn.
-pub fn skill_listing_section_for_edge_profile(
-    raw: Option<&str>,
-) -> Option<crate::prompts::PromptSection> {
+/// this session). The context binder owns its `CacheScope::Session`
+/// placement through `SessionContext.skill_listing_block`; callers must not
+/// also copy it into the generic stable-section lane.
+pub fn skill_listing_block_for_edge_profile(raw: Option<&str>) -> Option<String> {
     let text = raw?.trim();
     if text.is_empty() {
         return None;
     }
-    Some(crate::prompts::PromptSection::stable(
-        text.to_string(),
-        crate::prompts::CacheScope::Session,
-    ))
+    Some(text.to_string())
 }
 
 fn deferred_tools_section_for_edge_profile(
@@ -437,6 +431,60 @@ fn has_inprocess_persisted_events(
     tool_events_persisted: bool,
 ) -> bool {
     core_event_count > 0 || (tool_events_persisted && tool_event_count > 0)
+}
+
+fn observe_context_compaction(
+    id: impl Into<String>,
+    phase: impl Into<String>,
+    history_before: &[Value],
+    result: &crate::turn::cloud::compaction::CompactResult,
+    fixed_context: &[Value],
+    visible_tools: &[Value],
+) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
+    result.boundary.as_ref()?;
+    if result.messages == history_before {
+        return None;
+    }
+
+    let estimate = |history: &[Value]| -> u64 {
+        fixed_context
+            .iter()
+            .chain(history)
+            .chain(visible_tools)
+            .map(crate::prompts::estimate_json_value_tokens)
+            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add)
+    };
+    let tokens_before = estimate(history_before);
+    let tokens_after = estimate(&result.messages);
+    if tokens_after >= tokens_before {
+        return None;
+    }
+    let tier = serde_json::to_value(result.tier)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(
+        astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+            id: id.into(),
+            phase: phase.into(),
+            tier,
+            messages_before: history_before.len().min(u64::MAX as usize) as u64,
+            messages_after: result.messages.len().min(u64::MAX as usize) as u64,
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before.saturating_sub(tokens_after),
+        },
+    )
+}
+
+fn bind_bridge_memoria_owner(
+    client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
+    user_id: &str,
+) -> Result<Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>, String> {
+    let scope = astra_memoria::MemoryScope::new(user_id, "bridge-owner-binding")?;
+    Ok(client.map(|client| client.with_owner_user_id(scope.user_id)))
 }
 
 #[derive(Debug, Default)]
@@ -1756,7 +1804,13 @@ impl InProcessChatTurnBridge {
             .clone()
             .unwrap_or_else(|| Arc::new(CancellationToken::new()));
         let client_cancel_capture = response_cancel.clone();
-        let memoria_client_owned = self.memoria_client.clone();
+        let memoria_client_owned = bind_bridge_memoria_owner(self.memoria_client.clone(), &user_id)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to bind Memoria request owner: {error}"),
+                )
+            })?;
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
         let persist_tails_shared = self.persist_tails.clone();
@@ -2156,19 +2210,16 @@ impl InProcessChatTurnBridge {
                 .unwrap_or_default();
 
             // ── Skill listing (injected by CLI via edge_profile) ──
-            // Phase-9 fix: route to the session-stable lane so the
-            // Anthropic prompt cache hits the listing block. Previously
-            // this string went into `dynamic_sections` (volatile) which
-            // made CLI users' turn-to-turn cache miss the entire listing
-            // every round — the very regression the skill rewrite was
-            // meant to eliminate.
-            let skill_listing_hint_text = edge_profile
-                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let skill_listing_section =
-                skill_listing_section_for_edge_profile(skill_listing_hint_text.as_deref());
+            // The typed AvailableSkills channel owns session-stable placement.
+            // Keeping the catalog out of generic stable sections prevents the
+            // same routing metadata from appearing twice in one wire request.
+            let skill_listing_hint_text = skill_listing_block_for_edge_profile(
+                edge_profile
+                    .get(
+                        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT,
+                    )
+                    .and_then(Value::as_str),
+            );
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_for_turn.clone();
@@ -2232,11 +2283,6 @@ impl InProcessChatTurnBridge {
                         prompts::PromptTokenBucket::Environment,
                     ),
                 );
-            }
-            if let Some(section) = skill_listing_section.clone() {
-                // Session-scope: joins the cached prefix. Cache flips
-                // once when skill catalog changes, then stabilizes.
-                stable_sections.push(section);
             }
             let runtime_volatile_parts =
                 astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
@@ -2336,6 +2382,7 @@ impl InProcessChatTurnBridge {
             };
             let pipeline_outcome = crate::turn::llm::context::assemble_bridge_context(
                 crate::turn::llm::context::BridgeContextAssemblyInput {
+                    conversation_messages: &messages,
                     tool_surface:
                         crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                             &edge_tools,
@@ -2369,6 +2416,7 @@ impl InProcessChatTurnBridge {
             );
             let mut system_msg = pipeline_outcome.primary_system;
             let mut dynamic_msg = pipeline_outcome.dynamic_system;
+            let pipeline_messages = pipeline_outcome.messages;
             let mut prompt_sections = pipeline_outcome.prompt_sections;
             // Pipeline decision is the only source of truth for tier + pruning.
             // Cache the outputs so the round-level block below uses them
@@ -2406,17 +2454,15 @@ impl InProcessChatTurnBridge {
             }
             llm_messages.push(system_msg);
             let mut bridge_volatile_text: Option<String> = None;
-            if let Some(dyn_msg) = dynamic_msg {
+            if let Some(ref dyn_msg) = dynamic_msg {
                 // Volatile per-turn content (Self-Awareness counter, session
                 // anchor, etc.) — ALL protocols now route it to the
                 // last user message prefix so the system + tools prefix stays
                 // byte-stable across rounds. Earlier the Anthropic/Bedrock
                 // paths embedded volatile in the system content array past
-                // the cache_control marker; controlled probes (session
-                // 5c5cbf78, see deepseek_anthropic_cache_probe.py) showed
-                // DeepSeek treats the byte change as a fresh payload and
-                // never reaches the 2nd-warm state where tools enter cache.
-                // Bedrock is unaffected either way.
+                // the cache_control marker. Providers that cache an exact
+                // request prefix treat that byte change as a fresh payload,
+                // while marker-isolated providers are unaffected.
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
@@ -2434,8 +2480,19 @@ impl InProcessChatTurnBridge {
             // now route through the shared `wire_assembly::MemoriaContext`.
             // The summary adapter uses the same admitted route as the main
             // request, including forwarded headers and endpoint overrides.
+            let mut compaction_fixed_context = llm_messages.clone();
+            if let Some(dynamic) = dynamic_msg.as_ref() {
+                compaction_fixed_context.push(dynamic.clone());
+            }
+            if let Some(required) = required_runtime_text.as_deref().and_then(
+                crate::turn::wire_assembly::required_runtime_preamble_message,
+            )
+            {
+                compaction_fixed_context.push(required);
+            }
+            let mut context_compactions = Vec::new();
             let (merged_messages, _initial_tier) = {
-                let raw = messages.clone();
+                let raw = pipeline_messages;
 
                 let memoria_client = memoria_client_shared.clone();
 
@@ -2453,7 +2510,19 @@ impl InProcessChatTurnBridge {
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
 
-                let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
+                let compact_result = ctx
+                    .compact(&raw, &compaction_fixed_context, &edge_tools)
+                    .await;
+                if let Some(observation) = observe_context_compaction(
+                    "initial",
+                    "initial",
+                    &raw,
+                    &compact_result,
+                    &compaction_fixed_context,
+                    &edge_tools,
+                ) {
+                    context_compactions.push(observation);
+                }
 
                 if let Some(rerun) =
                     crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
@@ -2465,6 +2534,7 @@ impl InProcessChatTurnBridge {
                         |session_memory_entry, memory_entries| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {
+                                    conversation_messages: &messages,
                                     tool_surface:
                                         crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                                             &edge_tools,
@@ -2754,6 +2824,14 @@ impl InProcessChatTurnBridge {
                         &llm_messages,
                         &pruned_tools,
                     );
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                        &model_name,
+                        model_context_window,
+                        max_output_tokens,
+                    );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
@@ -2791,9 +2869,10 @@ impl InProcessChatTurnBridge {
                             prompt_request_plan,
                         );
                     }
-                    yield render_sse(&crate::turn::llm::context::context_meta_event(
+                    yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
+                        &context_compactions,
                     ));
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
@@ -2835,6 +2914,14 @@ impl InProcessChatTurnBridge {
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
+                    );
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                        &model_name,
+                        model_context_window,
+                        max_output_tokens,
                     );
 
                     // Capture the final post-mutation request state (see the
@@ -2967,9 +3054,10 @@ impl InProcessChatTurnBridge {
                         "type": "injection_freshness",
                         "channels": channels_payload,
                     }));
-                    yield render_sse(&crate::turn::llm::context::context_meta_event(
+                    yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
+                        &context_compactions,
                     ));
                     tracing::debug!(
                         target: "astra_timing",
@@ -3189,6 +3277,18 @@ impl InProcessChatTurnBridge {
                                     overrides,
                                 )
                                 .await;
+                            if let Some(observation) = observe_context_compaction(
+                                format!(
+                                    "context_window_retry:{round_ix}:{attempt_in_round}"
+                                ),
+                                "context_window_retry",
+                                &retry_compaction_history,
+                                &compact_result,
+                                system_prefix,
+                                &round_edge_tools,
+                            ) {
+                                context_compactions.push(observation);
+                            }
 
                             let rebuilt_retry_messages =
                                 crate::turn::llm::context::rebuild_bridge_retry_wire_messages(
@@ -3222,9 +3322,18 @@ impl InProcessChatTurnBridge {
                                 &llm_messages,
                                 &pruned_tools,
                             );
-                            yield render_sse(&crate::turn::llm::context::context_meta_event(
+                            crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                                &mut bridge_manifest_trace_json,
+                                &llm_messages,
+                                &pruned_tools,
+                                &model_name,
+                                model_context_window,
+                                max_output_tokens / 2,
+                            );
+                            yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                                 &breakdown,
                                 Some(&bridge_manifest_trace_json),
+                                &context_compactions,
                             ));
                             attempt_in_round = attempt_in_round.saturating_add(1);
                             record_full_llm_request_event(
@@ -4631,6 +4740,7 @@ impl InProcessChatTurnBridge {
                 recent_tools_for_quality.clone(),
                 last_measured_prompt,
                 budget.model_limit,
+                !context_compactions.is_empty(),
                 tool_execution_ms,
                 turn_started.elapsed().as_millis() as u64,
             );
@@ -5684,6 +5794,7 @@ mod tests {
             vec!["read_file".to_string(), "grep".to_string()],
             Some(1200),
             8000,
+            true,
             450,
             1500,
         );
@@ -5695,12 +5806,111 @@ mod tests {
         );
         assert_eq!(tool_surface.tools_available, 5);
 
+        let budget = signal.budget.as_ref().expect("budget");
+        assert!(
+            budget.compression_triggered,
+            "bridge trace must preserve the compaction fact supplied by prompt assembly"
+        );
+
         let timing = signal.timing.as_ref().expect("timing");
         assert_eq!(timing.turn, 3);
         assert_eq!(timing.context_assembly_ms, 0);
         assert_eq!(timing.llm_total_ms, 1050);
         assert_eq!(timing.tool_execution_ms, 450);
         assert_eq!(timing.total_ms, 1500);
+    }
+
+    #[test]
+    fn compaction_observation_measures_the_actual_prompt_delta() {
+        use crate::turn::cloud::compaction::{CompactBoundary, CompactResult, CompactTrigger};
+
+        let before = vec![
+            json!({"role": "user", "content": "keep the database invariant"}),
+            json!({"role": "assistant", "content": "x".repeat(4_000)}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let after = vec![
+            json!({"role": "user", "content": "keep the database invariant"}),
+            json!({"role": "assistant", "content": "summary"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let result = CompactResult {
+            messages: after,
+            boundary: Some(
+                CompactBoundary::new(
+                    CompactTrigger::Auto,
+                    crate::prompts::CompactionTier::CompactHistory,
+                )
+                .with_pre_metrics(0, before.len())
+                .with_post_count(3),
+            ),
+            tier: crate::prompts::CompactionTier::CompactHistory,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+
+        let observation = observe_context_compaction(
+            "initial",
+            "initial",
+            &before,
+            &result,
+            &[json!({"role": "system", "content": "stable"})],
+            &[json!({"type": "function", "function": {"name": "read_file"}})],
+        )
+        .expect("boundary must produce one observation");
+
+        assert_eq!(observation.id, "initial");
+        assert_eq!(observation.phase, "initial");
+        assert_eq!(observation.tier, "compact_history");
+        assert_eq!(observation.messages_before, 3);
+        assert_eq!(observation.messages_after, 3);
+        assert!(observation.tokens_before > observation.tokens_after);
+        assert_eq!(
+            observation.tokens_saved,
+            observation.tokens_before - observation.tokens_after
+        );
+    }
+
+    #[test]
+    fn compaction_observation_ignores_a_noop_result() {
+        use crate::turn::cloud::compaction::{CompactBoundary, CompactResult, CompactTrigger};
+
+        let messages = vec![json!({"role": "user", "content": "small"})];
+        let result = CompactResult {
+            messages: messages.clone(),
+            boundary: Some(CompactBoundary::new(
+                CompactTrigger::Auto,
+                crate::prompts::CompactionTier::CompactHistory,
+            )),
+            tier: crate::prompts::CompactionTier::CompactHistory,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+
+        assert!(
+            observe_context_compaction("initial", "initial", &messages, &result, &[], &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bridge_memoria_client_is_bound_to_the_authenticated_request_owner() {
+        let client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
+            "http://127.0.0.1:9".to_string(),
+            "test-key".to_string(),
+        );
+
+        let bound = bind_bridge_memoria_owner(Some(client), "authenticated-user")
+            .expect("valid owner")
+            .expect("configured client");
+
+        assert_eq!(
+            bound.bound_owner_user_id(),
+            Some("authenticated-user"),
+            "the shared startup transport must become request-owner-scoped before any strict recall"
+        );
     }
 
     // ── Static/dynamic prompt boundary tests ──
