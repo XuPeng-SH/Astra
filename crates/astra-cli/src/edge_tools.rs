@@ -1230,7 +1230,7 @@ fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration
         "task_id": task_id,
         "status": "stop_status_unknown",
         "error": format!(
-            "Background task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
+            "Background task registry did not respond within {}ms. The task may still be running; query task_list before issuing another stop request.",
             duration_ms_u64(timeout)
         ),
     })
@@ -5140,7 +5140,7 @@ impl ToolExecutor {
     ) -> EdgeToolRun {
         if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
             let evidence = error.failure_evidence();
-            return EdgeToolRun::failure_evidence(format!("Error: {error}"), evidence);
+            return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
