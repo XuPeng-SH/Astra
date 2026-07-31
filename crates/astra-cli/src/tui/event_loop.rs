@@ -23,6 +23,7 @@ use crate::lock_recovery::LockRecovery;
 use astra_services::session_journal::ToolCallRecord;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
+use crossterm::style::Stylize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
@@ -4406,10 +4407,6 @@ fn refresh_footer_from_state(
     state: &crate::cli::session::session_state::SessionState,
 ) {
     bottom_pane.footer.model = state.model.clone();
-    bottom_pane.footer.session_id = state
-        .session_id
-        .as_ref()
-        .map(|sid| sid[..8.min(sid.len())].to_string());
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     if let Some(trace) = latest_context_trace(state)
         && let Some(usage) = context_window_from_trace(&trace)
@@ -4683,9 +4680,6 @@ pub(crate) async fn run_tui_session(
 
     if let Some(ref model) = state.model {
         bottom_pane.footer.model = Some(model.clone());
-    }
-    if let Some(ref sid) = state.session_id {
-        bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     // Lock-free observer of `perm_manager.mode()` so the inner-tick
@@ -5859,6 +5853,7 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut output_settled_at: Option<std::time::Instant> = None;
+                                    let mut exit_after_turn_settlement = false;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
@@ -6189,12 +6184,32 @@ pub(crate) async fn run_tui_session(
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         match slash_dispatch::immediate_control(&queued_text) {
                                                                             Some(slash_dispatch::ImmediateControl::Exit) => {
-                                                                                // `/exit` is a workbench lifecycle command in every
-                                                                                // turn phase. Cancel the in-flight local boundary and
-                                                                                // leave through the regular shutdown path; never queue
-                                                                                // it as model guidance or a follow-up user message.
-                                                                                tui_cancel_token.cancel();
-                                                                                break 'main Ok(());
+                                                                                // Exit is a lifecycle intent, not permission to drop a
+                                                                                // visible-but-not-yet-durable turn. If generation is
+                                                                                // still active, request its normal cancellation; in both
+                                                                                // cases keep polling the turn future until settlement has
+                                                                                // rebound/persisted the session, then leave the main loop.
+                                                                                if !exit_after_turn_settlement {
+                                                                                    exit_after_turn_settlement = true;
+                                                                                    if output_settled_at.is_none() {
+                                                                                        request_active_run_cancel(
+                                                                                            &mut chat_widget,
+                                                                                            &mut bottom_pane,
+                                                                                            &mut status_indicator,
+                                                                                            &mut cancel_control_tasks,
+                                                                                            task_service_for_cancel.as_ref(),
+                                                                                            &preinstalled_run_control,
+                                                                                            &tui_cancel_token,
+                                                                                        );
+                                                                                        interrupt_pending = true;
+                                                                                        bottom_pane.interrupt_pending = true;
+                                                                                    }
+                                                                                    let now = std::time::Instant::now();
+                                                                                    bottom_pane.set_task_status(TaskStatus::Exiting);
+                                                                                    status_indicator.begin_exit(now);
+                                                                                    frame_requester.schedule_frame();
+                                                                                }
+                                                                                continue;
                                                                             }
                                                                             Some(slash_dispatch::ImmediateControl::StopCurrentRun) => {
                                                                                 if output_settled_at.is_some() {
@@ -7289,7 +7304,9 @@ pub(crate) async fn run_tui_session(
                                     let unapplied_user_intents =
                                         bottom_pane.take_unapplied_user_intents();
                                     let should_start_followups =
-                                        turn_result.is_ok() && !state.last_turn_interrupted;
+                                        turn_result.is_ok()
+                                            && !state.last_turn_interrupted
+                                            && !exit_after_turn_settlement;
                                     if interrupt_pending {
                                         interrupt_pending = false;
                                         bottom_pane.interrupt_pending = false;
@@ -7366,8 +7383,6 @@ pub(crate) async fn run_tui_session(
 
                                     // Update footer
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
-                                    bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // The live stream has already updated the footer from the
                                     // current request's assembly and provider usage. A trace is
@@ -7442,6 +7457,10 @@ pub(crate) async fn run_tui_session(
                                     // possibly TurnSummary + SystemError) to
                                     // scrollback in one shot.
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
+
+                                    if exit_after_turn_settlement {
+                                        break 'main turn_result;
+                                    }
 
                                     let new_tok = std::sync::Arc::new(
                                         session_shutdown_token.child_token(),
@@ -7845,10 +7864,6 @@ pub(crate) async fn run_tui_session(
                                                 &mut board_user_pin,
                                             );
                                         }
-                                        bottom_pane.footer.session_id = state
-                                            .session_id
-                                            .as_ref()
-                                            .map(|s| s[..8.min(s.len())].to_string());
                                     } else if let bottom_pane::view::ViewResult::Session {
                                         session_id: parent_id,
                                         intent: bottom_pane::view::SessionSelectionIntent::Fork,
@@ -7890,10 +7905,6 @@ pub(crate) async fn run_tui_session(
                                                         outcome.events_copied,
                                                         task_board_note,
                                                     )),
-                                                );
-                                                bottom_pane.footer.session_id = Some(
-                                                    outcome.new_session_id[..8.min(outcome.new_session_id.len())]
-                                                        .to_string(),
                                                 );
                                             }
                                             Err(error) => chat_widget.commit_system(
@@ -8556,6 +8567,34 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
+    // A graceful exit can spend time settling journals, background workers,
+    // and session memory. Render that accepted lifecycle state before any of
+    // those waits so the terminal never appears unresponsive.
+    if result.is_ok() {
+        let now = std::time::Instant::now();
+        bottom_pane.set_task_status(TaskStatus::Exiting);
+        status_indicator.begin_exit(now);
+        let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+        let frame = active_viewport(
+            &chat_widget,
+            &status_indicator,
+            Some(&*task_board),
+            board_expanded,
+            board_user_pin,
+            width,
+            guard.terminal.size().map(|size| size.height).unwrap_or(24),
+        );
+        board_expanded = frame.resolved_board_expanded;
+        let _ = do_draw(
+            &mut guard,
+            frame.active,
+            frame.multi_agent,
+            &mut bottom_pane,
+            Some((&*task_board, board_expanded)),
+            frame.task_board,
+        );
+    }
+
     let shutdown_signal = if session_shutdown_token.is_cancelled() {
         match (&mut shutdown_monitor).await {
             Ok(signal) => Some(signal),
@@ -8570,6 +8609,13 @@ pub(crate) async fn run_tui_session(
         None
     };
     let signal_driven_shutdown = shutdown_signal.is_some();
+    let exit_reason = match (result.is_err(), shutdown_signal) {
+        (true, _) => crate::cli::session::session_cleanup::SessionExit::Error,
+        (false, Some(signal)) => {
+            crate::cli::session::session_cleanup::SessionExit::Shutdown(signal)
+        }
+        (false, None) => crate::cli::session::session_cleanup::SessionExit::Command,
+    };
     if let Some(signal) = shutdown_signal {
         tracing::info!(
             signal = signal.label(),
@@ -8656,6 +8702,13 @@ pub(crate) async fn run_tui_session(
     );
     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
     flush_chat_widget(&mut guard, &mut chat_widget, width);
+    // Capture before finalization: process-local cleanup may release the live
+    // identity, while the copyable command must name the durable session that
+    // was just committed.
+    let resume_hint = crate::cli::session::session_cleanup::resume_hint_for_exit(
+        exit_reason,
+        state.session_id.as_deref(),
+    );
     let finalization_budget = if signal_driven_shutdown {
         Duration::from_secs(2)
     } else {
@@ -8683,6 +8736,10 @@ pub(crate) async fn run_tui_session(
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
     drop(guard);
+    if let Some((label, command)) = resume_hint {
+        println!("{}", label.dim());
+        println!("  {}", command.cyan());
+    }
     result
 }
 
@@ -8833,7 +8890,6 @@ mod tests {
     use crate::background_task_error::BackgroundTaskError;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use crate::tui::background_tasks::BgTaskEvent;
-    use crate::tui::status_line::{StatusContext, StatusLine};
     use astra_runtime::turn::run_control::{
         RunControlStatus, RunStatusProvider, UserIntentProvider,
     };
@@ -10132,16 +10188,6 @@ mod tests {
             Some(astra_turn_types::ContextWindowUsage::provider_reported(
                 20_687, 800_000
             ))
-        );
-
-        let plain = StatusLine::from_context(&StatusContext {
-            context_window: usage,
-            ..StatusContext::default()
-        })
-        .plain();
-        assert!(
-            plain.contains("Ctx 3%") && plain.contains("21k/800k"),
-            "footer should present one request's context occupancy: {plain:?}"
         );
     }
 
@@ -12519,9 +12565,14 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut buf);
         let pane_text = crate::tui::testing::render::buffer_to_string(&buf);
+        assert!(bottom_pane.footer.is_turn_active);
         assert!(
-            pane_text.contains("Enter queues") && pane_text.contains("Ctrl+C stops"),
-            "active-turn composer feedback missing: {pane_text:?}"
+            pane_text.contains("Message Astra"),
+            "dispatch feedback must not displace the composer: {pane_text:?}"
+        );
+        assert!(
+            !pane_text.contains("Enter queues") && !pane_text.contains("Ctrl+C stops"),
+            "the status indicator owns dispatch feedback; the composer must stay free of duplicate key chrome: {pane_text:?}"
         );
 
         finish_submission_feedback(&mut bottom_pane, &mut indicator);
@@ -12530,6 +12581,7 @@ mod tests {
             status_indicator::IndicatorState::Idle
         ));
         assert!(indicator.render_at(at).is_none());
+        assert!(!bottom_pane.footer.is_turn_active);
 
         let mut settled = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut settled);
@@ -12546,6 +12598,7 @@ mod tests {
             indicator.state(),
             status_indicator::IndicatorState::Idle
         ));
+        assert!(!bottom_pane.footer.is_turn_active);
         let mut after_late_progress = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut after_late_progress);
         let after_late_progress =
