@@ -34,6 +34,7 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::turn::canonical_commit::{canonical_commit_delta, pack_canonical_turn_segments};
 use crate::turn::run_control::{RunControlProvider, RunControlStatus, UserIntentProvider};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
@@ -2711,6 +2712,9 @@ struct CanonicalTurnAdmission {
     prior_messages: Vec<Value>,
     prior_message_count: usize,
     had_canonical_head: bool,
+    /// Leases supplied as an explicit controller capability outlive one run;
+    /// only leases acquired internally by this run are released here.
+    release_writer_on_finish: bool,
     release_started: Arc<AtomicBool>,
     renewal_cancel: CancellationToken,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
@@ -2723,6 +2727,9 @@ impl Drop for CanonicalTurnAdmission {
             return;
         }
         self.renewal_cancel.cancel();
+        if !self.release_writer_on_finish {
+            return;
+        }
         let coordinator = Arc::clone(&self.coordinator);
         let lease = self.lease.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -2969,70 +2976,111 @@ impl AgenticRunLifecycleService {
                 })?,
             None => Vec::new(),
         };
-        let authority_epochs = coordinator
-            .load_authority_epochs(&key)
-            .await
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to load canonical authority epochs: {error}"),
-                    "session_authority_unavailable",
-                )
-            })?
-            .unwrap_or_default();
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            user_id,
-            format!("server-run:{run_id}"),
-            astra_turn_types::ActorKindV1::Server,
-            astra_turn_types::SessionSurfaceV1::Server,
-            None,
-            authority_epochs,
-        );
-        let lease = match coordinator
-            .acquire_writer(
-                &key,
-                head.as_ref().map(|head| &head.cursor),
-                &actor,
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:writer"),
-            )
-            .await
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to acquire canonical writer: {error}"),
-                    "session_writer_unavailable",
-                )
-            })? {
-            astra_services::AcquireWriterOutcome::Acquired(lease)
-            | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-            astra_services::AcquireWriterOutcome::Conflict { .. } => {
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    "another controller owns this canonical session branch",
-                    "session_writer_conflict",
-                ));
-            }
-        };
-        let reservation = match coordinator
+        let (lease, release_writer_on_finish) =
+            if let Some(authority) = request.conversation_authority.as_ref() {
+                let active = coordinator
+                    .load_active_writer(&key)
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to load canonical writer: {error}"),
+                            "session_writer_unavailable",
+                        )
+                    })?
+                    .filter(|lease| {
+                        lease.key == key
+                            && lease.lease_id == authority.execution_grant.claims.lease_id
+                            && lease.writer_epoch == authority.writer_epoch
+                            && lease.actor.actor_id == authority.actor_id
+                            && authority.run_id == run_id
+                            && authority.expected_cursor
+                                == head.as_ref().map(|head| head.cursor.clone())
+                    })
+                    .ok_or_else(|| {
+                        error_response_coded(
+                            StatusCode::CONFLICT,
+                            "conversation authority no longer owns the active writer lease",
+                            "conversation_authority_fenced",
+                        )
+                    })?;
+                (active, false)
+            } else {
+                let authority_epochs = coordinator
+                    .load_authority_epochs(&key)
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to load canonical authority epochs: {error}"),
+                            "session_authority_unavailable",
+                        )
+                    })?
+                    .unwrap_or_default();
+                let actor = astra_turn_types::ActorContextV1::owner_user(
+                    user_id,
+                    format!("server-run:{run_id}"),
+                    astra_turn_types::ActorKindV1::Server,
+                    astra_turn_types::SessionSurfaceV1::Server,
+                    None,
+                    authority_epochs,
+                );
+                let acquired = coordinator
+                    .acquire_writer(
+                        &key,
+                        head.as_ref().map(|head| &head.cursor),
+                        &actor,
+                        Duration::from_secs(15 * 60),
+                        &format!("server-run:{run_id}:writer"),
+                    )
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to acquire canonical writer: {error}"),
+                            "session_writer_unavailable",
+                        )
+                    })?;
+                let lease = match acquired {
+                    astra_services::AcquireWriterOutcome::Acquired(lease)
+                    | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+                    astra_services::AcquireWriterOutcome::Conflict { .. } => {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "another controller owns this canonical session branch",
+                            "session_writer_conflict",
+                        ));
+                    }
+                };
+                (lease, true)
+            };
+        let reservation_outcome = coordinator
             .reserve_turn(
                 &lease,
                 head.as_ref().map(|head| &head.cursor),
                 Duration::from_secs(15 * 60),
                 &format!("server-run:{run_id}:turn"),
             )
-            .await
-            .map_err(|error| {
-                error_response_coded(
+            .await;
+        let reservation = match reservation_outcome {
+            Err(error) => {
+                if release_writer_on_finish {
+                    let _ = coordinator.release_writer(&lease).await;
+                }
+                let _ = distributed_permit.release().await;
+                return Err(error_response_coded(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("failed to reserve canonical turn: {error}"),
                     "session_turn_reservation_unavailable",
-                )
-            })? {
-            astra_services::ReserveTurnOutcome::Reserved(reservation)
-            | astra_services::ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
-            astra_services::ReserveTurnOutcome::Conflict { .. } => {
-                let _ = coordinator.release_writer(&lease).await;
+                ));
+            }
+            Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
+            | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => reservation,
+            Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+                if release_writer_on_finish {
+                    let _ = coordinator.release_writer(&lease).await;
+                }
+                let _ = distributed_permit.release().await;
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,
                     "canonical session cursor changed before turn reservation",
@@ -3115,6 +3163,7 @@ impl AgenticRunLifecycleService {
             prior_messages,
             prior_message_count,
             had_canonical_head: head.is_some(),
+            release_writer_on_finish,
             release_started: Arc::new(AtomicBool::new(false)),
             renewal_cancel,
             _weighted_permit: weighted_permit,
@@ -3126,36 +3175,26 @@ impl AgenticRunLifecycleService {
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
         compaction_rewrote_prefix: bool,
+        cancellation_requested: bool,
         run_id: &str,
-    ) -> Result<(), astra_core::ClassifiedError> {
+    ) -> Result<bool, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
-            return Ok(());
+            return Ok(false);
         };
         admission.renewal_cancel.cancel();
         let result = async {
-            if compaction_rewrote_prefix && admission.prior_message_count > 0 {
-                return Err(
-                    "compaction rewrote the admitted canonical prefix before CAS commit"
-                        .to_string(),
-                );
-            }
-            let suffix = messages
-                .get(admission.prior_message_count..)
-                .ok_or_else(|| {
-                    "canonical conversation became shorter than the admitted prefix".to_string()
-                })?;
-            let canonical_suffix =
-                astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
-                    suffix.to_vec(),
-                )
-                .map_err(|error| {
-                    format!("canonical turn contains invalid user-turn semantics: {error}")
-                })?;
-            let logical_segments = pack_canonical_turn_segments(canonical_suffix);
-            if logical_segments.is_empty() {
-                return Err("canonical turn produced no committable messages".to_string());
-            }
+            let Some((mode, logical_segments)) = canonical_commit_delta(
+                admission.prior_message_count,
+                admission.had_canonical_head,
+                messages,
+                compaction_rewrote_prefix,
+                cancellation_requested,
+            )?
+            else {
+                return Ok(false);
+            };
             let base = admission.reservation.expected_cursor.as_ref();
+            let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
             let delta = astra_turn_types::CanonicalTurnDeltaV1 {
                 schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                 completed_turn: admission.reservation.reserved_turn,
@@ -3163,8 +3202,13 @@ impl AgenticRunLifecycleService {
                     .map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
                 conversation_seq: base
                     .map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
-                compaction_generation: base.map_or(0, |cursor| cursor.compaction_generation),
+                compaction_generation: if replaces_history {
+                    base.map_or(1, |cursor| cursor.compaction_generation.saturating_add(1))
+                } else {
+                    base.map_or(0, |cursor| cursor.compaction_generation)
+                },
                 config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
+                mode,
                 logical_segments,
             };
             match admission
@@ -3178,7 +3222,7 @@ impl AgenticRunLifecycleService {
                 .map_err(|error| error.to_string())?
             {
                 astra_turn_types::CoordinatorMutationV1::Applied { .. }
-                | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { .. } => Ok(()),
+                | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { .. } => Ok(true),
                 astra_turn_types::CoordinatorMutationV1::Conflict { .. } => {
                     Err("canonical session head changed before turn commit".to_string())
                 }
@@ -3186,7 +3230,9 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        let _ = admission.coordinator.release_writer(&admission.lease).await;
+        if admission.release_writer_on_finish {
+            let _ = admission.coordinator.release_writer(&admission.lease).await;
+        }
         let _ = admission.distributed_permit.release().await;
         admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
@@ -4120,6 +4166,7 @@ impl AgenticRunLifecycleService {
                 source: resume_source,
                 cursor,
                 conversation_messages: restored_messages,
+                materialized_conversation_root_hash: None,
                 degraded_reasons: resume_degraded_reasons,
                 repair_actions: resume_repair_actions,
                 projections: astra_turn_types::ResumeProjectionSetV1::default(),
@@ -8050,71 +8097,6 @@ fn runtime_workspace_authority_from_request(
     }
 }
 
-fn pack_canonical_turn_segments(mut messages: Vec<Value>) -> Vec<Vec<Value>> {
-    const TARGET_PACK_BYTES: u64 = 512 * 1024;
-
-    let mut packs = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 2_u64;
-    let mut index = 0;
-    while index < messages.len() {
-        let group_start = index;
-        let keeps_tool_results = opens_structured_tool_group(&messages[index]);
-        index += 1;
-        if keeps_tool_results {
-            while index < messages.len() && is_structured_tool_result(&messages[index]) {
-                index += 1;
-            }
-        }
-        let group = &mut messages[group_start..index];
-        let group_bytes = astra_turn_types::canonical_conversation_serialized_len(group);
-        let projected = current_bytes
-            .saturating_add(group_bytes.saturating_sub(2))
-            .saturating_add(u64::from(!current.is_empty()));
-        if !current.is_empty() && projected > TARGET_PACK_BYTES {
-            packs.push(std::mem::take(&mut current));
-            current_bytes = 2;
-        }
-        current_bytes = current_bytes
-            .saturating_add(group_bytes.saturating_sub(2))
-            .saturating_add(u64::from(!current.is_empty()));
-        current.extend(group.iter_mut().map(Value::take));
-    }
-    if !current.is_empty() {
-        packs.push(current);
-    }
-    packs
-}
-
-fn opens_structured_tool_group(message: &Value) -> bool {
-    message.get("role").and_then(Value::as_str) == Some("assistant")
-        && (message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some_and(|calls| !calls.is_empty())
-            || message
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| {
-                    content
-                        .iter()
-                        .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"))
-                }))
-}
-
-fn is_structured_tool_result(message: &Value) -> bool {
-    message.get("role").and_then(Value::as_str) == Some("tool")
-        || message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|content| {
-                !content.is_empty()
-                    && content
-                        .iter()
-                        .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
-            })
-}
-
 fn execution_bindings_from_workspace_record(
     record: &RuntimeWorkspaceRecord,
 ) -> ExecutionBindingSnapshot {
@@ -8247,7 +8229,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = request
+            .conversation_authority
+            .as_ref()
+            .map(|authority| authority.run_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id
             .clone()
@@ -9010,11 +8996,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &loop_state.messages,
                         loop_state.context_compression_triggered,
+                        bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
                     )
                     .await
                     {
-                        Ok(()) => canonical_context_persisted = true,
+                        Ok(persisted) => canonical_context_persisted = persisted,
                         Err(commit_error) => outcome = Err(commit_error),
                     }
                 }
@@ -9387,9 +9375,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let provider_idempotent_start = provider_identity.is_some();
-        let run_id = provider_identity
+        let authority_run_id = request
+            .conversation_authority
             .as_ref()
-            .map(|identity| identity.run_id.clone())
+            .map(|authority| authority.run_id.as_str());
+        if let (Some(identity), Some(authority_run_id)) =
+            (provider_identity.as_ref(), authority_run_id)
+            && identity.run_id != authority_run_id
+        {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "provider and conversation authority identify different runs",
+                "conversation_authority_run_conflict",
+            ));
+        }
+        let run_id = authority_run_id
+            .map(str::to_owned)
+            .or_else(|| {
+                provider_identity
+                    .as_ref()
+                    .map(|identity| identity.run_id.clone())
+            })
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id
@@ -10622,11 +10628,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &state.messages,
                         state.context_compression_triggered,
+                        bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
                     )
                     .await
                     {
-                        Ok(()) => canonical_context_persisted = true,
+                        Ok(persisted) => canonical_context_persisted = persisted,
                         Err(commit_error) => loop_result = Err(commit_error),
                     }
                 }

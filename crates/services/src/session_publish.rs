@@ -8,10 +8,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    ActorContextV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalTurnDeltaV1,
-    ContextManifestNodeV1, ConversationCommitV1, ConversationDeltaV1, ConversationSegmentV1,
-    ConversationWriterLeaseV1, CoordinatorMutationV1, SessionContextHeadV1, SessionCursorV1,
-    SessionKeyV1, canonical_conversation_root, validate_canonical_tool_pairing,
+    ActorContextV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
+    CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationCommitV1, ConversationDeltaV1,
+    ConversationSegmentV1, ConversationWriterLeaseV1, CoordinatorMutationV1, SessionContextHeadV1,
+    SessionCursorV1, SessionKeyV1, canonical_conversation_root, validate_canonical_tool_pairing,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,10 @@ pub struct PublishSessionRequestV1 {
     pub idempotency_key: String,
     pub key: SessionKeyV1,
     pub actor: ActorContextV1,
+    /// A controller lease obtained from attach, fork, handoff, or a prior
+    /// publish. When present it must still be the exact active lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_lease: Option<ConversationWriterLeaseV1>,
     pub items: Vec<PublishJournalItemV1>,
 }
 
@@ -138,6 +142,7 @@ impl DatabaseSessionPublishService {
             None => Vec::new(),
         };
         let mut local_root = canonical_conversation_root(&local_messages);
+        let mut local_cursor = anchor.as_ref().map(|anchor| anchor.local_cursor.clone());
         if let Some(anchor) = &anchor {
             if anchor.local_cursor.canonical_root_hash != local_root {
                 return Err(SessionPublishError::NeedsRepair(
@@ -179,24 +184,24 @@ impl DatabaseSessionPublishService {
                 .iter()
                 .flat_map(|segment| segment.messages.iter().cloned())
                 .collect::<Vec<_>>();
-            match &item.commit.delta {
-                ConversationDeltaV1::Append { messages } if messages == &appended => {}
-                ConversationDeltaV1::Append { .. } => {
+            let mode = match &item.commit.delta {
+                ConversationDeltaV1::Append { messages } if messages == &appended => {
+                    CanonicalDeltaModeV1::Append
+                }
+                ConversationDeltaV1::Replace { messages, .. } if messages == &appended => {
+                    CanonicalDeltaModeV1::Replace
+                }
+                ConversationDeltaV1::Append { .. } | ConversationDeltaV1::Replace { .. } => {
                     return Err(SessionPublishError::Invalid(
                         "staged segments do not equal the ordered journal delta".into(),
                     ));
                 }
-                // A replacement requires the replacement-manifest work in
-                // Phase 6. Treating it as append would silently corrupt head
-                // consistency, so it is an explicit child-lineage case.
-                ConversationDeltaV1::Replace { .. } => {
-                    return Err(fork_required(
-                        item.commit.cursor.canonical_root_hash.clone(),
-                        simulated_head.as_ref(),
-                    ));
-                }
+            };
+            validate_local_commit_advance(local_cursor.as_ref(), &item.commit.cursor, mode)?;
+            match mode {
+                CanonicalDeltaModeV1::Append => local_messages.extend(appended),
+                CanonicalDeltaModeV1::Replace => local_messages = appended,
             }
-            local_messages.extend(appended);
             validate_canonical_tool_pairing(&local_messages)
                 .map_err(|error| SessionPublishError::Invalid(error.to_string()))?;
             local_root = canonical_conversation_root(&local_messages);
@@ -214,28 +219,50 @@ impl DatabaseSessionPublishService {
                     .map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
                 conversation_seq: base
                     .map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
-                compaction_generation: base.map_or(0, |cursor| cursor.compaction_generation),
+                compaction_generation: match mode {
+                    CanonicalDeltaModeV1::Append => {
+                        base.map_or(0, |cursor| cursor.compaction_generation)
+                    }
+                    CanonicalDeltaModeV1::Replace => {
+                        base.map_or(1, |cursor| cursor.compaction_generation.saturating_add(1))
+                    }
+                },
                 config_version_id: item.commit.cursor.config_version_id.clone(),
+                mode,
                 logical_segments: segments
                     .iter()
                     .map(|segment| segment.messages.clone())
                     .collect(),
             };
-            let node = ContextManifestNodeV1::new(
-                request.key.clone(),
-                simulated_head
-                    .as_ref()
-                    .map(|head| head.latest_manifest_root.clone()),
-                delta.completed_turn,
-                delta.journal_event_seq,
-                delta.conversation_seq,
-                delta.compaction_generation,
-                delta.config_version_id.clone(),
-                segments
-                    .iter()
-                    .map(ConversationSegmentV1::reference)
-                    .collect(),
-            )
+            let parent = simulated_head
+                .as_ref()
+                .map(|head| head.latest_manifest_root.clone());
+            let references = segments
+                .iter()
+                .map(ConversationSegmentV1::reference)
+                .collect();
+            let node = match mode {
+                CanonicalDeltaModeV1::Append => ContextManifestNodeV1::new(
+                    request.key.clone(),
+                    parent,
+                    delta.completed_turn,
+                    delta.journal_event_seq,
+                    delta.conversation_seq,
+                    delta.compaction_generation,
+                    delta.config_version_id.clone(),
+                    references,
+                ),
+                CanonicalDeltaModeV1::Replace => ContextManifestNodeV1::new_replacement(
+                    request.key.clone(),
+                    parent,
+                    delta.completed_turn,
+                    delta.journal_event_seq,
+                    delta.conversation_seq,
+                    delta.compaction_generation,
+                    delta.config_version_id.clone(),
+                    references,
+                ),
+            }
             .map_err(|error| SessionPublishError::Invalid(error.to_string()))?;
             let server_cursor = node.cursor();
             plans.push(PublishPlan {
@@ -251,33 +278,39 @@ impl DatabaseSessionPublishService {
                 simulated_head.as_ref(),
                 &segments,
                 server_cursor,
+                mode,
             )?);
+            local_cursor = Some(item.commit.cursor.clone());
         }
 
         let expected_cursor = actual_head.as_ref().map(|head| &head.cursor);
-        let acquire_idempotency_key = format!("publish:{}", request.idempotency_key);
         let active = self.coordinator.load_active_writer(&request.key).await?;
-        let lease = match active.filter(|lease| {
-            lease.actor == request.actor && lease.idempotency_key == acquire_idempotency_key
-        }) {
+        let lease = match reusable_publish_lease(
+            request.writer_lease.as_ref(),
+            active.as_ref(),
+            &request.actor,
+        )? {
             Some(lease) => lease,
-            None => match self
-                .coordinator
-                .acquire_writer(
-                    &request.key,
-                    expected_cursor,
-                    &request.actor,
-                    writer_ttl,
-                    &acquire_idempotency_key,
-                )
-                .await?
-            {
-                AcquireWriterOutcome::Acquired(lease)
-                | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-                AcquireWriterOutcome::Conflict { .. } => {
-                    return Err(SessionPublishError::Conflict);
+            None => {
+                let acquire_idempotency_key = format!("publish:{}", request.idempotency_key);
+                match self
+                    .coordinator
+                    .acquire_writer(
+                        &request.key,
+                        expected_cursor,
+                        &request.actor,
+                        writer_ttl,
+                        &acquire_idempotency_key,
+                    )
+                    .await?
+                {
+                    AcquireWriterOutcome::Acquired(lease)
+                    | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+                    AcquireWriterOutcome::Conflict { .. } => {
+                        return Err(SessionPublishError::Conflict);
+                    }
                 }
-            },
+            }
         };
 
         let mut current_cursor = expected_cursor.cloned();
@@ -527,6 +560,21 @@ impl DatabaseSessionPublishService {
     }
 }
 
+fn reusable_publish_lease(
+    presented: Option<&ConversationWriterLeaseV1>,
+    active: Option<&ConversationWriterLeaseV1>,
+    actor: &ActorContextV1,
+) -> Result<Option<ConversationWriterLeaseV1>, SessionPublishError> {
+    match (presented, active) {
+        (Some(presented), Some(active)) if presented == active && &active.actor == actor => {
+            Ok(Some(active.clone()))
+        }
+        (Some(_), _) => Err(SessionPublishError::Conflict),
+        (None, Some(active)) if &active.actor == actor => Ok(Some(active.clone())),
+        (None, _) => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 struct VerifiedItem {
     request: PublishJournalItemV1,
@@ -637,6 +685,46 @@ fn suffix_start(
         })
 }
 
+fn validate_local_commit_advance(
+    prior: Option<&SessionCursorV1>,
+    cursor: &SessionCursorV1,
+    mode: CanonicalDeltaModeV1,
+) -> Result<(), SessionPublishError> {
+    let (
+        prior_completed_turn,
+        prior_journal_event_seq,
+        prior_conversation_seq,
+        prior_compaction_generation,
+    ) = prior.map_or((0, 0, 0, 0), |cursor| {
+        (
+            cursor.completed_turn,
+            cursor.journal_event_seq,
+            cursor.conversation_seq,
+            cursor.compaction_generation,
+        )
+    });
+    let expected_compaction_generation = match mode {
+        CanonicalDeltaModeV1::Append => prior_compaction_generation,
+        CanonicalDeltaModeV1::Replace => {
+            prior_compaction_generation.checked_add(1).ok_or_else(|| {
+                SessionPublishError::Invalid(
+                    "local compaction generation cannot advance beyond u64".into(),
+                )
+            })?
+        }
+    };
+    if cursor.completed_turn != prior_completed_turn.saturating_add(1)
+        || cursor.journal_event_seq != prior_journal_event_seq.saturating_add(1)
+        || cursor.conversation_seq != prior_conversation_seq.saturating_add(1)
+        || cursor.compaction_generation != expected_compaction_generation
+    {
+        return Err(SessionPublishError::Invalid(
+            "journal commit cursor does not advance its acknowledged local predecessor".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_request(
     request: &PublishSessionRequestV1,
     writer_ttl: Duration,
@@ -649,6 +737,17 @@ fn validate_request(
         .actor
         .validate_for(&request.key)
         .map_err(|error| SessionPublishError::Invalid(error.to_string()))?;
+    if request.writer_lease.as_ref().is_some_and(|lease| {
+        lease.schema_version != astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION
+            || lease.key != request.key
+            || lease.actor != request.actor
+            || lease.lease_id.is_empty()
+            || lease.lease_id.len() > 512
+    }) {
+        return Err(SessionPublishError::Invalid(
+            "presented writer lease does not match the publish actor and branch".into(),
+        ));
+    }
     if request.idempotency_key.is_empty()
         || request.idempotency_key.len() > 384
         || request.idempotency_key.chars().any(char::is_control)
@@ -685,15 +784,24 @@ fn simulated_next_head(
     base: Option<&SessionContextHeadV1>,
     segments: &[ConversationSegmentV1],
     cursor: SessionCursorV1,
+    mode: CanonicalDeltaModeV1,
 ) -> Result<SessionContextHeadV1, SessionPublishError> {
-    let bytes = segments.iter().try_fold(
-        base.map_or(0, |head| head.total_canonical_bytes),
-        |total, segment| total.checked_add(segment.canonical_bytes),
-    );
-    let messages = segments.iter().try_fold(
-        base.map_or(0, |head| head.total_message_count),
-        |total, segment| total.checked_add(u64::from(segment.message_count)),
-    );
+    let base_bytes = if mode == CanonicalDeltaModeV1::Replace {
+        0
+    } else {
+        base.map_or(0, |head| head.total_canonical_bytes)
+    };
+    let base_messages = if mode == CanonicalDeltaModeV1::Replace {
+        0
+    } else {
+        base.map_or(0, |head| head.total_message_count)
+    };
+    let bytes = segments.iter().try_fold(base_bytes, |total, segment| {
+        total.checked_add(segment.canonical_bytes)
+    });
+    let messages = segments.iter().try_fold(base_messages, |total, segment| {
+        total.checked_add(u64::from(segment.message_count))
+    });
     Ok(SessionContextHeadV1 {
         schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
         key: key.clone(),
@@ -831,6 +939,88 @@ mod tests {
         assert_eq!(suffix_start(&[first, second], Some(&equal)).unwrap(), 2);
     }
 
+    #[test]
+    fn local_publish_cursor_coordinates_follow_append_and_replace_protocol() {
+        let prior = item(
+            &canonical_conversation_root(&[]),
+            vec![json!({"role":"user","content":"first"})],
+            1,
+        )
+        .commit
+        .cursor;
+        let mut next = prior.clone();
+        next.completed_turn = 2;
+        next.journal_event_seq = 2;
+        next.conversation_seq = 2;
+        assert!(
+            validate_local_commit_advance(Some(&prior), &next, CanonicalDeltaModeV1::Append)
+                .is_ok()
+        );
+
+        next.compaction_generation = 1;
+        assert!(
+            validate_local_commit_advance(Some(&prior), &next, CanonicalDeltaModeV1::Replace)
+                .is_ok()
+        );
+        next.compaction_generation = 0;
+        assert!(matches!(
+            validate_local_commit_advance(Some(&prior), &next, CanonicalDeltaModeV1::Replace),
+            Err(SessionPublishError::Invalid(_))
+        ));
+    }
+
+    fn controller_lease(actor: ActorContextV1, lease_id: &str) -> ConversationWriterLeaseV1 {
+        ConversationWriterLeaseV1 {
+            schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
+            key: SessionKeyV1::owner_session("server", "owner-a", "session-a", "main"),
+            lease_id: lease_id.into(),
+            writer_epoch: 3,
+            actor,
+            expected_cursor: None,
+            acquired_at_unix_ms: 1_000,
+            expires_at_unix_ms: 60_000,
+            idempotency_key: "original-operation".into(),
+        }
+    }
+
+    #[test]
+    fn controller_lease_is_reused_across_distinct_publish_operations() {
+        let actor = ActorContextV1::owner_user(
+            "owner-a",
+            "device-a",
+            ActorKindV1::Cli,
+            SessionSurfaceV1::Cli,
+            Some("device-a".into()),
+            AuthorityEpochsV1::default(),
+        );
+        let active = controller_lease(actor.clone(), "lease-current");
+
+        assert_eq!(
+            reusable_publish_lease(None, Some(&active), &actor).unwrap(),
+            Some(active)
+        );
+    }
+
+    #[test]
+    fn stale_presented_lease_fails_closed_after_handoff() {
+        let actor = ActorContextV1::owner_user(
+            "owner-a",
+            "device-a",
+            ActorKindV1::Cli,
+            SessionSurfaceV1::Cli,
+            Some("device-a".into()),
+            AuthorityEpochsV1::default(),
+        );
+        let stale = controller_lease(actor.clone(), "lease-before-handoff");
+        let mut active = controller_lease(actor.clone(), "lease-after-handoff");
+        active.writer_epoch += 1;
+
+        assert!(matches!(
+            reusable_publish_lease(Some(&stale), Some(&active), &actor),
+            Err(SessionPublishError::Conflict)
+        ));
+    }
+
     async fn setup_publish_db_it() -> (SharedPool, astra_core::MatrixOneSettings) {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -949,6 +1139,7 @@ mod tests {
                 Some("device-a".into()),
                 AuthorityEpochsV1::default(),
             ),
+            writer_lease: None,
             items: vec![PublishJournalItemV1 {
                 event_id: event_id.clone(),
                 payload_hash: payload_hash.clone(),
