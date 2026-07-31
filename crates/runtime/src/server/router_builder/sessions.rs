@@ -66,6 +66,59 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::resume_session_handler),
         )
         .route(
+            "/sessions/{session_id}/attachments",
+            post(session::session_handlers::attach_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/context/segments:batchGet",
+            post(session::session_handlers::get_session_segments_handler),
+        )
+        .route(
+            "/sessions/{session_id}/context/segments:upload",
+            post(session::session_handlers::upload_session_segments_handler),
+        )
+        .route(
+            "/sessions/{session_id}/publish",
+            post(session::session_handlers::publish_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/handoffs",
+            post(session::session_handlers::request_session_handoff_handler),
+        )
+        .route(
+            "/sessions/{session_id}/handoffs/{handoff_id}",
+            get(session::session_handlers::get_session_handoff_handler),
+        )
+        .route(
+            "/sessions/{session_id}/handoffs/{handoff_id}/transitions",
+            post(session::session_handlers::transition_session_handoff_handler),
+        )
+        .route(
+            "/sessions/{session_id}/handoffs/{handoff_id}/fence",
+            post(session::session_handlers::fence_session_handoff_handler),
+        )
+        .route(
+            "/sessions/{session_id}/handoffs/{handoff_id}/activate",
+            post(session::session_handlers::activate_session_handoff_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks",
+            get(session::session_handlers::list_session_forks_handler)
+                .post(session::session_handlers::prepare_session_fork_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks/{fork_id}",
+            get(session::session_handlers::get_session_fork_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks/{fork_id}/activate",
+            post(session::session_handlers::activate_session_fork_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks/{fork_id}/abort",
+            post(session::session_handlers::abort_session_fork_handler),
+        )
+        .route(
             "/sessions/{session_id}/todos:execute",
             post(session::session_todo_handlers::execute_todo_handler),
         )

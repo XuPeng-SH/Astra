@@ -651,6 +651,8 @@ struct ResolvedTurnLlmConfig {
     /// did not provide model metadata; callers must choose an explicit fallback
     /// policy rather than inferring from the model name.
     context_window: Option<u32>,
+    /// Catalog-declared completion ceiling used by the exact context policy.
+    max_completion_tokens: Option<u32>,
 }
 
 impl ResolvedTurnLlmConfig {
@@ -800,6 +802,7 @@ async fn resolve_llm_model_for_turn(
             completions_url_override: execution.completions_url_override.clone(),
             request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
             context_window: execution.context_window,
+            max_completion_tokens: execution.max_completion_tokens,
         });
     }
     let resolved =
@@ -820,6 +823,7 @@ async fn resolve_llm_model_for_turn(
         completions_url_override: None,
         request_timeout: None,
         context_window: resolved.context_window,
+        max_completion_tokens: resolved.max_completion_tokens,
     })
 }
 
@@ -3235,6 +3239,7 @@ impl ServerAgenticLoopHost {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         };
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
@@ -3245,10 +3250,15 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
         );
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire(
+            crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                 trace,
                 &wire_messages,
                 &annotated_tools,
+                if self.full_llm_capture {
+                    crate::turn::llm::context::WireTraceDetail::Debug
+                } else {
+                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                },
             );
         }
         self.emit_context_meta(
@@ -4907,6 +4917,34 @@ impl ServerAgenticLoopHost {
         memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
+        self.run_turn_pipeline_with_model_limits_and_session_memory(
+            state,
+            visible_tools,
+            provider,
+            model_name,
+            model_context_window,
+            None,
+            cache_capability,
+            session_memory_entry,
+            memory_entries,
+            user_content,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_turn_pipeline_with_model_limits_and_session_memory(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        model_context_window: Option<u32>,
+        model_max_completion_tokens: Option<u32>,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+        memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
+        user_content: &str,
+    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
@@ -4959,6 +4997,7 @@ impl ServerAgenticLoopHost {
                 provider,
                 model_name,
                 context_window: model_context_window,
+                max_completion_tokens: model_max_completion_tokens,
                 cache_capability,
                 user_content,
                 query_source: "agentic_loop",
@@ -5501,12 +5540,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             has_session_memory = initial_session_memory_entry.is_some(),
             "turn pipeline: session memory loaded"
         );
-        let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
+        let turn_pipeline = self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.context_window,
+            llm_cfg.max_completion_tokens,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
             &memoria_prefetch_entries,
@@ -5567,6 +5607,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &compact_result,
             &compaction_fixed_context,
             &visible_tools,
+            Some(
+                crate::prompts::budget_for_model_with_metadata(
+                    Some(&llm_cfg.model_name),
+                    llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
+                )
+                .window_policy(),
+            ),
         )
         .into_iter()
         .collect::<Vec<_>>();
@@ -5582,12 +5630,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &memoria_prefetch_entries,
             &compact_result.retrieved_memory_entries,
             |session_memory_entry, memory_entries| {
-                self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                self.run_turn_pipeline_with_model_limits_and_session_memory(
                     state,
                     &visible_tools,
                     &llm_cfg.provider,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     llm_cfg.cache_capability,
                     session_memory_entry,
                     memory_entries,
@@ -5626,9 +5675,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
-        let budget = crate::prompts::budget_for_model_with_override(
+        let budget = crate::prompts::budget_for_model_with_metadata(
             Some(&llm_cfg.model_name),
             llm_cfg.context_window,
+            llm_cfg.max_completion_tokens,
         );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
@@ -5667,25 +5717,32 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&final_tools);
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                crate::turn::llm::context::augment_manifest_trace_with_wire(
+                crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                     trace,
                     &llm_messages,
                     &final_tools,
+                    if self.full_llm_capture {
+                        crate::turn::llm::context::WireTraceDetail::Debug
+                    } else {
+                        crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                    },
                 );
-                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                     trace,
                     &llm_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     max_output_tokens,
                 )
             } else {
-                crate::turn::wire_assembly::wire_budget_status(
+                crate::turn::wire_assembly::wire_budget_status_with_metadata(
                     &llm_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     max_output_tokens,
                 )
             };
@@ -5744,6 +5801,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
             }
             let prompt_round = next_provider_request_round(state);
+            let attempt_wire_budget_status =
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::wire_assembly::set_manifest_wire_budget(
+                    trace,
+                    attempt_wire_budget_status,
+                );
+            }
             let prompt_request_plan =
                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
@@ -5806,8 +5871,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "durable inference admission failed: Server execution has no durable run identity",
                 )
             })?;
+            let request_context =
+                crate::turn::llm::context::model_request_context_seed_from_manifest(
+                    astra_services::ModelRequestTopology::ServerOnly,
+                    state.last_llm_context_manifest_trace.as_ref(),
+                );
             let durable_invocation = durable_ledger
-                .admit(
+                .admit_with_request_context(
                     astra_turn_types::InferenceInvocationScope::Run {
                         session_id: self.session_id.clone(),
                         run_id,
@@ -5823,6 +5893,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         .as_deref()
                         .unwrap_or(&llm_cfg.model_name),
                     &llm_cfg.provider,
+                    request_context,
                 )
                 .await?;
             state
@@ -7385,6 +7456,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         }
     }
 
@@ -9794,6 +9866,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         };
         let msgs = host.assemble_llm_messages(
             vec![json!({"role": "system", "content": "system prompt text"})],
@@ -12357,6 +12430,7 @@ mod tests {
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(64_000),
+                max_completion_tokens: Some(8_192),
                 request_headers: Some(serde_json::Map::from_iter([(
                     "x-provider-mode".to_string(),
                     Value::String("coding".to_string()),

@@ -30,6 +30,7 @@ use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadat
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
 const TOOL_RUNTIME_CONTEXT_SUFFIX: &str = "</runtime-context-after-tool>";
+const MAX_DERIVED_BUDGET_REFINEMENTS: usize = 8;
 
 /// Convert a Memoria boundary into a typed provider-wire observation.
 ///
@@ -42,6 +43,7 @@ pub(crate) fn observe_context_compaction(
     result: &CompactResult,
     fixed_context: &[Value],
     visible_tools: &[Value],
+    window_policy: Option<crate::prompts::ContextWindowPolicy>,
 ) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
     result.boundary.as_ref()?;
     if result.messages == history_before {
@@ -63,6 +65,17 @@ pub(crate) fn observe_context_compaction(
         return None;
     }
 
+    let post_compaction_target_tokens = window_policy
+        .map(|policy| u64::try_from(policy.post_compaction_target_tokens()).unwrap_or(u64::MAX));
+    let effectiveness = match post_compaction_target_tokens {
+        Some(target) if tokens_after <= target => {
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient
+        }
+        Some(_) => {
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
+        }
+        None => astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
+    };
     Some(
         astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
             id: id.into(),
@@ -73,6 +86,8 @@ pub(crate) fn observe_context_compaction(
             tokens_before,
             tokens_after,
             tokens_saved: tokens_before - tokens_after,
+            post_compaction_target_tokens,
+            effectiveness,
         },
     )
 }
@@ -86,11 +101,20 @@ pub(crate) fn observe_context_compaction(
 pub(crate) struct WireBudgetStatus {
     pub estimated_input_tokens: usize,
     pub requested_output_tokens: usize,
+    pub reserved_protocol_tokens: usize,
     pub effective_input_limit: usize,
     pub model_limit: usize,
 }
 
 impl WireBudgetStatus {
+    #[must_use]
+    pub fn with_requested_output_tokens(self, requested_output_tokens: usize) -> Self {
+        Self {
+            requested_output_tokens,
+            ..self
+        }
+    }
+
     #[must_use]
     pub fn soft_target_exceeded(self) -> bool {
         self.estimated_input_tokens > self.effective_input_limit
@@ -100,6 +124,7 @@ impl WireBudgetStatus {
     pub fn hard_limit_exceeded(self) -> bool {
         self.estimated_input_tokens
             .saturating_add(self.requested_output_tokens)
+            .saturating_add(self.reserved_protocol_tokens)
             > self.model_limit
     }
 
@@ -108,6 +133,7 @@ impl WireBudgetStatus {
         serde_json::json!({
             "estimated_input_tokens": self.estimated_input_tokens,
             "requested_output_tokens": self.requested_output_tokens,
+            "reserved_protocol_tokens": self.reserved_protocol_tokens,
             "effective_input_limit": self.effective_input_limit,
             "model_limit": self.model_limit,
             "soft_target_exceeded": self.soft_target_exceeded(),
@@ -117,46 +143,7 @@ impl WireBudgetStatus {
     }
 }
 
-pub(crate) fn wire_budget_status(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    context_window: Option<u32>,
-    requested_output_tokens: usize,
-) -> WireBudgetStatus {
-    const PROVIDER_FRAMING_TOKENS: usize = 300;
-    let tool_tokens = tools
-        .iter()
-        .map(crate::prompts::estimate_json_value_tokens)
-        .sum();
-    let estimated_input_tokens =
-        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens)
-            .total_tokens
-            .saturating_add(PROVIDER_FRAMING_TOKENS);
-    let budget = crate::prompts::budget_for_model_with_override(Some(model_name), context_window);
-    WireBudgetStatus {
-        estimated_input_tokens,
-        requested_output_tokens,
-        effective_input_limit: budget.effective_input_limit(),
-        model_limit: budget.model_limit,
-    }
-}
-
-pub(crate) fn augment_manifest_trace_with_wire_budget(
-    trace: &mut Value,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    context_window: Option<u32>,
-    requested_output_tokens: usize,
-) -> WireBudgetStatus {
-    let status = wire_budget_status(
-        messages,
-        tools,
-        model_name,
-        context_window,
-        requested_output_tokens,
-    );
+pub(crate) fn set_manifest_wire_budget(trace: &mut Value, status: WireBudgetStatus) {
     if !trace.is_object() {
         *trace = serde_json::json!({});
     }
@@ -164,6 +151,55 @@ pub(crate) fn augment_manifest_trace_with_wire_budget(
         trace["wire"] = serde_json::json!({});
     }
     trace["wire"]["budget"] = status.to_json();
+}
+
+pub(crate) fn wire_budget_status_with_metadata(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
+    requested_output_tokens: usize,
+) -> WireBudgetStatus {
+    let tool_tokens = tools
+        .iter()
+        .map(crate::prompts::estimate_json_value_tokens)
+        .sum();
+    let estimated_input_tokens =
+        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens).total_tokens;
+    let budget = crate::prompts::budget_for_model_with_metadata(
+        Some(model_name),
+        context_window,
+        max_completion_tokens,
+    );
+    let policy = budget.window_policy();
+    WireBudgetStatus {
+        estimated_input_tokens,
+        requested_output_tokens,
+        reserved_protocol_tokens: policy.reserved_protocol_tokens,
+        effective_input_limit: budget.effective_input_limit(),
+        model_limit: budget.model_limit,
+    }
+}
+
+pub(crate) fn augment_manifest_trace_with_wire_budget_and_metadata(
+    trace: &mut Value,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
+    requested_output_tokens: usize,
+) -> WireBudgetStatus {
+    let status = wire_budget_status_with_metadata(
+        messages,
+        tools,
+        model_name,
+        context_window,
+        max_completion_tokens,
+        requested_output_tokens,
+    );
+    set_manifest_wire_budget(trace, status);
     status
 }
 
@@ -429,6 +465,7 @@ impl<'a> MemoriaContext<'a> {
         visible_tools: &[Value],
         overrides: BudgetOverrides,
     ) -> CompactResult {
+        let uses_derived_history_budget = overrides.budget_chars.is_none();
         let budget = self.context_budget();
         // `current_tokens` is a pressure signal for Memoria retrieval; the
         // authoritative compaction tier is `self.tier` (or the override). The
@@ -473,7 +510,7 @@ impl<'a> MemoriaContext<'a> {
 
         let compact_config = CompactConfig::from_env();
 
-        compact_with_memoria(
+        let mut result = compact_with_memoria(
             messages,
             Some(self.session_id),
             &memoria_config,
@@ -482,7 +519,52 @@ impl<'a> MemoriaContext<'a> {
             Some(&compact_config),
             self.summary_client,
         )
-        .await
+        .await;
+
+        // The char budget is derived from the observed chars/token density.
+        // Compaction itself can change that density (for example by replacing
+        // a large tool result with a short structured projection). Refine
+        // against the already-bounded output in the same operation so later
+        // turns do not repeatedly erode an unchanged conversation. The first
+        // pass is the only one over the original long history; refinements
+        // operate on the bounded working set and never repeat Memoria/LLM I/O.
+        if uses_derived_history_budget && result.boundary.is_some() {
+            for _ in 0..MAX_DERIVED_BUDGET_REFINEMENTS {
+                let refined_estimate = crate::prompts::estimate_tokens_cache_aware_split(
+                    system_messages,
+                    &result.messages,
+                    tool_schema_tokens,
+                );
+                let refined_budget_chars = history_budget_chars(
+                    &budget,
+                    refined_estimate.cache_eligible_tokens,
+                    &result.messages,
+                    refined_estimate.volatile_tokens,
+                );
+                if serialized_history_measurement(&result.messages).chars <= refined_budget_chars {
+                    break;
+                }
+
+                let mut messages = std::mem::take(&mut result.messages);
+                let refined =
+                    crate::turn::cloud::compaction_engine::CompactionEngine::compact_tiered(
+                        &mut messages,
+                        refined_budget_chars,
+                        resolved.keep_chars,
+                        resolved.tier,
+                        resolved.keep_recent_turns,
+                    );
+                result.messages = refined.messages;
+                if refined.boundary.is_none() {
+                    break;
+                }
+                if let Some(boundary) = result.boundary.as_mut() {
+                    boundary.messages_after = result.messages.len();
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -934,6 +1016,14 @@ mod tests {
             &result,
             &[json!({"role": "system", "content": "fixed"})],
             &[json!({"type": "function", "function": {"name": "lookup"}})],
+            Some(
+                crate::prompts::budget_for_model_with_metadata(
+                    Some("model"),
+                    Some(10_000),
+                    Some(1_000),
+                )
+                .window_policy(),
+            ),
         )
         .expect("a shrinking boundary is observable");
 
@@ -945,6 +1035,11 @@ mod tests {
         assert_eq!(
             observation.tokens_saved,
             observation.tokens_before - observation.tokens_after
+        );
+        assert!(observation.post_compaction_target_tokens.is_some());
+        assert_eq!(
+            observation.effectiveness,
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient
         );
         assert!(observation.is_consistent());
     }
@@ -970,7 +1065,8 @@ mod tests {
                 &messages,
                 &no_boundary,
                 &[],
-                &[]
+                &[],
+                None
             )
             .is_none()
         );
@@ -990,7 +1086,8 @@ mod tests {
                 &messages,
                 &unchanged,
                 &[],
-                &[]
+                &[],
+                None
             )
             .is_none()
         );
@@ -1028,11 +1125,15 @@ mod tests {
     fn history_budget_reserves_system_and_tool_tokens_once() {
         let budget = crate::prompts::budget_for_model_with_override(Some("model"), Some(10_000));
         let ascii_history = vec![json!({"role": "user", "content": "a".repeat(39_970)})];
-        assert_eq!(budget.effective_input_limit(), 8_500);
+        let policy = budget.window_policy();
+        assert_eq!(policy.reserved_output_tokens, 2_500);
+        assert_eq!(policy.reserved_summary_tokens, 1_800);
+        assert_eq!(policy.reserved_protocol_tokens, 300);
+        assert_eq!(budget.effective_input_limit(), 5_400);
         let available = history_budget_chars(&budget, 1_500, &ascii_history, 10_000);
         assert!(
-            (27_900..=28_000).contains(&available),
-            "ASCII-like history should retain the conventional four chars/token budget: {available}"
+            (15_500..=15_600).contains(&available),
+            "fixed context must be subtracted once after resolving all policy reserves: {available}"
         );
         assert_eq!(
             history_budget_chars(&budget, 20_000, &ascii_history, 10_000),
@@ -1048,7 +1149,7 @@ mod tests {
 
         let available = history_budget_chars(&budget, 1_500, &dense_history, 15_000);
         assert!(
-            (4_600..=4_700).contains(&available),
+            (2_550..=2_650).contains(&available),
             "character budgets must reflect the estimator's observed density: {available}"
         );
     }
@@ -1098,17 +1199,19 @@ mod tests {
             "content": [{"type": "text", "text": "你好世界".repeat(400)}]
         })];
         let mut trace = json!({"wire": {"message_count": 1}});
-        let status = augment_manifest_trace_with_wire_budget(
+        let status = augment_manifest_trace_with_wire_budget_and_metadata(
             &mut trace,
             &messages,
             &[],
             "model",
             Some(1_000),
+            None,
             100,
         );
 
         assert!(status.soft_target_exceeded());
         assert!(status.hard_limit_exceeded());
+        assert_eq!(status.reserved_protocol_tokens, 300);
         assert_eq!(trace["wire"]["message_count"], 1);
         assert_eq!(
             trace["wire"]["budget"]["enforcement"],
@@ -1168,7 +1271,6 @@ mod tests {
 
         let first = ctx.compact(&history, &system, &tools).await;
         let second = ctx.compact(&first.messages, &system, &tools).await;
-
         assert_eq!(
             second.messages, first.messages,
             "reapplying compaction to an already-bounded working set must converge"
