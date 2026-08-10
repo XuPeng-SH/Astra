@@ -3344,8 +3344,66 @@ pub struct ModelAccessProjectionResponse {
     pub accesses: Vec<ModelAccessViewResponse>,
     pub offerings: Vec<ModelListItemResponse>,
     pub default_offering_id: Option<String>,
+    /// The Astra-owned result of resolving a default against this effective
+    /// catalog.  Clients must not infer a replacement default when this is
+    /// `invalid`; the listed Offerings remain available for an explicit user
+    /// choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_resolution: Option<ModelDefaultResolution>,
     pub catalog_revision: String,
     pub observed_at: String,
+}
+
+/// The authority that nominated a candidate default.  Astra owns resolution;
+/// an external provider may only nominate a candidate for its own scoped
+/// catalog.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultSource {
+    Astra,
+    ExternalProvider,
+}
+
+/// The catalog boundary against which a default candidate is valid.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultScope {
+    EffectiveCatalog,
+}
+
+/// A scoped, source-owned proposal.  This deliberately is not a bare model
+/// id: future workspace and platform policies can add candidates without
+/// letting a provider redefine Astra's precedence rules.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDefaultCandidate {
+    pub offering_id: String,
+    pub source: ModelDefaultSource,
+    pub scope: ModelDefaultScope,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultInvalidReason {
+    InvalidOfferingId,
+    NotEffectiveOffering,
+}
+
+/// Outcome of resolving the default separately from projecting the usable
+/// catalog.  `Invalid` is an upstream contract violation, but it must not
+/// hide otherwise authorized Offerings from a user selecting one manually.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelDefaultResolution {
+    Selected {
+        offering_id: String,
+        source: ModelDefaultSource,
+        scope: ModelDefaultScope,
+    },
+    Missing,
+    Invalid {
+        reason: ModelDefaultInvalidReason,
+    },
 }
 
 struct ProjectedModelAccessAvailability {
@@ -3528,7 +3586,19 @@ fn project_access_availability(
 /// access source. That mismatch is a contract error rather than a UI guess.
 pub fn project_model_access(
     declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItemResponse>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    project_model_access_with_default(declared, offerings, None, observed_at)
+}
+
+/// Build Model Access while resolving an optional scoped provider candidate.
+/// Astra never substitutes another Offering for an invalid provider
+/// candidate, while still returning the valid Offerings for explicit choice.
+pub fn project_model_access_with_default(
+    declared: Vec<DeclaredModelAccess>,
     mut offerings: Vec<ModelListItemResponse>,
+    provider_default: Option<ModelDefaultCandidate>,
     observed_at: String,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let mut accesses = BTreeMap::new();
@@ -3611,23 +3681,24 @@ pub fn project_model_access(
         })
         .collect::<crate::service_error::ServiceResult<_>>()?;
 
-    // Phase 0 has one deterministic Server-owned default policy: the first
-    // canonical active Offering. Clients receive the decision and never
-    // recreate this ordering rule locally.
-    let default_offering_id = offerings
-        .first()
-        .map(|offering| offering.offering_id.clone());
+    let default_resolution = resolve_model_default(&offerings, provider_default);
+    let default_offering_id = match &default_resolution {
+        ModelDefaultResolution::Selected { offering_id, .. } => Some(offering_id.clone()),
+        ModelDefaultResolution::Missing | ModelDefaultResolution::Invalid { .. } => None,
+    };
 
     #[derive(Serialize)]
     struct CatalogRevisionFacts<'a> {
         accesses: &'a [ModelAccessViewResponse],
         offerings: &'a [ModelListItemResponse],
         default_offering_id: &'a Option<String>,
+        default_resolution: &'a ModelDefaultResolution,
     }
     let revision_bytes = serde_json::to_vec(&CatalogRevisionFacts {
         accesses: &accesses,
         offerings: &offerings,
         default_offering_id: &default_offering_id,
+        default_resolution: &default_resolution,
     })
     .map_err(|error| {
         crate::service_error::ServiceError::with_source(
@@ -3642,9 +3713,48 @@ pub fn project_model_access(
         accesses,
         offerings,
         default_offering_id,
+        default_resolution: Some(default_resolution),
         catalog_revision,
         observed_at,
     })
+}
+
+/// Resolve a source-scoped candidate only against the catalog it was admitted
+/// to.  This is intentionally the sole default-precedence point: callers may
+/// supply candidates but cannot select a fallback themselves.
+fn resolve_model_default(
+    offerings: &[ModelListItemResponse],
+    provider_default: Option<ModelDefaultCandidate>,
+) -> ModelDefaultResolution {
+    match provider_default {
+        Some(candidate) if validate_model_offering_id(&candidate.offering_id).is_err() => {
+            ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::InvalidOfferingId,
+            }
+        }
+        Some(candidate)
+            if offerings
+                .iter()
+                .any(|offering| offering.offering_id == candidate.offering_id) =>
+        {
+            ModelDefaultResolution::Selected {
+                offering_id: candidate.offering_id,
+                source: candidate.source,
+                scope: candidate.scope,
+            }
+        }
+        Some(_) => ModelDefaultResolution::Invalid {
+            reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+        },
+        None => match offerings.first() {
+            Some(offering) => ModelDefaultResolution::Selected {
+                offering_id: offering.offering_id.clone(),
+                source: ModelDefaultSource::Astra,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            },
+            None => ModelDefaultResolution::Missing,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4880,6 +4990,147 @@ mod tests {
         assert_eq!(reverse.default_offering_id, forward.default_offering_id);
         assert_eq!(reverse.catalog_revision, forward.catalog_revision);
         assert_eq!(reverse.offerings, forward.offerings);
+    }
+
+    #[test]
+    fn model_access_projection_honors_provider_default_offering() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = |id: &str, name: &str| ModelListItemResponse {
+            offering_id: id.into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: name.into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let alpha = offering("offer-alpha", "Alpha");
+        let beta = offering("offer-beta", "Beta");
+
+        let projection = project_model_access_with_default(
+            vec![declared],
+            vec![alpha, beta],
+            Some(ModelDefaultCandidate {
+                offering_id: "offer-beta".into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("provider default in catalog");
+
+        assert_eq!(
+            projection.default_offering_id.as_deref(),
+            Some("offer-beta")
+        );
+    }
+
+    #[test]
+    fn model_access_projection_marks_missing_provider_default_without_hiding_offerings() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-alpha".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Alpha".into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let projection = project_model_access_with_default(
+            vec![declared],
+            vec![offering],
+            Some(ModelDefaultCandidate {
+                offering_id: "offer-missing".into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("invalid default does not invalidate otherwise authorized offerings");
+
+        assert_eq!(projection.offerings.len(), 1);
+        assert!(projection.default_offering_id.is_none());
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn model_access_projection_hides_invalid_provider_default_identity() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-alpha".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Alpha".into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let invalid_id = "not-a-valid\noffering-id";
+        let projection = project_model_access_with_default(
+            vec![declared],
+            vec![offering],
+            Some(ModelDefaultCandidate {
+                offering_id: invalid_id.into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
+            "2026-08-10T00:00:00Z".into(),
+        )
+        .expect("invalid default does not invalidate otherwise authorized offerings");
+
+        assert_eq!(projection.offerings.len(), 1);
+        assert!(projection.default_offering_id.is_none());
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::InvalidOfferingId,
+            })
+        ));
+        let encoded = serde_json::to_string(&projection).expect("projection serializes");
+        assert!(!encoded.contains("not-a-valid"));
     }
 
     #[test]

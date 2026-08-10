@@ -4,7 +4,10 @@ use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crate::{manifest_loader, mcp_client};
-use astra_services::{ModelAccessProjectionResponse, ModelListItemResponse, session_journal};
+use astra_services::{
+    ModelAccessProjectionResponse, ModelDefaultInvalidReason, ModelDefaultResolution,
+    ModelListItemResponse, session_journal,
+};
 #[cfg(test)]
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
@@ -460,6 +463,36 @@ fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<Serv
 pub(crate) fn default_model_selection_from_access(
     projection: &ModelAccessProjectionResponse,
 ) -> Result<Option<ServerModelSelection>, String> {
+    match projection.default_resolution.as_ref() {
+        Some(ModelDefaultResolution::Invalid { reason }) => {
+            return Err(format!(
+                "Model Access rejected the provider default because {}; choose an available model explicitly",
+                model_default_invalid_reason_message(*reason)
+            ));
+        }
+        Some(ModelDefaultResolution::Missing) => {
+            return if projection.offerings.is_empty() {
+                Ok(None)
+            } else {
+                Err(
+                    "Model Access has no resolved default for a non-empty effective catalog"
+                        .to_string(),
+                )
+            };
+        }
+        Some(ModelDefaultResolution::Selected { offering_id, .. })
+            if projection.default_offering_id.as_deref() != Some(offering_id) =>
+        {
+            return Err(
+                "Model Access default resolution disagrees with default_offering_id".to_string(),
+            );
+        }
+        Some(ModelDefaultResolution::Selected { .. }) => {}
+        // Servers predating default_resolution expose the legacy contract.
+        // Preserve its validation behavior while a capability-negotiated
+        // version of the external catalog protocol is introduced.
+        None => {}
+    }
     let Some(default_offering_id) = projection.default_offering_id.as_deref() else {
         return if projection.offerings.is_empty() {
             Ok(None)
@@ -480,6 +513,15 @@ pub(crate) fn default_model_selection_from_access(
     model_selection_from_list_entry(entry)
         .map(Some)
         .ok_or_else(|| "Model Access default has invalid selection metadata".to_string())
+}
+
+fn model_default_invalid_reason_message(reason: ModelDefaultInvalidReason) -> &'static str {
+    match reason {
+        ModelDefaultInvalidReason::InvalidOfferingId => "its offering identity is invalid",
+        ModelDefaultInvalidReason::NotEffectiveOffering => {
+            "it is not part of the effective model catalog"
+        }
+    }
 }
 
 pub(crate) fn model_selection_for_name_from_catalog(
@@ -1604,9 +1646,10 @@ mod tests {
         SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
         banner_session_display, banner_welcome_text, current_access_token, current_git_root,
         default_model_selection_from_access, ensure_state_default_model, fresh_access_token,
-        initialize_session_state, model_selection_for_name_from_catalog,
-        pending_recovery_status_line, resolve_server_default_model, resolve_server_model_selection,
-        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
+        initialize_session_state, model_default_invalid_reason_message,
+        model_selection_for_name_from_catalog, pending_recovery_status_line,
+        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
+        restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -1615,7 +1658,8 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use crate::tests::isolate_credentials;
     use astra_services::{
-        ModelAccessKind, ModelAccessProjectionResponse, ModelExecutionPlacement,
+        ModelAccessKind, ModelAccessProjectionResponse, ModelDefaultInvalidReason,
+        ModelDefaultResolution, ModelDefaultScope, ModelDefaultSource, ModelExecutionPlacement,
         ModelListItemResponse, session_journal,
     };
     use tempfile::tempdir;
@@ -1687,10 +1731,19 @@ mod tests {
         offerings: Vec<ModelListItemResponse>,
         default_offering_id: Option<&str>,
     ) -> ModelAccessProjectionResponse {
+        let default_resolution = match default_offering_id {
+            Some(offering_id) => ModelDefaultResolution::Selected {
+                offering_id: offering_id.to_string(),
+                source: ModelDefaultSource::Astra,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            },
+            None => ModelDefaultResolution::Missing,
+        };
         ModelAccessProjectionResponse {
             accesses: Vec::new(),
             offerings,
             default_offering_id: default_offering_id.map(str::to_string),
+            default_resolution: Some(default_resolution),
             catalog_revision: "sha256:test-catalog".to_string(),
             observed_at: "2026-07-20T00:00:00Z".to_string(),
         }
@@ -1878,6 +1931,59 @@ mod tests {
             Some("offer-missing"),
         );
         assert!(default_model_selection_from_access(&unknown_default).is_err());
+    }
+
+    #[test]
+    fn invalid_provider_default_message_is_human_readable_and_stable() {
+        assert_eq!(
+            model_default_invalid_reason_message(ModelDefaultInvalidReason::InvalidOfferingId),
+            "its offering identity is invalid"
+        );
+        assert_eq!(
+            model_default_invalid_reason_message(ModelDefaultInvalidReason::NotEffectiveOffering),
+            "it is not part of the effective model catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_default_keeps_manual_model_selection_available() {
+        let mock = MockServer::start().await;
+        let projection = ModelAccessProjectionResponse {
+            accesses: Vec::new(),
+            offerings: vec![catalog_entry("offer-valid", "valid-model", true, 8_192)],
+            default_offering_id: None,
+            default_resolution: Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+            }),
+            catalog_revision: "sha256:invalid-provider-default".to_string(),
+            observed_at: "2026-08-10T00:00:00Z".to_string(),
+        };
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(projection))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![catalog_entry(
+                "offer-valid",
+                "valid-model",
+                true,
+                8_192,
+            )]))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        assert_eq!(
+            resolve_server_default_model(&api, "token").await,
+            ServerDefaultModel::Unavailable,
+            "an invalid provider default must not silently fall back"
+        );
+        let manual = resolve_server_model_selection(&api, "token", "valid-model")
+            .await
+            .expect("valid effective Offering remains selectable manually");
+        assert_eq!(manual.offering_id, "offer-valid");
     }
 
     #[test]
