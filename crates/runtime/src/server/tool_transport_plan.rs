@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -28,6 +29,13 @@ pub(crate) struct EdgeBoundExecutionPlan {
     timeout_secs: u64,
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
+    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_file_transfer_required: bool,
+    runtime_filesystem_boundary:
+        Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    runtime_edge_dispatch_authorization_required: bool,
 }
 
 impl EdgeBoundExecutionPlan {
@@ -63,6 +71,14 @@ impl EdgeBoundExecutionPlan {
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
+            runtime_file_transfer: request.runtime_file_transfer.clone(),
+            runtime_file_transfer_required: request.runtime_file_transfer_required,
+            runtime_filesystem_boundary: request.runtime_filesystem_boundary.clone(),
+            runtime_edge_dispatch_authorization: request
+                .runtime_edge_dispatch_authorization
+                .clone(),
+            runtime_edge_dispatch_authorization_required: request
+                .runtime_edge_dispatch_authorization_required,
         })
     }
 
@@ -83,23 +99,63 @@ impl EdgeBoundExecutionPlan {
         &self.identity
     }
 
+    pub(crate) fn runtime_file_transfer(
+        &self,
+    ) -> Option<&astra_services::runs::RuntimeFileTransferContext> {
+        self.runtime_file_transfer.as_deref()
+    }
+
+    pub(crate) fn runtime_file_transfer_required(&self) -> bool {
+        self.runtime_file_transfer_required
+    }
+
+    pub(crate) fn runtime_filesystem_boundary(
+        &self,
+    ) -> Option<&astra_services::runs::RuntimeFilesystemBoundaryContext> {
+        self.runtime_filesystem_boundary.as_deref()
+    }
+
+    pub(crate) fn runtime_edge_dispatch_authorization(
+        &self,
+    ) -> Option<&astra_services::runs::RuntimeEdgeDispatchAuthorizationContext> {
+        self.runtime_edge_dispatch_authorization.as_deref()
+    }
+
+    pub(crate) fn runtime_edge_dispatch_authorization_required(&self) -> bool {
+        self.runtime_edge_dispatch_authorization_required
+    }
+
     pub(crate) fn wait_timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs.saturating_add(Self::WAIT_GRACE_SECS))
     }
 
-    fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
+    fn dispatch_message(
+        &self,
+        include_runtime_file_transfer: bool,
+    ) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: self.dispatch_request_id.clone(),
             identity: self.identity.clone(),
             delivery_generation: 1,
             tool: self.tool_name.clone(),
             args: self.args.clone(),
+            runtime_file_transfer: include_runtime_file_transfer
+                .then_some(self.runtime_file_transfer.as_deref())
+                .flatten()
+                .map(|context| Box::new(context.into())),
+            runtime_filesystem_boundary: self
+                .runtime_filesystem_boundary
+                .as_deref()
+                .map(|context| Box::new(context.into())),
             timeout_secs: self.timeout_secs,
         }
     }
 
     pub(crate) fn dispatch_payload_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(&self.dispatch_message())
+        // Durable dispatch rows are replayable database state. RuntimeGrant
+        // bearer credentials are request-scoped secrets and must only be
+        // attached by the live websocket delivery boundary.
+        serde_json::to_string(&self.dispatch_message(false))
     }
 
     pub(crate) fn delivered_result_with_fields(

@@ -42,6 +42,24 @@ pub(crate) async fn execute_edge_bound(
             ));
         }
     };
+    if plan.runtime_file_transfer_required() && plan.runtime_file_transfer().is_none() {
+        return edge_admission_rejected_result(
+            &request,
+            binding,
+            "file-transfer",
+            "managed runtime file-transfer context is unavailable",
+        );
+    }
+    if plan.runtime_edge_dispatch_authorization_required()
+        && plan.runtime_edge_dispatch_authorization().is_none()
+    {
+        return edge_admission_rejected_result(
+            &request,
+            binding,
+            "edge-authorization",
+            "provider executor authorization context is unavailable",
+        );
+    }
 
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
@@ -62,36 +80,51 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    match try_edge_dispatch(
-        &request,
-        binding,
-        &plan,
-        edge_dispatch_service.clone(),
-        edge_registry_service.as_ref(),
-        tool_registry,
-        cancel_token.clone(),
-    )
-    .await
+    if plan.runtime_file_transfer().is_none()
+        && plan.runtime_edge_dispatch_authorization().is_none()
     {
-        EdgeTransportAttempt::Delivered(result) => return result,
-        EdgeTransportAttempt::AdmissionRejected(error) => {
-            return edge_admission_rejected_result(&request, binding, "edge-dispatch", &error);
+        match try_edge_dispatch(
+            &request,
+            binding,
+            &plan,
+            edge_dispatch_service.clone(),
+            edge_registry_service.as_ref(),
+            tool_registry,
+            cancel_token.clone(),
+        )
+        .await
+        {
+            EdgeTransportAttempt::Delivered(result) => return result,
+            EdgeTransportAttempt::AdmissionRejected(error) => {
+                return edge_admission_rejected_result(&request, binding, "edge-dispatch", &error);
+            }
+            EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
+                diagnostics.push(format!(
+                    "edge-dispatch: admission outcome is unknown: {error}"
+                ));
+                return edge_transport_failure_result(&request, binding, diagnostics, true);
+            }
+            EdgeTransportAttempt::TransportDisconnected => {
+                diagnostics.push(
+                    "edge-dispatch: outcome may be unknown after durable dispatch".to_string(),
+                );
+                return edge_transport_failure_result(&request, binding, diagnostics, true);
+            }
+            EdgeTransportAttempt::Unavailable => {
+                diagnostics
+                    .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
+            }
         }
-        EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
-            diagnostics.push(format!(
-                "edge-dispatch: admission outcome is unknown: {error}"
-            ));
-            return edge_transport_failure_result(&request, binding, diagnostics, true);
-        }
-        EdgeTransportAttempt::TransportDisconnected => {
-            diagnostics
-                .push("edge-dispatch: outcome may be unknown after durable dispatch".to_string());
-            return edge_transport_failure_result(&request, binding, diagnostics, true);
-        }
-        EdgeTransportAttempt::Unavailable => {
-            diagnostics
-                .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
-        }
+    } else if plan.runtime_edge_dispatch_authorization().is_some() {
+        diagnostics.push(
+            "edge-dispatch: provider-authorized executor requires live reauthorization and cannot use durable relay"
+                .to_string(),
+        );
+    } else {
+        diagnostics.push(
+            "edge-dispatch: request-scoped transfer credentials require live websocket delivery"
+                .to_string(),
+        );
     }
     let mut outcome_may_be_unknown = false;
     match try_edge_websocket(
@@ -319,6 +352,13 @@ async fn try_edge_websocket(
             }
         }
     };
+    if let Some(authorization) = plan.runtime_edge_dispatch_authorization() {
+        if authorization.executor_id != edge.edge_agent_id {
+            return EdgeTransportAttempt::AdmissionRejected(
+                "selected edge does not match the provider authorization scope".to_string(),
+            );
+        }
+    }
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
         &request.session_id,
@@ -335,26 +375,33 @@ async fn try_edge_websocket(
         }
     };
     match dispatch
-        .admit_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
+        .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
         .await
     {
-        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
-        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed) => {
+            if let Some(authorization) = plan.runtime_edge_dispatch_authorization()
+                && let Err(error) = authorize_edge_dispatch(authorization, request).await
+            {
+                return match dispatch
+                    .fail_dispatch(
+                        &dispatch_identity,
+                        &edge.edge_agent_id,
+                        "provider authorization denied before delivery",
+                    )
+                    .await
+                {
+                    Ok(true) => EdgeTransportAttempt::AdmissionRejected(error),
+                    Ok(false) => EdgeTransportAttempt::AdmissionOutcomeUnknown(
+                        "provider authorization was denied but the durable claim was no longer fail-able"
+                            .to_string(),
+                    ),
+                    Err(fail_error) => EdgeTransportAttempt::AdmissionOutcomeUnknown(format!(
+                        "provider authorization was denied but the durable claim could not be closed: {fail_error}"
+                    )),
+                };
+            }
         }
-        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
-            return EdgeTransportAttempt::AdmissionRejected(error);
-        }
-        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
-            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
-        }
-    }
-    match dispatch
-        .claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Observing) => {
             return match dispatch
                 .wait_result(&dispatch_identity, plan.wait_timeout())
                 .await
@@ -365,7 +412,15 @@ async fn try_edge_websocket(
                 Ok(None) | Err(_) => EdgeTransportAttempt::TransportDisconnected,
             };
         }
-        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Terminal(result_json)) => {
+            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
+            return EdgeTransportAttempt::AdmissionRejected(error);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+        }
     }
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
@@ -377,12 +432,16 @@ async fn try_edge_websocket(
     );
     let edge_result = pool
         .execute_durably_admitted_invocation_on_connection_with_cancel(
-            &edge_owner_user_id,
-            plan.identity(),
-            &edge.edge_agent_id,
-            &request.tool_name,
-            &request.args,
-            cancel_token,
+            astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                connection_user_id: &edge_owner_user_id,
+                identity: plan.identity(),
+                edge_agent_id: &edge.edge_agent_id,
+                tool: &request.tool_name,
+                args: &request.args,
+                runtime_file_transfer: plan.runtime_file_transfer(),
+                runtime_filesystem_boundary: plan.runtime_filesystem_boundary(),
+                cancel_token,
+            },
         )
         .await;
     tracing::info!(
@@ -409,6 +468,41 @@ async fn try_edge_websocket(
         ToolTransportKind::EdgeWs,
         edge_result.tool_result_fields,
     ))
+}
+
+async fn authorize_edge_dispatch(
+    authorization: &astra_services::runs::RuntimeEdgeDispatchAuthorizationContext,
+    request: &ToolExecutionRequest,
+) -> Result<(), String> {
+    let client = astra_core::net::client_builder_for_target(&authorization.endpoint_url)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| "runtime executor authorization client is unavailable".to_string())?;
+    let response = client
+        .post(&authorization.endpoint_url)
+        .header(reqwest::header::AUTHORIZATION, &authorization.authorization)
+        .json(&serde_json::json!({
+            "task_id": authorization.task_id,
+            "executor_id": authorization.executor_id,
+            "run_id": request.run_id,
+            "turn_chain_id": request.turn_chain_id,
+            "tool_call_id": request.tool_call_id,
+        }))
+        .send()
+        .await
+        .map_err(|_| "runtime executor authorization service is unavailable".to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err("current runtime executor authorization was denied".to_string());
+    }
+    Err("runtime executor authorization service did not confirm dispatch".to_string())
 }
 
 async fn try_edge_dispatch(
@@ -715,7 +809,7 @@ fn edge_transport_failure_message(
     }
 }
 
-fn edge_admission_rejected_result(
+pub(crate) fn edge_admission_rejected_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     transport: &str,

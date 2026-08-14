@@ -354,6 +354,10 @@ pub enum ExecutorBindingRequestKind {
 pub enum ToolTransportKindRequest {
     ServerLocal,
     EdgeWs,
+    /// Live edge WebSocket delivery guarded by a provider callback immediately
+    /// before each dispatch. This is intentionally a distinct wire value so an
+    /// older runtime fails closed instead of treating it as ordinary edge_ws.
+    EdgeWsAuthorized,
     EdgeLedger,
     GatewayRelay,
     SandboxResidentAgent,
@@ -471,6 +475,78 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_transfer: Option<RuntimeCapabilityDescriptorRequest>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferAttachment {
+    pub file_id: String,
+    pub name: String,
+    pub size: i64,
+    pub md5: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferContext {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub task_id: String,
+    /// Canonical workspace root selected by the runtime binding. Relative
+    /// model-visible file paths are resolved from this directory.
+    pub workspace_root: String,
+    pub root: String,
+    pub catalog_dir: String,
+    pub session_dir: String,
+    pub scratch_dir: String,
+    pub max_file_bytes: u64,
+    pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+/// Non-secret filesystem boundary for a provider-managed Edge workspace.
+/// Unlike transfer credentials this contract is safe to persist in durable
+/// dispatch state and must accompany every tool that can mutate the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFilesystemBoundaryContext {
+    pub workspace_root: String,
+    pub read_only_paths: Vec<String>,
+}
+
+impl std::fmt::Debug for RuntimeFileTransferContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeFileTransferContext")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("task_id", &self.task_id)
+            .field("root", &self.root)
+            .field("attachment_count", &self.attachments.len())
+            .finish()
+    }
+}
+
+/// Request-scoped provider callback used to reauthorize a selected Edge
+/// executor immediately before dispatch. The bearer is deliberately skipped
+/// by durable tool snapshots and redacted from Debug output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeEdgeDispatchAuthorizationContext {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub task_id: String,
+    pub executor_id: String,
+}
+
+impl std::fmt::Debug for RuntimeEdgeDispatchAuthorizationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeEdgeDispatchAuthorizationContext")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("task_id", &self.task_id)
+            .field("executor_id", &self.executor_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

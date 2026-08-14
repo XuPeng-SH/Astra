@@ -538,6 +538,11 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,
             policy: Default::default(),
         }

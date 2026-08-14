@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use super::tool_admission::{
     ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding_with_context,
 };
-use super::tool_edge_transport::execute_edge_bound;
+use super::tool_edge_transport::{edge_admission_rejected_result, execute_edge_bound};
 use super::tool_execution_binding::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
@@ -592,6 +592,45 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
+        if transport_request.runtime_file_transfer_required
+            && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
+                || transport_request.runtime_file_transfer.is_none())
+        {
+            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
+            let reason = if transport_request.runtime_file_transfer.is_none() {
+                "managed runtime file-transfer context is unavailable"
+            } else {
+                "managed runtime file transfer requires an edge-bound execution route"
+            };
+            return edge_admission_rejected_result(
+                &transport_request,
+                &binding,
+                "file-transfer",
+                reason,
+            );
+        }
+        if transport_request.runtime_edge_dispatch_authorization_required
+            && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
+                || transport_request
+                    .runtime_edge_dispatch_authorization
+                    .is_none())
+        {
+            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
+            let reason = if transport_request
+                .runtime_edge_dispatch_authorization
+                .is_none()
+            {
+                "provider executor authorization context is unavailable"
+            } else {
+                "provider executor authorization requires an edge-bound execution route"
+            };
+            return edge_admission_rejected_result(
+                &transport_request,
+                &binding,
+                "edge-authorization",
+                reason,
+            );
+        }
         if matches!(route, ToolExecutionRouteKind::Unsupported)
             && !matches!(
                 transport_request.workspace.kind,
@@ -1287,6 +1326,11 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
             selected_offer: Some(
                 super::super::tool_execution_binding::SelectedToolOfferSnapshot {
                     offer_id: "read_file@provider-a".to_string(),
@@ -1380,6 +1424,11 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: Some(runtime),
+            runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,
             policy: Default::default(),
         };

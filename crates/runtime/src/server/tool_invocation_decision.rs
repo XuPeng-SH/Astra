@@ -4,6 +4,8 @@
 //! ledger's `Prepared -> Dispatched` CAS. Route execution consumes the same
 //! admission snapshot, preventing decision-hash/dispatch TOCTOU.
 
+use std::sync::Arc;
+
 use astra_turn_types::{
     DurableToolReference, ResolvedSemanticCacheBaseline, ResolvedToolEffect,
     ResolvedToolIdempotency, SemanticReadCacheContractError, SemanticReadCacheKey,
@@ -20,7 +22,7 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v3";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v5";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
@@ -36,6 +38,10 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub semantic_cache: InvocationSemanticReadCacheDecision,
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
+    pub runtime_file_transfer_required: bool,
+    pub runtime_filesystem_boundary:
+        Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
+    pub runtime_edge_dispatch_authorization_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +215,10 @@ impl ToolInvocationDecisionSnapshot {
                 }
             }),
             admission,
+            runtime_file_transfer_required: request.runtime_file_transfer_required,
+            runtime_filesystem_boundary: request.runtime_filesystem_boundary.clone(),
+            runtime_edge_dispatch_authorization_required: request
+                .runtime_edge_dispatch_authorization_required,
         })
     }
 
@@ -341,6 +351,10 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.admission_snapshot = Some(self.admission.clone());
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
+        request.runtime_file_transfer_required = self.runtime_file_transfer_required;
+        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary.clone();
+        request.runtime_edge_dispatch_authorization_required =
+            self.runtime_edge_dispatch_authorization_required;
     }
 }
 
@@ -678,9 +692,9 @@ mod tests {
     }
 
     #[test]
-    fn pre_current_freshness_decision_contract_is_rejected_as_an_explicit_upgrade_boundary() {
+    fn pre_file_transfer_requirement_contract_is_rejected_as_an_explicit_upgrade_boundary() {
         let legacy = ToolInvocationDecision::from_snapshot(json!({
-            "contract_version": "tool-dispatch-decision-v2",
+            "contract_version": "tool-dispatch-decision-v3",
             "legacy": true,
         }))
         .unwrap();
@@ -688,7 +702,7 @@ mod tests {
         assert!(matches!(
             ToolInvocationDecisionSnapshot::from_durable(&legacy),
             Err(ToolInvocationDecisionError::UnsupportedContractVersion(version))
-                if version == "tool-dispatch-decision-v2"
+                if version == "tool-dispatch-decision-v3"
         ));
     }
 
@@ -781,6 +795,36 @@ mod tests {
         let mut request = request();
         request.workspace.cwd = Some("/original".to_string());
         request.policy.max_output_bytes = Some(4096);
+        request.runtime_file_transfer = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeFileTransferContext {
+                endpoint_url: "https://moi.example/runtime-files".to_string(),
+                authorization: "Bearer transfer-secret-must-not-persist".to_string(),
+                task_id: "task-1".to_string(),
+                workspace_root: "/workspace".to_string(),
+                root: "/workspace/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/workspace/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/workspace/.moi/runtime/task-1/scratch".to_string(),
+                max_file_bytes: 1024,
+                attachments: Vec::new(),
+            },
+        ));
+        request.runtime_file_transfer_required = true;
+        request.runtime_filesystem_boundary = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeFilesystemBoundaryContext {
+                workspace_root: "/workspace".to_string(),
+                read_only_paths: vec!["/workspace/.moi/runtime/task-1".to_string()],
+            },
+        ));
+        request.runtime_edge_dispatch_authorization = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+                endpoint_url: "https://moi.example/runtime-executors/authorize".to_string(),
+                authorization: "Bearer edge-secret-must-not-persist".to_string(),
+                task_id: "task-1".to_string(),
+                executor_id: "edge-1".to_string(),
+            },
+        ));
+        request.runtime_edge_dispatch_authorization_required = true;
         let original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
@@ -788,11 +832,19 @@ mod tests {
         )
         .unwrap();
         let durable = original.durable().unwrap();
+        let durable_json = durable.snapshot.to_string();
+        assert!(!durable_json.contains("transfer-secret-must-not-persist"));
+        assert!(!durable_json.contains("edge-secret-must-not-persist"));
 
         request.workspace.cwd = Some("/changed".to_string());
         request.workspace.authority = WorkspaceAuthority::None;
         request.executor.status = astra_runtime_env::ExecutorStatus::Offline;
         request.policy.max_output_bytes = Some(1);
+        request.runtime_file_transfer = None;
+        request.runtime_file_transfer_required = false;
+        request.runtime_filesystem_boundary = None;
+        request.runtime_edge_dispatch_authorization = None;
+        request.runtime_edge_dispatch_authorization_required = false;
         request.policy.admission_snapshot = Some(Default::default());
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
         restored.apply_to_request(&mut request);
@@ -804,6 +856,17 @@ mod tests {
             astra_runtime_env::ExecutorStatus::Online
         );
         assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert!(request.runtime_file_transfer.is_none());
+        assert!(request.runtime_file_transfer_required);
+        assert_eq!(
+            request
+                .runtime_filesystem_boundary
+                .as_ref()
+                .map(|boundary| boundary.read_only_paths.as_slice()),
+            Some(["/workspace/.moi/runtime/task-1".to_string()].as_slice())
+        );
+        assert!(request.runtime_edge_dispatch_authorization.is_none());
+        assert!(request.runtime_edge_dispatch_authorization_required);
         assert_eq!(restored.route, ToolExecutionRouteKind::ServerLocal);
         assert_eq!(restored, original);
     }

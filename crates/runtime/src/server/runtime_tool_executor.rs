@@ -534,6 +534,12 @@ pub struct RuntimeToolExecutor {
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Tool names explicitly admitted for edge dispatch (bypass capability check).
     edge_admitted_tools: HashSet<String>,
+    /// Hidden RuntimeGrant-backed byte-transfer context for managed Edge
+    /// tools. It is attached after model admission and never merged into args.
+    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    /// Provider-owned live authorization callback for the selected Edge.
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
 }
 
 impl RuntimeToolExecutor {
@@ -618,6 +624,8 @@ impl RuntimeToolExecutor {
             invocation_ledger: None,
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
+            runtime_file_transfer: None,
+            runtime_edge_dispatch_authorization: None,
         }
     }
 
@@ -647,6 +655,22 @@ impl RuntimeToolExecutor {
     /// so that multiple executors share the same disabled tool-offer set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
+        self
+    }
+
+    pub fn with_runtime_file_transfer(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    ) -> Self {
+        self.runtime_file_transfer = context;
+        self
+    }
+
+    pub fn with_runtime_edge_dispatch_authorization(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    ) -> Self {
+        self.runtime_edge_dispatch_authorization = context;
         self
     }
 
@@ -1344,6 +1368,7 @@ impl RuntimeToolExecutor {
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
+        context.request_scoped_file_transfer_provider_ready = self.runtime_file_transfer.is_some();
         context
     }
 
@@ -1988,6 +2013,13 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
+        request.runtime_edge_dispatch_authorization =
+            self.runtime_edge_dispatch_authorization_for_request(&request);
+        request.runtime_edge_dispatch_authorization_required =
+            request.runtime_edge_dispatch_authorization.is_some();
         request
     }
 
@@ -2004,7 +2036,46 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
+        request.runtime_edge_dispatch_authorization =
+            self.runtime_edge_dispatch_authorization_for_request(&request);
+        request.runtime_edge_dispatch_authorization_required =
+            request.runtime_edge_dispatch_authorization.is_some();
         request
+    }
+
+    fn runtime_file_transfer_for_tool(
+        &self,
+        name: &str,
+    ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
+        matches!(name, "materialize_attachment" | "publish_artifact")
+            .then(|| self.runtime_file_transfer.clone())
+            .flatten()
+    }
+
+    fn runtime_filesystem_boundary(
+        &self,
+    ) -> Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>> {
+        self.runtime_file_transfer.as_ref().map(|context| {
+            Arc::new(astra_services::runs::RuntimeFilesystemBoundaryContext {
+                workspace_root: context.workspace_root.clone(),
+                read_only_paths: vec![context.root.clone(), context.session_dir.clone()],
+            })
+        })
+    }
+
+    fn runtime_edge_dispatch_authorization_for_request(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>> {
+        matches!(
+            self.tool_execution_service.routing_decision(request),
+            crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound
+        )
+        .then(|| self.runtime_edge_dispatch_authorization.clone())
+        .flatten()
     }
 
     fn selected_offer_for_request(
@@ -4108,6 +4179,94 @@ mod tests {
         assert!(!names.contains("bash"));
         assert!(!names.contains("read_file"));
         assert!(!exec.supports_server_tool_name("bash"));
+    }
+
+    #[test]
+    fn transfer_credentials_are_attached_only_to_transfer_tools() {
+        let (exec, _dir) = test_executor();
+        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            task_id: "task-1".to_string(),
+            workspace_root: "/sandbox".to_string(),
+            root: "/sandbox/.moi/runtime/task-1".to_string(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        });
+        let exec = exec.with_runtime_file_transfer(Some(context));
+
+        let materialize = exec.tool_execution_request("materialize_attachment", &Value::Null);
+        assert!(materialize.runtime_file_transfer.is_some());
+        assert!(materialize.runtime_file_transfer_required);
+        assert!(materialize.runtime_filesystem_boundary.is_some());
+
+        let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
+        assert!(publish.runtime_file_transfer.is_some());
+        assert!(publish.runtime_file_transfer_required);
+        assert!(publish.runtime_filesystem_boundary.is_some());
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
+        assert!(bash.runtime_file_transfer.is_none());
+        assert!(!bash.runtime_file_transfer_required);
+        assert!(bash.runtime_filesystem_boundary.is_some());
+    }
+
+    #[test]
+    fn edge_authorization_is_attached_only_to_edge_bound_tools() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "Managed runner",
+                "/sandbox",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "runner-1",
+                "Managed runner",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        let exec = exec.with_runtime_edge_dispatch_authorization(Some(Arc::new(
+            astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+                endpoint_url: "https://moi.example/runtime-executors/authorize".to_string(),
+                authorization: "Bearer request-scoped".to_string(),
+                task_id: "task-1".to_string(),
+                executor_id: "runner-1".to_string(),
+            },
+        )));
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
+        assert!(bash.runtime_edge_dispatch_authorization.is_some());
+        assert!(bash.runtime_edge_dispatch_authorization_required);
+
+        for tool_name in ["ask_user", "tool_search", "memory"] {
+            let local = exec.tool_execution_request(tool_name, &Value::Null);
+            assert!(
+                local.runtime_edge_dispatch_authorization.is_none(),
+                "{tool_name} must keep its server-owned route"
+            );
+            assert!(!local.runtime_edge_dispatch_authorization_required);
+        }
+
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let invocation = exec.tool_execution_request_for_invocation(
+            &identity,
+            "bash",
+            &json!({"command": "pwd"}),
+        );
+        assert!(invocation.runtime_edge_dispatch_authorization.is_some());
+        assert!(invocation.runtime_edge_dispatch_authorization_required);
     }
 
     #[test]

@@ -401,6 +401,10 @@ pub struct ExternalRuntimeCapabilityDescriptors {
     pub mcp: Option<ExternalRuntimeCapabilityDescriptor>,
     #[serde(default)]
     pub skills: Option<ExternalRuntimeCapabilityDescriptor>,
+    #[serde(default)]
+    pub edge_agent: Option<ExternalRuntimeCapabilityDescriptor>,
+    #[serde(default)]
+    pub file_transfer: Option<ExternalRuntimeCapabilityDescriptor>,
 }
 
 impl ExternalRuntimeCapabilityDescriptors {
@@ -418,7 +422,14 @@ impl ExternalRuntimeCapabilityDescriptors {
                 .skills
                 .as_ref()
                 .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
-            edge_agent: None,
+            edge_agent: self
+                .edge_agent
+                .as_ref()
+                .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
+            file_transfer: self
+                .file_transfer
+                .as_ref()
+                .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
         }
     }
 }
@@ -1084,6 +1095,12 @@ pub fn validate_provider_runtime_context(
     if let Some(skills) = context.capability_descriptors.skills.as_ref() {
         validate_capability_descriptor(provider, skills, "skills")?;
     }
+    if let Some(edge_agent) = context.capability_descriptors.edge_agent.as_ref() {
+        validate_capability_descriptor(provider, edge_agent, "edge_agent")?;
+    }
+    if let Some(file_transfer) = context.capability_descriptors.file_transfer.as_ref() {
+        validate_capability_descriptor(provider, file_transfer, "file_transfer")?;
+    }
     Ok(())
 }
 
@@ -1593,6 +1610,37 @@ mod tests {
     }
 
     #[test]
+    fn external_file_transfer_descriptor_is_preserved_for_runtime_admission() {
+        let descriptor = ExternalRuntimeCapabilityDescriptor {
+            id: "moi-runtime-files".to_string(),
+            descriptor_type: "file_transfer".to_string(),
+            transport: "http".to_string(),
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            protocol: "moi_runtime_files_v1".to_string(),
+            semantic_read: None,
+            metadata: serde_json::Map::from_iter([("contract_version".to_string(), json!(1))]),
+        };
+        let descriptors = ExternalRuntimeCapabilityDescriptors {
+            file_transfer: Some(descriptor),
+            ..Default::default()
+        };
+
+        let request = descriptors.to_request_descriptors();
+
+        assert_eq!(
+            request.file_transfer.as_ref().map(|item| item.id.as_str()),
+            Some("moi-runtime-files")
+        );
+        assert_eq!(
+            request
+                .file_transfer
+                .as_ref()
+                .map(|item| item.protocol.as_str()),
+            Some("moi_runtime_files_v1")
+        );
+    }
+
+    #[test]
     fn runtime_context_rejects_scope_different_from_authorized_principal() {
         let context = ExternalRuntimeContextResponse {
             selected_model: ExternalSelectedModelResponse {
@@ -1688,6 +1736,18 @@ mod tests {
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
                     "protocol": "openai_chat_completions",
                     "metadata": {}
+                },
+                "edge_agent": {
+                    "id": "edge-test",
+                    "type": "edge_agent",
+                    "transport": "edge_ws",
+                    "endpoint_url": "https://moi.example/agent-executors/authorize-dispatch",
+                    "protocol": "moi_edge_dispatch_authorization_v1",
+                    "metadata": {
+                        "contract_version": 1,
+                        "task_id": "task-1",
+                        "executor_id": "edge-test"
+                    }
                 }
             },
             "runtime_scope": {
@@ -1703,6 +1763,21 @@ mod tests {
 
         let context: ExternalRuntimeContextResponse =
             serde_json::from_value(value).expect("MOI runtime context should parse");
+        validate_provider_runtime_context(
+            &provider("http://127.0.0.1/external-auth".to_string()),
+            "model-qwen",
+            "ws-1",
+            &context,
+        )
+        .expect("complete MOI runtime context should validate");
+        let request_descriptors = context.capability_descriptors.to_request_descriptors();
+        let edge_agent = request_descriptors
+            .edge_agent
+            .expect("edge dispatch authorization descriptor");
+        assert_eq!(edge_agent.id, "edge-test");
+        assert_eq!(edge_agent.descriptor_type, "edge_agent");
+        assert_eq!(edge_agent.transport, "edge_ws");
+        assert_eq!(edge_agent.protocol, "moi_edge_dispatch_authorization_v1");
         let model_gateway = context
             .capability_descriptors
             .model_gateway

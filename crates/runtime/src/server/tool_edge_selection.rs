@@ -117,6 +117,28 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
+    // Managed transfer tools and their filesystem boundary require the same
+    // Edge protocol implementation. Transfer credentials prove authority;
+    // this independently advertised version proves implementation support for
+    // both the interceptor and ordinary-tool mount boundary.
+    if request.runtime_filesystem_boundary.is_some() || request.runtime_file_transfer.is_some() {
+        if capabilities
+            .get("protocol_capabilities")
+            .and_then(|value| {
+                value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
+            })
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        return Err(Box::new((
+            advert.binding,
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                "managed_file_transfer_v1_not_advertised".to_string(),
+            ),
+        )));
+    }
     astra_runtime_env::CapabilityResolver
         .check_tool_call_for_surface(
             registry,

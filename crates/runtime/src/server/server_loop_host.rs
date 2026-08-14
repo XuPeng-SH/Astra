@@ -1240,6 +1240,7 @@ pub struct ServerAgenticLoopHost {
     executor_binding: ExecutorBinding,
     runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
     request_scoped_mcp_provider_ready: bool,
+    request_scoped_file_transfer_provider_ready: bool,
     /// Request-scoped terminal control metadata supplied by the runtime
     /// provider. Kept outside the provider-facing tool schemas.
     runtime_control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
@@ -1895,6 +1896,7 @@ impl ServerAgenticLoopHostBuilder {
             executor_binding: schema_executor.clone(),
             runtime_binding: schema_runtime.clone(),
             request_scoped_mcp_provider_ready: false,
+            request_scoped_file_transfer_provider_ready: false,
             runtime_control_tools: Default::default(),
             runtime_stop_after_success_tools: Default::default(),
             terminal_handoff_window: Default::default(),
@@ -2412,6 +2414,31 @@ impl ServerAgenticLoopHost {
         }
         self.request_scoped_mcp_provider_ready |= installed_request_scoped_mcp_schema;
         self.tool_schemas.extend(schemas);
+    }
+
+    /// Install tools backed by a validated, request-scoped managed file
+    /// transfer descriptor. These schemas are intentionally absent from every
+    /// generic provider catalog and become admissible only for this run.
+    pub(crate) fn install_managed_file_transfer_tool_schemas(&mut self) {
+        self.request_scoped_file_transfer_provider_ready = true;
+        for schema in astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES.contains(&name)
+                })
+            })
+        {
+            append_tool_schemas_unique(&mut self.admission_tool_schemas, vec![schema.clone()]);
+            let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
+                continue;
+            };
+            self.valid_tools.insert(name.clone());
+            if !self.admissible_extras.iter().any(|extra| extra == &name) {
+                self.admissible_extras.push(name);
+            }
+            append_tool_schemas_unique(&mut self.tool_schemas, vec![schema]);
+        }
     }
 
     pub(crate) fn install_runtime_stop_after_success_tools(
@@ -4337,6 +4364,11 @@ impl ServerAgenticLoopHost {
                 runtime: self.runtime_binding.clone(),
                 selected_offer: None,
                 policy: ToolPolicySnapshot::default(),
+                runtime_file_transfer: None,
+                runtime_file_transfer_required: false,
+                runtime_filesystem_boundary: None,
+                runtime_edge_dispatch_authorization: None,
+                runtime_edge_dispatch_authorization_required: false,
             };
             let binding = request.runtime_environment_binding(&registry);
             match serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
@@ -4431,6 +4463,8 @@ impl ServerAgenticLoopHost {
             server_service_provider_ready: self.server_service_provider_catalog_enabled,
             control_plane_provider_ready: self.control_plane_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
+            request_scoped_file_transfer_provider_ready: self
+                .request_scoped_file_transfer_provider_ready,
             selected_runtime_platform: self
                 .runtime_binding
                 .as_ref()
@@ -7992,6 +8026,35 @@ mod tests {
             selected.is_empty(),
             "request-scoped MCP tools must not be delivered to the edge ledger"
         );
+    }
+
+    #[test]
+    fn managed_file_transfer_install_adds_both_request_scoped_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-transfer".to_string(),
+            "s-transfer".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_service_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+
+        host.install_managed_file_transfer_tool_schemas();
+
+        let installed = schema_names(&host.tool_schemas);
+        let admission = schema_names(&host.admission_tool_schemas);
+        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
+            assert!(installed.contains(*tool_name), "missing {tool_name} schema");
+            assert!(
+                admission.contains(*tool_name),
+                "missing {tool_name} admission schema"
+            );
+            assert!(host.valid_tool_names().contains(*tool_name));
+        }
     }
 
     #[test]
