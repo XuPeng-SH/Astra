@@ -10,6 +10,31 @@ use serde::{Deserialize, Serialize};
 use super::metrics::SharedMultiAgentMetrics;
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
+// MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
+// decodes this optional payload as text before serde_json validation. Wrapping
+// the parsed value in a one-element JSON array lets JSON_UNQUOTE produce
+// unbounded text without stripping quotes from a top-level JSON string;
+// SUBSTRING removes only the wrapper brackets. JSON_EXTRACT first normalizes
+// both the canonical TEXT schema and legacy JSON-typed columns to the same JSON
+// value. Keep every EdgeAgentRecord read on this projection so no query asks
+// sqlx to decode JSON directly or uses VARCHAR(65535)-bounded CAST(... AS CHAR).
+const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+     CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
+       SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$'))), 2, \
+         CHAR_LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
+     END AS capabilities_json, workspace_id, \
+     CAST(registered_at AS CHAR) AS registered_at, \
+     CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
+
+fn serialize_edge_capabilities(
+    capabilities: Option<&serde_json::Value>,
+) -> Result<Option<String>, String> {
+    capabilities
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("capabilities json: {error}"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EdgeAgentRecord {
     pub registry_id: String,
@@ -254,11 +279,7 @@ impl DatabaseEdgeRegistryService {
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
     ) -> Result<EdgeRegistrationLease, String> {
-        let cap_json = capabilities
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| format!("capabilities json: {e}"))?;
+        let cap_json = serialize_edge_capabilities(capabilities.as_ref())?;
         const MAX_RETRIES: u32 = 5;
         let claim_id = uuid::Uuid::new_v4().to_string();
 
@@ -276,18 +297,16 @@ impl DatabaseEdgeRegistryService {
                 .begin()
                 .await
                 .map_err(|e| format!("edge_registry lease begin (attempt {attempt}): {e}"))?;
-            let row = sqlx::query(
-                "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-                 capabilities_json, workspace_id, registration_state, \
-                 CAST(registered_at AS CHAR) AS registered_at, \
-                 CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
-                 FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
-            )
-            .bind(user_id)
-            .bind(edge_agent_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|e| format!("edge_registry lease lookup (attempt {attempt}): {e}"))?;
+            let lookup_sql = format!(
+                "SELECT {EDGE_AGENT_RECORD_COLUMNS}, registration_state \
+                 FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?"
+            );
+            let row = sqlx::query(&lookup_sql)
+                .bind(user_id)
+                .bind(edge_agent_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|e| format!("edge_registry lease lookup (attempt {attempt}): {e}"))?;
             let previous = row.as_ref().map(decode_edge_agent_record).transpose()?;
             let registration_state = row
                 .as_ref()
@@ -494,10 +513,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
         let capabilities_for_record = capabilities.clone();
-        let cap_json = capabilities
-            .map(|v| serde_json::to_string(&v))
-            .transpose()
-            .map_err(|e| format!("capabilities json: {e}"))?;
+        let cap_json = serialize_edge_capabilities(capabilities.as_ref())?;
 
         // MatrixOne does not reliably fire ON DUPLICATE KEY UPDATE for UNIQUE KEY
         // violations (only PRIMARY KEY). Use SELECT-then-UPDATE-or-INSERT instead.
@@ -924,43 +940,37 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         // This prevents a request without workspace context from resolving a
         // workspace-bound sandbox edge (e.g. when workspace_record is None on
         // the MOI provider-authorized path).
-        let row = sqlx::query(
-            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-             capabilities_json, workspace_id, \
-             CAST(registered_at AS CHAR) AS registered_at, \
-             CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
-             FROM edge_agent_registry \
+        let lookup_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
              WHERE edge_agent_id = ? \
                AND registration_state = 1 \
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
-             ORDER BY last_heartbeat_at DESC LIMIT 1",
-        )
-        .bind(edge_agent_id)
-        .bind(workspace_id)
-        .bind(workspace_id)
-        .bind(workspace_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry find_by_agent_id_and_workspace: {e}"))?;
+             ORDER BY last_heartbeat_at DESC LIMIT 1"
+        );
+        let row = sqlx::query(&lookup_sql)
+            .bind(edge_agent_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry find_by_agent_id_and_workspace: {e}"))?;
 
         row.as_ref().map(decode_edge_agent_record).transpose()
     }
 
     #[tracing::instrument(skip(self), fields(user_id = %user_id))]
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
-        let rows = sqlx::query(
-            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-             capabilities_json, workspace_id, \
-             CAST(registered_at AS CHAR) AS registered_at, \
-             CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
-             FROM edge_agent_registry \
+        let list_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
              WHERE user_id = ? AND registration_state = 1 \
-             ORDER BY last_heartbeat_at DESC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry list_by_user: {e}"))?;
+             ORDER BY last_heartbeat_at DESC"
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry list_by_user: {e}"))?;
 
         rows.iter().map(decode_edge_agent_record).collect()
     }
@@ -1038,6 +1048,18 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_agent_record_projection_extracts_matrixone_json_as_unbounded_text() {
+        assert!(
+            EDGE_AGENT_RECORD_COLUMNS
+                .contains("JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))"),
+        );
+        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("CHAR_LENGTH(JSON_UNQUOTE"));
+        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("END AS capabilities_json"));
+        assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
+        assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("\n         LENGTH(JSON_UNQUOTE"));
+    }
 
     struct FakeEdgeRegistryRow {
         failed_column: Option<&'static str>,
