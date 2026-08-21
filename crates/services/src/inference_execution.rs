@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::model_request_context::{
-    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextSeed,
-    ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology, ModelRequestUsage,
-    ModelRequestWireComposition,
+    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology,
+    ModelRequestUsage, ModelRequestWireComposition, compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
@@ -486,6 +486,37 @@ async fn insert_model_request_context_event(
     stage: ModelRequestEventStage,
     terminal: Option<&InferenceInvocationTerminal>,
 ) -> ServiceResult<()> {
+    let context_expired_at = sqlx::query(
+        "SELECT context_expired_at
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?
+         FOR UPDATE",
+    )
+    .bind(&attempt.user_id)
+    .bind(&attempt.attempt_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "lock inference provider attempt for model request context",
+            error,
+        )
+    })?
+    .ok_or_else(|| {
+        ServiceError::conflict(format!(
+            "inference provider attempt {} is unavailable for model request context",
+            attempt.attempt_id
+        ))
+    })?
+    .try_get::<Option<chrono::NaiveDateTime>, _>("context_expired_at")
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference provider attempt context expiry",
+            error,
+        )
+    })?;
     let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
     let usage = event.usage.as_ref();
     let model_family = attempt
@@ -493,53 +524,65 @@ async fn insert_model_request_context_event(
         .model_family
         .as_deref()
         .unwrap_or("unspecified");
-    sqlx::query(
-        "INSERT INTO model_request_context_events
+    if context_expired_at.is_none() {
+        sqlx::query(
+            "INSERT INTO model_request_context_events
          (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(event_id)
-    .bind(&attempt.user_id)
-    .bind(&attempt.attempt_id)
-    .bind(&attempt.invocation_id)
-    .bind(attempt.invocation_input.scope.session_id())
-    .bind(attempt.invocation_input.scope.run_id())
-    .bind(attempt.invocation_input.scope.harness_run_id())
-    .bind(stage.as_str())
-    .bind(event.terminal_status.as_deref())
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(model_family)
-    .bind(&event.identity.inference_purpose)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.request_input_tokens),
-        "model request input_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.output_tokens),
-        "model request output_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.cache_read_tokens),
-        "model request cache_read_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.cache_creation_tokens),
-        "model request cache_creation_tokens",
-    )?)
-    .bind(event_json)
-    .execute(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "insert model request context event",
-            error,
         )
-    })?;
+        .bind(event_id)
+        .bind(&attempt.user_id)
+        .bind(&attempt.attempt_id)
+        .bind(&attempt.invocation_id)
+        .bind(attempt.invocation_input.scope.session_id())
+        .bind(attempt.invocation_input.scope.run_id())
+        .bind(attempt.invocation_input.scope.harness_run_id())
+        .bind(stage.as_str())
+        .bind(event.terminal_status.as_deref())
+        .bind(event.identity.topology.as_str())
+        .bind(&event.identity.provider)
+        .bind(model_family)
+        .bind(&event.identity.inference_purpose)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.request_input_tokens),
+            "model request input_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.output_tokens),
+            "model request output_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.cache_read_tokens),
+            "model request cache_read_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.cache_creation_tokens),
+            "model request cache_creation_tokens",
+        )?)
+        .bind(event_json)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert model request context event",
+                error,
+            )
+        })?;
+        let scope = match &attempt.invocation_input.scope {
+            InferenceInvocationScope::Run { session_id, .. }
+            | InferenceInvocationScope::Session { session_id, .. } => {
+                ModelRequestContextScope::Session(session_id)
+            }
+            InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
+                ModelRequestContextScope::HarnessRun(harness_run_id)
+            }
+        };
+        compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+    }
     if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
         sqlx::query(
             "INSERT INTO model_request_metric_shards
@@ -588,125 +631,6 @@ async fn insert_model_request_context_event(
             )
         })?;
     }
-    prune_model_request_context_scope(connection, attempt).await?;
-    Ok(())
-}
-
-async fn prune_model_request_context_scope(
-    connection: &mut sqlx::MySqlConnection,
-    attempt: &InferenceProviderAttemptPlan,
-) -> ServiceResult<()> {
-    const MAX_CONTEXT_EVENTS_PER_SCOPE: i64 = 2_048;
-    const PRUNE_ATTEMPTS_PER_BATCH: i64 = 256;
-
-    let (probe_sql, oldest_sql, scope_value) =
-        if let Some(session_id) = attempt.invocation_input.scope.session_id() {
-            (
-                "SELECT event_id FROM model_request_context_events
-                 WHERE user_id = ? AND session_id = ?
-                 ORDER BY created_at DESC, event_id DESC
-                 LIMIT 1 OFFSET ?",
-                "SELECT attempt_id FROM model_request_context_events
-                 WHERE user_id = ? AND session_id = ?
-                 GROUP BY attempt_id
-                 HAVING COUNT(*) = 2
-                 ORDER BY MIN(created_at) ASC, attempt_id ASC
-                 LIMIT ?",
-                session_id,
-            )
-        } else if let Some(harness_run_id) = attempt.invocation_input.scope.harness_run_id() {
-            (
-                "SELECT event_id FROM model_request_context_events
-                 WHERE user_id = ? AND harness_run_id = ?
-                 ORDER BY created_at DESC, event_id DESC
-                 LIMIT 1 OFFSET ?",
-                "SELECT attempt_id FROM model_request_context_events
-                 WHERE user_id = ? AND harness_run_id = ?
-                 GROUP BY attempt_id
-                 HAVING COUNT(*) = 2
-                 ORDER BY MIN(created_at) ASC, attempt_id ASC
-                 LIMIT ?",
-                harness_run_id,
-            )
-        } else {
-            return Err(ServiceError::new(
-                ServiceErrorKind::Internal,
-                "model request context has no durable session or harness scope",
-            ));
-        };
-    let over_limit = sqlx::query(probe_sql)
-        .bind(&attempt.user_id)
-        .bind(scope_value)
-        .bind(MAX_CONTEXT_EVENTS_PER_SCOPE)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "probe model request context retention",
-                error,
-            )
-        })?
-        .is_some();
-    if !over_limit {
-        return Ok(());
-    }
-
-    let oldest_attempts = sqlx::query(oldest_sql)
-        .bind(&attempt.user_id)
-        .bind(scope_value)
-        .bind(PRUNE_ATTEMPTS_PER_BATCH)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "load model request context retention batch",
-                error,
-            )
-        })?;
-    let attempt_ids = oldest_attempts
-        .into_iter()
-        .map(|row| {
-            row.try_get::<String, _>("attempt_id").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode model request context retention batch",
-                    error,
-                )
-            })
-        })
-        .collect::<ServiceResult<Vec<_>>>()?;
-    if attempt_ids.is_empty() {
-        // Concurrent accepted attempts are not disposable until their
-        // terminal fact arrives. Provider-slot admission bounds this temporary
-        // excess; a later terminal insert will prune complete pairs.
-        return Ok(());
-    }
-    let mut delete = sqlx::QueryBuilder::<sqlx::MySql>::new(
-        "DELETE FROM model_request_context_events WHERE user_id = ",
-    );
-    delete
-        .push_bind(&attempt.user_id)
-        .push(" AND attempt_id IN (");
-    {
-        let mut separated = delete.separated(", ");
-        for attempt_id in &attempt_ids {
-            separated.push_bind(attempt_id);
-        }
-    }
-    delete.push(")");
-    delete
-        .build()
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "prune model request context retention batch",
-                error,
-            )
-        })?;
     Ok(())
 }
 

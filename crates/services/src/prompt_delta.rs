@@ -4,6 +4,223 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
+const EXPIRED_PROMPT_REQUESTS_SQL: &str =
+    "SELECT request.user_id, request.session_id, request.request_id
+     FROM prompt_request_records AS request
+     LEFT JOIN agent_session_lifecycle_fences AS fence
+       ON fence.user_id = request.user_id
+      AND fence.session_id = request.session_id
+     WHERE request.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL ? DAY)) * 1000
+       AND (
+           fence.database_deleted_at IS NOT NULL
+           OR (
+               fence.delete_requested_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM prompt_request_records AS child
+                   INNER JOIN prompt_deltas AS child_delta
+                     ON child_delta.user_id = child.user_id
+                    AND child_delta.session_id = child.session_id
+                    AND child_delta.request_id = child.request_id
+                    AND child_delta.op = 'reuse_prefix'
+                   WHERE child.user_id = request.user_id
+                     AND child.session_id = request.session_id
+                     AND child.previous_request_id = request.request_id
+               )
+           )
+       )
+     ORDER BY request.created_at_unix_ms ASC, request.user_id ASC, request.request_id ASC
+     LIMIT ?";
+
+const VALIDATE_EXPIRED_PROMPT_REQUEST_SQL: &str = "SELECT 1
+     FROM prompt_request_records AS request
+     WHERE request.user_id = ?
+       AND request.session_id = ?
+       AND request.request_id = ?
+       AND request.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL ? DAY)) * 1000
+       AND NOT EXISTS (
+           SELECT 1
+           FROM prompt_request_records AS child
+           INNER JOIN prompt_deltas AS child_delta
+             ON child_delta.user_id = child.user_id
+            AND child_delta.session_id = child.session_id
+            AND child_delta.request_id = child.request_id
+            AND child_delta.op = 'reuse_prefix'
+           WHERE child.user_id = request.user_id
+             AND child.session_id = request.session_id
+             AND child.previous_request_id = request.request_id
+       )
+     LIMIT 1
+     FOR UPDATE";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromptDiagnosticExpiry {
+    pub prompt_request_records: u64,
+    pub prompt_deltas: u64,
+}
+
+fn push_prompt_request_key_predicates<'a>(
+    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
+    request_keys: &'a [(String, String, String)],
+) {
+    for (index, (user_id, session_id, request_id)) in request_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND request_id = ")
+            .push_bind(request_id)
+            .push(")");
+    }
+}
+
+fn delete_prompt_deltas_query(
+    request_keys: &[(String, String, String)],
+) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_deltas WHERE ");
+    push_prompt_request_key_predicates(&mut query, request_keys);
+    query.push(" ORDER BY user_id ASC, session_id ASC, request_id ASC, delta_seq ASC");
+    query
+}
+
+fn delete_prompt_requests_query(
+    request_keys: &[(String, String, String)],
+) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+    let mut query =
+        sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_request_records WHERE ");
+    push_prompt_request_key_predicates(&mut query, request_keys);
+    query
+}
+
+/// Expire high-volume prompt-assembly diagnostics independently from durable
+/// conversation history. Candidates are selected through the retention index,
+/// then revalidated under the session fence. A request remains until no child
+/// `reuse_prefix` record needs it for reconstruction.
+pub(crate) async fn expire_prompt_diagnostics(
+    pool: &SharedPool,
+    batch_limit: u32,
+) -> Result<PromptDiagnosticExpiry, String> {
+    let expired_requests =
+        sqlx::query_as::<_, (String, String, String)>(EXPIRED_PROMPT_REQUESTS_SQL)
+            .bind(PROMPT_DIAGNOSTIC_RETENTION_DAYS)
+            .bind(batch_limit)
+            .fetch_all(pool.get())
+            .await
+            .map_err(|error| format!("select expired prompt diagnostics: {error}"))?;
+    if expired_requests.is_empty() {
+        return Ok(PromptDiagnosticExpiry::default());
+    }
+
+    let mut candidates = expired_requests;
+    candidates.sort();
+    candidates.dedup();
+
+    let mut tx = pool
+        .get()
+        .begin()
+        .await
+        .map_err(|error| format!("begin prompt diagnostic expiry: {error}"))?;
+    let mut expired_requests = Vec::with_capacity(candidates.len());
+    for (user_id, session_id, request_id) in candidates {
+        match crate::storage::lock_or_claim_orphaned_agent_session_write_fence(
+            &mut tx,
+            &session_id,
+            &user_id,
+        )
+        .await
+        .map_err(|error| format!("lock prompt diagnostic expiry session fence: {error}"))?
+        {
+            crate::storage::AgentSessionWriteFenceState::Writable => {
+                let eligible: Option<i32> = sqlx::query_scalar(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL)
+                    .bind(&user_id)
+                    .bind(&session_id)
+                    .bind(&request_id)
+                    .bind(PROMPT_DIAGNOSTIC_RETENTION_DAYS)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| format!("validate expired prompt diagnostic: {error}"))?;
+                if eligible.is_some() {
+                    expired_requests.push((user_id, session_id, request_id));
+                }
+            }
+            crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                expired_requests.push((user_id, session_id, request_id));
+            }
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
+            | crate::storage::AgentSessionWriteFenceState::Missing => continue,
+        }
+    }
+    if expired_requests.is_empty() {
+        tx.commit()
+            .await
+            .map_err(|error| format!("commit empty prompt diagnostic expiry: {error}"))?;
+        return Ok(PromptDiagnosticExpiry::default());
+    }
+
+    let mut delete_deltas = delete_prompt_deltas_query(&expired_requests);
+    let mut delete_requests = delete_prompt_requests_query(&expired_requests);
+    let prompt_deltas = delete_deltas
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| format!("expire prompt_deltas: {error}"))?;
+    let prompt_request_records = delete_requests
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| format!("expire prompt_request_records: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit prompt diagnostic expiry: {error}"))?;
+    Ok(PromptDiagnosticExpiry {
+        prompt_request_records,
+        prompt_deltas,
+    })
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_diagnostic_expiry_is_indexed_bounded_and_child_first() {
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("WHERE request.created_at_unix_ms <"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains(
+            "ORDER BY request.created_at_unix_ms ASC, request.user_id ASC, request.request_id ASC"
+        ));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.ends_with("LIMIT ?"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("fence.database_deleted_at IS NOT NULL"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("fence.delete_requested_at IS NULL"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("NOT EXISTS"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("reuse_prefix"));
+        assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.contains("NOT EXISTS"));
+        assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.contains("reuse_prefix"));
+        assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.ends_with("FOR UPDATE"));
+
+        let keys = vec![(
+            "user-1".to_string(),
+            "session-1".to_string(),
+            "request-1".to_string(),
+        )];
+        let delete_deltas = delete_prompt_deltas_query(&keys);
+        let delete_requests = delete_prompt_requests_query(&keys);
+        assert!(delete_deltas.sql().starts_with("DELETE FROM prompt_deltas"));
+        assert!(delete_deltas.sql().contains("delta_seq ASC"));
+        assert!(
+            delete_requests
+                .sql()
+                .starts_with("DELETE FROM prompt_request_records")
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PromptDeltaCounts {
     pub reuse: u32,
@@ -336,14 +553,18 @@ pub async fn persist_prompt_request(
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
     let db = pool.get();
-    ensure_session_owner(db, &input.session_id, &input.user_id).await?;
-    if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
+    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
+    crate::storage::lock_agent_session_write_fence(&mut tx, &input.session_id, &input.user_id)
+        .await
+        .map_err(|error| format!("lock prompt diagnostic session fence: {error}"))?;
+    ensure_session_owner(&mut tx, &input.session_id, &input.user_id).await?;
+    if let Some(existing) = load_existing_request(&mut tx, input, &plan.request_id).await? {
         return existing_prompt_request_or_conflict(input, plan, existing);
     }
 
-    let previous_request = load_previous_request(db, input).await?;
+    let previous_request = load_previous_request(&mut tx, input).await?;
     let previous_state = if let Some(previous_request) = previous_request.as_ref() {
-        load_request_chunks(db, input, &previous_request.request_id).await?
+        load_request_chunks(&mut tx, input, &previous_request.request_id).await?
     } else {
         LoadedPromptChunks::default()
     };
@@ -497,7 +718,6 @@ pub async fn persist_prompt_request(
         "delta_counts": delta_counts,
     });
 
-    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
     let write_result: Result<(), String> = async {
         sqlx::query(
             "INSERT INTO prompt_request_records
@@ -535,7 +755,10 @@ pub async fn persist_prompt_request(
 
     if let Err(error) = write_result {
         rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await;
-        if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
+        let mut recovery = db.acquire().await.map_err(|source| source.to_string())?;
+        if let Some(existing) =
+            load_existing_request(&mut recovery, input, &plan.request_id).await?
+        {
             return existing_prompt_request_or_conflict(input, plan, existing);
         }
         return Err(error);
@@ -675,7 +898,7 @@ fn existing_prompt_request_or_conflict(
 }
 
 async fn load_existing_request(
-    pool: &sqlx::Pool<sqlx::MySql>,
+    connection: &mut sqlx::MySqlConnection,
     input: &PromptRequestPersistInput,
     request_id: &str,
 ) -> Result<Option<PromptRequestPersistResult>, String> {
@@ -687,7 +910,7 @@ async fn load_existing_request(
     .bind(request_id)
     .bind(&input.user_id)
     .bind(&input.session_id)
-    .fetch_optional(pool)
+    .fetch_optional(connection)
     .await
     .map_err(|error| error.to_string())?;
     row.map(|row| decode_prompt_persist_result(&row))
@@ -695,7 +918,7 @@ async fn load_existing_request(
 }
 
 async fn ensure_session_owner(
-    pool: &sqlx::Pool<sqlx::MySql>,
+    connection: &mut sqlx::MySqlConnection,
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
@@ -704,7 +927,7 @@ async fn ensure_session_owner(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(connection)
     .await
     .map_err(|error| error.to_string())?;
     if exists.is_some() {
@@ -794,7 +1017,7 @@ fn unchanged_prefix_work(
 }
 
 async fn load_previous_request(
-    pool: &sqlx::Pool<sqlx::MySql>,
+    connection: &mut sqlx::MySqlConnection,
     input: &PromptRequestPersistInput,
 ) -> Result<Option<PreviousPromptRequest>, String> {
     sqlx::query(
@@ -818,7 +1041,7 @@ async fn load_previous_request(
     .bind(i64::from(input.turn))
     .bind(i64::from(input.round))
     .bind(i64::from(input.attempt))
-    .fetch_optional(pool)
+    .fetch_optional(connection)
     .await
     .map_err(|error| error.to_string())
     .and_then(|row| {
@@ -828,7 +1051,7 @@ async fn load_previous_request(
 }
 
 async fn load_request_chunks(
-    pool: &sqlx::Pool<sqlx::MySql>,
+    connection: &mut sqlx::MySqlConnection,
     input: &PromptRequestPersistInput,
     request_id: &str,
 ) -> Result<LoadedPromptChunks, String> {
@@ -856,7 +1079,7 @@ async fn load_request_chunks(
         i64::try_from(MAX_PROMPT_DELTA_CHAIN_REQUESTS + 1)
             .map_err(|_| "prompt delta chain limit exceeds BIGINT range".to_string())?,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await
     .map_err(|error| error.to_string())?;
     let mut links = std::collections::HashMap::with_capacity(link_rows.len());
@@ -943,7 +1166,7 @@ async fn load_request_chunks(
     query.push(")");
     let rows = query
         .build()
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(|error| error.to_string())?;
     let mut deltas =

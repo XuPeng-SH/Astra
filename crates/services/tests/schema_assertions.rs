@@ -194,6 +194,53 @@ async fn schema_rationalization_runtime_contract() {
         ["user_id", "session_id"],
         "agent_sessions primary key must carry the owner boundary"
     );
+    let session_lifecycle_fences =
+        column_names(&pool, &schema, "agent_session_lifecycle_fences").await;
+    for expected in [
+        "session_id",
+        "user_id",
+        "delete_requested_at",
+        "database_deleted_at",
+    ] {
+        assert!(
+            session_lifecycle_fences
+                .iter()
+                .any(|column| column == expected),
+            "agent_session_lifecycle_fences missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "agent_session_lifecycle_fences").await,
+        ["user_id", "session_id"],
+        "session lifecycle fence identity must preserve the owner boundary"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_previous"
+        )
+        .await,
+        ["user_id", "session_id", "previous_request_id"],
+        "prompt retention must find reuse-prefix dependents without scanning all diagnostics"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_session_lifecycle_fences",
+            "idx_agent_session_fences_pending_delete"
+        )
+        .await,
+        [
+            "database_deleted_at",
+            "delete_requested_at",
+            "user_id",
+            "session_id"
+        ],
+        "delete reconciliation must scan only pending lifecycle fences"
+    );
     assert_eq!(
         index_columns(
             &pool,

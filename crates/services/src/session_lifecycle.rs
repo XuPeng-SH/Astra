@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde::Serialize;
-use sqlx::{MySql, Pool, Row, query};
+use sqlx::{MySql, Pool, Row, query, query_as};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SessionDeleteStatement {
@@ -19,6 +19,40 @@ struct SessionBatchDeleteStatement {
 }
 
 const SESSION_DELETE_BATCH_LIMIT: i64 = 1000;
+pub(crate) const SESSION_DELETE_INTENT_RETRY_GRACE_SECS: u64 = 5 * 60;
+
+const SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL: &str = "SELECT session_id, user_id
+     FROM agent_session_lifecycle_fences
+     WHERE delete_requested_at IS NOT NULL
+     AND database_deleted_at IS NULL
+     AND delete_requested_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
+     ORDER BY delete_requested_at ASC, user_id ASC, session_id ASC
+     LIMIT ?";
+
+const MARK_SESSION_DELETING_SQL: &str = "UPDATE agent_sessions
+     SET status = 'deleting',
+         delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6)),
+         ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP(6)),
+         updated_at = CURRENT_TIMESTAMP(6)
+     WHERE session_id = ? AND user_id = ?";
+
+const MARK_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_fences
+     SET delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6)),
+         updated_at = CURRENT_TIMESTAMP(6)
+     WHERE session_id = ? AND user_id = ?";
+
+const LOCK_PENDING_SESSION_DELETE_FENCE_SQL: &str = "SELECT 1
+     FROM agent_session_lifecycle_fences
+     WHERE session_id = ? AND user_id = ?
+       AND delete_requested_at IS NOT NULL
+       AND database_deleted_at IS NULL
+     FOR UPDATE";
+
+const COMPLETE_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_fences
+     SET database_deleted_at = COALESCE(database_deleted_at, CURRENT_TIMESTAMP(6)),
+         updated_at = CURRENT_TIMESTAMP(6)
+     WHERE session_id = ? AND user_id = ?
+       AND delete_requested_at IS NOT NULL";
 
 const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
     &[SessionDeleteStatement {
@@ -881,6 +915,16 @@ pub(crate) async fn hard_delete_session_rows(
 ) -> Result<SessionDatabaseDeleteOutcome, String> {
     let mut outcome = SessionDatabaseDeleteOutcome::default();
 
+    query(LOCK_PENDING_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.lock_lifecycle_fence: {source}"))?
+        .ok_or_else(|| {
+            "delete_session.lock_lifecycle_fence: pending delete fence not found".to_string()
+        })?;
+
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or
     // provider attempts so session deletion follows the same global order.
@@ -1056,6 +1100,13 @@ pub(crate) async fn hard_delete_session_rows(
 
     verify_core_session_tables_deleted(tx, session_id, user_id).await?;
 
+    query(COMPLETE_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.complete_lifecycle_fence: {source}"))?;
+
     Ok(outcome)
 }
 
@@ -1074,40 +1125,137 @@ pub(crate) struct SessionHardDeleteOutcome {
     pub cleanup_errors: Vec<String>,
 }
 
+/// Result of retrying durable user-initiated delete intents.
+///
+/// Only rows with a durable explicit delete intent are eligible. This
+/// deliberately never derives deletion from inactivity or any other
+/// user-visible session state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionDeleteIntentReconciliation {
+    pub completed: u64,
+    pub cleanup_errors: Vec<String>,
+}
+
+/// Retry a bounded set of explicitly requested session deletes.
+///
+/// `delete_requested_at` is immutable once set, so unrelated session writers
+/// cannot postpone or hide this work. The grace period avoids competing with
+/// the foreground request that just recorded the intent; a later sweep repairs
+/// an interrupted database delete without expiring any otherwise valid
+/// session.
+pub(crate) async fn reconcile_explicit_session_delete_intents(
+    pool: &Pool<MySql>,
+    grace_secs: u64,
+    batch_limit: u32,
+) -> Result<SessionDeleteIntentReconciliation, String> {
+    let candidates: Vec<(String, String)> = query_as(SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL)
+        .bind(i64::try_from(grace_secs).map_err(|_| {
+            "delete intent reconciliation grace period exceeds SQL integer range".to_string()
+        })?)
+        .bind(batch_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|source| format!("delete_intent_reconciliation.select: {source}"))?;
+
+    let mut result = SessionDeleteIntentReconciliation::default();
+    for (session_id, user_id) in candidates {
+        match hard_delete_session(pool, &session_id, &user_id).await {
+            Ok(outcome) => {
+                result.completed = result.completed.saturating_add(1);
+                for error in outcome.cleanup_errors {
+                    let error = format!(
+                        "delete_intent_reconciliation.post_commit_cleanup session_id={session_id} user_id={user_id}: {error}"
+                    );
+                    tracing::warn!(
+                        target: "astra_services::session_lifecycle",
+                        %session_id,
+                        %user_id,
+                        %error,
+                        "explicit session delete completed with post-commit cleanup error"
+                    );
+                    result.cleanup_errors.push(error);
+                }
+            }
+            Err(error) => {
+                let error = format!(
+                    "delete_intent_reconciliation.hard_delete session_id={session_id} user_id={user_id}: {error}"
+                );
+                tracing::warn!(
+                    target: "astra_services::session_lifecycle",
+                    %session_id,
+                    %user_id,
+                    %error,
+                    "explicit session delete intent reconciliation failed"
+                );
+                result.cleanup_errors.push(error);
+            }
+        }
+    }
+    Ok(result)
+}
+
 async fn mark_session_deleting(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let result = query(
-        "UPDATE agent_sessions \
-         SET status = 'deleting', \
-             ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP(6)), \
-             updated_at = CURRENT_TIMESTAMP(6) \
-         WHERE session_id = ? AND user_id = ?",
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.begin: {source}"))?;
+    query(
+        "INSERT IGNORE INTO agent_session_lifecycle_fences
+         (session_id, user_id, created_at, updated_at)
+         VALUES (?, ?, NOW(6), NOW(6))",
     )
     .bind(session_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map_err(|source| format!("delete_session.mark_deleting: {source}"))?;
+    .map_err(|source| format!("delete_session.mark_deleting.ensure_fence: {source}"))?;
+    query(
+        "SELECT 1 FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
+
+    let result = query(MARK_SESSION_DELETING_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting: {source}"))?;
 
     if result.rows_affected() == 0 {
         let still_exists =
             query("SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1")
                 .bind(session_id)
                 .bind(user_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|source| format!("delete_session.mark_deleting.confirm: {source}"))?
                 .is_some();
-        if still_exists {
-            return Ok(());
+        if !still_exists {
+            return Err(
+                "delete_session.mark_deleting: session not found or not owned by user".to_string(),
+            );
         }
-        return Err(
-            "delete_session.mark_deleting: session not found or not owned by user".to_string(),
-        );
     }
+
+    query(MARK_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.persist_fence: {source}"))?;
+    tx.commit()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
 
     Ok(())
 }
@@ -1446,6 +1594,52 @@ mod tests {
         assert!(normalized.contains("session_id = ? AND user_id = ?"));
         assert!(normalized.contains("ORDER BY created_at ASC, invocation_id ASC"));
         assert!(normalized.ends_with("FOR UPDATE"));
+    }
+
+    #[test]
+    fn delete_intent_reconciliation_only_targets_explicit_deletes() {
+        let normalized = SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("FROM agent_session_lifecycle_fences"));
+        assert!(normalized.contains("WHERE delete_requested_at IS NOT NULL"));
+        assert!(normalized.contains("database_deleted_at IS NULL"));
+        assert!(!normalized.contains("status IN"));
+        assert!(normalized.contains("delete_requested_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)"));
+        assert!(normalized.contains("ORDER BY delete_requested_at ASC"));
+        assert!(normalized.ends_with("LIMIT ?"));
+
+        let mark_intent = MARK_SESSION_DELETING_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            mark_intent.contains(
+                "delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6))"
+            )
+        );
+
+        let durable_fence = MARK_SESSION_DELETE_FENCE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(durable_fence.contains("UPDATE agent_session_lifecycle_fences"));
+        assert!(
+            durable_fence.contains(
+                "delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6))"
+            )
+        );
+
+        let complete_fence = COMPLETE_SESSION_DELETE_FENCE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            complete_fence.contains(
+                "database_deleted_at = COALESCE(database_deleted_at, CURRENT_TIMESTAMP(6))"
+            )
+        );
     }
 
     #[test]
