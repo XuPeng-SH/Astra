@@ -8251,9 +8251,10 @@ async fn provider_stream_session_exclusion_is_scoped_by_user() {
 #[tokio::test]
 async fn stream_chat_tracks_run_for_status_and_replay() {
     let (svc, _llm) = terminal_test_service().await;
-    let stream = ok(svc
-        .stream_chat("user-1".into(), test_request("hello"))
-        .await);
+    let mut request = test_request("hello");
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let stream = ok(svc.stream_chat("user-1".into(), request).await);
 
     let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -8276,6 +8277,7 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     assert!(status.events_count > 0);
     assert_eq!(replay.len(), status.events_count as usize);
     assert_eq!(replay[0]["event_type"], "run_started");
+    assert_eq!(replay[0]["data"]["skill_auto_route_policy"], "disabled");
     assert_eq!(
         svc.test_llm_cancel_token_is_cancelled(&stream.run_id).await,
         Some(false)
@@ -10560,14 +10562,24 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
 }
 
 #[tokio::test]
-async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
+async fn agent_binding_runtime_discovers_descriptor_capabilities_concurrently() {
     use axum::{Router, extract::State, http::HeaderMap, routing::post};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Barrier, Mutex};
 
-    #[derive(Default)]
     struct Capture {
         mcp_authorization: Mutex<Option<String>>,
         skill_authorization: Mutex<Option<String>>,
+        discovery_barrier: Barrier,
+    }
+
+    impl Default for Capture {
+        fn default() -> Self {
+            Self {
+                mcp_authorization: Mutex::new(None),
+                skill_authorization: Mutex::new(None),
+                discovery_barrier: Barrier::new(2),
+            }
+        }
     }
 
     async fn mcp_handler(
@@ -10579,6 +10591,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        capture.discovery_barrier.wait().await;
         Json(json!({
             "jsonrpc": "2.0",
             "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -10595,6 +10608,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        capture.discovery_barrier.wait().await;
         Json(json!({
             "jsonrpc": "2.0",
             "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -10657,10 +10671,13 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             file_transfer: None,
         });
 
-    let capabilities = service
-        .prepare_runtime_capabilities(&request, &RequestConstraints::default())
-        .await
-        .expect("agent binding descriptors should prepare capabilities");
+    let capabilities = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.prepare_runtime_capabilities(&request, &RequestConstraints::default()),
+    )
+    .await
+    .expect("MCP and skill discovery must overlap")
+    .expect("agent binding descriptors should prepare capabilities");
 
     assert!(capabilities.mcp_bundle.is_some());
     assert!(capabilities.agent_binding.is_some());

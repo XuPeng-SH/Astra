@@ -256,6 +256,8 @@ pub struct ExecutionBudget {
 pub struct ExecutionPolicyRequest {
     #[serde(default)]
     pub turn_intent: TurnIntentExecutionPolicy,
+    #[serde(default)]
+    pub skill_auto_route: SkillAutoRouteExecutionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +268,16 @@ pub enum TurnIntentExecutionPolicy {
     /// Do not call Astra's auxiliary TurnIntent LLM. The request keeps the
     /// deterministic baseline profile selected when its loop state is built.
     FixedDefault,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAutoRouteExecutionPolicy {
+    #[default]
+    Auto,
+    /// Do not call Astra's auxiliary skill auto-route LLM. Skills remain
+    /// visible to the primary model and can still be invoked explicitly.
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2199,6 +2211,38 @@ fn status_projection_patch_hash(
     sha256_hex(payload.to_string().as_bytes())
 }
 
+fn event_projection_patch_hash(
+    run_id: &str,
+    projection_event_idx: i64,
+    latest_event_type: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "event_patch": {
+            "projection_event_idx": projection_event_idx,
+            "latest_event_type": latest_event_type,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
+fn checkpoint_projection_patch_hash(
+    run_id: &str,
+    checkpoint_id: &str,
+    checkpoint_kind: &str,
+    checkpoint_version: &str,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "checkpoint_patch": {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_kind": checkpoint_kind,
+            "checkpoint_version": checkpoint_version,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
@@ -3058,6 +3102,8 @@ pub enum DatabaseRunStateStoreError {
         rows: usize,
         bytes: usize,
     },
+    #[error("run event batch too large: run_id={run_id}, rows={rows}")]
+    RunEventBatchTooLarge { run_id: String, rows: usize },
     #[error("JSON serialization failed: operation={operation}, entity={entity}, source={source}")]
     Json {
         operation: &'static str,
@@ -3093,6 +3139,16 @@ pub struct DatabaseRunStateStore {
     owner_pod_id: String,
     lease_ttl: Duration,
     session_execution_slot_stale_after: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum RunProjectionWriteMode {
+    /// Normal writers may initialize a missing projection, but never replace
+    /// an existing snapshot assembled by another field owner.
+    InsertIfAbsent,
+    /// An explicit rebuild holds the authoritative run row while replacing a
+    /// corrupt projection from the durable run facts.
+    AuthoritativeRepair,
 }
 
 impl DatabaseRunStateStore {
@@ -3657,6 +3713,24 @@ impl DatabaseRunStateStore {
         row.map(run_projection_record_from_row).transpose()
     }
 
+    async fn load_run_projection_metadata_for_user_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
+        let sql = format!(
+            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE user_id = ? AND run_id = ?"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("load_rebuilt_run_projection", run_id, source))?;
+        row.map(run_projection_record_from_row).transpose()
+    }
+
     async fn load_latest_event_type_for_user(
         &self,
         user_id: &str,
@@ -3681,18 +3755,16 @@ impl DatabaseRunStateStore {
         .transpose()
     }
 
-    async fn upsert_run_projection(
-        &self,
+    fn run_projection_write_sql(
         projection: &DurableRunDisplayProjectionRecord,
-    ) -> DbStoreResult<()> {
-        let upsert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, waiting_for, error_message,
-              projection_event_idx, latest_event_type, latest_checkpoint_id,
-              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
-              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE
+        write_mode: RunProjectionWriteMode,
+    ) -> String {
+        let on_duplicate_key = match write_mode {
+            RunProjectionWriteMode::InsertIfAbsent => {
+                "ON DUPLICATE KEY UPDATE projection_hash = projection_hash"
+            }
+            RunProjectionWriteMode::AuthoritativeRepair => {
+                "ON DUPLICATE KEY UPDATE
                status = VALUES(status),
                waiting_for = VALUES(waiting_for),
                error_message = VALUES(error_message),
@@ -3705,7 +3777,20 @@ impl DatabaseRunStateStore {
                total_completion_tokens = VALUES(total_completion_tokens),
                total_tool_calls = VALUES(total_tool_calls),
                projection_hash = VALUES(projection_hash),
-               updated_at = NOW(6)",
+               updated_at = NOW(6)"
+            }
+        };
+        let statement = format!(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+             {on_duplicate_key}"
+        );
+        matrixone_statement_with_null_shape(
+            &statement,
             [
                 projection.waiting_for.is_some(),
                 projection.error_message.is_some(),
@@ -3714,8 +3799,14 @@ impl DatabaseRunStateStore {
                 projection.latest_checkpoint_kind.is_some(),
                 projection.latest_checkpoint_version.is_some(),
             ],
-        );
-        sqlx::query(&upsert_sql)
+        )
+    }
+
+    fn bind_run_projection_query<'q>(
+        sql: &'q str,
+        projection: &'q DurableRunDisplayProjectionRecord,
+    ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+        sqlx::query(sql)
             .bind(&projection.run_id)
             .bind(&projection.user_id)
             .bind(&projection.session_id)
@@ -3731,14 +3822,138 @@ impl DatabaseRunStateStore {
             .bind(projection.total_completion_tokens as i64)
             .bind(projection.total_tool_calls as i64)
             .bind(&projection.projection_hash)
+    }
+
+    async fn insert_run_projection_if_absent(
+        &self,
+        projection: &DurableRunDisplayProjectionRecord,
+    ) -> DbStoreResult<()> {
+        let sql =
+            Self::run_projection_write_sql(projection, RunProjectionWriteMode::InsertIfAbsent);
+        Self::bind_run_projection_query(&sql, projection)
             .execute(self.pool.get())
             .await
-            .map_err(|source| db_error("upsert_run_projection", &projection.run_id, source))?;
+            .map_err(|source| {
+                db_error(
+                    "insert_run_projection_if_absent",
+                    &projection.run_id,
+                    source,
+                )
+            })?;
         Ok(())
     }
 
-    async fn patch_run_projection_usage_for_user(
+    async fn load_latest_checkpoint_for_user_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunCheckpointRecord>> {
+        let row = sqlx::query(
+            "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                    checkpoint_version, idempotency_key, checkpoint_json,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM run_checkpoints
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY created_at DESC, checkpoint_id DESC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_latest_checkpoint_for_rebuild", run_id, source))?;
+        row.map(|row| decode_run_checkpoint_record_from_row(&row))
+            .transpose()
+    }
+
+    /// Replace a display projection from the currently locked durable run facts.
+    ///
+    /// Normal projection refreshes are deliberately monotonic because they race
+    /// with later event writes. Repair is different: it holds the authoritative
+    /// `agent_runs` row, then writes the exact projection derived from that
+    /// locked state, including when a corrupt projection leads the run facts.
+    async fn rebuild_run_projection_from_authoritative_facts(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| db_error("rebuild_run_projection_begin", run_id, source))?;
+        let Some(mut run) = self
+            .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error("rebuild_run_projection_rollback_missing", run_id, source)
+            })?;
+            return Ok(None);
+        };
+
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|source| db_error("load_run_events_for_rebuild", run_id, source))?;
+        run.events = rows
+            .into_iter()
+            .map(|row| decode_run_event_payload(&row, run_id))
+            .collect::<DbStoreResult<Vec<_>>>()?;
+
+        let latest_event_type = run.events.last().map(extract_event_type);
+        let latest_checkpoint = self
+            .load_latest_checkpoint_for_user_tx(&mut tx, user_id, run_id)
+            .await?;
+        let projection = build_run_display_projection(
+            &run,
+            latest_event_type,
+            latest_checkpoint.as_ref().map(checkpoint_summary_tuple),
+        );
+        let sql = Self::run_projection_write_sql(
+            &projection,
+            RunProjectionWriteMode::AuthoritativeRepair,
+        );
+        Self::bind_run_projection_query(&sql, &projection)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| db_error("rebuild_run_projection_write", run_id, source))?;
+        let persisted = self
+            .load_run_projection_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                db_error(
+                    "rebuild_run_projection_verify",
+                    run_id,
+                    sqlx::Error::RowNotFound,
+                )
+            })?;
+        if persisted.projection_hash != projection.projection_hash {
+            return Err(db_error(
+                "rebuild_run_projection_verify",
+                run_id,
+                sqlx::Error::Protocol(
+                    "authoritative projection hash did not persist after repair".to_string(),
+                ),
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|source| db_error("rebuild_run_projection_commit", run_id, source))?;
+        Ok(Some(persisted))
+    }
+
+    async fn patch_run_projection_usage_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
@@ -3762,25 +3977,26 @@ impl DatabaseRunStateStore {
         .bind(&projection_hash)
         .bind(user_id)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(&mut **tx)
         .await
         .map_err(|source| db_error("patch_run_projection_usage", run_id, source))?;
         Ok(result.rows_affected())
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn patch_run_projection_status_for_user(
+    async fn patch_run_projection_status_tx(
         &self,
-        user_id: &str,
-        run_id: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        run: &DurableRunRecord,
         status: &str,
         waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        requested_error_message: Option<&str>,
         projection_event_idx: i64,
         latest_event_type: Option<&str>,
     ) -> DbStoreResult<u64> {
+        let error_message = requested_error_message.or(run.error_message.as_deref());
         let projection_hash = status_projection_patch_hash(
-            run_id,
+            &run.run_id,
             status,
             waiting_for,
             error_message,
@@ -3804,74 +4020,100 @@ impl DatabaseRunStateStore {
         .bind(projection_event_idx)
         .bind(latest_event_type)
         .bind(&projection_hash)
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .bind(projection_event_idx)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| db_error("patch_run_projection_status", &run.run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn patch_run_projection_event_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        projection_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) -> DbStoreResult<u64> {
+        let projection_hash =
+            event_projection_patch_hash(run_id, projection_event_idx, latest_event_type);
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET projection_event_idx = ?,
+                 latest_event_type = COALESCE(?, latest_event_type),
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ? AND projection_event_idx <= ?",
+        )
+        .bind(projection_event_idx)
+        .bind(latest_event_type)
+        .bind(&projection_hash)
         .bind(user_id)
         .bind(run_id)
         .bind(projection_event_idx)
         .execute(self.pool.get())
         .await
-        .map_err(|source| db_error("patch_run_projection_status", run_id, source))?;
+        .map_err(|source| db_error("patch_run_projection_event", run_id, source))?;
         Ok(result.rows_affected())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn patch_or_repair_run_projection_status_for_user(
+    async fn patch_run_projection_checkpoint_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        run_id: &str,
+        checkpoint_id: &str,
+        checkpoint_kind: &str,
+        checkpoint_version: &str,
+    ) -> DbStoreResult<u64> {
+        let projection_hash = checkpoint_projection_patch_hash(
+            run_id,
+            checkpoint_id,
+            checkpoint_kind,
+            checkpoint_version,
+        );
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET latest_checkpoint_id = ?,
+                 latest_checkpoint_kind = ?,
+                 latest_checkpoint_version = ?,
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(checkpoint_id)
+        .bind(checkpoint_kind)
+        .bind(checkpoint_version)
+        .bind(&projection_hash)
+        .bind(user_id)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| db_error("patch_run_projection_checkpoint", run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn reconcile_run_projection_patch(
         &self,
         user_id: &str,
         run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        projection_event_idx: i64,
-        latest_event_type: Option<&str>,
+        operation: &'static str,
+        result: DbStoreResult<u64>,
     ) {
-        match self
-            .patch_run_projection_status_for_user(
-                user_id,
-                run_id,
-                status,
-                waiting_for,
-                error_message,
-                projection_event_idx,
-                latest_event_type,
-            )
-            .await
-        {
+        match result {
             Ok(0) => {
-                match self
-                    .load_run_projection_metadata_for_user(user_id, run_id)
+                if let Err(error) = self
+                    .rebuild_run_projection_from_authoritative_facts(user_id, run_id)
                     .await
                 {
-                    Ok(None) => {
-                        if let Err(error) = self
-                            .sync_projection_for_user(user_id, run_id, None, None)
-                            .await
-                        {
-                            tracing::warn!(
-                                user_id,
-                                run_id,
-                                error = %error,
-                                "run transition committed but missing display projection repair failed"
-                            );
-                        }
-                    }
-                    Ok(Some(existing)) if existing.projection_event_idx > projection_event_idx => {
-                        tracing::debug!(
-                            user_id,
-                            run_id,
-                            attempted_projection_event_idx = projection_event_idx,
-                            current_projection_event_idx = existing.projection_event_idx,
-                            "ignored stale run display projection status patch"
-                        );
-                    }
-                    Ok(Some(_)) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            user_id,
-                            run_id,
-                            error = %error,
-                            "run transition committed but display projection state check failed"
-                        );
-                    }
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        operation,
+                        error = %error,
+                        "run mutation committed but display projection repair failed"
+                    );
                 }
             }
             Ok(_) => {}
@@ -3879,57 +4121,12 @@ impl DatabaseRunStateStore {
                 tracing::warn!(
                     user_id,
                     run_id,
+                    operation,
                     error = %error,
-                    "run transition committed but display projection status patch failed"
+                    "run mutation committed but display projection patch failed"
                 );
             }
         }
-    }
-
-    async fn sync_projection_for_user(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        latest_event_type: Option<&str>,
-        latest_checkpoint: Option<&DurableRunCheckpointRecord>,
-    ) -> DbStoreResult<()> {
-        let Some(run) = self.load_run_metadata_for_user(user_id, run_id).await? else {
-            return Ok(());
-        };
-        let existing = self
-            .load_run_projection_metadata_for_user(user_id, run_id)
-            .await?;
-        let latest_event_type = if let Some(latest_event_type) = latest_event_type {
-            Some(latest_event_type.to_owned())
-        } else {
-            let existing_event_type = existing
-                .as_ref()
-                .and_then(|entry| entry.latest_event_type.clone());
-            if existing
-                .as_ref()
-                .is_some_and(|entry| entry.projection_event_idx >= run.last_event_idx)
-            {
-                existing_event_type
-            } else {
-                self.load_latest_event_type_for_user(user_id, run_id)
-                    .await?
-                    .or(existing_event_type)
-            }
-        };
-        let projection = build_run_display_projection(
-            &run,
-            latest_event_type,
-            latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
-                existing.as_ref().and_then(|entry| {
-                    Some((
-                        entry.latest_checkpoint_id.clone()?,
-                        entry.latest_checkpoint_kind.clone()?,
-                        entry.latest_checkpoint_version.clone()?,
-                    ))
-                })
-            }),
-        );
-        self.upsert_run_projection(&projection).await
     }
 
     /// Allocate a contiguous block of `count` event indices in one CAS operation.
@@ -4129,8 +4326,22 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("update_run_last_event_idx_batch", run_id, source))?;
 
-        self.sync_projection_for_user(user_id, run_id, None, None)
+        let latest_event_type = self
+            .load_latest_event_type_for_user(user_id, run_id)
             .await?;
+        if self
+            .patch_run_projection_event_for_user(
+                user_id,
+                run_id,
+                last_idx,
+                latest_event_type.as_deref(),
+            )
+            .await?
+            == 0
+        {
+            self.rebuild_run_projection_from_authoritative_facts(user_id, run_id)
+                .await?;
+        }
 
         Ok(())
     }
@@ -4161,6 +4372,71 @@ fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
 }
 
 impl DatabaseRunStateStore {
+    async fn insert_initial_run_events_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        record: &DurableRunRecord,
+        events: &[serde_json::Value],
+    ) -> DbStoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let event_count = i64::try_from(events.len()).map_err(|_| {
+            DatabaseRunStateStoreError::RunEventBatchTooLarge {
+                run_id: record.run_id.clone(),
+                rows: events.len(),
+            }
+        })?;
+        let mut rows = Vec::with_capacity(events.len());
+        for (event_idx, event) in (0_i64..event_count).zip(events) {
+            rows.push(build_run_event_insert_row(
+                &record.user_id,
+                &record.run_id,
+                &record.session_id,
+                record.agent_id.as_deref(),
+                event_idx,
+                &self.owner_pod_id,
+                event,
+            )?);
+        }
+        // These rows are the newly allocated contiguous initial facts for a
+        // run inserted in this transaction after acquiring its exclusive
+        // session slot. A duplicate therefore violates the start invariant:
+        // fail and roll back the whole start instead of silently creating a
+        // run whose `last_event_idx` no longer matches its stored events.
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_run_events \
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
+              subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+        );
+        builder.push_values(rows.iter(), |mut row, event| {
+            row.push_bind(&event.id)
+                .push_bind(&event.run_id)
+                .push_bind(event.event_idx)
+                .push_bind(&event.user_id)
+                .push_bind(&event.session_id)
+                .push_bind(&event.event_type)
+                .push_bind(&event.event_id)
+                .push_bind(&event.agent_id)
+                .push_bind(&event.subject_run_id)
+                .push_bind(&event.interaction_request_id)
+                .push_bind(&event.idempotency_key)
+                .push_bind(&event.event_hash)
+                .push_bind(&event.producer_pod_id)
+                .push_bind(&event.payload_json)
+                .push("NOW(6)");
+        });
+        builder.push(matrixone_null_shape_comment(
+            rows.iter().flat_map(RunEventInsertRow::nullable_shape),
+        ));
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| db_error("insert_initial_run_events", &record.run_id, source))?;
+        Ok(())
+    }
+
     async fn existing_run_start_claim(
         &self,
         user_id: &str,
@@ -4223,10 +4499,21 @@ impl DatabaseRunStateStore {
             + chrono::Duration::from_std(self.lease_ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
+        let holds_session_slot = run_requires_session_execution_slot(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        let atomic_initial_events = holds_session_slot && !events.is_empty();
 
-        // New run: last_event_idx must be -1 (no events written yet) so the
-        // first batch append allocates indices starting at 0.
-        if !events.is_empty() {
+        // A blocking run and its initial events are inserted in one transaction.
+        // Other run shapes retain the general append allocator below.
+        if atomic_initial_events {
+            record.last_event_idx = i64::try_from(events.len()).map_err(|_| {
+                DatabaseRunStateStoreError::RunEventBatchTooLarge {
+                    run_id: record.run_id.clone(),
+                    rows: events.len(),
+                }
+                .to_string()
+            })? - 1;
+        } else if !events.is_empty() {
             record.last_event_idx = -1;
         }
 
@@ -4249,9 +4536,7 @@ impl DatabaseRunStateStore {
             record.provider_request_fingerprint.is_some(),
         ];
 
-        let insert_result = if run_requires_session_execution_slot(&record)
-            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
-        {
+        let (insert_result, initial_events_committed) = if holds_session_slot {
             let mut tx = self.pool.get().begin().await.map_err(|source| {
                 db_error("insert_run_begin", &record.run_id, source).to_string()
             })?;
@@ -4345,10 +4630,25 @@ impl DatabaseRunStateStore {
                 })?;
                 return Err("session already has an active run".to_string());
             }
+            if atomic_initial_events
+                && let Err(source) = self
+                    .insert_initial_run_events_tx(&mut tx, &record, &events)
+                    .await
+            {
+                tx.rollback().await.map_err(|rollback_error| {
+                    db_error(
+                        "insert_run_rollback_initial_events",
+                        &record.run_id,
+                        rollback_error,
+                    )
+                    .to_string()
+                })?;
+                return Err(source.to_string());
+            }
             tx.commit().await.map_err(|source| {
                 db_error("insert_run_commit", &record.run_id, source).to_string()
             })?;
-            result
+            (result, atomic_initial_events)
         } else {
             let insert_sql = if claim_existing {
                 "INSERT INTO agent_runs
@@ -4410,7 +4710,7 @@ impl DatabaseRunStateStore {
                 .bind(&record.provider_request_fingerprint)
                 .execute(self.pool.get())
                 .await;
-            match result {
+            let result = match result {
                 Ok(result) => result,
                 Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
                     return self
@@ -4424,25 +4724,29 @@ impl DatabaseRunStateStore {
                 Err(source) => {
                     return Err(db_error("insert_run", &record.run_id, source).to_string());
                 }
-            }
+            };
+            (result, false)
         };
         if insert_result.rows_affected() == 0 {
             return Err("session already has an active run".to_string());
         }
 
-        if !events.is_empty() {
+        if initial_events_committed {
+            let projection =
+                build_run_display_projection(&record, events.last().map(extract_event_type), None);
+            self.insert_run_projection_if_absent(&projection)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else if !events.is_empty() {
             self.append_events_batch_for_user(&record.user_id, &record.run_id, &events)
                 .await
                 .map_err(|e| e.to_string())?;
+        } else {
+            let projection = build_run_display_projection(&record, None, None);
+            self.insert_run_projection_if_absent(&projection)
+                .await
+                .map_err(|error| error.to_string())?;
         }
-        self.sync_projection_for_user(
-            &record.user_id,
-            &record.run_id,
-            record.events.last().map(extract_event_type).as_deref(),
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
         Ok(DurableRunStartClaim::Started)
     }
 }
@@ -4653,21 +4957,22 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         }
+        let projection_update = self
+            .patch_run_projection_status_tx(
+                &mut tx,
+                &run,
+                status,
+                waiting_for,
+                error_message,
+                run.last_event_idx,
+                None,
+            )
+            .await;
         tx.commit()
             .await
             .map_err(|source| db_error("update_run_status_commit", run_id, source).to_string())?;
-        if result.rows_affected() > 0
-            && let Err(error) = self
-                .sync_projection_for_user(user_id, run_id, None, None)
-                .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run status committed but display projection refresh failed"
-            );
-        }
+        self.reconcile_run_projection_patch(user_id, run_id, "status", projection_update)
+            .await;
         Ok(true)
     }
 
@@ -4769,21 +5074,22 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         }
+        let projection_update = self
+            .patch_run_projection_status_tx(
+                &mut tx,
+                &run,
+                status,
+                waiting_for,
+                error_message,
+                run.last_event_idx,
+                None,
+            )
+            .await;
         tx.commit().await.map_err(|source| {
             db_error("update_run_status_if_current_commit", run_id, source).to_string()
         })?;
-        if result.rows_affected() > 0
-            && let Err(error) = self
-                .sync_projection_for_user(user_id, run_id, None, None)
-                .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run status CAS committed but display projection refresh failed"
-            );
-        }
+        self.reconcile_run_projection_patch(user_id, run_id, "status_cas", projection_update)
+            .await;
         Ok(true)
     }
 
@@ -4963,18 +5269,25 @@ impl RunStateStore for DatabaseRunStateStore {
             return Err(detail);
         }
 
+        let projection_update = self
+            .patch_run_projection_status_tx(
+                &mut tx,
+                &run,
+                status,
+                waiting_for,
+                error_message,
+                event_row.event_idx,
+                Some(&event_row.event_type),
+            )
+            .await;
         tx.commit().await.map_err(|source| {
             db_error("transition_run_status_with_event_commit", run_id, source).to_string()
         })?;
-
-        self.patch_or_repair_run_projection_status_for_user(
+        self.reconcile_run_projection_patch(
             user_id,
             run_id,
-            status,
-            waiting_for,
-            error_message,
-            event_row.event_idx,
-            Some(&event_row.event_type),
+            "status_with_event",
+            projection_update,
         )
         .await;
         Ok(true)
@@ -5197,6 +5510,17 @@ impl RunStateStore for DatabaseRunStateStore {
             return Err(detail);
         }
 
+        let projection_update = self
+            .patch_run_projection_status_tx(
+                &mut tx,
+                &run,
+                status,
+                waiting_for,
+                error_message,
+                event_row.event_idx,
+                Some(&event_row.event_type),
+            )
+            .await;
         tx.commit().await.map_err(|source| {
             db_error(
                 "guarded_transition_run_status_with_event_commit",
@@ -5205,15 +5529,11 @@ impl RunStateStore for DatabaseRunStateStore {
             )
             .to_string()
         })?;
-
-        self.patch_or_repair_run_projection_status_for_user(
+        self.reconcile_run_projection_patch(
             user_id,
             run_id,
-            status,
-            waiting_for,
-            error_message,
-            event_row.event_idx,
-            Some(&event_row.event_type),
+            "guarded_status_with_event",
+            projection_update,
         )
         .await;
         Ok(GuardedRunStatusTransition::Updated)
@@ -5401,18 +5721,25 @@ impl RunStateStore for DatabaseRunStateStore {
             }
         }
 
+        let projection_update = self
+            .patch_run_projection_status_tx(
+                &mut tx,
+                &run,
+                status,
+                waiting_for,
+                error_message,
+                next_last_event_idx,
+                event_rows.last().map(|event| event.event_type.as_str()),
+            )
+            .await;
         tx.commit().await.map_err(|source| {
             db_error("transition_run_status_with_events_commit", run_id, source).to_string()
         })?;
-
-        self.patch_or_repair_run_projection_status_for_user(
+        self.reconcile_run_projection_patch(
             user_id,
             run_id,
-            status,
-            waiting_for,
-            error_message,
-            next_last_event_idx,
-            event_rows.last().map(|event| event.event_type.as_str()),
+            "status_with_events",
+            projection_update,
         )
         .await;
         Ok(true)
@@ -5426,6 +5753,12 @@ impl RunStateStore for DatabaseRunStateStore {
         completion_tokens: u64,
         tool_calls: u32,
     ) -> Result<bool, String> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| db_error("update_run_usage_begin", run_id, source).to_string())?;
         let result = sqlx::query(
             "UPDATE agent_runs
              SET total_prompt_tokens = ?, total_completion_tokens = ?, total_tool_calls = ?, updated_at = NOW(6)
@@ -5436,45 +5769,31 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(tool_calls as i64)
         .bind(user_id)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(&mut *tx)
         .await
         .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
-        if result.rows_affected() > 0 {
-            match self
-                .patch_run_projection_usage_for_user(
-                    user_id,
-                    run_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
-            {
-                Ok(0) => {
-                    if let Err(error) = self
-                        .sync_projection_for_user(user_id, run_id, None, None)
-                        .await
-                    {
-                        tracing::warn!(
-                            user_id,
-                            run_id,
-                            error = %error,
-                            "run usage committed but display projection repair failed"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        error = %error,
-                        "run usage committed but display projection usage patch failed"
-                    );
-                }
-            }
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error("update_run_usage_rollback_missing", run_id, source).to_string()
+            })?;
+            return Ok(false);
         }
-        Ok(result.rows_affected() > 0)
+        let projection_update = self
+            .patch_run_projection_usage_tx(
+                &mut tx,
+                user_id,
+                run_id,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+            )
+            .await;
+        tx.commit()
+            .await
+            .map_err(|source| db_error("update_run_usage_commit", run_id, source).to_string())?;
+        self.reconcile_run_projection_patch(user_id, run_id, "usage", projection_update)
+            .await;
+        Ok(true)
     }
 
     async fn save_checkpoint(
@@ -5547,28 +5866,28 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         }
+        let projection_update = self
+            .patch_run_projection_checkpoint_tx(
+                &mut tx,
+                user_id,
+                run_id,
+                &checkpoint_id,
+                &checkpoint_kind,
+                &checkpoint_version,
+            )
+            .await;
         tx.commit()
             .await
             .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
-        self.sync_projection_for_user(
-            user_id,
-            run_id,
-            None,
-            Some(&DurableRunCheckpointRecord {
-                checkpoint_id,
-                run_id: run.run_id,
-                user_id: run.user_id,
-                session_id: run.session_id,
-                node_seq: run.last_event_idx.max(0),
-                checkpoint_kind,
-                checkpoint_version,
-                idempotency_key,
-                checkpoint_json: checkpoint_json.to_string(),
-                created_at: created_at.to_string(),
-            }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        match projection_update {
+            Ok(0) => {
+                self.rebuild_run_projection_from_authoritative_facts(user_id, run_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
         Ok(true)
     }
 
@@ -5638,20 +5957,9 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        let latest_event_type = run.events.last().map(extract_event_type);
-        let latest_checkpoint = self.load_latest_checkpoint(user_id, run_id, None).await?;
-        let projection = build_run_display_projection(
-            &run,
-            latest_event_type,
-            latest_checkpoint.as_ref().map(checkpoint_summary_tuple),
-        );
-        self.upsert_run_projection(&projection)
+        self.rebuild_run_projection_from_authoritative_facts(user_id, run_id)
             .await
-            .map_err(|e| e.to_string())?;
-        Ok(Some(projection))
+            .map_err(|error| error.to_string())
     }
 
     // `append_event` not overridden — trait default delegates to
@@ -5874,20 +6182,27 @@ impl RunStateStore for DatabaseRunStateStore {
             insert.build().execute(&mut *tx).await.map_err(|source| {
                 db_error("resolve_run_interaction_insert_events", run_id, source).to_string()
             })?;
+            let projection_update = self
+                .patch_run_projection_status_tx(
+                    &mut tx,
+                    &run,
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    last_event_idx,
+                    event_rows.last().map(|event| event.event_type.as_str()),
+                )
+                .await;
             tx.commit().await.map_err(|source| {
                 db_error("resolve_run_interaction_commit", run_id, source).to_string()
             })?;
-            if let Err(error) = self
-                .sync_projection_for_user(user_id, run_id, Some("run_resumed"), None)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    error = %error,
-                    "interaction resolved but display projection refresh failed"
-                );
-            }
+            self.reconcile_run_projection_patch(
+                user_id,
+                run_id,
+                "interaction_resolution",
+                projection_update,
+            )
+            .await;
             return Ok(DurableRunInteractionResolveOutcome::Resolved(
                 events[0].clone(),
             ));
@@ -7479,6 +7794,13 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(turn_intent_policy) = data.get("turn_intent_policy").cloned() {
                     obj.insert("turn_intent_policy".to_string(), turn_intent_policy);
                 }
+                if let Some(skill_auto_route_policy) = data.get("skill_auto_route_policy").cloned()
+                {
+                    obj.insert(
+                        "skill_auto_route_policy".to_string(),
+                        skill_auto_route_policy,
+                    );
+                }
                 if let Some(workspace) = data.get("workspace").cloned() {
                     obj.insert("workspace".to_string(), workspace);
                 }
@@ -8033,6 +8355,28 @@ mod tests {
     }
 
     #[test]
+    fn run_projection_queries_bind_exactly_the_declared_placeholders() {
+        use sqlx::{Arguments, Execute};
+
+        let run = durable_run_record("projection-bind-contract");
+        let projection = build_run_display_projection(&run, None, None);
+        for mode in [
+            RunProjectionWriteMode::InsertIfAbsent,
+            RunProjectionWriteMode::AuthoritativeRepair,
+        ] {
+            let sql = DatabaseRunStateStore::run_projection_write_sql(&projection, mode);
+            assert_eq!(sql.matches('?').count(), 15);
+            let mut query = DatabaseRunStateStore::bind_run_projection_query(&sql, &projection);
+            assert_eq!(query.sql(), sql);
+            let arguments = query
+                .take_arguments()
+                .expect("projection arguments encode")
+                .expect("projection query uses prepared arguments");
+            assert_eq!(arguments.len(), 15);
+        }
+    }
+
+    #[test]
     fn run_event_rows_normalize_spawn_subject_without_inventing_terminal_subjects() {
         let spawned = build_run_event_insert_row(
             "user-1",
@@ -8321,6 +8665,10 @@ mod tests {
                 let mut record = durable_run_record(&run_id);
                 record.user_id = user_id;
                 record.session_id = session_id.clone();
+                record.events = vec![json!({
+                    "event_type": "run_started",
+                    "event_id": format!("event-{run_id}"),
+                })];
                 store.claim_run_start(record, Some(&session_id)).await
             }
         };
@@ -8346,6 +8694,26 @@ mod tests {
                 .count(),
             1
         );
+
+        let durable_counts = sqlx::query(
+            "SELECT run.last_event_idx,
+                    (SELECT COUNT(*) FROM agent_run_events AS event
+                     WHERE event.user_id = run.user_id AND event.run_id = run.run_id
+                       AND event.event_idx = 0) AS event_count,
+                    (SELECT COUNT(*) FROM run_display_projections AS projection
+                     WHERE projection.user_id = run.user_id AND projection.run_id = run.run_id
+                       AND projection.projection_event_idx = 0) AS projection_count
+             FROM agent_runs AS run
+             WHERE run.user_id = ? AND run.run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("load atomic run-start facts");
+        assert_eq!(durable_counts.get::<i64, _>("last_event_idx"), 0);
+        assert_eq!(durable_counts.get::<i64, _>("event_count"), 1);
+        assert_eq!(durable_counts.get::<i64, _>("projection_count"), 1);
 
         sqlx::query(
             "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
@@ -9140,6 +9508,55 @@ mod tests {
         active.status = STATUS_WAITING.into();
         ensure_terminal_status_immutable(&active, STATUS_FAILED)
             .expect("waiting recovery can still settle terminally");
+    }
+
+    #[tokio::test]
+    async fn in_memory_terminal_status_replay_preserves_run_and_projection_error() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("terminal-error-replay"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "terminal-error-replay",
+                    &[STATUS_RUNNING],
+                    STATUS_FAILED,
+                    None,
+                    Some("boom"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "terminal-error-replay",
+                    &[STATUS_FAILED],
+                    STATUS_FAILED,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        let run = store
+            .load_run("u1", "terminal-error-replay")
+            .await
+            .unwrap()
+            .expect("run exists after replay");
+        let projection = store
+            .load_run_projection("u1", "terminal-error-replay")
+            .await
+            .unwrap()
+            .expect("projection exists after replay");
+        assert_eq!(run.error_message.as_deref(), Some("boom"));
+        assert_eq!(projection.error_message.as_deref(), Some("boom"));
     }
 
     #[tokio::test]
@@ -10878,6 +11295,7 @@ mod tests {
                         "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
                         "interactive_client": true,
                         "turn_intent_policy": "fixed_default",
+                        "skill_auto_route_policy": "disabled",
                         "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                         "executor": {"kind": "server_local", "status": "online"},
                         "transport": "server_local"
@@ -10888,6 +11306,7 @@ mod tests {
                     assert_eq!(o["run_id"], "run-1");
                     assert_eq!(o["interaction_mode"], "auto");
                     assert_eq!(o["turn_intent_policy"], "fixed_default");
+                    assert_eq!(o["skill_auto_route_policy"], "disabled");
                 },
             ),
             (
@@ -12330,7 +12749,7 @@ mod tests {
             "UPDATE run_display_projections
              SET status = 'running',
                  error_message = NULL,
-                 projection_event_idx = -1,
+                 projection_event_idx = 99,
                  latest_event_type = 'stale_event',
                  latest_checkpoint_kind = NULL,
                  latest_checkpoint_version = NULL
@@ -12355,6 +12774,132 @@ mod tests {
             repaired.latest_checkpoint_version.as_deref(),
             Some("checkpoint_v2")
         );
+
+        let persisted = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load repaired projection")
+            .expect("repaired projection exists");
+        assert_eq!(persisted.status, STATUS_FAILED);
+        assert_eq!(persisted.error_message.as_deref(), Some("boom"));
+        assert_eq!(persisted.projection_event_idx, 1);
+        assert_eq!(persisted.latest_event_type.as_deref(), Some("run_finished"));
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_status_replay_preserves_run_and_projection_error_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-replay-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-replay-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-replay-session-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut record = durable_run_record(&run_id);
+        record.user_id = user_id.clone();
+        record.session_id = session_id;
+        record.root_run_id = Some(run_id.clone());
+        record.ancestor_path = Some(run_id.clone());
+        store.insert_run(record).await.expect("insert replay run");
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    STATUS_FAILED,
+                    None,
+                    Some("boom"),
+                )
+                .await
+                .expect("persist failed status")
+        );
+        assert!(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_FAILED],
+                    STATUS_FAILED,
+                    None,
+                    None,
+                )
+                .await
+                .expect("replay failed status without error")
+        );
+
+        let run = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load replayed run")
+            .expect("replayed run exists");
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load replayed projection")
+            .expect("replayed projection exists");
+        assert_eq!(run.error_message.as_deref(), Some("boom"));
+        assert_eq!(projection.error_message.as_deref(), Some("boom"));
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_projection_initialization_does_not_overwrite_equal_index_state() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-projection-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-projection-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-projection-session-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut stale_run = durable_run_record(&run_id);
+        stale_run.user_id = user_id.clone();
+        stale_run.session_id = session_id;
+        stale_run.root_run_id = Some(run_id.clone());
+        stale_run.ancestor_path = Some(run_id.clone());
+        stale_run.last_event_idx = 0;
+        store
+            .insert_run(stale_run.clone())
+            .await
+            .expect("insert projection fixture run");
+        sqlx::query("DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .expect("remove automatically initialized projection");
+
+        let mut newer_run = stale_run.clone();
+        newer_run.total_prompt_tokens = 13;
+        newer_run.total_completion_tokens = 5;
+        let newer_projection =
+            build_run_display_projection(&newer_run, Some("run_started".to_string()), None);
+        store
+            .insert_run_projection_if_absent(&newer_projection)
+            .await
+            .expect("persist newer projection");
+
+        let stale_projection =
+            build_run_display_projection(&stale_run, Some("run_started".to_string()), None);
+        store
+            .insert_run_projection_if_absent(&stale_projection)
+            .await
+            .expect("stale projection write is harmless");
+
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load monotonic projection")
+            .expect("projection exists");
+        assert_eq!(projection.projection_event_idx, 0);
+        assert_eq!(projection.status, STATUS_RUNNING);
+        assert_eq!(projection.latest_event_type.as_deref(), Some("run_started"));
+        assert_eq!(projection.total_prompt_tokens, 13);
+        assert_eq!(projection.total_completion_tokens, 5);
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
