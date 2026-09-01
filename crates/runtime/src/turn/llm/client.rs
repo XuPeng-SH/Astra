@@ -39,6 +39,7 @@ use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
+use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
@@ -607,6 +608,9 @@ pub(crate) struct LlmCall<'a> {
     pub purpose: astra_turn_types::InferencePurpose,
     pub messages: &'a [Value],
     pub tools: &'a [Value],
+    /// Cache placement resolved from model metadata by the owning runtime path.
+    /// `None` preserves heuristic classification for standalone inference calls.
+    pub cache_capability: Option<CacheCapability>,
     pub route: LlmExecutionRoute<'a>,
     pub max_output_tokens: Option<usize>,
     pub temperature: Option<f64>,
@@ -2200,10 +2204,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     let marker_stripped_messages;
-    let messages = if messages
-        .iter()
-        .any(crate::turn::wire_assembly::is_required_runtime_preamble)
-    {
+    let messages = if messages.iter().any(|message| {
+        crate::turn::wire_assembly::is_required_runtime_preamble(message)
+            || crate::turn::wire_assembly::is_runtime_system_context(message)
+    }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
                 astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
@@ -2536,11 +2540,21 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
+    model_name: &str,
+    explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
-    let preserve_runtime_system_tail = matches!(
-        llm_provider_protocol(provider),
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible
+    let protocol = llm_provider_protocol(provider);
+    let cache_cap = CacheCapability::from_explicit_or_provider_model(
+        explicit_cache_capability,
+        provider,
+        model_name,
     );
+    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
+        || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
+            && !matches!(
+                cache_cap.volatile_placement,
+                VolatilePlacement::CurrentUserOnly
+            ));
     consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
 }
 
@@ -2578,7 +2592,7 @@ fn consolidate_system_messages_inner(
         let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
         let preserve_runtime_control = preserve_runtime_system_tail
             && is_system
-            && crate::turn::wire_assembly::is_required_runtime_preamble(msg);
+            && crate::turn::wire_assembly::is_runtime_system_context(msg);
         if is_system && !preserve_runtime_control {
             match msg.get("content") {
                 Some(Value::String(text)) => {
@@ -3205,6 +3219,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         purpose,
         messages,
         tools,
+        cache_capability,
         route,
         max_output_tokens,
         temperature,
@@ -3235,7 +3250,8 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     // Consolidate system messages: merge all system-role messages into the first
     // one, converting extras to a single leading system message. Some providers
     // (e.g. MiniMax) reject system messages after the first position.
-    let messages = consolidate_system_messages_for_provider(messages, provider);
+    let messages =
+        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
@@ -4570,6 +4586,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         purpose,
         messages,
         tools,
+        cache_capability,
         route,
         max_output_tokens,
         temperature,
@@ -4590,7 +4607,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let started = Instant::now();
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let messages = consolidate_system_messages_for_provider(messages, provider);
+    let messages =
+        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
 
     let body = build_provider_request_body_with_overrides(
         &messages,
@@ -5336,6 +5354,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"x"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -5419,6 +5438,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -5489,6 +5509,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -7849,6 +7870,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -7908,6 +7930,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -7953,6 +7976,7 @@ mod tests {
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
+                    cache_capability: None,
                     route: LlmExecutionRoute {
                         model_name: "m",
                         wire_model_name: None,
@@ -7995,6 +8019,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8034,6 +8059,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8076,6 +8102,7 @@ mod tests {
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
+                    cache_capability: None,
                     route: LlmExecutionRoute {
                         model_name: "m",
                         wire_model_name: None,
@@ -8148,6 +8175,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8177,6 +8205,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8227,6 +8256,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8291,6 +8321,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8337,6 +8368,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8387,6 +8419,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8431,6 +8464,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8474,6 +8508,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8655,7 +8690,7 @@ mod tests {
             "turn_chain_id": "chain-current"
         });
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai");
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o", None);
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -8677,55 +8712,123 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_openai_preserves_runtime_control_system_tail() {
+    fn consolidate_for_openai_preserves_runtime_system_at_current_turn_boundary() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
         .expect("runtime message");
         let msgs = vec![
             json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "hi"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
             runtime,
+            json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o", None);
 
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "stable");
         assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[1]["content"], "hi");
-        assert_eq!(out[2]["role"], "system");
-        assert_eq!(out[2]["content"], "required resume context");
+        assert_eq!(out[3]["role"], "system");
+        assert_eq!(out[3]["content"], "required resume context");
+        assert_eq!(out[4]["content"], "hi");
         assert!(
-            out[2]
+            out.iter().all(|message| message
                 .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
-                .is_none(),
+                .is_none()),
             "internal marker must not reach provider request messages"
         );
     }
 
     #[test]
-    fn consolidate_for_anthropic_preserves_runtime_control_system_tail() {
+    fn consolidate_for_strict_history_openai_moves_required_runtime_to_initial_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
         .expect("runtime message");
         let msgs = vec![
             json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "hi"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
             runtime,
+            json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "anthropic");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
 
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            out.iter()
+                .skip(1)
+                .all(|message| { message.get("role").and_then(Value::as_str) != Some("system") })
+        );
+        assert_eq!(out[3]["content"], "hi");
+    }
+
+    #[test]
+    fn explicit_current_user_only_capability_overrides_provider_model_heuristic() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            runtime,
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let explicit = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
+        };
+
+        let out = consolidate_system_messages_for_provider(
+            &msgs,
+            "openai",
+            "metadata-defined-alias",
+            Some(explicit),
+        );
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            out.iter()
+                .skip(1)
+                .all(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        );
+        assert_eq!(out[3]["content"], "hi");
+    }
+
+    #[test]
+    fn consolidate_for_anthropic_preserves_runtime_system_boundary_for_body_builder() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            runtime,
+            json!({"role": "user", "content": "hi"}),
+        ];
+
+        let out =
+            consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4", None);
+
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "stable");
-        assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[1]["content"], "hi");
-        assert_eq!(out[2]["role"], "system");
-        assert_eq!(out[2]["content"], "required resume context");
+        assert_eq!(out[3]["role"], "system");
+        assert_eq!(out[3]["content"], "required resume context");
+        assert_eq!(out[4]["content"], "hi");
         assert!(
             out.iter().all(|message| message
                 .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
@@ -10485,7 +10588,12 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages = consolidate_system_messages_for_provider(&messages, "anthropic");
+        let messages = consolidate_system_messages_for_provider(
+            &messages,
+            "anthropic",
+            "claude-sonnet-4",
+            None,
+        );
         let body = build_provider_request_body(
             &messages,
             &[],
@@ -10524,6 +10632,91 @@ mod tests {
                 .to_string()
                 .contains(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER),
             "internal runtime marker must never reach the provider request body: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn build_openai_body_strips_optional_runtime_system_marker() {
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "optional runtime evidence",
+            false,
+        )
+        .expect("runtime message");
+        let body = build_provider_request_body(
+            &[runtime, json!({"role": "user", "content": "hello"})],
+            &[],
+            "gpt-4o",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+
+        let rendered = body.to_string();
+        assert!(rendered.contains("optional runtime evidence"));
+        assert!(
+            !rendered.contains(crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER),
+            "optional runtime marker must never reach the provider request body: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn build_openai_body_keeps_real_tool_result_before_tail_runtime_system() {
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "round runtime context",
+            false,
+        )
+        .expect("runtime message");
+        let mut messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-real",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-real",
+                "content": "real tool result"
+            }),
+        ];
+        let boundary = crate::turn::wire_assembly::insert_runtime_system_context(
+            &mut messages,
+            vec![runtime],
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+        );
+        assert_eq!(boundary, Some(4));
+
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen-plus",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let provider_messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(provider_messages.len(), 5, "{provider_messages:#?}");
+        assert_eq!(provider_messages[2]["role"], "assistant");
+        assert_eq!(provider_messages[3]["role"], "tool");
+        assert_eq!(provider_messages[3]["tool_call_id"], "call-real");
+        assert_eq!(provider_messages[3]["content"], "real tool result");
+        assert_eq!(provider_messages[4]["role"], "system");
+        assert_eq!(provider_messages[4]["content"], "round runtime context");
+        assert!(
+            provider_messages.iter().all(|message| {
+                message.get("content").and_then(Value::as_str)
+                    != Some(SYNTHETIC_TOOL_INTERRUPTED_CONTENT)
+            }),
+            "valid tool result must not be replaced with synthetic repair: {provider_messages:#?}"
         );
     }
 
