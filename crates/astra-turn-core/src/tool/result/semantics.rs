@@ -1,6 +1,6 @@
 //! Shared interpretation of edge tool outputs and stable tool-call keys (§5.5 dedup).
 //!
-//! Used by CLI `chat_stream` / `stream_render` and available for `bridge_inprocess` or server paths.
+//! Used by CLI `chat_stream` / `stream_render` and available for `server_loop` or server paths.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,7 +112,10 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     match classify_tool_result_status(output) {
         ToolResultStatus::Failed => "failed",
         ToolResultStatus::Completed => "completed",
-        ToolResultStatus::Skipped => "skipped",
+        // A suppressed invocation did not produce a successful tool outcome.
+        // Edge callbacks must fail closed unless they replay the original
+        // cached terminal result for the same durable invocation.
+        ToolResultStatus::Skipped => "failed",
     }
 }
 

@@ -6,13 +6,13 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
-mod bridge_turn;
 mod canonical_tool_pairing;
 mod context_identity;
 mod context_window;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
+mod phase_receipt;
 mod provider_contract;
 mod result_quality;
 mod resume;
@@ -26,19 +26,15 @@ mod session_handoff;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
+mod turn_provenance;
 mod user_intent;
 
 pub use agent_communication::{
     AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
-    AgentCommunicationParty, AgentCommunicationTarget,
+    AgentCommunicationParty, AgentCommunicationPayloadKind, AgentCommunicationTarget,
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
-pub use bridge_turn::{
-    BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD, BRIDGE_TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
-    BridgeTurnMessageProvenanceError, BridgeTurnMessageProvenanceV1,
-    bridge_turn_message_provenance, clear_bridge_turn_message_provenance, mark_bridge_turn_message,
-};
 pub use canonical_tool_pairing::{CanonicalToolPairingError, validate_canonical_tool_pairing};
 pub use context_identity::{
     ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
@@ -52,12 +48,16 @@ pub use inference::{
     client_direct_execution_field,
 };
 pub use memory_ranking::{
-    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
-    is_persistent_type, partition_by_scope, sort_by_retrieval_score,
+    MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
+    freshness_suffix_for, is_persistent_type, partition_by_scope, sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
+};
+pub use phase_receipt::{
+    TURN_PHASE_EVENT_TYPE, TURN_PHASE_SCHEMA_VERSION, TurnPhaseKindV1, TurnPhaseOutcomeV1,
+    TurnPhaseReceiptV1,
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
@@ -80,8 +80,7 @@ pub use resume::{
     RESUME_BUNDLE_SCHEMA_VERSION, ResumeActivationProjectionV1, ResumeBundleV1, ResumeCandidateV1,
     ResumeCheckpointProjectionV1, ResumeDegradedReasonV1, ResumeDescriptorV1,
     ResumeProjectionSetV1, ResumeProviderProjectionV1, ResumeRepairActionV1, ResumeSelectionError,
-    ResumeSourceV1, ResumeTaskProjectionV1, cursor_relation, legacy_resume_cursor,
-    select_resume_bundle, select_resume_candidate_index,
+    ResumeSourceV1, cursor_relation, select_resume_bundle, select_resume_candidate_index,
 };
 pub use runtime_scaffolding::{
     RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,
@@ -139,6 +138,11 @@ pub use tool_invocation::{
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
     ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
     canonical_public_tool_arguments,
+};
+pub use turn_provenance::{
+    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
+    mark_turn_message, turn_message_provenance,
 };
 pub use user_intent::{
     ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,

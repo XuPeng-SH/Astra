@@ -36,11 +36,11 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | Triggers + fire + delete + DB | `journey_full` | `triggers_contract` |
 | Marketplace probe | `journey_full` | `marketplace_contract` |
 | Data versioning lineage | `journey_full` | `data_versioning_contract` |
-| Replay compare | `journey_full` | `replay_contract` |
-| `GET /models` (authenticated list) | `journey_full` + `e2e_matrix_models` | — |
+| Replay fail-closed guardrails (owned 501; foreign/missing 404; no replay rows) | `journey_full` + `replay_*_unavailable_guardrail` | — (positive durable replay contract unimplemented) |
+| `GET /models` (authenticated paginated catalog) | `journey_full` + `e2e_matrix_models` | cursor continuation, global total, revision stability |
 | Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
 | `POST /branches/cost-estimate` (JWT + estimate fields; 401 without auth) | `e2e_matrix_branches_cost_estimate_http` | `branches_contract` (stub; different surface) |
-| `GET /admin/tokens` (403 → grant `astra_admin` → 200 array) | `e2e_matrix_admin_tokens_smoke` | — |
+| `GET /admin/tokens` (403 → grant `astra_admin` → 200 array) | `e2e_matrix_saas_admin_tokens_rbac_smoke` | — |
 | Delegation `GET .../delegations` + `POST .../delegate` validation failure (`400`) | `e2e_matrix_delegate_http_boundaries` | — |
 | Reflect + decision-trace (authenticated) | `journey_full` (`GET .../reflect`, `GET .../decision-trace`) | `reflect_contract` (stub) |
 | Skill config CRUD (in-memory stub) | — (future E2E or `astra-runtime` unit tests) | `skill_config_contract` |
@@ -48,8 +48,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | `POST /streaming/chat` (stub `X-User-Id`) | — (prod uses configured `StreamingService`; `journey_extended` covers `POST /chat/stream` SSE) | `streaming_contract` |
 | Route registration (no accidental 404 on major paths) | `runtime/src/server/router_builder.rs` `#[cfg(test)]` (`route_count_regression`, `critical_route_paths_exist`, `all_api_groups_have_routes`) + Matrix `journey_full` | `route_registry_contract` (HTTP smoke) |
 | `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
-| `/health` includes `persist_ok` / `persist_fail` | `http_contract` + `fixtures/contracts/http_shell_contract.json` | `persist_counter_contract` |
-| Global `PERSIST_*` atomics increment | `runtime/src/bridge/side_effects.rs` `#[cfg(test)]` | `persist_counter_contract` |
 | Thinking models: `reasoning_content` on every assistant+`tool_calls` after mid-session switch / DB recovery | `runtime/src/turn/edge_ledger.rs` `#[cfg(test)]` (`mid_session_switch_*`, `append_recovered_events` + `strip_stale_reasoning` pipeline) | — (avoid extra integration binary) |
 
 ## Large integration binaries (audit — not removed in this pass)
@@ -58,19 +56,17 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 |--------|------|-------------|----------------|
 | `improvement_proofs.rs` | Token/budget/compaction **proofs** vs baselines | None (no HTTP/DB) | **Keep**; move overlapping cases into `astra-runtime` unit tests only if duplicates appear in `src/`. |
 | `utterance_regression.rs` | Utterance/tool-selection regression | Partial overlap with `phase8_regression` / cloud routing | **Keep** for NLP surface; dedupe individual cases incrementally if two tests assert the same ranking. |
-| `bridge_e2e_comprehensive.rs` | 13 E2E tests covering persistence, multi-turn, cancellation, errors via `bridge-e2e-hooks` mock LLM | `chat_turn_bridge_ledger_inject_e2e`, `edge_cloud_round_trip_e2e` | **Keep**; uses `test_llm_rounds` for deterministic testing without real LLM. |
+| `web_agent_e2e.rs` | Real `/chat/stream` journeys for CLI+Server, Server-only, and Edge+Server, including multi-round, cancellation, callback isolation, and errors | Supersedes the deleted client-owned bridge binaries | **Keep**; one production loop with deterministic provider fixtures. |
 | Chat turn **pure helpers** (stall, state, persist, routing, cloud/history, …) | `#[cfg(test)]` next to each module under `crates/runtime/src/turn/` | Removed ~33 `chat_turn_*_contract.rs` + matching `fixtures/contracts/chat_turn_*.json` (duplicated JSON snapshots) |
 | Run/chat lifecycle (stub `RunLifecycleService` + `/chat/stream` SSE) | — (Matrix journeys exercise `/runs` list and `journey_tasks_runs` for pause/resume) | `chat_lifecycle_contract` |
-| Memory prefetch (`prefetch_memories` + mock Memoria HTTP) | `bridge_inprocess.rs` unit tests around `prefetch_memories` | `memory_prefetch_contract` |
+| Memory prefetch + mock Memoria HTTP | server loop/context unit tests | `memory_prefetch_contract` |
 | Token / context budget / retrieval JSON tables | `crates/runtime/src/prompts/mod.rs`, `context.rs` `#[cfg(test)]` | `token_retrieval_contract` + `token_retrieval_contract.json` |
 
-## Chat turn / bridge (what remains)
+## Developer-loop coverage
 
-- **Stub integration:** `bridge_e2e_comprehensive.rs` (13 tests) + `edge_cloud_round_trip_e2e.rs` (16 tests) + `chat_turn_bridge_ledger_inject_e2e.rs` — fast CI path without MatrixOne via `bridge-e2e-hooks` feature + `test_llm_rounds` mock mechanism.
-- **Logic:** prefer `src/turn/*` unit tests; extend those modules (or Matrix `system_matrix_http_e2e`) instead of new top-level `*_contract.rs` binaries.
-- **`/chat/stream` bridge fallback** (lifecycle unconfigured): `runtime/src/server/chat_handlers.rs` → `chat_stream_bridge_fallback_tests` (`#[cfg(test)]`, was `chat_stream_bridge_fallback_contract.rs`).
-- **Bridge hook DB side effects** (`build_turn_hook_args` → `run_bridge_hook_side_effects`): `runtime/src/bridge/side_effects.rs` → `inprocess_hook_contract_tests` (`#[cfg(test)]`, was `inprocess_hook_contract.rs`).
-- **LLM stream failures (in-process bridge):** `runtime/src/turn/llm_request_dump.rs` — writes `~/.astra/sessions/<id>/llm_error_*.json` and emits `llm_request_dump` via `TurnAuxiliaryEventWriter` from `bridge_inprocess.rs` error paths.
+- **Topology journeys:** `web_agent_e2e.rs` proves CLI+Server single admission, Server-only internal tools, Edge+Server callbacks, offline blocking, and unknown-run isolation.
+- **Durability:** `system_matrix_http_e2e` owns fail-closed replay guardrails, concurrency, callback, and retention coverage; positive replay remains reserved until durable reconstruction exists.
+- **Logic:** prefer unit tests beside the canonical server loop and provider transports; do not introduce a second loop-shaped integration harness.
 
 ## Services crate
 
@@ -92,6 +88,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 
 ## How to run
 
-- Offline slice: `make test-offline` (workspace + bridge hooks; no online `#[ignore]` suites).
+- Offline slice: `make test-offline` (workspace + server E2E hooks; no online `#[ignore]` suites).
 - Full validation with MatrixOne: `make test` (`test-offline` then `test-online`) or run `make test-online` alone when you only need ignored suites.
 - Advanced: set `ASTRA_TEST_DB_IT=1` / `ASTRA_TEST_DB_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).

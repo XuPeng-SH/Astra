@@ -178,7 +178,7 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
             if !keep {
                 return None;
             }
-            astra_turn_types::clear_bridge_turn_message_provenance(&mut message);
+            astra_turn_types::clear_turn_message_provenance(&mut message);
             Some(message)
         })
         .collect::<Vec<_>>();
@@ -215,6 +215,52 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
             // Tool messages are admitted only by `append_complete_tool_group`,
             // which guarantees that every retained result has a matching call.
             _ => index += 1,
+        }
+    }
+    Ok(out)
+}
+
+/// Project a successfully completed turn into durable conversational meaning.
+///
+/// Completed tool call/result frames are execution evidence owned by the run
+/// transcript and recovery checkpoint, not by every future model request. This
+/// projection intentionally has no generic recent-message cap: the caller
+/// passes one canonical turn delta, and dropping its opening user message would
+/// make the resulting suffix structurally invalid.
+pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    for message in &messages {
+        if message
+            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+            .is_some()
+        {
+            astra_turn_types::user_turn_semantics(message)?;
+        }
+    }
+
+    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut has_user_context = false;
+    for message in messages.into_iter().skip(start) {
+        if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true)
+            || is_runtime_owned_message(&message)
+        {
+            continue;
+        }
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "assistant" && contains_tool_call_frame(&message) {
+            continue;
+        }
+        if !matches!(role, "user" | "assistant" | "system") {
+            continue;
+        }
+        if role == "assistant" && !has_user_context {
+            continue;
+        }
+        if let Some(projected) = canonical_text_message(&message, role, role == "user") {
+            out.push(projected);
+            has_user_context |= role == "user";
         }
     }
     Ok(out)

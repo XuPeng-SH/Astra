@@ -1,6 +1,7 @@
 {
   "name": "@astra/sdk",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -43,7 +44,8 @@
   },
   "overrides": {
     "esbuild": "^0.28.1",
-    "undici": "7.28.0"
+    "postcss": "^8.5.23",
+    "undici": "7.29.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",

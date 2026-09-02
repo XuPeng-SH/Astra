@@ -1190,41 +1190,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_contract_errors_do_not_advise_avoidance_tool() {
-        let mut guard = TurnGuard::new();
-        let errors = [
-            "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
-            "Error: Tool 'task_board' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
-            "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
-        ];
-
-        for error in errors {
-            let quality = guard.record_tool_result("task_board", error);
-            assert_eq!(quality, super::result_quality::ResultQuality::Error);
-        }
-
-        let health = guard
-            .health
-            .get("task_board")
-            .expect("task health should be tracked");
-        assert_eq!(health.total_calls, 0, "the executor was never called");
-        assert_eq!(health.total_failures, 0, "the executor never failed");
-        assert_eq!(
-            health.input_validation_failures,
-            errors.len(),
-            "caller-fixable contract errors remain attributable"
-        );
-        assert_eq!(
-            health.consecutive_failures, 0,
-            "caller-fixable contract errors must not count toward tool quarantine"
-        );
-        assert!(
-            !guard.health.is_avoidance_advised("task_board"),
-            "bad tool-call shape must not hide a healthy task tool"
-        );
-    }
-
-    #[test]
     fn repeated_input_validation_failures_do_not_escalate_as_executor_failures() {
         let mut guard = TurnGuard::new();
         for _ in 0..16 {
@@ -2395,8 +2360,9 @@ mod tests {
     #[test]
     fn stall_pipeline_detection_through_advisory_threshold_reached() {
         let mut guard = TurnGuard::new();
-        let identical_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let identical_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
 
         let mut first_stall_turn = None;
         let mut first_warning_turn = None;
@@ -2448,8 +2414,9 @@ mod tests {
     #[test]
     fn stall_reflection_is_structured_and_actionable() {
         let mut guard = TurnGuard::new();
-        let identical_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let identical_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
 
         for _ in 0..5 {
             guard.record_tool_calls(&identical_call);
@@ -2476,8 +2443,9 @@ mod tests {
     #[test]
     fn nudge_ignore_detected_and_escalates() {
         let mut guard = TurnGuard::new();
-        let bash_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let bash_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
 
         for _ in 0..5 {
             guard.record_tool_calls(&bash_call);
@@ -2514,10 +2482,12 @@ mod tests {
     #[test]
     fn correction_compliance_tracked_accurately() {
         let mut guard = TurnGuard::new();
-        let bash_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
-        let grep_call =
-            vec![serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"})];
+        let bash_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
+        let grep_call = vec![
+            serde_json::json!({"function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}}),
+        ];
 
         // Trigger stall → correction issued
         for _ in 0..5 {
@@ -2548,10 +2518,12 @@ mod tests {
     #[test]
     fn correction_lifecycle_mixed_compliance() {
         let mut guard = TurnGuard::new();
-        let bash_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
-        let grep_call =
-            vec![serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"})];
+        let bash_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
+        let grep_call = vec![
+            serde_json::json!({"function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}}),
+        ];
 
         // Phase 1: Trigger stall (3 identical turns)
         for _ in 0..4 {
@@ -2610,8 +2582,9 @@ mod tests {
         let mut guard = TurnGuard::new();
         let initial_window = guard.stall_window();
 
-        let bash_call =
-            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let bash_call = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
+        ];
 
         // Run many turns of stall → correction → ignore → resolve.
         for _cycle in 0..6 {

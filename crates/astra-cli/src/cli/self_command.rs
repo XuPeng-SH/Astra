@@ -1230,6 +1230,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
+        JournalEventType::SubsystemDiagnostic => "subsystem_diagnostic",
+        JournalEventType::SubsystemSettled => "subsystem_settled",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
@@ -1667,11 +1669,54 @@ mod tests {
         }
     }
 
+    fn typed_resume_bundle(
+        session_id: &str,
+        turn_count: u32,
+        messages: Vec<serde_json::Value>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let sequence = u64::from(turn_count);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: turn_count,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: None,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }],
+        )
+        .expect("valid test resume bundle")
+    }
+
     async fn mock_cloud_resume(
         server: &MockServer,
         session_id: &str,
         restored: &astra_services::session_restore::RestoredSession,
     ) {
+        let mut restored = restored.clone();
+        if restored.resume_bundle.is_none() {
+            restored.resume_bundle = Some(typed_resume_bundle(
+                session_id,
+                restored.turn_count,
+                restored.conversation_messages.clone(),
+            ));
+        }
+        restored.conversation_messages.clear();
         Mock::given(method("POST"))
             .and(path(format!("/sessions/{session_id}/resume")))
             .respond_with(ResponseTemplate::new(200).set_body_json(restored))
@@ -1760,7 +1805,6 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("finish the engine".to_string());
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
         ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
@@ -1862,7 +1906,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
-        assert_eq!(value["run"]["goal"], "finish the engine");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["recent_steps"][0]["event_type"], "turn");
         assert!(
             value["environment"]["last_context_trace_preview"]
@@ -2108,7 +2152,6 @@ mod tests {
 
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
-        workspace.plan_goal = Some("ship cloud restore".to_string());
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),
@@ -2138,7 +2181,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
         assert_eq!(value["run"]["turn_count"], 3);
-        assert_eq!(value["run"]["goal"], "ship cloud restore");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["environment"]["cwd"], "/srv/cloud-repo");
         assert_eq!(value["environment"]["model"], "gpt-5.4");
         assert_eq!(

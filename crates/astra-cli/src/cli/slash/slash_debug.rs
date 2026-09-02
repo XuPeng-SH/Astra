@@ -36,8 +36,18 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
         resolve_session_id(arg.trim())
     };
 
-    let base = session_dir(&session_id);
-    let journal_path = session_journal_path(&session_id);
+    // Server-owned runs persist their full journal/checkpoints under the
+    // authenticated user, while the legacy CLI mirror uses the process-local
+    // profile owner. Diagnostics must follow the same authenticated owner as
+    // event ingestion or they can report "No data" for a live, observable
+    // session. Never scan unrelated owner partitions.
+    let owner = state
+        .ingestion_user_id
+        .as_deref()
+        .and_then(|user_id| astra_services::OwnerScope::user(user_id).ok())
+        .unwrap_or_else(astra_services::OwnerScope::local_user);
+    let base = session_dir_for_owner(&owner, &session_id);
+    let journal_path = session_journal_path_for_owner(&owner, &session_id);
 
     // Load data sources.
     let turns = load_journal_turns(&journal_path);
@@ -345,13 +355,9 @@ fn inspect_turn(
         "[7]".magenta()
     );
     eprintln!("  {} summary  — journal turn summary", "[6]".magenta());
-    eprintln!(
-        "  {} fork     — fork session from this turn",
-        "[f]".magenta()
-    );
 
     loop {
-        eprint!("  What to inspect? [1-6, 7, f, b to go back]: ");
+        eprint!("  What to inspect? [1-7, b to go back]: ");
         io::stderr().flush().ok();
         let Some(line) = read_line() else { return };
         let line = line.trim().to_lowercase();
@@ -366,7 +372,6 @@ fn inspect_turn(
             "5" => dump_turn_json(view, summary, session_id, turn_n, false),
             "6" => show_summary(summary),
             "7" => dump_turn_json(view, summary, session_id, turn_n, true),
-            "f" | "fork" => fork_from_turn(session_id, turn_n),
             _ => eprintln!("  {}", "Invalid choice".yellow()),
         }
     }
@@ -714,14 +719,15 @@ fn resolve_session_id(input: &str) -> String {
     input.to_string()
 }
 
-fn session_dir(session_id: &str) -> PathBuf {
+fn session_dir_for_owner(owner: &astra_services::OwnerScope, session_id: &str) -> PathBuf {
     let store = astra_services::local_session_artifact_store();
-    astra_services::SessionArtifactStore::session_dir(&store, session_id)
-        .expect("session id must resolve owner-bound debug session directory")
+    astra_services::SessionArtifactStore::session_dir_for_owner(&store, owner, session_id)
+        .expect("session id must resolve authenticated owner-bound debug directory")
 }
 
-fn session_journal_path(session_id: &str) -> PathBuf {
-    astra_services::session_journal::journal_file_path(session_id)
+fn session_journal_path_for_owner(owner: &astra_services::OwnerScope, session_id: &str) -> PathBuf {
+    astra_services::session_journal::journal_file_path_for_owner(owner, session_id)
+        .expect("session id must resolve authenticated owner-bound debug journal")
 }
 
 #[derive(Debug)]
@@ -1092,32 +1098,6 @@ fn show_correction_timeline(session_id: &str) {
     eprintln!();
 }
 
-// ── Fork from turn ──────────────────────────────────────────────────────────
-
-fn fork_from_turn(session_id: &str, turn_n: usize) {
-    let opts = astra_services::session_fork::ForkSessionOptions {
-        parent_session_id: session_id.to_string(),
-        new_session_id: None,
-        label: Some(format!("debug-fork-at-turn-{turn_n}")),
-        forked_after_turn: Some(turn_n as u32),
-        data_branch: None,
-        snapshot_spec: None,
-    };
-    match astra_services::session_fork::fork_local_session(opts) {
-        Ok(result) => {
-            let short = &result.new_session_id[..8.min(result.new_session_id.len())];
-            eprintln!(
-                "  {} Forked → {} ({} events copied, label: debug-fork-at-turn-{})",
-                theme::icon_ok(),
-                short.green(),
-                result.events_copied,
-                turn_n,
-            );
-        }
-        Err(e) => eprintln!("  {} Fork failed: {}", theme::icon_err(), e),
-    }
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn read_line() -> Option<String> {
@@ -1303,7 +1283,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
         std::fs::write(&path, concat!(
-            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"bridge_inprocess","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"server_loop","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
             r#"{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"s1","turn":2,"agentic_step":4,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":3,"turns_completed":4,"remaining_turns":0}}}"#, "\n",
             r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":2,"user_input":"continue","assistant_output":"done","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"visible_tools":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000}"#, "\n",
         )).unwrap();
@@ -1313,7 +1293,7 @@ mod tests {
         assert_eq!(turns[0].llm_rounds[0].agentic_step, Some(4));
         assert_eq!(
             turns[0].llm_rounds[0].source.as_deref(),
-            Some("bridge_inprocess")
+            Some("server_loop")
         );
         assert_eq!(turns[0].interruptions.len(), 1);
         assert_eq!(turns[0].interruptions[0].kind, "budget_exhausted");

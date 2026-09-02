@@ -289,19 +289,19 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         messages,
     );
     let mut units = Vec::<Vec<usize>>::new();
-    let mut active_bridge_turn: Option<&str> = None;
+    let mut active_turn_chain: Option<&str> = None;
     for (idx, message) in messages.iter().enumerate() {
         let role = message.get("role").and_then(Value::as_str);
         if role == Some("system") {
             continue;
         }
-        let bridge_turn = message
-            .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+        let turn_provenance = message
+            .get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
             .and_then(Value::as_object)
             .filter(|provenance| {
                 provenance.get("schema_version").and_then(Value::as_u64)
                     == Some(u64::from(
-                        astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+                        astra_turn_types::TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
                     ))
             })
             .and_then(|provenance| provenance.get("turn_chain_id"))
@@ -309,10 +309,10 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
             .filter(|turn_chain_id| !turn_chain_id.is_empty());
         let starts_unit = units.is_empty()
             || (role == Some("user")
-                && (bridge_turn.is_none() || bridge_turn != active_bridge_turn));
+                && (turn_provenance.is_none() || turn_provenance != active_turn_chain));
         if starts_unit {
             units.push(Vec::new());
-            active_bridge_turn = bridge_turn;
+            active_turn_chain = turn_provenance;
         }
         if let Some(unit) = units.last_mut() {
             unit.push(idx);
@@ -609,7 +609,6 @@ mod tests {
     use crate::section_types::{CompressionPriority, PlannedSection, SectionSource};
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
-    use std::collections::HashMap;
 
     fn build_test_plan_and_bound() -> (ContextPlan, ContextBound, SessionLatches) {
         let statics = StaticSections::test_default();
@@ -637,8 +636,6 @@ mod tests {
             tool_results: vec![],
             tokens: TokenAccounting::default(),
             active_skills: vec![],
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 10,
             turn_index: 1,
             recovery: RecoveryState::default(),
             last_user_message: "test".into(),
@@ -1130,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn round_dropping_keeps_guidance_in_the_same_active_bridge_turn_atomic() {
+    fn round_dropping_keeps_guidance_in_the_same_active_turn_chain_atomic() {
         let mut messages = vec![
             serde_json::json!({"role": "user", "content": "old request"}),
             serde_json::json!({"role": "assistant", "content": "old answer"}),
@@ -1140,7 +1137,7 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "continued progress"}),
         ];
         for message in &mut messages[2..] {
-            assert!(astra_turn_types::mark_bridge_turn_message(
+            assert!(astra_turn_types::mark_turn_message(
                 message,
                 "chain-current"
             ));

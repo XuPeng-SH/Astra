@@ -155,8 +155,10 @@ impl<'a> CompactCtx<'a> {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token,
+            execution_time_budget: None,
             run_control: None,
             incremental_state: self.incremental_state.clone(),
+            request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
             stream_json_emitter: None,
@@ -183,8 +185,6 @@ impl<'a> CompactCtx<'a> {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: None,
-            task_notify_tx: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
@@ -192,10 +192,10 @@ impl<'a> CompactCtx<'a> {
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,
+            workspace_observation_quarantine: self.state.workspace_observation_quarantine.clone(),
             idempotency_cache: None,
             pre_loaded_messages,
             append_system_prompt: None,
-            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: Some(self.state.harness_sink.clone()),
             #[cfg(feature = "harness")]
@@ -416,11 +416,10 @@ fn append_history_edit_rollback_error(
 /// Create and bind a fresh server session without owning any presentation.
 /// Both the text CLI and TUI call this transaction; each surface renders its
 /// own acknowledgement after the authoritative `SessionState` rebind lands.
-pub(crate) async fn start_fresh_session(
+async fn create_server_session_identity(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     token: &str,
-    state: &mut SessionState,
 ) -> Result<String, String> {
     let body = api
         .post_sessions_json(token, &serde_json::json!({}))
@@ -440,6 +439,42 @@ pub(crate) async fn start_fresh_session(
         &session_id,
         "slash_state:clear_starts_fresh_session",
     );
+    Ok(session_id)
+}
+
+/// Bind the first authoritative identity to an otherwise sessionless runtime.
+///
+/// Startup may already have installed long-lived producers (notably the
+/// dynamic-agent spawner) against the pristine session-scoped registries.
+/// Initial identity discovery is not a session transition, so rotating those
+/// registries here would split producers from their consumers. Actual session
+/// transitions continue to go through [`start_fresh_session`].
+pub(crate) async fn bind_initial_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    if state.session_id.is_some()
+        || state.run_id.is_some()
+        || state.turn != 0
+        || !state.history.is_empty()
+    {
+        return Err("initial session identity requires a pristine sessionless runtime".to_string());
+    }
+    let session_id = create_server_session_identity(api, profile, token).await?;
+    state.set_session_id(session_id.clone());
+    crate::cli::session::session_startup::initialize_journal_pub(state, &session_id);
+    Ok(session_id)
+}
+
+pub(crate) async fn start_fresh_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    let session_id = create_server_session_identity(api, profile, token).await?;
     state.prepare_for_session_rebind().await;
     state.reset_for_new_session();
     state.set_session_id(session_id.clone());
@@ -894,14 +929,19 @@ pub(crate) async fn handle_state_command(
                 profile,
                 incremental_state: Some(inc_state),
             };
+            // `stream_chat_sse` carries the complete turn/runtime state
+            // machine. Keep that large future behind one heap boundary so
+            // `/compact` does not inline it into this already broad slash
+            // command future and overflow ordinary 2 MiB executor stacks.
+            let compact_inference = Box::pin(stream_chat_sse(compact_ctx.build_params(
+                prompts::COMPACT_UNIFIED_PROMPT,
+                true,
+                &mut auto_pm,
+                Some(cancel_token.clone()),
+                pre_messages,
+            )));
             let unified_result = tokio::select! {
-                r = stream_chat_sse(compact_ctx.build_params(
-                    prompts::COMPACT_UNIFIED_PROMPT,
-                    true,
-                    &mut auto_pm,
-                    Some(cancel_token.clone()),
-                    pre_messages,
-                )) => r,
+                r = compact_inference => r,
                 _ = tokio::signal::ctrl_c() => {
                     cancel_token.cancel();
                     eprintln!("{}", "  Interrupted.".dim());
@@ -1132,7 +1172,7 @@ pub(crate) async fn handle_state_command(
                     .dim()
                 );
             }
-            if state.plan_mode_active() || state.executing_plan.is_some() {
+            if state.plan_mode_active() {
                 eprintln!(
                     "{}",
                     "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan` or your plan view."
@@ -1730,14 +1770,9 @@ mod state_command_tests {
         state.queued_message = Some("queued".into());
         state.resume_guidance = Some("resume".into());
         state.resume_restricted_tools = vec!["read_file".into()];
-        state.executing_plan_goal = Some("goal".into());
-        state.executing_plan_id = Some("plan-1".into());
-        state.plan_execution_rounds = 3;
         state.last_turn_interrupted = true;
         state.plan_mode_sync_error = Some("sync failed".into());
         state.pending_bg_notifications = vec!["background".into()];
-        state.turns_since_task_use = 5;
-        state.turns_since_task_reminder = 4;
         state.session_lessons_loaded = true;
         state.perm_manager.record_approval("bash", None, false);
         let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
@@ -1778,14 +1813,9 @@ mod state_command_tests {
         assert!(state.queued_message.is_none());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
-        assert!(state.executing_plan_goal.is_none());
-        assert!(state.executing_plan_id.is_none());
-        assert_eq!(state.plan_execution_rounds, 0);
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.pending_bg_notifications.is_empty());
-        assert_eq!(state.turns_since_task_use, 0);
-        assert_eq!(state.turns_since_task_reminder, 0);
         assert!(!state.session_lessons_loaded);
         assert!(state.journal.is_some());
         assert!(state.root_mailbox.is_none());

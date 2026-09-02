@@ -47,7 +47,8 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
 	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
@@ -139,7 +140,7 @@ DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
-STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_BRIDGE_SECRET MEMORIA_MASTER_KEY
+STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
 
 # Per-test-case hard budget. Any case running longer than the budget is
@@ -589,7 +590,7 @@ stack-env:
 	}; \
 	ensure_secret ASTRA_JWT_SECRET; \
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
-	ensure_secret ASTRA_BRIDGE_SECRET; \
+	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
 	echo "Edit required embedding config before running: make stack-up"
 
@@ -941,7 +942,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
+.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online validate-capability-matrix
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -951,8 +952,12 @@ test-dashboard: ## Build astra-test and launch live dashboard
 
 .PHONY: test-offline
 # Run the focused runtime profile gate first so provider/surface regressions fail
-# before the broader workspace, bridge-hook, SDK, and web offline suites.
-test-offline: sweep test-runtime-profiles test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+# before the broader workspace, server E2E-hook, SDK, and web offline suites.
+test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-runtime-e2e-hooks test-sdk-offline test-web-offline
+
+.PHONY: validate-capability-matrix
+validate-capability-matrix:
+	@python3 scripts/e2e/validate_capability_matrix.py
 
 .PHONY: test-runtime-profiles
 test-runtime-profiles: test-server-only test-server-edge test-managed-runtime test-cli-local
@@ -979,8 +984,8 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::subrun_turn_budget
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks cli_thin_client_single_admission_completes_server_owned_multi_round_loop
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/chat-input-route.test.ts \
@@ -992,8 +997,8 @@ test-server-only:
 test-server-edge:
 	@echo "Running focused server+edge provider tests..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-edge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::edge_profile_can_declare_read_only_workspace_authority
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_execution_bindings_make_edge_provider_explicit
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::request_bindings_without_server_workspace_require_typed_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_does_not_infer_execution_bindings
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::turn_start_lifecycle_summary_reports_edge_provider_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_composes_server_owned_tools_with_edge_declared_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::offline_edge_blocking_does_not_require_sse_event_channel
@@ -1005,9 +1010,9 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_selected_executor_does_not_route_to_other_connected_edge
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_offline_or_unknown_status_blocks_without_dispatch
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/work-surface.test.ts \
@@ -1033,7 +1038,7 @@ test-managed-runtime:
 test-cli-local:
 	@echo "Running focused CLI-local provider tests..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib capabilities::tests::cli_local_catalog_filters_builtin_source_by_provider_ownership
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-cli --lib edge_tools::tests::schema_tests::local_cli_catalog_uses_runtime_env_surface_for_local_runtime
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-cli --lib edge_tools::tests::schema_tests::local_cli_catalog_exposes_the_root_work_lifecycle
 
 # Fast correctness gate for the no-sticky control plane. This intentionally
 # stays out of the default test targets: it is focused evidence for LB/session
@@ -1052,13 +1057,12 @@ test-workspace: sweep
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
-# Compiles chat/turn bridge hook paths and runs integration binaries that require
-# `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
-.PHONY: test-runtime-bridge-hooks
-test-runtime-bridge-hooks: sweep
-	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
+# Compiles deterministic model/edge hooks used by runtime system journeys.
+.PHONY: test-runtime-e2e-hooks
+test-runtime-e2e-hooks: sweep
+	@echo "Running astra-runtime tests with feature e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
+		--features e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
@@ -1081,22 +1085,22 @@ test-ignored-integration:
 			JOBS_FLAG="-j 1"; \
 			echo "Online integration tests: serial mode (ASTRA_TEST_DB_IT_TEST_THREADS=1)"; \
 		else \
-			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
+			echo "Running online integration tests (ignored; live MatrixOne; e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
 		PERF_FAILED=""; \
 		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
 			echo "Running runtime/plan integration and performance tests in one serial build..."; \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
@@ -1104,7 +1108,7 @@ test-ignored-integration:
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) -j 1 \
 				-E 'binary(perf_benchmarks)' \
@@ -1179,6 +1183,12 @@ test-online:
 		ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
 			ASTRA_TEST_DB_IT=1 \
+			ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+			ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+			ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+			ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+			ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			$(MAKE) test-ignored-integration \
 			|| FAILED="$$FAILED test-ignored-integration"; \
 	fi; \
@@ -1243,12 +1253,17 @@ test-saas:
 	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
 	echo "Running SaaS platform E2E (ASTRA_TEST_DB_IT=1, database=$$TEST_DB, --test-threads=1)..."; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+	ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+	ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+	ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+	RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
 	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
 	CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) \
 		-p astra-runtime \
-		--features bridge-e2e-hooks \
+		--features e2e-hooks \
 		--test system_matrix_http_e2e \
 		-- --ignored --nocapture e2e_matrix_saas_ --test-threads=1 \
 	&& ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -1299,13 +1314,18 @@ test-saas-coverage:
 	echo "Running SaaS E2E with llvm coverage (database=$$TEST_DB, --test-threads=1)..."; \
 	echo "NOTE: if tests fail with connection cap, run: make dev-stop"; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+	ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+	ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+	ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+	RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
 	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
 	CARGO_INCREMENTAL=0 cargo llvm-cov test $(CARGO_MANIFEST_FLAG) \
 		--no-report --ignore-run-fail \
 		-p astra-runtime \
-		--features bridge-e2e-hooks \
+		--features e2e-hooks \
 		--test system_matrix_http_e2e \
 		-- --ignored e2e_matrix_saas_ --test-threads=1; \
 	RUNTIME_EXIT=$$?; \
@@ -1435,6 +1455,20 @@ test-harness:
 	[ -n "$${SUMMARIZE:-}" ] && ARGS="$$ARGS --summarize"; \
 	[ -n "$${SUMMARIZE_MODEL:-}" ] && ARGS="$$ARGS --summarize-model $${SUMMARIZE_MODEL}"; \
 	./target/release/astra-test $$ARGS
+
+.PHONY: test-harness-capabilities
+test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, then run model capability probes and prompt variants with DeepSeek Flash
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release --bin astra
+	@mkdir -p target/astra-test-harness/capabilities
+	@./target/release/astra-test --suite crates/astra-test-harness/cases --audit-capabilities
+	@./target/release/astra-test --suite crates/astra-test-harness/cases \
+		--capability-probes --force-model deepseek-v4-flash \
+		--prompt-variants --judger-model deepseek-v4-flash \
+		--artifacts-dir target/astra-test-harness/capabilities/artifacts \
+		--report-file target/astra-test-harness/capabilities/report.json \
+		--eval-file target/astra-test-harness/capabilities/eval.json \
+		--parallel "$${PARALLEL:-1}" --runs "$${RUNS:-1}"
 
 # ============================================================================
 # Code Quality
