@@ -72,6 +72,17 @@ Memoria persists through the shared MatrixOne dependency. Use
 `make dev-deps-clean` when you intentionally need to remove all local
 dependency data; that command prompts before deletion.
 
+## All-in-One first run
+
+| Command | Description |
+| --- | --- |
+| `make stack-setup` | State-aware wizard for embedding preflight, data-preserving stack reconciliation, runtime verification, admin, and model probe |
+| `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
+| `make stack-env` | Create local `.env` and generate secrets without prompting |
+| `make stack-up` | Start the configured Compose stack |
+| `make stack-up STACK_RECREATE=1` | Recreate containers and network attachments while preserving volumes |
+| `make stack-verify` | Verify health and a memory round trip |
+
 ## Useful Direct Cargo Commands
 
 ```bash

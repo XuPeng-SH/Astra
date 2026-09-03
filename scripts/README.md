@@ -13,7 +13,7 @@ scripts/
 ├── load/     # capacity probes, mock provider, reports, and unit tests
 ├── ops/      # deployment, health, backup, and restore helpers
 ├── schema/   # schema inventory and its contract tests
-├── setup/    # demo environment initialization
+├── setup/    # interactive stack and demo environment initialization
 └── *.sh/*.py # release, production-baseline, and diagram utilities
 ```
 
@@ -81,6 +81,18 @@ dotenv values in setup or deployment scripts.
 
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
+
+### `scripts/setup/stack-setup.sh`
+Runs the human-facing first-run flow behind `make stack-setup`. It validates the
+embedding endpoint before startup, inventories current Compose state, repairs
+disconnected containers without deleting volumes, checks host-port conflicts,
+and gives explicit retry/stop/inspect choices. It keeps keys out of output,
+verifies the complete stack, and delegates admin/model configuration to
+`astra admin setup`. Use `make stack-up` and explicit variables for automation.
+
+### `scripts/setup/check_embedding.py`
+Performs the credential-safe OpenAI-compatible embedding probe used by the
+wizard and verifies that the returned vector matches the configured dimension.
 
 ### `scripts/load/multi_cli_capacity_probe.py`
 Runs a stdlib-only concurrent `POST /chat/stream` SSE capacity probe for the
