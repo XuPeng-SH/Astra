@@ -22,7 +22,23 @@ make stack-up
 
 # 4. Verify
 curl http://localhost:17001/health
+
+# 5. Install the prebuilt CLI (no Rust toolchain needed)
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+
+# 6. Bootstrap the admin account and register a model
+astra admin register --username admin --password '<password>'
+astra admin model add MODEL_NAME openai --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
+astra admin model check MODEL_NAME
+
+# 7. First agent response
+astra chat -m "Explain what you can and cannot do in this deployment"
 ```
+
+Steps 1-4 prove the services are up; steps 5-7 prove Astra is usable. The CLI
+defaults to `http://127.0.0.1:17001`; set `ASTRA_API_URL` or pass `--api-url`
+if you remapped `ASTRA_API_PORT`. `model check` reports `is_active` and
+`connectivity`, and a model becomes active only when the probe succeeds.
 
 ## Compose Stack
 

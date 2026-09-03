@@ -77,14 +77,25 @@ Use `astra admin register` to create an administrator account. On a fresh Matrix
 data volume this performs the initial admin bootstrap. After an admin exists,
 `astra admin register` must be run while logged in as an existing admin.
 
+This stack ships `astra-server` but not the `astra` CLI binary. Install the
+prebuilt CLI if you are not building from source:
+
 ```bash
-./target/debug/astra admin --api-url http://127.0.0.1:17001 register \
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+```
+
+```bash
+astra admin --api-url http://127.0.0.1:17001 register \
   --username admin \
   --email admin@example.com \
   --password '<password>'
 
-./target/debug/astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
 ```
+
+When building from source, use `./target/debug/astra` (or
+`./target/release/astra`) in place of `astra` above. `--api-url` can be omitted
+whenever the server listens on the default `http://127.0.0.1:17001`.
 
 `astra admin register` stores the returned admin credentials locally. It prints
 `registered and logged in (initial admin)` for the first admin, and

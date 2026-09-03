@@ -146,15 +146,16 @@ ties Pi, finishes one task behind Hermes, and one ahead of DSH.
 
 ## Quick start
 
-Two supported paths. Start with **Docker** to evaluate Astra without a Rust or
-Node toolchain; **build from source** when you want the `astra` CLI/TUI, the Web
-dashboard, or to change Astra itself. For production topologies, use the
+Two supported paths, both ending at a working agent response. Start with
+**Docker** to evaluate Astra without a Rust or Node toolchain; **build from
+source** when you want the Web dashboard, CLI-local Runner capacity, or to
+change Astra itself. For production topologies, use the
 [getting-started guide](docs/quickstart/README.md).
 
 | Path | What you get | Additional prerequisites |
 | --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images — the HTTP API | Docker Compose and OpenSSL |
-| [From source](#build-from-source) | The same backbone plus the `astra` CLI/TUI, the Web dashboard, and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
+| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus the prebuilt `astra` CLI | Docker Compose and OpenSSL |
+| [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
 Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
 memory needs an embedding API; deterministic mock embeddings are also available
@@ -162,9 +163,14 @@ for local evaluation and tests.
 
 ### Docker
 
+No Rust or Node toolchain. These steps run all the way to a real agent
+response, not just a healthy port.
+
+#### 1. Start the stack
+
 ```bash
-git clone https://github.com/matrixorigin/astra.git
-cd astra
+git clone https://github.com/matrixorigin/Astra.git
+cd Astra
 
 make stack-env
 ```
@@ -187,13 +193,63 @@ curl http://localhost:17001/health
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
 
+#### 2. Install the CLI
+
+The stack ships `astra-server`, not the CLI. Install the prebuilt `astra`
+binary to drive it — Linux and macOS, `amd64` and `arm64`:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+astra health
+```
+
+The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
+so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
+`ASTRA_API_URL` or pass `--api-url` to each command. Pass `-v <version>` to the
+installer, and set `ASTRA_IMAGE` before `make stack-up`, when you need a pinned
+CLI and server pair.
+
+#### 3. Bootstrap the admin account
+
+```bash
+astra admin register --username admin --password '<password>'
+```
+
+On a fresh data volume this performs the initial admin bootstrap, prints
+`registered and logged in (initial admin)`, and stores the credentials in the
+local CLI profile.
+
+#### 4. Register a model
+
+```bash
+astra admin model add MODEL_NAME openai \
+  --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
+astra admin model check MODEL_NAME
+```
+
+`model check` probes the endpoint and reports `is_active` and `connectivity`.
+A model reaches `is_active: true` only when the probe succeeds, so this is the
+step that tells you routing will work. For more than one model, write a
+`.models.yaml` and run
+`astra admin model load .models.yaml --update-existing`.
+
+#### 5. First agent response
+
+```bash
+astra chat -m "Explain what you can and cannot do in this deployment"
+astra session list
+```
+
+You are through the loop when the request returns a model response and
+`session list` shows the durable session it created.
+
 This stack is Server-only by design. Server-side agent turns, memory, planning,
 MCP, and introspection are available, while file, shell, Git, build/test, and
-private-network tools stay unavailable until a Runner connects. Operate it with
-`make stack-status`, `make stack-logs SERVICE=api`, and `make stack-down`. The
-[all-in-one guide](deployment/all-in-one/README.md) covers admin bootstrap,
-model loading, and the server+edge profile; the
-[Docker quick start](docs/quickstart/docker.md) covers ports and
+private-network tools stay unavailable until a Runner connects — which is what
+the answer above should tell you. Operate it with `make stack-status`,
+`make stack-logs SERVICE=api`, and `make stack-down`. The
+[all-in-one guide](deployment/all-in-one/README.md) covers the server+edge
+profile; the [Docker quick start](docs/quickstart/docker.md) covers ports and
 troubleshooting.
 
 ### Build from source
