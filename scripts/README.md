@@ -141,6 +141,17 @@ offline, dependency-free guard against renamed or deleted evidence anchors:
 python3 scripts/e2e/validate_capability_matrix.py
 ```
 
+### `scripts/render_readme_diagrams.py`
+Regenerates the README architecture diagrams under `docs/assets/diagrams/` as
+matching light and dark SVG pairs. Standard library only:
+
+```sh
+python3 scripts/render_readme_diagrams.py
+```
+
+Edit the diagram definitions in this script rather than the generated SVG, then
+commit the regenerated files.
+
 ### Public CLI Installer
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
 
