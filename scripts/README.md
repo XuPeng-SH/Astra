@@ -189,6 +189,18 @@ python3 scripts/render_readme_diagrams.py
 Edit the diagram definitions in this script rather than the generated SVG, then
 commit the regenerated files.
 
+### `scripts/render_readme_demo.py`
+Regenerates the 20-second illustrative context-to-execution walkthrough
+embedded near the top of the README. It uses the repository's Inconsolata
+fonts and dark TUI theme colors, and requires Pillow:
+
+```sh
+python3 scripts/render_readme_demo.py
+```
+
+Keep the flow explicitly labeled as illustrative so the asset explains Astra's
+runtime contract without being mistaken for a captured live session.
+
 ### Public CLI Installer
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
 

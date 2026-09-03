@@ -2,9 +2,9 @@
 
 # Astra
 
-### The context-to-execution runtime for enterprise agents
+### The self-hosted runtime for agents that must act inside private systems
 
-**Right context. Governed actions. Runners where your IT lives. End-to-end traceability.**
+**Durable work. User-bound execution. Policy before action. Evidence after every step.**
 
 [![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
@@ -21,11 +21,30 @@
 
 ---
 
-Astra is an open-source runtime for durable agent work across real enterprise
-systems. It connects what an agent knows to where its work happens: the
-[Context Pipeline](#context-pipeline) assembles the right information, Policy
-governs each action, Runners execute inside the environment that owns the tools
-and data, and Trace records what actually happened.
+Astra is not another coding agent or a library for wrapping one model call. It
+is the open-source, self-hosted runtime behind CLI, Web, and application agents
+that must keep working across requests and reconnects, act inside private
+environments under the right user or enterprise identity, and leave verifiable
+evidence of every action.
+
+| Work survives | Access stays local | Authority stays explicit |
+| --- | --- | --- |
+| Durable Work, checkpoints, retries, and handoffs outlive any request or chat connection. | The Server coordinates; a User Runner executes beside private repositories, tools, data, network, and credentials. | Policy decides who may do what and where before execution; Trace and Audit record what happened afterward. |
+
+Astra includes the Server, CLI/TUI, Web dashboard, APIs, and TypeScript SDK. You
+bring the LLM and embedding endpoints, then connect tools and data through a
+Runner or MCP.
+
+<div align="center">
+  <img alt="Illustrative 20-second Astra flow: a request becomes durable Work on the Server, context and policy determine an execution route, a user-bound Runner acts inside a private environment, and the result returns with trace and audit evidence." src="docs/assets/astra-cli-demo.gif" width="900">
+</div>
+
+<p align="center"><sub>The Server keeps the Work. The Runner keeps private access local. Policy governs the boundary. Trace preserves the evidence.</sub></p>
+
+Use Astra when an agent becomes shared infrastructure across users,
+applications, private networks, and approval boundaries. If all you need is a
+prompt-and-tools loop on one machine, a lighter agent framework or coding agent
+is usually simpler.
 
 > **Context decides what the agent knows. Policy decides what it may do. The
 > Runner carries out the action where the relevant systems live. Trace makes
