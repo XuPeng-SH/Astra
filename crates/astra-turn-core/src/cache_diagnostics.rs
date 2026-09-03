@@ -403,10 +403,40 @@ pub fn prompt_snapshot_from_messages(
     model: &str,
     cache_eligible_tokens: usize,
 ) -> Option<PromptStateSnapshot> {
+    prompt_snapshot_from_messages_with_cache_capability(
+        messages,
+        tool_schemas,
+        provider,
+        model,
+        cache_eligible_tokens,
+        None,
+    )
+}
+
+/// Build a cache snapshot using the same provider capability that shaped the
+/// final message list.
+///
+/// Auto-prefix providers cache the leading system prefix; a runtime-owned
+/// system message after conversation history is a volatile suffix, not a
+/// mutation of that prefix. Exact-history providers intentionally continue to
+/// fingerprint every system message because any such change may invalidate
+/// their whole request.
+pub fn prompt_snapshot_from_messages_with_cache_capability(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+    provider: &str,
+    model: &str,
+    cache_eligible_tokens: usize,
+    explicit_cache_capability: Option<crate::cache_placement::CacheCapability>,
+) -> Option<PromptStateSnapshot> {
+    let cache_capability = crate::cache_placement::CacheCapability::from_explicit_or_provider(
+        explicit_cache_capability,
+        provider,
+    );
     let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
     let snapshot = PromptStateSnapshot::capture_with_hashes(
         hash_str(&system_prompt_text),
-        prompt_snapshot_fingerprint_system_blocks(messages),
+        prompt_snapshot_fingerprint_system_blocks(messages, cache_capability),
         tool_schemas,
         provider,
         model,
@@ -469,11 +499,31 @@ fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
 
 fn prompt_snapshot_fingerprint_system_blocks(
     messages: &[serde_json::Value],
+    cache_capability: crate::cache_placement::CacheCapability,
 ) -> Vec<SystemBlockFingerprint> {
-    prompt_snapshot_selected_message_contents(messages)
-        .into_iter()
-        .flat_map(prompt_snapshot_content_value_blocks)
-        .collect()
+    let prefix_only = matches!(
+        cache_capability.protocol,
+        crate::cache_placement::CacheProtocol::OpenAiAutoPrefix
+    );
+    let mut crossed_conversation_boundary = false;
+    let mut out = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+            crossed_conversation_boundary = true;
+            continue;
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let mut blocks = prompt_snapshot_content_value_blocks(content);
+        if prefix_only && crossed_conversation_boundary {
+            for block in &mut blocks {
+                block.scope = "None".to_string();
+            }
+        }
+        out.extend(blocks);
+    }
+    out
 }
 
 fn prompt_snapshot_content_value_blocks(value: &serde_json::Value) -> Vec<SystemBlockFingerprint> {
@@ -1548,6 +1598,89 @@ mod tests {
         assert_eq!(snapshot.model, "claude");
         assert_eq!(snapshot.cache_eligible_tokens, 42);
         assert_eq!(snapshot.system_prompt_hash, hash_str("Prompt"));
+    }
+
+    #[test]
+    fn auto_prefix_snapshot_excludes_runtime_system_tail_from_stable_system_identity() {
+        let messages = |runtime: &str| {
+            vec![
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "do the work"}),
+                json!({"role": "assistant", "content": "working"}),
+                json!({"role": "system", "content": runtime}),
+            ]
+        };
+        let first = prompt_snapshot_from_messages(
+            &messages("completion settlement revision 1"),
+            &[],
+            "openai",
+            "deepseek-v4-flash",
+            42,
+        )
+        .expect("first snapshot");
+        let second = prompt_snapshot_from_messages(
+            &messages("completion settlement revision 2"),
+            &[],
+            "openai",
+            "deepseek-v4-flash",
+            42,
+        )
+        .expect("second snapshot");
+
+        assert_ne!(first.system_prompt_hash, second.system_prompt_hash);
+        assert_eq!(
+            effective_prefix_system_prompt_hash(&first),
+            effective_prefix_system_prompt_hash(&second),
+            "a changed provider-visible tail is not a changed leading cache prefix"
+        );
+        assert_eq!(first.system_blocks[0].scope, "provider_visible");
+        assert_eq!(first.system_blocks[1].scope, "None");
+    }
+
+    #[test]
+    fn strict_history_snapshot_keeps_runtime_system_change_in_cache_identity() {
+        let capability = crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let messages = |runtime: &str| {
+            vec![
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "do the work"}),
+                json!({"role": "system", "content": runtime}),
+            ]
+        };
+        let first = prompt_snapshot_from_messages_with_cache_capability(
+            &messages("authority 1"),
+            &[],
+            "openai",
+            "gateway-alias",
+            42,
+            Some(capability),
+        )
+        .expect("first snapshot");
+        let second = prompt_snapshot_from_messages_with_cache_capability(
+            &messages("authority 2"),
+            &[],
+            "openai",
+            "gateway-alias",
+            42,
+            Some(capability),
+        )
+        .expect("second snapshot");
+
+        assert_ne!(
+            effective_prefix_system_prompt_hash(&first),
+            effective_prefix_system_prompt_hash(&second)
+        );
+        assert!(
+            first
+                .system_blocks
+                .iter()
+                .all(|block| block.scope != "None")
+        );
     }
 
     #[test]

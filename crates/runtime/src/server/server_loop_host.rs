@@ -1885,6 +1885,11 @@ pub struct CapturedLlmRequest {
     /// Conversation messages after `add_message_cache_breakpoint` was applied
     /// (for Anthropic) or a clone of `state.messages` (otherwise).
     pub messages: Vec<Value>,
+    /// Exact message array after provider-specific system consolidation and
+    /// internal-marker stripping. This is the shape handed to the request-body
+    /// builder; cache regressions must assert on this field rather than the
+    /// earlier assembly representation.
+    pub provider_messages: Vec<Value>,
     /// Number of `cache_control` blocks present in `system_primary` content.
     pub system_cache_control_count: usize,
     /// Whether the last tool schema carries a `cache_control` marker.
@@ -2078,6 +2083,7 @@ fn build_captured_llm_request(
     system_msgs: &[Value],
     tools: &[Value],
     messages: &[Value],
+    provider_messages: &[Value],
     breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
 ) -> CapturedLlmRequest {
     let _ = breakdown; // retained in case future assertions want it
@@ -2150,6 +2156,7 @@ fn build_captured_llm_request(
         system_dynamic: dynamic,
         tools: tools.to_vec(),
         messages: messages.to_vec(),
+        provider_messages: provider_messages.to_vec(),
         system_cache_control_count,
         last_tool_has_cache_control,
         last_message_has_cache_control,
@@ -2457,6 +2464,8 @@ pub struct ServerAgenticLoopHost {
     /// leaves `PromptCacheConfig::default()` behavior (annotations off).
     #[cfg(feature = "e2e-hooks")]
     mock_provider: Option<(String, String)>,
+    #[cfg(feature = "e2e-hooks")]
+    mock_cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     /// Per-turn captured payloads for assertion in tests.
     #[cfg(feature = "e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
@@ -2734,6 +2743,8 @@ pub struct ServerAgenticLoopHostBuilder {
     #[cfg(feature = "e2e-hooks")]
     mock_provider: Option<(String, String)>,
     #[cfg(feature = "e2e-hooks")]
+    mock_cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    #[cfg(feature = "e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     work_planning_bound: bool,
@@ -2808,6 +2819,8 @@ impl ServerAgenticLoopHostBuilder {
             test_work_admission: None,
             #[cfg(feature = "e2e-hooks")]
             mock_provider: None,
+            #[cfg(feature = "e2e-hooks")]
+            mock_cache_capability: None,
             #[cfg(feature = "e2e-hooks")]
             llm_request_capture: None,
             capabilities: crate::capabilities::full_server_capabilities_for_tests(),
@@ -3043,6 +3056,17 @@ impl ServerAgenticLoopHostBuilder {
         model: impl Into<String>,
     ) -> Self {
         self.mock_provider = Some((provider.into(), model.into()));
+        self
+    }
+
+    /// **Test-only.** Declare the cache/request shape independently from the
+    /// provider and model labels, matching production model metadata.
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_mock_cache_capability(
+        mut self,
+        capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Self {
+        self.mock_cache_capability = Some(capability);
         self
     }
 
@@ -3410,6 +3434,8 @@ impl ServerAgenticLoopHostBuilder {
             test_work_admission: self.test_work_admission,
             #[cfg(feature = "e2e-hooks")]
             mock_provider: self.mock_provider,
+            #[cfg(feature = "e2e-hooks")]
+            mock_cache_capability: self.mock_cache_capability,
             #[cfg(feature = "e2e-hooks")]
             llm_request_capture: self.llm_request_capture,
             #[cfg(feature = "e2e-hooks")]
@@ -6981,7 +7007,7 @@ impl ServerAgenticLoopHost {
         let cache_cfg = match &self.mock_provider {
             Some((provider, model)) => {
                 self.resolved_model_name = Some(model.clone());
-                PromptCacheConfig::latch(provider, model)
+                PromptCacheConfig::from_cache_capability(self.mock_cache_capability, provider)
             }
             None => PromptCacheConfig::default(),
         };
@@ -6994,11 +7020,15 @@ impl ServerAgenticLoopHost {
             None => ("openai".to_string(), "server-loop-mock".to_string()),
         };
         let user_content = state.message.clone();
-        let mock_pipeline = self.run_turn_pipeline(
+        let mock_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             &tool_schemas_snapshot,
             &provider_name,
             &model_name_for_pipeline,
+            None,
+            self.mock_cache_capability,
+            None,
+            &[],
             &user_content,
         )?;
         state.last_llm_context_manifest_trace = Some(mock_pipeline.manifest_trace.to_json());
@@ -7031,7 +7061,7 @@ impl ServerAgenticLoopHost {
             api_key: String::new(),
             base_url: String::new(),
             fallback_chain: Vec::new(),
-            cache_capability: None,
+            cache_capability: self.mock_cache_capability,
             thinking_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -7049,13 +7079,23 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
             false,
         );
+        let provider_wire_messages =
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &wire_messages,
+                &provider,
+                mock_llm_cfg.cache_capability,
+            );
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_prompt(&wire_messages, &annotated_tools);
+            pipeline_session.replace_pending_wire_prompt_with_cache_capability(
+                &provider_wire_messages,
+                &annotated_tools,
+                mock_llm_cfg.cache_capability,
+            );
         }
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
             crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                 trace,
-                &wire_messages,
+                &provider_wire_messages,
                 &annotated_tools,
                 if self.full_llm_capture {
                     crate::turn::llm::context::WireTraceDetail::Debug
@@ -7104,6 +7144,7 @@ impl ServerAgenticLoopHost {
                 &system_msgs,
                 &annotated_tools,
                 &annotated_messages,
+                &provider_wire_messages,
                 &mock_pipeline.breakdown,
             );
             if let Ok(mut guard) = cap.lock() {
@@ -10490,8 +10531,7 @@ impl ServerAgenticLoopHost {
             model_name,
             model_context_window,
         );
-        let cache_cfg =
-            PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
+        let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
                 state,
@@ -11420,10 +11460,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let final_answer_settlement_text_only = state.hooks.completion_settlement.text_only;
         let work_settlement_only = state.hooks.completion_settlement.work_settlement_only;
         let cache_cap =
-            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
                 llm_cfg.cache_capability,
                 &llm_cfg.provider,
-                &llm_cfg.model_name,
             );
         // A Work-bound run keeps one stable declaration surface for strict-
         // history providers. This is presentation/cache state only; the
@@ -11497,11 +11536,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
-        let cache_cfg = PromptCacheConfig::from_cache_capability(
-            llm_cfg.cache_capability,
-            &llm_cfg.provider,
-            &llm_cfg.model_name,
-        );
+        let cache_cfg =
+            PromptCacheConfig::from_cache_capability(llm_cfg.cache_capability, &llm_cfg.provider);
         self.remember_resolved_llm_config(&llm_cfg);
 
         // ── 2b. Run the context pipeline ─────────────────────────────────
@@ -11761,6 +11797,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &cache_cfg,
             &self.always_load_tool_names,
         );
+        // From this boundary onward, diagnostics, durable prompt planning,
+        // budget estimation, and the client all consume the provider-final
+        // message projection. The client repeats this idempotent operation as
+        // a defense for standalone callers, but no runtime observer sees the
+        // pre-consolidation approximation anymore.
+        llm_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &llm_messages,
+            &llm_cfg.provider,
+            llm_cfg.cache_capability,
+        );
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
@@ -11811,7 +11857,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.sticky_tool_schemas = final_tools.clone();
         }
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_prompt(&llm_messages, &final_tools);
+            pipeline_session.replace_pending_wire_prompt_with_cache_capability(
+                &llm_messages,
+                &final_tools,
+                llm_cfg.cache_capability,
+            );
         }
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
@@ -20815,7 +20865,7 @@ mod tests {
             state.messages.clone(),
             &mut state,
             &llm_cfg,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
+            &PromptCacheConfig::latch("openai"),
             false,
         );
         assert!(msgs.len() >= 2, "should have system + user messages");
@@ -23754,6 +23804,8 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -29993,6 +30045,7 @@ mod tests {
                 json!({ "role": "system", "content": [{ "type": "text", "text": "x", "cache_control": { "type": "ephemeral" } }] }),
             ],
             &tools,
+            &messages,
             &messages,
             &breakdown,
         );

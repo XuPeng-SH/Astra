@@ -50,6 +50,14 @@ pub(crate) fn cache_capability_from_model_metadata(
             astra_turn_core::cache_placement::VolatilePlacement::Free
         }
     };
+    let volatile_delivery = match value.volatile_delivery {
+        astra_services::PromptCacheVolatileDeliveryData::All => {
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::All
+        }
+        astra_services::PromptCacheVolatileDeliveryData::RequiredOnly => {
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly
+        }
+    };
     let reuse_scope = value.reuse_scope.map(|scope| match scope {
         astra_services::PromptCacheReuseScopeData::ConversationTurns => {
             astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns
@@ -61,8 +69,21 @@ pub(crate) fn cache_capability_from_model_metadata(
     Some(astra_turn_core::cache_placement::CacheCapability {
         protocol,
         volatile_placement,
+        volatile_delivery,
         reuse_scope,
     })
+}
+
+pub(crate) fn compact_strategy_from_model_metadata(
+    value: Option<astra_services::PromptCacheCapabilityData>,
+    provider: &str,
+) -> astra_turn_core::microcompact::CompactStrategy {
+    let explicit = cache_capability_from_model_metadata(value);
+    astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider(
+        explicit,
+        Some(provider),
+    )
+    .compact_strategy
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
@@ -1139,11 +1160,8 @@ pub(crate) fn assemble_context_pipeline(
         })
         .collect();
     let tool_names: Vec<&str> = tool_names_owned.iter().map(String::as_str).collect();
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        input.cache_capability,
-        input.provider,
-        input.model_name,
-    );
+    let cache_cap =
+        CacheCapability::from_explicit_or_provider(input.cache_capability, input.provider);
     if state.pipeline_session.is_none() {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -2071,6 +2089,54 @@ mod context_cache_contract_tests {
         }
     }
 
+    #[test]
+    fn normalized_volatile_delivery_maps_without_behavior_guessing() {
+        let capability =
+            cache_capability_from_model_metadata(Some(astra_services::PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement:
+                    astra_services::PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
+                reuse_scope: None,
+            }))
+            .expect("declared capability");
+
+        assert_eq!(
+            capability.volatile_delivery,
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            "runtime must map the total metadata value without inferring a behavior policy"
+        );
+    }
+
+    #[test]
+    fn declared_volatile_delivery_survives_model_metadata_mapping() {
+        let capability =
+            cache_capability_from_model_metadata(Some(astra_services::PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::RequiredOnly,
+                reuse_scope: Some(astra_services::PromptCacheReuseScopeData::ConversationTurns),
+            }))
+            .expect("declared capability");
+
+        assert_eq!(
+            capability.protocol,
+            astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
+        );
+        assert_eq!(
+            capability.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+        );
+        assert_eq!(
+            capability.volatile_delivery,
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly
+        );
+        assert_eq!(
+            capability.reuse_scope,
+            Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns)
+        );
+    }
+
     fn tool_with_parameter_insert_order(name: &str, parameter_names: &[&str]) -> Value {
         let mut properties = Map::new();
         for parameter_name in parameter_names {
@@ -2103,6 +2169,8 @@ mod context_cache_contract_tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         }
     }
@@ -2248,6 +2316,8 @@ mod context_cache_contract_tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
@@ -2445,7 +2515,7 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "相关的测试够硬核吗？"}),
         ];
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+        let cache_cfg = PromptCacheConfig::latch("openai");
 
         let messages = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
@@ -2497,6 +2567,8 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "问题总结？"}),
         ];
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let cache_capability = strict_history_cache_capability();
+        let cache_cfg = PromptCacheConfig::from_cache_capability(Some(cache_capability), "openai");
         let messages = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
             volatile_preamble: Vec::new(),
@@ -2506,9 +2578,9 @@ mod context_cache_contract_tests {
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
-            model_name: "deepseek-v4-flash",
-            cache_capability: None,
-            cache_cfg: &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
+            model_name: "deployment-alias",
+            cache_capability: Some(cache_capability),
+            cache_cfg: &cache_cfg,
         });
 
         assert_eq!(
@@ -2557,7 +2629,7 @@ mod context_cache_contract_tests {
             );
             let visible_tools = vec![tool("bash")];
             let restricted_tools = HashSet::new();
-            let cache_cfg = PromptCacheConfig::latch("openai", "deepseek-v4-flash");
+            let cache_cfg = PromptCacheConfig::latch("openai");
             let strict_history = strict_history_cache_capability();
             let output = assemble_context_pipeline(LlmContextAssemblyInput {
                 state: &mut state,
@@ -2593,7 +2665,6 @@ mod context_cache_contract_tests {
             crate::turn::llm::client::consolidate_system_messages_for_provider(
                 &wire,
                 "openai",
-                "deepseek-v4-flash",
                 Some(strict_history),
             )
         }
@@ -2654,7 +2725,7 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "gpt-4",
             cache_capability: None,
-            cache_cfg: &PromptCacheConfig::latch("openai", "gpt-4"),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
         });
 
         assert!(
@@ -2672,7 +2743,7 @@ mod context_cache_contract_tests {
         state.message = "continue".to_string();
         state.current_round_index = 1;
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+        let cache_cfg = PromptCacheConfig::latch("openai");
 
         let without_boundary = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
@@ -2761,6 +2832,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2830,6 +2903,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2854,6 +2929,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),

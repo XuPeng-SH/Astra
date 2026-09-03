@@ -11055,9 +11055,16 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             observation_journal: Default::default(),
             session_memory_state: Default::default(),
-            compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-                request.model.as_deref().unwrap_or(""),
-            ),
+            compact_strategy: request
+                .admitted_model_execution
+                .as_ref()
+                .map(|execution| {
+                    crate::turn::llm::context::compact_strategy_from_model_metadata(
+                        execution.cache_capability,
+                        &execution.provider,
+                    )
+                })
+                .unwrap_or_default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -20776,9 +20783,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
         });
 
         // Build edge profile from agent's system prompt and metadata.
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            child_model_name.as_deref().unwrap_or(""),
-        );
+        let compact_strategy = admitted_model_execution
+            .as_ref()
+            .map(|execution| {
+                crate::turn::llm::context::compact_strategy_from_model_metadata(
+                    execution.cache_capability,
+                    &execution.provider,
+                )
+            })
+            .unwrap_or_default();
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(

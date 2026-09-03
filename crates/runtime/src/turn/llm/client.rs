@@ -3175,15 +3175,10 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
-    model_name: &str,
     explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        explicit_cache_capability,
-        provider,
-        model_name,
-    );
+    let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
         || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
             && !matches!(
@@ -3220,6 +3215,7 @@ fn consolidate_system_messages_inner(
     let mut system_blocks: Vec<Value> = Vec::new();
     let mut structured_system = false;
     let mut rest: Vec<Value> = Vec::new();
+    let mut primary_system_seen = false;
 
     let flush_string_parts_into_blocks = |blocks: &mut Vec<Value>, parts: &mut Vec<String>| {
         for part in parts.drain(..) {
@@ -3234,8 +3230,9 @@ fn consolidate_system_messages_inner(
         let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
         let preserve_runtime_control = preserve_runtime_system_tail
             && is_system
-            && crate::turn::wire_assembly::is_runtime_system_context(msg);
+            && (primary_system_seen || crate::turn::wire_assembly::is_runtime_system_context(msg));
         if is_system && !preserve_runtime_control {
+            primary_system_seen = true;
             match msg.get("content") {
                 Some(Value::String(text)) => {
                     if text.is_empty() {
@@ -4122,11 +4119,10 @@ async fn call_llm_and_collect_with_total_budget(
         .map(|observer| observer as &dyn ProviderAttemptObserver);
     let client = global_llm_client();
 
-    // Consolidate system messages: merge all system-role messages into the first
-    // one, converting extras to a single leading system message. Some providers
-    // (e.g. MiniMax) reject system messages after the first position.
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    // Project system messages according to the declared transport/cache shape.
+    // A current-user-only capability consolidates them at the head; protocols
+    // that admit a runtime system suffix preserve that boundary.
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
@@ -6329,8 +6325,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         .map(|observer| observer as &dyn ProviderAttemptObserver);
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
 
     let mut body = build_provider_request_body_with_overrides(
         &messages,
@@ -12601,7 +12596,7 @@ mod tests {
         runtime["_timestamp"] = json!(1234);
         runtime["_synthetic"] = json!(true);
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", None);
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -12639,7 +12634,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -12657,7 +12652,38 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_strict_history_openai_moves_required_runtime_to_initial_system() {
+    fn provider_system_consolidation_is_idempotent_with_runtime_tail() {
+        let runtime =
+            crate::turn::wire_assembly::required_runtime_preamble_message("completion settlement")
+                .expect("runtime message");
+        let input = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "answer"}),
+            runtime,
+        ];
+
+        let once = consolidate_system_messages_for_provider(&input, "openai", None);
+        let twice = consolidate_system_messages_for_provider(&once, "openai", None);
+
+        assert_eq!(once, twice);
+        assert_eq!(once[0]["content"], "stable");
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("completion settlement")
+        );
+    }
+
+    #[test]
+    fn declared_strict_history_shape_moves_required_runtime_to_initial_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
@@ -12670,7 +12696,14 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
+        let capability = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(capability));
 
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["role"], "system");
@@ -12684,7 +12717,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_current_user_only_capability_overrides_provider_model_heuristic() {
+    fn explicit_current_user_only_capability_overrides_provider_baseline() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
@@ -12699,15 +12732,12 @@ mod tests {
         let explicit = CacheCapability {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
-        let out = consolidate_system_messages_for_provider(
-            &msgs,
-            "openai",
-            "metadata-defined-alias",
-            Some(explicit),
-        );
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(explicit));
 
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["role"], "system");
@@ -12734,8 +12764,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out =
-            consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "anthropic", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -14588,12 +14617,7 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages = consolidate_system_messages_for_provider(
-            &messages,
-            "anthropic",
-            "claude-sonnet-4",
-            None,
-        );
+        let messages = consolidate_system_messages_for_provider(&messages, "anthropic", None);
         let body = build_provider_request_body(
             &messages,
             &[],

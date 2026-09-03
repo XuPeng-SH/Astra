@@ -308,19 +308,35 @@ impl PipelineSession {
         messages: &[serde_json::Value],
         tool_schemas: &[serde_json::Value],
     ) -> bool {
+        self.replace_pending_wire_prompt_with_cache_capability(messages, tool_schemas, None)
+    }
+
+    /// Capability-aware counterpart used by provider-owning runtimes after
+    /// final message consolidation. Keeping the capability and the exact wire
+    /// projection together prevents a volatile system tail from being
+    /// misdiagnosed as a leading-system mutation on prefix-cache providers.
+    pub fn replace_pending_wire_prompt_with_cache_capability(
+        &mut self,
+        messages: &[serde_json::Value],
+        tool_schemas: &[serde_json::Value],
+        cache_capability: Option<crate::cache_placement::CacheCapability>,
+    ) -> bool {
         let Some(pending) = self.pending_prompt_snapshot.as_mut() else {
             return false;
         };
         let provider = pending.snapshot.provider.clone();
         let model = pending.snapshot.model.clone();
         let cache_eligible_tokens = pending.snapshot.cache_eligible_tokens;
-        let Some(snapshot) = crate::cache_diagnostics::prompt_snapshot_from_messages(
-            messages,
-            tool_schemas,
-            &provider,
-            &model,
-            cache_eligible_tokens,
-        ) else {
+        let Some(snapshot) =
+            crate::cache_diagnostics::prompt_snapshot_from_messages_with_cache_capability(
+                messages,
+                tool_schemas,
+                &provider,
+                &model,
+                cache_eligible_tokens,
+                cache_capability,
+            )
+        else {
             return false;
         };
         pending.snapshot = snapshot;

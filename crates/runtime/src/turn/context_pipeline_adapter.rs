@@ -632,12 +632,12 @@ pub(crate) fn build_session_context(
     user_id: Option<&str>,
 ) -> SessionContext {
     let provider_policy =
-        super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
-    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        super::prompt_cache::provider_cache_policy_for(cache_capability, provider);
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_name),
+        provider,
     );
+    let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -867,6 +867,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -1197,6 +1198,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -2416,6 +2418,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -2443,6 +2446,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: None,
             }),
         );

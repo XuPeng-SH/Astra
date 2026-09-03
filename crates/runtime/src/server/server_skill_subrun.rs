@@ -874,9 +874,16 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let execution_result: Result<SubRunResult, String> = async {
         let effective_model = self.default_model.clone();
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            effective_model.as_deref().unwrap_or(""),
-        );
+        let compact_strategy = self
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| {
+                crate::turn::llm::context::compact_strategy_from_model_metadata(
+                    execution.cache_capability,
+                    &execution.provider,
+                )
+            })
+            .unwrap_or_default();
         let permission_context =
             crate::orchestration::PermissionSyncContext::shared(self.inherited_permissions.clone());
 

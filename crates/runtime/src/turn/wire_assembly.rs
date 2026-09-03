@@ -410,17 +410,12 @@ pub(crate) fn is_required_runtime_preamble(message: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn is_prompt_visible_under_strict_history(message: &Value) -> bool {
-    // Strict-history providers only retain useful cache when every ordinary
-    // round keeps the system prefix byte-identical. Decision feedback is
-    // advisory and changes as evidence accumulates, so folding it into the
-    // first system message defeats the CurrentUserOnly contract. Required
-    // lifecycle context remains visible because correctness outranks reuse at
-    // an explicit authority boundary. ActiveTurnFrame is the one required-
-    // class exception: its changing current/prior text is already present in
-    // canonical conversation history. Strict-history requests instead receive
-    // one byte-stable focus policy that tells the model how to resolve that
-    // history without copying turn-specific values into the system prefix.
+fn is_prompt_visible_under_required_only(message: &Value) -> bool {
+    // Required-only delivery keeps optional, changing evidence off the wire
+    // while preserving lifecycle authority. ActiveTurnFrame is the one
+    // required-class exception: its exact current/prior text is already in
+    // canonical conversation history. One byte-stable leading policy conveys
+    // the resolution rule without duplicating turn-specific values.
     is_required_runtime_preamble(message)
         && message
             .get(RUNTIME_VOLATILE_KIND_MARKER)
@@ -437,9 +432,38 @@ pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
     }
 }
 
-fn strict_history_focus_policy_message() -> Value {
-    runtime_system_context_message(STRICT_HISTORY_FOCUS_POLICY, true)
-        .expect("strict-history focus policy is non-empty")
+fn append_required_only_focus_policy(system_messages: &mut Vec<Value>) {
+    // This is stable policy, not a runtime tail. Fold it into the leading
+    // system value before any runtime-control message is placed. The operation
+    // is deterministic for both string and structured system content.
+    let Some(primary) = system_messages.first_mut() else {
+        system_messages.push(serde_json::json!({
+            "role": "system",
+            "content": STRICT_HISTORY_FOCUS_POLICY,
+        }));
+        return;
+    };
+    match primary.get_mut("content") {
+        Some(Value::String(content)) => {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(STRICT_HISTORY_FOCUS_POLICY);
+        }
+        Some(Value::Array(blocks)) => {
+            if !blocks.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": "\n\n"}));
+            }
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": STRICT_HISTORY_FOCUS_POLICY,
+            }));
+        }
+        _ => {
+            primary["role"] = Value::String("system".to_string());
+            primary["content"] = Value::String(STRICT_HISTORY_FOCUS_POLICY.to_string());
+        }
+    }
 }
 
 pub(crate) fn session_memory_entry_for_pipeline(
@@ -845,7 +869,7 @@ pub(crate) fn maybe_append_continuation_prompt(
 /// 4. `strip_stale_reasoning` is applied in place.
 /// 5. `apply_anthropic_cache_metadata` (Anthropic path only).
 pub(crate) fn assemble_llm_messages_with_cache_capability(
-    system_messages: Vec<Value>,
+    mut system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
     drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     mut compacted_messages: Vec<Value>,
@@ -857,49 +881,45 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
-    let cache_cap =
-        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
-            cache_capability,
-            provider,
-            model_name,
-        );
-    let suppress_volatile = matches!(
-        cache_cap.volatile_placement,
-        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    let cache_cap = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+        cache_capability,
+        provider,
     );
+    let suppress_optional_volatile = !cache_cap.should_inject_volatile_on_round(0);
     // Structured volatile lane (`state.volatile_pending`): drained upstream,
     // rendered to the provider-specific runtime-system slot.
     // Producers use `state.push_volatile(Kind, content)` and never touch
     // `state.messages[]` for volatile content, so `messages[]` stays byte-
     // stable across rounds. The runtime system message is wire-only and never
     // becomes canonical user/tool history.
-    // Strict-history providers consolidate every system-role message into the
-    // first system entry. Put the invariant focus rule first, so its bytes are
-    // identical on every request and any genuinely required dynamic authority
-    // context can invalidate only the suffix that follows it.
-    let mut runtime_system_messages = if suppress_volatile {
-        vec![strict_history_focus_policy_message()]
-    } else {
-        Vec::new()
-    };
+    // The invariant focus rule belongs to the stable leading system lane.
+    // Required runtime context remains separate and follows the capability's
+    // physical placement; this prevents a required tail from dragging stable
+    // policy out of the cacheable prefix.
+    if suppress_optional_volatile {
+        append_required_only_focus_policy(&mut system_messages);
+    }
+    let mut runtime_system_messages = Vec::new();
     runtime_system_messages.extend(
         volatile_preamble
             .into_iter()
-            .filter(|message| !suppress_volatile || is_prompt_visible_under_strict_history(message))
+            .filter(|message| {
+                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
+            })
             .filter_map(runtime_system_context_from_message),
     );
     runtime_system_messages.extend(
         render_drained_volatile_messages(&drained_volatile)
             .into_iter()
             .filter(|message| {
-                !suppress_volatile || is_prompt_visible_under_strict_history(message)
+                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
             }),
     );
     runtime_system_messages.extend(
         take_runtime_system_context_messages(&mut compacted_messages)
             .into_iter()
             .filter(|message| {
-                !suppress_volatile || is_prompt_visible_under_strict_history(message)
+                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
             }),
     );
 
@@ -1033,11 +1053,21 @@ mod tests {
     use serde_json::json;
 
     fn cache_cfg() -> PromptCacheConfig {
-        PromptCacheConfig::latch("openai", "gpt-4")
+        PromptCacheConfig::latch("openai")
     }
 
     fn anthropic_cache_cfg() -> PromptCacheConfig {
-        PromptCacheConfig::latch("anthropic", "claude-sonnet-4")
+        PromptCacheConfig::latch("anthropic")
+    }
+
+    fn required_only_tail_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
     }
 
     fn message_text(message: &Value) -> String {
@@ -1970,7 +2000,7 @@ mod tests {
             "claude-sonnet-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4"),
+            &PromptCacheConfig::latch("anthropic"),
         );
         let server_out = assemble_llm_messages_with_cache_capability(
             system,
@@ -1988,7 +2018,7 @@ mod tests {
             "claude-sonnet-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4"),
+            &PromptCacheConfig::latch("anthropic"),
         );
 
         // Both paths must emit well-formed message arrays; the last message
@@ -2013,7 +2043,7 @@ mod tests {
             "gpt-4o",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
+            &PromptCacheConfig::latch("openai"),
         );
 
         assert!(
@@ -2479,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn current_user_only_models_suppress_round_specific_decision_feedback() {
+    fn required_only_delivery_suppresses_round_specific_decision_feedback() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
@@ -2500,19 +2530,18 @@ mod tests {
             &PostCompactAttachments::default(),
             "sid",
             "openai",
-            "deepseek-v4-flash",
+            "deployment-alias",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
+            Some(required_only_tail_capability()),
             &cache_cfg(),
         );
-        assert_eq!(msgs.len(), 5, "advisory feedback must not churn the prefix");
+        assert_eq!(msgs.len(), 4, "advisory feedback must not churn the prefix");
         assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[1]["role"], "system");
-        assert!(message_text(&msgs[1]).contains("active_turn_focus_policy.v1"));
-        assert_eq!(msgs[2]["role"], "user");
-        assert_eq!(msgs[2]["content"], "hi");
-        assert_eq!(msgs[3]["role"], "assistant");
-        assert_eq!(msgs[4]["role"], "tool");
+        assert!(message_text(&msgs[0]).contains("active_turn_focus_policy.v1"));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "tool");
         assert!(
             msgs.iter().all(|message| {
                 !message
@@ -2531,12 +2560,12 @@ mod tests {
                         .unwrap_or_default()
                         .contains("optional policy advisory")
             }),
-            "CurrentUserOnly providers must drop all optional volatile content"
+            "RequiredOnly delivery must drop all optional volatile content"
         );
     }
 
     #[test]
-    fn current_user_only_models_keep_required_typed_runtime_as_system() {
+    fn required_only_delivery_keeps_required_typed_runtime_as_system() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
@@ -2554,26 +2583,85 @@ mod tests {
             &PostCompactAttachments::default(),
             "sid",
             "openai",
-            "deepseek-v4-flash",
+            "deployment-alias",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
+            Some(required_only_tail_capability()),
             &cache_cfg(),
         );
 
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 3);
+        assert!(message_text(&msgs[0]).contains("active_turn_focus_policy.v1"));
         assert_eq!(msgs[1]["role"], "system");
-        assert!(message_text(&msgs[1]).contains("active_turn_focus_policy.v1"));
-        assert_eq!(msgs[2]["role"], "system");
-        let runtime_text = message_text(&msgs[2]);
+        let runtime_text = message_text(&msgs[1]);
         assert!(runtime_text.contains("<runtime-required-context>"));
         assert!(runtime_text.contains("\"kind\":\"budget_advisory\""));
         assert!(runtime_text.contains("finish with verified evidence"));
         assert!(!runtime_text.contains("volatile"));
-        assert_eq!(msgs[3], json!({"role": "user", "content": "hi"}));
+        assert_eq!(msgs[2], json!({"role": "user", "content": "hi"}));
     }
 
     #[test]
-    fn current_user_only_models_project_dynamic_frames_to_one_stable_focus_policy() {
+    fn declared_required_only_prefix_keeps_completion_authority_out_of_leading_system() {
+        let compacted = vec![
+            json!({"role": "user", "content": "finish the change"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        let assemble = |drained| {
+            let internal = assemble_llm_messages_with_cache_capability(
+                vec![json!({"role": "system", "content": "stable contract"})],
+                Vec::new(),
+                drained,
+                compacted.clone(),
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "deployment-alias",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(required_only_tail_capability()),
+                &cache_cfg(),
+            );
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &internal,
+                "openai",
+                Some(required_only_tail_capability()),
+            )
+        };
+
+        let baseline = assemble(Vec::new());
+        let settlement = assemble(vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+            payload: json!({
+                "schema": "completion_settlement.v2",
+                "mode": "text_only",
+                "instruction": "answer now"
+            }),
+            round_index: 4,
+        }]);
+
+        assert_eq!(baseline[0], settlement[0]);
+        assert!(message_text(&baseline[0]).contains("active_turn_focus_policy.v1"));
+        let settlement_index = settlement
+            .iter()
+            .position(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message_text(message).contains("completion_settlement.v2")
+            })
+            .expect("required completion settlement remains provider-visible");
+        assert_eq!(settlement_index, settlement.len() - 1);
+        assert_eq!(settlement[settlement_index - 1]["role"], "tool");
+    }
+
+    #[test]
+    fn required_only_delivery_projects_dynamic_frames_to_one_stable_focus_policy() {
         let assemble = |latest: &str, prior: &str, turn_id: u64| {
             let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
                 kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
@@ -2594,26 +2682,25 @@ mod tests {
                 &PostCompactAttachments::default(),
                 "sid",
                 "openai",
-                "deepseek-v4-flash",
+                "deployment-alias",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
-                None,
+                Some(required_only_tail_capability()),
                 &cache_cfg(),
             )
         };
 
         let first = assemble("Reply ACK", "first request", 2);
         let second = assemble("问题总结？", "只读 review", 9);
-        assert_eq!(first.len(), 3);
-        assert_eq!(second.len(), 3);
-        assert_eq!(first[0], json!({"role": "system", "content": "stable"}));
-        assert_eq!(first[1]["role"], "system");
-        assert_eq!(message_text(&first[1]), message_text(&second[1]));
-        let focus_policy = message_text(&first[1]);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(message_text(&first[0]), message_text(&second[0]));
+        assert!(message_text(&first[0]).starts_with("stable\n\n"));
+        let focus_policy = message_text(&first[0]);
         assert!(focus_policy.contains("active_turn_focus_policy.v1"));
         for dynamic in ["Reply ACK", "first request", "问题总结？", "只读 review"] {
             assert!(!focus_policy.contains(dynamic));
         }
-        assert_eq!(first[2], json!({"role": "user", "content": "Reply ACK"}));
-        assert_eq!(second[2], json!({"role": "user", "content": "问题总结？"}));
+        assert_eq!(first[1], json!({"role": "user", "content": "Reply ACK"}));
+        assert_eq!(second[1], json!({"role": "user", "content": "问题总结？"}));
     }
 }

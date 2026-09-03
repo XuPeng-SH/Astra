@@ -85,15 +85,24 @@ Prompt cache goals:
 
 ForkPrefix is a cache/diagnostic optimization, not restore correctness.
 
-Provider placement is capability-driven. Providers that require an exact
-history match suppress optional, round-specific advisory and decision-feedback
-blocks; required lifecycle context may still invalidate reuse at an explicit
-authority boundary. Turn focus is represented by one invariant system policy:
-the exact current and immediately prior text remains in canonical conversation
-messages and is never recopied into the cached system prefix. This preserves
-elliptical-follow-up semantics without introducing turn-specific prefix bytes.
-Cache diagnostics must fingerprint the final provider-wire messages and tool
-schemas, not an earlier pipeline candidate.
+Provider cache behavior is capability-driven along independent axes: cache
+protocol, physical volatile placement, and optional-volatile delivery. A
+prefix-cache provider may suppress duplicated advisory/active-turn snapshots
+while preserving required lifecycle context as a system-authority tail; these
+are not contradictory policies. Providers that require an exact history match
+also suppress optional round-specific blocks, but an unrepresentable required
+authority boundary may still cause an intentional cold request. Correctness is
+never weakened to preserve reuse.
+
+Turn focus is represented by one invariant leading-system policy: the exact
+current and immediately prior text remains in canonical conversation messages
+and is never recopied into the cached system prefix. Required runtime context
+remains model-visible under its system role. For automatic-prefix protocols a
+changed system message after the conversation boundary is a volatile suffix,
+not a changed leading-system identity. Cache diagnostics must fingerprint the
+provider-final messages and tool schemas after system consolidation, not an
+earlier pipeline candidate, and must apply the same protocol boundary semantics
+as the provider.
 
 At a text-only completion boundary, a provider may receive one request with a
 stable schema declaration plus its native no-tool choice. If it nevertheless

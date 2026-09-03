@@ -432,6 +432,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             &turns,
@@ -452,6 +453,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             &[],

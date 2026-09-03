@@ -187,6 +187,25 @@ pub enum PromptCacheVolatilePlacementData {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PromptCacheVolatileDeliveryData {
+    All,
+    RequiredOnly,
+}
+
+impl Default for PromptCacheVolatileDeliveryData {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl PromptCacheVolatileDeliveryData {
+    fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptCacheReuseScopeData {
     ConversationTurns,
     IntraTurnRounds,
@@ -215,6 +234,14 @@ impl PromptCacheReuseScopeData {
 pub struct PromptCacheCapabilityData {
     pub protocol: PromptCacheProtocolData,
     pub volatile_placement: PromptCacheVolatilePlacementData,
+    /// Total delivery policy after deserialization. An omitted YAML/JSON field
+    /// has the protocol-defined neutral value `all`; runtime never receives an
+    /// unknown state or infers behavior from placement/model names.
+    #[serde(
+        default,
+        skip_serializing_if = "PromptCacheVolatileDeliveryData::is_all"
+    )]
+    pub volatile_delivery: PromptCacheVolatileDeliveryData,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_scope: Option<PromptCacheReuseScopeData>,
 }
@@ -5124,6 +5151,7 @@ mod tests {
             prompt_cache_capability: Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             ..QuirksData::default()
@@ -5221,6 +5249,7 @@ mod tests {
             prompt_cache_capability: Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
             }),
             request_body_overrides: Some(Map::from_iter([(
@@ -5261,6 +5290,7 @@ mod tests {
   prompt_cache_capability:
     protocol: openai_auto_prefix
     volatile_placement: tail_suffix
+    volatile_delivery: required_only
     reuse_scope: intra_turn_rounds
 - name: deepseek-v4-flash
   quirks:
@@ -5276,6 +5306,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
             })
         );
@@ -5284,6 +5315,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: PromptCacheVolatileDeliveryData::All,
                 reuse_scope: None,
             })
         );

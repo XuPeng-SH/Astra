@@ -1066,9 +1066,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            effective_model.as_deref().unwrap_or(""),
-        );
+        // The model alias does not establish a cache protocol. The admitted
+        // server execution owns provider-specific request shaping.
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()

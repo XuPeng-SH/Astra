@@ -641,11 +641,9 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
 /// - `TailSuffix` providers (OpenAI auto-prefix): volatile content
 ///   must be in the LAST message only. Earlier positions are inside
 ///   the auto-prefix and break on every change.
-/// - `CurrentUserOnly` providers (MiniMax strict history): volatile
-///   content may only appear on round 0 of a visible turn. Session
-///   986a553e observed volatile bytes at msg[7] in every tool-loop
-///   round, causing cache_read to collapse from 7680 to 0 for six
-///   consecutive rounds.
+/// - `CurrentUserOnly` placement keeps any admitted runtime context at
+///   the current-user boundary. Whether optional content is admitted is
+///   a separate delivery policy and cannot be inferred from placement.
 /// - `Free` / unknown: not enforced.
 ///
 /// Signal is provider+model aware; wrong-placement gets Critical,
@@ -665,7 +663,7 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
             .iter()
             .any(|&idx| role_at(r, idx) != "system")
     })?;
-    let cap = CacheCapability::for_provider_and_model(&sample.provider, &sample.model);
+    let cap = CacheCapability::for_provider(&sample.provider);
     // Last non-system volatile index — that's the relevant one.
     let vol_idx = *sample
         .volatile_msg_indices

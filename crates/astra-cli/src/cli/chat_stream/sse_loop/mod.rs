@@ -1031,8 +1031,8 @@ pub(crate) async fn stream_chat_sse(
         session_facts: Default::default(),
         // Canonical Server execution is the sole per-turn memory producer.
         memory_extraction_service: None,
-        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
-            p.provider, p.model,
+        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_explicit_or_provider(
+            None, p.provider,
         ),
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
