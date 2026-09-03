@@ -1,5 +1,8 @@
 name: Release Docker Image
 
+permissions:
+  contents: read
+
 on:
   push:
     tags:
@@ -7,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Docker tag to publish (defaults to <YYYYMMDD>-<short-commit>)'
+        description: 'Snapshot Docker tag (defaults to <YYYYMMDD>-<short-commit>; semver requires a Git tag)'
         required: false
         default: ''
         type: string
@@ -21,6 +24,11 @@ on:
           - amd64
           - arm64
 
+concurrency:
+  group: release-docker
+  # Never cancel a run that may already have pushed a platform image.
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: matrixorigin/astra
 
@@ -28,6 +36,7 @@ jobs:
   version:
     name: Resolve Image Settings
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       image_version: ${{ steps.release.outputs.image_version }}
       rolling_version: ${{ steps.release.outputs.rolling_version }}
@@ -51,6 +60,12 @@ jobs:
               image_version="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
             fi
             architecture="${INPUT_ARCHITECTURE:-all}"
+
+            if [[ "${image_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Semantic-version Docker tags are release-only." >&2
+              echo "Push the matching Git tag so source and manifest versions are validated." >&2
+              exit 1
+            fi
           else
             image_version="${GITHUB_REF_NAME#v}"
             architecture=all
@@ -119,6 +134,16 @@ jobs:
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
+      - name: Check out release source
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate manifest version
+        if: ${{ github.event_name == 'push' }}
+        run: scripts/validate-release-version.sh "${{ steps.release.outputs.image_version }}"
+
   build:
     name: Build ${{ matrix.platform }}
     needs: version
@@ -129,16 +154,18 @@ jobs:
       matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ env.IMAGE_NAME }}
@@ -149,7 +176,7 @@ jobs:
             type=raw,value=${{ needs.version.outputs.rolling_version }},enable=${{ needs.version.outputs.latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
         with:
           context: .
@@ -160,6 +187,7 @@ jobs:
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
+            IMAGE_SOURCE_DIRTY=false
             IMAGE_BRANCH=${{ github.ref_name }}
           # Registry caches are shared across release tags/branches and do not
           # compete with Rust/sccache for the repository's Actions cache quota.
@@ -177,7 +205,7 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: digests-${{ matrix.slug }}
           path: /tmp/digests/*
@@ -190,22 +218,23 @@ jobs:
       - version
       - build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: digests-*
           path: /tmp/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ env.IMAGE_NAME }}
@@ -260,12 +289,17 @@ jobs:
     steps:
       - name: Install crane
         shell: bash
+        env:
+          CRANE_VERSION: v0.20.6
+          CRANE_LINUX_X86_64_SHA256: c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/bin"
           curl -fsSL \
             -o "${RUNNER_TEMP}/go-containerregistry.tar.gz" \
-            "https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz"
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_LINUX_X86_64_SHA256}  ${RUNNER_TEMP}/go-containerregistry.tar.gz" \
+            | sha256sum --check --strict
           tar -xzf "${RUNNER_TEMP}/go-containerregistry.tar.gz" -C "${RUNNER_TEMP}/bin" crane
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/crane" version

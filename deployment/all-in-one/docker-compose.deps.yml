@@ -1,4 +1,4 @@
-# astra-engine — Dev Dependencies
+# Astra — Dev Dependencies
 #
 # Starts MatrixOne + Memoria (memory service).
 # Used by: make dev-deps
@@ -32,8 +32,8 @@ services:
     entrypoint: /entrypoint.sh
     command: []
     ports:
-      - "${MATRIXONE_PORT:-6001}:6001"
-      - "${MATRIXONE_DEBUG_HTTP_PORT:-6060}:6060"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MATRIXONE_PORT:-6001}:6001"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MATRIXONE_DEBUG_HTTP_PORT:-6060}:6060"
     volumes:
       - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
@@ -60,7 +60,7 @@ services:
     hostname: memoria
     user: "${UID:-1000}:${GID:-1000}"
     ports:
-      - "${MEMORIA_PORT:-8100}:8100"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MEMORIA_PORT:-8100}:8100"
     volumes:
       - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
     # Memoria container expects bare EMBEDDING_* / MASTER_KEY names internally.
@@ -108,8 +108,5 @@ volumes:
   # Override ${MATRIXONE_DATA_VOLUME} (default: matrixone-data) to point at a
   # pre-existing Docker volume — e.g., to share state across compose projects.
   # The `name:` field sets the literal Docker volume name (no project prefix).
-  #
-  # NOTE: the legacy ${MATRIXONE_DATA_DIR} env var no longer affects this
-  # stack. It is still honored by docker-compose.yml and docker-compose.memoria.yml.
   matrixone-data:
     name: ${MATRIXONE_DATA_VOLUME:-matrixone-data}

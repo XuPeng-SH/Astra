@@ -1,6 +1,6 @@
-# astra-engine Development & Testing Guide
+# Astra Development & Testing Guide
 
-You are working on astra-engine, a Rust-first agent platform. Your primary tasks are development, testing, and debugging.
+You are working on Astra, a Rust-first agent platform. Your primary tasks are development, testing, and debugging.
 
 ## Quick Reference
 
@@ -20,8 +20,7 @@ make dev-stop           # Stop all
 - `crates/core/` — shared types
 - `crates/services/` — sessions, journals, durable tasks, cloud sync
 - `crates/runtime/` — Axum HTTP server, contract tests in `tests/`
-- `crates/astra-cli/` — CLI, edge tools, plan executor, code intel
-- `crates/astra-admin/` — admin CLI
+- `crates/astra-cli/` — CLI, admin subcommands, edge tools, plan executor, code intel
 - `.claude/skills/` — curated Agent Skills for Claude-compatible agents
 - `.agent/skills/` — curated Agent Skills for Agent-compatible runtimes and Astra local discovery
 - `web/` — Next.js admin dashboard
@@ -34,10 +33,10 @@ directory.
 
 ```bash
 # ✓ repo root
-cd /home/xupeng/github/astra && cargo build -p astra-runtime
+cargo build -p astra-runtime
 
 # ✓ any directory
-cargo build --manifest-path /home/xupeng/github/astra/Cargo.toml -p astra-runtime
+cargo build --manifest-path /path/to/astra/Cargo.toml -p astra-runtime
 ```
 
 Prefer `make <target>` from the repo root when possible.

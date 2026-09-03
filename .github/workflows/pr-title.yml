@@ -2,6 +2,8 @@
 # Add more workflows under .github/workflows/ for other CI checks.
 name: PR Title
 
+permissions: {}
+
 on:
   pull_request:
     types: [opened, edited, synchronize]
@@ -14,6 +16,7 @@ jobs:
   title:
     name: Check PR title
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Validate title
         env:
