@@ -2485,7 +2485,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn strict_history_focus_policy_anchors_elliptical_follow_up_without_prefix_churn() {
+    fn active_turn_frame_anchors_elliptical_follow_up_to_immediate_exchange() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.message = "问题总结？".to_string();
         state.session_turn = 9;
