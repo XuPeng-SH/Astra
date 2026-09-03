@@ -69,6 +69,11 @@ benchmark summary.
 ### `scripts/dev/init.sh`
 Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
 
+### `scripts/lib/env_file.sh`
+Provides the canonical, non-evaluating reader and placeholder checks for Astra
+environment templates. Source this helper instead of independently parsing
+dotenv values in setup or deployment scripts.
+
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
 
@@ -197,4 +202,6 @@ Keep installer behavior there so the public install path, documentation, and rel
 Operational helpers for health checks, backup/restore, and deployment.
 `deploy.sh [api-replicas]` validates and starts the canonical production
 Compose profile using root `.env.production` (override the path with
-`ASTRA_PRODUCTION_ENV_FILE`).
+`ASTRA_PRODUCTION_ENV_FILE`). `validate_production_env.sh` enforces required
+values, immutable image selection, trusted CORS origins, and minimum secret
+lengths without evaluating the environment file.

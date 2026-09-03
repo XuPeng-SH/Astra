@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free repository metadata and documentation checks."""
+"""Repository metadata, documentation, and deterministic setup checks."""
 
 from __future__ import annotations
 
@@ -58,6 +58,21 @@ def main() -> None:
         )
         if result.returncode:
             errors.append(f"{source}: invalid shell syntax ({result.stderr.strip()})")
+
+    contract_scripts = [
+        Path("scripts/dev/test_setup_contract.sh"),
+        Path("scripts/ops/test_production_env_contract.sh"),
+    ]
+    for contract_script in contract_scripts:
+        result = subprocess.run(
+            [str(contract_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            errors.append(f"{contract_script}: contract failed ({detail})")
 
     workflow_files = [
         *Path(".github/workflows").glob("*.yml"),
