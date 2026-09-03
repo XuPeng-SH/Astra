@@ -88,10 +88,12 @@ ForkPrefix is a cache/diagnostic optimization, not restore correctness.
 Provider placement is capability-driven. Providers that require an exact
 history match suppress optional, round-specific advisory and decision-feedback
 blocks; required lifecycle context may still invalidate reuse at an explicit
-authority boundary. They also avoid duplicating the active goal in a system
-block when the same goal is already the real current user message. Cache
-diagnostics must fingerprint the final provider-wire messages and tool schemas,
-not an earlier pipeline candidate.
+authority boundary. Turn focus is represented by one invariant system policy:
+the exact current and immediately prior text remains in canonical conversation
+messages and is never recopied into the cached system prefix. This preserves
+elliptical-follow-up semantics without introducing turn-specific prefix bytes.
+Cache diagnostics must fingerprint the final provider-wire messages and tool
+schemas, not an earlier pipeline candidate.
 
 At a text-only completion boundary, a provider may receive one request with a
 stable schema declaration plus its native no-tool choice. If it nevertheless

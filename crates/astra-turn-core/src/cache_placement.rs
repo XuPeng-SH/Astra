@@ -102,8 +102,10 @@ pub enum VolatilePlacement {
     /// Strict-history providers (MiniMax/DeepSeek v4): any byte change
     /// mid-history destroys the full cache entry. **Ordinary volatile content
     /// is suppressed on EVERY round** — even round 0. The wire assembler may
-    /// still carry a required lifecycle/authority boundary, but it must not
-    /// duplicate the active goal already present in the real user message.
+    /// still carry a required lifecycle/authority boundary. Turn focus is
+    /// projected as one byte-stable policy; changing current/prior text stays
+    /// exclusively in canonical conversation messages instead of being
+    /// duplicated into the system prefix.
     ///
     /// The round-0-only variant was tried and rejected: prepending
     /// volatile to msg[1] on round 0 but not on round 1+ still

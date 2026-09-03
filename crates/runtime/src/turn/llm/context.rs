@@ -1386,42 +1386,31 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
-    let mut required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+    let required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
         input.runtime_signals.edge_profile,
         astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-    );
-    required_runtime_texts.extend(
-        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
-            input.runtime_signals.edge_profile,
-        )
-        .into_iter()
-        .filter(|injection| {
-            injection.delivery_class
-                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
-        })
-        .filter_map(|injection| injection.render_for_prompt()),
     );
     if let Some(required_text) = crate::turn::wire_assembly::required_runtime_preamble_message(
         &required_runtime_texts.join("\n\n"),
     ) {
         volatile_preamble.push(required_text);
     }
-    let decision_feedback =
+    volatile_preamble.extend(
         astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
             input.runtime_signals.edge_profile,
         )
         .into_iter()
         .filter(|injection| {
-            injection.delivery_class
-                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+            matches!(
+                injection.delivery_class,
+                astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                    | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+            )
         })
-        .filter_map(|injection| injection.render_for_prompt())
-        .collect::<Vec<_>>();
-    if let Some(feedback) = crate::turn::wire_assembly::decision_feedback_preamble_message(
-        &decision_feedback.join("\n\n"),
-    ) {
-        volatile_preamble.push(feedback);
-    }
+        .filter_map(|injection| {
+            crate::turn::wire_assembly::runtime_volatile_preamble_message(&injection)
+        }),
+    );
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
     let system_prompt_tokens = system_messages
@@ -2496,7 +2485,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn active_turn_frame_anchors_elliptical_follow_up_to_immediate_exchange() {
+    fn strict_history_focus_policy_anchors_elliptical_follow_up_without_prefix_churn() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.message = "问题总结？".to_string();
         state.session_turn = 9;
@@ -2527,18 +2516,103 @@ mod context_cache_contract_tests {
             Some(&json!({"role": "user", "content": "问题总结？"})),
             "runtime focus context must not be appended to user speech"
         );
-        let frame = messages
+        let focus_policy = messages
             .iter()
             .rev()
             .find(|message| {
                 message.get("role").and_then(Value::as_str) == Some("system")
-                    && message_text(message).contains("<runtime-required-context>")
+                    && message_text(message).contains("<runtime-focus-policy>")
             })
             .map(message_text)
-            .expect("typed active-turn frame");
-        assert!(frame.contains("不要修改，只读 review uncommitted changes"));
-        assert!(!frame.contains("immediate_prior_user_request\":\"分析整个 task 系统"));
-        assert!(frame.contains("whole session only when the user explicitly asks"));
+            .expect("stable strict-history focus policy");
+        assert!(focus_policy.contains("immediately preceding user-assistant exchange"));
+        assert!(focus_policy.contains("explicitly broadens the scope"));
+        assert!(!focus_policy.contains("问题总结？"));
+        assert!(!focus_policy.contains("不要修改，只读 review uncommitted changes"));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_text(message) == "不要修改，只读 review uncommitted changes"
+        }));
+    }
+
+    #[test]
+    fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
+        fn provider_messages(frame_value: &str) -> Vec<Value> {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.messages = vec![
+                json!({"role": "user", "content": "review the current change"}),
+                json!({"role": "assistant", "content": "I found one issue"}),
+                json!({"role": "user", "content": "summarize it"}),
+            ];
+            let mut edge_profile = serde_json::Map::new();
+            edge_profile.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                    .to_string(),
+                json!([astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                    kind: "active_turn_frame".to_string(),
+                    delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                    payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
+                    round_index: 1,
+                }]),
+            );
+            let visible_tools = vec![tool("bash")];
+            let restricted_tools = HashSet::new();
+            let cache_cfg = PromptCacheConfig::latch("openai", "deepseek-v4-flash");
+            let strict_history = strict_history_cache_capability();
+            let output = assemble_context_pipeline(LlmContextAssemblyInput {
+                state: &mut state,
+                session_id: "sid-edge-frame",
+                tool_surface: ToolSurfacePlan::from_visible_tools(
+                    &visible_tools,
+                    &restricted_tools,
+                ),
+                runtime_signals: RuntimeSignals::new(&edge_profile, None),
+                cache_cfg: &cache_cfg,
+                provider: "openai",
+                model_name: "deepseek-v4-flash",
+                context_window: Some(200_000),
+                max_completion_tokens: Some(16_384),
+                cache_capability: Some(strict_history),
+                user_content: "summarize it",
+                query_source: "test",
+            })
+            .expect("context pipeline should assemble");
+            let wire = crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
+                output.system_messages,
+                output.volatile_preamble,
+                Vec::new(),
+                output.messages,
+                &crate::turn::wire_assembly::PostCompactAttachments::default(),
+                "sid-edge-frame",
+                "openai",
+                "deepseek-v4-flash",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(strict_history),
+                &cache_cfg,
+            );
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &wire,
+                "openai",
+                "deepseek-v4-flash",
+                Some(strict_history),
+            )
+        }
+
+        let first = provider_messages("frame-alpha-dynamic-value");
+        let second = provider_messages("frame-beta-dynamic-value");
+        assert_eq!(first[0]["role"], "system");
+        assert_eq!(
+            first[0], second[0],
+            "typed edge-profile frames must not alter the consolidated strict-provider prefix"
+        );
+        let system = message_text(&first[0]);
+        assert!(system.contains("active_turn_focus_policy.v1"));
+        assert!(!system.contains("frame-alpha-dynamic-value"));
+        assert!(!message_text(&second[0]).contains("frame-beta-dynamic-value"));
+        assert!(first.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_text(message) == "summarize it"
+        }));
     }
 
     #[test]
