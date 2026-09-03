@@ -656,6 +656,14 @@ fn settlement_wire_tool_schemas(
     })
 }
 
+fn preserve_text_only_wire_surface(
+    text_only: bool,
+    ignored_text_only_rounds: u32,
+    provider: &str,
+) -> bool {
+    text_only && ignored_text_only_rounds == 0 && provider_supports_no_tool_choice(provider)
+}
+
 /// Select the tool surface that versions both the provider's schemas and its
 /// cross-tool prompt contract. Runtime execution authority may be narrower at
 /// a settlement boundary, but the provider-visible pair must never disagree.
@@ -7010,9 +7018,6 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
             &self.always_load_tool_names,
         );
-        if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_tool_schemas(&annotated_tools);
-        }
         self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
         self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&annotated_tools);
         let (provider, model) = self
@@ -7044,6 +7049,9 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
             false,
         );
+        if let Some(pipeline_session) = state.pipeline_session.as_mut() {
+            pipeline_session.replace_pending_wire_prompt(&wire_messages, &annotated_tools);
+        }
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
             crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                 trace,
@@ -11428,11 +11436,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ) && state.runtime_tool_executor.as_deref().is_some_and(
                 crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding,
             );
-        let preserve_text_only_tool_surface = final_answer_settlement_text_only
-            && provider_supports_no_tool_choice(&llm_cfg.provider);
-        let preserve_settlement_wire_surface = work_settlement_only
-            || preserve_text_only_tool_surface
-            || preserve_final_synthesis_wire_surface;
+        let preserve_text_only_tool_surface = preserve_text_only_wire_surface(
+            final_answer_settlement_text_only,
+            state.budget_wrapup_ignored_rounds,
+            &llm_cfg.provider,
+        );
+        // A provider that ignored the first explicit text-only request has
+        // demonstrated that schema preservation is not a reliable boundary.
+        // On the one allowed repair request, physically remove declarations
+        // so degraded text protocols cannot request another tool. Work-only
+        // settlement is a different typed boundary and retains its sole
+        // settlement capability.
+        let retrying_ignored_text_only_boundary = final_answer_settlement_text_only
+            && !work_settlement_only
+            && state.budget_wrapup_ignored_rounds > 0;
+        let preserve_settlement_wire_surface = !retrying_ignored_text_only_boundary
+            && (work_settlement_only
+                || preserve_text_only_tool_surface
+                || preserve_final_synthesis_wire_surface);
         let effective_restricted =
             self.compute_effective_restricted(state, true, preserve_text_only_tool_surface);
         tracing::debug!(
@@ -11721,13 +11742,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        // A text-only settlement changes execution authority, not the
-        // provider-visible schema prefix. Keep the schemas stable for cache
-        // reuse, but use the protocol's explicit no-tool choice whenever the
-        // provider supports it. The local admission gate remains a defense in
-        // depth for providers that ignore the wire choice or return malformed
-        // tool calls.
-        let use_no_tool_choice = preserve_text_only_tool_surface;
+        // The first text-only settlement keeps the provider-visible schema
+        // prefix and uses the protocol's explicit no-tool choice. If that
+        // request was ignored, the bounded repair request above fails closed
+        // with an empty schema surface instead of repeating an ineffective
+        // tool_choice-only hint.
+        let use_no_tool_choice = final_answer_settlement_text_only
+            && provider_supports_no_tool_choice(&llm_cfg.provider);
         tracing::debug!(
             target: "astra::tool_surface",
             run_id = state.current_run_id.as_deref().unwrap_or_default(),
@@ -11790,7 +11811,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.sticky_tool_schemas = final_tools.clone();
         }
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_tool_schemas(&final_tools);
+            pipeline_session.replace_pending_wire_prompt(&llm_messages, &final_tools);
         }
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
@@ -11825,7 +11846,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let provider_attempt_boundary =
             ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
         let primary_thinking = if canonical_work_establishment_pending
-            || preserve_text_only_tool_surface
+            || final_answer_settlement_text_only
             || provider_attempt_boundary.forces_thinking_off()
         {
             ThinkingConfig::Off
@@ -24945,6 +24966,30 @@ mod tests {
             None,
             "ordinary rounds retain lifecycle-aware schema projection"
         );
+    }
+
+    #[test]
+    fn repeated_text_only_violation_removes_wire_surface() {
+        assert!(preserve_text_only_wire_surface(true, 0, "openai"));
+        assert!(
+            !preserve_text_only_wire_surface(true, 1, "openai"),
+            "the repair request must not repeat schemas after tool_choice was ignored"
+        );
+        assert!(!preserve_text_only_wire_surface(false, 0, "openai"));
+
+        let preceding = vec![json!({
+            "type": "function",
+            "function": {"name": "bash"}
+        })];
+        let selected = settlement_wire_tool_schemas(
+            true,
+            false,
+            preserve_text_only_wire_surface(true, 1, "openai"),
+            &preceding,
+            &[],
+        )
+        .expect("text-only boundary owns wire schema selection");
+        assert!(selected.is_empty());
     }
 
     #[test]

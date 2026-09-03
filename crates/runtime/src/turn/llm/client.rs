@@ -2925,18 +2925,24 @@ fn apply_no_tool_choice(
     provider: &str,
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
-    if tools.is_empty() {
-        return Ok(());
-    }
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiCompatible => {
+            // Keep the explicit terminal instruction even when the repair
+            // request physically removed every schema. OpenAI-compatible
+            // models can otherwise infer the tool protocol from conversation
+            // history and emit a degraded text call despite an empty `tools`
+            // array.
             body["tool_choice"] = Value::String("none".to_string());
             Ok(())
         }
         LlmProviderProtocol::AnthropicMessages => {
+            if tools.is_empty() {
+                return Ok(());
+            }
             body["tool_choice"] = json!({"type": "none"});
             Ok(())
         }
+        LlmProviderProtocol::BedrockConverse if tools.is_empty() => Ok(()),
         LlmProviderProtocol::BedrockConverse => Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             "Bedrock Converse cannot preserve a non-empty tool surface at a no-tool settlement boundary",
@@ -5135,6 +5141,10 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     let mut made_progress = false;
     let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut hidden_reasoning_state = HiddenReasoningStreamState::default();
+    let mut visible_text_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
+    let mut visible_reasoning_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
                           reasoning: &String,
@@ -5149,8 +5159,14 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .collect();
         LlmCallResult {
             response_id: response_id.clone(),
-            full_text: full_text.clone(),
-            reasoning: reasoning.clone(),
+            full_text:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    full_text,
+                ),
+            reasoning:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    reasoning,
+                ),
             reasoning_signature: String::new(),
             tool_calls,
             usage: usage.clone(),
@@ -5383,14 +5399,20 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 if is_reasoning {
                     reasoning.push_str(&chunk);
                     yield_state.observe_reasoning_activity(&chunk, TokioInstant::now());
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Reasoning(chunk));
+                    let visible = visible_reasoning_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Reasoning(visible));
                     }
                 } else {
                     full_text.push_str(&chunk);
                     yield_state.observe_text(&chunk, TokioInstant::now());
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Text(chunk));
+                    let visible = visible_text_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Text(visible));
                     }
                 }
             }
@@ -5419,8 +5441,11 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             }
             reasoning.push_str(r);
             yield_state.observe_reasoning_activity(r, TokioInstant::now());
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Reasoning(r.to_string()));
+            let visible = visible_reasoning_filter.push(r);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
             }
             made_progress = true;
         }
@@ -5536,15 +5561,34 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     for (chunk, is_reasoning) in finish_hidden_reasoning_chunks(&mut hidden_reasoning_state) {
         if is_reasoning {
             reasoning.push_str(&chunk);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Reasoning(chunk));
+            let visible = visible_reasoning_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
             }
         } else {
             full_text.push_str(&chunk);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Text(chunk));
+            let visible = visible_text_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Text(visible));
             }
         }
+    }
+
+    let trailing_visible_text = visible_text_filter.finish();
+    if !trailing_visible_text.is_empty()
+        && let Some(callback) = stream_callback.as_deref_mut()
+    {
+        callback(LlmStreamUpdate::Text(trailing_visible_text));
+    }
+    let trailing_visible_reasoning = visible_reasoning_filter.finish();
+    if !trailing_visible_reasoning.is_empty()
+        && let Some(callback) = stream_callback
+    {
+        callback(LlmStreamUpdate::Reasoning(trailing_visible_reasoning));
     }
 
     if !yield_state.is_terminal() {
@@ -5570,20 +5614,22 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
 
     // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
     // tags in content instead of structured tool_calls. Recover them.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    if let Some(parsed) =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    {
+        if tool_calls.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
                 parsed.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
+    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
     canonicalize_provider_tool_calls(&mut tool_calls);
 
     // Extract <think>...</think> blocks from content into reasoning.
@@ -6659,20 +6705,22 @@ fn parse_openai_compatible_nonstream_response(
         .map(String::from);
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    if let Some(parsed) =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    {
+        if tool_calls.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
+    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
     canonicalize_provider_tool_calls(&mut tool_calls);
 
     if reasoning.is_empty() {
@@ -9431,6 +9479,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
+        let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d3 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo ok</｜｜DSML｜｜parameter>"}}]});
+        let d4 = json!({"choices":[{"delta":{"content":"</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls><｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d5 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>\nvisible after"}}]});
+        let body = format!(
+            "data: {d1}\n\ndata: {d2}\n\ndata: {d3}\n\ndata: {d4}\n\ndata: {d5}\n\ndata: [DONE]\n\n"
+        );
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+
+        let result = collect_llm_stream(
+            stream,
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect");
+
+        assert_eq!(result.full_text, "visible before\n\nvisible after");
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(result.tool_calls[1]["function"]["name"], "bash");
+        let published = updates
+            .iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) | LlmStreamUpdate::Reasoning(text) => Some(text),
+                LlmStreamUpdate::ToolCall { .. } => None,
+            })
+            .cloned()
+            .collect::<String>();
+        assert_eq!(published, "visible before\n\nvisible after");
+        assert!(!published.contains("DSML"));
+        assert!(!published.contains("echo ok"));
+        assert!(!published.contains("pwd"));
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
@@ -10227,6 +10319,16 @@ mod tests {
             );
             assert!(provider_supports_no_tool_choice(provider));
         }
+    }
+
+    #[test]
+    fn openai_no_tool_choice_remains_explicit_with_empty_schema_surface() {
+        let mut body = json!({"model": "test-model", "messages": []});
+        apply_no_tool_choice(&mut body, "openai", &[])
+            .expect("empty repair surface still supports an explicit no-tool choice");
+
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

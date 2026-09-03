@@ -99,9 +99,11 @@ pub enum VolatilePlacement {
     /// letting later tool rounds reuse the accumulated conversation prefix
     /// without rewriting any conversation message.
     TailSuffix,
-    /// Strict-history providers (MiniMax): any byte change mid-history
-    /// destroys the full cache entry. **Volatile content is suppressed
-    /// on EVERY round** — even round 0.
+    /// Strict-history providers (MiniMax/DeepSeek v4): any byte change
+    /// mid-history destroys the full cache entry. **Ordinary volatile content
+    /// is suppressed on EVERY round** — even round 0. The wire assembler may
+    /// still carry a required lifecycle/authority boundary, but it must not
+    /// duplicate the active goal already present in the real user message.
     ///
     /// The round-0-only variant was tried and rejected: prepending
     /// volatile to msg[1] on round 0 but not on round 1+ still
@@ -109,7 +111,7 @@ pub enum VolatilePlacement {
     /// msg[1] = preamble + user_q; round 1's msg[1] = user_q only),
     /// and MiniMax's cache sees that as a total miss. The only way
     /// to keep history byte-stable for strict-history providers is
-    /// to never inject volatile at all on this path. The agent
+    /// to never inject ordinary volatile content on this path. The agent
     /// loses Self-Awareness signals in exchange for
     /// usable cache — observed collapse was 100% of cache reads for
     /// six consecutive tool-loop rounds in session 986a553e.
@@ -249,8 +251,9 @@ impl CacheCapability {
     ///
     /// `MarkerIsolated` / `TailSuffix` / `Free`: always true.
     /// `CurrentUserOnly`: always **false** — see the variant's doc
-    /// for why round-0-only didn't work and we had to suppress
-    /// volatile entirely for strict-history providers.
+    /// for why round-0-only didn't work and we had to suppress ordinary
+    /// volatile content for strict-history providers. Required authority
+    /// contexts are handled separately by the wire assembler.
     #[must_use]
     pub fn should_inject_volatile_on_round(&self, _round_within_turn: u32) -> bool {
         match self.volatile_placement {

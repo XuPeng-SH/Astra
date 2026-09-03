@@ -1,7 +1,7 @@
 # Prompt lifecycle
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-03.
 
 Prompt lifecycle defines how Astra builds, versions, caches, inspects, and evolves prompts. It is distinct from context selection and tool routing, though it consumes both.
 
@@ -85,6 +85,21 @@ Prompt cache goals:
 
 ForkPrefix is a cache/diagnostic optimization, not restore correctness.
 
+Provider placement is capability-driven. Providers that require an exact
+history match suppress optional, round-specific advisory and decision-feedback
+blocks; required lifecycle context may still invalidate reuse at an explicit
+authority boundary. They also avoid duplicating the active goal in a system
+block when the same goal is already the real current user message. Cache
+diagnostics must fingerprint the final provider-wire messages and tool schemas,
+not an earlier pipeline candidate.
+
+At a text-only completion boundary, a provider may receive one request with a
+stable schema declaration plus its native no-tool choice. If it nevertheless
+requests a tool, the bounded repair request removes the schema declaration
+physically while retaining a provider-native no-tool choice where the protocol
+supports one. Cache reuse never takes precedence over terminal execution
+authority.
+
 ## Prompt introspection
 
 The system should be able to explain:
@@ -94,6 +109,11 @@ The system should be able to explain:
 - which tools were included and why;
 - which memories/artifacts were included;
 - whether cache should have hit or missed.
+
+Provider control syntax recovered from a degraded text response is runtime
+protocol, not assistant prose. Streaming clients must withhold it across chunk
+boundaries, while the canonical parser retains the original bytes long enough
+to recover and validate the structured action.
 
 ## Evolution
 

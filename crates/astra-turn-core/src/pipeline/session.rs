@@ -298,18 +298,32 @@ impl PipelineSession {
         Ok(output)
     }
 
-    /// Align cache-break diagnostics with the exact provider-visible tool
-    /// schemas after runtime stabilization and cache annotation.
+    /// Align cache-break diagnostics with the exact provider-visible messages
+    /// and tool schemas after runtime assembly, stabilization, and cache
+    /// annotation.
     ///
     /// Returns `false` only when no pipeline request is awaiting feedback.
-    pub fn replace_pending_wire_tool_schemas(
+    pub fn replace_pending_wire_prompt(
         &mut self,
+        messages: &[serde_json::Value],
         tool_schemas: &[serde_json::Value],
     ) -> bool {
         let Some(pending) = self.pending_prompt_snapshot.as_mut() else {
             return false;
         };
-        pending.snapshot.replace_tool_schemas(tool_schemas);
+        let provider = pending.snapshot.provider.clone();
+        let model = pending.snapshot.model.clone();
+        let cache_eligible_tokens = pending.snapshot.cache_eligible_tokens;
+        let Some(snapshot) = crate::cache_diagnostics::prompt_snapshot_from_messages(
+            messages,
+            tool_schemas,
+            &provider,
+            &model,
+            cache_eligible_tokens,
+        ) else {
+            return false;
+        };
+        pending.snapshot = snapshot;
         true
     }
 
@@ -858,6 +872,50 @@ mod tests {
             recovery: RecoveryState::default(),
             last_user_message: "hello".into(),
         }
+    }
+
+    #[test]
+    fn pending_cache_snapshot_is_replaced_with_final_wire_prompt() {
+        let mut session = PipelineSession::new(PipelineConfig::default());
+        session.pending_prompt_snapshot = Some(PendingPromptSnapshot {
+            query_source: "test".to_string(),
+            snapshot: PromptStateSnapshot::capture(
+                "pipeline candidate",
+                &[],
+                "deepseek-v4-flash",
+                7_225,
+            ),
+            section_usage: std::collections::HashMap::new(),
+            section_fingerprints: Vec::new(),
+        });
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "stable system"}),
+            serde_json::json!({"role": "system", "content": "final wire runtime context"}),
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "bash", "parameters": {"type": "object"}}
+        })];
+        let expected = crate::cache_diagnostics::prompt_snapshot_from_messages(
+            &messages,
+            &tools,
+            "unknown",
+            "deepseek-v4-flash",
+            7_225,
+        )
+        .expect("wire snapshot");
+
+        assert!(session.replace_pending_wire_prompt(&messages, &tools));
+        let actual = &session
+            .pending_prompt_snapshot
+            .as_ref()
+            .expect("pending snapshot")
+            .snapshot;
+        assert_eq!(actual.system_prompt_hash, expected.system_prompt_hash);
+        assert_eq!(actual.system_blocks, expected.system_blocks);
+        assert_eq!(actual.tools_hash, expected.tools_hash);
+        assert_eq!(actual.cache_eligible_tokens, 7_225);
     }
 
     fn test_external() -> ExternalSources {

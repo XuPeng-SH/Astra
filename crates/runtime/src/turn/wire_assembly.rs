@@ -26,6 +26,7 @@ use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadat
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
 pub(crate) const RUNTIME_SYSTEM_CONTEXT_MARKER: &str = "__astra_runtime_system_context";
 pub(crate) const DECISION_FEEDBACK_PREAMBLE_MARKER: &str = "__astra_runtime_decision_feedback";
+const RUNTIME_VOLATILE_KIND_MARKER: &str = "__astra_runtime_volatile_kind";
 #[cfg(test)]
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
 #[cfg(test)]
@@ -382,11 +383,20 @@ pub(crate) fn is_required_runtime_preamble(message: &Value) -> bool {
 }
 
 fn is_prompt_visible_under_strict_history(message: &Value) -> bool {
+    // Strict-history providers only retain useful cache when every ordinary
+    // round keeps the system prefix byte-identical. Decision feedback is
+    // advisory and changes as evidence accumulates, so folding it into the
+    // first system message defeats the CurrentUserOnly contract. Required
+    // lifecycle context remains visible because correctness outranks reuse at
+    // an explicit authority boundary. ActiveTurnFrame is the one required-
+    // class exception: its goal is already present in the real current user
+    // message, so duplicating it in system adds no authority and guarantees a
+    // cross-turn cache miss.
     is_required_runtime_preamble(message)
-        || message
-            .get(DECISION_FEEDBACK_PREAMBLE_MARKER)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        && message
+            .get(RUNTIME_VOLATILE_KIND_MARKER)
+            .and_then(Value::as_str)
+            != Some("active_turn_frame")
 }
 
 pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
@@ -394,6 +404,7 @@ pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
         object.remove(REQUIRED_RUNTIME_PREAMBLE_MARKER);
         object.remove(RUNTIME_SYSTEM_CONTEXT_MARKER);
         object.remove(DECISION_FEEDBACK_PREAMBLE_MARKER);
+        object.remove(RUNTIME_VOLATILE_KIND_MARKER);
     }
 }
 
@@ -957,8 +968,9 @@ fn render_drained_volatile_messages(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for inj in drained {
+        let kind = inj.kind.wire_kind();
         let edge_injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-            kind: inj.kind.wire_kind(),
+            kind: kind.clone(),
             delivery_class: inj.kind.delivery_class(),
             payload: inj.payload.clone(),
             round_index: inj.round_index,
@@ -979,7 +991,8 @@ fn render_drained_volatile_messages(
             }
             astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly => None,
         };
-        if let Some(message) = message {
+        if let Some(mut message) = message {
+            message[RUNTIME_VOLATILE_KIND_MARKER] = Value::String(kind);
             out.push(message);
         }
     }
@@ -2438,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn current_user_only_models_keep_typed_decision_feedback_only() {
+    fn current_user_only_models_suppress_round_specific_decision_feedback() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
@@ -2464,15 +2477,12 @@ mod tests {
             None,
             &cache_cfg(),
         );
-        assert_eq!(msgs.len(), 5, "typed decision feedback must remain visible");
+        assert_eq!(msgs.len(), 4, "advisory feedback must not churn the prefix");
         assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[1]["role"], "system");
-        assert!(message_text(&msgs[1]).contains("optional policy advisory"));
-        assert!(message_text(&msgs[1]).contains("<runtime-decision-feedback>"));
-        assert_eq!(msgs[2]["role"], "user");
-        assert_eq!(msgs[2]["content"], "hi");
-        assert_eq!(msgs[3]["role"], "assistant");
-        assert_eq!(msgs[4]["role"], "tool");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "tool");
         assert!(
             msgs.iter().all(|message| {
                 !message
@@ -2485,8 +2495,13 @@ mod tests {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .contains("volatile")
+                    && !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("optional policy advisory")
             }),
-            "CurrentUserOnly providers must drop untyped optional volatile content"
+            "CurrentUserOnly providers must drop all optional volatile content"
         );
     }
 
@@ -2495,8 +2510,8 @@ mod tests {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
-            kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
-            payload: json!({"latest_user_goal": "latest user goal"}),
+            kind: crate::turn::agentic_loop::host::VolatileKind::BudgetAdvisory,
+            payload: json!({"instruction": "finish with verified evidence"}),
             round_index: 1,
         }];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
@@ -2519,9 +2534,44 @@ mod tests {
         assert_eq!(msgs[1]["role"], "system");
         let runtime_text = message_text(&msgs[1]);
         assert!(runtime_text.contains("<runtime-required-context>"));
-        assert!(runtime_text.contains("\"kind\":\"active_turn_frame\""));
-        assert!(runtime_text.contains("latest user goal"));
+        assert!(runtime_text.contains("\"kind\":\"budget_advisory\""));
+        assert!(runtime_text.contains("finish with verified evidence"));
         assert!(!runtime_text.contains("volatile"));
         assert_eq!(msgs[2], json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn current_user_only_models_do_not_duplicate_active_goal_in_system_prefix() {
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+            payload: json!({
+                "latest_user_message": "Reply ACK",
+                "active_goal": "Reply ACK",
+                "turn_id": 2,
+                "round_id": 0
+            }),
+            round_index: 0,
+        }];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            vec![json!({"role": "system", "content": "stable"})],
+            Vec::new(),
+            drained,
+            vec![json!({"role": "user", "content": "Reply ACK"})],
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "deepseek-v4-flash",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(
+            msgs,
+            vec![
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "Reply ACK"}),
+            ]
+        );
     }
 }
