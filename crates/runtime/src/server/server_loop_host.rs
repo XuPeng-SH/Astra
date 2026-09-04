@@ -12716,7 +12716,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     appended.push(frame.clone());
                 }
                 {
-                    if !appended.is_empty() && !attempt_llm_messages.ends_with(&appended) {
+                    if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
+                        attempt_llm_messages,
+                        &appended,
+                    ) {
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ContractViolation,
                             "provider request does not preserve its staged canonical append suffix",
@@ -21299,6 +21302,51 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.messages, before);
+    }
+
+    #[test]
+    fn provider_admission_matches_staged_authority_through_the_wire_projection() {
+        let mut state = create_test_state();
+        state.messages = vec![json!({"role": "user", "content": "do the work"})];
+        let durable_canonical_cursor = state.messages.len();
+        let settlement =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "synthesize the completed work",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::FinalWorkSynthesis,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        state
+            .extend_append_only_runtime_messages([settlement])
+            .expect("wire assembly stages typed canonical authority");
+
+        let capability = append_only_test_cache_capability();
+        let mut attempt_messages =
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &state.messages,
+                "openai",
+                Some(capability),
+            );
+        let dispatch_budget =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "finish before the admitted deadline",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        attempt_messages.push(dispatch_budget.clone());
+
+        let mut canonical_appended = state.messages[durable_canonical_cursor..].to_vec();
+        canonical_appended.push(dispatch_budget);
+        assert!(!attempt_messages.ends_with(&canonical_appended));
+        assert!(
+            crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
+                &attempt_messages,
+                &canonical_appended,
+            )
+        );
     }
 
     #[test]

@@ -3694,6 +3694,48 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
     }
 }
 
+/// Project canonical messages through the metadata-only portion of the
+/// provider boundary.
+///
+/// Canonical history retains typed provenance so intent, recovery, and
+/// append-only authority consumers can distinguish runtime-owned messages.
+/// Provider requests deliberately remove that metadata.  Any equality check
+/// across those two representations must therefore compare this projection,
+/// while preserving roles, content, ordering, and every provider-visible
+/// field exactly.
+fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+    }
+    strip_internal_runtime_markers(&mut projected);
+    projected
+}
+
+/// Return whether the request ends in the exact provider-visible projection
+/// of a staged canonical append.
+///
+/// This is intentionally a shape check, not a content classifier: the only
+/// differences ignored are the same typed internal metadata fields removed
+/// at the provider boundary.
+pub(crate) fn provider_request_preserves_projected_canonical_suffix(
+    provider_messages: &[Value],
+    canonical_appended: &[Value],
+) -> bool {
+    if canonical_appended.is_empty() {
+        return true;
+    }
+    let Some(suffix_start) = provider_messages
+        .len()
+        .checked_sub(canonical_appended.len())
+    else {
+        return false;
+    };
+    let provider_suffix = &provider_messages[suffix_start..];
+    project_provider_message_metadata(provider_suffix)
+        == project_provider_message_metadata(canonical_appended)
+}
+
 fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
@@ -13650,6 +13692,72 @@ mod tests {
         for key in ["_round_index", "_tool_name", "_timestamp", "_synthetic"] {
             assert!(out[0].get(key).is_none(), "internal key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn canonical_suffix_check_compares_the_exact_provider_metadata_projection() {
+        let mut assistant = json!({"role": "assistant", "content": "tool result accepted"});
+        assert!(astra_turn_types::mark_turn_message(
+            &mut assistant,
+            "turn-chain-1"
+        ));
+        let work_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "establish the admitted work graph",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let budget_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "finish before the admitted deadline",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let canonical_appended = vec![assistant, work_frame, budget_frame.clone()];
+
+        // The main assembly was already consolidated, while the dispatch-time
+        // budget frame was appended afterward. This mixed representation is
+        // the real provider-attempt boundary that exposed the regression.
+        let mut provider_messages = vec![
+            json!({"role": "system", "content": "stable policy"}),
+            json!({"role": "user", "content": "do the task"}),
+        ];
+        provider_messages.extend(project_provider_message_metadata(
+            &canonical_appended[..canonical_appended.len() - 1],
+        ));
+        provider_messages.push(budget_frame);
+
+        assert!(!provider_messages.ends_with(&canonical_appended));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &canonical_appended,
+        ));
+
+        let mut changed_content = canonical_appended.clone();
+        changed_content[0]["content"] = Value::String("different response".to_string());
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &changed_content,
+        ));
+
+        let mut reordered = canonical_appended.clone();
+        reordered.swap(0, 1);
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &reordered,
+        ));
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages[..2],
+            &canonical_appended,
+        ));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &[],
+        ));
     }
 
     #[test]
