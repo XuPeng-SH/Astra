@@ -1943,21 +1943,22 @@ async fn resolve_llm_model_for_turn(
                 "model override does not match the Offering admitted for this run".to_string(),
             );
         }
+        let material = execution.server_material();
         return Ok(ResolvedTurnLlmConfig {
             model_name: execution.model_name.clone(),
             wire_model_name: execution.wire_model_name.clone(),
-            api_key: execution.api_key.clone(),
-            base_url: execution.base_url.clone(),
+            api_key: material.api_key.clone(),
+            base_url: material.base_url.clone(),
             provider: execution.provider.clone(),
             cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
                 execution.cache_capability,
             ),
             thinking_capability: execution.thinking_capability,
             fallback_chain: Vec::new(),
-            header_overrides: execution.header_overrides.clone(),
+            header_overrides: material.header_overrides.clone(),
             request_body_overrides: execution.request_body_overrides.clone(),
-            completions_url_override: execution.completions_url_override.clone(),
-            request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
+            completions_url_override: material.completions_url_override.clone(),
+            request_timeout: material.request_timeout_ms.map(Duration::from_millis),
             context_window: execution.context_window,
             max_completion_tokens: execution.max_completion_tokens,
         });
@@ -6209,11 +6210,14 @@ impl ServerAgenticLoopHost {
         let Some(admitted) = self.admitted_model_execution.as_ref() else {
             return Ok(());
         };
-        if admitted.execution_placement != astra_services::ModelExecutionPlacement::Server {
-            // Edge execution material was authenticated from the current
-            // client request, not resolved from the Server catalog. There is
-            // no Server-owned route or secret to refresh at this boundary.
-            return Ok(());
+        match admitted.source {
+            astra_services::ModelAdmissionSource::ProviderGateway => {
+                // Provider gateway material was authenticated from the current
+                // request. Server executes its HTTP call, but the Server catalog
+                // has no authority to replace that route or refresh its credential.
+                return Ok(());
+            }
+            astra_services::ModelAdmissionSource::ServerCatalog => {}
         }
         let offering = astra_services::revalidate_active_llm_offering(
             &self.matrixone,
@@ -6237,6 +6241,12 @@ impl ServerAgenticLoopHost {
     }
 
     fn cached_llm_config_matches_state(&self, state: &AgenticLoopState) -> bool {
+        // Admitted material is already an in-memory execution snapshot. Its
+        // authority must be rechecked, and a replacement snapshot must take
+        // effect immediately even when its model and Offering names are equal.
+        if self.admitted_model_execution.is_some() {
+            return false;
+        }
         let Some(config) = self.resolved_llm_config.as_ref() else {
             return false;
         };
@@ -29155,10 +29165,12 @@ mod tests {
     async fn admitted_model_execution_uses_its_normalized_url_and_headers() {
         let mut execution =
             test_gateway_execution("http://catalog:8081/api/v1/chat/completions", Some(2000));
-        execution
+        let astra_services::ModelExecutionMaterial::Server(material) =
+            &mut execution.execution_material;
+        material
             .header_overrides
             .insert("authorization".to_string(), "Bearer moi-token".to_string());
-        execution
+        material
             .header_overrides
             .insert("x-workspace-id".to_string(), "ws-001".to_string());
 
@@ -29439,56 +29451,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_model_resolution_reuses_cached_admitted_execution() {
+    async fn provider_gateway_refreshes_material_without_catalog_revalidation() {
         let state = create_test_state();
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-model-cache".to_string(),
-            "session-model-cache".to_string(),
-        )
-        .with_model(Some("gpt-5-mini".to_string()))
-        .with_admitted_model_execution(Some(test_gateway_execution(
-            "http://catalog-a/api/v1/chat/completions".to_string(),
+        let initial = test_gateway_execution(
+            "https://gateway.example/chat/completions".to_string(),
             Some(1000),
-        )))
-        .build();
+        );
+        let mut rotated_auth = initial.clone();
+        let astra_services::ModelExecutionMaterial::Server(material) =
+            &mut rotated_auth.execution_material;
+        material.header_overrides.insert(
+            "authorization".to_string(),
+            "Bearer rotated-token".to_string(),
+        );
+        let mut changed_endpoint = initial.clone();
+        let astra_services::ModelExecutionMaterial::Server(material) =
+            &mut changed_endpoint.execution_material;
+        material.completions_url_override =
+            Some("https://other-gateway.example/chat/completions".to_string());
+        let mut changed_timeout = initial.clone();
+        let astra_services::ModelExecutionMaterial::Server(material) =
+            &mut changed_timeout.execution_material;
+        material.request_timeout_ms = Some(2000);
 
-        let first = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("first resolution");
-        host.admitted_model_execution = Some(test_gateway_execution(
-            "http://catalog-b/api/v1/chat/completions".to_string(),
-            Some(2000),
-        ));
-        let second = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("second resolution");
-
-        assert_eq!(
-            first.completions_url_override,
-            Some("http://catalog-a/api/v1/chat/completions".to_string())
-        );
-        assert_eq!(
-            second.completions_url_override,
-            first.completions_url_override
-        );
-        assert_eq!(second.request_timeout, first.request_timeout);
-        assert_eq!(
-            second
-                .header_overrides
-                .get("authorization")
-                .map(String::as_str),
-            Some("Bearer forwarded-token")
-        );
+        for replacement in [rotated_auth, changed_endpoint, changed_timeout] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "user-model-cache".to_string(),
+                "session-model-cache".to_string(),
+            )
+            .with_model(Some("gpt-5-mini".to_string()))
+            .with_admitted_model_execution(Some(initial.clone()))
+            .build();
+            host.resolve_llm_config_for_state(&state)
+                .await
+                .expect("initial gateway resolution");
+            assert_eq!(replacement.offering_id, initial.offering_id);
+            assert_eq!(replacement.model_name, initial.model_name);
+            assert_eq!(
+                replacement.execution_placement(),
+                astra_services::ModelExecutionPlacement::Server
+            );
+            host.admitted_model_execution = Some(replacement.clone());
+            let current = host
+                .resolve_llm_config_for_state(&state)
+                .await
+                .expect("current gateway material must not query catalog");
+            assert_eq!(
+                current.header_overrides,
+                replacement.server_material().header_overrides
+            );
+            assert_eq!(
+                current.completions_url_override,
+                replacement.server_material().completions_url_override
+            );
+            assert_eq!(
+                current.request_timeout,
+                replacement
+                    .server_material()
+                    .request_timeout_ms
+                    .map(Duration::from_millis)
+            );
+        }
     }
 
     #[tokio::test]
-    async fn host_model_resolution_refreshes_after_cache_ttl() {
+    async fn provider_gateway_material_is_isolated_for_equal_model_identities() {
         let state = create_test_state();
-        let mut host = ServerAgenticLoopHostBuilder::new(
+        let mut first_host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "user-model-cache".to_string(),
@@ -29501,17 +29532,30 @@ mod tests {
         )))
         .build();
 
-        let first = host
+        let first = first_host
             .resolve_llm_config_for_state(&state)
             .await
             .expect("first resolution");
-        host.resolved_llm_config_at =
-            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
-        host.admitted_model_execution = Some(test_gateway_execution(
+        let mut second_execution = test_gateway_execution(
             "http://catalog-b/api/v1/chat/completions".to_string(),
             Some(2000),
-        ));
-        let second = host
+        );
+        let astra_services::ModelExecutionMaterial::Server(material) =
+            &mut second_execution.execution_material;
+        material.header_overrides.insert(
+            "authorization".to_string(),
+            "Bearer second-owner-token".to_string(),
+        );
+        let mut second_host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "second-user".to_string(),
+            "second-session".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_admitted_model_execution(Some(second_execution))
+        .build();
+        let second = second_host
             .resolve_llm_config_for_state(&state)
             .await
             .expect("second resolution");
@@ -29525,6 +29569,30 @@ mod tests {
             Some("http://catalog-b/api/v1/chat/completions".to_string())
         );
         assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(first.model_name, second.model_name);
+        assert_eq!(
+            first
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer forwarded-token")
+        );
+        assert_eq!(
+            second
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer second-owner-token")
+        );
+        let first_again = first_host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first owner still resolves independently");
+        assert_eq!(first_again.header_overrides, first.header_overrides);
+        assert_eq!(
+            first_again.completions_url_override,
+            first.completions_url_override
+        );
     }
 
     #[test]

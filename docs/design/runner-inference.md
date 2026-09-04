@@ -1,6 +1,6 @@
 # Runner inference and BYOK
 
-> Status: design proposal — awaiting review before implementation.
+> Status: accepted for staged implementation; Runner inference is not yet available.
 > Last updated: 2026-09-05.
 > Parent contract: [Model access and inference](model-access-and-inference.md).
 > Motivation and alternatives: [issue #702](https://github.com/matrixorigin/Astra/issues/702).
@@ -1162,7 +1162,14 @@ not proof about a compromised host.
 
 ## Implementation boundaries and release gates
 
-Apply these as reviewable slices after this proposal is accepted:
+Implement these as reviewable slices. Each slice requires focused verification,
+independent review, fixes, and a feature-branch commit before proceeding. Public
+Runner model exposure remains gated on the complete execution/recovery contract;
+preparatory refactors are not usable BYOK support.
+
+Do not preserve superseded execution paths for compatibility. Pay down technical
+debt in the touched owners, and replace tests that encode the old misconception
+with orthogonal behavior tests. Keep unrelated cleanup outside the slice.
 
 1. **Canonical route and exact-attempt seam.** Extend the parent route contract
    in `astra-services`, split secret material from serializable route facts,
@@ -1258,9 +1265,10 @@ local sync, first delta, preview delay, and terminal commit separately so tuning
 cannot hide durability loss. Fork must retain the existing shared-prefix cost,
 and reconnect recovery must scale with pending attempts, not total history.
 
-## Design review checkpoints
+## Implementation review checkpoints
 
-The proposal is ready for implementation only after agreement on these choices:
+Review each implementation slice against the accepted choices below. A passing
+preparatory slice does not close the later protocol and product release gates:
 
 - Server prepares the exact body; Runner owns local transport and credentials.
 - One dispatch plus two local durability boundaries is sufficient for v1;

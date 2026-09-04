@@ -6,20 +6,12 @@
 //!
 //! # Proxy invariant
 //!
-//! [`astra_core::net::apply_env_proxy`] is the **only** place in the codebase
-//! that honours `HTTPS_PROXY` / `ALL_PROXY` env vars. It is called from the
-//! LLM client here and from `validate_connectivity` in `astra-services`
-//! (both reach external provider endpoints). All other `reqwest` clients
-//! (durable bridge, skill HTTP, server tool executor, summary client, …)
-//! must call `.no_proxy()` — their traffic is local/intranet and should
-//! not be routed through a user's LLM proxy.
-//!
-//! Re-exported as [`apply_env_proxy`] for in-crate call sites.
+//! Provider HTTP construction lives in [`super::transport`] and uses the
+//! canonical external-provider proxy policy in [`astra_core::net::apply_env_proxy`].
 
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::OnceLock,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -33,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
+use super::transport::global_llm_client;
 #[cfg(test)]
 use crate::prompts;
 #[cfg(test)]
@@ -635,81 +628,6 @@ pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
     astra_turn_core::thinking_config::provider_may_think_natively(provider)
 }
 
-/// Global HTTP client for LLM requests (connection pooling, reuse).
-pub(crate) fn global_llm_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let connect = llm_connect_timeout();
-        // This client-level ceiling is only a transport backstop. Derive it
-        // from the same effective provider-attempt configuration so an
-        // operator override cannot be silently capped by the compiled 300s
-        // default. Per-request deadlines remain authoritative below.
-        let total = llm_total_budget().saturating_add(std::time::Duration::from_secs(60));
-        let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4usize);
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(connect)
-            // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(total)
-            .pool_max_idle_per_host(pool_idle);
-        // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
-        // does not auto-read system proxy, so we wire it up explicitly).
-        builder = apply_env_proxy(builder);
-        match builder.build()
-        {
-            Ok(client) => {
-                tracing::info!(
-                    target: "astra_runtime::llm_client",
-                    pool_max_idle_per_host = pool_idle,
-                    connect_timeout_s = connect.as_secs(),
-                    total_timeout_s = total.as_secs(),
-                    "global LLM HTTP client built"
-                );
-                client
-            }
-            Err(e) => {
-                // audit-C1: TLS / HTTP stack init failure should not crash the process.
-                // Retry with the same timeouts but without pool tuning so we still bound
-                // hung-upstream risk if this tier succeeds.
-                tracing::error!(
-                    target: "astra_runtime::llm_client",
-                    error = %e,
-                    "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
-                );
-                let mut fallback_builder = reqwest::Client::builder()
-                    .connect_timeout(connect)
-                    .timeout(total);
-                fallback_builder = apply_env_proxy(fallback_builder);
-                match fallback_builder.build() {
-                    Ok(client) => client,
-                    Err(e2) => {
-                        tracing::error!(
-                            target: "astra_runtime::llm_client",
-                            error = %e2,
-                            "failed to build minimal global LLM HTTP client; retrying with proxy-aware reqwest::Client::new() equivalent"
-                        );
-                        let mut last_chance_builder = reqwest::Client::builder();
-                        last_chance_builder = apply_env_proxy(last_chance_builder);
-                        match last_chance_builder.build() {
-                            Ok(client) => client,
-                            Err(e3) => {
-                                tracing::error!(
-                                    target: "astra_runtime::llm_client",
-                                    error = %e3,
-                                    "failed to build last-chance proxy-aware LLM HTTP client; using reqwest::Client::new()"
-                                );
-                                reqwest::Client::new()
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 fn reset_rate_limit_cooldown_for_tests() {
     rate_limit_cooldown().reset_for_tests();
@@ -879,17 +797,18 @@ impl<'a> LlmExecutionRoute<'a> {
     /// client-selected model name or URL.
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
+        let material = execution.server_material();
         Self {
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
-            api_key: &execution.api_key,
-            base_url: &execution.base_url,
+            api_key: &material.api_key,
+            base_url: &material.base_url,
             provider: &execution.provider,
-            header_overrides: (!execution.header_overrides.is_empty())
-                .then_some(&execution.header_overrides),
+            header_overrides: (!material.header_overrides.is_empty())
+                .then_some(&material.header_overrides),
             request_body_overrides: execution.request_body_overrides.as_ref(),
-            completions_url_override: execution.completions_url_override.as_deref(),
-            request_timeout: execution
+            completions_url_override: material.completions_url_override.as_deref(),
+            request_timeout: material
                 .request_timeout_ms
                 .map(std::time::Duration::from_millis),
         }
@@ -1586,21 +1505,6 @@ pub(crate) fn set_test_retry_backoff_ms(ms: u64) -> impl Drop {
     }
     Guard
 }
-
-/// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
-///
-/// reqwest is built with `default-features = false`, so it does not auto-read
-/// the system proxy env vars. We wire them up explicitly here and honour
-/// `NO_PROXY` via `reqwest::NoProxy::from_env()`.
-///
-/// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
-/// `all_proxy`. For `HTTPS_PROXY`/`https_proxy` we register an HTTPS-scheme
-/// proxy; for `ALL_PROXY`/`all_proxy` we register an all-scheme proxy so that
-/// `socks5://` URLs (which only make sense as all-scheme) are honoured.
-pub(crate) use astra_core::net::apply_env_proxy;
-
-// Tests for `apply_env_proxy` live with its authoritative implementation in
-// `astra_core::net`. Do not duplicate them here.
 
 /// Resolve an LLM duration-in-seconds constant, consulting its env-var
 /// override and falling back to the compile-time default. Used by
@@ -4652,7 +4556,7 @@ async fn call_llm_and_collect_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
+    let client = global_llm_client()?;
 
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
@@ -15152,13 +15056,6 @@ mod tests {
         assert!(!log_line.contains("sk-abc12345"));
         assert!(log_line.contains("[REDACTED]"));
     }
-
-    /// audit-C1: global_llm_client must not use .expect() — a TLS backend
-    /// failure should not crash the entire process.
-
-    /// Regression: external LLM traffic must keep honoring env proxy policy even
-    /// on fallback builds; silently downgrading to `.no_proxy()` makes
-    /// region-gated upstreams flap between working and unsupported-region 400s.
 
     /// P1-E: llm_client must NOT define its own rate_limit_cooldown singleton.
     /// There must be exactly one PerModelCooldown singleton shared across all

@@ -75,38 +75,44 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
         if proxy_url.is_empty() {
             continue;
         }
-        let is_all = matches!(*var, "ALL_PROXY" | "all_proxy");
-        let parsed = if is_all {
-            reqwest::Proxy::all(&proxy_url)
-        } else {
-            reqwest::Proxy::https(&proxy_url)
-        };
-        match parsed {
-            Ok(mut proxy) => {
-                if let Some(np) = no_proxy.clone() {
-                    proxy = proxy.no_proxy(Some(np));
-                }
-                tracing::info!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    "applying proxy from environment"
-                );
-                builder = builder.proxy(proxy);
-                return builder;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    error = %e,
-                    "failed to parse proxy URL; ignoring"
-                );
-            }
+        if let Some(proxy) = parse_environment_proxy(var, &proxy_url, no_proxy.clone()) {
+            builder = builder.proxy(proxy);
+            return builder;
         }
     }
     builder
+}
+
+fn parse_environment_proxy(
+    var: &str,
+    proxy_url: &str,
+    no_proxy: Option<reqwest::NoProxy>,
+) -> Option<reqwest::Proxy> {
+    let parsed = if matches!(var, "ALL_PROXY" | "all_proxy") {
+        reqwest::Proxy::all(proxy_url)
+    } else {
+        reqwest::Proxy::https(proxy_url)
+    };
+    match parsed {
+        Ok(proxy) => {
+            tracing::info!(
+                target: "astra_core::net",
+                env_var = var,
+                "applying proxy from environment"
+            );
+            Some(proxy.no_proxy(no_proxy))
+        }
+        Err(_) => {
+            // URLs and parser errors can contain credentials, private hosts,
+            // and local paths. The variable name is enough to locate repair.
+            tracing::warn!(
+                target: "astra_core::net",
+                env_var = var,
+                "failed to parse proxy URL; ignoring"
+            );
+            None
+        }
+    }
 }
 
 /// Returns `true` when `url` targets the local host (`localhost`,
@@ -169,7 +175,75 @@ mod client_builder_for_target_tests {
 
 #[cfg(test)]
 mod apply_env_proxy_tests {
-    use super::apply_env_proxy;
+    use super::{apply_env_proxy, parse_environment_proxy};
+
+    #[test]
+    fn proxy_configuration_logs_never_include_private_material() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                parse_environment_proxy(
+                    "HTTPS_PROXY",
+                    "http://canary-user:canary-secret@canary-proxy.invalid/private-path",
+                    None,
+                )
+                .is_some()
+            );
+            assert!(
+                parse_environment_proxy(
+                    "ALL_PROXY",
+                    "http://canary-user:canary-secret@[invalid/private-path",
+                    None,
+                )
+                .is_none()
+            );
+        });
+        let output = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("UTF-8 logs");
+        assert!(output.contains("applying proxy from environment"));
+        assert!(output.contains("failed to parse proxy URL; ignoring"));
+        assert!(output.contains("HTTPS_PROXY"));
+        assert!(output.contains("ALL_PROXY"));
+        for private_value in [
+            "canary-user",
+            "canary-secret",
+            "canary-proxy",
+            "private-path",
+            "[invalid",
+        ] {
+            assert!(
+                !output.contains(private_value),
+                "private configuration in logs"
+            );
+        }
+    }
 
     /// All four recognized env var names must be cleared for isolation, since
     /// `apply_env_proxy` reads them in precedence order.

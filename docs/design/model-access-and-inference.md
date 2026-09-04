@@ -2,7 +2,7 @@
 
 > Status: target design contract.
 > Last updated: 2026-09-05.
-> Runner execution changes are proposed for review in [Runner inference and BYOK](runner-inference.md).
+> Runner execution follows the staged implementation contract in [Runner inference and BYOK](runner-inference.md); it is not yet available.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
