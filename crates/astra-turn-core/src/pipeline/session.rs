@@ -87,6 +87,8 @@ pub struct PipelineSession {
     pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     turns_completed: u32,
     latest_runtime_feedback: Option<RuntimeFeedbackFrame>,
+    provider_cache_observed_since_feedback: bool,
+    pending_provider_cache_break: Option<crate::cache_diagnostics::CacheBreakReason>,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
 
@@ -102,6 +104,52 @@ pub(crate) struct PendingPromptSnapshot {
     section_usage: std::collections::HashMap<crate::section_types::SectionKind, u32>,
     #[serde(default)]
     section_fingerprints: Vec<(crate::section_types::SectionKind, u64)>,
+}
+
+/// One exact, dispatched physical provider attempt ready for cache diagnosis.
+/// The runtime constructs this only from the immutable prepared-body receipt
+/// and an explicitly available (or unavailable) provider usage fact.
+#[derive(Debug, Clone)]
+pub struct ProviderAttemptCacheObservation {
+    pub attempt_identity: crate::cache_diagnostics::ProviderAttemptCacheIdentity,
+    pub dispatched: bool,
+    pub fingerprint: crate::cache_diagnostics::ProviderFinalPromptFingerprint,
+    pub cache_read_tokens: Option<u64>,
+}
+
+/// Merge cache-break evidence from multiple physical attempts belonging to
+/// one logical feedback frame. Reasons are typed and deduplicated by value;
+/// a later stable retry must never erase an earlier observed break.
+fn merge_cache_break_reason(
+    current: Option<crate::cache_diagnostics::CacheBreakReason>,
+    incoming: Option<crate::cache_diagnostics::CacheBreakReason>,
+) -> Option<crate::cache_diagnostics::CacheBreakReason> {
+    use crate::cache_diagnostics::CacheBreakReason;
+
+    fn append_unique(target: &mut Vec<CacheBreakReason>, reason: CacheBreakReason) {
+        match reason {
+            CacheBreakReason::Multiple(reasons) => {
+                for reason in reasons {
+                    append_unique(target, reason);
+                }
+            }
+            reason if !target.contains(&reason) => target.push(reason),
+            _ => {}
+        }
+    }
+
+    let mut reasons = Vec::new();
+    if let Some(reason) = current {
+        append_unique(&mut reasons, reason);
+    }
+    if let Some(reason) = incoming {
+        append_unique(&mut reasons, reason);
+    }
+    match reasons.len() {
+        0 => None,
+        1 => reasons.pop(),
+        _ => Some(CacheBreakReason::Multiple(reasons)),
+    }
 }
 
 impl PipelineSession {
@@ -130,6 +178,8 @@ impl PipelineSession {
             pending_prompt_snapshot: None,
             turns_completed: 0,
             latest_runtime_feedback: None,
+            provider_cache_observed_since_feedback: false,
+            pending_provider_cache_break: None,
             pending_audits: Vec::new(),
         }
     }
@@ -153,6 +203,8 @@ impl PipelineSession {
             pending_prompt_snapshot: None,
             turns_completed: 0,
             latest_runtime_feedback: None,
+            provider_cache_observed_since_feedback: false,
+            pending_provider_cache_break: None,
             pending_audits: Vec::new(),
         }
     }
@@ -182,6 +234,8 @@ impl PipelineSession {
             pending_prompt_snapshot: None,
             turns_completed: 0,
             latest_runtime_feedback: None,
+            provider_cache_observed_since_feedback: false,
+            pending_provider_cache_break: None,
             pending_audits: Vec::new(),
         }
     }
@@ -289,6 +343,12 @@ impl PipelineSession {
             explain,
             metrics,
         };
+        // A new pipeline request supersedes any orphaned observation
+        // aggregation left by a prior request that failed after dispatch but
+        // before runtime feedback. Host-internal physical retries and
+        // continuations do not re-enter this boundary.
+        self.provider_cache_observed_since_feedback = false;
+        self.pending_provider_cache_break = None;
         self.pending_prompt_snapshot = Some(PendingPromptSnapshot::capture(
             query_source,
             session,
@@ -298,24 +358,25 @@ impl PipelineSession {
         Ok(output)
     }
 
-    /// Align cache-break diagnostics with the exact provider-visible messages
-    /// and tool schemas after runtime assembly, stabilization, and cache
-    /// annotation.
+    /// Align planned cache diagnostics with the runtime's pre-client message
+    /// and tool projection. This is not provider-final authority; transports
+    /// that own an immutable prepared-body receipt must call
+    /// [`Self::record_provider_attempt_cache_observation`] before feedback.
     ///
     /// Returns `false` only when no pipeline request is awaiting feedback.
-    pub fn replace_pending_wire_prompt(
+    pub fn replace_pending_planned_wire_prompt(
         &mut self,
         messages: &[serde_json::Value],
         tool_schemas: &[serde_json::Value],
     ) -> bool {
-        self.replace_pending_wire_prompt_with_cache_capability(messages, tool_schemas, None)
+        self.replace_pending_planned_wire_prompt_with_cache_capability(messages, tool_schemas, None)
     }
 
     /// Capability-aware counterpart used by provider-owning runtimes after
     /// final message consolidation. Keeping the capability and the exact wire
     /// projection together prevents a volatile system tail from being
     /// misdiagnosed as a leading-system mutation on prefix-cache providers.
-    pub fn replace_pending_wire_prompt_with_cache_capability(
+    pub fn replace_pending_planned_wire_prompt_with_cache_capability(
         &mut self,
         messages: &[serde_json::Value],
         tool_schemas: &[serde_json::Value],
@@ -341,6 +402,39 @@ impl PipelineSession {
         };
         pending.snapshot = snapshot;
         true
+    }
+
+    /// Consume one dispatched physical attempt from the immutable provider
+    /// receipt. Each durable attempt identity is accepted at most once.
+    /// Provider usage is optional: absent usage advances only the structural
+    /// baseline and never fabricates a hit or miss.
+    pub fn record_provider_attempt_cache_observation(
+        &mut self,
+        query_source: &str,
+        observation: ProviderAttemptCacheObservation,
+    ) -> bool {
+        if !observation.dispatched {
+            return false;
+        }
+        let Some(pending) = self.pending_prompt_snapshot.as_ref() else {
+            return false;
+        };
+        let mut snapshot = pending.snapshot.clone();
+        snapshot.attach_provider_final_fingerprint(observation.fingerprint);
+        let (accepted, event) = self.cache_detector.record_provider_attempt_for_source(
+            query_source,
+            &observation.attempt_identity,
+            snapshot,
+            observation.cache_read_tokens,
+        );
+        if accepted {
+            self.provider_cache_observed_since_feedback = true;
+            self.pending_provider_cache_break = merge_cache_break_reason(
+                self.pending_provider_cache_break.take(),
+                event.map(|event| event.reason),
+            );
+        }
+        accepted
     }
 
     /// Run the pipeline in shadow mode: produce pipeline output AND compare
@@ -372,6 +466,9 @@ impl PipelineSession {
         feedback: &mut ContextFeedback,
         turn_output: Option<&TurnOutput>,
     ) {
+        let provider_final_observed =
+            std::mem::take(&mut self.provider_cache_observed_since_feedback);
+        let provider_final_break = self.pending_provider_cache_break.take();
         let pending_snapshot = self.pending_prompt_snapshot.take();
         let recorded_pending_sections = pending_snapshot.as_ref().is_some_and(|pending| {
             !pending.section_usage.is_empty() || !pending.section_fingerprints.is_empty()
@@ -381,32 +478,38 @@ impl PipelineSession {
             self.stats
                 .record_section_fingerprint_hashes(&pending.section_fingerprints);
         }
-        let had_cache_baseline = pending_snapshot.as_ref().is_some_and(|pending| {
-            self.cache_detector
-                .snapshot_for_source(&pending.query_source)
-                .is_some()
-        });
-        if let Some(pending) = pending_snapshot {
-            if let Some(event) = self.cache_detector.record_turn_for_source(
-                &pending.query_source,
-                pending.snapshot,
-                Some(feedback.tokens.cache_read),
-            ) {
-                feedback.attribute_cache_break(event.reason);
-            } else if !had_cache_baseline {
-                // First-turn / post-compaction cold starts are expected.
+        if provider_final_observed {
+            if let Some(reason) = provider_final_break {
+                feedback.attribute_cache_break(reason);
+            }
+        } else {
+            let had_cache_baseline = pending_snapshot.as_ref().is_some_and(|pending| {
+                self.cache_detector
+                    .snapshot_for_source(&pending.query_source)
+                    .is_some()
+            });
+            if let Some(pending) = pending_snapshot {
+                if let Some(event) = self.cache_detector.record_turn_for_source(
+                    &pending.query_source,
+                    pending.snapshot,
+                    Some(feedback.tokens.cache_read),
+                ) {
+                    feedback.attribute_cache_break(event.reason);
+                } else if !had_cache_baseline {
+                    // First-turn / post-compaction cold starts are expected.
+                } else {
+                    feedback.detect_cache_break(
+                        self.stats.turns_executed + 1,
+                        DEFAULT_MIN_CACHE_BREAK_TOKENS,
+                    );
+                }
             } else {
+                let _ = query_source;
                 feedback.detect_cache_break(
                     self.stats.turns_executed + 1,
                     DEFAULT_MIN_CACHE_BREAK_TOKENS,
                 );
             }
-        } else {
-            let _ = query_source;
-            feedback.detect_cache_break(
-                self.stats.turns_executed + 1,
-                DEFAULT_MIN_CACHE_BREAK_TOKENS,
-            );
         }
 
         self.stats.record(model_id, query_source, feedback);
@@ -454,6 +557,10 @@ impl PipelineSession {
             return false;
         }
         let Some(request_usage) = frame.request_usage else {
+            if std::mem::take(&mut self.provider_cache_observed_since_feedback) {
+                frame.cache_break_detected = self.pending_provider_cache_break.take();
+                self.pending_prompt_snapshot = None;
+            }
             self.latest_runtime_feedback = Some(frame.clone());
             return true;
         };
@@ -701,6 +808,8 @@ impl PipelineSession {
             pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
             turns_completed: self.turns_completed,
             latest_runtime_feedback: self.latest_runtime_feedback.clone(),
+            provider_cache_observed_since_feedback: self.provider_cache_observed_since_feedback,
+            pending_provider_cache_break: self.pending_provider_cache_break.clone(),
             session_current_date: Some(self.session_current_date.clone()),
         }
     }
@@ -723,6 +832,8 @@ impl PipelineSession {
             pending_prompt_snapshot,
             turns_completed,
             latest_runtime_feedback,
+            provider_cache_observed_since_feedback,
+            pending_provider_cache_break,
             session_current_date,
         } = snapshot;
         let mut recovery = recovery;
@@ -746,6 +857,8 @@ impl PipelineSession {
             pending_prompt_snapshot,
             turns_completed,
             latest_runtime_feedback: latest_runtime_feedback.filter(RuntimeFeedbackFrame::is_valid),
+            provider_cache_observed_since_feedback,
+            pending_provider_cache_break,
             pending_audits: Vec::new(),
         }
     }
@@ -773,6 +886,10 @@ pub struct PipelineSessionSnapshot {
     pub turns_completed: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_runtime_feedback: Option<RuntimeFeedbackFrame>,
+    #[serde(default)]
+    pub provider_cache_observed_since_feedback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_provider_cache_break: Option<crate::cache_diagnostics::CacheBreakReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_current_date: Option<String>,
 }
@@ -891,6 +1008,33 @@ mod tests {
     }
 
     #[test]
+    fn physical_retry_break_aggregation_is_typed_deduplicated_and_monotonic() {
+        use crate::cache_diagnostics::CacheBreakReason;
+
+        let system = CacheBreakReason::SystemPromptChanged;
+        assert_eq!(
+            merge_cache_break_reason(Some(system.clone()), None),
+            Some(system.clone()),
+            "a stable retry cannot erase an earlier physical-attempt break"
+        );
+        assert_eq!(
+            merge_cache_break_reason(Some(system.clone()), Some(system.clone())),
+            Some(system.clone()),
+            "the same typed reason from two attempts is reported once"
+        );
+        assert_eq!(
+            merge_cache_break_reason(
+                Some(system.clone()),
+                Some(CacheBreakReason::CacheControlChanged),
+            ),
+            Some(CacheBreakReason::Multiple(vec![
+                system,
+                CacheBreakReason::CacheControlChanged,
+            ]))
+        );
+    }
+
+    #[test]
     fn pending_cache_snapshot_is_replaced_with_final_wire_prompt() {
         let mut session = PipelineSession::new(PipelineConfig::default());
         session.pending_prompt_snapshot = Some(PendingPromptSnapshot {
@@ -922,7 +1066,7 @@ mod tests {
         )
         .expect("wire snapshot");
 
-        assert!(session.replace_pending_wire_prompt(&messages, &tools));
+        assert!(session.replace_pending_planned_wire_prompt(&messages, &tools));
         let actual = &session
             .pending_prompt_snapshot
             .as_ref()
@@ -947,6 +1091,39 @@ mod tests {
         let sess = PipelineSession::new(PipelineConfig::default());
         assert_eq!(sess.turns_completed(), 0);
         assert!(!sess.should_abort());
+    }
+
+    #[test]
+    fn new_pipeline_request_clears_orphaned_provider_observation_aggregation() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        sess.provider_cache_observed_since_feedback = true;
+        sess.pending_provider_cache_break =
+            Some(crate::cache_diagnostics::CacheBreakReason::UnknownColdStart);
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(2);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        sess.run_turn(TurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            optimize_limits: &limits,
+            model_id: "m",
+            query_source: "repl",
+        })
+        .expect("new pipeline request");
+
+        assert!(!sess.provider_cache_observed_since_feedback);
+        assert!(sess.pending_provider_cache_break.is_none());
+        assert!(
+            sess.pending_prompt_snapshot.is_some(),
+            "a later pre-dispatch failure may retain only the new planned request"
+        );
     }
 
     #[test]

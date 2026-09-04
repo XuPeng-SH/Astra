@@ -624,6 +624,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

@@ -7936,15 +7936,25 @@ async fn root_live_terminal_precedes_blocked_remote_descendant_convergence() {
     );
     let blocked = descendant_entered.notified();
     tokio::pin!(blocked);
-    assert!(
-        AgenticRunLifecycleService::schedule_durable_user_cancelled_run_descendants(
-            engine.clone(),
-            "user-1",
-            session_id,
-            root_id,
-            false,
-        )
+    // A process-global scheduler is bound to the production runtime's
+    // lifetime. Unit tests create and destroy independent Tokio runtimes, so
+    // sharing that singleton across tests can leave a supervisor attached to
+    // an already-closed runtime. Exercise the same scheduler contract with an
+    // explicitly owned test instance.
+    let scheduler = DescendantCancellationScheduler::new(
+        DESCENDANT_CANCELLATION_JOB_CONCURRENCY,
+        DESCENDANT_CANCELLATION_QUEUE_CAPACITY,
+        DESCENDANT_CANCELLATION_JOB_DEADLINE,
     );
+    assert!(scheduler.enqueue(DescendantCancellationJob {
+        key: DescendantCancellationJobKey {
+            user_id: "user-1".to_string(),
+            session_id: session_id.to_string(),
+            parent_run_id: root_id.to_string(),
+        },
+        run_engine: engine.clone(),
+        verify_outermost_scope: false,
+    }));
     tokio::time::timeout(Duration::from_secs(2), &mut blocked)
         .await
         .expect("background durable descendant sweep must reach the remote row");

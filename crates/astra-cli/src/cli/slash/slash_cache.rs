@@ -305,6 +305,7 @@ mod tests {
             round,
             provider: "openai".into(),
             model: "test-model".into(),
+            cache_capability: None,
             cache_read_tokens,
             cache_creation_tokens: 0,
             tool_count: 0,

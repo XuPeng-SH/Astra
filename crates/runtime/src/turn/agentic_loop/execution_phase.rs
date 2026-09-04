@@ -3808,8 +3808,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     let mut turn_result = match turn_result {
-        Ok(turn_result) => turn_result,
+        Ok(turn_result) => {
+            state.commit_volatile_attempt_lease();
+            turn_result
+        }
         Err(error) => {
+            state.restore_volatile_attempt_lease();
             fold_provider_completion_error_usage(state, &error);
             if schedule_safe_provider_recovery(state, &error) {
                 tracing::warn!(

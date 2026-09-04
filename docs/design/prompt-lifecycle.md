@@ -86,23 +86,102 @@ Prompt cache goals:
 ForkPrefix is a cache/diagnostic optimization, not restore correctness.
 
 Provider cache behavior is capability-driven along independent axes: cache
-protocol, physical volatile placement, and optional-volatile delivery. A
-prefix-cache provider may suppress duplicated advisory/active-turn snapshots
-while preserving required lifecycle context as a system-authority tail; these
-are not contradictory policies. Providers that require an exact history match
-also suppress optional round-specific blocks, but an unrepresentable required
-authority boundary may still cause an intentional cold request. Correctness is
-never weakened to preserve reuse.
+protocol, physical volatile placement, optional-volatile delivery, and reuse
+scope. Concrete offerings declare these facts; runtime code never infers them
+from a model name. Missing legacy delivery metadata retains the pre-axis `all`
+behavior, while newly serialized metadata is versioned and writes every
+behavioral field explicitly.
+
+`append_only_user_tail` is a distinct provider wire shape, not a compatibility
+fallback. It is valid only with `required_only` delivery. A required runtime
+control is appended as a typed, runtime-owned `role=user` frame so the next
+request strictly extends the prior provider history. Provider role is not
+semantic authorship: intent, memory, observer, display, turn-boundary, and
+ordinary summary projections must use typed provenance and must never count
+that frame as human speech. Unknown runtime provenance fails closed and cannot
+be promoted to a user request.
+
+Every append-only authority frame carries a kind and one explicit lifetime:
+`next_assistant_decision` or `current_user_turn`. A later frame of the same kind
+supersedes an earlier one; assistant or human-turn boundaries consume the
+applicable lifetime. Retries are transactional: a failed wire assembly neither
+commits a partial frame nor consumes pending authority. Cache-reusing inline
+compaction may retain the exact frame bytes only under the same stable semantic
+policy used by main inference; all other summary/learning projections exclude
+runtime-owned frames.
+
+When an active session changes to a non-append wire shape, expired frames are
+removed from the provider projection. Active authority is unframed and re-homed
+to the required system lane; kinds rebuilt by a current authoritative source
+replace their historical frame instead of being duplicated. Canonical history
+retains the typed record needed for deterministic resume, while the chosen
+provider projection contains each effective authority kind once. Correctness is
+never weakened to preserve cache reuse.
 
 Turn focus is represented by one invariant leading-system policy: the exact
 current and immediately prior text remains in canonical conversation messages
 and is never recopied into the cached system prefix. Required runtime context
-remains model-visible under its system role. For automatic-prefix protocols a
+remains model-visible through the role required by the selected wire shape,
+without changing its typed runtime ownership. For automatic-prefix protocols a
 changed system message after the conversation boundary is a volatile suffix,
-not a changed leading-system identity. Cache diagnostics must fingerprint the
-provider-final messages and tool schemas after system consolidation, not an
-earlier pipeline candidate, and must apply the same protocol boundary semantics
-as the provider.
+not a changed leading-system identity. Planned diagnostics are explicitly
+labelled as a pre-client projection. Provider-final diagnostics come only from
+the immutable prepared-body receipt and fingerprint the ordered message,
+system, conversation, and tool-schema sequences after every provider
+transformation and internal-schema sanitization. Both read the exact resolved
+capability captured with the request and never guess a shape from provider or
+model labels. The receipt also derives cache-key system and tool identities
+from that typed capability: automatic-prefix layouts exclude post-history
+system tails, while explicit-marker layouts stop at their protocol-native
+system/tool marker. Every dispatched physical attempt advances this structural
+baseline exactly once by durable request identity; only attempts with provider
+usage contribute hit/miss counts. Pre-dispatch attempts and missing-usage
+terminals never fabricate cache statistics.
+
+Append-only canonical state uses the provider-attempt ledger as a write-ahead
+boundary. Before HTTP is authorized, the same transaction that admits the
+exact provider body stores every newly provider-owned canonical append as a
+versioned transition with predecessor/result message counts and canonical root
+hashes. The transition is self-contained from the canonical coordinator's
+admitted durable base: it carries either the lossless uncommitted suffix or an
+explicit replacement after an authorized compaction rewrite, followed by the
+attempt-owned append. A request with no new runtime frame still stores a
+recovery-only snapshot: provider delivery, rather than the presence of a
+particular authority shape, creates the durability obligation. Initial
+authority frames are authority-only appends; an internal continuation is one
+atomic assistant-plus-authority append.
+
+A resumed host uses the admitted durable message count as an ownership
+boundary. It detaches the fresh request suffix, loads the database-authoritative
+per-turn head, restores that one self-contained leaf on the durable base, and
+finally reattaches the fresh suffix. Every transition names its immutable parent
+transition id. Provider-attempt admission validates parent-to-current-head and
+advances the head in the same transaction as the exact provider body; a
+same-transition physical retry is idempotent. It never compares message values
+to infer lineage or guess whether repeated input such as `continue` belongs
+before or after the crash. A missing parent, fork, stale head, payload/hash
+conflict, or ambiguous commit without the exact head attempt fails before HTTP
+or canonical mutation.
+This covers a crash after HTTP authorization but before any step or canonical
+checkpoint. Provider body roles, model names, prompt text, transport errors,
+timestamps, run-local counters, and attempt ids are not recovery evidence.
+
+WAL snapshots cross the same durable credential-redaction boundary as runtime
+checkpoints. They preserve the already-durable canonical base byte-for-byte and
+redact only newly retained message data. Head advancement clears the prior
+attempt's large JSON payload in the admission transaction, leaving exactly one
+recoverable snapshot regardless of provider-round count; transition id, parent,
+and content hash remain as audit evidence. Once a canonical commit absorbs a
+turn, its head and final payload are retired atomically; the next session
+boundary retries retirement for an earlier commit that crashed before cleanup.
+Hard session deletion removes both owner-scoped heads and attempt rows.
+
+Prefix mismatch is not replacement authority. An append transition must prove
+that the admitted durable base remains an exact prefix. A replacement
+transition can be created only from the canonical rewrite proof after its
+pre-mutation permit has been validated and bound to the exact resulting
+predecessor identity and compaction generation; otherwise provider admission
+fails before HTTP.
 
 At a text-only completion boundary, a provider may receive one request with a
 stable schema declaration plus its native no-tool choice. If it nevertheless

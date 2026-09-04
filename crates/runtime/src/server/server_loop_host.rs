@@ -101,6 +101,7 @@ const PROVIDER_ACTION_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 #[derive(Clone, Copy, Debug)]
 struct RunExecutionTimeBudget {
     deadline: tokio::time::Instant,
+    deadline_unix_ms: u64,
 }
 
 impl RunExecutionTimeBudget {
@@ -109,14 +110,32 @@ impl RunExecutionTimeBudget {
     }
 
     fn new_at(snapshot: ExecutionTimeBudget, now: tokio::time::Instant) -> Self {
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         Self {
             deadline: now + Duration::from_secs(snapshot.remaining_seconds),
+            deadline_unix_ms: wall_now_ms
+                .saturating_add(snapshot.remaining_seconds.saturating_mul(1_000)),
         }
     }
 
     fn tighten_at(&mut self, snapshot: ExecutionTimeBudget, now: tokio::time::Instant) {
         let proposed = now + Duration::from_secs(snapshot.remaining_seconds);
-        self.deadline = self.deadline.min(proposed);
+        if proposed < self.deadline {
+            self.deadline = proposed;
+            let wall_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            self.deadline_unix_ms =
+                wall_now_ms.saturating_add(snapshot.remaining_seconds.saturating_mul(1_000));
+        }
     }
 
     fn remaining(self) -> Duration {
@@ -127,9 +146,9 @@ impl RunExecutionTimeBudget {
         self.deadline.saturating_duration_since(now)
     }
 
-    fn snapshot(self) -> ExecutionTimeBudget {
-        ExecutionTimeBudget {
-            remaining_seconds: self.remaining().as_secs(),
+    fn authority_snapshot(self) -> ExecutionDeadlineAuthority {
+        ExecutionDeadlineAuthority {
+            deadline_unix_ms: self.deadline_unix_ms,
         }
     }
 
@@ -137,6 +156,11 @@ impl RunExecutionTimeBudget {
         let remaining = self.remaining();
         (!remaining.is_zero()).then_some(requested.min(remaining))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutionDeadlineAuthority {
+    deadline_unix_ms: u64,
 }
 
 /// Execution-owned provider-work slice derived from the run's monotonic
@@ -149,6 +173,15 @@ impl ProviderWorkBudget {
     fn clamp(self, other: Duration) -> Duration {
         self.0.min(other)
     }
+}
+
+/// One no-await dispatch snapshot. The model-visible remaining seconds and
+/// client timeout are derived from this same value, so preparation latency can
+/// neither replenish the hard deadline nor make the prompt overstate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderDispatchBudget {
+    prompt_snapshot: Option<ExecutionDeadlineAuthority>,
+    client_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,12 +804,25 @@ fn system_next_work_item_call(session_turn: u32, round: u32) -> Value {
     })
 }
 
+fn pre_turn_summary_spill_count(messages: &[Value]) -> usize {
+    let keep_recent = (messages.len() / 4).max(4);
+    let proposed = crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
+        messages,
+        messages.len().saturating_sub(keep_recent),
+    );
+    astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+        .map_or(proposed, |protected_start| proposed.min(protected_start))
+}
+
 fn apply_pre_turn_summary(
     state: &mut AgenticLoopState,
     pressure: f64,
     summary_text: String,
-) -> CompactionEvent {
-    let rewrite_permit = state.begin_canonical_rewrite();
+    spill_count: usize,
+) -> Option<CompactionEvent> {
+    if spill_count == 0 || spill_count > state.messages.len() {
+        return None;
+    }
     let max_tokens = state.max_turn_input_tokens;
     let (tokens_before, old_count) = (
         crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
@@ -787,37 +833,35 @@ fn apply_pre_turn_summary(
         .1,
         state.messages.len(),
     );
-    let keep_recent = (old_count / 4).max(4);
-    let spill_count =
-        crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
-            &state.messages,
-            old_count.saturating_sub(keep_recent),
-        );
-    let spilled_count = state.messages.drain(..spill_count).count();
-    state.messages.insert(
-        0,
-        serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "[Conversation compacted — {} messages summarized]\n\n{}",
-                spilled_count,
-                summary_text,
-            )
-        }),
-    );
-    state.finish_canonical_rewrite(rewrite_permit);
-    state.compact_tier_applied = CompactionTier::CompactHistory;
-    state.context_compression_triggered = true;
-
+    let mut compacted = Vec::with_capacity(old_count.saturating_sub(spill_count) + 1);
+    compacted.push(serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "[Conversation compacted — {} messages summarized]\n\n{}",
+            spill_count,
+            summary_text,
+        )
+    }));
+    compacted.extend(state.messages[spill_count..].iter().cloned());
     let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
-        &state.messages,
+        &compacted,
         state.pinned_tool_schema_tokens as usize,
         max_tokens,
     )
     .1;
+    if tokens_after >= tokens_before {
+        return None;
+    }
+
+    let rewrite_permit = state.begin_canonical_rewrite();
+    state.messages = compacted;
+    state.finish_canonical_rewrite(rewrite_permit);
+    state.compact_tier_applied = CompactionTier::CompactHistory;
+    state.context_compression_triggered = true;
+
     let tokens_freed = tokens_before.saturating_sub(tokens_after);
     let messages_removed = old_count.saturating_sub(state.messages.len());
-    CompactionEvent::new(
+    Some(CompactionEvent::new(
         CompactionKind::PreTurnSummary,
         pressure,
         tokens_freed,
@@ -826,7 +870,7 @@ fn apply_pre_turn_summary(
         messages_removed,
         state.messages.len(),
         vec!["llm_summary".to_string()],
-    )
+    ))
 }
 
 fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
@@ -1170,17 +1214,27 @@ fn merge_output_cap_continuation(prefix: &str, continuation: &str) -> String {
     format!("{prefix}\n{continuation}")
 }
 
-fn append_output_cap_continuation_context(messages: &mut Vec<Value>, partial_text: &str) {
-    if !partial_text.is_empty() {
-        messages.push(json!({
-            "role": "assistant",
-            "content": partial_text,
-        }));
+fn provider_retry_assistant(result: &LlmCallResult) -> Value {
+    let mut assistant = json!({
+        "role": "assistant",
+        "content": result.full_text,
+    });
+    let Some(object) = assistant.as_object_mut() else {
+        return assistant;
+    };
+    if !result.reasoning.is_empty() {
+        object.insert(
+            "reasoning_content".to_string(),
+            Value::String(result.reasoning.clone()),
+        );
     }
-    messages.push(json!({
-        "role": "user",
-        "content": output_cap_continuation_prompt(),
-    }));
+    if !result.reasoning_signature.is_empty() {
+        object.insert(
+            "reasoning_signature".to_string(),
+            Value::String(result.reasoning_signature.clone()),
+        );
+    }
+    assistant
 }
 
 fn output_cap_action_first_context() -> Option<Value> {
@@ -1394,10 +1448,12 @@ fn record_full_llm_request_event(
     source: &str,
     model: &str,
     provider: &str,
+    cache_capability: astra_turn_core::cache_placement::CacheCapability,
     attempt: u32,
     messages: &[Value],
     tools: &[Value],
     max_output_tokens: Option<usize>,
+    provider_attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
 ) {
     if session_id.is_empty() || !full_llm_capture {
         return;
@@ -1406,7 +1462,7 @@ fn record_full_llm_request_event(
         return;
     };
     let round = buf.current_round();
-    let prompt_request_plan =
+    let mut prompt_request_plan =
         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
             user_id,
             session_id,
@@ -1419,10 +1475,20 @@ fn record_full_llm_request_event(
             max_output_tokens,
         })
         .ok();
+    if let Some(summary) = prompt_request_plan
+        .as_mut()
+        .and_then(|plan| plan.summary_json.as_object_mut())
+    {
+        summary.insert(
+            "projection_authority".to_string(),
+            Value::String("planned_pre_client_projection_v1".to_string()),
+        );
+    }
     let trace = crate::turn::llm::exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
         user_query_event_id: None,
+        cache_capability: Some(cache_capability),
     };
     let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
         Some(session_id),
@@ -1432,13 +1498,36 @@ fn record_full_llm_request_event(
             "source": source,
             "model": model,
             "provider": provider,
+            "cache_capability": cache_capability,
             "attempt": attempt,
+            "request_projection_authority": "planned_pre_client_projection_v1",
+            "provider_final_request_receipts": provider_attempts.iter().map(|attempt| json!({
+                "authority": "exact_serialized_provider_body_v1",
+                "transport_stage": if attempt.dispatch_started {
+                    "dispatch_started"
+                } else {
+                    "prepared_and_admitted"
+                },
+                "request_id": attempt.request.request_id,
+                "request_hash": attempt.request.request_hash,
+                "attempt": attempt.request.attempt,
+                "protocol": attempt.request.protocol.as_str(),
+                "serialized_bytes": attempt.request.provider_wire_bytes,
+                "message_sequence_sha256": attempt.request.fingerprints.message_sequence_sha256,
+                "system_sequence_sha256": attempt.request.fingerprints.system_sequence_sha256,
+                "cache_key_system_sha256": attempt.request.fingerprints.cache_key_system_sha256,
+                "conversation_sequence_sha256": attempt.request.fingerprints.conversation_sequence_sha256,
+                "tool_schema_sequence_sha256": attempt.request.fingerprints.tool_schema_sequence_sha256,
+                "cache_key_tool_schema_sequence_sha256": attempt.request.fingerprints.cache_key_tool_schema_sequence_sha256,
+                "cache_capability": attempt.request.fingerprints.cache_capability,
+            })).collect::<Vec<_>>(),
             "trace": {
                 "session_turn": state.session_turn,
                 "round": round,
                 "session_turn_source": trace.session_turn_source,
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
+                "cache_capability": trace.cache_capability,
             },
             "request": build_server_capture_request_json(
                 messages,
@@ -1461,6 +1550,40 @@ fn record_full_llm_request_event(
     buf.record(evt);
 }
 
+fn record_provider_attempt_cache_observations(
+    state: &mut AgenticLoopState,
+    attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+) {
+    let Some(pipeline_session) = state.pipeline_session.as_mut() else {
+        return;
+    };
+    for attempt in attempts.iter().filter(|attempt| attempt.dispatch_started) {
+        let Some(fingerprint) = attempt.request.fingerprints.cache_diagnostic_fingerprint() else {
+            continue;
+        };
+        let cache_read_tokens = attempt.terminal.as_ref().and_then(|terminal| {
+            (!matches!(
+                terminal.usage_status,
+                astra_services::InferenceUsageStatus::Unavailable
+            ))
+            .then_some(terminal.usage.input.cache_read_tokens)
+        });
+        pipeline_session.record_provider_attempt_cache_observation(
+            "agentic_loop",
+            astra_turn_core::pipeline_session::ProviderAttemptCacheObservation {
+                attempt_identity:
+                    astra_turn_core::cache_diagnostics::ProviderAttemptCacheIdentity {
+                        request_id: attempt.request.request_id.clone(),
+                        attempt: attempt.request.attempt,
+                    },
+                dispatched: true,
+                fingerprint,
+                cache_read_tokens,
+            },
+        );
+    }
+}
+
 fn record_full_llm_response_event(
     state: &mut AgenticLoopState,
     full_llm_capture: bool,
@@ -1468,6 +1591,7 @@ fn record_full_llm_response_event(
     source: &str,
     model: &str,
     provider: &str,
+    cache_capability: astra_turn_core::cache_placement::CacheCapability,
     attempt: u32,
     outcome: &str,
     response: Value,
@@ -1483,6 +1607,7 @@ fn record_full_llm_response_event(
         session_turn_source: Some("state"),
         turn_chain_id: None,
         user_query_event_id: None,
+        cache_capability: Some(cache_capability),
     };
     let mut evt = astra_services::session_journal::JournalEvent::llm_response_full(
         Some(session_id),
@@ -1492,6 +1617,7 @@ fn record_full_llm_response_event(
             "source": source,
             "model": model,
             "provider": provider,
+            "cache_capability": cache_capability,
             "attempt": attempt,
             "trace": {
                 "session_turn": state.session_turn,
@@ -1499,6 +1625,7 @@ fn record_full_llm_response_event(
                 "session_turn_source": trace.session_turn_source,
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
+                "cache_capability": trace.cache_capability,
             },
             "response": crate::turn::llm::exchange_capture::build_capture_response_json(
                 outcome,
@@ -1915,6 +2042,110 @@ pub struct CapturedLlmRequest {
     pub message_sha256: Vec<String>,
 }
 
+#[derive(Debug)]
+struct ProviderCanonicalHydrationOutcome {
+    reconciled_transitions: usize,
+    head_transition_id: Option<String>,
+    replacement: Option<astra_turn_types::ProviderCanonicalTransitionV1>,
+}
+
+fn sanitize_provider_canonical_wal_snapshot(
+    durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+    messages: &[Value],
+) -> Vec<Value> {
+    let base_count = usize::try_from(durable_base.message_count).ok();
+    if let Some(base_count) = base_count
+        && messages.len() >= base_count
+        && astra_turn_types::canonical_conversation_root(&messages[..base_count])
+            == durable_base.root_hash
+    {
+        let mut sanitized = messages[..base_count].to_vec();
+        sanitized.extend(
+            astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+                messages[base_count..].to_vec(),
+            ),
+        );
+        sanitized
+    } else {
+        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(messages.to_vec())
+    }
+}
+
+fn apply_provider_canonical_transition_receipts(
+    messages: &mut Vec<Value>,
+    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
+) -> Result<ProviderCanonicalHydrationOutcome, astra_core::ClassifiedError> {
+    if receipts.is_empty() {
+        return Ok(ProviderCanonicalHydrationOutcome {
+            reconciled_transitions: 0,
+            head_transition_id: None,
+            replacement: None,
+        });
+    }
+    if receipts.len() != 1 || receipts[0].transitions.len() != 1 {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "provider canonical WAL loader returned more than its unique-head contract",
+        ));
+    }
+    let leaf = receipts
+        .into_iter()
+        .next()
+        .and_then(|receipt| receipt.transitions.into_iter().next())
+        .expect("the unique-head cardinality was checked above");
+    leaf.validate().map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            format!("validate provider canonical WAL head: {error}"),
+        )
+    })?;
+    let mut candidate = messages.clone();
+    leaf.apply_to(&mut candidate).map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            format!("reconcile provider canonical transition WAL leaf: {error}"),
+        )
+    })?;
+    let replacement = (leaf.recovery_mode
+        == astra_turn_types::ProviderCanonicalRecoveryModeV1::ReplaceFromDurableBase)
+        .then_some(leaf.clone());
+    let head_transition_id = Some(leaf.transition_id.clone());
+    *messages = candidate;
+    Ok(ProviderCanonicalHydrationOutcome {
+        reconciled_transitions: 1,
+        head_transition_id,
+        replacement,
+    })
+}
+
+fn hydrate_provider_canonical_transition_receipts(
+    messages: &mut Vec<Value>,
+    durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
+) -> Result<ProviderCanonicalHydrationOutcome, astra_core::ClassifiedError> {
+    let durable_count = usize::try_from(durable_base.message_count).map_err(|_| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "provider canonical WAL durable-base count overflow",
+        )
+    })?;
+    if messages.len() < durable_count
+        || astra_turn_types::canonical_conversation_root(&messages[..durable_count])
+            != durable_base.root_hash
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "provider canonical WAL durable base is absent from restored history",
+        ));
+    }
+    let fresh_suffix = messages[durable_count..].to_vec();
+    let mut recovered = messages[..durable_count].to_vec();
+    let outcome = apply_provider_canonical_transition_receipts(&mut recovered, receipts)?;
+    recovered.extend(fresh_suffix);
+    *messages = recovered;
+    Ok(outcome)
+}
+
 #[cfg(feature = "e2e-hooks")]
 fn value_has_cache_control(v: &Value) -> bool {
     v.get("cache_control")
@@ -2200,6 +2431,10 @@ pub struct ServerAgenticLoopHost {
     summary_attempt_allocator: DurableSummaryAttemptAllocator,
     /// Monotonic wall-clock authority for this process-local run host.
     execution_time_budget: Option<RunExecutionTimeBudget>,
+    /// Recovery gate for provider-attempt-owned canonical append WAL. It is
+    /// opened exactly once, after session history restoration and before any
+    /// real provider dispatch owned by this host.
+    canonical_transition_hydrated: bool,
 
     // ── Context ──
     /// Final prompt-visible tool schemas after provider declaration, binding,
@@ -2435,7 +2670,6 @@ pub struct ServerAgenticLoopHost {
     /// Attempt identity that already received its one start-of-task contract.
     /// This is a runtime reminder, not a second task state machine; the
     /// durable assignment and settlement remain authoritative.
-    work_attempt_started_context: Option<String>,
     /// Attempt identity that already received one server-owned assignment
     /// replay after a text-only coordinator response. `run_next_work_item`
     /// returns the same active attempt in this state; replaying it again is
@@ -3345,6 +3579,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config_at: None,
             summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
             execution_time_budget: self.execution_time_budget,
+            canonical_transition_hydrated: false,
             tool_schemas,
             admission_tool_schemas,
             deferred_tool_schemas,
@@ -3413,7 +3648,6 @@ impl ServerAgenticLoopHostBuilder {
             progress_filter,
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
-            work_attempt_started_context: None,
             work_attempt_scheduler_replayed: None,
             execution_metadata: self.execution_bindings.as_ref().map(|snapshot| {
                 Value::Object(binding_event_fields(
@@ -3878,6 +4112,7 @@ impl ServerAgenticLoopHost {
         )
     }
 
+    #[cfg(test)]
     fn execution_provider_work_budget(
         execution_time_budget: Option<RunExecutionTimeBudget>,
     ) -> Result<Option<ProviderWorkBudget>, astra_core::ClassifiedError> {
@@ -3891,6 +4126,7 @@ impl ServerAgenticLoopHost {
         Ok(Some(ProviderWorkBudget(remaining)))
     }
 
+    #[cfg(test)]
     fn provider_work_budget_at_client_boundary(
         execution_time_budget: Option<RunExecutionTimeBudget>,
         boundary: ProviderAttemptBoundary,
@@ -3899,48 +4135,145 @@ impl ServerAgenticLoopHost {
             .provider_work_budget(Self::execution_provider_work_budget(execution_time_budget)?))
     }
 
+    fn provider_dispatch_budget(
+        execution_time_budget: Option<RunExecutionTimeBudget>,
+        boundary: ProviderAttemptBoundary,
+    ) -> Result<ProviderDispatchBudget, astra_core::ClassifiedError> {
+        let Some(execution_time_budget) = execution_time_budget else {
+            return Ok(ProviderDispatchBudget {
+                prompt_snapshot: None,
+                client_timeout: boundary.provider_work_budget(None),
+            });
+        };
+        // The wire schema is second-granular. Clamp the actual provider slice
+        // to those same whole seconds instead of advertising a smaller value
+        // while silently granting the fractional remainder.
+        let remaining_seconds = execution_time_budget.remaining().as_secs();
+        if remaining_seconds == 0 {
+            return Err(Self::execution_time_budget_error());
+        }
+        let snapshot = execution_time_budget.authority_snapshot();
+        let client_timeout = boundary.provider_work_budget(Some(ProviderWorkBudget(
+            Duration::from_secs(remaining_seconds),
+        )));
+        Ok(ProviderDispatchBudget {
+            prompt_snapshot: Some(snapshot),
+            client_timeout,
+        })
+    }
+
     fn clamp_execution_timeout(&self, requested: Duration) -> Option<Duration> {
         self.execution_time_budget
             .map_or(Some(requested), |budget| budget.clamp_timeout(requested))
     }
 
-    fn append_execution_time_budget_tail(
-        messages: &mut Vec<Value>,
-        snapshot: ExecutionTimeBudget,
+    fn execution_time_budget_context(
+        snapshot: ExecutionDeadlineAuthority,
         round_index: u32,
-    ) {
+    ) -> Option<String> {
         let injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
             kind: "execution_time_budget".to_string(),
             delivery_class:
                 astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
             payload: json!({
-                "schema": "execution_time_budget.v1",
-                "remaining_seconds": snapshot.remaining_seconds,
-                "status": if snapshot.remaining_seconds == 0 { "exhausted" } else { "active" },
-                "instruction": "This is the current runtime-enforced wall-clock remainder. Finish or hand off within it; do not start work that cannot complete inside the remaining time.",
+                "schema": "execution_time_deadline.v2",
+                "deadline_unix_ms": snapshot.deadline_unix_ms,
+                "status": "active",
+                "instruction": "This is the immutable wall-clock deadline paired with the runtime's monotonic hard timeout. Time continues to elapse during provider admission and transport; finish or hand off before this deadline and do not treat it as a replenishable per-request allowance.",
             }),
             round_index,
         };
-        if let Some(content) = injection.render_for_prompt() {
-            // This synthetic current-request tail is never written back to
-            // state.messages and is appended after cache annotation.
-            messages.push(json!({
-                "role": "user",
-                "content": content,
-            }));
+        injection.render_for_prompt()
+    }
+
+    fn project_required_runtime_authority(
+        provider_messages: &[Value],
+        canonical_history: &[Value],
+        content: &str,
+        kind: crate::turn::wire_assembly::RuntimeAuthorityKind,
+        lifetime: astra_turn_types::RuntimeAuthorityLifetime,
+        _provider: &str,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Result<(Vec<Value>, Option<Value>), astra_core::ClassifiedError> {
+        let mut projected = provider_messages.to_vec();
+        let mut new_append_only_runtime_message = None;
+        if matches!(
+            cache_capability.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+        ) {
+            let frame = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                content, kind, lifetime,
+            )
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    error.to_string(),
+                )
+            })?
+            .ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "required runtime authority produced empty content",
+                )
+            })?;
+            if !crate::turn::wire_assembly::append_only_runtime_authority_is_redundant(
+                canonical_history,
+                &frame,
+            ) {
+                projected.push(frame.clone());
+                new_append_only_runtime_message = Some(frame);
+            }
+        } else if let Some(message) =
+            crate::turn::wire_assembly::required_runtime_preamble_message(content, kind, lifetime)
+        {
+            projected.push(message);
         }
+        Ok((projected, new_append_only_runtime_message))
     }
 
     fn messages_with_current_execution_time_budget(
         &self,
-        messages: &[Value],
+        provider_messages: &[Value],
+        canonical_history: &[Value],
         round_index: u32,
-    ) -> Option<Vec<Value>> {
-        self.execution_time_budget.map(|budget| {
-            let mut messages = messages.to_vec();
-            Self::append_execution_time_budget_tail(&mut messages, budget.snapshot(), round_index);
-            messages
-        })
+        provider: &str,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Result<Option<(Vec<Value>, Option<Value>)>, astra_core::ClassifiedError> {
+        let Some(budget) = self.execution_time_budget else {
+            return Ok(None);
+        };
+        self.messages_with_execution_time_budget_snapshot(
+            provider_messages,
+            canonical_history,
+            round_index,
+            provider,
+            cache_capability,
+            budget.authority_snapshot(),
+        )
+        .map(Some)
+    }
+
+    fn messages_with_execution_time_budget_snapshot(
+        &self,
+        provider_messages: &[Value],
+        canonical_history: &[Value],
+        round_index: u32,
+        provider: &str,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+        snapshot: ExecutionDeadlineAuthority,
+    ) -> Result<(Vec<Value>, Option<Value>), astra_core::ClassifiedError> {
+        let Some(content) = Self::execution_time_budget_context(snapshot, round_index) else {
+            return Ok((provider_messages.to_vec(), None));
+        };
+        Self::project_required_runtime_authority(
+            provider_messages,
+            canonical_history,
+            &content,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            provider,
+            cache_capability,
+        )
     }
 
     fn selected_edge_ledger_executor_id(&self) -> Result<&str, String> {
@@ -4514,15 +4847,11 @@ impl ServerAgenticLoopHost {
     /// hard call-count limit: a long task may still use as many focused tools
     /// as its evidence requires. It simply makes the expected-result boundary
     /// visible before broad exploration can start.
-    fn active_work_attempt_start_context(&mut self, state: &AgenticLoopState) -> Option<Value> {
+    fn active_work_attempt_start_context(&self, state: &AgenticLoopState) -> Option<Value> {
         let active = state
             .runtime_tool_executor
             .as_deref()?
             .active_primary_work_attempt()?;
-        if self.work_attempt_started_context.as_deref() == Some(active.attempt_id.as_str()) {
-            return None;
-        }
-        self.work_attempt_started_context = Some(active.attempt_id.clone());
         crate::turn::wire_assembly::required_runtime_preamble_message(
             &json!({
                 "schema": "active_work_attempt_start.v1",
@@ -4532,6 +4861,8 @@ impl ServerAgenticLoopHost {
                 "instruction": "Execute only this assigned WorkItem. Use the smallest focused evidence path and keep the investigation inside the objective. Before outcome=delivered, compare direct evidence literally with every payload and verification field in expected_result: every field must be present in both the evidence and settlement summary. Every explicit conjunct, including a named behavior check, command, test, or observable workflow, needs direct successful evidence; an unrun or failed check remains a gap, and compilation, imports, or adjacent smoke checks do not substitute for it. Reachability, an index/home page, a category list, or a claim that an action ran never substitutes for a requested item, value, article, result, or source. If a field is missing, continue the focused evidence path; if it cannot be obtained, report the truthful blocked or failed outcome. Settle immediately once the exact boundary is satisfied. Do not create, delegate, or broaden the task."
             })
             .to_string(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         )
     }
 
@@ -4549,6 +4880,8 @@ impl ServerAgenticLoopHost {
                 "instruction": "Answer the user's outcome, not an internal execution transcript. Re-check every explicit requested payload against direct evidence, not settlement labels or summaries. A collection root, index/home page, category list, or reachability does not satisfy a requested member/item. If direct evidence is incomplete, do the smallest corrective work or truthfully disclose the gap; never call it delivered. Unless the user explicitly asks for debugging internals, omit tool names, revision numbers, rejected attempts, runtime gates, and instructions for operating Astra. State only the concise user-visible results and any material limitation."
             })
             .to_string(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::FinalWorkSynthesis,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
     }
 
@@ -4715,6 +5048,13 @@ impl ServerAgenticLoopHost {
                 "instruction": instruction
             })
             .to_string(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::PendingWorkGraphMutations,
+            // This obligation is conditional on the host's current durable
+            // pending set. One assistant decision consumes the frame; while
+            // the source remains pending the next request reconstructs it.
+            // Once an accepted exact proposal clears the source, no canonical
+            // append-only frame can keep the obsolete obligation alive.
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         )
     }
 
@@ -4734,6 +5074,8 @@ impl ServerAgenticLoopHost {
                         ]
                     })
                     .to_string(),
+                    crate::turn::wire_assembly::RuntimeAuthorityKind::ReadOnlyEffectBoundary,
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
                 )
             })
             .flatten()
@@ -5228,6 +5570,8 @@ impl ServerAgenticLoopHost {
                 "instruction": "The previous response did not establish canonical Work. Do not answer the user or call another tool yet. Call start_work now with the bounded task graph that realizes the user goal. After it succeeds, wait for the runtime-owned task assignment."
             })
             .to_string(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         )
         .expect("non-empty canonical Work retry contract")
     }
@@ -6970,9 +7314,23 @@ impl ServerAgenticLoopHost {
             || json!({ "full_text": "[mock rounds exhausted]", "tool_calls": [], "usage": {} }),
         );
         let started = Instant::now();
-        let result = self.execute_mock_turn(state, &round, started).await?;
-        state.llm_rounds_completed = state.llm_rounds_completed.saturating_add(1);
-        Ok(result)
+        let result = self.execute_mock_turn(state, &round, started).await;
+        match result {
+            Ok(result) => {
+                // `run_one_mock_turn_for_test` bypasses the production
+                // execution-phase owner, so it must close the same volatile
+                // attempt transaction at this boundary.  Keeping the lease
+                // semantics identical prevents tests from silently weakening
+                // failed-attempt replay or successful-attempt consumption.
+                state.commit_volatile_attempt_lease();
+                state.llm_rounds_completed = state.llm_rounds_completed.saturating_add(1);
+                Ok(result)
+            }
+            Err(error) => {
+                state.restore_volatile_attempt_lease();
+                Err(error)
+            }
+        }
     }
 
     /// Execute a mock LLM turn from `test_llm_rounds` (e2e-hooks only).
@@ -7078,7 +7436,7 @@ impl ServerAgenticLoopHost {
             &mock_llm_cfg,
             &cache_cfg,
             false,
-        );
+        )?;
         let provider_wire_messages =
             crate::turn::llm::client::consolidate_system_messages_for_provider(
                 &wire_messages,
@@ -7086,7 +7444,7 @@ impl ServerAgenticLoopHost {
                 mock_llm_cfg.cache_capability,
             );
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_prompt_with_cache_capability(
+            pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
                 &provider_wire_messages,
                 &annotated_tools,
                 mock_llm_cfg.cache_capability,
@@ -7188,6 +7546,12 @@ impl ServerAgenticLoopHost {
                         session_turn_source: Some("state"),
                         turn_chain_id: None,
                         user_query_event_id: None,
+                        cache_capability: Some(
+                            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+                                mock_llm_cfg.cache_capability,
+                                &provider,
+                            ),
+                        ),
                     }),
                 )
                 .await;
@@ -7352,6 +7716,12 @@ impl ServerAgenticLoopHost {
                     session_turn_source: Some("state"),
                     turn_chain_id: None,
                     user_query_event_id: None,
+                    cache_capability: Some(
+                        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+                            mock_llm_cfg.cache_capability,
+                            &provider,
+                        ),
+                    ),
                 }),
             )
             .await;
@@ -10415,6 +10785,7 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    #[cfg(test)]
     fn run_turn_pipeline(
         &mut self,
         state: &mut AgenticLoopState,
@@ -10436,6 +10807,7 @@ impl ServerAgenticLoopHost {
         )
     }
 
+    #[cfg(any(test, feature = "e2e-hooks"))]
     fn run_turn_pipeline_with_cache_capability_and_session_memory(
         &mut self,
         state: &mut AgenticLoopState,
@@ -10612,7 +10984,7 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
         compaction_boundary_hit: bool,
-    ) -> Vec<Value> {
+    ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
         // Per-turn skill listing (ranked shortlist) now flows through the
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
         // None scope). See `context_pipeline_adapter` — post-hoc injection
@@ -10737,6 +11109,82 @@ impl ServerAgenticLoopHost {
             edge_tool_round: Vec::new(),
             error_kind: None,
         }))
+    }
+
+    async fn hydrate_provider_canonical_transitions(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if self.canonical_transition_hydrated {
+            return Ok(());
+        }
+        if !state.owns_provider_canonical_transition_wal() {
+            // A subagent can share the parent's durable run/session scope for
+            // evidence custody while owning an independent prompt history.
+            // It must neither consume nor publish root canonical WAL rows.
+            self.canonical_transition_hydrated = true;
+            return Ok(());
+        }
+        let Some(pool) = self.shared_pool.as_ref() else {
+            // A host without the durable inference ledger cannot have
+            // attempt-owned canonical WAL rows to recover.
+            self.canonical_transition_hydrated = true;
+            return Ok(());
+        };
+        let receipts = astra_services::load_inference_canonical_transitions_for_session(
+            pool,
+            &self.user_id,
+            &self.session_id,
+            state.session_turn,
+        )
+        .await
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::DatabaseError,
+                format!("load provider canonical transition WAL: {error}"),
+            )
+        })?;
+
+        // A crashed reservation is reissued at the same reserved turn because
+        // only canonical commit advances the coordinator head. The admitted
+        // durable-base count is therefore the ownership boundary: detach the
+        // fresh request suffix, replay only on H, then restore that suffix.
+        // Comparing values cannot distinguish repeated input such as two
+        // identical `continue` messages across the crash boundary.
+        let durable_base = state.provider_canonical_wal_base.clone().ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "provider canonical WAL hydration has no admitted durable base",
+            )
+        })?;
+        let mut recovered = state.messages.clone();
+        let outcome = hydrate_provider_canonical_transition_receipts(
+            &mut recovered,
+            &durable_base,
+            receipts,
+        )?;
+        if let Some(replacement) = outcome.replacement.as_ref() {
+            state
+                .recover_provider_canonical_replacement(replacement, &recovered)
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        format!("recover provider canonical rewrite proof: {error}"),
+                    )
+                })?;
+        }
+        state.provider_canonical_wal_head_transition_id = outcome.head_transition_id.clone();
+        tracing::debug!(
+            target: "astra_runtime::canonical_wal",
+            session_id = %self.session_id,
+            turn = state.session_turn,
+            reconciled_transitions = outcome.reconciled_transitions,
+            replacement = outcome.replacement.is_some(),
+            "hydrated provider canonical transition WAL"
+        );
+        state.messages = recovered;
+        self.canonical_transition_hydrated = true;
+        Ok(())
     }
 }
 
@@ -11228,7 +11676,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.work_admission_topology_authoritative = false;
         self.work_admission_conflict = None;
         self.work_admission_capabilities.clear();
-        self.work_attempt_started_context = None;
         self.deferred_work_surface_turn = None;
         self.deferred_tools_block_cache = None;
         if let Some(content) = crate::turn::run_control::user_intent_content(&event.input) {
@@ -11312,6 +11759,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 });
             }
         }
+
+        // This is the single recovery gate shared by background and SSE run
+        // lifecycles: both have completed history restoration before the host
+        // can execute a real turn. The service first recovers expired
+        // pre-delivery owners and rejects every live or delivery-unknown old
+        // invocation. Run-generation fencing stops future old admissions, but
+        // only this delivery boundary prevents a duplicate after an already
+        // authorized HTTP request. Failure precedes model resolution,
+        // provider-attempt admission, and all new HTTP I/O.
+        self.hydrate_provider_canonical_transitions(state).await?;
 
         // Reconcile a fast semantic preflight before the primary request so
         // its typed optional capabilities (for example `agent_fanout`) are
@@ -11452,7 +11909,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .messages
             .iter()
             .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .find(|m| astra_turn_types::is_human_user_message(m))
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
@@ -11702,7 +12159,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
         }
         final_volatile_preamble.extend(compact_result.runtime_contexts.iter().filter_map(
-            |context| crate::turn::wire_assembly::required_runtime_preamble_message(context),
+            |context| {
+                crate::turn::wire_assembly::required_runtime_preamble_message(
+                    context,
+                    crate::turn::wire_assembly::RuntimeAuthorityKind::CompactedConversationSummary,
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                )
+            },
         ));
         self.reconcile_pending_work_graph_mutations(state);
         if let Some(context) = self.active_work_attempt_start_context(state) {
@@ -11760,6 +12223,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
+        // Canonical messages appended by the wire assembler are staged from
+        // this exact prefix. A matching WAL transition is bound to provider
+        // attempt admission before HTTP is authorized.
+        let mut durable_canonical_cursor = state.messages.len();
         let mut llm_messages = self.assemble_llm_messages(
             final_system_messages,
             final_volatile_preamble,
@@ -11768,7 +12235,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg,
             &cache_cfg,
             compaction_boundary_hit,
-        );
+        )?;
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model_with_metadata(
@@ -11797,11 +12264,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &cache_cfg,
             &self.always_load_tool_names,
         );
-        // From this boundary onward, diagnostics, durable prompt planning,
-        // budget estimation, and the client all consume the provider-final
-        // message projection. The client repeats this idempotent operation as
-        // a defense for standalone callers, but no runtime observer sees the
-        // pre-consolidation approximation anymore.
+        // From this boundary onward, budget estimation and planned prompt
+        // diagnostics consume one shared pre-client projection. The client
+        // remains the sole provider-final projector: its immutable prepared
+        // body receipt is attached after durable admission/dispatch below.
         llm_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
             &llm_messages,
             &llm_cfg.provider,
@@ -11857,7 +12323,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.sticky_tool_schemas = final_tools.clone();
         }
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_wire_prompt_with_cache_capability(
+            pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
                 &llm_messages,
                 &final_tools,
                 llm_cfg.cache_capability,
@@ -11920,7 +12386,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let mut attempt_in_round = 0_u32;
         let mut last_length_output_tokens: Option<u64> = None;
-        let mut output_cap_continuations = 0_u8;
+        let mut output_cap_continuations =
+            state.hooks.completion_settlement.output_cap_continuations;
         let mut output_cap_partial_text = String::new();
         let mut output_cap_partial_reasoning = String::new();
         // A logical host turn may contain a bounded provider retry.  Keep
@@ -11952,7 +12419,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             || semantic_admission_pending;
         let started_with_action_window = self.terminal_handoff_window.is_open();
         let mut action_window_updates = Vec::new();
-        let mut canonical_work_establishment_retries = 0_u32;
+        let mut canonical_work_establishment_retries = state
+            .hooks
+            .completion_settlement
+            .canonical_work_establishment_retries;
         let mut result = loop {
             let repeated_provider_output_cap;
             // A retry begins a new physical provider attempt.  Its preparation
@@ -11967,12 +12437,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             // Admission still accounts for the volatile tail's tokens, but
             // this early estimate is never reused as provider wire context.
-            let admission_budgeted_llm_messages = self.messages_with_current_execution_time_budget(
-                &llm_messages,
-                state.current_round_index,
-            );
+            let admission_budgeted_llm_messages = match self
+                .messages_with_current_execution_time_budget(
+                    &llm_messages,
+                    &state.messages,
+                    state.current_round_index,
+                    &llm_cfg.provider,
+                    cache_cap,
+                ) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
             let admission_llm_messages = admission_budgeted_llm_messages
-                .as_deref()
+                .as_ref()
+                .map(|(messages, _)| messages.as_slice())
                 .unwrap_or(llm_messages.as_slice());
             let admission_estimated_tokens = crate::prompts::estimate_tokens(
                 admission_llm_messages,
@@ -12161,22 +12648,164 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "host advanced to the authoritative recovered inference identity"
                 );
             }
-            // This tail is volatile request context. Sample it only after the
-            // provider and durable-invocation admission waits above, then use
-            // that exact snapshot for both prompt truth and the wire request.
-            // The hard client budget is sampled again at the later call edge.
-            let budgeted_llm_messages = self.messages_with_current_execution_time_budget(
-                &llm_messages,
-                state.current_round_index,
-            );
-            let attempt_llm_messages = budgeted_llm_messages
-                .as_deref()
-                .unwrap_or(llm_messages.as_slice());
+            // All admission awaits are complete. Sample one second-granular
+            // dispatch budget and derive both the model-visible authority and
+            // the hard client timeout from it. No await is allowed between
+            // this snapshot and provider dispatch.
+            let dispatch_budget = match Self::provider_dispatch_budget(
+                self.execution_time_budget,
+                provider_attempt_boundary,
+            ) {
+                Ok(budget) => budget,
+                Err(error) => {
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    durable_invocation.finish_error(&error).await?;
+                    return Err(error);
+                }
+            };
+            let budgeted_llm_messages = match dispatch_budget.prompt_snapshot {
+                Some(snapshot) => self
+                    .messages_with_execution_time_budget_snapshot(
+                        &llm_messages,
+                        &state.messages,
+                        state.current_round_index,
+                        &llm_cfg.provider,
+                        cache_cap,
+                        snapshot,
+                    )
+                    .map(Some),
+                None => Ok(None),
+            };
+            let (attempt_llm_messages_owned, new_budget_append_only_runtime_message) =
+                match budgeted_llm_messages {
+                    Ok(messages) => messages.unwrap_or_else(|| (llm_messages.clone(), None)),
+                    Err(error) => {
+                        self.complete_request_preparation_phase(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                        );
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                };
+            let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
+            let provider_canonical_transitions = if state.owns_provider_canonical_transition_wal()
+                && matches!(
+                    cache_cap.volatile_placement,
+                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                ) {
+                if durable_canonical_cursor > state.messages.len() {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "provider canonical transition cursor exceeds canonical history",
+                    );
+                    durable_invocation.finish_error(&error).await?;
+                    return Err(error);
+                }
+                let mut appended = state.messages[durable_canonical_cursor..].to_vec();
+                if let Some(frame) = new_budget_append_only_runtime_message.as_ref() {
+                    appended.push(frame.clone());
+                }
+                {
+                    if !appended.is_empty() && !attempt_llm_messages.ends_with(&appended) {
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "provider request does not preserve its staged canonical append suffix",
+                        );
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                    let Some(durable_base) = state.provider_canonical_wal_base.clone() else {
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "provider canonical transition has no admitted durable base",
+                        );
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    };
+                    let predecessor_messages = &state.messages[..durable_canonical_cursor];
+                    let durable_predecessor = sanitize_provider_canonical_wal_snapshot(
+                        &durable_base,
+                        predecessor_messages,
+                    );
+                    let durable_appended =
+                        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+                            appended.clone(),
+                        );
+                    let transition_result = match
+                        astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+                            state.provider_canonical_wal_head_transition_id.clone(),
+                            durable_base.clone(),
+                            &durable_predecessor,
+                            durable_appended.clone(),
+                        ) {
+                        Err(
+                            astra_turn_types::ProviderCanonicalTransitionError::DurableBaseNotPrefix,
+                        ) => {
+                            let Some(authorization) = state
+                                .provider_canonical_replacement_authorization(
+                                    &durable_base,
+                                    predecessor_messages,
+                                )
+                            else {
+                                let error = astra_core::ClassifiedError::new(
+                                    astra_core::ErrorKind::ContractViolation,
+                                    "provider canonical replacement lacks a valid rewrite proof",
+                                );
+                                durable_invocation.finish_error(&error).await?;
+                                return Err(error);
+                            };
+                            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                                state.provider_canonical_wal_head_transition_id.clone(),
+                                durable_base.clone(),
+                                authorization.generation,
+                                &durable_predecessor,
+                                durable_appended,
+                            )
+                        }
+                        other => other,
+                    };
+                    let transition = match transition_result {
+                        Ok(transition) => transition,
+                        Err(source) => {
+                            let error = astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                format!(
+                                    "failed to construct provider canonical transition: {source}"
+                                ),
+                            );
+                            durable_invocation.finish_error(&error).await?;
+                            return Err(error);
+                        }
+                    };
+                    vec![transition]
+                }
+            } else {
+                Vec::new()
+            };
+            let provider_canonical_transition_id = provider_canonical_transitions
+                .first()
+                .map(|transition| transition.transition_id.clone());
+            if let Err(error) = durable_invocation
+                .bind_provider_canonical_transitions(provider_canonical_transitions)
+            {
+                durable_invocation.finish_error(&error).await?;
+                return Err(error);
+            }
             // Attempt-keyed prompt truth is created only after durable
             // admission chooses the authoritative logical identity. The
             // cancelled N recovery fact must never own the request artifact
             // that is physically sent as N+1.
-            let prompt_request_plan =
+            let mut prompt_request_plan =
                 match astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
                     session_id: &self.session_id,
@@ -12211,36 +12840,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         return Err(error);
                     }
                 };
-            record_full_llm_request_event(
-                state,
-                self.full_llm_capture,
-                &self.user_id,
-                &self.session_id,
-                "server_loop_host",
-                &llm_cfg.model_name,
-                &llm_cfg.provider,
-                attempt_in_round,
-                attempt_llm_messages,
-                &final_tools,
-                Some(effective_max_output),
-            );
-            crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
-                "server_loop_host",
-                self.shared_pool.clone(),
-                astra_services::PromptRequestPersistInput {
-                    session_id: self.session_id.clone(),
-                    user_id: self.user_id.clone(),
-                    run_id: state.current_run_id.clone(),
-                    turn: state.session_turn,
-                    round: prompt_round,
-                    attempt: attempt_in_round,
-                    source: "server_loop_host".to_string(),
-                    model: llm_cfg.model_name.clone(),
-                    provider: llm_cfg.provider.clone(),
-                },
-                prompt_request_plan,
-            )
-            .await;
+            if let Some(summary) = prompt_request_plan.summary_json.as_object_mut() {
+                summary.insert(
+                    "projection_authority".to_string(),
+                    Value::String("planned_pre_client_projection_v1".to_string()),
+                );
+            }
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
@@ -12253,13 +12858,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &mut request_preparation_recorded_attempts,
                 TurnPhaseOutcome::Succeeded,
             );
-            let llm_cancel = llm_cancel_for_state(state);
             let mut attempt_first_stream_update_ms: Option<u64> = None;
             let mut attempt_first_visible_text_ms: Option<u64> = None;
-            // Carry the absolute monotonic deadline across callback construction;
-            // conversion to a relative client budget happens only immediately
-            // before the call below.
-            let execution_time_budget = self.execution_time_budget;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
@@ -12424,7 +13024,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         purpose: state.inference_purpose,
                         messages: attempt_llm_messages,
                         tools: &final_tools,
-                        cache_capability: llm_cfg.cache_capability,
+                        cache_capability: Some(cache_cap),
                         route: LlmExecutionRoute {
                             model_name: &llm_cfg.model_name,
                             wire_model_name: llm_cfg.wire_model_name.as_deref(),
@@ -12442,24 +13042,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         has_fallback,
                         thinking: &primary_thinking,
                     };
-                    // Take the relative duration at the last common boundary before
-                    // invoking the provider. Prompt preparation and durable-attempt
-                    // admission above may await; sampling earlier would replenish
-                    // that elapsed time even though the run deadline is monotonic.
-                    let provider_work_budget = match Self::provider_work_budget_at_client_boundary(
-                        execution_time_budget,
-                        provider_attempt_boundary,
-                    ) {
-                        Ok(budget) => budget,
-                        Err(error) => {
-                            // Durable admission already owns this invocation. If
-                            // the run expired during preparation, terminalize that
-                            // exact identity without sending a provider request.
-                            durable_invocation.finish_error(&error).await?;
-                            return Err(error);
-                        }
-                    };
-                    match (provider_work_budget, use_no_tool_choice) {
+                    let llm_cancel = llm_cancel_for_state(state);
+                    match (dispatch_budget.client_timeout, use_no_tool_choice) {
                         (Some(budget), true) => {
                             call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
                                 call,
@@ -12541,6 +13125,71 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 provider_result
             };
+            let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            if let Some(admitted_transition_id) =
+                durable_invocation.admitted_canonical_transition_id()
+            {
+                if provider_canonical_transition_id.as_deref()
+                    != Some(admitted_transition_id.as_str())
+                {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable provider admission returned a different canonical WAL head",
+                    );
+                    durable_invocation.finish_error(&error).await?;
+                    return Err(error);
+                }
+                state.provider_canonical_wal_head_transition_id = Some(admitted_transition_id);
+            }
+            record_provider_attempt_cache_observations(state, &provider_attempts);
+            if durable_invocation.provider_dispatch_started() {
+                if let Some(frame) = new_budget_append_only_runtime_message {
+                    if let Err(error) = state.extend_append_only_runtime_messages([frame]) {
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                    // A request that actually entered transport now owns this
+                    // exact canonical frame. Any bounded retry extends it.
+                    llm_messages = attempt_llm_messages_owned.clone();
+                }
+                durable_canonical_cursor = state.messages.len();
+                record_full_llm_request_event(
+                    state,
+                    self.full_llm_capture,
+                    &self.user_id,
+                    &self.session_id,
+                    "server_loop_host",
+                    &llm_cfg.model_name,
+                    &llm_cfg.provider,
+                    cache_cap,
+                    attempt_in_round,
+                    attempt_llm_messages,
+                    &final_tools,
+                    Some(effective_max_output),
+                    &provider_attempts,
+                );
+                // Prompt-delta persistence describes only a request that
+                // crossed the provider dispatch boundary. Keeping this await
+                // after the call prevents durable-admission expiry from
+                // creating a phantom sent-request artifact.
+                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                    "server_loop_host",
+                    self.shared_pool.clone(),
+                    astra_services::PromptRequestPersistInput {
+                        session_id: self.session_id.clone(),
+                        user_id: self.user_id.clone(),
+                        run_id: state.current_run_id.clone(),
+                        turn: state.session_turn,
+                        round: prompt_round,
+                        attempt: attempt_in_round,
+                        source: "server_loop_host".to_string(),
+                        model: llm_cfg.model_name.clone(),
+                        provider: llm_cfg.provider.clone(),
+                    },
+                    prompt_request_plan,
+                )
+                .await;
+            }
             complete_turn_phase(
                 self,
                 state,
@@ -12556,7 +13205,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 format!("model_inference_{prompt_round}_{attempt_in_round}"),
             );
 
-            let provider_attempts = durable_invocation.provider_attempt_facts().await;
             if !provider_attempts.is_empty() {
                 if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                     crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
@@ -12606,6 +13254,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "server_loop_host",
                         &llm_cfg.model_name,
                         &llm_cfg.provider,
+                        cache_cap,
                         attempt_in_round,
                         "fallback_required",
                         llm_capture_error_response(&e),
@@ -12632,6 +13281,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "server_loop_host",
                         &llm_cfg.model_name,
                         &llm_cfg.provider,
+                        cache_cap,
                         attempt_in_round,
                         "context_window_error",
                         llm_capture_error_response(e),
@@ -12684,6 +13334,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 session_turn_source: Some("state"),
                                 turn_chain_id: None,
                                 user_query_event_id: None,
+                                cache_capability: Some(cache_cap),
                             }),
                         )
                         .await;
@@ -12722,6 +13373,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "server_loop_host",
                         &llm_cfg.model_name,
                         &llm_cfg.provider,
+                        cache_cap,
                         attempt_in_round,
                         "error",
                         llm_capture_error_response(&e),
@@ -12774,6 +13426,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 session_turn_source: Some("state"),
                                 turn_chain_id: None,
                                 user_query_event_id: None,
+                                cache_capability: Some(cache_cap),
                             }),
                         )
                         .await;
@@ -12841,6 +13494,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "server_loop_host",
                     &llm_cfg.model_name,
                     &llm_cfg.provider,
+                    cache_cap,
                     attempt_in_round,
                     llm_attempt_outcome,
                     json!({
@@ -12885,12 +13539,59 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 canonical_work_establishment_retries,
             ) {
                 canonical_work_establishment_retries += 1;
-                llm_messages.insert(
-                    0,
-                    Self::canonical_work_establishment_retry_preamble(
-                        canonical_work_establishment_retries,
-                    ),
+                state
+                    .hooks
+                    .completion_settlement
+                    .canonical_work_establishment_retries = canonical_work_establishment_retries;
+                // The repair request is a strict extension of the physical
+                // request that just completed: first append that provider's
+                // assistant result, then project the required Work authority
+                // through the same deployment shape as every other control.
+                let retry = Self::canonical_work_establishment_retry_preamble(
+                    canonical_work_establishment_retries,
                 );
+                let retry_content =
+                    retry
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                "canonical Work retry authority is missing content",
+                            )
+                        })?;
+                let retry_assistant = provider_retry_assistant(&r);
+                llm_messages.push(retry_assistant.clone());
+                let mut retry_canonical_prefix = state.messages.clone();
+                retry_canonical_prefix.push(retry_assistant.clone());
+                let (projected, new_frame) = Self::project_required_runtime_authority(
+                    &llm_messages,
+                    &retry_canonical_prefix,
+                    retry_content,
+                    crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    &llm_cfg.provider,
+                    cache_cap,
+                )?;
+                if matches!(
+                    cache_cap.volatile_placement,
+                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                ) {
+                    let frame = new_frame.ok_or_else(|| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "append-only Work retry did not produce a fresh canonical authority",
+                        )
+                    })?;
+                    state.append_provider_retry_transition(retry_assistant, frame)?;
+                } else {
+                    state.push_prompt_history_message(retry_assistant);
+                    state.push_volatile_payload_for_active_attempt(
+                        crate::turn::agentic_loop::host::VolatileKind::CanonicalWorkEstablishmentRetry,
+                        Value::String(retry_content.to_string()),
+                    );
+                }
+                llm_messages = projected;
                 attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
                     astra_core::ClassifiedError::new(
                         astra_core::ErrorKind::ContractViolation,
@@ -12917,8 +13618,41 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             {
                 output_cap_partial_text = r.full_text.clone();
                 output_cap_partial_reasoning = r.reasoning.clone();
-                append_output_cap_continuation_context(&mut llm_messages, &r.full_text);
+                let partial_assistant = provider_retry_assistant(&r);
+                llm_messages.push(partial_assistant.clone());
+                let mut continuation_canonical_prefix = state.messages.clone();
+                continuation_canonical_prefix.push(partial_assistant.clone());
+                let (projected, new_frame) = Self::project_required_runtime_authority(
+                    &llm_messages,
+                    &continuation_canonical_prefix,
+                    output_cap_continuation_prompt(),
+                    crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    &llm_cfg.provider,
+                    cache_cap,
+                )?;
+                if matches!(
+                    cache_cap.volatile_placement,
+                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                ) {
+                    let frame = new_frame.ok_or_else(|| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "append-only output continuation did not produce fresh canonical authority",
+                        )
+                    })?;
+                    state.append_provider_retry_transition(partial_assistant, frame)?;
+                } else {
+                    state.push_prompt_history_message(partial_assistant);
+                    state.push_volatile_payload_for_active_attempt(
+                        crate::turn::agentic_loop::host::VolatileKind::OutputCapContinuation,
+                        Value::String(output_cap_continuation_prompt().to_string()),
+                    );
+                }
+                llm_messages = projected;
                 output_cap_continuations = output_cap_continuations.saturating_add(1);
+                state.hooks.completion_settlement.output_cap_continuations =
+                    output_cap_continuations;
                 attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
                     astra_core::ClassifiedError::new(
                         astra_core::ErrorKind::ContractViolation,
@@ -13057,6 +13791,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     session_turn_source: Some("state"),
                     turn_chain_id: None,
                     user_query_event_id: None,
+                    cache_capability: Some(cache_cap),
                 }),
             )
             .await;
@@ -13379,23 +14114,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .messages
             .iter()
             .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .find(|m| astra_turn_types::is_human_user_message(m))
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
 
         let effective_restricted = self.compute_effective_restricted(state, false, false);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
-        // We only need the system messages here — the inline summary call
-        // reuses the main turn's system prefix, not its tools.
-        let system_messages = match self.run_turn_pipeline(
+        // Rebuild the matching stable system projection. The tool projection
+        // comes from the preceding provider-final request when available.
+        let cache_capability =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+                config.cache_capability,
+                &config.provider,
+            );
+        let pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
             &config.provider,
             &config.model_name,
+            config.context_window,
+            config.max_completion_tokens,
+            Some(cache_capability),
+            None,
+            &[],
             &user_content,
         ) {
-            Ok(outcome) => outcome.system_messages,
+            Ok(outcome) => outcome,
             Err(error) => {
                 astra_core::agent_warn!(
                     "pipeline",
@@ -13405,15 +14150,56 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return None;
             }
         };
-        let client = self.durable_summary_client(&config, 4096, state, "pre_turn_compaction")?;
+        let system_messages = pipeline.system_messages;
+        let summary_tools = if state.sticky_tool_schemas.is_empty() {
+            pipeline.tool_schemas
+        } else {
+            // Main inference commits this only after stabilization and cache
+            // annotation. Recomputing tools from post-compaction pressure can
+            // select a different schema prefix and defeat inline reuse.
+            state.sticky_tool_schemas.clone()
+        };
+        let client = self
+            .durable_summary_client(&config, 4096, state, "pre_turn_compaction")?
+            .with_prompt_cache_context(summary_tools, cache_capability);
+        let spill_count = pre_turn_summary_spill_count(&state.messages);
+        if spill_count == 0 {
+            state.compaction_effectiveness.record_futile();
+            tracing::debug!(
+                target: "astra::pre_turn_compaction",
+                pressure,
+                session_id = %self.session_id,
+                "pre-turn compaction skipped because active canonical authority protects the entire history"
+            );
+            return None;
+        }
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
-            &state.messages,
+            &state.messages[..spill_count],
+            if matches!(
+                cache_capability.volatile_placement,
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+            ) {
+                astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix
+            } else {
+                astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
+            },
             &client,
         )
         .await
         {
-            Some(apply_pre_turn_summary(state, pressure, summary_text))
+            let event = apply_pre_turn_summary(state, pressure, summary_text, spill_count);
+            if event.is_none() {
+                state.compaction_effectiveness.record_futile();
+                tracing::warn!(
+                    target: "astra::pre_turn_compaction",
+                    pressure,
+                    session_id = %self.session_id,
+                    spill_count,
+                    "pre-turn compaction rejected because it did not reduce estimated context tokens"
+                );
+            }
+            event
         } else {
             state.compaction_effectiveness.record_futile();
             tracing::warn!(
@@ -14214,6 +15000,17 @@ mod tests {
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
 
+    fn append_only_test_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
+    }
+
     #[test]
     fn execution_time_budget_retry_can_only_tighten_deadline() {
         let start = tokio::time::Instant::now();
@@ -14300,7 +15097,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_work_budget_is_sampled_after_admission_delay() {
+    async fn provider_dispatch_budget_is_sampled_after_admission_delay() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -14314,12 +15111,14 @@ mod tests {
         let ordinary = ProviderAttemptBoundary::new(false, false);
 
         assert_eq!(
-            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
-                host.execution_time_budget,
-                ordinary,
-            )
-            .expect("initial provider budget"),
-            Some(Duration::from_secs(10))
+            ServerAgenticLoopHost::provider_dispatch_budget(host.execution_time_budget, ordinary,)
+                .expect("initial provider budget"),
+            ProviderDispatchBudget {
+                prompt_snapshot: host
+                    .execution_time_budget
+                    .map(|budget| budget.authority_snapshot()),
+                client_timeout: Some(Duration::from_secs(10)),
+            }
         );
 
         // Model prompt construction, durable admission, and ledger work can
@@ -14328,25 +15127,21 @@ mod tests {
         // relative-duration snapshot.
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(
-            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
-                host.execution_time_budget,
-                ordinary,
-            )
-            .expect("post-admission provider budget"),
+            ServerAgenticLoopHost::provider_dispatch_budget(host.execution_time_budget, ordinary,)
+                .expect("post-admission provider budget")
+                .client_timeout,
             Some(Duration::from_secs(6))
         );
 
         tokio::time::advance(Duration::from_secs(6)).await;
-        let error = ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
-            host.execution_time_budget,
-            ordinary,
-        )
-        .expect_err("an exhausted deadline must reject before client invocation");
+        let error =
+            ServerAgenticLoopHost::provider_dispatch_budget(host.execution_time_budget, ordinary)
+                .expect_err("an exhausted deadline must reject before client invocation");
         assert_eq!(error.kind, astra_core::ErrorKind::BudgetExhausted);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn volatile_budget_tail_is_resampled_after_durable_admission_delay() {
+    async fn volatile_budget_tail_uses_one_immutable_deadline_across_admission_delay() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -14358,70 +15153,110 @@ mod tests {
             remaining_seconds: 10,
         }));
         let stable = vec![json!({"role": "system", "content": "stable prefix"})];
+        let capability = append_only_test_cache_capability();
 
         let admission_estimate = host
-            .messages_with_current_execution_time_budget(&stable, 1)
+            .messages_with_current_execution_time_budget(&stable, &[], 1, "openai", capability)
+            .expect("valid budget projection")
             .expect("admission estimate tail");
-        assert!(admission_estimate.last().is_some_and(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("\"remaining_seconds\":10"))
-        }));
+        let first_content = admission_estimate.0.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(first_content.contains("\"deadline_unix_ms\":"));
 
         tokio::time::advance(Duration::from_secs(4)).await;
         let post_admission_wire = host
-            .messages_with_current_execution_time_budget(&stable, 1)
+            .messages_with_current_execution_time_budget(&stable, &[], 1, "openai", capability)
+            .expect("valid budget projection")
             .expect("post-admission wire tail");
-        assert!(post_admission_wire.last().is_some_and(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("\"remaining_seconds\":6"))
-        }));
-        assert_eq!(post_admission_wire[0], stable[0]);
+        assert_eq!(
+            post_admission_wire.0.last().unwrap()["content"].as_str(),
+            Some(first_content.as_str())
+        );
+        assert_eq!(
+            ServerAgenticLoopHost::provider_dispatch_budget(
+                host.execution_time_budget,
+                ProviderAttemptBoundary::new(false, false),
+            )
+            .unwrap()
+            .client_timeout,
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(post_admission_wire.0[0], stable[0]);
+        assert_eq!(
+            astra_turn_types::runtime_authority_kind(
+                post_admission_wire.1.as_ref().expect("canonical frame")
+            ),
+            Some("execution_time_budget")
+        );
     }
 
-    #[test]
-    fn execution_time_budget_is_a_fresh_volatile_wire_tail() {
+    #[tokio::test(start_paused = true)]
+    async fn execution_time_budget_is_typed_and_extends_append_only_history() {
         let base = vec![json!({"role": "system", "content": "stable prefix"})];
-        let mut first = base.clone();
-        let mut second = base.clone();
-        ServerAgenticLoopHost::append_execution_time_budget_tail(
-            &mut first,
-            ExecutionTimeBudget {
-                remaining_seconds: 9,
+        let capability = append_only_test_cache_capability();
+        let first_content = ServerAgenticLoopHost::execution_time_budget_context(
+            ExecutionDeadlineAuthority {
+                deadline_unix_ms: 1,
             },
             1,
+        )
+        .expect("budget context");
+        let first_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                &first_content,
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let mut canonical = vec![json!({"role": "user", "content": "do the work"})];
+        canonical.push(first_frame.clone());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-budget-tail".to_string(),
+            "s-budget-tail".to_string(),
+        )
+        .build();
+        host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
+            remaining_seconds: 4,
+        }));
+        let mut prior_internal = base.clone();
+        prior_internal.push(first_frame);
+        let prior_provider = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &prior_internal,
+            "openai",
+            Some(capability),
         );
-        ServerAgenticLoopHost::append_execution_time_budget_tail(
-            &mut second,
-            ExecutionTimeBudget {
-                remaining_seconds: 4,
-            },
-            1,
-        );
+        let second = host
+            .messages_with_current_execution_time_budget(
+                &prior_provider,
+                &canonical,
+                1,
+                "openai",
+                capability,
+            )
+            .expect("valid budget projection")
+            .expect("budget projection");
 
-        assert_eq!(first[0], base[0]);
-        assert_eq!(second[0], base[0]);
-        assert!(first.last().is_some_and(|message| {
+        assert!(second.0.starts_with(&prior_provider));
+        assert!(second.0.last().is_some_and(|message| {
             message
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|content| {
                     content.contains("runtime-required-context")
-                        && content.contains("\"remaining_seconds\":9")
+                        && content.contains("\"deadline_unix_ms\":")
                 })
         }));
-        assert!(second.last().is_some_and(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| {
-                    content.contains("runtime-required-context")
-                        && content.contains("\"remaining_seconds\":4")
-                })
-        }));
+        let canonical_frame = second.1.expect("new canonical frame");
+        assert!(!astra_turn_types::is_human_user_message(&canonical_frame));
+        assert_eq!(
+            astra_turn_types::runtime_authority_kind(&canonical_frame),
+            Some("execution_time_budget")
+        );
     }
 
     #[test]
@@ -15273,8 +16108,8 @@ mod tests {
     }
 
     #[test]
-    fn active_work_attempt_start_contract_is_once_per_attempt() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
+    fn active_work_attempt_contract_is_reconstructible_for_every_provider_shape() {
+        let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "u-pacing".to_string(),
@@ -15310,7 +16145,7 @@ mod tests {
         );
         let start_context = host
             .active_work_attempt_start_context(&state)
-            .expect("a new assignment gets one start contract");
+            .expect("an active assignment gets its execution contract");
         let start_payload: Value = serde_json::from_str(
             start_context["content"]
                 .as_str()
@@ -15334,9 +16169,10 @@ mod tests {
                 .is_some_and(|instruction| instruction
                     .contains("named behavior check, command, test, or observable workflow"))
         );
-        assert!(
-            host.active_work_attempt_start_context(&state).is_none(),
-            "the start contract is emitted once per attempt"
+        assert_eq!(
+            host.active_work_attempt_start_context(&state),
+            Some(start_context),
+            "provider revalidation may change cache shape between requests; active Work authority must be rebuilt from canonical execution state, not a one-shot host latch"
         );
         state.hooks.completion_settlement.work_settlement_only = true;
         let restricted = host.compute_effective_restricted(&mut state, true, false);
@@ -20353,12 +21189,30 @@ mod tests {
     }
 
     #[test]
-    fn output_cap_continuation_context_is_provider_only_and_typed() {
+    fn output_cap_continuation_is_a_typed_append_only_authority() {
         let mut messages = vec![json!({"role":"user", "content":"finish the task"})];
-        append_output_cap_continuation_context(&mut messages, "partial result");
+        messages.push(provider_retry_assistant(&LlmCallResult {
+            full_text: "partial result".to_string(),
+            reasoning: "captured reasoning".to_string(),
+            reasoning_signature: "captured signature".to_string(),
+            ..Default::default()
+        }));
+        let capability = append_only_test_cache_capability();
+        let (messages, frame) = ServerAgenticLoopHost::project_required_runtime_authority(
+            &messages,
+            &[],
+            output_cap_continuation_prompt(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "openai",
+            capability,
+        )
+        .expect("valid continuation projection");
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "partial result");
+        assert_eq!(messages[1]["reasoning_content"], "captured reasoning");
+        assert_eq!(messages[1]["reasoning_signature"], "captured signature");
         assert_eq!(messages[2]["role"], "user");
         assert!(
             messages[2]["content"]
@@ -20366,6 +21220,484 @@ mod tests {
                 .expect("continuation prompt")
                 .contains("next concrete tool call or give a concise final result")
         );
+        let frame = frame.expect("canonical typed continuation frame");
+        assert!(!astra_turn_types::is_human_user_message(&frame));
+        assert_eq!(
+            astra_turn_types::runtime_authority_kind(&frame),
+            Some("output_cap_continuation")
+        );
+    }
+
+    #[test]
+    fn non_append_retry_uses_required_system_wire_without_append_canonical_frame() {
+        let messages = vec![
+            json!({"role":"user", "content":"finish the task"}),
+            provider_retry_assistant(&LlmCallResult {
+                full_text: "partial result".to_string(),
+                ..Default::default()
+            }),
+        ];
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let (wire, canonical_frame) = ServerAgenticLoopHost::project_required_runtime_authority(
+            &messages,
+            &messages,
+            output_cap_continuation_prompt(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "openai",
+            capability,
+        )
+        .expect("valid non-append projection");
+
+        assert!(canonical_frame.is_none());
+        assert!(wire.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("system")
+                && crate::turn::wire_assembly::is_required_runtime_preamble(message)
+        }));
+        assert!(wire.iter().all(|message| {
+            astra_turn_types::runtime_message_delivery(message)
+                != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        }));
+    }
+
+    #[test]
+    fn provider_retry_transition_is_atomic_and_resume_reconstructs_the_wire_prefix() {
+        let mut state = create_test_state();
+        state.messages = vec![json!({"role": "user", "content": "do the work"})];
+        let assistant = json!({"role": "assistant", "content": "partial result"});
+        let frame = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            output_cap_continuation_prompt(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        state
+            .append_provider_retry_transition(assistant.clone(), frame.clone())
+            .expect("atomic retry transition");
+
+        assert_eq!(state.messages[1], assistant);
+        assert_eq!(state.messages[2], frame);
+        let resumed = state.messages.clone();
+        assert_eq!(resumed[1]["role"], "assistant");
+        assert_eq!(
+            astra_turn_types::runtime_authority_kind(&resumed[2]),
+            Some("output_cap_continuation")
+        );
+
+        let invalid = json!({"role": "system", "content": "not an assistant"});
+        let before = state.messages.clone();
+        assert!(
+            state
+                .append_provider_retry_transition(invalid, resumed[2].clone())
+                .is_err()
+        );
+        assert_eq!(state.messages, before);
+    }
+
+    #[test]
+    fn provider_transition_wal_hydrates_ordered_pairs_once_before_fresh_user_suffix() {
+        let durable_head = vec![
+            json!({"role": "user", "content": "older request"}),
+            json!({"role": "assistant", "content": "older answer"}),
+        ];
+        let mut base = durable_head.clone();
+        base.push(json!({"role": "user", "content": "do the work"}));
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+        let first_authority =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "opaque first authority",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap();
+        let first = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &base,
+            vec![first_authority.clone()],
+        )
+        .unwrap();
+        let mut after_first = base.clone();
+        after_first.push(first_authority.clone());
+        let assistant = json!({"role": "assistant", "content": "partial result"});
+        let retry_authority =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                output_cap_continuation_prompt(),
+                crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let second = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            Some(first.transition_id.clone()),
+            durable_base.clone(),
+            &after_first,
+            vec![assistant.clone(), retry_authority.clone()],
+        )
+        .unwrap();
+        let receipt =
+            |physical_attempt, transitions| astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt,
+                transitions,
+            };
+        let fresh_user = json!({"role": "user", "content": "fresh follow-up"});
+        let mut restored = durable_head;
+        restored.push(fresh_user.clone());
+        let outcome = hydrate_provider_canonical_transition_receipts(
+            &mut restored,
+            &durable_base,
+            vec![receipt(1, vec![second.clone()])],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.reconciled_transitions, 1);
+        assert_eq!(outcome.head_transition_id, Some(second.transition_id));
+        assert_eq!(restored[2], base[2]);
+        assert_eq!(restored[3], first_authority);
+        assert_eq!(restored[4], assistant);
+        assert_eq!(restored[5], retry_authority);
+        assert_eq!(restored[6], fresh_user);
+    }
+
+    #[test]
+    fn provider_transition_wal_uses_the_durable_boundary_for_repeated_fresh_input() {
+        let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
+        let repeated = json!({"role": "user", "content": "continue"});
+        let mut predecessor = durable_head.clone();
+        predecessor.push(repeated.clone());
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "continue safely",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &predecessor,
+            vec![authority.clone()],
+        )
+        .unwrap();
+        let mut restored = durable_head;
+        restored.push(repeated.clone());
+        hydrate_provider_canonical_transition_receipts(
+            &mut restored,
+            &durable_base,
+            vec![astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt: 0,
+                transitions: vec![transition],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(restored[1], repeated);
+        assert_eq!(restored[2], authority);
+        assert_eq!(restored[3], repeated);
+    }
+
+    #[test]
+    fn provider_transition_wal_recovers_a_request_with_zero_runtime_frames() {
+        let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
+        let old_user = json!({"role": "user", "content": "old request"});
+        let mut predecessor = durable_head.clone();
+        predecessor.push(old_user.clone());
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &predecessor,
+            Vec::new(),
+        )
+        .unwrap();
+        let fresh = json!({"role": "user", "content": "hi"});
+        let mut restored = durable_head;
+        restored.push(fresh.clone());
+        hydrate_provider_canonical_transition_receipts(
+            &mut restored,
+            &durable_base,
+            vec![astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt: 0,
+                transitions: vec![transition],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            restored,
+            vec![
+                json!({"role": "assistant", "content": "ready"}),
+                old_user,
+                fresh
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_transition_wal_redacts_uncommitted_credentials_before_persistence() {
+        let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let mut snapshot = durable_head.clone();
+        snapshot.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-secret",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": format!("{{\"command\":\"tool --token {secret}\"}}")
+                }
+            }]
+        }));
+
+        let durable = sanitize_provider_canonical_wal_snapshot(&durable_base, &snapshot);
+        assert_eq!(durable[0], durable_head[0]);
+        assert!(serde_json::to_string(&snapshot).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&durable).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn provider_transition_wal_collapses_post_compaction_and_second_rewrite_lineage() {
+        let durable_head = vec![
+            json!({"role": "user", "content": "old goal"}),
+            json!({"role": "assistant", "content": "old answer"}),
+        ];
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+        let authority = |text, kind| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let old_user = json!({"role": "user", "content": "work"});
+        let mut pre_rewrite = durable_head.clone();
+        pre_rewrite.push(old_user);
+        let first_authority = authority(
+            "first",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+        );
+        let append = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &pre_rewrite,
+            vec![first_authority.clone()],
+        )
+        .unwrap();
+        let summary = json!({"role": "system", "content": "summary one"});
+        let second_authority = authority(
+            "second",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+        );
+        let first_replacement =
+            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                Some(append.transition_id.clone()),
+                durable_base.clone(),
+                1,
+                std::slice::from_ref(&summary),
+                vec![second_authority.clone()],
+            )
+            .unwrap();
+
+        let ordinary_response = json!({"role": "assistant", "content": "intermediate"});
+        let third_authority = authority(
+            "third",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+        );
+        let post_compaction_predecessor = vec![
+            summary.clone(),
+            second_authority.clone(),
+            ordinary_response.clone(),
+        ];
+        let ordinary_post_compaction =
+            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                Some(first_replacement.transition_id.clone()),
+                durable_base.clone(),
+                1,
+                &post_compaction_predecessor,
+                vec![third_authority.clone()],
+            )
+            .unwrap();
+
+        let summary_two = json!({"role": "system", "content": "summary two"});
+        let final_authority = authority(
+            "final",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+        );
+        let second_replacement =
+            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                Some(ordinary_post_compaction.transition_id.clone()),
+                durable_base.clone(),
+                1,
+                std::slice::from_ref(&summary_two),
+                vec![final_authority.clone()],
+            )
+            .unwrap();
+        let receipt =
+            |physical_attempt, transitions| astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt,
+                transitions,
+            };
+
+        let fresh = json!({"role": "user", "content": "fresh"});
+        let mut after_one_rewrite = durable_head.clone();
+        after_one_rewrite.push(fresh.clone());
+        let one_rewrite = hydrate_provider_canonical_transition_receipts(
+            &mut after_one_rewrite,
+            &durable_base,
+            vec![receipt(2, vec![ordinary_post_compaction.clone()])],
+        )
+        .unwrap();
+        assert_eq!(one_rewrite.reconciled_transitions, 1);
+        assert_eq!(
+            one_rewrite.replacement,
+            Some(ordinary_post_compaction.clone())
+        );
+        assert_eq!(after_one_rewrite[0], summary);
+        assert_eq!(after_one_rewrite[1], second_authority);
+        assert_eq!(after_one_rewrite[2], ordinary_response);
+        assert_eq!(after_one_rewrite[3], third_authority);
+        assert_eq!(after_one_rewrite[4], fresh);
+
+        let mut after_second_rewrite = durable_head;
+        after_second_rewrite.push(fresh.clone());
+        let two_rewrites = hydrate_provider_canonical_transition_receipts(
+            &mut after_second_rewrite,
+            &durable_base,
+            vec![receipt(3, vec![second_replacement.clone()])],
+        )
+        .unwrap();
+        assert_eq!(two_rewrites.reconciled_transitions, 1);
+        assert_eq!(two_rewrites.replacement, Some(second_replacement));
+        assert_eq!(
+            after_second_rewrite,
+            vec![summary_two, final_authority, fresh]
+        );
+    }
+
+    #[test]
+    fn provider_transition_wal_rejects_a_forked_predecessor() {
+        let base = vec![json!({"role": "user", "content": "do the work"})];
+        let authority = |text, kind| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let left = astra_turn_types::ProviderCanonicalTransitionV1::new(
+            None,
+            &base,
+            vec![authority(
+                "left",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            )],
+        )
+        .unwrap();
+        let right = astra_turn_types::ProviderCanonicalTransitionV1::new(
+            None,
+            &base,
+            vec![authority(
+                "right",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+            )],
+        )
+        .unwrap();
+        let mut restored = base;
+        let before = restored.clone();
+        let error = apply_provider_canonical_transition_receipts(
+            &mut restored,
+            vec![astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt: 0,
+                transitions: vec![left, right],
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(restored, before);
+    }
+
+    #[test]
+    fn provider_transition_wal_rejects_disconnected_valid_branches_atomically() {
+        let base = vec![json!({"role": "assistant", "content": "ready"})];
+        let durable_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&base).unwrap();
+        let authority = |text| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let mut left_predecessor = base.clone();
+        left_predecessor.push(json!({"role": "user", "content": "left"}));
+        let left = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &left_predecessor,
+            vec![authority("left")],
+        )
+        .unwrap();
+        let mut right_predecessor = base.clone();
+        right_predecessor.push(json!({"role": "user", "content": "right"}));
+        let right = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            None,
+            durable_base,
+            &right_predecessor,
+            vec![authority("right")],
+        )
+        .unwrap();
+        let mut restored = base;
+        let before = restored.clone();
+        let error = apply_provider_canonical_transition_receipts(
+            &mut restored,
+            vec![astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 0,
+                logical_attempt: 0,
+                physical_attempt: 0,
+                transitions: vec![left, right],
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(restored, before);
     }
 
     #[test]
@@ -20785,11 +22117,14 @@ mod tests {
         )
         .1;
 
+        let spill_count = pre_turn_summary_spill_count(&state.messages);
         let event = apply_pre_turn_summary(
             &mut state,
             0.82,
             "Preserve the structured facts and continue.".to_string(),
-        );
+            spill_count,
+        )
+        .expect("summary must reduce the spilled prefix");
         let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
             &state.messages,
             state.pinned_tool_schema_tokens as usize,
@@ -20820,6 +22155,59 @@ mod tests {
         .expect("pre-turn compaction must remain committable");
         assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
         assert!(!packs.is_empty());
+    }
+
+    #[test]
+    fn pre_turn_summary_does_not_rewrite_an_entirely_protected_active_turn() {
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 20_000;
+        state.messages = vec![json!({"role": "user", "content": "long active work"})];
+        for index in 0..12 {
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": format!("evidence {index}: {}", "detail ".repeat(40)),
+            }));
+        }
+        let mut authority = json!({"role": "user", "content": "continue active Work"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "active_work_attempt_start",
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        state.messages.push(authority);
+        let before = state.messages.clone();
+
+        let spill_count = pre_turn_summary_spill_count(&state.messages);
+        assert_eq!(spill_count, 0);
+        assert!(
+            apply_pre_turn_summary(&mut state, 0.95, "summary".to_string(), spill_count).is_none()
+        );
+        assert_eq!(state.messages, before);
+        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
+        assert!(!state.context_compression_triggered);
+    }
+
+    #[test]
+    fn pre_turn_summary_rejects_a_summary_that_does_not_reduce_tokens() {
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 20_000;
+        for index in 0..12 {
+            state.messages.push(json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("short {index}"),
+            }));
+        }
+        let before = state.messages.clone();
+        let spill_count = pre_turn_summary_spill_count(&state.messages);
+        assert!(spill_count > 0);
+
+        assert!(
+            apply_pre_turn_summary(&mut state, 0.9, "oversized ".repeat(2_000), spill_count,)
+                .is_none()
+        );
+        assert_eq!(state.messages, before);
+        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
+        assert!(!state.context_compression_triggered);
     }
 
     #[tokio::test]
@@ -20859,15 +22247,17 @@ mod tests {
             context_window: None,
             max_completion_tokens: None,
         };
-        let msgs = host.assemble_llm_messages(
-            vec![json!({"role": "system", "content": "system prompt text"})],
-            Vec::new(),
-            state.messages.clone(),
-            &mut state,
-            &llm_cfg,
-            &PromptCacheConfig::latch("openai"),
-            false,
-        );
+        let msgs = host
+            .assemble_llm_messages(
+                vec![json!({"role": "system", "content": "system prompt text"})],
+                Vec::new(),
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::latch("openai"),
+                false,
+            )
+            .unwrap();
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
@@ -21186,16 +22576,12 @@ mod tests {
         );
     }
 
-    /// Session 986a553e observed MiniMax-M2.7 cache collapsing from
-    /// 7680 to 0 across six tool-loop rounds because volatile
-    /// content (Self-Awareness with live turn/token counters) was
-    /// being re-injected every round. The new `CacheCapability`
-    /// routing classifies MiniMax as `VolatilePlacement::CurrentUserOnly`;
-    /// `run_turn_pipeline` now consults it and emits an **empty**
-    /// `volatile_preamble` on rounds > 0 so the message history bytes
-    /// stay stable across the tool loop.
+    /// A deployment that explicitly admits required-only delivery at the
+    /// current-user boundary must not emit optional volatile preamble. The
+    /// arbitrary model alias proves this behavior comes from the typed
+    /// capability, not from model-name recognition.
     #[tokio::test]
-    async fn run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round() {
+    async fn current_user_required_only_capability_skips_optional_volatile_context() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -21220,27 +22606,43 @@ mod tests {
         ));
         let tools = host.tool_schemas.clone();
 
-        // Updated contract: strict-history providers (MiniMax) must
-        // suppress volatile preamble on EVERY round, not just >0.
-        // Round-0-only injection still causes a byte mismatch at
-        // msg[1] vs round 1+ (round 0 has preamble+user_q, round 1
-        // has only user_q), so the whole turn's cache misses.
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
         for round in [0u32, 1, 5] {
             state.current_round_index = round;
             let out = host
-                .run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi")
+                .run_turn_pipeline_with_cache_capability_and_session_memory(
+                    &mut state,
+                    &tools,
+                    "openai",
+                    "arbitrary-current-user-deployment",
+                    None,
+                    Some(capability),
+                    None,
+                    &[],
+                    "hi",
+                )
                 .expect("pipeline should succeed");
             assert!(
                 out.volatile_preamble.is_empty(),
-                "MiniMax must suppress volatile preamble on every round \
-                 (strict-history provider). round={round} preamble={:?}",
+                "required-only delivery must suppress optional volatile context on every round. \
+                 round={round} preamble={:?}",
                 out.volatile_preamble,
             );
         }
     }
 
+    /// Append-only delivery is a deployment wire contract. It suppresses the
+    /// optional preamble independently of the model alias; required authority
+    /// is carried later by typed append-only runtime frames.
     #[tokio::test]
-    async fn run_turn_pipeline_deepseek_v4_flash_skips_volatile_on_tool_loop_round() {
+    async fn append_only_required_context_capability_skips_optional_volatile_context() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -21263,15 +22665,33 @@ mod tests {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
         let tools = host.tool_schemas.clone();
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
 
         for round in [0u32, 1, 5] {
             state.current_round_index = round;
             let out = host
-                .run_turn_pipeline(&mut state, &tools, "openai", "deepseek-v4-flash", "hi")
+                .run_turn_pipeline_with_cache_capability_and_session_memory(
+                    &mut state,
+                    &tools,
+                    "openai",
+                    "arbitrary-append-only-deployment",
+                    None,
+                    Some(capability),
+                    None,
+                    &[],
+                    "hi",
+                )
                 .expect("pipeline should succeed");
             assert!(
                 out.volatile_preamble.is_empty(),
-                "DeepSeek v4 flash must suppress volatile preamble on every round. \
+                "append-only required delivery must suppress optional volatile context. \
                  round={round} preamble={:?}",
                 out.volatile_preamble,
             );
@@ -22734,10 +24154,25 @@ mod tests {
             ..Default::default()
         });
         assert!(host.pending_work_graph_mutation_boundary_crossed(&state));
-        let context = host
+        let context_message = host
             .pending_work_graph_mutation_context(&state)
-            .expect("post-settlement mutation context")
-            .to_string();
+            .expect("post-settlement mutation context");
+        let stale_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                context_message["content"]
+                    .as_str()
+                    .expect("context payload"),
+                crate::turn::wire_assembly::RuntimeAuthorityKind::PendingWorkGraphMutations,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .expect("valid append frame")
+            .expect("non-empty append frame");
+        assert_eq!(
+            astra_turn_types::runtime_authority_lifetime(&stale_frame),
+            Some(astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision),
+            "a source-conditioned mutation obligation must expire after the decision that acts on it"
+        );
+        let context = context_message.to_string();
         assert!(context.contains("scheduling_boundary_crossed"));
         assert!(context.contains("Do not execute or settle"));
         assert!(context.contains("task-2"));
@@ -22921,6 +24356,40 @@ mod tests {
         });
         host.reconcile_pending_work_graph_mutations(&state);
         assert!(host.pending_work_graph_mutations.is_empty());
+        assert!(
+            host.pending_work_graph_mutation_context(&state).is_none(),
+            "an accepted exact proposal must remove the live source projection"
+        );
+
+        // Reconstruct the canonical append history as it would appear after
+        // the assistant proposed the accepted mutation. On resume the prior
+        // frame is present as immutable history, but its typed lifetime is no
+        // longer active. A provider-shape switch therefore re-homes nothing.
+        let mut resumed_history = vec![
+            json!({"role": "user", "content": "change the remaining work"}),
+            stale_frame,
+            json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": "exact-patch",
+                "type": "function",
+                "function": {"name": "propose_work_plan", "arguments": "{}"}
+            }]}),
+            json!({"role": "tool", "tool_call_id": "exact-patch", "content": "accepted"}),
+        ];
+        assert!(
+            !astra_turn_types::append_only_runtime_authority_is_active(&resumed_history, 1),
+            "resume must not reactivate an obligation consumed by an assistant decision"
+        );
+        let rehomed =
+            crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut resumed_history)
+                .expect("provider switch must accept valid canonical history");
+        assert!(
+            rehomed.is_empty(),
+            "provider switch must not re-home stale authority"
+        );
+        assert!(resumed_history.iter().all(|message| {
+            astra_turn_types::runtime_authority_kind(message)
+                != Some("pending_work_graph_mutations")
+        }));
     }
 
     #[test]
@@ -24668,6 +26137,8 @@ mod tests {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head_transition_id: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
@@ -28302,6 +29773,29 @@ mod tests {
         assert_eq!(
             llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
             Some("state")
+        );
+        let expected_cache_capability =
+            astra_turn_core::cache_placement::CacheCapability::for_provider("openai");
+        assert_eq!(
+            serde_json::from_value::<astra_turn_core::cache_placement::CacheCapability>(
+                llm_events[0]["metadata"]["trace"]["cache_capability"].clone(),
+            )
+            .unwrap(),
+            expected_cache_capability
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["cache_capability"],
+            llm_events[1]["metadata"]["cache_capability"],
+            "request and response capture must report the same resolved shape"
+        );
+        let diagnostic_snapshot =
+            astra_turn_core::introspect::cache_diagnosis::snapshot_from_capture_json(
+                &llm_events[0]["metadata"],
+            );
+        assert_eq!(
+            diagnostic_snapshot.cache_capability,
+            Some(expected_cache_capability),
+            "harness/introspect parser must recover exact capability from journal metadata"
         );
         assert!(
             llm_events[0]["metadata"]["trace"]["turn_chain_id"].is_null(),

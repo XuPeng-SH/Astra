@@ -1900,6 +1900,13 @@ pub struct StopHookState {
 /// Recovery state for a textless provider response.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompletionSettlementState {
+    /// Host-internal canonical Work establishment repairs already attempted in
+    /// this user turn. Keeping the counter in typed loop state preserves the
+    /// bounded-once contract across transport failure and resume.
+    pub canonical_work_establishment_retries: u32,
+    /// Host-internal output-cap continuations already attempted in this user
+    /// turn. This is independent of provider prose and survives retry/resume.
+    pub output_cap_continuations: u8,
     /// Number of same-turn recovery calls made after the provider returned a
     /// successful response with neither tool calls nor user-visible text.
     pub textless_response_retries: u32,
@@ -2161,6 +2168,13 @@ pub struct VolatileInjection {
     /// Round index the injection was produced in (for introspect
     /// telemetry; not used by the wire layer).
     pub round_index: u32,
+    /// Internal delivery lease. A volatile authority remains pending until a
+    /// provider attempt has produced an assistant decision; transport and
+    /// admission failures release the lease so the exact same typed fact is
+    /// projected again on retry. This bit is control-plane state, never wire
+    /// provenance.
+    #[doc(hidden)]
+    pub attempt_leased: bool,
 }
 
 /// In-memory summary of one LLM round within the current session.
@@ -2197,7 +2211,7 @@ pub const RECENT_ROUNDS_RING_CAPACITY: usize = 32;
 /// Taxonomy of runtime-produced volatile content. Add a new variant
 /// when introducing a new injection kind — both the producer and the
 /// drain path become compile-time-checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolatileKind {
     /// Stall-reflection evidence (`build_stall_reflection`).
@@ -2256,6 +2270,12 @@ pub enum VolatileKind {
     /// neither tool calls nor final text. Hosts pair this typed signal with a
     /// physically empty tool surface for the recovery call.
     FinalAnswerSettlement,
+    /// Required authority for the bounded retry that must establish canonical
+    /// Work after a provider response failed to do so.
+    CanonicalWorkEstablishmentRetry,
+    /// Required authority for the bounded continuation of a text-only response
+    /// that reached the provider output cap.
+    OutputCapContinuation,
     /// Required provenance boundary for one bounded retry when a runtime or
     /// session retrospective attempted to finish without live observation.
     RuntimeEvidenceRequired,
@@ -2289,6 +2309,8 @@ impl VolatileKind {
                 | Self::CompactResume
                 | Self::CircuitBreaker
                 | Self::FinalAnswerSettlement
+                | Self::CanonicalWorkEstablishmentRetry
+                | Self::OutputCapContinuation
                 | Self::RuntimeEvidenceRequired
                 | Self::StopHookEvidence
                 | Self::SessionHookContext
@@ -2318,6 +2340,8 @@ impl VolatileKind {
             | Self::ActiveWorkSnapshot
             | Self::UserIntentBoundary
             | Self::FinalAnswerSettlement
+            | Self::CanonicalWorkEstablishmentRetry
+            | Self::OutputCapContinuation
             | Self::RuntimeEvidenceRequired
             | Self::SessionHookContext
             | Self::PlanModeMarker
@@ -2342,6 +2366,15 @@ impl VolatileKind {
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .expect("unit enum serialization must produce a string")
+    }
+
+    /// Whether the serialized category denotes one replaceable snapshot.
+    /// Unknown extension kinds are conservatively accumulative: silently
+    /// treating a new multi-event producer as singleton would discard facts.
+    #[must_use]
+    pub(crate) fn wire_kind_is_singleton(kind: &str) -> bool {
+        serde_json::from_value::<Self>(Value::String(kind.to_string()))
+            .is_ok_and(Self::is_singleton)
     }
 }
 
@@ -3048,6 +3081,16 @@ pub struct AgenticLoopState {
     /// only by an explicit compaction operation. Observability flags must not
     /// authorize a canonical Replace commit.
     pub canonical_rewrite_state: CanonicalRewriteState,
+    /// Exact committed conversation prefix from which provider-attempt WAL
+    /// may reconstruct this uncommitted turn. Present only when the outer
+    /// canonical coordinator admitted the turn; local/subrun histories must
+    /// not invent this authority.
+    pub provider_canonical_wal_base: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    /// Latest transition durably admitted for this unfinished turn. Every new
+    /// transition names this exact id as its parent; recovery restores it from
+    /// the database-owned per-turn WAL head instead of inferring lineage from
+    /// message values.
+    pub provider_canonical_wal_head_transition_id: Option<String>,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3400,10 +3443,43 @@ impl AgenticLoopState {
             ));
     }
 
+    pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
+        self.provider_canonical_wal_base =
+            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(durable_prefix).ok();
+        self.provider_canonical_wal_head_transition_id = None;
+    }
+
     pub(crate) fn canonical_rewrite_proof(
         &self,
     ) -> Option<&crate::turn::canonical_commit::CanonicalRewriteProof> {
         self.canonical_rewrite_state.proof.as_ref()
+    }
+
+    pub(crate) fn provider_canonical_replacement_authorization(
+        &self,
+        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        predecessor_messages: &[Value],
+    ) -> Option<crate::turn::canonical_commit::ProviderWalReplacementAuthorization> {
+        self.canonical_rewrite_state
+            .proof
+            .as_ref()?
+            .provider_wal_replacement_authorization(durable_base, predecessor_messages)
+    }
+
+    pub(crate) fn recover_provider_canonical_replacement(
+        &mut self,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV1,
+        recovered_messages: &[Value],
+    ) -> Result<(), String> {
+        let durable_base = self
+            .provider_canonical_wal_base
+            .as_ref()
+            .ok_or_else(|| "provider WAL recovery has no admitted durable base".to_string())?;
+        self.canonical_rewrite_state
+            .proof
+            .as_mut()
+            .ok_or_else(|| "provider WAL replacement has no admitted rewrite proof".to_string())?
+            .recover_provider_wal_replacement(durable_base, transition, recovered_messages)
     }
 
     pub(crate) fn begin_canonical_rewrite(
@@ -3450,6 +3526,68 @@ impl AgenticLoopState {
         }
         self.messages.push(message.clone());
         self.record_prompt_history_messages(std::iter::once(message));
+    }
+
+    /// Persist provider-visible runtime authority without claiming human-turn
+    /// provenance or adding it to a child run's conversational transcript.
+    /// This is the only runtime-context class allowed in canonical prompt
+    /// history because its physical append position is part of the provider
+    /// cache contract.
+    pub fn extend_append_only_runtime_messages<I>(
+        &mut self,
+        messages: I,
+    ) -> Result<(), astra_core::ClassifiedError>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        if messages.iter().any(|message| {
+            astra_turn_types::runtime_message_delivery(message)
+                != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        }) {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "canonical append-only runtime history received a message from another delivery lane",
+            ));
+        }
+        self.messages.extend(messages);
+        Ok(())
+    }
+
+    /// Atomically append the provider response that triggered an internal
+    /// retry and the typed authority for that retry.
+    ///
+    /// Both values are validated before canonical state changes. A checkpoint
+    /// or resumed provider projection therefore observes either the whole
+    /// transition or neither half; it can never retain a continuation command
+    /// whose referenced assistant response is missing.
+    pub fn append_provider_retry_transition(
+        &mut self,
+        mut assistant: Value,
+        authority: Value,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if assistant.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "provider retry transition requires an assistant response",
+            ));
+        }
+        if astra_turn_types::runtime_message_delivery(&authority)
+            != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "provider retry transition requires typed append-only runtime authority",
+            ));
+        }
+        if let Some(turn_chain_id) = self.canonical_turn_chain_id.as_deref() {
+            astra_turn_types::mark_turn_message(&mut assistant, turn_chain_id);
+        }
+        self.messages.reserve(2);
+        self.messages.push(assistant.clone());
+        self.messages.push(authority);
+        self.record_prompt_history_messages(std::iter::once(assistant));
+        Ok(())
     }
 
     /// Stamp and capture a suffix appended by a lower-level routine that had
@@ -3522,6 +3660,16 @@ impl AgenticLoopState {
         self.recursion_depth == 0 && self.delegation_chain.is_empty()
     }
 
+    /// Whether this loop owns provider-attempt write-ahead transitions for
+    /// the canonical session conversation. Subagents and delegated loops may
+    /// share a session id for tool/evidence custody, but their private prompt
+    /// histories must never hydrate from or write into the root transcript.
+    #[must_use]
+    pub fn owns_provider_canonical_transition_wal(&self) -> bool {
+        self.owns_session_composite_snapshot()
+            && self.inference_purpose == astra_turn_types::InferencePurpose::PrimaryAgent
+    }
+
     /// Provider-reported total tokens consumed by this loop.
     ///
     /// The four run-level token buckets are disjoint. Any budget, governor, or
@@ -3581,16 +3729,37 @@ impl AgenticLoopState {
     /// Queue a structured runtime payload without flattening it to text at the
     /// process boundary.
     pub fn push_volatile_payload(&mut self, kind: VolatileKind, mut payload: Value) {
-        if let Value::String(text) = &mut payload {
+        self.push_volatile_payload_with_lease(kind, &mut payload, false);
+    }
+
+    /// Queue authority already projected to an in-process provider retry. It
+    /// joins the active attempt lease: success commits it, while any failure
+    /// restores it for the next assembled request.
+    pub fn push_volatile_payload_for_active_attempt(
+        &mut self,
+        kind: VolatileKind,
+        mut payload: Value,
+    ) {
+        self.push_volatile_payload_with_lease(kind, &mut payload, true);
+    }
+
+    fn push_volatile_payload_with_lease(
+        &mut self,
+        kind: VolatileKind,
+        payload: &mut Value,
+        attempt_leased: bool,
+    ) {
+        if let Value::String(text) = payload {
             *text = text.trim().to_string();
         }
-        if volatile_payload_is_empty(&payload) {
+        if volatile_payload_is_empty(payload) {
             return;
         }
         let injection = VolatileInjection {
             kind,
-            payload,
+            payload: payload.clone(),
             round_index: self.current_round_index,
+            attempt_leased,
         };
         if kind.is_singleton() {
             // Replace any prior entry of the same kind so the snapshot
@@ -3778,12 +3947,47 @@ impl AgenticLoopState {
         );
     }
 
-    /// Drain all pending volatile injections. Called by
-    /// `wire_assembly::assemble_llm_messages` once per LLM call.
+    /// Lease the current volatile authorities to one provider attempt.
     ///
-    /// Consumers (and tests inspecting runtime state) get an owned
-    /// list; the lane is empty afterward so the NEXT LLM call starts
-    /// from a clean slate.
+    /// The entries deliberately stay in `volatile_pending` until the caller
+    /// observes an assistant decision. This makes request construction
+    /// transactional: an admission, transport, timeout, or context-window
+    /// failure cannot consume required runtime authority.
+    pub fn lease_volatile_pending(
+        &mut self,
+    ) -> Result<Vec<VolatileInjection>, astra_core::ClassifiedError> {
+        if self
+            .volatile_pending
+            .iter()
+            .any(|injection| injection.attempt_leased)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "volatile runtime authority already has an unresolved provider-attempt lease",
+            ));
+        }
+        for injection in &mut self.volatile_pending {
+            injection.attempt_leased = true;
+        }
+        Ok(self.volatile_pending.clone())
+    }
+
+    /// Commit only the authorities actually leased to the completed attempt.
+    /// Facts queued after request construction remain pending.
+    pub fn commit_volatile_attempt_lease(&mut self) {
+        self.volatile_pending
+            .retain(|injection| !injection.attempt_leased);
+    }
+
+    /// Release a failed provider attempt without consuming its authority.
+    pub fn restore_volatile_attempt_lease(&mut self) {
+        for injection in &mut self.volatile_pending {
+            injection.attempt_leased = false;
+        }
+    }
+
+    /// Test/support escape hatch that consumes the whole pending lane without
+    /// creating a provider-attempt lease.
     #[must_use]
     pub fn take_volatile_pending(&mut self) -> Vec<VolatileInjection> {
         std::mem::take(&mut self.volatile_pending)
@@ -4549,6 +4753,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         budget_wrapup_injected: false,
         context_compression_triggered: false,
         canonical_rewrite_state: Default::default(),
+        provider_canonical_wal_base: None,
+        provider_canonical_wal_head_transition_id: None,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
@@ -5165,13 +5371,21 @@ pub(crate) mod tests {
     fn only_root_loop_owns_session_composite_snapshot() {
         let mut state = make_state();
         assert!(state.owns_session_composite_snapshot());
+        assert!(state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 1;
         assert!(!state.owns_session_composite_snapshot());
+        assert!(!state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 0;
         state.delegation_chain = vec!["orchestrator".to_string()];
         assert!(!state.owns_session_composite_snapshot());
+        assert!(!state.owns_provider_canonical_transition_wal());
+
+        state.delegation_chain.clear();
+        state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
+        assert!(state.owns_session_composite_snapshot());
+        assert!(!state.owns_provider_canonical_transition_wal());
     }
 
     /// Unwind-safe cleanup guard for tests that write under
@@ -6094,6 +6308,8 @@ pub(crate) mod tests {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head_transition_id: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
@@ -12734,6 +12950,25 @@ mod parallel_execution_tests {
             state.take_volatile_pending().is_empty(),
             "stale volatile leaked across rounds — cache bloat risk"
         );
+    }
+
+    #[test]
+    fn volatile_attempt_lease_commits_only_after_decision_and_restores_on_failure() {
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::FinalAnswerSettlement, "settle with evidence");
+
+        let leased = state.lease_volatile_pending().expect("first attempt lease");
+        assert_eq!(leased.len(), 1);
+        assert!(leased[0].attempt_leased);
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert!(state.lease_volatile_pending().is_err());
+
+        state.restore_volatile_attempt_lease();
+        assert!(!state.volatile_pending[0].attempt_leased);
+        let retry = state.lease_volatile_pending().expect("retry lease");
+        assert_eq!(retry[0].payload, leased[0].payload);
+        state.commit_volatile_attempt_lease();
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[test]

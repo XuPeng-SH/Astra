@@ -435,7 +435,7 @@ impl AgenticLoopHost for SubRunHost {
         // Drain runtime volatile as typed edge metadata. Do not splice it into
         // messages[]: that loses producer kind, pollutes prompt-facing history,
         // and makes soft runtime evidence look like user content.
-        let runtime_volatile_injections = state.take_volatile_pending();
+        let runtime_volatile_injections = state.lease_volatile_pending()?;
 
         let effective_model = self.model.as_deref();
         let effective_offering_id = self.offering_id.clone();
@@ -1303,6 +1303,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
@@ -1794,6 +1795,7 @@ mod tests {
             kind: astra_runtime::turn::agentic_loop::host::VolatileKind::PolicyAdvisory,
             payload: json!({"signal": "soft subrun evidence"}),
             round_index: 2,
+            attempt_leased: false,
         }];
 
         attach_runtime_volatile_injections(&mut payload, &injections);

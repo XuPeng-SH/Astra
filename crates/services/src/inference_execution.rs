@@ -67,8 +67,23 @@ pub struct InferenceProviderAttemptPlan {
     owner_token: String,
     owner_generation: u64,
     wire: InferenceProviderWireIdentity,
+    canonical_transition_id: Option<String>,
+    canonical_parent_transition_id: Option<String>,
+    canonical_transition_json: Option<String>,
+    canonical_transition_hash: Option<String>,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
+}
+
+/// Ordered write-ahead transitions committed with one physical provider
+/// attempt. Coordinates come from the invocation identity, never timestamps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InferenceCanonicalTransitionReceipt {
+    pub turn: u32,
+    pub round: u32,
+    pub logical_attempt: u32,
+    pub physical_attempt: u32,
+    pub transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1>,
 }
 
 /// Immutable identity of the exact serialized provider request body.
@@ -150,6 +165,80 @@ impl InferenceProviderAttemptPlan {
     #[must_use]
     pub fn request_context(&self) -> &ModelRequestContextSeed {
         &self.request_context
+    }
+
+    #[must_use]
+    pub fn canonical_transition_hash(&self) -> Option<&str> {
+        self.canonical_transition_hash.as_deref()
+    }
+
+    #[must_use]
+    pub fn canonical_transition_id(&self) -> Option<&str> {
+        self.canonical_transition_id.as_deref()
+    }
+
+    /// Bind canonical append WAL entries to the same immutable admission as
+    /// the exact provider body. Empty means this request owns no canonical
+    /// append transition.
+    pub fn with_canonical_transitions(
+        mut self,
+        transitions: &[astra_turn_types::ProviderCanonicalTransitionV1],
+    ) -> ServiceResult<Self> {
+        if transitions.is_empty() {
+            self.canonical_transition_id = None;
+            self.canonical_parent_transition_id = None;
+            self.canonical_transition_json = None;
+            self.canonical_transition_hash = None;
+            return Ok(self);
+        }
+        if self.invocation_input.purpose != InferencePurpose::PrimaryAgent
+            || !matches!(
+                self.invocation_input.scope,
+                InferenceInvocationScope::Run { .. }
+            )
+        {
+            return Err(ServiceError::invalid(
+                "canonical append transitions require a run-scoped primary-agent owner",
+            ));
+        }
+        if transitions.len() != 1 {
+            return Err(ServiceError::invalid(
+                "one provider attempt must bind exactly one canonical transition snapshot",
+            ));
+        }
+        let transition = &transitions[0];
+        transition.validate().map_err(|error| {
+            ServiceError::invalid(format!(
+                "invalid provider canonical append transition: {error}"
+            ))
+        })?;
+        let encoded = serde_json::to_vec(transitions).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Internal,
+                "serialize provider canonical append transitions",
+                error,
+            )
+        })?;
+        let max_encoded =
+            usize::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES)
+                .unwrap_or(usize::MAX)
+                .saturating_add(2);
+        if encoded.len() > max_encoded {
+            return Err(ServiceError::invalid(
+                "provider canonical append transitions exceed the durable byte bound",
+            ));
+        }
+        self.canonical_transition_id = Some(transition.transition_id.clone());
+        self.canonical_parent_transition_id = transition.parent_transition_id.clone();
+        self.canonical_transition_hash = Some(format!("{:x}", Sha256::digest(&encoded)));
+        self.canonical_transition_json = Some(String::from_utf8(encoded).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Internal,
+                "encode provider canonical append transitions as UTF-8 JSON",
+                error,
+            )
+        })?);
+        Ok(self)
     }
 }
 
@@ -569,6 +658,10 @@ pub fn plan_inference_provider_attempt_with_context(
         owner_token: invocation.owner_token.clone(),
         owner_generation: invocation.owner_generation,
         wire,
+        canonical_transition_id: None,
+        canonical_parent_transition_id: None,
+        canonical_transition_json: None,
+        canonical_transition_hash: None,
         invocation_input: invocation.input.clone(),
         request_context,
     }
@@ -1816,6 +1909,10 @@ struct PersistedProviderAttemptFact {
     provider_protocol: String,
     provider_wire_hash: String,
     provider_wire_bytes: i64,
+    canonical_transition_id: Option<String>,
+    canonical_parent_transition_id: Option<String>,
+    canonical_transition_json: Option<String>,
+    canonical_transition_hash: Option<String>,
     status: String,
     terminal_fingerprint: Option<String>,
 }
@@ -1826,7 +1923,10 @@ async fn load_provider_attempt_fact(
 ) -> ServiceResult<Option<PersistedProviderAttemptFact>> {
     sqlx::query(
         "SELECT invocation_id, attempt_index, provider, admission_token, provider_protocol,
-                provider_wire_hash, provider_wire_bytes, status, terminal_fingerprint
+                provider_wire_hash, provider_wire_bytes,
+                canonical_transition_id, canonical_parent_transition_id,
+                CAST(canonical_transition_json AS CHAR) AS canonical_transition_json,
+                canonical_transition_hash, status, terminal_fingerprint
          FROM inference_provider_attempts
          WHERE user_id = ? AND attempt_id = ? LIMIT 1",
     )
@@ -1850,6 +1950,10 @@ async fn load_provider_attempt_fact(
             provider_protocol: row.try_get("provider_protocol")?,
             provider_wire_hash: row.try_get("provider_wire_hash")?,
             provider_wire_bytes: row.try_get("provider_wire_bytes")?,
+            canonical_transition_id: row.try_get("canonical_transition_id")?,
+            canonical_parent_transition_id: row.try_get("canonical_parent_transition_id")?,
+            canonical_transition_json: row.try_get("canonical_transition_json")?,
+            canonical_transition_hash: row.try_get("canonical_transition_hash")?,
             status: row.try_get("status")?,
             terminal_fingerprint: row.try_get("terminal_fingerprint")?,
         })
@@ -1891,6 +1995,26 @@ fn validate_persisted_provider_attempt_identity(
     if persisted.provider_wire_bytes != provider_wire_bytes {
         mismatches.push("provider_wire_bytes");
     }
+    if persisted.canonical_transition_id != attempt.canonical_transition_id {
+        mismatches.push("canonical_transition_id");
+    }
+    if persisted.canonical_parent_transition_id != attempt.canonical_parent_transition_id {
+        mismatches.push("canonical_parent_transition_id");
+    }
+    // Recovery may retire the large payload after a later child is admitted;
+    // immutable id/parent/hash remain authoritative audit evidence. A present
+    // payload must still be byte-exact, and a no-transition attempt can never
+    // acquire one.
+    if persisted
+        .canonical_transition_json
+        .as_ref()
+        .is_some_and(|payload| Some(payload) != attempt.canonical_transition_json.as_ref())
+    {
+        mismatches.push("canonical_transition_json");
+    }
+    if persisted.canonical_transition_hash != attempt.canonical_transition_hash {
+        mismatches.push("canonical_transition_hash");
+    }
     if mismatches.is_empty() {
         return Ok(());
     }
@@ -1907,6 +2031,12 @@ fn validate_ambiguous_provider_attempt_admission(
     provider_wire_bytes: i64,
 ) -> ServiceResult<()> {
     validate_persisted_provider_attempt_identity(persisted, attempt, provider_wire_bytes)?;
+    if persisted.canonical_transition_json != attempt.canonical_transition_json {
+        return Err(ServiceError::conflict(format!(
+            "inference provider attempt {} ambiguous admission lost its recoverable canonical payload",
+            attempt.attempt_id
+        )));
+    }
     if persisted.status == "started" && persisted.terminal_fingerprint.is_none() {
         return Ok(());
     }
@@ -1920,6 +2050,70 @@ fn validate_ambiguous_provider_attempt_admission(
             "missing"
         }
     )))
+}
+
+async fn validate_ambiguous_canonical_head_admission(
+    db: &sqlx::Pool<sqlx::MySql>,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<()> {
+    let Some(transition_id) = attempt.canonical_transition_id.as_deref() else {
+        return Ok(());
+    };
+    let (session_id, turn) = match &attempt.invocation_input.scope {
+        InferenceInvocationScope::Run {
+            session_id, turn, ..
+        } if attempt.invocation_input.purpose == InferencePurpose::PrimaryAgent => {
+            (session_id.as_str(), *turn)
+        }
+        _ => {
+            return Err(ServiceError::conflict(
+                "ambiguous canonical head admission has no run-scoped primary owner",
+            ));
+        }
+    };
+    let head = sqlx::query(
+        "SELECT head_transition_id, head_attempt_id
+         FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index = ?",
+    )
+    .bind(&attempt.user_id)
+    .bind(session_id)
+    .bind(i64::from(turn))
+    .fetch_optional(db)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "resolve ambiguous inference canonical head admission",
+            error,
+        )
+    })?;
+    let Some(head) = head else {
+        return Err(ServiceError::conflict(
+            "provider attempt exists without its canonical transition head",
+        ));
+    };
+    let head_transition_id: String = head.try_get("head_transition_id").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode ambiguous canonical head id",
+            error,
+        )
+    })?;
+    let head_attempt_id: String = head.try_get("head_attempt_id").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode ambiguous canonical head attempt",
+            error,
+        )
+    })?;
+    if head_transition_id == transition_id && head_attempt_id == attempt.attempt_id {
+        Ok(())
+    } else {
+        Err(ServiceError::conflict(
+            "provider attempt admission did not atomically become the canonical WAL head",
+        ))
+    }
 }
 
 fn validate_first_provider_attempt_binding(
@@ -1949,18 +2143,180 @@ fn validate_first_provider_attempt_binding(
     )))
 }
 
+async fn advance_inference_canonical_transition_head(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<()> {
+    let Some(transition_id) = attempt.canonical_transition_id.as_deref() else {
+        if attempt.canonical_parent_transition_id.is_some()
+            || attempt.canonical_transition_json.is_some()
+            || attempt.canonical_transition_hash.is_some()
+        {
+            return Err(ServiceError::invalid(
+                "canonical transition payload is missing its immutable transition id",
+            ));
+        }
+        return Ok(());
+    };
+    let (session_id, turn) = match &attempt.invocation_input.scope {
+        InferenceInvocationScope::Run {
+            session_id, turn, ..
+        } if attempt.invocation_input.purpose == InferencePurpose::PrimaryAgent => {
+            (session_id.as_str(), *turn)
+        }
+        _ => {
+            return Err(ServiceError::invalid(
+                "canonical transition head requires a run-scoped primary-agent owner",
+            ));
+        }
+    };
+    let current = sqlx::query(
+        "SELECT head_transition_id, head_attempt_id
+         FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index = ?
+         FOR UPDATE",
+    )
+    .bind(&attempt.user_id)
+    .bind(session_id)
+    .bind(i64::from(turn))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "lock inference canonical transition head",
+            error,
+        )
+    })?;
+
+    if let Some(current) = current {
+        let current_transition_id: String =
+            current.try_get("head_transition_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode inference canonical transition head id",
+                    error,
+                )
+            })?;
+        let current_attempt_id: String = current.try_get("head_attempt_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference canonical transition head attempt",
+                error,
+            )
+        })?;
+        let exact_retry = current_transition_id == transition_id;
+        if !exact_retry
+            && attempt.canonical_parent_transition_id.as_deref()
+                != Some(current_transition_id.as_str())
+        {
+            return Err(ServiceError::conflict(format!(
+                "canonical transition {} does not extend current head {}",
+                transition_id, current_transition_id
+            )));
+        }
+        if current_attempt_id != attempt.attempt_id {
+            let retired = sqlx::query(
+                "UPDATE inference_provider_attempts
+                 SET canonical_transition_json = NULL
+                 WHERE user_id = ? AND attempt_id = ?
+                   AND canonical_transition_id = ?
+                   AND canonical_transition_json IS NOT NULL",
+            )
+            .bind(&attempt.user_id)
+            .bind(&current_attempt_id)
+            .bind(&current_transition_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "retire previous inference canonical transition payload",
+                    error,
+                )
+            })?;
+            if retired.rows_affected() != 1 {
+                return Err(ServiceError::conflict(
+                    "current canonical transition head has no unique recoverable payload",
+                ));
+            }
+        }
+        let updated = sqlx::query(
+            "UPDATE inference_canonical_transition_heads
+             SET head_transition_id = ?, head_attempt_id = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND turn_index = ?
+               AND head_transition_id = ? AND head_attempt_id = ?",
+        )
+        .bind(transition_id)
+        .bind(&attempt.attempt_id)
+        .bind(&attempt.user_id)
+        .bind(session_id)
+        .bind(i64::from(turn))
+        .bind(&current_transition_id)
+        .bind(&current_attempt_id)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "advance inference canonical transition head",
+                error,
+            )
+        })?;
+        if updated.rows_affected() != 1 {
+            return Err(ServiceError::conflict(
+                "canonical transition head changed during provider-attempt admission",
+            ));
+        }
+        return Ok(());
+    }
+
+    if attempt.canonical_parent_transition_id.is_some() {
+        return Err(ServiceError::conflict(format!(
+            "canonical transition {transition_id} names a parent but no durable head exists"
+        )));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO inference_canonical_transition_heads
+         (user_id, session_id, turn_index, head_transition_id, head_attempt_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(&attempt.user_id)
+    .bind(session_id)
+    .bind(i64::from(turn))
+    .bind(transition_id)
+    .bind(&attempt.attempt_id)
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "create inference canonical transition head",
+            error,
+        )
+    })?;
+    if inserted.rows_affected() != 1 {
+        return Err(ServiceError::conflict(
+            "canonical transition head was not created exactly once",
+        ));
+    }
+    Ok(())
+}
+
 async fn insert_inference_provider_attempt_admission(
     connection: &mut sqlx::MySqlConnection,
     attempt: &InferenceProviderAttemptPlan,
     provider_wire_bytes: i64,
 ) -> ServiceResult<()> {
-    let result = sqlx::query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
+          canonical_transition_id, canonical_parent_transition_id,
+          canonical_transition_json, canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND NOT EXISTS (
@@ -1969,31 +2325,43 @@ async fn insert_inference_provider_attempt_admission(
                 WHERE settlement_debt.user_id = inference_invocations.user_id
                   AND settlement_debt.invocation_id = inference_invocations.invocation_id
            )",
-    )
-    .bind(&attempt.attempt_id)
-    .bind(i64::from(attempt.attempt_index))
-    .bind(&attempt.provider)
-    .bind(&attempt.admission_token)
-    .bind(&attempt.wire.protocol)
-    .bind(&attempt.wire.provider_wire_hash)
-    .bind(provider_wire_bytes)
-    .bind(&attempt.user_id)
-    .bind(&attempt.invocation_id)
-    .execute(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "insert inference provider attempt",
-            error,
-        )
-    })?;
+        [
+            attempt.canonical_transition_id.is_some(),
+            attempt.canonical_parent_transition_id.is_some(),
+            attempt.canonical_transition_json.is_some(),
+            attempt.canonical_transition_hash.is_some(),
+        ],
+    );
+    let result = sqlx::query(&insert_sql)
+        .bind(&attempt.attempt_id)
+        .bind(i64::from(attempt.attempt_index))
+        .bind(&attempt.provider)
+        .bind(&attempt.admission_token)
+        .bind(&attempt.wire.protocol)
+        .bind(&attempt.wire.provider_wire_hash)
+        .bind(provider_wire_bytes)
+        .bind(&attempt.canonical_transition_id)
+        .bind(&attempt.canonical_parent_transition_id)
+        .bind(&attempt.canonical_transition_json)
+        .bind(&attempt.canonical_transition_hash)
+        .bind(&attempt.user_id)
+        .bind(&attempt.invocation_id)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert inference provider attempt",
+                error,
+            )
+        })?;
     if result.rows_affected() != 1 {
         return Err(ServiceError::conflict(format!(
             "inference invocation {} is not admitted for provider attempt {}",
             attempt.invocation_id, attempt.attempt_id
         )));
     }
+    advance_inference_canonical_transition_head(connection, attempt).await?;
     // This row was inserted immediately above in the same transaction, so its
     // context-expiry fact is exactly NULL. Re-reading and locking it would add
     // a database round trip without adding any concurrency protection.
@@ -2030,7 +2398,8 @@ async fn validate_ambiguous_invocation_with_first_attempt_admission(
                 attempt.attempt_id
             ))
         })?;
-    validate_ambiguous_provider_attempt_admission(&attempt_fact, attempt, provider_wire_bytes)
+    validate_ambiguous_provider_attempt_admission(&attempt_fact, attempt, provider_wire_bytes)?;
+    validate_ambiguous_canonical_head_admission(db, attempt).await
 }
 
 /// Atomically admit a logical invocation and its first physical provider
@@ -2385,13 +2754,15 @@ pub async fn begin_inference_provider_attempt(
             attempt.invocation_id
         )));
     }
-    let result = sqlx::query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
+          canonical_transition_id, canonical_parent_transition_id,
+          canonical_transition_json, canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND owner_token = ? AND owner_generation = ?
@@ -2409,24 +2780,40 @@ pub async fn begin_inference_provider_attempt(
                   AND open_attempt.invocation_id = inference_invocations.invocation_id
                   AND open_attempt.status = 'started'
            )",
-    )
-    .bind(&attempt.attempt_id)
-    .bind(i64::from(attempt.attempt_index))
-    .bind(&attempt.provider)
-    .bind(&attempt.admission_token)
-    .bind(&attempt.wire.protocol)
-    .bind(&attempt.wire.provider_wire_hash)
-    .bind(provider_wire_bytes)
-    .bind(&attempt.user_id)
-    .bind(&attempt.invocation_id)
-    .bind(&attempt.owner_token)
-    .bind(i64::try_from(attempt.owner_generation).map_err(|_| {
-        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
-    })?)
-    .execute(&mut *tx)
-    .await;
+        [
+            attempt.canonical_transition_id.is_some(),
+            attempt.canonical_parent_transition_id.is_some(),
+            attempt.canonical_transition_json.is_some(),
+            attempt.canonical_transition_hash.is_some(),
+        ],
+    );
+    let result = sqlx::query(&insert_sql)
+        .bind(&attempt.attempt_id)
+        .bind(i64::from(attempt.attempt_index))
+        .bind(&attempt.provider)
+        .bind(&attempt.admission_token)
+        .bind(&attempt.wire.protocol)
+        .bind(&attempt.wire.provider_wire_hash)
+        .bind(provider_wire_bytes)
+        .bind(&attempt.canonical_transition_id)
+        .bind(&attempt.canonical_parent_transition_id)
+        .bind(&attempt.canonical_transition_json)
+        .bind(&attempt.canonical_transition_hash)
+        .bind(&attempt.user_id)
+        .bind(&attempt.invocation_id)
+        .bind(&attempt.owner_token)
+        .bind(i64::try_from(attempt.owner_generation).map_err(|_| {
+            ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+        })?)
+        .execute(&mut *tx)
+        .await;
     match result {
         Ok(result) if result.rows_affected() == 1 => {
+            if let Err(error) = advance_inference_canonical_transition_head(&mut tx, attempt).await
+            {
+                rollback_inference_tx(tx, "advance inference canonical transition head").await;
+                return Err(error);
+            }
             if let Err(error) = insert_model_request_context_event(
                 &mut tx,
                 attempt,
@@ -2447,11 +2834,14 @@ pub async fn begin_inference_provider_attempt(
                 error,
             );
             match load_provider_attempt_fact(db, attempt).await {
-                Ok(Some(persisted)) => validate_ambiguous_provider_attempt_admission(
-                    &persisted,
-                    attempt,
-                    provider_wire_bytes,
-                ),
+                Ok(Some(persisted)) => {
+                    validate_ambiguous_provider_attempt_admission(
+                        &persisted,
+                        attempt,
+                        provider_wire_bytes,
+                    )?;
+                    validate_ambiguous_canonical_head_admission(db, attempt).await
+                }
                 Ok(None) => Err(commit_error),
                 Err(read_error) => {
                     tracing::warn!(
@@ -2488,6 +2878,374 @@ pub async fn begin_inference_provider_attempt(
             }
         }
     }
+}
+
+/// Load the single database-authoritative WAL head for one unfinished turn.
+/// Parent validation and head advancement happen in provider-attempt admission;
+/// recovery therefore reads and materializes one snapshot, independent of the
+/// number or size of earlier physical attempts.
+pub async fn load_inference_canonical_transitions_for_session(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    first_turn: u32,
+) -> ServiceResult<Vec<InferenceCanonicalTransitionReceipt>> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    if let Some(previous_turn) = first_turn.checked_sub(1)
+        && let Err(error) = retire_inference_canonical_transitions_through_turn(
+            pool,
+            user_id,
+            session_id,
+            previous_turn,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "astra_services::inference_execution",
+            user_id,
+            session_id,
+            previous_turn,
+            %error,
+            "failed to retire already-absorbed provider canonical WAL; recovery continues"
+        );
+    }
+    reconcile_provider_canonical_transition_boundary(pool.get(), user_id, session_id, first_turn)
+        .await?;
+    let head = sqlx::query(
+        "SELECT head_transition_id, head_attempt_id
+         FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load inference canonical transition head",
+            error,
+        )
+    })?;
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+    let head_transition_id: String = head.try_get("head_transition_id").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference canonical transition head id",
+            error,
+        )
+    })?;
+    let head_attempt_id: String = head.try_get("head_attempt_id").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference canonical transition head attempt",
+            error,
+        )
+    })?;
+    let row = sqlx::query(
+        "SELECT invocation.turn_index, invocation.round_index,
+                invocation.logical_attempt, attempt.attempt_index,
+                attempt.canonical_transition_id, attempt.canonical_parent_transition_id,
+                CAST(attempt.canonical_transition_json AS CHAR) AS canonical_transition_json,
+                attempt.canonical_transition_hash
+         FROM inference_provider_attempts AS attempt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = attempt.user_id
+          AND invocation.invocation_id = attempt.invocation_id
+         WHERE attempt.user_id = ? AND attempt.session_id = ?
+           AND attempt.attempt_id = ? AND attempt.canonical_transition_id = ?
+           AND invocation.turn_index = ?
+           AND invocation.scope_kind = 'run'
+           AND invocation.purpose = 'primary_agent'
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(&head_attempt_id)
+    .bind(&head_transition_id)
+    .bind(i64::from(first_turn))
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load inference canonical transition head payload",
+            error,
+        )
+    })?
+    .ok_or_else(|| {
+        ServiceError::conflict(
+            "inference canonical transition head has no owner-matched attempt payload",
+        )
+    })?;
+    let turn = decode_non_negative_u32(&row, "turn_index")?;
+    let round = decode_non_negative_u32(&row, "round_index")?;
+    let logical_attempt = decode_non_negative_u32(&row, "logical_attempt")?;
+    let physical_attempt = decode_non_negative_u32(&row, "attempt_index")?;
+    let persisted_transition_id: Option<String> =
+        row.try_get("canonical_transition_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical transition id",
+                error,
+            )
+        })?;
+    let persisted_parent_transition_id: Option<String> = row
+        .try_get("canonical_parent_transition_id")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical parent transition id",
+                error,
+            )
+        })?;
+    let encoded: Option<String> = row.try_get("canonical_transition_json").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical transition JSON",
+            error,
+        )
+    })?;
+    let encoded = encoded.ok_or_else(|| {
+        ServiceError::conflict("inference canonical transition head payload was retired early")
+    })?;
+    let persisted_hash: Option<String> =
+        row.try_get("canonical_transition_hash").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical transition hash",
+                error,
+            )
+        })?;
+    let actual_hash = format!("{:x}", Sha256::digest(encoded.as_bytes()));
+    if persisted_hash.as_deref() != Some(actual_hash.as_str()) {
+        return Err(ServiceError::conflict(
+            "provider canonical transition WAL hash does not match its payload",
+        ));
+    }
+    let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
+        serde_json::from_str(&encoded).map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "parse canonical transition WAL payload",
+                error,
+            )
+        })?;
+    if transitions.len() != 1 {
+        return Err(ServiceError::conflict(
+            "provider canonical WAL head payload must contain exactly one transition",
+        ));
+    }
+    let transition = &transitions[0];
+    transition.validate().map_err(|error| {
+        ServiceError::conflict(format!(
+            "provider canonical transition WAL is invalid: {error}"
+        ))
+    })?;
+    if persisted_transition_id.as_deref() != Some(transition.transition_id.as_str())
+        || transition.transition_id != head_transition_id
+        || persisted_parent_transition_id != transition.parent_transition_id
+    {
+        return Err(ServiceError::conflict(
+            "provider canonical WAL head metadata does not match its payload",
+        ));
+    }
+    Ok(vec![InferenceCanonicalTransitionReceipt {
+        turn,
+        round,
+        logical_attempt,
+        physical_attempt,
+        transitions,
+    }])
+}
+
+/// Remove recoverable message payloads after the canonical coordinator has
+/// absorbed them. The content hash remains as immutable audit evidence; owner,
+/// session, turn, run-scope, and primary-purpose predicates prevent one
+/// conversation surface from retiring another's WAL.
+pub async fn retire_inference_canonical_transitions_through_turn(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    through_turn: u32,
+) -> ServiceResult<u64> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let mut tx = pool.get().begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin inference canonical transition retirement",
+            error,
+        )
+    })?;
+    let result = sqlx::query(
+        "UPDATE inference_provider_attempts AS attempt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = attempt.user_id
+          AND invocation.invocation_id = attempt.invocation_id
+         SET attempt.canonical_transition_json = NULL
+         WHERE attempt.user_id = ? AND attempt.session_id = ?
+           AND invocation.turn_index <= ?
+           AND invocation.scope_kind = 'run'
+           AND invocation.purpose = 'primary_agent'
+           AND attempt.canonical_transition_json IS NOT NULL",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "retire absorbed inference canonical transition payloads",
+            error,
+        )
+    })?;
+    let retired = result.rows_affected();
+    sqlx::query(
+        "DELETE FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index <= ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "retire inference canonical transition heads",
+            error,
+        )
+    })?;
+    tx.commit().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "commit inference canonical transition retirement",
+            error,
+        )
+    })?;
+    Ok(retired)
+}
+
+/// Establish a fail-closed recovery boundary before a restored host can use
+/// attempt-owned canonical state and admit new provider I/O.
+///
+/// An expired pre-delivery invocation is safe to cancel. An expired started
+/// attempt becomes `delivery_unknown` through the ordinary recovery path. A
+/// live old owner blocks the restored turn. A delivery-unknown terminal does
+/// not: at-most-once forbids reusing that exact invocation/attempt identity,
+/// while a later identity may extend its committed canonical transition. The
+/// unknown response cannot execute tools because it was never observed by the
+/// runtime.
+async fn reconcile_provider_canonical_transition_boundary(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    first_turn: u32,
+) -> ServiceResult<()> {
+    let expired = sqlx::query(
+        "SELECT invocation_id
+         FROM inference_invocations
+         WHERE user_id = ? AND session_id = ? AND turn_index >= ?
+           AND scope_kind = 'run' AND purpose = 'primary_agent'
+           AND status = 'admitted' AND owner_lease_expires_at <= NOW(6)
+         ORDER BY turn_index ASC, round_index ASC, logical_attempt ASC,
+                  invocation_id ASC",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .fetch_all(db)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "load expired inference owners at canonical recovery boundary",
+            error,
+        )
+    })?;
+    for row in expired {
+        let invocation_id: String = row.try_get("invocation_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode expired inference owner at canonical recovery boundary",
+                error,
+            )
+        })?;
+        recover_expired_inference_invocation(db, user_id, &invocation_id)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "recover expired inference owner at canonical recovery boundary",
+                    error,
+                )
+            })?;
+    }
+
+    let blocker = sqlx::query(
+        "SELECT invocation_id, status
+         FROM inference_invocations
+         WHERE user_id = ? AND session_id = ? AND turn_index >= ?
+           AND scope_kind = 'run' AND purpose = 'primary_agent'
+           AND status = 'admitted'
+         ORDER BY turn_index ASC, round_index ASC, logical_attempt ASC,
+                  invocation_id ASC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .fetch_optional(db)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "verify canonical recovery inference delivery boundary",
+            error,
+        )
+    })?;
+    if let Some(blocker) = blocker {
+        let invocation_id: String = blocker.try_get("invocation_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical recovery inference blocker identity",
+                error,
+            )
+        })?;
+        let status: String = blocker.try_get("status").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical recovery inference blocker status",
+                error,
+            )
+        })?;
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} is {status} at the canonical recovery boundary; new provider delivery is forbidden"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_non_negative_u32(row: &sqlx::mysql::MySqlRow, column: &str) -> ServiceResult<u32> {
+    let value: i64 = row.try_get(column).map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            format!("decode inference canonical transition coordinate {column}"),
+            error,
+        )
+    })?;
+    u32::try_from(value).map_err(|_| {
+        ServiceError::conflict(format!(
+            "inference canonical transition coordinate {column} is outside u32 range"
+        ))
+    })
 }
 
 async fn record_successful_attempt_debt_if_needed(
@@ -4791,6 +5549,7 @@ pub async fn finish_inference_invocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn input() -> InferenceInvocationInput {
         InferenceInvocationInput {
@@ -5037,6 +5796,10 @@ mod tests {
             provider_protocol: attempt.wire.protocol.clone(),
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: i64::try_from(attempt.wire.provider_wire_bytes).unwrap(),
+            canonical_transition_id: attempt.canonical_transition_id.clone(),
+            canonical_parent_transition_id: attempt.canonical_parent_transition_id.clone(),
+            canonical_transition_json: attempt.canonical_transition_json.clone(),
+            canonical_transition_hash: attempt.canonical_transition_hash.clone(),
             status: status.to_string(),
             terminal_fingerprint: terminal_fingerprint.map(str::to_string),
         }
@@ -5054,6 +5817,118 @@ mod tests {
             )
             .expect("exact wire identity"),
         )
+    }
+
+    fn exact_provider_attempt_with_transition() -> InferenceProviderAttemptPlan {
+        let content = astra_turn_types::render_append_only_runtime_authority_frame(
+            "test_authority",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "opaque test authority",
+        )
+        .unwrap();
+        let mut authority = json!({"role": "user", "content": content});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "test_authority",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new(
+            None,
+            &[json!({"role": "user", "content": "goal"})],
+            vec![authority],
+        )
+        .unwrap();
+        exact_provider_attempt()
+            .with_canonical_transitions(&[transition])
+            .unwrap()
+    }
+
+    #[test]
+    fn ambiguous_attempt_reread_requires_exact_canonical_transition_identity() {
+        let attempt = exact_provider_attempt_with_transition();
+        let exact = provider_attempt_fact(&attempt, "started", None);
+        validate_ambiguous_provider_attempt_admission(
+            &exact,
+            &attempt,
+            i64::try_from(attempt.wire.provider_wire_bytes).unwrap(),
+        )
+        .expect("exact body and transition identity authorize the ambiguous commit");
+
+        let mut changed_hash = exact.clone();
+        changed_hash.canonical_transition_hash = Some("f".repeat(64));
+        assert_eq!(
+            validate_ambiguous_provider_attempt_admission(
+                &changed_hash,
+                &attempt,
+                i64::try_from(attempt.wire.provider_wire_bytes).unwrap(),
+            )
+            .expect_err("a different WAL hash must not authorize provider delivery")
+            .kind,
+            ServiceErrorKind::Conflict
+        );
+
+        let mut missing_payload = exact;
+        missing_payload.canonical_transition_json = None;
+        assert_eq!(
+            validate_ambiguous_provider_attempt_admission(
+                &missing_payload,
+                &attempt,
+                i64::try_from(attempt.wire.provider_wire_bytes).unwrap(),
+            )
+            .expect_err("a missing WAL payload must not authorize provider delivery")
+            .kind,
+            ServiceErrorKind::Conflict
+        );
+
+        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
+            serde_json::from_str(
+                attempt
+                    .canonical_transition_json
+                    .as_deref()
+                    .expect("transition JSON"),
+            )
+            .unwrap();
+        let mut subagent_input = input();
+        subagent_input.purpose = InferencePurpose::SubAgent;
+        let subagent = plan_inference_invocation(subagent_input).unwrap();
+        let subagent_attempt = plan_inference_provider_attempt(
+            &subagent,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                4_096,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            subagent_attempt
+                .with_canonical_transitions(&transitions)
+                .expect_err("subagent prompt history cannot own root canonical WAL")
+                .kind,
+            ServiceErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn provider_attempt_owns_one_self_contained_canonical_snapshot() {
+        let attempt = exact_provider_attempt_with_transition();
+        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
+            serde_json::from_str(
+                attempt
+                    .canonical_transition_json
+                    .as_deref()
+                    .expect("transition JSON"),
+            )
+            .unwrap();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            exact_provider_attempt()
+                .with_canonical_transitions(&[transitions[0].clone(), transitions[0].clone()])
+                .expect_err("one physical request cannot own competing snapshots")
+                .kind,
+            ServiceErrorKind::Invalid
+        );
     }
 
     #[test]

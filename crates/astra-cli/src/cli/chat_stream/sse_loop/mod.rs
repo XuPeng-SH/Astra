@@ -519,8 +519,7 @@ pub(crate) async fn stream_chat_sse(
     // preceding prompt history is inherited context, not a new conversation
     // item for this run.
     let root_initial_transcript_item = messages.last().and_then(|message| {
-        (message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-            .then(|| message.clone())
+        astra_turn_types::is_human_user_message(message).then(|| message.clone())
     });
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
@@ -1016,6 +1015,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_injected: false,
         context_compression_triggered: false,
         canonical_rewrite_state: Default::default(),
+        provider_canonical_wal_base: None,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,

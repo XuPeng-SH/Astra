@@ -243,9 +243,7 @@ fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &Tur
         .enumerate()
         .rev()
         .find_map(|(index, message)| {
-            if message.get("role").and_then(Value::as_str) != Some("user")
-                || astra_turn_types::is_runtime_owned_message(message)
-            {
+            if !astra_turn_types::is_human_user_message(message) {
                 return None;
             }
             let content = astra_turn_core::prompt_facing::extract_text_content(message)?;

@@ -872,6 +872,155 @@ async fn deepseek_required_settlement_stays_in_provider_final_tail() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn append_only_metadata_drives_two_round_provider_prefix_and_canonical_ownership() {
+    let case = ProviderCase {
+        label: "declared-append-only",
+        provider: "openai",
+        model: "deployment-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    };
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let mut host = build_host_for(
+        case,
+        vec![scripted_round("r1"), scripted_round("r2")],
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state
+        .messages
+        .push(json!({"role": "user", "content": "finish"}));
+
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 1}),
+    );
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let first_frame = state
+        .messages
+        .iter()
+        .find(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("final_answer_settlement")
+        })
+        .cloned()
+        .expect("first request must commit its append-only authority frame");
+    state.messages.extend([
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "observe-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "observe-1", "content": "observed"}),
+    ]);
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 2}),
+    );
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let guard = capture.lock().unwrap();
+    assert_eq!(guard.len(), 2);
+    assert_eq!(guard[0].tools, guard[1].tools);
+    assert!(
+        guard[1]
+            .provider_messages
+            .starts_with(&guard[0].provider_messages),
+        "round 2 must strictly extend the exact round-1 provider messages"
+    );
+    assert!(guard[0].provider_messages.iter().all(|message| {
+        message
+            .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+            .is_none()
+    }));
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .filter(|message| astra_turn_types::is_human_user_message(message))
+            .count(),
+        1
+    );
+    assert!(state.messages.contains(&first_frame));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn provider_switch_replaces_live_authority_kind_without_leaking_frame_syntax() {
+    let append_case = ProviderCase {
+        label: "append-source",
+        provider: "openai",
+        model: "append-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        }),
+    };
+    let append_capture = Arc::new(Mutex::new(Vec::new()));
+    let mut append_host = build_host_for(append_case, vec![scripted_round("r1")], append_capture);
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state
+        .messages
+        .push(json!({"role": "user", "content": "finish"}));
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 1}),
+    );
+    append_host
+        .run_one_mock_turn_for_test(&mut state)
+        .await
+        .unwrap();
+
+    let tail_case = ProviderCase {
+        label: "tail-destination",
+        provider: "openai",
+        model: "tail-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        }),
+    };
+    let tail_capture = Arc::new(Mutex::new(Vec::new()));
+    let mut tail_host = build_host_for(tail_case, vec![scripted_round("r2")], tail_capture.clone());
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 2}),
+    );
+    tail_host
+        .run_one_mock_turn_for_test(&mut state)
+        .await
+        .unwrap();
+
+    let guard = tail_capture.lock().unwrap();
+    let provider_messages = &guard[0].provider_messages;
+    let joined = provider_messages
+        .iter()
+        .map(flatten_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains("<runtime-authority-frame>"));
+    assert!(!joined.contains("\"revision\":1"));
+    assert_eq!(joined.matches("\"revision\":2").count(), 1);
+}
+
 // ── Invariant 5: trailing role=system messages don't claim the cache marker
 //
 // 5c0b9693 regression: when the runtime appends a trailing `role=system`

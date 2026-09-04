@@ -34,7 +34,7 @@
 //! per round and threads the result through the volatile-placement
 //! pipeline.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// How the provider signals "end of cacheable prefix."
 ///
@@ -102,6 +102,16 @@ pub enum VolatilePlacement {
     /// letting later tool rounds reuse the accumulated conversation prefix
     /// without rewriting any conversation message.
     TailSuffix,
+    /// Append required runtime authority as a provenance-tagged `user` frame
+    /// and retain that frame in conversation order. This is an explicit
+    /// deployment wire shape for providers which support prefix reuse for
+    /// appended conversation messages but treat every `system` message as
+    /// part of one global, cache-keyed system header.
+    ///
+    /// Optional volatile delivery remains controlled independently by
+    /// [`VolatileDeliveryPolicy`]. The runtime provenance marker, rather than
+    /// the physical provider role, keeps this frame out of human user intent.
+    AppendOnlyUserTail,
     /// Put runtime context at the current-user boundary. Providers which
     /// reject mid-history system messages later consolidate required runtime
     /// authority into the leading system message. Whether optional volatile
@@ -140,16 +150,68 @@ pub enum CacheReuseScope {
 }
 
 /// The combined classification the runtime consumes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct CacheCapability {
     pub protocol: CacheProtocol,
     pub volatile_placement: VolatilePlacement,
-    #[serde(default)]
     pub volatile_delivery: VolatileDeliveryPolicy,
     pub reuse_scope: Option<CacheReuseScope>,
 }
 
+/// Deserialize capabilities at the trace/wire boundary. An omitted delivery
+/// axis retains the pre-axis behavior (`All`); placement never implies a
+/// different delivery policy.
+impl<'de> Deserialize<'de> for CacheCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireCapability {
+            protocol: CacheProtocol,
+            volatile_placement: VolatilePlacement,
+            #[serde(default)]
+            volatile_delivery: Option<VolatileDeliveryPolicy>,
+            #[serde(default)]
+            reuse_scope: Option<CacheReuseScope>,
+        }
+
+        let wire = WireCapability::deserialize(deserializer)?;
+        let volatile_delivery = wire
+            .volatile_delivery
+            .unwrap_or(VolatileDeliveryPolicy::All);
+        if matches!(
+            wire.volatile_placement,
+            VolatilePlacement::AppendOnlyUserTail
+        ) && (!matches!(volatile_delivery, VolatileDeliveryPolicy::RequiredOnly)
+            || !matches!(wire.protocol, CacheProtocol::OpenAiAutoPrefix))
+        {
+            return Err(serde::de::Error::custom(
+                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+            ));
+        }
+        Ok(Self {
+            protocol: wire.protocol,
+            volatile_placement: wire.volatile_placement,
+            volatile_delivery,
+            reuse_scope: wire.reuse_scope,
+        })
+    }
+}
+
 impl CacheCapability {
+    /// Append-only history can extend a provider prefix only when every
+    /// admitted volatile message is durable. Today only required authority is
+    /// durable, so optional volatile delivery is an incoherent combination.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        !matches!(
+            self.volatile_placement,
+            VolatilePlacement::AppendOnlyUserTail
+        ) || (matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
+            && matches!(self.volatile_delivery, VolatileDeliveryPolicy::RequiredOnly))
+    }
+
     /// Resolve the transport-level default for a provider.
     ///
     /// Concrete deployments that differ from this baseline must declare an
@@ -278,6 +340,64 @@ mod tests {
         assert_eq!(baseline.protocol, CacheProtocol::OpenAiAutoPrefix);
         assert_eq!(baseline.volatile_placement, VolatilePlacement::TailSuffix);
         assert_eq!(baseline.volatile_delivery, VolatileDeliveryPolicy::All);
+    }
+
+    #[test]
+    fn omitted_delivery_retains_pre_axis_all_without_placement_inference() {
+        let capability: CacheCapability = serde_json::from_value(serde_json::json!({
+            "protocol": "StrictHistoryMatch",
+            "volatile_placement": "CurrentUserOnly",
+            "reuse_scope": "ConversationTurns",
+        }))
+        .unwrap();
+
+        assert_eq!(capability.volatile_delivery, VolatileDeliveryPolicy::All);
+    }
+
+    #[test]
+    fn legacy_non_strict_placement_deserializes_to_full_delivery_at_boundary() {
+        let capability: CacheCapability = serde_json::from_value(serde_json::json!({
+            "protocol": "OpenAiAutoPrefix",
+            "volatile_placement": "TailSuffix",
+        }))
+        .unwrap();
+
+        assert_eq!(capability.volatile_delivery, VolatileDeliveryPolicy::All);
+    }
+
+    #[test]
+    fn explicit_delivery_is_preserved() {
+        let capability: CacheCapability = serde_json::from_value(serde_json::json!({
+            "protocol": "StrictHistoryMatch",
+            "volatile_placement": "CurrentUserOnly",
+            "volatile_delivery": "All",
+        }))
+        .unwrap();
+
+        assert_eq!(capability.volatile_delivery, VolatileDeliveryPolicy::All);
+    }
+
+    #[test]
+    fn append_only_requires_prefix_protocol_and_required_only_delivery() {
+        for value in [
+            serde_json::json!({
+                "protocol": "OpenAiAutoPrefix",
+                "volatile_placement": "AppendOnlyUserTail",
+            }),
+            serde_json::json!({
+                "protocol": "OpenAiAutoPrefix",
+                "volatile_placement": "AppendOnlyUserTail",
+                "volatile_delivery": "All",
+            }),
+            serde_json::json!({
+                "protocol": "MarkerExplicit",
+                "volatile_placement": "AppendOnlyUserTail",
+                "volatile_delivery": "RequiredOnly",
+            }),
+        ] {
+            let error = serde_json::from_value::<CacheCapability>(value).unwrap_err();
+            assert!(error.to_string().contains("append_only_user_tail"));
+        }
     }
 
     #[test]
