@@ -1497,16 +1497,17 @@ mod tests {
             "final_answer_settlement",
             astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         );
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "real request"}),
+            runtime,
+            serde_json::json!({"role": "assistant", "content": "answer"}),
+        ];
         let artifacts = astra_services::self_surface::LoadedSelfSurfaceArtifacts {
             session_id: "sid".to_string(),
             workspace: None,
             restored: Some(astra_services::session_restore::RestoredSession {
                 session_id: "sid".to_string(),
-                conversation_messages: vec![
-                    serde_json::json!({"role": "user", "content": "real request"}),
-                    runtime,
-                    serde_json::json!({"role": "assistant", "content": "answer"}),
-                ],
+                resume_bundle: Some(typed_resume_bundle("sid", 1, messages)),
                 ..Default::default()
             }),
             journal_events: Vec::new(),
