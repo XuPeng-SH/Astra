@@ -55,7 +55,7 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 
 ## Model Access in the TUI
 
-> Status: proposed BYOK interaction contract; awaiting design review.
+> Status: accepted BYOK interaction contract; implementation is staged and not yet available.
 
 TUI is a first-class Model Access surface. A user can discover, add, validate,
 select, inspect, rotate, disable, and repair a personal model without leaving the

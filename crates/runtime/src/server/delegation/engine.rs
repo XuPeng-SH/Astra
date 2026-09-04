@@ -7277,10 +7277,11 @@ mod tests {
                         format!(
                             "{}|{}",
                             execution
+                                .server_material()
                                 .completions_url_override
                                 .as_deref()
                                 .unwrap_or_default(),
-                            execution.request_timeout_ms.unwrap_or(0)
+                            execution.server_material().request_timeout_ms.unwrap_or(0)
                         )
                     })
                     .unwrap_or_else(|| "none".to_string());

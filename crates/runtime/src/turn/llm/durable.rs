@@ -2694,7 +2694,7 @@ impl DurableInferenceLedger {
             upstream_model_name: upstream_model_name.to_string(),
             provider: provider.to_string(),
             purpose,
-            execution_placement: self.admitted_execution.execution_placement,
+            execution_placement: self.admitted_execution.execution_placement(),
             access_kind: self.admitted_execution.access_kind,
         }
     }
@@ -2727,13 +2727,7 @@ impl DurableInferenceLedger {
         upstream_model_name: &str,
         provider: &str,
     ) -> Result<DurableInferenceInvocation, DurableInferenceAdmissionFailure> {
-        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
-        if self.admitted_execution.execution_placement
-            == astra_services::ModelExecutionPlacement::Edge
-        {
-            request_context.topology = astra_services::ModelRequestTopology::EdgeServer;
-            request_context.execution_binding = "edge".to_string();
-        }
+        let request_context = astra_services::ModelRequestContextSeed::server_default();
         self.admit_with_request_context(
             scope,
             purpose,
@@ -2798,7 +2792,7 @@ impl DurableInferenceLedger {
         }
         let request_context = normalize_request_context_for_execution(
             request_context,
-            self.admitted_execution.execution_placement,
+            self.admitted_execution.execution_placement(),
         );
         let mut scope = scope;
         let mut foreground_recoveries = 0_u32;
@@ -4591,20 +4585,24 @@ mod tests {
         let execution = astra_services::AdmittedModelExecution {
             offering_id: "offering-test".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
-            execution_placement: astra_services::ModelExecutionPlacement::Server,
+            source: astra_services::ModelAdmissionSource::ServerCatalog,
+            execution_material: astra_services::ModelExecutionMaterial::Server(
+                astra_services::ServerModelExecutionMaterial {
+                    api_key: "test-key".to_string(),
+                    base_url: base_url.to_string(),
+                    header_overrides: std::collections::HashMap::new(),
+                    completions_url_override: None,
+                    request_timeout_ms: None,
+                },
+            ),
             model_name: "model-test".to_string(),
             wire_model_name: None,
-            api_key: "test-key".to_string(),
-            base_url: base_url.to_string(),
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
-            header_overrides: std::collections::HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
         };
         DurableInferenceLedger::required_with_persistence(
             None,
@@ -7821,6 +7819,54 @@ mod tests {
             .await
             .unwrap();
         invocation.finish(&terminal).await.unwrap();
+        persistence.assert_quiescent();
+    }
+
+    #[tokio::test]
+    async fn provider_gateway_ledger_records_server_execution() {
+        let persistence = TestInferenceLedgerPersistence::default();
+        let invocation = test_invocation(persistence.clone()).await;
+        // Route identity includes physical placement and access ownership.
+        // Compare the admitted result through the public plan contract rather
+        // than exposing its private input merely to inspect these facts.
+        let expected =
+            astra_services::plan_inference_invocation(astra_services::InferenceInvocationInput {
+                user_id: "user-test".to_string(),
+                run_authority: Some(astra_services::InferenceRunAdmissionAuthority {
+                    expected_owner_generation: 0,
+                    expected_owner_pod_id: "test-inference-owner".to_string(),
+                    expected_control_epoch: 0,
+                }),
+                scope: astra_turn_types::InferenceInvocationScope::Run {
+                    session_id: "session-test".to_string(),
+                    run_id: "run-test".to_string(),
+                    turn: 1,
+                    round: 0,
+                    operation_id: "agent_turn".to_string(),
+                    logical_attempt: 0,
+                },
+                offering_id: "offer-test".to_string(),
+                resolved_model_name: "model-test".to_string(),
+                upstream_model_name: "model-test".to_string(),
+                provider: "openai".to_string(),
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                execution_placement: astra_services::ModelExecutionPlacement::Server,
+                access_kind: astra_services::ModelAccessKind::ThisDevice,
+            })
+            .expect("expected Server gateway route");
+        assert_eq!(invocation.plan.route_id(), expected.route_id());
+        assert_eq!(
+            invocation.observer.request_context.execution_binding,
+            "server"
+        );
+        assert_eq!(
+            invocation.observer.request_context.topology,
+            astra_services::ModelRequestTopology::ServerOnly
+        );
+        invocation
+            .finish(&pre_provider_cancelled_terminal())
+            .await
+            .expect("close undispatched gateway invocation");
         persistence.assert_quiescent();
     }
 

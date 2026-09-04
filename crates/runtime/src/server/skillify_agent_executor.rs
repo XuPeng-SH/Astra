@@ -13,8 +13,9 @@ use astra_services::{
 use astra_turn_core::thinking_config::ThinkingConfig;
 
 use crate::turn::llm::{
-    client::{LlmCall, LlmExecutionRoute, global_llm_client, llm_nonstream_timeout},
+    client::{LlmCall, LlmExecutionRoute, llm_nonstream_timeout},
     durable::DurableInferenceLedger,
+    transport::global_llm_client,
 };
 
 const SKILLIFY_EXTRACTION_OUTPUT_TOKENS: usize = 5000;
@@ -85,7 +86,7 @@ impl RuntimeSkillifyAgentExecutor {
         let result = execution
             .ledger
             .execute_nonstream(
-                global_llm_client(),
+                global_llm_client().map_err(|error| error.to_string())?,
                 scope,
                 LlmCall {
                     purpose: astra_turn_types::InferencePurpose::SkillSynthesis,
