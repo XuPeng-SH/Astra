@@ -3471,7 +3471,7 @@ pub(crate) struct DurableProviderRequestIdentity {
     pub request_id: String,
     pub request_hash: String,
     pub attempt: u32,
-    pub protocol: crate::turn::llm::client::LlmProviderProtocol,
+    pub protocol: astra_inference_adapter::ProviderProtocol,
     pub provider_wire_bytes: u64,
     pub composition: crate::turn::llm::client::ProviderWireComposition,
     pub fingerprints: crate::turn::llm::client::ProviderWireFingerprints,
@@ -5871,7 +5871,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
             provider_wire_bytes: 2,
@@ -7452,7 +7452,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7513,7 +7513,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7604,7 +7604,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7660,7 +7660,7 @@ mod tests {
             astra_services::ModelRequestContextSeed::server_default(),
         );
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7750,7 +7750,7 @@ mod tests {
 
     fn test_wire_identity() -> ProviderWireRequestIdentity {
         ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
             provider_wire_bytes: 128,
@@ -8344,7 +8344,7 @@ mod tests {
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_string(),
                     attempt,
-                    protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+                    protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
                     provider_wire_bytes: 128,
                     composition: crate::turn::llm::client::ProviderWireComposition {
                         provider_envelope_bytes: 128,

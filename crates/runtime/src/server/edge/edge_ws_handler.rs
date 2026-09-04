@@ -971,14 +971,29 @@ async fn handle_edge_connection(
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
                                 }
+                                Ok(EdgeClientMessage::InferenceHello { protocol_version }) => {
+                                    let negotiation = state.edge_connection_pool.negotiate_runner_inference(
+                                        &user_id, &edge_agent_id, pool_generation, protocol_version,
+                                    );
+                                    let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::InferenceHelloAck { negotiation }).await;
+                                }
+                                Ok(EdgeClientMessage::InferenceBindingPublish { publication }) => {
+                                    let rejection = state.edge_connection_pool.reject_runner_inference_publication(
+                                        &user_id, &edge_agent_id, pool_generation, &publication,
+                                    );
+                                    let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::InferenceBindingRejected { rejection }).await;
+                                }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
                                 }
                                 Err(e) => {
+                                    let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
                                     tracing::warn!(
                                         user_id = %user_id,
                                         edge_agent_id = %edge_agent_id,
-                                        error = %e,
+                                        category = diagnostic.category,
+                                        line = diagnostic.line,
+                                        column = diagnostic.column,
                                         "Edge: invalid message"
                                     );
                                 }
@@ -1743,6 +1758,18 @@ mod tests {
                 .expect("edge advertisement parses");
         advert.binding.executor.executor_id = executor_id.to_string();
         serde_json::to_value(advert).expect("edge advertisement serializes")
+    }
+
+    #[test]
+    fn validate_edge_capabilities_does_not_enroll_self_declared_inference() {
+        let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
+        capabilities["protocol_capabilities"] = serde_json::json!({"runner_inference_v1": true});
+        capabilities["inference_bindings"] =
+            serde_json::json!([{"binding_id": "forged-binding", "model_name": "public-model"}]);
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("tool registration remains independent from inference");
+        assert!(sanitized.get("inference_bindings").is_none());
+        assert!(sanitized.get("protocol_capabilities").is_none());
     }
 
     #[test]
