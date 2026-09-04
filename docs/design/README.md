@@ -33,7 +33,7 @@ These documents describe target contracts. They should not be read as proof that
 | Cloud-edge sync | [../architecture/edge-cloud-sync-architecture.md](../architecture/edge-cloud-sync-architecture.md) | Durable outbox, sync facts, repair, retention. |
 | Orchestration | [orchestration.md](orchestration.md) | Multi-agent delegation, model selection per agent, coordination. |
 | Model access and inference | [model-access-and-inference.md](model-access-and-inference.md) | Cloud/Workspace/Personal access, stable selection and effective Offerings, TaaS bindings, connections, inference placement, invocation, usage, and billing boundaries. |
-| Runner inference (proposal) | [runner-inference.md](runner-inference.md) | BYOK scope and technical solution: multi-surface/durable/fork integration, shared local host, credentials, exact-attempt dispatch, custody, recovery, and performance gates. |
+| Runner inference (staged implementation) | [runner-inference.md](runner-inference.md) | BYOK scope and technical solution: multi-surface/durable/fork integration, shared local host, credentials, exact-attempt dispatch, custody, recovery, and performance gates. |
 | Model routing | [model-routing.md](model-routing.md) | Model/provider selection, escalation, fallback chains, and traceability. |
 | Multi-agent runtime | [multi-agent-runtime.md](multi-agent-runtime.md) | Durable child runs, fanout/fanin, delegation lineage, and bounded parallelism. |
 | Memory | [memory.md](memory.md) | Cross-session and in-session memory semantics. |

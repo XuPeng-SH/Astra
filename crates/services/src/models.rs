@@ -670,20 +670,61 @@ impl ModelExecutionPlacement {
     }
 }
 
-/// Non-serializable execution material produced once at the trusted model
-/// admission boundary and consumed by every inference surface.
+/// Authority that materialized an admitted Offering. This selects revalidation,
+/// independently of where provider HTTP executes or who owns Model Access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelAdmissionSource {
+    ServerCatalog,
+    ProviderGateway,
+}
+
+/// Server-local transport material. Never serialize it into an admitted identity,
+/// durable record, or a future Runner dispatch envelope.
+#[derive(Clone, PartialEq)]
+pub struct ServerModelExecutionMaterial {
+    pub api_key: String,
+    pub base_url: String,
+    pub header_overrides: HashMap<String, String>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for ServerModelExecutionMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("ServerModelExecutionMaterial")
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_names", &header_names)
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .finish()
+    }
+}
+
+/// Material for the actual executor. Only Server HTTP is implemented today;
+/// add a Runner variant when its admitted binding and dispatch path exist.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelExecutionMaterial {
+    Server(ServerModelExecutionMaterial),
+}
+
+/// Non-serializable admitted identity, request configuration and executor
+/// material produced at the trusted model admission boundary.
 ///
-/// Credential origin is intentionally absent. Executors receive one normalized
-/// invocation shape and never branch on the product source that produced it.
+/// Source controls revalidation only. Inference adapters consume the typed
+/// executor material and never choose transport from a product access label.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub offering_id: String,
     pub access_kind: ModelAccessKind,
-    pub execution_placement: ModelExecutionPlacement,
+    pub source: ModelAdmissionSource,
+    pub execution_material: ModelExecutionMaterial,
     pub model_name: String,
     pub wire_model_name: Option<String>,
-    pub api_key: String,
-    pub base_url: String,
     pub provider: String,
     pub cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-derived reasoning control contract. Inference adapters use this
@@ -693,31 +734,46 @@ pub struct AdmittedModelExecution {
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
     pub max_completion_tokens: Option<u32>,
-    pub header_overrides: HashMap<String, String>,
-    pub completions_url_override: Option<String>,
-    pub request_timeout_ms: Option<u64>,
 }
 
 impl AdmittedModelExecution {
+    #[must_use]
+    pub fn execution_placement(&self) -> ModelExecutionPlacement {
+        match &self.execution_material {
+            ModelExecutionMaterial::Server(_) => ModelExecutionPlacement::Server,
+        }
+    }
+
+    /// Borrow transport material only at a Server execution boundary. This
+    /// exhaustive match must be revisited when another executor is implemented.
+    #[must_use]
+    pub fn server_material(&self) -> &ServerModelExecutionMaterial {
+        match &self.execution_material {
+            ModelExecutionMaterial::Server(material) => material,
+        }
+    }
+
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
             offering_id: offering.offering_id,
             access_kind: ModelAccessKind::SelfHosted,
-            execution_placement: ModelExecutionPlacement::Server,
+            source: ModelAdmissionSource::ServerCatalog,
+            execution_material: ModelExecutionMaterial::Server(ServerModelExecutionMaterial {
+                api_key: offering.model.api_key,
+                base_url: offering.model.base_url,
+                header_overrides,
+                completions_url_override: None,
+                request_timeout_ms: None,
+            }),
             model_name: offering.model.model_name,
             wire_model_name: offering.model.wire_model_name,
-            api_key: offering.model.api_key,
-            base_url: offering.model.base_url,
             provider: offering.model.provider,
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
             max_completion_tokens: offering.model.max_completion_tokens,
-            header_overrides,
-            completions_url_override: None,
-            request_timeout_ms: None,
         })
     }
 
@@ -733,42 +789,37 @@ impl AdmittedModelExecution {
         Self {
             offering_id,
             access_kind: ModelAccessKind::ThisDevice,
-            execution_placement: ModelExecutionPlacement::Edge,
+            source: ModelAdmissionSource::ProviderGateway,
+            execution_material: ModelExecutionMaterial::Server(ServerModelExecutionMaterial {
+                api_key: String::new(),
+                base_url: String::new(),
+                header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
+                completions_url_override: Some(endpoint_url),
+                request_timeout_ms: timeout_ms,
+            }),
             model_name,
             wire_model_name: None,
-            api_key: String::new(),
-            base_url: String::new(),
             provider,
             cache_capability: None,
             thinking_capability: None,
             request_body_overrides: None,
             context_window: Some(context_window),
             max_completion_tokens: None,
-            header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
-            completions_url_override: Some(endpoint_url),
-            request_timeout_ms: timeout_ms,
         }
     }
 }
 
 impl std::fmt::Debug for AdmittedModelExecution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
-        header_names.sort_unstable();
         f.debug_struct("AdmittedModelExecution")
             .field("offering_id", &self.offering_id)
             .field("access_kind", &self.access_kind)
-            .field("execution_placement", &self.execution_placement)
+            .field("source", &self.source)
+            .field("execution_placement", &self.execution_placement())
             .field("model_name", &self.model_name)
             .field("wire_model_name", &self.wire_model_name)
             .field("provider", &self.provider)
-            .field("credential_present", &!self.api_key.is_empty())
-            .field("header_names", &header_names)
-            .field(
-                "completions_url_override_present",
-                &self.completions_url_override.is_some(),
-            )
-            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("execution_material", &self.execution_material)
             .field("context_window", &self.context_window)
             .field("max_completion_tokens", &self.max_completion_tokens)
             .finish()
@@ -4540,11 +4591,38 @@ mod tests {
             128_000,
         );
 
-        let debug = format!("{execution:?}");
-        assert!(!debug.contains("top-secret"));
-        assert!(!debug.contains("private.example"));
-        assert!(debug.contains("authorization"));
-        assert!(debug.contains("completions_url_override_present: true"));
+        for debug in [
+            format!("{execution:?}"),
+            format!("{:?}", execution.execution_material),
+            format!("{:?}", execution.server_material()),
+        ] {
+            assert!(!debug.contains("top-secret"));
+            assert!(!debug.contains("private.example"));
+            assert!(debug.contains("authorization"));
+            assert!(debug.contains("completions_url_override_present: true"));
+        }
+    }
+
+    #[test]
+    fn admitted_execution_server_material_debug_redacts_catalog_key_and_base_url() {
+        let material = ServerModelExecutionMaterial {
+            api_key: "catalog-secret".into(),
+            base_url: "https://private-catalog.example/v1?key=private-query".into(),
+            header_overrides: HashMap::from([("x-api-key".into(), "header-secret".into())]),
+            completions_url_override: None,
+            request_timeout_ms: None,
+        };
+        let debug = format!("{material:?}");
+        for secret in [
+            "catalog-secret",
+            "private-catalog.example",
+            "private-query",
+            "header-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("credential_present: true"));
+        assert!(debug.contains("x-api-key"));
     }
 
     // ── resolve_model_alias ──

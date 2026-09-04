@@ -13022,7 +13022,10 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
         prepared
             .admitted_model_execution
             .as_ref()
-            .and_then(|execution| execution.completions_url_override.as_deref()),
+            .and_then(|execution| execution
+                .server_material()
+                .completions_url_override
+                .as_deref()),
         Some("http://127.0.0.1/model-gateway")
     );
     assert_eq!(
