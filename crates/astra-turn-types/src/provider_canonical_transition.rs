@@ -186,19 +186,9 @@ impl ProviderCanonicalTransitionV1 {
         crate::validate_canonical_tool_pairing(&result_messages)
             .map_err(|_| ProviderCanonicalTransitionError::InvalidCanonicalRecovery)?;
         let result = CanonicalPrefixIdentityV1::from_messages(&result_messages)?;
-        let transition_id = transition_identity(
-            parent_transition_id.as_deref(),
-            &durable_base,
-            recovery_mode,
-            replacement_compaction_generation,
-            &recovery_messages,
-            &predecessor,
-            &result,
-            &appended_messages,
-        );
-        let transition = Self {
+        let mut transition = Self {
             schema_version: PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION,
-            transition_id,
+            transition_id: String::new(),
             parent_transition_id,
             durable_base,
             recovery_mode,
@@ -208,6 +198,7 @@ impl ProviderCanonicalTransitionV1 {
             result,
             appended_messages,
         };
+        transition.transition_id = transition_identity(&transition);
         transition.validate()?;
         Ok(transition)
     }
@@ -261,18 +252,7 @@ impl ProviderCanonicalTransitionV1 {
         {
             return Err(ProviderCanonicalTransitionError::ResultCountMismatch);
         }
-        if self.transition_id
-            != transition_identity(
-                self.parent_transition_id.as_deref(),
-                &self.durable_base,
-                self.recovery_mode,
-                self.replacement_compaction_generation,
-                &self.recovery_messages,
-                &self.predecessor,
-                &self.result,
-                &self.appended_messages,
-            )
-        {
+        if self.transition_id != transition_identity(self) {
             return Err(ProviderCanonicalTransitionError::IdentityMismatch);
         }
         let durable_bytes = crate::json_serialized_len(self)
@@ -419,35 +399,26 @@ fn validate_hash(hash: &str) -> Result<(), ProviderCanonicalTransitionError> {
     }
 }
 
-fn transition_identity(
-    parent_transition_id: Option<&str>,
-    durable_base: &CanonicalPrefixIdentityV1,
-    recovery_mode: ProviderCanonicalRecoveryModeV1,
-    replacement_compaction_generation: Option<u64>,
-    recovery_messages: &[Value],
-    predecessor: &CanonicalPrefixIdentityV1,
-    result: &CanonicalPrefixIdentityV1,
-    appended_messages: &[Value],
-) -> String {
-    let recovery_root = canonical_conversation_identity(recovery_messages).0;
-    let appended_root = canonical_conversation_identity(appended_messages).0;
+fn transition_identity(transition: &ProviderCanonicalTransitionV1) -> String {
+    let recovery_root = canonical_conversation_identity(&transition.recovery_messages).0;
+    let appended_root = canonical_conversation_identity(&transition.appended_messages).0;
     let mut digest = Sha256::new();
     digest.update(TRANSITION_ID_DOMAIN);
     digest.update(PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION.to_be_bytes());
-    match parent_transition_id {
+    match transition.parent_transition_id.as_deref() {
         Some(parent_transition_id) => {
             digest.update([1]);
             digest.update(parent_transition_id.as_bytes());
         }
         None => digest.update([0]),
     }
-    digest.update(durable_base.message_count.to_be_bytes());
-    digest.update(durable_base.root_hash.as_bytes());
-    digest.update([match recovery_mode {
+    digest.update(transition.durable_base.message_count.to_be_bytes());
+    digest.update(transition.durable_base.root_hash.as_bytes());
+    digest.update([match transition.recovery_mode {
         ProviderCanonicalRecoveryModeV1::AppendFromDurableBase => 0,
         ProviderCanonicalRecoveryModeV1::ReplaceFromDurableBase => 1,
     }]);
-    match replacement_compaction_generation {
+    match transition.replacement_compaction_generation {
         Some(generation) => {
             digest.update([1]);
             digest.update(generation.to_be_bytes());
@@ -455,10 +426,10 @@ fn transition_identity(
         None => digest.update([0]),
     }
     digest.update(recovery_root.as_bytes());
-    digest.update(predecessor.message_count.to_be_bytes());
-    digest.update(predecessor.root_hash.as_bytes());
-    digest.update(result.message_count.to_be_bytes());
-    digest.update(result.root_hash.as_bytes());
+    digest.update(transition.predecessor.message_count.to_be_bytes());
+    digest.update(transition.predecessor.root_hash.as_bytes());
+    digest.update(transition.result.message_count.to_be_bytes());
+    digest.update(transition.result.root_hash.as_bytes());
     digest.update(appended_root.as_bytes());
     format!("{:x}", digest.finalize())
 }
@@ -612,16 +583,7 @@ mod tests {
         let mut transition =
             ProviderCanonicalTransitionV1::new(None, &base, vec![authority("budget")]).unwrap();
         transition.result.root_hash = "0".repeat(64);
-        transition.transition_id = transition_identity(
-            transition.parent_transition_id.as_deref(),
-            &transition.durable_base,
-            transition.recovery_mode,
-            transition.replacement_compaction_generation,
-            &transition.recovery_messages,
-            &transition.predecessor,
-            &transition.result,
-            &transition.appended_messages,
-        );
+        transition.transition_id = transition_identity(&transition);
         let mut history = base;
         let before = history.clone();
 

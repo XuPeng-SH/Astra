@@ -186,17 +186,12 @@ pub enum PromptCacheVolatilePlacementData {
     Free,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheVolatileDeliveryData {
+    #[default]
     All,
     RequiredOnly,
-}
-
-impl Default for PromptCacheVolatileDeliveryData {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
