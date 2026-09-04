@@ -1292,8 +1292,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             Ok(EdgeServerMessage::AuthOk { .. } | EdgeServerMessage::AuthError { .. }) => {
                                 // ignore duplicate auth
                             }
+                            Ok(EdgeServerMessage::InferenceHelloAck { negotiation }) => {
+                                tracing::info!(?negotiation, "Runner inference negotiation");
+                            }
+                            Ok(EdgeServerMessage::InferenceBindingRejected { rejection }) => {
+                                tracing::warn!(reason = ?rejection.reason, "Runner inference binding publication rejected");
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "Failed to parse server message");
+                                let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
+                                tracing::warn!(category = diagnostic.category, line = diagnostic.line, column = diagnostic.column, "Failed to parse server message");
                             }
                         }
                     }
