@@ -159,6 +159,26 @@ pub fn sanitize_prompt_facing_messages_with_state(
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, false)
+}
+
+/// Project an already-compacted current-turn delta for resumable canonical
+/// commit.
+///
+/// Tiered compaction has already removed the compacted middle from this
+/// vector. Only an explicit typed replacement in the retained tail supersedes
+/// the protected head. Refinements, corrections, continuations, and unjudged
+/// user messages retain the objective they depend on.
+pub fn sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, true)
+}
+
+fn sanitize_canonical_continuation_messages_impl(
+    messages: Vec<Value>,
+    preserve_compacted_head: bool,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
     for message in &messages {
         if message
             .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
@@ -168,7 +188,11 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
         }
     }
 
-    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
+    let start = if preserve_compacted_head {
+        compacted_canonical_turn_start(&messages)?
+    } else {
+        latest_compaction_boundary_start(&messages).unwrap_or(0)
+    };
     let messages = messages
         .into_iter()
         .skip(start)
@@ -225,8 +249,8 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
 /// Completed tool call/result frames are execution evidence owned by the run
 /// transcript and recovery checkpoint, not by every future model request. This
 /// projection intentionally has no generic recent-message cap: the caller
-/// passes one canonical turn delta, and dropping its opening user message would
-/// make the resulting suffix structurally invalid.
+/// passes one canonical turn delta. Its opening objective is retained unless
+/// a typed replacement after compaction explicitly supersedes it.
 pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
@@ -239,7 +263,7 @@ pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
         }
     }
 
-    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
+    let start = compacted_canonical_turn_start(&messages)?;
     let mut out = Vec::new();
     let mut has_user_context = false;
     for message in messages.into_iter().skip(start) {
@@ -542,6 +566,26 @@ fn latest_compaction_boundary_start(messages: &[Value]) -> Option<usize> {
     })
 }
 
+fn compacted_canonical_turn_start(
+    messages: &[Value],
+) -> Result<usize, astra_turn_types::UserTurnSemanticsError> {
+    let Some(boundary_index) = latest_compaction_boundary_start(messages) else {
+        return Ok(0);
+    };
+    for (index, message) in messages.iter().enumerate().skip(boundary_index + 1).rev() {
+        if !is_runtime_owned_message(message)
+            && message.get("role").and_then(Value::as_str) == Some("user")
+            && canonical_text_message(message, "user", false).is_some()
+            && astra_turn_types::user_turn_semantics(message)?.is_some_and(|semantics| {
+                semantics.objective_relation == astra_turn_types::ObjectiveRelation::Replace
+            })
+        {
+            return Ok(index);
+        }
+    }
+    Ok(0)
+}
+
 fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
     let _ = role;
     let content = content.trim().to_string();
@@ -703,6 +747,125 @@ mod tests {
         );
     }
 
+    fn compacted_turn_projections(messages: Vec<Value>) -> Vec<Vec<Value>> {
+        vec![
+            super::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+                messages.clone(),
+            )
+            .expect("valid compacted turn"),
+            super::sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
+                .expect("valid completed turn"),
+        ]
+    }
+
+    fn typed_user(content: &str, relation: astra_turn_types::ObjectiveRelation) -> Value {
+        let mut message = json!({"role": "user", "content": content});
+        astra_turn_types::mark_user_turn_semantics(
+            &mut message,
+            astra_turn_types::UserTurnSemantics::new(relation, None),
+        );
+        message
+    }
+
+    #[test]
+    fn compacted_current_turn_preserves_objective_until_typed_replacement() {
+        use astra_turn_types::ObjectiveRelation;
+        for relation in [
+            None,
+            Some(ObjectiveRelation::Unknown),
+            Some(ObjectiveRelation::Acknowledge),
+            Some(ObjectiveRelation::Continue),
+            Some(ObjectiveRelation::Refine),
+            Some(ObjectiveRelation::Correct),
+            Some(ObjectiveRelation::Replace),
+        ] {
+            let head = typed_user("initial objective", ObjectiveRelation::Replace);
+            // Identical text deliberately cannot tell the projection what to do.
+            let tail = relation.map_or_else(
+                || json!({"role": "user", "content": "follow-up input"}),
+                |relation| typed_user("follow-up input", relation),
+            );
+            let answer = json!({"role": "assistant", "content": "done"});
+            let messages = vec![
+                head.clone(),
+                json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+                tail.clone(),
+                answer.clone(),
+            ];
+            let mut expected = vec![tail, answer];
+            if relation != Some(ObjectiveRelation::Replace) {
+                expected.insert(0, head);
+            }
+            for projected in compacted_turn_projections(messages) {
+                assert_eq!(projected, expected, "relation: {relation:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compacted_current_turn_starts_at_last_explicit_replacement() {
+        use astra_turn_types::ObjectiveRelation;
+        let replacement = typed_user("replacement objective", ObjectiveRelation::Replace);
+        let refinement = typed_user("additional constraint", ObjectiveRelation::Refine);
+        let messages = vec![
+            typed_user("obsolete head", ObjectiveRelation::Replace),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            typed_user("obsolete refinement", ObjectiveRelation::Refine),
+            typed_user("superseded replacement", ObjectiveRelation::Replace),
+            json!({"role": "assistant", "content": "obsolete answer"}),
+            replacement.clone(),
+            refinement.clone(),
+        ];
+        for projected in compacted_turn_projections(messages) {
+            assert_eq!(projected, vec![replacement.clone(), refinement.clone()]);
+        }
+    }
+
+    #[test]
+    fn compacted_current_turn_ignores_runtime_owned_replacement() {
+        use astra_turn_types::ObjectiveRelation;
+        let head = typed_user("initial objective", ObjectiveRelation::Replace);
+        let mut control =
+            runtime_owned_message("user", "control", RuntimeMessageDelivery::EphemeralControl);
+        astra_turn_types::mark_user_turn_semantics(
+            &mut control,
+            astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Replace, None),
+        );
+        let messages = vec![
+            head.clone(),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            control,
+            typed_user("  ", ObjectiveRelation::Replace),
+        ];
+        for projected in compacted_turn_projections(messages) {
+            assert_eq!(projected, vec![head.clone()]);
+        }
+    }
+
+    #[test]
+    fn compacted_current_turn_rejects_corrupt_semantics() {
+        let messages = vec![
+            json!({"role": "user", "content": "objective"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            json!({
+                "role": "user", "content": "input",
+                (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                    "schema_version": 1, "objective_relation": "invalid",
+                },
+            }),
+        ];
+        assert!(
+            super::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+                messages.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            super::sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
+                .is_err()
+        );
+    }
+
     #[test]
     fn canonical_continuation_normalizes_structured_tool_results_to_provider_neutral_text() {
         let messages = vec![
@@ -826,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_drops_only_corrupt_semantics_then_runs_the_full_sanitizer() {
+    fn recovery_drops_corrupt_semantics_and_pre_boundary_history() {
         let messages = vec![
             json!({"role": "user", "content": "stale objective"}),
             json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
