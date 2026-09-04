@@ -16,6 +16,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use astra_inference_adapter::sse::{ParsedSseEvent, decode_provider_sse};
+use astra_inference_adapter::{
+    DEFAULT_REQUEST_LIMIT_BYTES, DEFAULT_SSE_EVENT_LIMIT_BYTES, ExactProviderRequest,
+    ProviderProtocol, RequestCompileError,
+};
 use astra_logging::redact_known_secret_patterns;
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -33,11 +38,6 @@ use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
-};
-use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
-use astra_turn_core::sse_data_lines::{
-    json_events_from_sse_event_block, validate_sse_event_block_json,
-    validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -102,37 +102,11 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmProviderProtocol {
-    OpenAiCompatible,
-    AnthropicMessages,
-    BedrockConverse,
-}
-
-impl LlmProviderProtocol {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAiCompatible => "openai_compatible",
-            Self::AnthropicMessages => "anthropic_messages",
-            Self::BedrockConverse => "bedrock_converse",
-        }
-    }
-
-    /// Whether the concrete request builder preserves each appended provider
-    /// message as a distinct wire item. Append-only caching is invalid for
-    /// transports that merge adjacent roles and thereby rewrite the old tail.
-    #[must_use]
-    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
-        matches!(self, Self::OpenAiCompatible)
-    }
-}
-
-pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
+pub(crate) fn llm_provider_protocol(provider: &str) -> ProviderProtocol {
     match provider {
-        "anthropic" => LlmProviderProtocol::AnthropicMessages,
-        "bedrock" => LlmProviderProtocol::BedrockConverse,
-        _ => LlmProviderProtocol::OpenAiCompatible,
+        "anthropic" => ProviderProtocol::AnthropicMessages,
+        "bedrock" => ProviderProtocol::BedrockConverse,
+        _ => ProviderProtocol::OpenAiCompatible,
     }
 }
 
@@ -143,7 +117,7 @@ pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
 /// serialization or a pre-transport prompt projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderWireRequestIdentity {
-    pub protocol: LlmProviderProtocol,
+    pub protocol: ProviderProtocol,
     pub provider_wire_hash: String,
     pub provider_wire_bytes: u64,
     pub composition: ProviderWireComposition,
@@ -170,11 +144,11 @@ pub(crate) struct ProviderWireFingerprints {
 impl ProviderWireFingerprints {
     fn from_body(
         body: &Value,
-        protocol: LlmProviderProtocol,
+        protocol: ProviderProtocol,
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let (messages, system, conversation, tools) = match protocol {
-            LlmProviderProtocol::OpenAiCompatible => {
+            ProviderProtocol::OpenAiCompatible => {
                 let messages = body
                     .get("messages")
                     .and_then(Value::as_array)
@@ -197,13 +171,13 @@ impl ProviderWireFingerprints {
                     provider_wire_items(body.get("tools")),
                 )
             }
-            LlmProviderProtocol::AnthropicMessages => (
+            ProviderProtocol::AnthropicMessages => (
                 provider_wire_items(body.get("messages")),
                 provider_wire_items(body.get("system")),
                 provider_wire_items(body.get("messages")),
                 provider_wire_items(body.get("tools")),
             ),
-            LlmProviderProtocol::BedrockConverse => (
+            ProviderProtocol::BedrockConverse => (
                 provider_wire_items(body.get("messages")),
                 provider_wire_items(body.get("system")),
                 provider_wire_items(body.get("messages")),
@@ -259,13 +233,13 @@ impl ProviderWireFingerprints {
 
 fn provider_cache_key_system_items(
     body: &Value,
-    protocol: LlmProviderProtocol,
+    protocol: ProviderProtocol,
     cache_capability: Option<CacheCapability>,
 ) -> Vec<&Value> {
     use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
 
     let mut system = match protocol {
-        LlmProviderProtocol::OpenAiCompatible => {
+        ProviderProtocol::OpenAiCompatible => {
             let messages = body
                 .get("messages")
                 .and_then(Value::as_array)
@@ -287,8 +261,8 @@ fn provider_cache_key_system_items(
                     .collect(),
             }
         }
-        LlmProviderProtocol::AnthropicMessages => provider_wire_items(body.get("system")),
-        LlmProviderProtocol::BedrockConverse => provider_wire_items(body.get("system")),
+        ProviderProtocol::AnthropicMessages => provider_wire_items(body.get("system")),
+        ProviderProtocol::BedrockConverse => provider_wire_items(body.get("system")),
     };
 
     let marker_protocol = cache_capability
@@ -312,18 +286,16 @@ fn provider_cache_key_system_items(
 
 fn provider_cache_key_tool_items(
     body: &Value,
-    protocol: LlmProviderProtocol,
+    protocol: ProviderProtocol,
     cache_capability: Option<CacheCapability>,
 ) -> Vec<&Value> {
     use astra_turn_core::cache_placement::CacheProtocol;
 
     let mut tools = match protocol {
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages => {
+        ProviderProtocol::OpenAiCompatible | ProviderProtocol::AnthropicMessages => {
             provider_wire_items(body.get("tools"))
         }
-        LlmProviderProtocol::BedrockConverse => {
-            provider_wire_items(body.pointer("/toolConfig/tools"))
-        }
+        ProviderProtocol::BedrockConverse => provider_wire_items(body.pointer("/toolConfig/tools")),
     };
     let Some(cache_capability) = cache_capability else {
         return tools;
@@ -348,11 +320,11 @@ fn provider_cache_key_tool_items(
     }
 }
 
-fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
+fn provider_wire_tool_name(protocol: ProviderProtocol, tool: &Value) -> Option<&str> {
     let pointer = match protocol {
-        LlmProviderProtocol::OpenAiCompatible => "/function/name",
-        LlmProviderProtocol::AnthropicMessages => "/name",
-        LlmProviderProtocol::BedrockConverse => "/toolSpec/name",
+        ProviderProtocol::OpenAiCompatible => "/function/name",
+        ProviderProtocol::AnthropicMessages => "/name",
+        ProviderProtocol::BedrockConverse => "/toolSpec/name",
     };
     tool.pointer(pointer).and_then(Value::as_str)
 }
@@ -407,12 +379,12 @@ pub(crate) struct ProviderWireComposition {
 impl ProviderWireComposition {
     fn from_body(
         body: &Value,
-        protocol: LlmProviderProtocol,
+        protocol: ProviderProtocol,
         provider_wire_bytes: u64,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let mut composition = Self::default();
         match protocol {
-            LlmProviderProtocol::OpenAiCompatible => {
+            ProviderProtocol::OpenAiCompatible => {
                 for message in body
                     .get("messages")
                     .and_then(Value::as_array)
@@ -438,7 +410,7 @@ impl ProviderWireComposition {
                     &mut composition.tool_schema_items,
                 )?;
             }
-            LlmProviderProtocol::AnthropicMessages => {
+            ProviderProtocol::AnthropicMessages => {
                 accumulate_wire_items(
                     body.get("system"),
                     &mut composition.system_bytes,
@@ -455,7 +427,7 @@ impl ProviderWireComposition {
                     &mut composition.tool_schema_items,
                 )?;
             }
-            LlmProviderProtocol::BedrockConverse => {
+            ProviderProtocol::BedrockConverse => {
                 accumulate_wire_items(
                     body.get("system"),
                     &mut composition.system_bytes,
@@ -544,7 +516,7 @@ fn accumulate_wire_items(
 /// Exact provider payload shared by durable attempt admission and HTTP send.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedProviderRequest {
-    body: Bytes,
+    request: ExactProviderRequest,
     identity: ProviderWireRequestIdentity,
 }
 
@@ -552,38 +524,45 @@ impl PreparedProviderRequest {
     #[cfg(test)]
     pub(crate) fn from_json(
         body: &Value,
-        protocol: LlmProviderProtocol,
+        protocol: ProviderProtocol,
     ) -> Result<Self, astra_core::ClassifiedError> {
         Self::from_json_with_cache_capability(body, protocol, None)
     }
 
     pub(crate) fn from_json_with_cache_capability(
         body: &Value,
-        protocol: LlmProviderProtocol,
+        protocol: ProviderProtocol,
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
-        let encoded = serde_json::to_vec(body).map_err(|error| {
-            astra_core::history_work::record_serialization_failure(
-                astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
-                &error,
-            );
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                format!("serialize exact provider request body: {error}"),
-            )
-        })?;
-        let provider_wire_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        let request = ExactProviderRequest::compile(body, protocol, DEFAULT_REQUEST_LIMIT_BYTES)
+            .map_err(|error| {
+                if let Some(serialization_error) = error.serialization_error() {
+                    astra_core::history_work::record_serialization_failure(
+                        astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
+                        serialization_error,
+                    );
+                }
+                astra_core::ClassifiedError::new(
+                    if matches!(error, RequestCompileError::TooLarge { .. }) {
+                        astra_core::ErrorKind::ResourceLimit
+                    } else {
+                        astra_core::ErrorKind::ContractViolation
+                    },
+                    format!("serialize exact provider request body: {error}"),
+                )
+            })?;
+        let provider_wire_bytes = request.identity().bytes;
         if astra_core::history_work::instrumentation_enabled() {
             astra_core::history_work::record_bytes(
                 astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
                 provider_wire_bytes,
             );
         }
-        let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
+        let provider_wire_hash = request.identity().sha256.clone();
         let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
         let fingerprints = ProviderWireFingerprints::from_body(body, protocol, cache_capability)?;
         Ok(Self {
-            body: Bytes::from(encoded),
+            request,
             identity: ProviderWireRequestIdentity {
                 protocol,
                 provider_wire_hash,
@@ -601,21 +580,21 @@ impl PreparedProviderRequest {
 
     #[must_use]
     pub(crate) fn body(&self) -> Bytes {
-        self.body.clone()
+        self.request.body()
     }
 
     #[cfg(test)]
-    fn body_bytes(&self) -> &[u8] {
-        self.body.as_ref()
+    fn body_bytes(&self) -> Bytes {
+        self.request.body()
     }
 }
 
 pub(crate) fn provider_uses_anthropic_messages(provider: &str) -> bool {
-    llm_provider_protocol(provider) == LlmProviderProtocol::AnthropicMessages
+    llm_provider_protocol(provider) == ProviderProtocol::AnthropicMessages
 }
 
 pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
-    llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
+    llm_provider_protocol(provider) == ProviderProtocol::BedrockConverse
 }
 
 /// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
@@ -1788,15 +1767,15 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::AnthropicMessages => {
+        ProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
             } else {
                 format!("{base}/v1/messages")
             }
         }
-        LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
-        LlmProviderProtocol::OpenAiCompatible => format!("{base}/chat/completions"),
+        ProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
+        ProviderProtocol::OpenAiCompatible => format!("{base}/chat/completions"),
     }
 }
 
@@ -3069,7 +3048,7 @@ fn build_provider_request_body_with_cache_capability(
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::BedrockConverse => {
+        ProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let (system, bedrock_messages) =
                 build_bedrock_messages(&repaired, thinking.is_enabled());
@@ -3122,7 +3101,7 @@ fn build_provider_request_body_with_cache_capability(
             );
             body
         }
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+        ProviderProtocol::AnthropicMessages | ProviderProtocol::OpenAiCompatible => {
             let is_anthropic = provider_uses_anthropic_messages(provider);
             if is_anthropic {
                 let (system, anthropic_messages) =
@@ -3274,7 +3253,7 @@ fn apply_no_tool_choice(
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible => {
+        ProviderProtocol::OpenAiCompatible => {
             // Keep the explicit terminal instruction even when the repair
             // request physically removed every schema. OpenAI-compatible
             // models can otherwise infer the tool protocol from conversation
@@ -3283,15 +3262,15 @@ fn apply_no_tool_choice(
             body["tool_choice"] = Value::String("none".to_string());
             Ok(())
         }
-        LlmProviderProtocol::AnthropicMessages => {
+        ProviderProtocol::AnthropicMessages => {
             if tools.is_empty() {
                 return Ok(());
             }
             body["tool_choice"] = json!({"type": "none"});
             Ok(())
         }
-        LlmProviderProtocol::BedrockConverse if tools.is_empty() => Ok(()),
-        LlmProviderProtocol::BedrockConverse => Err(astra_core::ClassifiedError::new(
+        ProviderProtocol::BedrockConverse if tools.is_empty() => Ok(()),
+        ProviderProtocol::BedrockConverse => Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             "Bedrock Converse cannot preserve a non-empty tool surface at a no-tool settlement boundary",
         )),
@@ -3318,19 +3297,19 @@ fn apply_required_tool_choice(
     }
 
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible => {
+        ProviderProtocol::OpenAiCompatible => {
             body["tool_choice"] = json!({
                 "type": "function",
                 "function": { "name": required_tool_name },
             });
         }
-        LlmProviderProtocol::AnthropicMessages => {
+        ProviderProtocol::AnthropicMessages => {
             body["tool_choice"] = json!({
                 "type": "tool",
                 "name": required_tool_name,
             });
         }
-        LlmProviderProtocol::BedrockConverse => {
+        ProviderProtocol::BedrockConverse => {
             let Some(tool_config) = body.get_mut("toolConfig").and_then(Value::as_object_mut)
             else {
                 return Err(astra_core::ClassifiedError::new(
@@ -3561,8 +3540,8 @@ pub(crate) fn consolidate_system_messages_for_provider(
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
     let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
-    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
-        || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
+    let preserve_runtime_system_tail = matches!(protocol, ProviderProtocol::AnthropicMessages)
+        || (matches!(protocol, ProviderProtocol::OpenAiCompatible)
             && !matches!(
                 cache_cap.volatile_placement,
                 VolatilePlacement::CurrentUserOnly
@@ -4475,7 +4454,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice
 pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+        ProviderProtocol::OpenAiCompatible | ProviderProtocol::AnthropicMessages
     )
 }
 
@@ -5625,7 +5604,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         }
     };
 
-    let sse = parse_openai_sse_json_stream(stream);
+    let sse = decode_provider_sse(stream, DEFAULT_SSE_EVENT_LIMIT_BYTES);
     tokio::pin!(sse);
     let provider_work_deadline = started + provider_work_budget;
     loop {
@@ -5759,7 +5738,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     break;
                 }
                 return Err(StreamCollectError::Transport {
-                    error,
+                    error: error.to_string(),
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -6235,7 +6214,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
         }
     };
 
-    let sse = parse_openai_sse_json_stream(stream);
+    let sse = decode_provider_sse(stream, DEFAULT_SSE_EVENT_LIMIT_BYTES);
     tokio::pin!(sse);
     let provider_work_deadline = started + provider_work_budget;
     loop {
@@ -6375,7 +6354,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             Ok(ParsedSseEvent::Data(v)) => v,
             Err(error) => {
                 return Err(StreamCollectError::Transport {
-                    error,
+                    error: error.to_string(),
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -7332,97 +7311,14 @@ pub(crate) fn parse_nonstream_response_for_provider(
     started: Instant,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::BedrockConverse => {
+        ProviderProtocol::BedrockConverse => {
             parse_bedrock_nonstream_response(v, model_name, started)
         }
-        LlmProviderProtocol::AnthropicMessages => {
+        ProviderProtocol::AnthropicMessages => {
             parse_anthropic_nonstream_response(v, model_name, started)
         }
-        LlmProviderProtocol::OpenAiCompatible => {
+        ProviderProtocol::OpenAiCompatible => {
             parse_openai_compatible_nonstream_response(v, model_name, started)
-        }
-    }
-}
-
-/// One semantically meaningful item from a provider SSE stream.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParsedSseEvent {
-    Data(Value),
-    Done,
-}
-
-/// Parse OpenAI-style SSE bytes without collapsing `[DONE]` into ordinary EOF.
-/// Transport and framing errors surface as `Err`; a clean socket EOF without
-/// [`ParsedSseEvent::Done`] remains distinguishable to the caller.
-pub(crate) fn parse_openai_sse_json_stream(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
-) -> impl futures_util::Stream<Item = Result<ParsedSseEvent, String>> + Send + 'static {
-    async_stream::stream! {
-        let mut sse_in = SseBlankLineUtf8Buf::new();
-        tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
-            let bytes = match chunk {
-                Ok(b) => b,
-                Err(e) => {
-                    yield Err(e.to_string());
-                    return;
-                }
-            };
-            let blocks = match sse_in.push_bytes(&bytes) {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                    return;
-                }
-            };
-            for block in blocks {
-                if let Err(error) = validate_sse_event_block_json(&block) {
-                    yield Err(error);
-                    return;
-                }
-                let d = json_events_from_sse_event_block(&block);
-                for v in d.events {
-                    yield Ok(ParsedSseEvent::Data(v));
-                }
-                if d.stream_finished {
-                    yield Ok(ParsedSseEvent::Done);
-                    return;
-                }
-            }
-        }
-        let mut buf = match sse_in.into_inner() {
-            Ok(buf) => buf,
-            Err(error) => {
-                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                return;
-            }
-        };
-        let tail = match validated_drain_sse_data_lines(&mut buf, "") {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in tail.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if tail.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
-            return;
-        }
-        let fin = match validated_finish_sse_data_buffer(&mut buf) {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in fin.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if fin.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
         }
     }
 }
@@ -8710,7 +8606,7 @@ mod tests {
             Ok(Bytes::from(r#"{"t":1}"#)),
             Ok(Bytes::from("\n\n")),
         ];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let ev = st.next().await.unwrap().unwrap();
         assert_eq!(ev, ParsedSseEvent::Data(json!({"t": 1})));
@@ -8724,7 +8620,7 @@ mod tests {
             Ok(Bytes::from_static(b"\x88")),
             Ok(Bytes::from_static(b"\x91\"}\n\n")),
         ];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         assert_eq!(
             st.next().await.unwrap().unwrap(),
@@ -8737,14 +8633,14 @@ mod tests {
     async fn parse_openai_sse_json_stream_rejects_invalid_utf8() {
         let parts: Vec<Result<Bytes, reqwest::Error>> =
             vec![Ok(Bytes::from_static(b"data: {\"text\":\"\xff\"}\n\n"))];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let error = st
             .next()
             .await
             .expect("invalid UTF-8 item")
             .expect_err("invalid UTF-8 must fail");
-        assert!(error.contains("invalid UTF-8"), "{error}");
+        assert!(error.to_string().contains("invalid UTF-8"), "{error}");
         assert!(st.next().await.is_none());
     }
 
@@ -8753,7 +8649,7 @@ mod tests {
         let body = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
         let parts: Vec<Result<Bytes, reqwest::Error>> =
             vec![Ok(Bytes::copy_from_slice(body.as_bytes()))];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let e1 = st.next().await.unwrap().unwrap();
         assert_eq!(e1, ParsedSseEvent::Data(json!({"a": 1})));
@@ -9638,11 +9534,11 @@ mod tests {
     async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
         let err = sample_reqwest_stream_error().await;
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Err(err)];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let r = st.next().await.expect("one item");
         let msg = r.expect_err("transport");
-        assert!(!msg.is_empty());
+        assert!(!msg.to_string().is_empty());
         assert!(st.next().await.is_none());
     }
 
@@ -9651,7 +9547,7 @@ mod tests {
         let err = sample_reqwest_stream_error().await;
         let parts: Vec<Result<Bytes, reqwest::Error>> =
             vec![Ok(Bytes::from("data: {\"x\":1}\n\n")), Err(err)];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         assert_eq!(
             st.next().await.unwrap().unwrap(),
@@ -9665,7 +9561,7 @@ mod tests {
     async fn parse_openai_sse_json_stream_invalid_block_errors() {
         let parts: Vec<Result<Bytes, reqwest::Error>> =
             vec![Ok(Bytes::from("data: {\"x\":1}\n\ndata: not-json\n\n"))];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         assert_eq!(
             st.next().await.unwrap().unwrap(),
@@ -9676,28 +9572,34 @@ mod tests {
             .await
             .expect("invalid block item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(
+            err.to_string().contains("invalid JSON in SSE data line"),
+            "{err}"
+        );
         assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
     async fn parse_openai_sse_json_stream_invalid_tail_errors() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: not-json"))];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let err = st
             .next()
             .await
             .expect("invalid tail item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(
+            err.to_string().contains("invalid JSON in SSE data line"),
+            "{err}"
+        );
         assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
     async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        let st = decode_provider_sse(stream::iter(parts), DEFAULT_SSE_EVENT_LIMIT_BYTES);
         tokio::pin!(st);
         let ev = st.next().await.unwrap().unwrap();
         assert_eq!(ev, ParsedSseEvent::Data(json!({"z": 9})));
@@ -10429,7 +10331,7 @@ mod tests {
         };
         let prepared = PreparedProviderRequest::from_json(
             &json!({"model":"m","messages":[],"stream":true}),
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
         )
         .expect("provider request identity");
 
@@ -10714,7 +10616,7 @@ mod tests {
     fn prepared_provider_request_reconciles_exact_bytes_for_every_protocol() {
         let cases = [
             (
-                LlmProviderProtocol::OpenAiCompatible,
+                ProviderProtocol::OpenAiCompatible,
                 json!({
                     "model": "m",
                     "messages": [
@@ -10727,7 +10629,7 @@ mod tests {
                 (1, 1, 1),
             ),
             (
-                LlmProviderProtocol::AnthropicMessages,
+                ProviderProtocol::AnthropicMessages,
                 json!({
                     "model": "m",
                     "system": [{"type": "text", "text": "stable"}],
@@ -10738,7 +10640,7 @@ mod tests {
                 (1, 1, 1),
             ),
             (
-                LlmProviderProtocol::BedrockConverse,
+                ProviderProtocol::BedrockConverse,
                 json!({
                     "system": [{"text": "stable"}],
                     "messages": [{"role": "user", "content": [{"text": "task"}]}],
@@ -10801,11 +10703,10 @@ mod tests {
                 {"role": "system", "content": "s2"}
             ]
         });
-        let first =
-            PreparedProviderRequest::from_json(&first, LlmProviderProtocol::OpenAiCompatible)
-                .expect("first request");
+        let first = PreparedProviderRequest::from_json(&first, ProviderProtocol::OpenAiCompatible)
+            .expect("first request");
         let second =
-            PreparedProviderRequest::from_json(&second, LlmProviderProtocol::OpenAiCompatible)
+            PreparedProviderRequest::from_json(&second, ProviderProtocol::OpenAiCompatible)
                 .expect("second request");
 
         assert_eq!(
@@ -10846,13 +10747,13 @@ mod tests {
         };
         let first = PreparedProviderRequest::from_json_with_cache_capability(
             &tail_body("stable", "round 1"),
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
             Some(tail),
         )
         .expect("first tail request");
         let second = PreparedProviderRequest::from_json_with_cache_capability(
             &tail_body("stable", "round 2"),
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
             Some(tail),
         )
         .expect("second tail request");
@@ -10868,7 +10769,7 @@ mod tests {
         );
         let changed_leading = PreparedProviderRequest::from_json_with_cache_capability(
             &tail_body("changed", "round 2"),
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
             Some(tail),
         )
         .expect("changed leading request");
@@ -10897,13 +10798,13 @@ mod tests {
         };
         let marker_first = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_body("stable", "round 1"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("first marker request");
         let marker_second = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_body("stable", "round 2"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("second marker request");
@@ -10916,7 +10817,7 @@ mod tests {
         );
         let marker_changed = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_body("changed", "round 2"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("changed marker request");
@@ -10953,13 +10854,13 @@ mod tests {
         };
         let marker_tools_first = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_tool_body("stable", "dynamic_one"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("first marker tool request");
         let marker_tools_second = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_tool_body("stable", "dynamic_two"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("second marker tool request");
@@ -10986,7 +10887,7 @@ mod tests {
         );
         let marker_tools_changed = PreparedProviderRequest::from_json_with_cache_capability(
             &marker_tool_body("changed", "dynamic_two"),
-            LlmProviderProtocol::AnthropicMessages,
+            ProviderProtocol::AnthropicMessages,
             Some(marker),
         )
         .expect("changed marker tool request");
@@ -11035,13 +10936,13 @@ mod tests {
         );
         let append_first = PreparedProviderRequest::from_json_with_cache_capability(
             &append_first_body,
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
             Some(append),
         )
         .expect("first append request");
         let append_second = PreparedProviderRequest::from_json_with_cache_capability(
             &append_second_body,
-            LlmProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::OpenAiCompatible,
             Some(append),
         )
         .expect("second append request");
@@ -11161,7 +11062,7 @@ mod tests {
         for (wire, body) in wires.iter().zip(&bodies) {
             let actual = PreparedProviderRequest::from_json_with_cache_capability(
                 body,
-                LlmProviderProtocol::OpenAiCompatible,
+                ProviderProtocol::OpenAiCompatible,
                 Some(cache_capability),
             )
             .expect("captured provider request");
@@ -11588,7 +11489,7 @@ mod tests {
         .expect_err("invalid UTF-8 must fail the stream");
         match error {
             StreamCollectError::Transport { error, partial } => {
-                assert!(error.contains("invalid UTF-8"), "{error}");
+                assert!(error.to_string().contains("invalid UTF-8"), "{error}");
                 assert!(partial.full_text.is_empty());
             }
             other => panic!("expected transport error, got {other:?}"),
