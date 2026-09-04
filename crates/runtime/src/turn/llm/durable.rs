@@ -2109,6 +2109,7 @@ struct TestInvocationState {
 #[cfg(test)]
 struct TestProviderAttemptState {
     invocation_id: String,
+    canonical_transition_hash: Option<String>,
     terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
@@ -2425,6 +2426,9 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
                 attempt.attempt_id().to_string(),
                 TestProviderAttemptState {
                     invocation_id: attempt.invocation_id().to_string(),
+                    canonical_transition_hash: attempt
+                        .canonical_transition_hash()
+                        .map(str::to_string),
                     terminal: None,
                 },
             )
@@ -3088,7 +3092,7 @@ impl DurableInferenceLedger {
     /// longer server-side completion window; semantic admission must not
     /// inherit that tail latency.  The durable invocation/attempt lifecycle
     /// remains identical to [`Self::execute_nonstream`].
-    pub(crate) async fn execute_stream(
+    pub(crate) async fn execute_stream_no_tool_choice(
         &self,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
@@ -3124,13 +3128,15 @@ impl DurableInferenceLedger {
                 Some(flag) => LlmCancel::FlagAndToken(flag, &owner_cancel),
                 None => LlmCancel::Token(&owner_cancel),
             };
-            let result = crate::turn::llm::client::call_llm_and_collect_with_stream_callback(
-                call,
-                cancel,
-                None,
-                Some(attempt_observer.as_ref()),
-            )
-            .await;
+            let result =
+                crate::turn::llm::client::call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                    call,
+                    cancel,
+                    None,
+                    Some(attempt_observer.as_ref()),
+                )
+                .await
+            ;
             match result {
                 Ok(result) => {
                     settlement
@@ -3383,12 +3389,17 @@ pub(crate) struct DurableProviderRequestIdentity {
     pub protocol: crate::turn::llm::client::LlmProviderProtocol,
     pub provider_wire_bytes: u64,
     pub composition: crate::turn::llm::client::ProviderWireComposition,
+    pub fingerprints: crate::turn::llm::client::ProviderWireFingerprints,
 }
 
 /// One admitted physical request and its terminal fact, when observed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableProviderAttemptFact {
     pub request: DurableProviderRequestIdentity,
+    /// Runtime transport observation for this physical attempt. Admission and
+    /// dispatch are separate facts; one retry starting transport must not make
+    /// another merely prepared request look sent.
+    pub dispatch_started: bool,
     pub terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
@@ -3410,8 +3421,70 @@ impl DurableInferenceInvocation {
         self.observer.clone()
     }
 
+    /// Bind the canonical append WAL before the first physical attempt is
+    /// admitted. The observer carries it unchanged into the same transaction
+    /// that fences the exact provider body.
+    pub(crate) fn bind_provider_canonical_transitions(
+        &self,
+        transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1>,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        for transition in &transitions {
+            transition.validate().map_err(|error| {
+                contract_error(
+                    "canonical transition binding",
+                    format!("invalid transition: {error}"),
+                )
+            })?;
+        }
+        if self.observer.next_attempt.load(Ordering::Acquire) != 0 {
+            return Err(contract_error(
+                "canonical transition binding",
+                "provider attempt admission already started",
+            ));
+        }
+        let mut bound = self
+            .observer
+            .canonical_transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !bound.is_empty() && *bound != transitions {
+            return Err(contract_error(
+                "canonical transition binding",
+                "a different transition set is already bound",
+            ));
+        }
+        *bound = transitions;
+        Ok(())
+    }
+
     pub(crate) async fn provider_attempt_facts(&self) -> Vec<DurableProviderAttemptFact> {
-        self.observer.state.lock().await.attempt_facts()
+        let dispatched_attempts = self
+            .observer
+            .dispatched_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.observer
+            .state
+            .lock()
+            .await
+            .attempt_facts(&dispatched_attempts)
+    }
+
+    /// Transition id acknowledged by the same durable transaction that
+    /// admitted a physical provider attempt. Prepared/request-observer state is
+    /// deliberately not sufficient authority to advance the runtime WAL head.
+    pub(crate) fn admitted_canonical_transition_id(&self) -> Option<String> {
+        self.observer
+            .admitted_canonical_transition_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub(crate) fn provider_dispatch_started(&self) -> bool {
+        self.observer.dispatch_started.load(Ordering::Acquire)
     }
 
     async fn take_settlement_reservation(
@@ -3688,7 +3761,11 @@ struct DurableProviderAttemptObserver {
     settlement_reservation: Arc<std::sync::Mutex<Option<ProviderSettlementReservation>>>,
     invocation: astra_services::InferenceInvocationPlan,
     request_context: astra_services::ModelRequestContextSeed,
+    canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV1>>,
+    admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
+    dispatch_started: AtomicBool,
+    dispatched_attempts: std::sync::Mutex<BTreeSet<u32>>,
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
     owner_lease: Arc<InferenceOwnerLease>,
@@ -3705,11 +3782,15 @@ struct ProviderAttemptState {
 }
 
 impl ProviderAttemptState {
-    fn attempt_facts(&self) -> Vec<DurableProviderAttemptFact> {
+    fn attempt_facts(
+        &self,
+        dispatched_attempts: &BTreeSet<u32>,
+    ) -> Vec<DurableProviderAttemptFact> {
         self.requests
             .iter()
             .map(|(attempt, request)| DurableProviderAttemptFact {
                 request: request.clone(),
+                dispatch_started: dispatched_attempts.contains(attempt),
                 terminal: self.terminals.get(attempt).cloned(),
             })
             .collect()
@@ -3874,7 +3955,11 @@ impl DurableProviderAttemptObserver {
             settlement_reservation,
             invocation,
             request_context,
+            canonical_transitions: std::sync::Mutex::new(Vec::new()),
+            admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
+            dispatch_started: AtomicBool::new(false),
+            dispatched_attempts: std::sync::Mutex::new(BTreeSet::new()),
             state: Arc::new(tokio::sync::Mutex::new(ProviderAttemptState::default())),
             operations: ProviderOperationGate::default(),
             owner_lease,
@@ -4062,12 +4147,22 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             conversation_items: wire.composition.conversation_items,
             tool_schema_items: wire.composition.tool_schema_items,
         });
+        let canonical_transitions = self
+            .canonical_transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let canonical_transition_id = canonical_transitions
+            .first()
+            .map(|transition| transition.transition_id.clone());
         let attempt = astra_services::plan_inference_provider_attempt_with_context(
             &self.invocation,
             attempt_index,
             service_wire,
             self.request_context.clone(),
-        );
+        )
+        .with_canonical_transitions(&canonical_transitions)
+        .map_err(|error| service_error("provider canonical transition", error))?;
         let request = DurableProviderRequestIdentity {
             request_id: attempt.request_id().to_string(),
             request_hash: wire.provider_wire_hash.clone(),
@@ -4075,6 +4170,7 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             protocol: wire.protocol,
             provider_wire_bytes: wire.provider_wire_bytes,
             composition: wire.composition.clone(),
+            fingerprints: wire.fingerprints.clone(),
         };
         {
             let mut state = self.state.lock().await;
@@ -4090,6 +4186,22 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             // slot; the caller's ledger-error settlement will close it as a
             // pre-delivery cancellation without ever authorizing HTTP.
             return Err(service_error("provider attempt admission", error));
+        }
+        if let Some(canonical_transition_id) = canonical_transition_id {
+            let mut admitted = self
+                .admitted_canonical_transition_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if admitted
+                .as_deref()
+                .is_some_and(|existing| existing != canonical_transition_id)
+            {
+                return Err(contract_error(
+                    "provider attempt admission",
+                    "physical retries admitted different canonical transition ids",
+                ));
+            }
+            *admitted = Some(canonical_transition_id);
         }
         self.owner_lease
             .ensure_live("provider delivery authorization")?;
@@ -4144,6 +4256,14 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
         state.pending_terminals.remove(&attempt_index);
         state.terminals.insert(attempt_index, terminal.clone());
         Ok(())
+    }
+
+    fn note_dispatch_started(&self, attempt_index: u32) {
+        self.dispatched_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(attempt_index);
+        self.dispatch_started.store(true, Ordering::Release);
     }
 }
 
@@ -5536,6 +5656,7 @@ mod tests {
                 provider_envelope_bytes: 2,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7116,6 +7237,7 @@ mod tests {
                 provider_envelope_bytes: 2,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7176,6 +7298,7 @@ mod tests {
                 provider_envelope_bytes: 2,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         };
 
         let admitting_observer = observer.clone();
@@ -7266,6 +7389,7 @@ mod tests {
                 provider_envelope_bytes: 2,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7321,6 +7445,7 @@ mod tests {
                 provider_envelope_bytes: 2,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7374,9 +7499,18 @@ mod tests {
         persistence: TestInferenceLedgerPersistence,
     ) -> DurableInferenceInvocation {
         test_ledger_for_persistence(persistence)
+            .with_run_authority(DurableInferenceRunAuthority::new(
+                0,
+                "test-inference-owner",
+                0,
+                None,
+                None,
+                None,
+            ))
             .admit(
-                astra_turn_types::InferenceInvocationScope::Session {
+                astra_turn_types::InferenceInvocationScope::Run {
                     session_id: "session-test".to_string(),
+                    run_id: "run-test".to_string(),
                     turn: 1,
                     round: 0,
                     operation_id: "agent_turn".to_string(),
@@ -7401,7 +7535,68 @@ mod tests {
                 provider_envelope_bytes: 128,
                 ..Default::default()
             },
+            fingerprints: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_transition_commits_with_attempt_before_dispatch() {
+        let persistence = TestInferenceLedgerPersistence::default();
+        let invocation = test_invocation(persistence.clone()).await;
+        let base = vec![serde_json::json!({"role": "user", "content": "goal"})];
+        let content = astra_turn_types::render_append_only_runtime_authority_frame(
+            "test_authority",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "opaque test authority",
+        )
+        .unwrap();
+        let mut authority = serde_json::json!({"role": "user", "content": content});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "test_authority",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV1::new(None, &base, vec![authority])
+                .unwrap();
+        let transition_id = transition.transition_id.clone();
+        invocation
+            .bind_provider_canonical_transitions(vec![transition])
+            .unwrap();
+
+        let attempt_index = invocation
+            .attempt_observer()
+            .begin_attempt(&test_wire_identity())
+            .await
+            .expect("attempt admission commits its canonical WAL");
+        assert_eq!(
+            invocation.admitted_canonical_transition_id().as_deref(),
+            Some(transition_id.as_str())
+        );
+        assert!(!invocation.provider_dispatch_started());
+        assert!(
+            persistence
+                .lock()
+                .attempts
+                .values()
+                .all(|attempt| attempt.canonical_transition_hash.is_some()),
+            "the durable attempt must own the transition before transport starts"
+        );
+        assert!(
+            invocation
+                .bind_provider_canonical_transitions(Vec::new())
+                .is_err(),
+            "transition identity freezes when attempt admission starts"
+        );
+
+        let terminal = pre_provider_cancelled_terminal();
+        invocation
+            .attempt_observer()
+            .finish_attempt(attempt_index, &terminal)
+            .await
+            .unwrap();
+        invocation.finish(&terminal).await.unwrap();
+        persistence.assert_quiescent();
     }
 
     #[tokio::test]
@@ -7884,6 +8079,7 @@ mod tests {
                         provider_envelope_bytes: 128,
                         ..Default::default()
                     },
+                    fingerprints: Default::default(),
                 },
             );
         }
@@ -7899,7 +8095,7 @@ mod tests {
             },
         );
 
-        let facts = state.attempt_facts();
+        let facts = state.attempt_facts(&BTreeSet::from([1]));
         assert_eq!(
             facts
                 .iter()
@@ -7915,5 +8111,7 @@ mod tests {
             Some("provider-429")
         );
         assert!(facts[1].terminal.is_none());
+        assert!(!facts[0].dispatch_started);
+        assert!(facts[1].dispatch_started);
     }
 }

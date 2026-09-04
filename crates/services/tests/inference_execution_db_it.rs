@@ -16,12 +16,14 @@ use astra_services::{
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
-    next_inference_logical_attempt_pair_base, plan_inference_invocation,
-    plan_inference_provider_attempt, reconcile_inference_settlements,
-    renew_inference_invocation_owner, settle_uncertain_inference_admission,
+    load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
+    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
+    renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
+    settle_uncertain_inference_admission,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
+use sha2::Digest;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -363,6 +365,410 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
     .await
     .expect("load strengthened terminal");
     assert_eq!(strengthened_status, "cancelled");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn large_canonical_payload_does_not_change_provider_terminal_identity() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("canonical-large-user-{suffix}");
+    let session_id = format!("canonical-large-session-{suffix}");
+    let run_id = format!("canonical-large-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+        .expect("empty durable base");
+    let history = vec![serde_json::json!({
+        "role": "user",
+        "content": "x".repeat(128 * 1024),
+    })];
+    let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        None,
+        durable_base,
+        &history,
+        Vec::new(),
+    )
+    .expect("construct a large canonical transition");
+    let plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "large_canonical_terminal",
+    ))
+    .expect("plan large canonical invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit large canonical invocation");
+    let attempt = provider_attempt(&plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&transition))
+        .expect("bind one large canonical transition");
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("admit large canonical provider attempt");
+    let stored_bytes: i64 = sqlx::query_scalar(
+        "SELECT OCTET_LENGTH(canonical_transition_json)
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("measure persisted canonical payload");
+    assert!(
+        stored_bytes > 65_535,
+        "the regression must cross MatrixOne's CAST AS CHAR truncation boundary"
+    );
+    let stored_payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT canonical_transition_json
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("read complete persisted canonical payload bytes");
+    assert_eq!(
+        i64::try_from(stored_payload.len()).expect("stored payload length"),
+        stored_bytes
+    );
+    let locally_rehashed_payload = format!("{:x}", sha2::Sha256::digest(&stored_payload));
+    assert_eq!(
+        Some(locally_rehashed_payload.as_str()),
+        attempt.canonical_transition_hash()
+    );
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("large_payload_complete".to_string()),
+        error_message: Some("close large canonical payload attempt".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &attempt, &terminal)
+        .await
+        .expect("terminal identity must not depend on reloading mutable WAL payload bytes");
+    finish_inference_invocation(&shared_pool, &plan, &terminal)
+        .await
+        .expect("finish large canonical invocation");
+    let receipts =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect("recover the complete large canonical payload");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].transitions.len(), 1);
+    let mut recovered = Vec::new();
+    receipts[0].transitions[0]
+        .apply_to(&mut recovered)
+        .expect("materialize the large canonical transition");
+    assert_eq!(recovered, history);
+    let mut corrupted_payload = stored_payload;
+    corrupted_payload.push(b' ');
+    sqlx::query(
+        "UPDATE inference_provider_attempts
+         SET canonical_transition_json = ?
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(corrupted_payload)
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("corrupt the head payload without changing immutable metadata");
+    assert_eq!(
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1,)
+            .await
+            .expect_err("recovery must fail closed on payload/hash drift")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn superseded_payload_owner_can_terminalize_after_its_child_becomes_head() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("canonical-late-terminal-user-{suffix}");
+    let session_id = format!("canonical-late-terminal-session-{suffix}");
+    let run_id = format!("canonical-late-terminal-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+        .expect("empty durable base");
+    let parent_history = vec![serde_json::json!({"role": "user", "content": "parent"})];
+    let parent_transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        None,
+        durable_base.clone(),
+        &parent_history,
+        Vec::new(),
+    )
+    .expect("construct parent transition");
+    let parent_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "late_terminal_parent",
+    ))
+    .expect("plan parent invocation");
+    admit_inference_invocation(&shared_pool, &parent_plan)
+        .await
+        .expect("admit parent invocation");
+    let parent_attempt = provider_attempt(&parent_plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&parent_transition))
+        .expect("bind parent transition");
+    begin_inference_provider_attempt(&shared_pool, &parent_attempt)
+        .await
+        .expect("admit parent provider attempt");
+
+    let child_history = vec![
+        serde_json::json!({"role": "user", "content": "parent"}),
+        serde_json::json!({"role": "assistant", "content": "child"}),
+    ];
+    let child_transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        Some(parent_transition.transition_id.clone()),
+        durable_base,
+        &child_history,
+        Vec::new(),
+    )
+    .expect("construct child transition");
+    let child_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        1,
+        "late_terminal_child",
+    ))
+    .expect("plan child invocation");
+    admit_inference_invocation(&shared_pool, &child_plan)
+        .await
+        .expect("admit child invocation");
+    let child_attempt = provider_attempt(&child_plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&child_transition))
+        .expect("bind child transition");
+    begin_inference_provider_attempt(&shared_pool, &child_attempt)
+        .await
+        .expect("atomically make child the canonical head");
+
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("late_terminal_complete".to_string()),
+        error_message: Some("terminalize after successor admission".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &parent_attempt, &terminal)
+        .await
+        .expect("late parent terminal must depend only on immutable attempt identity");
+    let payload_owners: Vec<String> = sqlx::query_scalar(
+        "SELECT attempt_id FROM inference_provider_attempts
+         WHERE user_id = ? AND session_id = ?
+           AND canonical_transition_json IS NOT NULL",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("load unique canonical payload owner");
+    assert_eq!(payload_owners, vec![child_attempt.attempt_id().to_string()]);
+
+    finish_inference_provider_attempt(&shared_pool, &child_attempt, &terminal)
+        .await
+        .expect("finish child provider attempt");
+    finish_inference_invocation(&shared_pool, &parent_plan, &terminal)
+        .await
+        .expect("finish parent invocation");
+    finish_inference_invocation(&shared_pool, &child_plan, &terminal)
+        .await
+        .expect("finish child invocation");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn canonical_transition_head_keeps_one_payload_across_three_hundred_rounds() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("canonical-head-user-{suffix}");
+    let session_id = format!("canonical-head-session-{suffix}");
+    let run_id = format!("canonical-head-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+        .expect("empty durable base");
+    let mut history = Vec::new();
+    let mut parent_transition_id = None;
+    for round in 0..300_u32 {
+        history.push(serde_json::json!({
+            "role": "user",
+            "content": format!("durable request {round}")
+        }));
+        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+            parent_transition_id.clone(),
+            durable_base.clone(),
+            &history,
+            Vec::new(),
+        )
+        .expect("construct an explicitly linked canonical transition");
+        let plan = plan_inference_invocation(run_input(
+            &user_id,
+            &session_id,
+            &run_id,
+            round,
+            &format!("canonical_head_{round}"),
+        ))
+        .expect("plan canonical head invocation");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit canonical head invocation");
+        let attempt = provider_attempt(&plan, 0)
+            .with_canonical_transitions(std::slice::from_ref(&transition))
+            .expect("bind one canonical transition");
+        begin_inference_provider_attempt(&shared_pool, &attempt)
+            .await
+            .expect("atomically advance canonical head");
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("test_round_complete".to_string()),
+            error_message: Some("close scale-test provider attempt".to_string()),
+        };
+        finish_inference_provider_attempt(&shared_pool, &attempt, &terminal)
+            .await
+            .expect("finish canonical head attempt");
+        if round == 0 {
+            let retry = provider_attempt(&plan, 1)
+                .with_canonical_transitions(std::slice::from_ref(&transition))
+                .expect("bind the same transition to its physical retry");
+            begin_inference_provider_attempt(&shared_pool, &retry)
+                .await
+                .expect("same-id physical retry moves the unique payload owner");
+            finish_inference_provider_attempt(&shared_pool, &retry, &terminal)
+                .await
+                .expect("finish same-id physical retry");
+        }
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish canonical head invocation");
+        parent_transition_id = Some(transition.transition_id);
+    }
+
+    let stale = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        Some("0".repeat(64)),
+        durable_base.clone(),
+        &history,
+        Vec::new(),
+    )
+    .expect("construct a structurally valid but causally stale transition");
+    let stale_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        300,
+        "canonical_head_stale_parent",
+    ))
+    .expect("plan stale-parent invocation");
+    admit_inference_invocation(&shared_pool, &stale_plan)
+        .await
+        .expect("admit stale-parent logical invocation");
+    let stale_attempt = provider_attempt(&stale_plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&stale))
+        .expect("bind stale-parent transition");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &stale_attempt)
+            .await
+            .expect_err("a stale parent must fail before provider delivery")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+    let stale_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(stale_attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("count rolled-back stale attempt");
+    assert_eq!(stale_attempts, 0);
+    let stale_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("stale_parent_rejected".to_string()),
+        error_message: Some("canonical head CAS rejected stale parent".to_string()),
+    };
+    finish_inference_invocation(&shared_pool, &stale_plan, &stale_terminal)
+        .await
+        .expect("close pre-delivery stale-parent invocation");
+
+    let active_payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND session_id = ?
+           AND canonical_transition_json IS NOT NULL",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count active canonical payloads");
+    assert_eq!(active_payloads, 1);
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND session_id = ? AND canonical_transition_id IS NOT NULL",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count canonical audit rows");
+    assert_eq!(attempts, 301);
+
+    let receipts =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect("load the unique canonical head");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].transitions.len(), 1);
+    assert_eq!(
+        receipts[0].transitions[0].transition_id,
+        parent_transition_id.expect("final transition id")
+    );
+    let mut recovered = Vec::new();
+    receipts[0].transitions[0]
+        .apply_to(&mut recovered)
+        .expect("materialize only the unique leaf snapshot");
+    assert_eq!(recovered, history);
+
+    retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
+        .await
+        .expect("retire canonical head and payload together");
+    let heads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count retired canonical heads");
+    assert_eq!(heads, 0);
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
@@ -1459,6 +1865,10 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
         ),
         (
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
+        (
+            "DELETE FROM inference_canonical_transition_heads WHERE user_id = ? AND session_id = ?",
             session_id,
         ),
         (
@@ -3591,6 +4001,16 @@ async fn expired_inference_owner_recovers_every_sigkill_shape_without_old_owner_
         "pre_delivery"
     );
     assert_eq!(pre_delivery_fact.get::<i64, _>("owner_generation"), 2);
+    let pre_delivery_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(pre_delivery.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count pre-delivery attempts");
+    assert_eq!(pre_delivery_attempts, 0, "pre-dispatch failure owns no WAL");
     assert_eq!(
         renew_inference_invocation_owner(&shared_pool, &pre_delivery)
             .await
@@ -3610,7 +4030,31 @@ async fn expired_inference_owner_recovers_every_sigkill_shape_without_old_owner_
     admit_inference_invocation(&shared_pool, &delivery_unknown)
         .await
         .expect("admit delivered orphan");
-    let open_attempt = provider_attempt(&delivery_unknown, 0);
+    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+        .expect("empty durable base");
+    let old_user = serde_json::json!({"role": "user", "content": "old request"});
+    let frame_content = astra_turn_types::render_append_only_runtime_authority_frame(
+        "test_authority",
+        astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        "preserve this request boundary",
+    )
+    .expect("authority frame");
+    let mut authority = serde_json::json!({"role": "user", "content": frame_content});
+    astra_turn_types::mark_append_only_required_context(
+        &mut authority,
+        "test_authority",
+        astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+    );
+    let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        None,
+        durable_base,
+        std::slice::from_ref(&old_user),
+        vec![authority.clone()],
+    )
+    .expect("self-contained attempt transition");
+    let open_attempt = provider_attempt(&delivery_unknown, 0)
+        .with_canonical_transitions(&[transition])
+        .expect("root attempt may own canonical WAL");
     begin_inference_provider_attempt(&shared_pool, &open_attempt)
         .await
         .expect("authorize provider delivery");
@@ -3663,6 +4107,88 @@ async fn expired_inference_owner_recovers_every_sigkill_shape_without_old_owner_
         "delivery_unknown"
     );
     assert_eq!(delivered_fact.get::<i64, _>("terminal_contexts"), 1);
+    let receipts =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect("delivery-unknown terminal does not brick canonical recovery");
+    assert_eq!(receipts.len(), 1);
+    let fresh_user = serde_json::json!({"role": "user", "content": "hi"});
+    let mut restored = Vec::new();
+    receipts[0].transitions[0]
+        .apply_to(&mut restored)
+        .expect("recover old request on its durable base");
+    restored.push(fresh_user.clone());
+    assert_eq!(restored, vec![old_user, authority, fresh_user]);
+    assert_eq!(
+        retire_inference_canonical_transitions_through_turn(
+            &shared_pool,
+            &user_id,
+            &session_id,
+            1,
+        )
+        .await
+        .expect("retire canonically absorbed WAL"),
+        1
+    );
+    let retired = sqlx::query(
+        "SELECT canonical_transition_json, canonical_transition_hash
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(open_attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load retired WAL audit row");
+    assert!(
+        retired
+            .try_get::<Option<String>, _>("canonical_transition_json")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        retired
+            .try_get::<Option<String>, _>("canonical_transition_hash")
+            .unwrap()
+            .is_some()
+    );
+
+    let successor = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        11,
+        "after_delivery_unknown",
+    ))
+    .expect("plan successor invocation");
+    admit_inference_invocation(&shared_pool, &successor)
+        .await
+        .expect("new invocation identity remains admissible");
+    let successor_attempt = provider_attempt(&successor, 0);
+    begin_inference_provider_attempt(&shared_pool, &successor_attempt)
+        .await
+        .expect("delivery-unknown old identity cannot block new provider delivery");
+    let successor_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("test_cleanup".to_string()),
+        error_message: Some("close successor attempt".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &successor_attempt, &successor_terminal)
+        .await
+        .expect("finish successor attempt");
+    finish_inference_invocation(&shared_pool, &successor, &successor_terminal)
+        .await
+        .expect("finish successor invocation");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &open_attempt)
+            .await
+            .expect_err("old attempt identity can never be delivered twice")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
     let late_terminal = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),

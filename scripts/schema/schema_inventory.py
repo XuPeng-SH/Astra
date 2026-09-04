@@ -270,6 +270,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / inference_execution",
         product_owner="inference durability, usage attribution, billing, and recovery",
     ),
+    "inference_canonical_transition_heads": TableMetadata(
+        semantic_owner="astra_services::inference_execution",
+        state_class="durable per-turn canonical provider transition lineage head",
+        primary_query="lock or load the single current head by user_id, session_id, and turn_index, then join head_attempt_id to its exact provider-attempt payload",
+        retention_policy="retain until the canonical coordinator absorbs the turn; retirement removes the head and provider payload through the absorbed turn, and session hard delete removes any remainder",
+        rebuildability="not safely rebuildable while an unabsorbed provider delivery exists because message values and provider responses do not identify the sole recoverable lineage leaf",
+        merge_guidance="keep separate from immutable provider attempts; the composite primary key serializes one mutable head per session turn while the unique attempt key prevents ambiguous lineage",
+        migration_owner="astra_services::storage / inference_execution",
+        product_owner="provider canonical context durability, crash recovery, and fork prevention",
+    ),
     "inference_provider_attempts": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="durable upstream inference delivery attempt fact",

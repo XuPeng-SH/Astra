@@ -4910,6 +4910,7 @@ fn fresh_request_admission_bytes(request: &ChatRequestData) -> Result<u64, serde
 
 struct CanonicalTurnAdmission {
     coordinator: Arc<dyn astra_services::SessionContextCoordinator>,
+    inference_pool: SharedPool,
     lease: astra_turn_types::ConversationWriterLeaseV1,
     reservation: astra_turn_types::TurnReservationV1,
     prior_messages: Vec<Value>,
@@ -5413,6 +5414,7 @@ impl AgenticRunLifecycleService {
         });
         Ok(Some(CanonicalTurnAdmission {
             coordinator,
+            inference_pool: pool.clone(),
             lease,
             reservation,
             prior_messages,
@@ -5499,6 +5501,27 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
+        if result.as_ref().is_ok_and(Option::is_some)
+            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
+                &admission.inference_pool,
+                &admission.lease.key.owner_user_id,
+                &admission.lease.key.session_id,
+                admission.reservation.reserved_turn,
+            )
+            .await
+        {
+            // The canonical commit is authoritative and must not be reported
+            // as failed because payload retirement is lagging. A later
+            // session boundary retries cleanup for all absorbed turns.
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "canonical commit succeeded but provider WAL payload retirement is pending"
+            );
+        }
         if admission.release_writer_on_finish {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
         }
@@ -11039,6 +11062,8 @@ impl AgenticRunLifecycleService {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head_transition_id: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
@@ -11055,9 +11080,16 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             observation_journal: Default::default(),
             session_memory_state: Default::default(),
-            compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-                request.model.as_deref().unwrap_or(""),
-            ),
+            compact_strategy: request
+                .admitted_model_execution
+                .as_ref()
+                .map(|execution| {
+                    crate::turn::llm::context::compact_strategy_from_model_metadata(
+                        execution.cache_capability,
+                        &execution.provider,
+                    )
+                })
+                .unwrap_or_default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -12877,6 +12909,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Some(admission) => admission.reservation.reserved_turn,
             None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
         };
+        if let Some(admission) = canonical_turn.as_ref() {
+            loop_state.initialize_provider_canonical_wal_base(&admission.prior_messages);
+        }
         if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
         {
@@ -14882,6 +14917,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &runtime_capabilities,
             tool_runtime_workspace.is_some(),
         )?;
+        if let Some(admission) = canonical_turn.as_ref() {
+            state.initialize_provider_canonical_wal_base(&admission.prior_messages);
+        }
         // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
@@ -20776,9 +20814,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
         });
 
         // Build edge profile from agent's system prompt and metadata.
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            child_model_name.as_deref().unwrap_or(""),
-        );
+        let compact_strategy = admitted_model_execution
+            .as_ref()
+            .map(|execution| {
+                crate::turn::llm::context::compact_strategy_from_model_metadata(
+                    execution.cache_capability,
+                    &execution.provider,
+                )
+            })
+            .unwrap_or_default();
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(
@@ -21106,6 +21150,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head_transition_id: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

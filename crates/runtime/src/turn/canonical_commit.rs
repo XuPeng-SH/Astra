@@ -4,15 +4,21 @@ use serde_json::Value;
 pub(crate) struct CanonicalRewriteProof {
     base_root: String,
     base_compaction_generation: u64,
+    base_prefix_len: usize,
     authorized_prefix_len: usize,
     authorized_prefix_root: String,
     rewritten: bool,
     valid: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct CanonicalRewritePermit {
     valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderWalReplacementAuthorization {
+    pub(crate) generation: u64,
 }
 
 impl CanonicalRewriteProof {
@@ -25,6 +31,7 @@ impl CanonicalRewriteProof {
         Self {
             base_root: base_root.to_string(),
             base_compaction_generation,
+            base_prefix_len: admitted_prefix.len(),
             authorized_prefix_len: admitted_prefix.len(),
             authorized_prefix_root: admitted_root.clone(),
             rewritten: false,
@@ -33,13 +40,12 @@ impl CanonicalRewriteProof {
     }
 
     pub(crate) fn begin(&self, messages: &[Value]) -> CanonicalRewritePermit {
-        CanonicalRewritePermit {
-            valid: self.valid
-                && messages.len() >= self.authorized_prefix_len
-                && astra_turn_types::canonical_conversation_root(
-                    &messages[..self.authorized_prefix_len],
-                ) == self.authorized_prefix_root,
-        }
+        let valid = self.valid
+            && messages.len() >= self.authorized_prefix_len
+            && astra_turn_types::canonical_conversation_root(
+                &messages[..self.authorized_prefix_len],
+            ) == self.authorized_prefix_root;
+        CanonicalRewritePermit { valid }
     }
 
     pub(crate) fn finish(&mut self, permit: CanonicalRewritePermit, messages: &[Value]) {
@@ -81,6 +87,55 @@ impl CanonicalRewriteProof {
 
     pub(crate) fn base_root(&self) -> &str {
         &self.base_root
+    }
+
+    pub(crate) fn provider_wal_replacement_authorization(
+        &self,
+        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        messages: &[Value],
+    ) -> Option<ProviderWalReplacementAuthorization> {
+        let base_count = usize::try_from(durable_base.message_count).ok()?;
+        if base_count != self.base_prefix_len
+            || durable_base.root_hash != self.base_root
+            || !self.authorizes(messages)
+        {
+            return None;
+        }
+        Some(ProviderWalReplacementAuthorization {
+            generation: self.base_compaction_generation.saturating_add(1),
+        })
+    }
+
+    pub(crate) fn recover_provider_wal_replacement(
+        &mut self,
+        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV1,
+        recovered_messages: &[Value],
+    ) -> Result<(), String> {
+        transition.validate().map_err(|error| error.to_string())?;
+        if transition.recovery_mode
+            != astra_turn_types::ProviderCanonicalRecoveryModeV1::ReplaceFromDurableBase
+            || &transition.durable_base != durable_base
+            || transition.replacement_compaction_generation
+                != Some(self.base_compaction_generation.saturating_add(1))
+            || usize::try_from(durable_base.message_count).ok() != Some(self.base_prefix_len)
+            || durable_base.root_hash != self.base_root
+        {
+            return Err("provider WAL replacement does not match the admitted rewrite base".into());
+        }
+        let result_count = usize::try_from(transition.result.message_count)
+            .map_err(|_| "provider WAL replacement result count overflow".to_string())?;
+        if recovered_messages.len() < result_count
+            || astra_turn_types::canonical_conversation_root(&recovered_messages[..result_count])
+                != transition.result.root_hash
+        {
+            return Err("provider WAL replacement result is absent from recovered history".into());
+        }
+        self.authorized_prefix_len = result_count;
+        self.authorized_prefix_root = transition.result.root_hash.clone();
+        self.rewritten = true;
+        self.valid = true;
+        Ok(())
     }
 }
 
@@ -208,4 +263,106 @@ fn is_structured_tool_result(message: &Value) -> bool {
                         .iter()
                         .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
             })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn authority() -> Value {
+        let content = astra_turn_types::render_append_only_runtime_authority_frame(
+            "continue",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "continue safely",
+        )
+        .unwrap();
+        let mut message = json!({"role": "user", "content": content});
+        astra_turn_types::mark_append_only_required_context(
+            &mut message,
+            "continue",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        message
+    }
+
+    #[test]
+    fn provider_replacement_requires_a_valid_pre_mutation_rewrite_permit() {
+        let durable = vec![
+            json!({"role": "user", "content": "old"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+        let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+
+        let mut invalid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let rewritten = vec![json!({"role": "system", "content": "summary"})];
+        let invalid_permit = invalid.begin(&rewritten);
+        invalid.finish(invalid_permit, &rewritten);
+        assert_eq!(
+            invalid.provider_wal_replacement_authorization(&base, &rewritten),
+            None
+        );
+
+        let mut valid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let permit = valid.begin(&durable);
+        valid.finish(permit, &rewritten);
+        let authorization = valid
+            .provider_wal_replacement_authorization(&base, &rewritten)
+            .expect("valid rewrite authorization");
+        assert_eq!(authorization.generation, 5);
+        assert_eq!(
+            valid.provider_wal_replacement_authorization(&base, &durable),
+            None,
+            "authorization is bound to the exact rewritten predecessor"
+        );
+    }
+
+    #[test]
+    fn recovered_provider_replacement_advances_the_rewrite_proof() {
+        let durable = vec![
+            json!({"role": "user", "content": "old"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+        let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let mut live = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        let mut source = durable.clone();
+        source.push(json!({"role": "user", "content": "current"}));
+        let permit = live.begin(&source);
+        let rewritten = vec![json!({"role": "user", "content": "typed summary"})];
+        live.finish(permit, &rewritten);
+        let authorization = live
+            .provider_wal_replacement_authorization(&base, &rewritten)
+            .unwrap();
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                None,
+                base.clone(),
+                authorization.generation,
+                &rewritten,
+                vec![authority()],
+            )
+            .unwrap();
+
+        let mut recovered = durable.clone();
+        transition.apply_to(&mut recovered).unwrap();
+        let mut restored_proof = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        restored_proof
+            .recover_provider_wal_replacement(&base, &transition, &recovered)
+            .unwrap();
+        let mut completed = recovered.clone();
+        completed.push(json!({"role": "assistant", "content": "done"}));
+        let (mode, _) =
+            canonical_commit_delta(&durable, true, &completed, Some(&restored_proof), false)
+                .unwrap()
+                .expect("recovered replacement remains committable");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+
+        let second_permit = restored_proof.begin(&completed);
+        let second_rewrite = vec![json!({"role": "user", "content": "summary two"})];
+        restored_proof.finish(second_permit, &second_rewrite);
+        let second_authorization = restored_proof
+            .provider_wal_replacement_authorization(&base, &second_rewrite)
+            .unwrap();
+        assert_eq!(second_authorization.generation, 8);
+    }
 }
