@@ -2341,7 +2341,7 @@ async fn call_runner_and_collect(
             format!("Runner continuation transaction failed: {error}"),
         )
     })?;
-    astra_services::inference_execution::runner::consume_runner_continuation_tx(
+    astra_services::inference_execution::runner::settle_runner_continuation_tx(
         &mut tx, &claim, &logical,
     )
     .await
