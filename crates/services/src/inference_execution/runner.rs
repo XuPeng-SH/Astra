@@ -23,6 +23,29 @@ use crate::session_artifact_store::{
 const MAX_CUSTODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_START_WINDOW_MS: u64 = 15_000;
 
+/// Authorize a terminal-transfer header before reserving any body capacity.
+/// Reconnect generation is checked by registry ownership, not stored as attempt
+/// authority; historical matching attempts remain eligible for custody replay.
+pub async fn validate_runner_terminal_attempt(
+    pool: &SharedPool,
+    connection: &AuthenticatedRunnerConnection,
+    identity: &RunnerInferenceAttemptIdentity,
+) -> ServiceResult<()> {
+    if identity.user_id != connection.user_id || identity.binding.runner_id != connection.runner_id
+    {
+        return Err(ServiceError::conflict("Runner terminal owner mismatch"));
+    }
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    lock_connection(&mut tx, connection).await?;
+    let row = sqlx::query("SELECT runner_grant_json FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ?")
+        .bind(&identity.user_id).bind(identity.attempt_id.as_str()).fetch_optional(&mut *tx).await.map_err(persistence)?
+        .ok_or_else(|| ServiceError::not_found("Runner terminal attempt absent"))?;
+    if decode_grant(&row)?.attempt != *identity {
+        return Err(ServiceError::conflict("Runner terminal identity mismatch"));
+    }
+    Ok(())
+}
+
 /// Private request/response bytes. Debug reports size only.
 pub struct RunnerCustodyBytes(Vec<u8>);
 
@@ -179,7 +202,8 @@ pub async fn record_runner_start_evidence(
             "runner_provider_started_at"
         }
         RunnerInferenceStartEvidence::ExpiredWithoutFence
-        | RunnerInferenceStartEvidence::CancelledWithoutFence => {
+        | RunnerInferenceStartEvidence::CancelledWithoutFence
+        | RunnerInferenceStartEvidence::RejectedWithoutFence => {
             if no_start.is_none()
                 && row.try_get::<String, _>("status").map_err(persistence)? != "started"
             {
@@ -192,11 +216,13 @@ pub async fn record_runner_start_evidence(
                     return Err(ServiceError::conflict("Runner grant has not expired"));
                 }
                 "expired_without_fence"
-            } else {
+            } else if evidence == RunnerInferenceStartEvidence::CancelledWithoutFence {
                 if row.try_get::<i64, _>("cancelled").map_err(persistence)? != 1 {
                     return Err(ServiceError::conflict("Runner cancellation intent absent"));
                 }
                 "cancelled_without_fence"
+            } else {
+                "rejected_without_fence"
             };
             if fenced
                 || no_start
@@ -235,6 +261,37 @@ pub struct RunnerInferenceDispatchPlan {
     attempt: InferenceProviderAttemptPlan,
     grant: RunnerInferenceDispatchGrant,
     request: String,
+}
+
+/// Exact Runner provider attempt beneath an already admitted logical
+/// invocation. This is the canonical agent-loop path: logical lifecycle is
+/// shared with Server execution, while request custody, physical attempt and
+/// finite Runner grant commit atomically before any device delivery.
+pub struct RunnerProviderAttemptDispatchPlan {
+    invocation: InferenceInvocationPlan,
+    attempt: InferenceProviderAttemptPlan,
+    grant: RunnerInferenceDispatchGrant,
+    request: String,
+}
+
+impl std::fmt::Debug for RunnerProviderAttemptDispatchPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerProviderAttemptDispatchPlan")
+            .field("grant", &self.grant)
+            .field("request", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RunnerProviderAttemptDispatchPlan {
+    pub fn attempt(&self) -> &InferenceProviderAttemptPlan {
+        &self.attempt
+    }
+
+    pub fn grant(&self) -> &RunnerInferenceDispatchGrant {
+        &self.grant
+    }
 }
 
 impl std::fmt::Debug for RunnerInferenceDispatchPlan {
@@ -385,6 +442,95 @@ pub fn plan_runner_inference_dispatch(
         attempt,
         grant,
         request: request_text,
+    })
+}
+
+pub fn plan_runner_provider_attempt_dispatch(
+    invocation: &InferenceInvocationPlan,
+    attempt_index: u32,
+    wire: InferenceProviderWireIdentity,
+    request_context: ModelRequestContextSeed,
+    canonical_transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
+    binding: &ResolvedRunnerModelBinding,
+    request: &[u8],
+    deadline_unix_ms: u64,
+) -> ServiceResult<RunnerProviderAttemptDispatchPlan> {
+    let input = &invocation.input;
+    if input.user_id != binding.user_id
+        || input.scope.session_id().is_none()
+        || input.execution_placement != ModelExecutionPlacement::Edge
+        || input.access_kind != ModelAccessKind::ThisDevice
+        || input.upstream_model_name != binding.definition.model_name.as_str()
+        || input.resolved_model_name != binding.definition.model_name.as_str()
+        || input.provider != "openai"
+        || input.offering_id
+            != crate::runner_model_bindings::runner_offering_id(
+                &input.user_id,
+                &binding.definition.identity,
+            )
+        || !matches!(
+            input.purpose,
+            InferencePurpose::PrimaryAgent
+                | InferencePurpose::SubAgent
+                | InferencePurpose::RequiredCompaction
+        )
+    {
+        return Err(ServiceError::invalid(
+            "Runner attempt does not match its admitted logical invocation and binding",
+        ));
+    }
+    if deadline_unix_ms == 0 || deadline_unix_ms > i64::MAX as u64 {
+        return Err(ServiceError::invalid(
+            "Runner inference deadline is out of range",
+        ));
+    }
+    let request = validate_json_body(request)?;
+    let request_value: serde_json::Value = serde_json::from_str(&request)
+        .map_err(|_| ServiceError::invalid("Runner request is not valid JSON"))?;
+    if request_value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        != Some(binding.definition.model_name.as_str())
+        || wire.provider_wire_hash != digest(request.as_bytes()).as_str()
+        || wire.provider_wire_bytes != request.len() as u64
+        || wire.protocol != "openai_compatible"
+    {
+        return Err(ServiceError::invalid(
+            "Runner exact request identity or model does not match its admission",
+        ));
+    }
+    let attempt = plan_inference_provider_attempt_with_context(
+        invocation,
+        attempt_index,
+        wire,
+        request_context,
+    )
+    .with_canonical_transitions(canonical_transitions)?;
+    let request_ref = artifact_reference(
+        hash_identity("rreq", &[attempt.attempt_id()]),
+        request.as_bytes(),
+    )?;
+    let grant = RunnerInferenceDispatchGrant {
+        attempt: RunnerInferenceAttemptIdentity {
+            user_id: input.user_id.clone(),
+            scope: input.scope.clone(),
+            invocation_id: RunnerInferenceId::new(invocation.invocation_id().to_string())
+                .map_err(ServiceError::invalid)?,
+            attempt_id: RunnerInferenceId::new(attempt.attempt_id().to_string())
+                .map_err(ServiceError::invalid)?,
+            binding: binding.definition.identity.clone(),
+            request: request_ref,
+        },
+        grant_id: RunnerInferenceId::new(new_admission_token()).map_err(ServiceError::invalid)?,
+        process_boot_nonce: binding.process_boot_nonce.clone(),
+        start_before_unix_ms: deadline_unix_ms,
+        deadline_unix_ms,
+    };
+    Ok(RunnerProviderAttemptDispatchPlan {
+        invocation: invocation.clone(),
+        attempt,
+        grant,
+        request,
     })
 }
 
@@ -549,17 +695,140 @@ pub async fn admit_runner_inference_dispatch(
     Ok(grant)
 }
 
+pub async fn admit_runner_provider_attempt_dispatch(
+    pool: &SharedPool,
+    plan: &RunnerProviderAttemptDispatchPlan,
+) -> ServiceResult<RunnerInferenceDispatchGrant> {
+    let identity = &plan.grant.attempt;
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    if !matches!(
+        lock_invocation_scope_authority(&mut tx, &plan.invocation.input).await?,
+        InvocationScopeAuthority::Live
+    ) {
+        return Err(ServiceError::conflict(
+            "Runner inference scope authority unavailable",
+        ));
+    }
+    lock_admitted_inference_invocation(
+        &mut tx,
+        &identity.user_id,
+        identity.invocation_id.as_str(),
+        &plan.invocation.owner_token,
+        plan.invocation.owner_generation,
+        "admit Runner provider attempt",
+    )
+    .await?;
+    if let Some(row) = sqlx::query(
+        "SELECT runner_grant_json FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
+    )
+    .bind(&identity.user_id)
+    .bind(identity.attempt_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    {
+        let persisted = decode_grant(&row)?;
+        if persisted.attempt != plan.grant.attempt
+            || persisted.process_boot_nonce != plan.grant.process_boot_nonce
+            || persisted.deadline_unix_ms != plan.grant.deadline_unix_ms
+        {
+            return Err(ServiceError::conflict(
+                "Runner grant already exists with another exact identity",
+            ));
+        }
+        return Ok(persisted);
+    }
+    let resolved = lock_resolved_binding(&mut tx, &identity.user_id, &identity.binding).await?;
+    if resolved.process_boot_nonce != plan.grant.process_boot_nonce {
+        return Err(ServiceError::conflict(
+            "Runner process boot changed before attempt admission",
+        ));
+    }
+    let database_now_ms: i64 = sqlx::query(
+        "SELECT CAST(ROUND(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) * 1000) AS SIGNED) AS now_ms",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .try_get("now_ms")
+    .map_err(persistence)?;
+    let deadline_ms = i64::try_from(plan.grant.deadline_unix_ms)
+        .map_err(|_| ServiceError::invalid("Runner deadline out of range"))?;
+    if deadline_ms <= database_now_ms {
+        return Err(ServiceError::conflict("Runner inference deadline expired"));
+    }
+    let start_ms = database_now_ms
+        .checked_add(MAX_START_WINDOW_MS as i64)
+        .ok_or_else(|| ServiceError::internal("Runner admission clock overflow"))?
+        .min(deadline_ms);
+    let mut grant = plan.grant.clone();
+    grant.start_before_unix_ms = start_ms as u64;
+    insert_inference_provider_attempt_admission(
+        &mut tx,
+        &plan.attempt,
+        checked_i64(plan.attempt.wire.provider_wire_bytes, "provider_wire_bytes")?,
+    )
+    .await?;
+    persist_referenced_json_artifact_tx(
+        &mut tx,
+        &artifact_record(
+            identity,
+            &identity.request,
+            "runner_inference_request",
+            plan.request.clone(),
+        )?,
+    )
+    .await
+    .map_err(|_| {
+        ServiceError::new(
+            ServiceErrorKind::Persistence,
+            "persist Runner request custody",
+        )
+    })?;
+    sqlx::query(
+        "UPDATE inference_routes SET runner_binding_json = ? WHERE user_id = ? AND route_id = ?",
+    )
+    .bind(
+        serde_json::to_string(&identity.binding)
+            .map_err(|_| ServiceError::invalid("Runner binding encoding failed"))?,
+    )
+    .bind(&identity.user_id)
+    .bind(plan.invocation.route_id())
+    .execute(&mut *tx)
+    .await
+    .map_err(persistence)?;
+    sqlx::query(
+        "UPDATE inference_provider_attempts SET runner_id = ?, runner_journal_id = ?,
+         runner_grant_json = ?, runner_grant_expires_at = FROM_UNIXTIME(? / 1000.0),
+         runner_deadline_at = FROM_UNIXTIME(? / 1000.0)
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(identity.binding.runner_id.as_str())
+    .bind(identity.binding.journal_id.as_str())
+    .bind(
+        serde_json::to_string(&grant)
+            .map_err(|_| ServiceError::invalid("Runner grant encoding failed"))?,
+    )
+    .bind(start_ms)
+    .bind(deadline_ms)
+    .bind(&identity.user_id)
+    .bind(identity.attempt_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(persistence)?;
+    tx.commit().await.map_err(persistence)?;
+    Ok(grant)
+}
+
 /// Hash covers terminal meaning and full/partial response bytes. It excludes
 /// arrival pod, socket generation and mutable Server ownership.
 pub fn runner_terminal_digest(
     terminal: &InferenceInvocationTerminal,
     response: &[u8],
 ) -> ServiceResult<RunnerInferenceDigest> {
-    let fingerprint = terminal_fingerprint(terminal)?;
-    Ok(digest(
-        &serde_json::to_vec(&(fingerprint, digest(response), response.len()))
-            .map_err(|_| ServiceError::invalid("Runner terminal encoding failed"))?,
-    ))
+    astra_turn_types::runner_inference::runner_terminal_digest(terminal, response)
+        .map_err(|_| ServiceError::invalid("Runner terminal encoding failed"))
 }
 
 /// Accept terminal evidence from the authenticated matching Runner even after
@@ -862,6 +1131,7 @@ pub async fn list_runner_reconciliation(
     let rows = sqlx::query(
         "SELECT runner_grant_json FROM inference_provider_attempts
         WHERE user_id = ? AND runner_id = ? AND status = 'started'
+          AND (runner_dispatch_claim_expires_at IS NULL OR runner_dispatch_claim_expires_at <= NOW(6))
         ORDER BY runner_grant_expires_at, attempt_id LIMIT ?",
     )
     .bind(&connection.user_id)
@@ -878,6 +1148,7 @@ pub struct RunnerContinuationClaim {
     invocation: InferenceInvocationPlan,
     identity: RunnerInferenceAttemptIdentity,
     terminal_hash: RunnerInferenceDigest,
+    physical_terminal: InferenceInvocationTerminal,
     pub response: RunnerInferenceArtifactReference,
 }
 
@@ -888,6 +1159,50 @@ impl RunnerContinuationClaim {
     pub fn identity(&self) -> &RunnerInferenceAttemptIdentity {
         &self.identity
     }
+
+    pub fn physical_terminal(&self) -> &InferenceInvocationTerminal {
+        &self.physical_terminal
+    }
+}
+
+fn public_terminal(
+    terminal: &DurableInferenceTerminal,
+) -> ServiceResult<InferenceInvocationTerminal> {
+    let status = match terminal.status.as_str() {
+        "succeeded" => InferenceTerminalStatus::Succeeded,
+        "failed" => InferenceTerminalStatus::Failed,
+        "cancelled" => InferenceTerminalStatus::Cancelled,
+        "delivery_unknown" => InferenceTerminalStatus::DeliveryUnknown,
+        _ => {
+            return Err(ServiceError::invalid(
+                "invalid durable Runner terminal status",
+            ));
+        }
+    };
+    let usage_status = match terminal.usage_status.as_str() {
+        "provider_exact" => InferenceUsageStatus::ProviderExact,
+        "provider_partial" => InferenceUsageStatus::ProviderPartial,
+        "unavailable" => InferenceUsageStatus::Unavailable,
+        _ => return Err(ServiceError::invalid("invalid durable Runner usage status")),
+    };
+    let nonnegative = |value: i64| {
+        u64::try_from(value).map_err(|_| ServiceError::invalid("negative durable Runner usage"))
+    };
+    Ok(InferenceInvocationTerminal {
+        status,
+        usage: InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage {
+                fresh_input_tokens: nonnegative(terminal.input_tokens)?,
+                cache_read_tokens: nonnegative(terminal.cache_read_tokens)?,
+                cache_creation_tokens: nonnegative(terminal.cache_creation_tokens)?,
+            },
+            output_tokens: nonnegative(terminal.output_tokens)?,
+        },
+        usage_status,
+        provider_response_id: terminal.provider_response_id.clone(),
+        error_kind: terminal.error_kind.clone(),
+        error_message: terminal.error_message.clone(),
+    })
 }
 
 /// Claim the continuation through the existing inference owner lease. A live
@@ -923,22 +1238,24 @@ pub async fn claim_runner_continuation(
     .map_err(persistence)?
     .ok_or_else(|| ServiceError::not_found("Runner continuation invocation absent"))?;
     let old_token: String = invocation.try_get("owner_token").map_err(persistence)?;
+    let owner_live = invocation
+        .try_get::<i64, _>("owner_live")
+        .map_err(persistence)?
+        == 1;
     if invocation
         .try_get::<String, _>("status")
         .map_err(persistence)?
         != "admitted"
-        || (invocation
-            .try_get::<i64, _>("owner_live")
-            .map_err(persistence)?
-            == 1
-            && live_invocation_owner_token != Some(old_token.as_str()))
+        || (owner_live && live_invocation_owner_token != Some(old_token.as_str()))
     {
         return Err(ServiceError::conflict(
             "Runner continuation inference owner is not available",
         ));
     }
     let row = sqlx::query("SELECT runner_grant_json, runner_terminal_hash, runner_response_artifact_id,
-        runner_response_hash, runner_response_bytes, runner_continuation_pending, runner_terminal_conflict
+        runner_response_hash, runner_response_bytes, runner_continuation_pending, runner_terminal_conflict,
+        status, terminal_fingerprint, usage_status, input_tokens, output_tokens,
+        cache_read_tokens, cache_creation_tokens, provider_response_id, error_kind, error_message
         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE")
         .bind(&identity.user_id).bind(identity.attempt_id.as_str()).fetch_optional(&mut *tx).await.map_err(persistence)?
         .ok_or_else(|| ServiceError::not_found("Runner continuation attempt absent"))?;
@@ -957,22 +1274,33 @@ pub async fn claim_runner_continuation(
     let old_generation: i64 = invocation
         .try_get("owner_generation")
         .map_err(persistence)?;
-    let generation = old_generation
-        .checked_add(1)
-        .ok_or_else(|| ServiceError::conflict("Runner inference owner generation exhausted"))?;
-    let token = new_admission_token();
-    sqlx::query(
-        "UPDATE inference_invocations SET owner_token = ?, owner_generation = ?,
-        owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
-        WHERE user_id = ? AND invocation_id = ?",
-    )
-    .bind(&token)
-    .bind(generation)
-    .bind(&identity.user_id)
-    .bind(identity.invocation_id.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(persistence)?;
+    // The foreground owner is already the canonical continuation owner. Keep
+    // its exact token/generation so the in-memory lease and the durable row do
+    // not diverge after a normal Runner round. Only recovery after lease expiry
+    // fences the abandoned owner with a fresh generation.
+    let (token, generation) = if owner_live {
+        (old_token, old_generation)
+    } else {
+        let generation = old_generation
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::conflict("Runner inference owner generation exhausted"))?;
+        let token = new_admission_token();
+        sqlx::query(
+            "UPDATE inference_invocations SET owner_token = ?, owner_generation = ?,
+            owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
+            WHERE user_id = ? AND invocation_id = ?",
+        )
+        .bind(&token)
+        .bind(generation)
+        .bind(&identity.user_id)
+        .bind(identity.invocation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(persistence)?;
+        (token, generation)
+    };
+    let physical_terminal =
+        public_terminal(&DurableInferenceTerminal::decode(&row).map_err(persistence)?)?;
     let claim = RunnerContinuationClaim {
         invocation: InferenceInvocationPlan {
             route_id: invocation.try_get("route_id").map_err(persistence)?,
@@ -988,6 +1316,7 @@ pub async fn claim_runner_continuation(
                 .map_err(persistence)?,
         )
         .map_err(ServiceError::invalid)?,
+        physical_terminal,
         response: RunnerInferenceArtifactReference {
             artifact_id: RunnerInferenceId::new(
                 row.try_get::<String, _>("runner_response_artifact_id")
@@ -1019,6 +1348,7 @@ pub async fn claim_runner_continuation(
 pub async fn consume_runner_continuation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     claim: &RunnerContinuationClaim,
+    logical_terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
     if !matches!(
         lock_invocation_scope_authority(tx, &claim.invocation.input).await?,
@@ -1051,8 +1381,24 @@ pub async fn consume_runner_continuation_tx(
     .await
     .map_err(persistence)?
     .ok_or_else(|| ServiceError::conflict("Runner continuation consumed or quarantined"))?;
-    let terminal = DurableInferenceTerminal::decode(&row).map_err(persistence)?;
-    settle_runner_invocation_tx(tx, &claim.identity, &terminal).await
+    let physical = DurableInferenceTerminal::decode(&row).map_err(persistence)?;
+    let logical = DurableInferenceTerminal::from_terminal(
+        logical_terminal,
+        terminal_fingerprint(logical_terminal)?,
+    )?;
+    if logical.input_tokens != physical.input_tokens
+        || logical.output_tokens != physical.output_tokens
+        || logical.cache_read_tokens != physical.cache_read_tokens
+        || logical.cache_creation_tokens != physical.cache_creation_tokens
+        || logical.usage_status != physical.usage_status
+        || logical.provider_response_id != physical.provider_response_id
+        || (logical.status == "succeeded" && physical.status != "succeeded")
+    {
+        return Err(ServiceError::invalid(
+            "logical Runner outcome cannot rewrite physical usage or promote incomplete transport",
+        ));
+    }
+    settle_runner_invocation_tx(tx, &claim.identity, &logical).await
 }
 
 async fn settle_runner_invocation_tx(

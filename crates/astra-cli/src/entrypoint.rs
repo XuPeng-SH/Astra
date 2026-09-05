@@ -378,6 +378,40 @@ async fn run_async() -> i32 {
     };
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
+    let runner_surface = print_mode
+        || continue_last
+        || resume.is_some()
+        || matches!(
+            command.as_ref(),
+            None | Some(cli::cli_config::cli_args::Command::Interactive)
+                | Some(cli::cli_config::cli_args::Command::Chat(_))
+                | Some(cli::cli_config::cli_args::Command::Message(_))
+                | Some(cli::cli_config::cli_args::Command::Review(_))
+                | Some(cli::cli_config::cli_args::Command::Team(_))
+                | Some(cli::cli_config::cli_args::Command::Work(_))
+        );
+    let local_models_configured = astra_credentials::LocalModelConfigStore::new()
+        .load()
+        .map(|config| !config.models.is_empty())
+        .unwrap_or(false);
+    let _local_runner = if runner_surface {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), &workspace)
+        {
+            Ok(runner) => Some(runner),
+            Err(error) if local_models_configured => {
+                eprintln!("{}", format!("Error: {error}").red());
+                return i32::from(ExitCode::ApiError);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "User Runner is not installed; Server models remain available");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());

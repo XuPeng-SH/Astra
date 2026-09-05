@@ -21,8 +21,7 @@ use crate::edge_ws_protocol::{
     MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
 };
 use crate::runner_inference::{
-    RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceBindingPublication,
-    RunnerInferenceBindingRejection, RunnerInferenceNegotiation, RunnerInferenceRejection,
+    RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceBindingPublication, RunnerInferenceRejection,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -99,6 +98,8 @@ pub struct EdgeConnection {
     pub connected_at: std::time::Instant,
     /// Pending tool call responses: request_id → oneshot sender.
     pending_results: Arc<DashMap<String, PendingEdgeResult>>,
+    /// Transport wakeup only. Durable attempt rows remain the dispatch owner.
+    inference_wakeup: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug)]
@@ -348,6 +349,7 @@ impl EdgeConnectionPool {
             sender,
             connected_at: std::time::Instant::now(),
             pending_results: Arc::new(DashMap::new()),
+            inference_wakeup: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -476,49 +478,27 @@ impl EdgeConnectionPool {
         }
     }
 
-    /// Negotiate the inference facet only for this authenticated socket's
-    /// current incarnation. Tool availability never implies inference support.
-    pub fn negotiate_runner_inference(
-        &self,
-        user_id: &str,
-        edge_agent_id: &str,
-        generation: u64,
-        protocol_version: u16,
-    ) -> RunnerInferenceNegotiation {
-        if !self.is_current_inference_connection(user_id, edge_agent_id, generation) {
-            return RunnerInferenceNegotiation::Unavailable {
-                reason: RunnerInferenceRejection::ConnectionSuperseded,
-            };
-        }
-        RunnerInferenceNegotiation::for_protocol_version(protocol_version)
-    }
-
-    /// Until the durable inference executor is enrolled, acknowledge rejection
-    /// without storing a binding or advertising an Offering. Authentication and
-    /// socket generation are supplied by the connection owner, never the frame.
-    pub fn reject_runner_inference_publication(
+    /// In-memory transport precheck, not publication authority. The service
+    /// still checks current durable enrollment and commits the receipt.
+    pub fn validate_runner_inference_publication(
         &self,
         user_id: &str,
         edge_agent_id: &str,
         generation: u64,
         publication: &RunnerInferenceBindingPublication,
-    ) -> RunnerInferenceBindingRejection {
-        let reason = if !self.is_current_inference_connection(user_id, edge_agent_id, generation) {
-            RunnerInferenceRejection::ConnectionSuperseded
+    ) -> Result<(), RunnerInferenceRejection> {
+        if !self.is_current_inference_connection(user_id, edge_agent_id, generation) {
+            Err(RunnerInferenceRejection::ConnectionSuperseded)
         } else if publication.change.identity().runner_id.as_str() != edge_agent_id {
-            RunnerInferenceRejection::BindingIdentityMismatch
+            Err(RunnerInferenceRejection::BindingIdentityMismatch)
         } else if publication.protocol_version != RUNNER_INFERENCE_PROTOCOL_VERSION {
-            RunnerInferenceRejection::ProtocolVersionUnsupported
+            Err(RunnerInferenceRejection::ProtocolVersionUnsupported)
         } else {
-            RunnerInferenceRejection::InferenceUnsupported
-        };
-        RunnerInferenceBindingRejection {
-            operation_id: publication.operation_id.clone(),
-            reason,
+            Ok(())
         }
     }
 
-    fn is_current_inference_connection(
+    pub fn is_current_inference_connection(
         &self,
         user_id: &str,
         edge_agent_id: &str,
@@ -532,6 +512,119 @@ impl EdgeConnectionPool {
                     && connection.generation == generation
                     && !connection.sender.is_closed()
             })
+    }
+
+    pub fn runner_inference_wakeup(
+        &self,
+        user_id: &str,
+        runner_id: &str,
+        generation: u64,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        self.connections
+            .get(&pool_key(user_id, runner_id))
+            .filter(|entry| {
+                entry.user_id == user_id
+                    && entry.edge_agent_id == runner_id
+                    && entry.generation == generation
+                    && !entry.sender.is_closed()
+            })
+            .map(|entry| entry.inference_wakeup.clone())
+    }
+
+    /// Wake a currently hosted Runner after durable admission/cancellation.
+    /// Missing wakeups are recovered by the connection worker's bounded batch.
+    pub fn notify_runner_inference(&self, user_id: &str, runner_id: &str) {
+        if let Some(connection) = self.connections.get(&pool_key(user_id, runner_id)) {
+            if connection.user_id == user_id && connection.edge_agent_id == runner_id {
+                connection.inference_wakeup.notify_one();
+            }
+        }
+    }
+
+    /// Reserve bounded outbound channel space without retaining a map lock.
+    /// Recheck the exact generation while sending, so replacement cannot redirect
+    /// an old worker's frame into the new socket. No inference waiter/state map.
+    pub async fn send_runner_inference_message(
+        &self,
+        user_id: &str,
+        runner_id: &str,
+        generation: u64,
+        message: EdgeServerMessage,
+    ) -> Result<(), RunnerInferenceRejection> {
+        let identity_matches =
+            |identity: &crate::runner_inference::RunnerInferenceAttemptIdentity| {
+                identity.user_id == user_id && identity.binding.runner_id.as_str() == runner_id
+            };
+        let valid = match &message {
+            EdgeServerMessage::InferenceDispatch {
+                grant,
+                delivery_generation,
+            }
+            | EdgeServerMessage::InferenceCancel {
+                grant,
+                delivery_generation,
+            }
+            | EdgeServerMessage::InferenceReconcile {
+                grant,
+                delivery_generation,
+            } => *delivery_generation == generation && identity_matches(&grant.attempt),
+            EdgeServerMessage::InferenceTerminalAck {
+                ack,
+                delivery_generation,
+            } => *delivery_generation == generation && identity_matches(&ack.attempt),
+            EdgeServerMessage::InferenceRequestChunk {
+                delivery_generation,
+                ..
+            }
+            | EdgeServerMessage::InferenceResponseCredit {
+                delivery_generation,
+                ..
+            } => *delivery_generation == generation,
+            EdgeServerMessage::InferenceBindingAck { receipt } => {
+                receipt.identity.runner_id.as_str() == runner_id
+            }
+            EdgeServerMessage::InferenceHelloAck { negotiation } => match negotiation {
+                crate::runner_inference::RunnerInferenceNegotiation::Accepted {
+                    delivery_generation,
+                    ..
+                } => *delivery_generation == generation,
+                crate::runner_inference::RunnerInferenceNegotiation::Unavailable { .. } => true,
+            },
+            EdgeServerMessage::InferenceBindingRejected { .. }
+            | EdgeServerMessage::InferenceRejected { .. } => true,
+            _ => false,
+        };
+        if !valid {
+            return Err(RunnerInferenceRejection::InvalidEvidence);
+        }
+        let sender = self
+            .connections
+            .get(&pool_key(user_id, runner_id))
+            .filter(|entry| {
+                entry.user_id == user_id
+                    && entry.edge_agent_id == runner_id
+                    && entry.generation == generation
+                    && !entry.sender.is_closed()
+            })
+            .map(|entry| entry.sender.clone())
+            .ok_or(RunnerInferenceRejection::ConnectionSuperseded)?;
+        let permit = sender
+            .reserve_owned()
+            .await
+            .map_err(|_| RunnerInferenceRejection::ConnectionSuperseded)?;
+        let current = self
+            .connections
+            .get(&pool_key(user_id, runner_id))
+            .filter(|entry| {
+                entry.user_id == user_id
+                    && entry.edge_agent_id == runner_id
+                    && entry.generation == generation
+                    && !entry.sender.is_closed()
+            })
+            .ok_or(RunnerInferenceRejection::ConnectionSuperseded)?;
+        permit.send(message);
+        drop(current);
+        Ok(())
     }
 
     /// Check if a user has any connected edge agent.
@@ -1130,125 +1223,90 @@ mod tests {
     }
 
     #[test]
-    fn runner_inference_publication_is_scoped_to_authenticated_owner_and_current_connection() {
+    fn runner_publication_precheck_is_owner_generation_and_binding_scoped() {
         let pool = EdgeConnectionPool::new();
-        let (alice_tx, mut alice_rx) = mpsc::channel(1);
-        let (bob_tx, mut bob_rx) = mpsc::channel(1);
-        let alice = pool.register("alice", "shared-runner-name", None, None, alice_tx);
-        let bob = pool.register("bob", "shared-runner-name", None, None, bob_tx);
-        let publication = inference_publication("shared-runner-name");
-        let reject = |owner, generation| {
-            pool.reject_runner_inference_publication(
-                owner,
-                "shared-runner-name",
-                generation,
-                &publication,
-            )
-            .reason
-        };
-        assert_eq!(
-            reject("alice", alice),
-            RunnerInferenceRejection::InferenceUnsupported
-        );
-        assert_eq!(
-            reject("bob", bob),
-            RunnerInferenceRejection::InferenceUnsupported
-        );
-        assert_eq!(
-            reject("bob", alice),
-            RunnerInferenceRejection::ConnectionSuperseded
-        );
-        assert_eq!(
-            reject("alice", bob),
-            RunnerInferenceRejection::ConnectionSuperseded
-        );
-        assert_eq!(
-            reject("unregistered-user", alice),
-            RunnerInferenceRejection::ConnectionSuperseded
-        );
-        assert!(alice_rx.try_recv().is_err());
-        assert!(bob_rx.try_recv().is_err());
-        assert_eq!(pool.connection_count(), 2);
-        assert!(pool.get_pending_requests_for_user("alice").is_empty());
-        assert!(pool.get_pending_requests_for_user("bob").is_empty());
-    }
-
-    #[test]
-    fn runner_inference_reconnect_rejects_stale_publication_without_changing_other_owner() {
-        let pool = EdgeConnectionPool::new();
-        let (old_tx, _old_rx) = mpsc::channel(1);
-        let old = pool.register("alice", "runner", None, None, old_tx);
+        let (alice_tx, _alice_rx) = mpsc::channel(1);
         let (bob_tx, _bob_rx) = mpsc::channel(1);
+        let alice = pool.register("alice", "runner", None, None, alice_tx);
         let bob = pool.register("bob", "runner", None, None, bob_tx);
         let publication = inference_publication("runner");
-        let before = serde_json::to_value(&publication).unwrap();
-        let (new_tx, new_rx) = mpsc::channel(1);
+        assert_eq!(
+            pool.validate_runner_inference_publication("alice", "runner", alice, &publication),
+            Ok(())
+        );
+        assert_eq!(
+            pool.validate_runner_inference_publication("bob", "runner", bob, &publication),
+            Ok(())
+        );
+        assert_eq!(
+            pool.validate_runner_inference_publication("bob", "runner", alice, &publication),
+            Err(RunnerInferenceRejection::ConnectionSuperseded)
+        );
+        assert_eq!(
+            pool.validate_runner_inference_publication(
+                "alice",
+                "runner",
+                alice,
+                &inference_publication("forged")
+            ),
+            Err(RunnerInferenceRejection::BindingIdentityMismatch)
+        );
+        let mut incompatible = publication.clone();
+        incompatible.protocol_version = 2;
+        assert_eq!(
+            pool.validate_runner_inference_publication("alice", "runner", alice, &incompatible),
+            Err(RunnerInferenceRejection::ProtocolVersionUnsupported)
+        );
+        let (new_tx, _new_rx) = mpsc::channel(1);
         let new = pool.register("alice", "runner", None, None, new_tx);
-        assert_ne!(old, new);
-        assert_eq!(
-            pool.reject_runner_inference_publication("alice", "runner", old, &publication)
-                .reason,
-            RunnerInferenceRejection::ConnectionSuperseded
-        );
-        assert_eq!(
-            pool.reject_runner_inference_publication("alice", "runner", new, &publication)
-                .reason,
-            RunnerInferenceRejection::InferenceUnsupported
-        );
-        assert_eq!(
-            pool.reject_runner_inference_publication("bob", "runner", bob, &publication)
-                .reason,
-            RunnerInferenceRejection::InferenceUnsupported
-        );
-        assert_eq!(
-            serde_json::to_value(&publication).unwrap(),
-            before,
-            "reconnect must not rewrite stable binding identity"
-        );
-        drop(new_rx);
-        assert_eq!(
-            pool.reject_runner_inference_publication("alice", "runner", new, &publication)
-                .reason,
-            RunnerInferenceRejection::ConnectionSuperseded
+        assert_ne!(new, alice);
+        assert!(!pool.is_current_inference_connection("alice", "runner", alice));
+        assert!(pool.is_current_inference_connection("bob", "runner", bob));
+        assert!(pool.get_pending_requests_for_user("alice").is_empty());
+        assert!(
+            pool.get_all_user_edges("alice")[0].capabilities.is_none(),
+            "precheck cannot publish inference capacity"
         );
     }
 
-    #[test]
-    fn runner_inference_rejects_forged_binding_and_protocol_without_enrolling_capacity() {
+    #[tokio::test]
+    async fn runner_send_rechecks_generation_after_channel_backpressure() {
         let pool = EdgeConnectionPool::new();
-        let (tx, _rx) = mpsc::channel(1);
-        let generation = pool.register("alice", "runner", None, None, tx);
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        old_tx.send(EdgeServerMessage::Pong {}).await.unwrap();
+        let old = pool.register("alice", "runner", None, None, old_tx);
+        let mut blocked = Box::pin(pool.send_runner_inference_message(
+            "alice",
+            "runner",
+            old,
+            EdgeServerMessage::InferenceRejected {
+                attempt_id: None,
+                reason: RunnerInferenceRejection::InvalidEvidence,
+            },
+        ));
+        // Poll through the initial generation check into the full old channel;
+        // replacing before the first poll would not exercise the second fence.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(blocked.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let new = pool.register("alice", "runner", None, None, new_tx);
+        old_rx.recv().await.unwrap();
         assert_eq!(
-            pool.reject_runner_inference_publication(
-                "alice",
-                "runner",
-                generation,
-                &inference_publication("other-runner")
-            )
-            .reason,
-            RunnerInferenceRejection::BindingIdentityMismatch
+            blocked.await,
+            Err(RunnerInferenceRejection::ConnectionSuperseded)
         );
-        let mut publication = inference_publication("runner");
-        publication.protocol_version = 2;
-        assert_eq!(
-            pool.reject_runner_inference_publication("alice", "runner", generation, &publication)
-                .reason,
-            RunnerInferenceRejection::ProtocolVersionUnsupported
-        );
-        assert_eq!(
-            pool.negotiate_runner_inference("alice", "runner", generation, 1),
-            RunnerInferenceNegotiation::Unavailable {
-                reason: RunnerInferenceRejection::InferenceUnsupported
-            }
-        );
-        assert_eq!(
-            pool.negotiate_runner_inference("bob", "runner", generation, 1),
-            RunnerInferenceNegotiation::Unavailable {
-                reason: RunnerInferenceRejection::ConnectionSuperseded
-            }
-        );
-        assert_eq!(pool.connection_count(), 1);
-        assert!(pool.get_all_user_edges("alice")[0].capabilities.is_none());
+        assert!(new_rx.try_recv().is_err());
+        let wake = pool
+            .runner_inference_wakeup("alice", "runner", new)
+            .unwrap();
+        pool.notify_runner_inference("alice", "runner");
+        tokio::time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .unwrap();
+        assert!(pool.runner_inference_wakeup("bob", "runner", new).is_none());
     }
     use serde_json::json;
 

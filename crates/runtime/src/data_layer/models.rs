@@ -364,6 +364,19 @@ async fn effective_model_catalog(
             availability: ModelAccessAvailability::Ready,
         });
     }
+    for item in &page.items {
+        if item.access_kind == ModelAccessKind::ThisDevice
+            && !declared.iter().any(|access| access.id == item.access_id)
+        {
+            declared.push(DeclaredModelAccess {
+                id: item.access_id.clone(),
+                kind: ModelAccessKind::ThisDevice,
+                label: item.access_label.clone(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
+            });
+        }
+    }
     Ok(EffectiveModelCatalog {
         declared,
         offerings: page.items,

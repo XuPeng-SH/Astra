@@ -37,7 +37,7 @@ pub(crate) struct DurableSummaryAttemptAllocator {
 }
 
 impl DurableSummaryAttemptAllocator {
-    fn reserve_pair_at_least(
+    pub(crate) fn reserve_pair_at_least(
         &self,
         scope_key: &str,
         durable_pair_base: u32,
@@ -536,11 +536,12 @@ mod tests {
     }
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
+        let material = execution.server_material().expect("Server material");
         OwnedLlmExecutionRoute {
             model_name: execution.model_name.clone(),
             wire_model_name: None,
-            api_key: execution.server_material().api_key.clone(),
-            base_url: execution.server_material().base_url.clone(),
+            api_key: material.api_key.clone(),
+            base_url: material.base_url.clone(),
             provider: execution.provider.clone(),
             thinking_capability: None,
             header_overrides: HashMap::new(),
@@ -816,7 +817,11 @@ mod tests {
             OwnedLlmExecutionRoute {
                 model_name: execution.model_name.clone(),
                 wire_model_name: None,
-                api_key: execution.server_material().api_key.clone(),
+                api_key: execution
+                    .server_material()
+                    .expect("Server material")
+                    .api_key
+                    .clone(),
                 base_url,
                 provider: execution.provider.clone(),
                 thinking_capability: None,

@@ -26,6 +26,9 @@ pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
     let name = required("model name", args.name, interactive)?;
     let base_url = required("API base URL", args.base_url, interactive)?;
     let provider_model = required("Provider model", args.provider_model, interactive)?;
+    let context_window = required_u32("Context window", args.context_window, interactive)?;
+    let max_output_tokens =
+        required_u32("Maximum output tokens", args.max_output_tokens, interactive)?;
 
     let store = LocalModelConfigStore::new();
     let secrets = LocalSecretStore::new();
@@ -73,6 +76,8 @@ pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
         name,
         base_url,
         provider_model,
+        context_window,
+        max_output_tokens,
         credential,
         created_secret,
     )
@@ -88,6 +93,8 @@ pub(crate) fn add_from_tui(
     name: String,
     base_url: String,
     provider_model: String,
+    context_window: u32,
+    max_output_tokens: u32,
     credential_input: LocalModelCredentialInput,
 ) -> Result<String, String> {
     let store = LocalModelConfigStore::new();
@@ -116,6 +123,8 @@ pub(crate) fn add_from_tui(
         name,
         base_url,
         provider_model,
+        context_window,
+        max_output_tokens,
         credential,
         created_secret,
     )
@@ -127,6 +136,8 @@ fn save_definition(
     name: String,
     base_url: String,
     provider_model: String,
+    context_window: u32,
+    max_output_tokens: u32,
     credential: LocalCredentialRef,
     created_secret: Option<String>,
 ) -> Result<String, String> {
@@ -137,6 +148,8 @@ fn save_definition(
             protocol: LocalInferenceProtocol::OpenaiCompatible,
             base_url,
             model: provider_model,
+            context_window,
+            max_output_tokens,
             credential,
         },
     );
@@ -169,6 +182,24 @@ fn save_definition(
     .map_err(|error| error.to_string())
 }
 
+fn required_u32(label: &'static str, value: Option<u32>, interactive: bool) -> Result<u32, String> {
+    if let Some(value) = value {
+        return (value > 0)
+            .then_some(value)
+            .ok_or_else(|| format!("{label} must be greater than zero"));
+    }
+    if !interactive {
+        return Err(format!("{label} is required in non-interactive mode"));
+    }
+    let value = prompt_or(label, None)?;
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{label} must be a positive integer"))
+}
+
 pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
     let store = LocalModelConfigStore::new();
     let config = store.load().map_err(|error| error.to_string())?;
@@ -196,7 +227,7 @@ pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
         &serde_json::json!({
             "model": definition.model,
             "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": 4,
+            "max_tokens": definition.max_output_tokens.min(4),
             "stream": true,
         }),
         astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
@@ -205,7 +236,7 @@ pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let endpoint = chat_completions_endpoint(&definition.base_url)?;
     let transport = astra_inference_adapter::transport::ProviderTransport::build(
-        reqwest::Client::builder().no_proxy(),
+        astra_core::net::runner_provider_client_builder().map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
     let headers = astra_inference_adapter::transport::provider_headers(
@@ -243,19 +274,31 @@ pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
     };
     let drain = async {
         let mut json_events = 0_u64;
+        let mut saw_choice = false;
+        let mut saw_provider_error = false;
         let mut done = false;
         while let Some(event) = events_rx.recv().await {
             match event {
-                astra_inference_adapter::transport::ProviderEvent::Json(_) => json_events += 1,
+                astra_inference_adapter::transport::ProviderEvent::Json(value) => {
+                    json_events += 1;
+                    saw_choice |= value
+                        .get("choices")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|choices| !choices.is_empty());
+                    saw_provider_error |= value.get("error").is_some();
+                }
                 astra_inference_adapter::transport::ProviderEvent::Done => done = true,
                 astra_inference_adapter::transport::ProviderEvent::Eof => {}
             }
         }
-        (json_events, done)
+        (json_events, saw_choice, saw_provider_error, done)
     };
-    let (terminal, (json_events, done)) = tokio::join!(execute, drain);
+    let (terminal, (json_events, saw_choice, saw_provider_error, done)) =
+        tokio::join!(execute, drain);
     if terminal.status != astra_inference_adapter::transport::ExecutionStatus::Complete
         || json_events == 0
+        || !saw_choice
+        || saw_provider_error
     {
         return Err(format!(
             "provider probe failed ({:?}); configuration remains saved and no retry was attempted",
@@ -304,6 +347,8 @@ pub(crate) fn show(name: &str) -> Result<Option<String>, String> {
         "protocol": definition.protocol,
         "base_url": definition.base_url,
         "model": definition.model,
+        "context_window": definition.context_window,
+        "max_output_tokens": definition.max_output_tokens,
         "credential_source": credential_kind(&definition.credential),
         "revision": config.revision,
         "config_path": store.path(),
@@ -386,6 +431,8 @@ mod tests {
             name: Some(name.to_string()),
             base_url: Some("http://127.0.0.1:8080/v1".to_string()),
             provider_model: Some("coding-model".to_string()),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
             credential_env: None,
             no_auth: true,
             store_secret: false,
@@ -490,12 +537,88 @@ mod tests {
         assert!(show("work").unwrap().is_some());
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn provider_error_envelope_is_not_mistaken_for_a_successful_probe() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"error\":{\"message\":\"model unavailable\"}}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let error = check(ModelCheckArgs {
+            name: "work".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("provider probe failed"));
+        assert!(show("work").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_choice_stream_is_not_mistaken_for_a_successful_probe() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let error = check(ModelCheckArgs {
+            name: "work".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("provider probe failed"));
+        assert!(show("work").unwrap().is_some());
+    }
+
     #[test]
     fn noninteractive_setup_fails_before_writing_when_required_input_is_missing() {
         let error = add(ModelAddArgs {
             name: Some("work".to_string()),
             base_url: None,
             provider_model: None,
+            context_window: None,
+            max_output_tokens: None,
             credential_env: None,
             no_auth: true,
             store_secret: false,

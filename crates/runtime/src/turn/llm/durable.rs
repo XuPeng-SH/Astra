@@ -278,6 +278,17 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
         attempt: &astra_services::InferenceProviderAttemptPlan,
     ) -> astra_services::ServiceResult<()>;
 
+    async fn admit_runner_provider_attempt(
+        &self,
+        _plan: &astra_services::inference_execution::runner::RunnerProviderAttemptDispatchPlan,
+    ) -> astra_services::ServiceResult<
+        astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+    > {
+        Err(astra_services::ServiceError::invalid(
+            "Runner provider attempts require durable database custody",
+        ))
+    }
+
     async fn finish_provider_attempt(
         &self,
         attempt: &astra_services::InferenceProviderAttemptPlan,
@@ -374,6 +385,19 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
         attempt: &astra_services::InferenceProviderAttemptPlan,
     ) -> astra_services::ServiceResult<()> {
         astra_services::begin_inference_provider_attempt(&self.shared_pool, attempt).await
+    }
+
+    async fn admit_runner_provider_attempt(
+        &self,
+        plan: &astra_services::inference_execution::runner::RunnerProviderAttemptDispatchPlan,
+    ) -> astra_services::ServiceResult<
+        astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+    > {
+        astra_services::inference_execution::runner::admit_runner_provider_attempt_dispatch(
+            &self.shared_pool,
+            plan,
+        )
+        .await
     }
 
     async fn finish_provider_attempt(
@@ -3498,12 +3522,49 @@ impl DurableInferenceInvocation {
         self.plan.logical_attempt()
     }
 
+    pub(crate) fn runner_continuation_input(&self) -> astra_services::InferenceInvocationInput {
+        self.plan.input().clone()
+    }
+
+    pub(crate) fn owner_token(&self) -> &str {
+        self.plan.owner_token()
+    }
+
     pub(crate) fn attempt_observer(&self) -> &dyn ProviderAttemptObserver {
         self.observer.as_ref()
     }
 
     pub(crate) fn attempt_observer_arc(&self) -> Arc<dyn ProviderAttemptObserver> {
         self.observer.clone()
+    }
+
+    pub(crate) async fn admit_runner_attempt(
+        &self,
+        prepared: &crate::turn::llm::client::PreparedRunnerRequest,
+        binding: &astra_services::runner_model_bindings::ResolvedRunnerModelBinding,
+        deadline_unix_ms: u64,
+    ) -> Result<
+        (
+            u32,
+            astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+        ),
+        astra_core::ClassifiedError,
+    > {
+        let body = prepared.exact_body();
+        self.observer
+            .admit_runner_attempt(prepared.identity(), &body, binding, deadline_unix_ms)
+            .await
+    }
+
+    pub(crate) async fn observe_runner_terminal(
+        &self,
+        attempt_index: u32,
+        physical_terminal: astra_services::InferenceInvocationTerminal,
+        logical_terminal: astra_services::InferenceInvocationTerminal,
+    ) {
+        self.observer
+            .observe_runner_terminal(attempt_index, physical_terminal, logical_terminal)
+            .await;
     }
 
     /// Bind the canonical append WAL before the first physical attempt is
@@ -3668,6 +3729,9 @@ impl DurableInferenceInvocation {
         &self,
         result: &LlmCallResult,
     ) -> Result<(), astra_core::ClassifiedError> {
+        if let Some(terminal) = self.observer.committed_logical_terminal().await {
+            return self.finish(&terminal).await;
+        }
         self.finish(&terminal_from_result(result)).await
     }
 
@@ -3675,6 +3739,16 @@ impl DurableInferenceInvocation {
         &self,
         error: &astra_core::ClassifiedError,
     ) -> Result<(), astra_core::ClassifiedError> {
+        if let Some(terminal) = self.observer.committed_logical_terminal().await {
+            return self.finish(&terminal).await;
+        }
+        // Once a Runner grant may have committed, its durable response custody
+        // and continuation are the only safe settlement authority. A local
+        // timeout, disconnect, or ambiguous database acknowledgement must not
+        // manufacture a competing Server-side physical terminal.
+        if self.observer.runner_custody.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if is_ledger_error(error) {
             // The detached provider-attempt operation still owns its exact
             // terminal. Keep the foreground bounded, but transfer logical
@@ -3864,6 +3938,7 @@ struct DurableProviderAttemptObserver {
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
+    runner_custody: AtomicBool,
     dispatched_attempts: std::sync::Mutex<BTreeSet<u32>>,
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
@@ -4020,6 +4095,147 @@ where
 }
 
 impl DurableProviderAttemptObserver {
+    async fn admit_runner_attempt(
+        &self,
+        wire: &ProviderWireRequestIdentity,
+        exact_body: &[u8],
+        binding: &astra_services::runner_model_bindings::ResolvedRunnerModelBinding,
+        deadline_unix_ms: u64,
+    ) -> Result<
+        (
+            u32,
+            astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+        ),
+        astra_core::ClassifiedError,
+    > {
+        self.owner_lease
+            .ensure_live("Runner provider attempt admission")?;
+        let _permit = self
+            .operations
+            .register("Runner provider attempt admission")?;
+        let attempt_index = self.next_attempt.fetch_add(1, Ordering::AcqRel);
+        let service_wire = astra_services::InferenceProviderWireIdentity::new(
+            wire.protocol.as_str(),
+            wire.provider_wire_hash.clone(),
+            wire.provider_wire_bytes,
+        )
+        .map_err(|error| service_error("Runner provider wire identity", error))?
+        .with_composition(astra_services::ModelRequestWireComposition {
+            system_bytes: wire.composition.system_bytes,
+            conversation_bytes: wire.composition.conversation_bytes,
+            tool_schema_bytes: wire.composition.tool_schema_bytes,
+            provider_envelope_bytes: wire.composition.provider_envelope_bytes,
+            system_items: wire.composition.system_items,
+            conversation_items: wire.composition.conversation_items,
+            tool_schema_items: wire.composition.tool_schema_items,
+        });
+        let transitions = self
+            .canonical_transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let plan =
+            astra_services::inference_execution::runner::plan_runner_provider_attempt_dispatch(
+                &self.invocation,
+                attempt_index,
+                service_wire,
+                self.request_context.clone(),
+                &transitions,
+                binding,
+                exact_body,
+                deadline_unix_ms,
+            )
+            .map_err(|error| service_error("Runner provider attempt planning", error))?;
+        let request = DurableProviderRequestIdentity {
+            request_id: plan.attempt().request_id().to_string(),
+            request_hash: wire.provider_wire_hash.clone(),
+            attempt: attempt_index,
+            protocol: wire.protocol,
+            provider_wire_bytes: wire.provider_wire_bytes,
+            composition: wire.composition.clone(),
+            fingerprints: wire.fingerprints.clone(),
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.requests.insert(attempt_index, request);
+            state
+                .open_attempts
+                .insert(attempt_index, plan.attempt().clone());
+        }
+        // From this point an acknowledgement failure is ambiguous: the atomic
+        // admission may already be committed. Transfer settlement authority
+        // before the await so Drop/error paths can never invent a competing
+        // Server transport outcome.
+        self.runner_custody.store(true, Ordering::Release);
+        let mut retry_delay = std::time::Duration::from_millis(25);
+        let grant = loop {
+            match self.persistence.admit_runner_provider_attempt(&plan).await {
+                Ok(grant) => break grant,
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        astra_services::ServiceErrorKind::Persistence
+                            | astra_services::ServiceErrorKind::Network
+                            | astra_services::ServiceErrorKind::ConflictTransient
+                    ) && retry_delay <= std::time::Duration::from_millis(100) =>
+                {
+                    // The transaction outcome may be unknown. Reconcile only
+                    // by replaying the byte-identical plan; a fresh grant or
+                    // attempt identity could duplicate provider work.
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay *= 2;
+                }
+                Err(error) => {
+                    let ambiguous = matches!(
+                        error.kind,
+                        astra_services::ServiceErrorKind::Persistence
+                            | astra_services::ServiceErrorKind::Network
+                            | astra_services::ServiceErrorKind::ConflictTransient
+                    );
+                    if !ambiguous {
+                        let mut state = self.state.lock().await;
+                        state.requests.remove(&attempt_index);
+                        state.open_attempts.remove(&attempt_index);
+                        // No durable Runner authority can exist for a
+                        // definitive pre-commit rejection. Restore ordinary
+                        // invocation settlement instead of stranding it in
+                        // Runner custody.
+                        self.runner_custody.store(false, Ordering::Release);
+                    }
+                    return Err(service_error("Runner provider attempt admission", error));
+                }
+            }
+        };
+        if let Some(transition_id) = transitions.first().map(|item| item.transition_id.clone()) {
+            *self
+                .admitted_canonical_transition_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(transition_id);
+        }
+        self.owner_lease
+            .ensure_live("Runner provider delivery authorization")?;
+        self.state
+            .lock()
+            .await
+            .delivery_authorized
+            .insert(attempt_index);
+        self.note_dispatch_started(attempt_index);
+        Ok((attempt_index, grant))
+    }
+
+    async fn observe_runner_terminal(
+        &self,
+        attempt_index: u32,
+        physical_terminal: astra_services::InferenceInvocationTerminal,
+        logical_terminal: astra_services::InferenceInvocationTerminal,
+    ) {
+        let mut state = self.state.lock().await;
+        state.open_attempts.remove(&attempt_index);
+        state.delivery_authorized.remove(&attempt_index);
+        state.terminals.insert(attempt_index, physical_terminal);
+        state.logical_terminal = Some(logical_terminal);
+    }
+
     #[cfg(test)]
     fn new_with_persistence(
         persistence: Arc<dyn InferenceLedgerPersistence>,
@@ -4059,6 +4275,7 @@ impl DurableProviderAttemptObserver {
             admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
             dispatch_started: AtomicBool::new(false),
+            runner_custody: AtomicBool::new(false),
             dispatched_attempts: std::sync::Mutex::new(BTreeSet::new()),
             state: Arc::new(tokio::sync::Mutex::new(ProviderAttemptState::default())),
             operations: ProviderOperationGate::default(),
@@ -4202,6 +4419,10 @@ impl Drop for DurableProviderAttemptObserver {
         else {
             return;
         };
+        if self.runner_custody.load(Ordering::Acquire) {
+            drop(reservation);
+            return;
+        }
         if self.owner_lease.is_lost() {
             drop(reservation);
             return;

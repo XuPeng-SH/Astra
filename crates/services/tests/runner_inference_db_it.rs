@@ -278,7 +278,8 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
         .await
         .unwrap();
     let terminal = terminal();
-    let hash = runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
     assert!(
         take_runner_terminal_custody(&f.pool, &old, &grant.attempt, &terminal, RESPONSE, &hash)
             .await
@@ -346,7 +347,7 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
         .is_err()
     );
     let mut tx = f.pool.get().begin().await.unwrap();
-    consume_runner_continuation_tx(&mut tx, &claim)
+    consume_runner_continuation_tx(&mut tx, &claim, &terminal)
         .await
         .unwrap();
     tx.rollback().await.unwrap();
@@ -357,14 +358,37 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
             .contains(&grant.attempt),
         "rollback retains continuation obligation"
     );
+    // Physical provider completion does not establish canonical agent-response
+    // validity. The continuation may fail while retaining exact measured usage.
+    let mut logical_terminal = terminal.clone();
+    logical_terminal.status = InferenceTerminalStatus::Failed;
+    logical_terminal.error_kind = Some("canonical_response_invalid".into());
     let mut tx = f.pool.get().begin().await.unwrap();
-    consume_runner_continuation_tx(&mut tx, &claim)
+    consume_runner_continuation_tx(&mut tx, &claim, &logical_terminal)
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    let physical_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(grant.attempt.attempt_id.as_str())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    let logical_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(grant.attempt.invocation_id.as_str())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert_eq!(physical_status, "succeeded");
+    assert_eq!(logical_status, "failed");
     let mut tx = f.pool.get().begin().await.unwrap();
     assert!(
-        consume_runner_continuation_tx(&mut tx, &claim)
+        consume_runner_continuation_tx(&mut tx, &claim, &terminal)
             .await
             .is_err()
     );
@@ -407,7 +431,8 @@ async fn runner_cancelled_run_keeps_real_usage_and_response_without_resuming() {
     .await
     .unwrap();
     let terminal = terminal();
-    let hash = runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
     take_runner_terminal_custody(
         &f.pool,
         &f.connection,
@@ -465,13 +490,15 @@ async fn runner_expiry_never_regrants_and_conflicting_terminal_cannot_overwrite_
         RunnerDeliveryAction::Reconcile(grant.clone())
     );
     assert!(
-        list_runner_reconciliation(&f.pool, &f.connection, 10)
+        !list_runner_reconciliation(&f.pool, &f.connection, 10)
             .await
             .unwrap()
-            .contains(&grant)
+            .contains(&grant),
+        "live delivery claims must not starve later queued attempts"
     );
     let terminal = terminal();
-    let hash = runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
     take_runner_terminal_custody(
         &f.pool,
         &f.connection,
@@ -483,7 +510,8 @@ async fn runner_expiry_never_regrants_and_conflicting_terminal_cannot_overwrite_
     .await
     .unwrap();
     let conflicting = br#"{"content":"different"}"#;
-    let conflicting_hash = runner_terminal_digest(&terminal, conflicting).unwrap();
+    let conflicting_hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, conflicting).unwrap();
     assert!(
         take_runner_terminal_custody(
             &f.pool,
