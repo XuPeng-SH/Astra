@@ -1425,6 +1425,7 @@ mod tests {
             budget_remaining_rounds: 8,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["grep".to_string(), "read_file".to_string()],
             activated_deferred_tool_names: Vec::new(),

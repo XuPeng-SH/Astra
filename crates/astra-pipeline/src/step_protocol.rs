@@ -720,6 +720,14 @@ pub struct HeavyCheckpoint {
     /// advance the loop without consuming a provider round.
     #[serde(default)]
     pub current_round_index: u32,
+    /// Runner responses that have reached custody during this loop and are
+    /// bound to this canonical checkpoint.  The receipt is non-secret and
+    /// hash-addressed; recovery re-validates it against the inference ledger
+    /// and treats its response as already absorbed rather than reading it
+    /// again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runner_continuation_receipts:
+        Vec<astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt>,
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
@@ -933,6 +941,7 @@ impl StepCheckpoint {
             budget_remaining_rounds: 0,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
             activated_deferred_tool_names: Vec::new(),
@@ -2994,6 +3003,7 @@ mod tests {
             budget_remaining_rounds: 5,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: vec![],
             recent_tools: vec![],
             activated_deferred_tool_names: vec![],
@@ -3034,6 +3044,7 @@ mod tests {
             budget_remaining_rounds: 10,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: vec![],
             recent_tools: vec![],
             activated_deferred_tool_names: vec![],

@@ -39,6 +39,7 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         budget_remaining_rounds: 0,
         llm_rounds_completed: 0,
         current_round_index: 0,
+        runner_continuation_receipts: Vec::new(),
         blocked_tools: vec![],
         recent_tools: vec![],
         activated_deferred_tool_names: vec![],

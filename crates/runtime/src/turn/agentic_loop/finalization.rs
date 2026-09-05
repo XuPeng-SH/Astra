@@ -382,6 +382,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     // continuation chains do not have one-to-one round numbering).
     heavy.llm_rounds_completed = state.llm_rounds_completed;
     heavy.current_round_index = state.current_round_index;
+    heavy.runner_continuation_receipts = state.stall.runner_continuation_receipts.clone();
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if state
         .stall

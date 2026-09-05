@@ -1569,6 +1569,11 @@ pub struct StallTrackingState {
     pub verdict_events: Vec<AgenticVerdictAuditEvent>,
     /// Last heavy checkpoint for step resumption.
     pub last_heavy_checkpoint: Option<StepCheckpoint>,
+    /// Exact Runner custody receipts waiting to be bound to the next canonical
+    /// heavy checkpoint.  This is not a replay queue: records are consumed
+    /// only by checkpoint-aware recovery after ledger revalidation.
+    pub runner_continuation_receipts:
+        Vec<astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt>,
     /// Tool call records for session journal.
     pub tool_call_records: Vec<ToolCallRecord>,
     /// Sticky, cross-process projection of an observation quarantine.  A

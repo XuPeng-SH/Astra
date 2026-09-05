@@ -145,6 +145,93 @@ pub async fn load_runner_response_custody(
     load_exact_artifact_tx(&mut tx, &claim.identity, &claim.response).await
 }
 
+/// Verify that a checkpoint marker corresponds to one immutable Runner
+/// custody record.  This verifies *consumption evidence* only and never
+/// returns response bytes: a receipt carried by the restored checkpoint is
+/// already part of the canonical conversation and must not be replayed.
+pub async fn verify_runner_checkpoint_consumption(
+    pool: &SharedPool,
+    input: &InferenceInvocationInput,
+    receipt: &astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
+) -> ServiceResult<()> {
+    if input.user_id != receipt.attempt.user_id || input.scope != receipt.attempt.scope {
+        return Err(ServiceError::conflict(
+            "Runner checkpoint receipt scope mismatch",
+        ));
+    }
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    if !matches!(
+        lock_invocation_scope_authority(&mut tx, input).await?,
+        InvocationScopeAuthority::Live
+    ) {
+        return Err(ServiceError::conflict(
+            "Runner checkpoint receipt run authority unavailable",
+        ));
+    }
+    let invocation = sqlx::query(
+        "SELECT status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&receipt.attempt.user_id)
+    .bind(receipt.attempt.invocation_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .ok_or_else(|| ServiceError::not_found("Runner checkpoint receipt invocation absent"))?;
+    let invocation_status: String = invocation.try_get("status").map_err(persistence)?;
+    if !matches!(
+        invocation_status.as_str(),
+        "succeeded" | "failed" | "cancelled" | "delivery_unknown"
+    ) {
+        return Err(ServiceError::conflict(
+            "Runner checkpoint receipt invocation is not logically terminal",
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT runner_grant_json, runner_terminal_hash, runner_response_artifact_id,
+         runner_response_hash, runner_response_bytes, runner_continuation_pending,
+         runner_terminal_conflict
+         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
+    )
+    .bind(&receipt.attempt.user_id)
+    .bind(receipt.attempt.attempt_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .ok_or_else(|| ServiceError::not_found("Runner checkpoint receipt attempt absent"))?;
+    let response_bytes = i64::try_from(receipt.response.byte_len.get())
+        .map_err(|_| ServiceError::invalid("Runner checkpoint receipt length overflow"))?;
+    if decode_grant(&row)?.attempt != receipt.attempt
+        || row
+            .try_get::<String, _>("runner_terminal_hash")
+            .map_err(persistence)?
+            != receipt.terminal_sha256.as_str()
+        || row
+            .try_get::<String, _>("runner_response_artifact_id")
+            .map_err(persistence)?
+            != receipt.response.artifact_id.as_str()
+        || row
+            .try_get::<String, _>("runner_response_hash")
+            .map_err(persistence)?
+            != receipt.response.sha256.as_str()
+        || row
+            .try_get::<i64, _>("runner_response_bytes")
+            .map_err(persistence)?
+            != response_bytes
+        || !row
+            .try_get::<bool, _>("runner_continuation_pending")
+            .map_err(persistence)?
+        || row
+            .try_get::<bool, _>("runner_terminal_conflict")
+            .map_err(persistence)?
+    {
+        return Err(ServiceError::conflict(
+            "Runner checkpoint receipt is stale or quarantined",
+        ));
+    }
+    tx.commit().await.map_err(persistence)
+}
+
 /// Positive and negative evidence stay on the original attempt. Absence of a
 /// row/message is never inferred as proof of no provider execution.
 pub async fn record_runner_start_evidence(
@@ -1162,6 +1249,19 @@ impl RunnerContinuationClaim {
 
     pub fn physical_terminal(&self) -> &InferenceInvocationTerminal {
         &self.physical_terminal
+    }
+
+    /// Produce the non-secret receipt that a canonical Agent Loop checkpoint
+    /// may later bind to its post-response state.  This is deliberately not
+    /// an acknowledgement: retention remains pending until run settlement.
+    pub fn checkpoint_receipt(
+        &self,
+    ) -> astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt {
+        astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt {
+            attempt: self.identity.clone(),
+            terminal_sha256: self.terminal_hash.clone(),
+            response: self.response.clone(),
+        }
     }
 }
 

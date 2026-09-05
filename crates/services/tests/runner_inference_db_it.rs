@@ -393,6 +393,18 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
             .contains(&grant.attempt),
         "logical settlement must not acknowledge Agent Backbone absorption"
     );
+    let receipt = claim.checkpoint_receipt();
+    verify_runner_checkpoint_consumption(&f.pool, &f.input, &receipt)
+        .await
+        .unwrap();
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.terminal_sha256 = RunnerInferenceDigest::new("0".repeat(64)).unwrap();
+    assert!(
+        verify_runner_checkpoint_consumption(&f.pool, &f.input, &wrong_receipt)
+            .await
+            .is_err(),
+        "a checkpoint marker cannot substitute another terminal for the same attempt"
+    );
     let mut active_tx = f.pool.get().begin().await.unwrap();
     assert!(
         acknowledge_runner_continuations_for_terminal_run_tx(

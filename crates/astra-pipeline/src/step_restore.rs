@@ -85,6 +85,9 @@ pub struct RestoredSession {
     pub llm_rounds_completed: u32,
     /// Agent-loop iteration captured with the checkpoint.
     pub current_round_index: u32,
+    /// Runner custody receipts bound to the restored canonical checkpoint.
+    pub runner_continuation_receipts:
+        Vec<astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt>,
     /// Tools currently blocked (from stall/health tracking)
     pub blocked_tools: Vec<String>,
     /// Recently used tools (for selection context)
@@ -228,6 +231,7 @@ fn build_restored_session(
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         llm_rounds_completed: heavy.llm_rounds_completed,
         current_round_index: heavy.current_round_index,
+        runner_continuation_receipts: heavy.runner_continuation_receipts,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
         activated_deferred_tool_names: heavy.activated_deferred_tool_names,
@@ -538,6 +542,7 @@ mod tests {
             budget_remaining_rounds: 5,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools,
             recent_tools: vec!["git".to_string()],
             activated_deferred_tool_names: Vec::new(),
@@ -697,6 +702,7 @@ mod tests {
             budget_remaining_rounds: 5,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
             activated_deferred_tool_names: Vec::new(),
