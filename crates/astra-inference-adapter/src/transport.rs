@@ -446,6 +446,14 @@ impl ProviderTransport {
         let work = async {
             terminal.delivery = DeliveryEvidence::MayHaveDispatched;
             let response = self.send_once(attempt).await.map_err(|error| {
+                // reqwest's connect classification covers DNS, TCP and TLS
+                // establishment failures before an HTTP request can reach the
+                // provider. Only that positive evidence can restore safe
+                // not-dispatched semantics; upload/header/body ambiguity stays
+                // conservative as MayHaveDispatched.
+                if error.is_connect() {
+                    terminal.delivery = DeliveryEvidence::NotDispatched;
+                }
                 if error.is_timeout() {
                     ExecutionStatus::Deadline
                 } else {

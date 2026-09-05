@@ -118,6 +118,31 @@ async fn rejected_or_redirected_requests_never_redispatch_or_forward_auth() {
 }
 
 #[tokio::test]
+async fn connect_failure_is_positive_not_dispatched_evidence() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let transport = transport();
+    let (events, mut receiver) = mpsc::channel(1);
+
+    let terminal = transport
+        .execute(
+            request(&transport, &endpoint),
+            ResponseMode::Sse,
+            ExecutionLimits::default(),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            &events,
+        )
+        .await;
+
+    assert_eq!(terminal.status, ExecutionStatus::Transport);
+    assert_eq!(terminal.delivery, DeliveryEvidence::NotDispatched);
+    assert_eq!(terminal.provider_bytes, 0);
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn cancel_and_deadline_preserve_partial_evidence_after_accepted_provider_bytes() {
     for cancel in [true, false] {
         let hits = Arc::new(AtomicUsize::new(0));
