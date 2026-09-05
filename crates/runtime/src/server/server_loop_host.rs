@@ -1822,7 +1822,7 @@ struct SummaryClientSkillAutoRouteJudge {
 #[derive(Clone)]
 enum ServerSummaryClient {
     Server(RuntimeSummaryClient),
-    Runner(RunnerSummaryClient),
+    Runner(Box<RunnerSummaryClient>),
 }
 
 impl ServerSummaryClient {
@@ -7034,7 +7034,7 @@ impl ServerAgenticLoopHost {
                 ))
             }
             ResolvedTurnLlmExecutor::Runner(binding) => {
-                Some(ServerSummaryClient::Runner(RunnerSummaryClient {
+                Some(ServerSummaryClient::Runner(Box::new(RunnerSummaryClient {
                     binding: binding.clone(),
                     pool: self.shared_pool.clone()?,
                     edge_pool: self.edge_connection_pool.clone()?,
@@ -7050,7 +7050,7 @@ impl ServerAgenticLoopHost {
                     max_output_tokens,
                     prompt_cache_tools: Vec::new(),
                     cache_capability: None,
-                }))
+                })))
             }
         }
     }

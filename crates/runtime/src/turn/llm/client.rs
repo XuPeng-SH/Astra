@@ -856,7 +856,6 @@ impl<'a> LlmExecutionRoute<'a> {
     /// Borrow the single trusted execution-material contract produced by
     /// model admission. Provider adapters must not rebuild this route from a
     /// client-selected model name or URL.
-    #[must_use]
     pub(crate) fn from_admitted(
         execution: &'a astra_services::AdmittedModelExecution,
     ) -> Result<Self, &'static str> {
@@ -5725,7 +5724,6 @@ pub(crate) async fn collect_runner_response(
             &collected,
         ));
     }
-    let mut collected = collected;
     reconcile_missing_output_cap_finish_reason(&mut collected, wire_output_limit);
     Ok(collected)
 }
