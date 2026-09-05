@@ -2630,9 +2630,9 @@ fn model_catalog_error_message(
     }
 }
 
-/// Fetch the full active model catalog, including provider and thinking
-/// metadata. The caller owns scheduling; this function is free of TUI
-/// references so it can run outside the input event loop.
+/// Fetch the full model catalog, including known unavailable Offerings.
+/// Selection surfaces must check `is_active`; retaining inactive rows lets the
+/// product explain and repair disconnected Runner capacity.
 pub(crate) async fn load_model_catalog(
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
@@ -2675,9 +2675,15 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
         Ok(models) => {
             let names = models
                 .iter()
+                .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
                 .filter_map(crate::cli::slash::slash_router::entry_model_name)
                 .map(ToOwned::to_owned)
                 .collect();
+            if let Some(message) =
+                crate::cli::slash::slash_router::unavailable_model_repair_summary(&models)
+            {
+                ctx.show_info(message);
+            }
             if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
                 return SlashResult::Deferred;
             }

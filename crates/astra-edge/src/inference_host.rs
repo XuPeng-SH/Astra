@@ -329,22 +329,31 @@ impl InferenceHost {
         &self,
         grant: &RunnerInferenceDispatchGrant,
         evidence: RunnerInferenceStartEvidence,
+        status: RunnerInferenceTransportStatus,
     ) -> Result<(), InferenceHostError> {
+        let valid = matches!(
+            (evidence, status),
+            (
+                RunnerInferenceStartEvidence::CancelledWithoutFence,
+                RunnerInferenceTransportStatus::Cancelled
+            ) | (
+                RunnerInferenceStartEvidence::ExpiredWithoutFence,
+                RunnerInferenceTransportStatus::Deadline
+            ) | (
+                RunnerInferenceStartEvidence::RejectedWithoutFence,
+                RunnerInferenceTransportStatus::CredentialUnavailable
+                    | RunnerInferenceTransportStatus::BindingUnavailable
+                    | RunnerInferenceTransportStatus::CapacityUnavailable
+                    | RunnerInferenceTransportStatus::Protocol
+            )
+        );
+        if !valid {
+            return Err(InferenceHostError::IdentityConflict);
+        }
         let response = RunnerInferenceResponse {
             events: vec![RunnerInferenceProviderEvent::Eof],
             transport: RunnerInferenceTransportTerminal {
-                status: match evidence {
-                    RunnerInferenceStartEvidence::CancelledWithoutFence => {
-                        RunnerInferenceTransportStatus::Cancelled
-                    }
-                    RunnerInferenceStartEvidence::ExpiredWithoutFence => {
-                        RunnerInferenceTransportStatus::Deadline
-                    }
-                    RunnerInferenceStartEvidence::RejectedWithoutFence => {
-                        RunnerInferenceTransportStatus::Protocol
-                    }
-                    _ => return Err(InferenceHostError::IdentityConflict),
-                },
+                status,
                 delivery: RunnerInferenceDeliveryEvidence::NotDispatched,
                 provider_bytes: 0,
                 events_delivered: 1,
@@ -379,8 +388,12 @@ impl InferenceHost {
             return Err(InferenceHostError::WrongIncarnation);
         }
         if grant.start_before_unix_ms <= clock.latest_server_time() {
-            self.retain_no_start(&grant, RunnerInferenceStartEvidence::ExpiredWithoutFence)
-                .await?;
+            self.retain_no_start(
+                &grant,
+                RunnerInferenceStartEvidence::ExpiredWithoutFence,
+                RunnerInferenceTransportStatus::Deadline,
+            )
+            .await?;
             return Ok(DispatchOutcome::NotStarted(
                 RunnerInferenceStartEvidence::ExpiredWithoutFence,
             ));
@@ -484,19 +497,44 @@ impl InferenceHost {
         .await;
         let (request, mode, deadline, config_lease) = match preparation {
             Ok(prepared) => prepared,
-            Err(_) => {
+            Err(error) => {
                 // Only an authenticated, exact current-incarnation grant may
                 // receive negative evidence. Persistence failure is not proof.
-                self.retain_no_start(&grant, RunnerInferenceStartEvidence::RejectedWithoutFence)
-                    .await?;
+                let status = match error {
+                    InferenceHostError::CredentialUnavailable => {
+                        RunnerInferenceTransportStatus::CredentialUnavailable
+                    }
+                    InferenceHostError::BindingUnavailable => {
+                        RunnerInferenceTransportStatus::BindingUnavailable
+                    }
+                    InferenceHostError::Capacity => {
+                        RunnerInferenceTransportStatus::CapacityUnavailable
+                    }
+                    InferenceHostError::JournalIo
+                    | InferenceHostError::Corrupt
+                    | InferenceHostError::UnsafeStorage
+                    | InferenceHostError::UnsupportedPlatform
+                    | InferenceHostError::AlreadyRunning => return Err(error),
+                    _ => RunnerInferenceTransportStatus::Protocol,
+                };
+                self.retain_no_start(
+                    &grant,
+                    RunnerInferenceStartEvidence::RejectedWithoutFence,
+                    status,
+                )
+                .await?;
                 return Ok(DispatchOutcome::NotStarted(
                     RunnerInferenceStartEvidence::RejectedWithoutFence,
                 ));
             }
         };
         if grant.start_before_unix_ms <= clock.latest_server_time() {
-            self.retain_no_start(&grant, RunnerInferenceStartEvidence::ExpiredWithoutFence)
-                .await?;
+            self.retain_no_start(
+                &grant,
+                RunnerInferenceStartEvidence::ExpiredWithoutFence,
+                RunnerInferenceTransportStatus::Deadline,
+            )
+            .await?;
             return Ok(DispatchOutcome::NotStarted(
                 RunnerInferenceStartEvidence::ExpiredWithoutFence,
             ));
@@ -567,8 +605,12 @@ impl InferenceHost {
         if grant.process_boot_nonce != self.process_boot_nonce {
             return Err(InferenceHostError::WrongIncarnation);
         }
-        self.retain_no_start(grant, RunnerInferenceStartEvidence::CancelledWithoutFence)
-            .await?;
+        self.retain_no_start(
+            grant,
+            RunnerInferenceStartEvidence::CancelledWithoutFence,
+            RunnerInferenceTransportStatus::Cancelled,
+        )
+        .await?;
         Ok(DispatchOutcome::NotStarted(
             RunnerInferenceStartEvidence::CancelledWithoutFence,
         ))
@@ -765,6 +807,9 @@ fn physical_terminal(response: &RunnerInferenceResponse) -> InferenceInvocationT
         ) => InferenceTerminalStatus::Cancelled,
         (
             RunnerInferenceTransportStatus::Deadline
+            | RunnerInferenceTransportStatus::CredentialUnavailable
+            | RunnerInferenceTransportStatus::BindingUnavailable
+            | RunnerInferenceTransportStatus::CapacityUnavailable
             | RunnerInferenceTransportStatus::Protocol
             | RunnerInferenceTransportStatus::Limit,
             RunnerInferenceDeliveryEvidence::NotDispatched,
@@ -795,8 +840,19 @@ fn physical_terminal(response: &RunnerInferenceResponse) -> InferenceInvocationT
             InferenceUsageStatus::Unavailable
         },
         provider_response_id,
-        error_kind: (status != InferenceTerminalStatus::Succeeded)
-            .then(|| "runner_provider_transport".to_string()),
+        error_kind: (status != InferenceTerminalStatus::Succeeded).then(|| {
+            match response.transport.status {
+                RunnerInferenceTransportStatus::CredentialUnavailable => {
+                    "runner_credential_unavailable"
+                }
+                RunnerInferenceTransportStatus::BindingUnavailable => "runner_binding_unavailable",
+                RunnerInferenceTransportStatus::CapacityUnavailable => {
+                    "runner_capacity_unavailable"
+                }
+                _ => "runner_provider_transport",
+            }
+            .to_string()
+        }),
         error_message: None,
     }
 }

@@ -26,6 +26,10 @@ fn transport() -> ProviderTransport {
 }
 impl Fixture {
     async fn new(endpoint: &str) -> Self {
+        Self::new_with_credential(endpoint, LocalCredentialRef::None).await
+    }
+
+    async fn new_with_credential(endpoint: &str, credential: LocalCredentialRef) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let models_path = directory.path().join("models.json");
         let mut config = LocalModelConfig::default();
@@ -37,7 +41,7 @@ impl Fixture {
                 model: "fixture".into(),
                 context_window: 1024,
                 max_output_tokens: 64,
-                credential: LocalCredentialRef::None,
+                credential,
             },
         );
         LocalModelConfigStore::with_path(models_path.clone())
@@ -106,6 +110,39 @@ impl Fixture {
 }
 
 const REQUEST: &str = r#"{"model":"fixture","messages":[{"role":"user","content":"prompt-canary"}],"max_tokens":64,"stream":true}"#;
+
+#[tokio::test]
+async fn missing_local_credential_is_typed_no_start_and_never_provider_io() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new_with_credential(
+        &server.uri(),
+        LocalCredentialRef::Environment {
+            name: "ABSENT_FIXTURE_KEY".to_string(),
+        },
+    )
+    .await;
+    let grant = fixture.grant("missing-credential", REQUEST).await;
+
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(grant, REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::RejectedWithoutFence)
+    ));
+    let payload = fixture.terminal().await;
+    let response: RunnerInferenceResponse = serde_json::from_str(&payload.response_json).unwrap();
+    assert_eq!(
+        response.transport.status,
+        RunnerInferenceTransportStatus::CredentialUnavailable
+    );
+    assert_eq!(
+        payload.terminal.error_kind.as_deref(),
+        Some("runner_credential_unavailable")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn durable_fence_precedes_exact_single_http_call_and_ack_erases_only_payload() {

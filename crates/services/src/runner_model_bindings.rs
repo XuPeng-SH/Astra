@@ -53,6 +53,40 @@ impl ResolvedRunnerModelBinding {
     }
 }
 
+/// Stable catalog projection. Availability is deliberately separate from the
+/// immutable published definition: heartbeat expiry may make a binding
+/// unselectable, but it must not make the user's configured model disappear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerModelCatalogBinding {
+    pub user_id: String,
+    pub definition: RunnerInferenceBindingDefinition,
+    pub online: bool,
+}
+
+impl RunnerModelCatalogBinding {
+    pub fn catalog_item(&self) -> crate::models::ModelListItem {
+        crate::models::ModelListItem {
+            offering_id: runner_offering_id(&self.user_id, &self.definition.identity),
+            access_id: format!("runner-{}", self.definition.identity.runner_id.as_str()),
+            access_kind: crate::models::ModelAccessKind::ThisDevice,
+            // Server cannot prove that an arbitrary Web/CLI consumer is
+            // colocated with this Runner. Local surfaces may render “This
+            // device” only after their private host handshake.
+            access_label: "Personal Runner".into(),
+            execution_placement: crate::models::ModelExecutionPlacement::Edge,
+            name: self.definition.model_name.as_str().into(),
+            provider: "openai".into(),
+            description: (!self.online)
+                .then(|| "Runner offline — reconnect this device to use the model".into()),
+            is_active: self.online,
+            context_window: self.definition.context_window.get() as i32,
+            max_completion_tokens: Some(self.definition.max_output_tokens.get() as i32),
+            architecture: None,
+            thinking_capability: None,
+        }
+    }
+}
+
 /// Derived from authenticated registry ownership, never deserialized from a
 /// publication. The connection identity fences new control operations only.
 #[derive(Clone, Debug)]
@@ -454,6 +488,52 @@ pub async fn list_effective_runner_model_bindings(
                 process_boot_nonce: RunnerInferenceId::new(boot).map_err(ServiceError::invalid)?,
                 publication_revision: u64::try_from(revision)
                     .map_err(|_| ServiceError::invalid("invalid durable publication revision"))?,
+            })
+        })
+        .collect()
+}
+
+/// Latest enabled bindings, including a Runner whose live lease has expired.
+/// This query is presentation-only; execution always goes through
+/// `resolve_runner_offering`, which revalidates current authority under lock.
+pub async fn list_runner_model_catalog_bindings(
+    pool: &SharedPool,
+    user_id: &str,
+) -> ServiceResult<Vec<RunnerModelCatalogBinding>> {
+    let rows = sqlx::query(
+        "SELECT p.definition_json,
+           IF(r.registration_state = 1 AND r.inference_edge_id = r.edge_id
+              AND r.inference_boot_nonce IS NOT NULL
+              AND r.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND), 1, 0) AS online
+         FROM runner_model_binding_publications p
+         LEFT JOIN edge_agent_registry r
+           ON r.user_id = p.user_id AND r.edge_agent_id = p.runner_id
+          AND r.inference_journal_id = p.journal_id
+         WHERE p.user_id = ? AND p.enabled = TRUE
+           AND NOT EXISTS (SELECT 1 FROM runner_model_binding_publications newer
+             WHERE newer.user_id = p.user_id AND newer.runner_id = p.runner_id
+               AND newer.journal_id = p.journal_id AND newer.binding_id = p.binding_id
+               AND newer.publication_revision > p.publication_revision)
+         ORDER BY p.runner_id, p.journal_id, p.binding_id LIMIT 257",
+    )
+    .bind(user_id)
+    .fetch_all(pool.get())
+    .await
+    .map_err(storage)?;
+    if rows.len() > 256 {
+        return Err(ServiceError::invalid(
+            "personal Runner catalog exceeds 256 bindings",
+        ));
+    }
+    rows.into_iter()
+        .map(|row| {
+            let encoded: String = row.try_get("definition_json").map_err(storage)?;
+            let definition = serde_json::from_str(&encoded)
+                .map_err(|_| ServiceError::invalid("invalid durable Runner definition"))?;
+            Ok(RunnerModelCatalogBinding {
+                user_id: user_id.into(),
+                definition,
+                online: row.try_get::<i64, _>("online").map_err(storage)? == 1,
             })
         })
         .collect()

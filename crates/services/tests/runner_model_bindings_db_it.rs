@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use astra_services::runner_model_bindings::{
     AuthenticatedRunnerConnection, enroll_runner_inference, list_effective_runner_model_bindings,
-    publish_runner_binding, resolve_runner_model_binding, resolve_runner_offering,
-    runner_offering_id,
+    list_runner_model_catalog_bindings, publish_runner_binding, resolve_runner_model_binding,
+    resolve_runner_offering, runner_offering_id,
 };
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelExecutionMaterial, ModelService,
@@ -178,6 +178,27 @@ async fn runner_reconnect_requires_executor_enrollment_but_preserves_publication
         .execute(pool.get())
         .await
         .unwrap();
+    assert!(
+        list_effective_runner_model_bindings(&pool, &user)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a superseded socket is never selectable"
+    );
+    let known = list_runner_model_catalog_bindings(&pool, &user)
+        .await
+        .unwrap();
+    assert_eq!(known.len(), 1);
+    assert!(!known[0].online);
+    assert!(!known[0].catalog_item().is_active);
+    assert!(
+        known[0]
+            .catalog_item()
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("offline")),
+        "known capacity carries a repairable unavailable projection"
+    );
     let current = AuthenticatedRunnerConnection {
         edge_id: "socket-2".into(),
         ..old.clone()

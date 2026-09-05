@@ -336,6 +336,14 @@ pub enum RunnerInferenceTransportStatus {
     Complete,
     Cancelled,
     Deadline,
+    /// Runner could not materialize the configured credential before any
+    /// provider I/O. This is action-required local state, not provider 401.
+    CredentialUnavailable,
+    /// The admitted immutable binding no longer resolves locally.
+    BindingUnavailable,
+    /// Runner rejected before its durable dispatch fence because its bounded
+    /// local execution capacity was full.
+    CapacityUnavailable,
     Transport,
     Protocol,
     Limit,
