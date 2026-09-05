@@ -180,6 +180,14 @@ pub(super) async fn completions_handler(
     );
     // 4. Execute through the same typed provider boundary as agent turns.
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+    let route =
+        crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted).map_err(|_| {
+            crate::error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Selected Offering requires a connected Runner executor",
+                "runner_inference_unavailable",
+            )
+        })?;
     let parsed = durable_ledger
         .execute_nonstream(
             crate::turn::llm::transport::global_llm_client()
@@ -190,7 +198,7 @@ pub(super) async fn completions_handler(
                 messages: &messages,
                 tools: &[],
                 cache_capability: None,
-                route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
+                route,
                 max_output_tokens: Some(request.max_tokens as usize),
                 temperature: Some(request.temperature),
                 has_fallback: false,

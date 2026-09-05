@@ -16,7 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use astra_inference_adapter::openai::OpenAiPayload;
 use astra_inference_adapter::sse::{ParsedSseEvent, decode_provider_sse};
+use astra_inference_adapter::transport::{
+    DEFAULT_ERROR_RESPONSE_LIMIT_BYTES, ProviderTransport, ResponseReadErrorKind, SendError,
+    provider_headers, read_json_response, read_response_body,
+};
 use astra_inference_adapter::{
     DEFAULT_REQUEST_LIMIT_BYTES, DEFAULT_SSE_EVENT_LIMIT_BYTES, ExactProviderRequest,
     ProviderProtocol, RequestCompileError,
@@ -578,11 +583,6 @@ impl PreparedProviderRequest {
         &self.identity
     }
 
-    #[must_use]
-    pub(crate) fn body(&self) -> Bytes {
-        self.request.body()
-    }
-
     #[cfg(test)]
     fn body_bytes(&self) -> Bytes {
         self.request.body()
@@ -775,9 +775,11 @@ impl<'a> LlmExecutionRoute<'a> {
     /// model admission. Provider adapters must not rebuild this route from a
     /// client-selected model name or URL.
     #[must_use]
-    pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
-        let material = execution.server_material();
-        Self {
+    pub(crate) fn from_admitted(
+        execution: &'a astra_services::AdmittedModelExecution,
+    ) -> Result<Self, &'static str> {
+        let material = execution.server_material()?;
+        Ok(Self {
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
             api_key: &material.api_key,
@@ -790,7 +792,7 @@ impl<'a> LlmExecutionRoute<'a> {
             request_timeout: material
                 .request_timeout_ms
                 .map(std::time::Duration::from_millis),
-        }
+        })
     }
 }
 
@@ -1105,7 +1107,7 @@ pub(crate) fn provider_attempt_terminal_from_delivery_unknown_error_with_partial
 /// inference request.
 pub(crate) fn classify_provider_send_error(
     context: &str,
-    error: &reqwest::Error,
+    error: &SendError,
 ) -> (astra_core::ClassifiedError, bool) {
     let retry_safe = error.is_connect();
     let kind = if retry_safe {
@@ -1117,6 +1119,18 @@ pub(crate) fn classify_provider_send_error(
         astra_core::ClassifiedError::new(kind, format!("{context}: {error}")),
         retry_safe,
     )
+}
+
+fn provider_http_error(
+    kind: astra_core::ErrorKind,
+    status: u16,
+    provider_bytes: u64,
+) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(kind, if kind == astra_core::ErrorKind::Auth {
+        "LLM provider authentication failed".to_string()
+    } else {
+        format!("LLM provider response HTTP {status} ({provider_bytes} bytes received)")
+    }).with_details_json(json!({"code":"provider_http_error", "http_status":status, "provider_bytes_received":provider_bytes}).to_string())
 }
 
 pub(crate) async fn finish_observed_provider_attempt(
@@ -3502,25 +3516,6 @@ fn merge_json_object_with_depth(target: &mut Value, overrides: &Map<String, Valu
     }
 }
 
-pub(crate) fn apply_provider_auth(
-    mut req: reqwest::RequestBuilder,
-    provider: &str,
-    api_key: &str,
-    header_overrides: Option<&HashMap<String, String>>,
-) -> reqwest::RequestBuilder {
-    if provider_uses_anthropic_messages(provider) {
-        if !has_llm_auth_override(provider, header_overrides) {
-            req = req.header("x-api-key", api_key);
-        }
-        req.header("anthropic-version", "2023-06-01")
-    } else {
-        if !has_llm_auth_override(provider, header_overrides) {
-            req = req.header("authorization", format!("Bearer {api_key}"));
-        }
-        req
-    }
-}
-
 /// Strip empty `tool_calls: []` from assistant messages in-place.
 ///
 /// Thin wrapper around the canonical implementation in `astra_turn_core`.
@@ -4313,46 +4308,6 @@ fn extract_think_tags(text: &str) -> Option<(String, String)> {
     }
 }
 
-pub(crate) fn apply_llm_header_overrides(
-    mut req: reqwest::RequestBuilder,
-    header_overrides: Option<&HashMap<String, String>>,
-) -> reqwest::RequestBuilder {
-    let Some(header_overrides) = header_overrides else {
-        return req;
-    };
-    for (name, value) in header_overrides {
-        if name.starts_with("__astra_") {
-            continue;
-        }
-        let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        let Ok(header_value) = reqwest::header::HeaderValue::from_str(value) else {
-            continue;
-        };
-        req = req.header(header_name, header_value);
-    }
-    req
-}
-
-fn has_llm_auth_override(
-    provider: &str,
-    header_overrides: Option<&HashMap<String, String>>,
-) -> bool {
-    let Some(header_overrides) = header_overrides else {
-        return false;
-    };
-    if provider_uses_anthropic_messages(provider) {
-        header_overrides
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("x-api-key"))
-    } else {
-        header_overrides
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization"))
-    }
-}
-
 /// Call the LLM streaming API, collect the full response, and return a structured result.
 ///
 /// Unlike `call_llm_stream` (which returns raw SSE bytes), this function
@@ -4593,6 +4548,21 @@ async fn call_llm_and_collect_with_total_budget(
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
 
+    let headers = provider_headers(
+        llm_provider_protocol(provider),
+        api_key,
+        header_overrides
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
+    .map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            error.to_string(),
+        )
+    })?;
+
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let max_retries = LLM_MAX_RETRIES;
@@ -4679,13 +4649,18 @@ async fn call_llm_and_collect_with_total_budget(
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let request = client
+            .prepare(&url, headers.clone(), &prepared_request.request, None)
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    error.to_string(),
+                )
+            })?;
         let observed_attempt = match attempt_observer {
             Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
             None => None,
         };
-        let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, header_overrides);
-        req = apply_llm_header_overrides(req, header_overrides);
         // `total_budget` is the provider-work wall-clock bound, not merely a retry-loop
         // check.  Previously a streaming request without an offering-specific
         // timeout could remain inside one `send`/response body beyond the
@@ -4716,11 +4691,10 @@ async fn call_llm_and_collect_with_total_budget(
         // the offering-specific response-start limit is enforced only by the
         // `send()` select below. A healthy progressing stream may therefore
         // outlive its header deadline without outliving total/idle budgets.
-        req = req.timeout(remaining_total_budget);
+        let request = request.constrain_timeout(remaining_total_budget);
 
         tracing::debug!(
             target: "astra_runtime::llm_client",
-            url = %url,
             attempt,
             purpose = purpose.as_str(),
             provider,
@@ -4736,7 +4710,7 @@ async fn call_llm_and_collect_with_total_budget(
                     .expect("observed attempt requires observer")
                     .note_dispatch_started(attempt_index);
             }
-            req.body(prepared_request.body()).send().await
+            client.send_once(request).await
         };
         let send_result = tokio::select! {
             biased;
@@ -4786,7 +4760,6 @@ async fn call_llm_and_collect_with_total_budget(
             Ok(Ok(r)) => {
                 tracing::debug!(
                     target: "astra_runtime::llm_client",
-                    url = %url,
                     status = r.status().as_u16(),
                     "LLM request connected"
                 );
@@ -4795,7 +4768,6 @@ async fn call_llm_and_collect_with_total_budget(
             Ok(Err(e)) => {
                 tracing::warn!(
                     target: "astra_runtime::llm_client",
-                    url = %url,
                     error = %e,
                     "LLM send failed"
                 );
@@ -5259,7 +5231,7 @@ async fn call_llm_and_collect_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = response.text();
+        let body = read_response_body(response, DEFAULT_ERROR_RESPONSE_LIMIT_BYTES);
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -5281,10 +5253,16 @@ async fn call_llm_and_collect_with_total_budget(
                 return Err(error);
             }
         };
-        let text = match body_result {
-            Ok(text) => text,
+        let (text, provider_bytes) = match body_result {
+            Ok(body) => (
+                String::from_utf8_lossy(&body.bytes).into_owned(),
+                body.provider_bytes,
+            ),
             Err(error) => {
-                let kind = if started.elapsed() >= total_budget {
+                let received_bytes = error.provider_bytes;
+                let kind = if error.kind == ResponseReadErrorKind::Limit {
+                    astra_core::ErrorKind::ResourceLimit
+                } else if started.elapsed() >= total_budget {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if error.is_timeout() {
                     astra_core::ErrorKind::StreamIdle
@@ -5304,37 +5282,32 @@ async fn call_llm_and_collect_with_total_budget(
                         format!("LLM error response body could not be read: {error}"),
                     )
                 };
-                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                let error = error.with_details_json(
+                    json!({"http_status":status,"provider_bytes_received":received_bytes})
+                        .to_string(),
+                );
+                finish_observed_provider_delivery_unknown(
+                    attempt_observer,
+                    observed_attempt,
+                    &error,
+                )
+                .await?;
                 return Err(error);
             }
         };
 
-        // Auth errors: redact the body in logs and return a generic message
-        // so provider-echoed secrets cannot leak through error propagation.
+        // Provider text is used only for classification, never diagnostics.
         if status == 401 || status == 403 {
-            let truncated = &text[..text.len().min(80)];
-            let redacted = redact_provider_secrets(truncated);
             tracing::warn!(
                 target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}: {redacted}",
+                status, provider_bytes, "LLM provider authentication failed",
             );
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                "LLM provider authentication failed".to_string(),
-            );
+            let error = provider_http_error(astra_core::ErrorKind::Auth, status, provider_bytes);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
 
-        // For other 4xx errors, suppress the raw response body to avoid
-        // leaking secrets that providers may echo back. Retain body for 5xx
-        // (helpful for diagnosing transient backend failures) and the 400
-        // context-window check below (which still needs to inspect text).
-        last_err = if (400..500).contains(&status) {
-            format!("LLM request rejected: {status}")
-        } else {
-            format!("LLM error {status}: {text}")
-        };
+        last_err = format!("LLM provider response HTTP {status} ({provider_bytes} bytes received)");
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
@@ -5421,10 +5394,8 @@ async fn call_llm_and_collect_with_total_budget(
 
         // Context-window errors — classified at source, no string prefix needed.
         if status == 400 && astra_core::is_llm_context_window_error(&text) {
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContextWindow,
-                format!("LLM error {status}: {text}"),
-            );
+            let error =
+                provider_http_error(astra_core::ErrorKind::ContextWindow, status, provider_bytes);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
@@ -5750,16 +5721,14 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 });
             }
         };
+        let payload = OpenAiPayload::stream(&chunk);
         if response_id.is_none() {
-            response_id = chunk
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
+            response_id = payload.response_id.map(ToString::to_string);
         }
         // Parse usage from any chunk. Streaming endpoints we call are always
         // OpenAI-compatible: Bedrock Converse streams are intercepted at a
         // higher level and decoded by the dedicated Bedrock transport.
-        if let Some(u) = chunk.get("usage").and_then(Value::as_object)
+        if let Some(u) = payload.usage
             && let Some(extracted) = crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
                 u,
@@ -5772,34 +5741,22 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             break;
         }
 
-        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-            continue;
-        };
-
         // Extract finish_reason from the last chunk that carries one.
-        if let Some(fr) = choices
-            .first()
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(Value::as_str)
-        {
+        if let Some(fr) = payload.finish_reason {
             finish_reason = Some(fr.to_string());
             yield_state.mark_terminal();
             made_progress = true;
         }
 
-        let Some(delta) = choices
-            .first()
-            .and_then(|c| c.get("delta"))
-            .and_then(Value::as_object)
-        else {
+        if !payload.message_present {
             if yield_state.is_terminal() && !usage.is_empty() {
                 break;
             }
             continue;
-        };
+        }
 
         // Text content
-        if let Some(content) = delta.get("content").and_then(Value::as_str)
+        if let Some(content) = payload.text
             && !content.is_empty()
         {
             accumulated_bytes += content.len();
@@ -5847,7 +5804,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         }
 
         // Reasoning
-        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
+        if let Some(r) = payload.reasoning
             && !r.is_empty()
         {
             accumulated_bytes += r.len();
@@ -5878,7 +5835,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         }
 
         // Tool calls (streaming accumulation)
-        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+        if let Some(tcs) = payload.tool_calls {
             for tc in tcs {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if tool_calls_map.len() >= MAX_STREAM_TOOL_CALLS
@@ -6704,7 +6661,7 @@ enum StreamCollectError {
 
 #[cfg(test)]
 pub(crate) async fn call_llm_nonstream(
-    client: &reqwest::Client,
+    client: &ProviderTransport,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
@@ -6720,7 +6677,7 @@ pub(crate) async fn call_llm_nonstream(
 
 #[cfg(test)]
 pub(crate) async fn call_llm_nonstream_no_tool_choice(
-    client: &reqwest::Client,
+    client: &ProviderTransport,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
@@ -6735,7 +6692,7 @@ pub(crate) async fn call_llm_nonstream_no_tool_choice(
 }
 
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
-    client: &reqwest::Client,
+    client: &ProviderTransport,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
@@ -6751,7 +6708,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
 }
 
 async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
-    client: &reqwest::Client,
+    client: &ProviderTransport,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
@@ -6832,13 +6789,32 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     );
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let headers = provider_headers(
+        llm_provider_protocol(provider),
+        api_key,
+        header_overrides
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
+    .map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            error.to_string(),
+        )
+    })?;
+    let request = client
+        .prepare(&url, headers, &prepared_request.request, None)
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?;
     let observed_attempt = match attempt_observer {
         Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
         None => None,
     };
-    let mut req = client.post(&url).header("content-type", "application/json");
-    req = apply_provider_auth(req, provider, api_key, header_overrides);
-    req = apply_llm_header_overrides(req, header_overrides);
 
     // Apply per-request timeout (overrides the client-level default).
     let remaining = timeout.saturating_sub(started.elapsed());
@@ -6854,9 +6830,9 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         .map(|value| value.min(remaining))
         .unwrap_or(remaining);
     let total_budget_owns_deadline = request_timeout.is_none_or(|value| remaining <= value);
+    let request = request.constrain_timeout(effective_timeout);
     tracing::debug!(
         target: "astra_runtime::llm_client",
-        url = %url,
         purpose = purpose.as_str(),
         provider,
         model_name,
@@ -6868,10 +6844,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 .expect("observed attempt requires observer")
                 .note_dispatch_started(attempt_index);
         }
-        req.timeout(effective_timeout)
-            .body(prepared_request.body())
-            .send()
-            .await
+        client.send_once(request).await
     };
     let resp = match send_request.await {
         Ok(response) => response,
@@ -6879,7 +6852,6 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
-                url = %url,
                 elapsed_ms = elapsed.as_millis() as u64,
                 configured_timeout_s = effective_timeout.as_secs(),
                 error = %e,
@@ -6925,33 +6897,49 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let text = match resp.text().await {
-            Ok(text) => text,
-            Err(body_error) => {
-                let kind = if body_error.is_timeout() && total_budget_owns_deadline {
-                    astra_core::ErrorKind::ProviderDeadline
-                } else if body_error.is_timeout() {
-                    astra_core::ErrorKind::StreamIdle
-                } else {
-                    astra_core::ErrorKind::StreamTransport
-                };
-                let error = if kind == astra_core::ErrorKind::ProviderDeadline {
-                    provider_deadline_from_transport(
-                        "reading the non-stream provider error response body",
-                        &body_error.to_string(),
-                        started.elapsed(),
-                        None,
+        let (text, provider_bytes) =
+            match read_response_body(resp, DEFAULT_ERROR_RESPONSE_LIMIT_BYTES).await {
+                Ok(body) => (
+                    String::from_utf8_lossy(&body.bytes).into_owned(),
+                    body.provider_bytes,
+                ),
+                Err(body_error) => {
+                    let received_bytes = body_error.provider_bytes;
+                    let kind = if body_error.kind == ResponseReadErrorKind::Limit {
+                        astra_core::ErrorKind::ResourceLimit
+                    } else if body_error.is_timeout() && total_budget_owns_deadline {
+                        astra_core::ErrorKind::ProviderDeadline
+                    } else if body_error.is_timeout() {
+                        astra_core::ErrorKind::StreamIdle
+                    } else {
+                        astra_core::ErrorKind::StreamTransport
+                    };
+                    let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                        provider_deadline_from_transport(
+                            "reading the non-stream provider error response body",
+                            &body_error.to_string(),
+                            started.elapsed(),
+                            None,
+                        )
+                    } else {
+                        astra_core::ClassifiedError::new(
+                            kind,
+                            format!("LLM non-stream error response body failed: {body_error}"),
+                        )
+                    };
+                    let error = error.with_details_json(
+                        json!({"http_status":status,"provider_bytes_received":received_bytes})
+                            .to_string(),
+                    );
+                    finish_observed_provider_delivery_unknown(
+                        attempt_observer,
+                        observed_attempt,
+                        &error,
                     )
-                } else {
-                    astra_core::ClassifiedError::new(
-                        kind,
-                        format!("LLM non-stream error response body failed: {body_error}"),
-                    )
-                };
-                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-                return Err(error);
-            }
-        };
+                    .await?;
+                    return Err(error);
+                }
+            };
         let kind = if status == 401 || status == 403 {
             astra_core::ErrorKind::Auth
         } else if is_rate_limit_status(status) {
@@ -6965,12 +6953,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         } else {
             astra_core::ErrorKind::Unknown
         };
-        let detail = redact_provider_secrets(&text);
-        let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-        let error = astra_core::ClassifiedError::new(
-            kind,
-            format!("LLM non-stream request error {status}: {detail}"),
-        );
+        let error = provider_http_error(kind, status, provider_bytes);
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
@@ -6983,10 +6966,13 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 .map(ToString::to_string)
         })
         .flatten();
-    let v: Value = match resp.json().await {
-        Ok(value) => value,
+    let v: Value = match read_json_response(resp, DEFAULT_SSE_EVENT_LIMIT_BYTES).await {
+        Ok(decoded) => decoded.value,
         Err(error) => {
-            let kind = if error.is_timeout() && total_budget_owns_deadline {
+            let provider_bytes = error.provider_bytes;
+            let kind = if error.kind == ResponseReadErrorKind::Limit {
+                astra_core::ErrorKind::ResourceLimit
+            } else if error.is_timeout() && total_budget_owns_deadline {
                 astra_core::ErrorKind::ProviderDeadline
             } else if error.is_timeout() {
                 astra_core::ErrorKind::StreamIdle
@@ -7003,6 +6989,13 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             } else {
                 astra_core::ClassifiedError::new(kind, error.to_string())
             };
+            let mut details = error
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<Value>(details).ok())
+                .unwrap_or_else(|| json!({}));
+            details["provider_bytes_received"] = json!(provider_bytes);
+            let error = error.with_details_json(details.to_string());
             let partial = LlmCallResult {
                 response_id: transport_response_id.clone(),
                 ..LlmCallResult::default()
@@ -7035,7 +7028,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
 }
 
 fn nonstream_send_error_message(
-    error: &reqwest::Error,
+    error: &SendError,
     effective_timeout: std::time::Duration,
     elapsed: std::time::Duration,
 ) -> String {
@@ -7145,12 +7138,12 @@ fn parse_openai_compatible_nonstream_response(
     model_name: &str,
     started: Instant,
 ) -> LlmCallResult {
-    let mut full_text = String::new();
-    let mut reasoning = String::new();
-    let mut tool_calls = Vec::new();
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let payload = OpenAiPayload::response(v);
+    let mut full_text = payload.text.unwrap_or_default().to_owned();
+    let mut reasoning = payload.reasoning.unwrap_or_default().to_owned();
+    let mut tool_calls = payload.tool_calls.unwrap_or_default().to_vec();
+    let usage = payload
+        .usage
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
@@ -7160,30 +7153,7 @@ fn parse_openai_compatible_nonstream_response(
         .map(|u| u.to_json_map())
         .unwrap_or_default();
 
-    if let Some(choice) = v
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        && let Some(msg) = choice.get("message").and_then(Value::as_object)
-    {
-        if let Some(content) = msg.get("content").and_then(Value::as_str) {
-            full_text = content.to_string();
-        }
-        if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
-            reasoning = r.to_string();
-        }
-        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
-            tool_calls = tcs.clone();
-        }
-    }
-
-    let finish_reason = v
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(Value::as_str)
-        .map(String::from);
+    let finish_reason = payload.finish_reason.map(String::from);
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
     if let Some(parsed) =
@@ -8247,10 +8217,8 @@ mod tests {
             }),
         );
         let base = spawn_local_http_server(app).await;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("build client");
+        let client =
+            ProviderTransport::build(reqwest::Client::builder().no_proxy()).expect("build client");
         // Use a very short timeout — should fail before the 5s delay completes.
         let timeout = std::time::Duration::from_millis(100);
         let observer = RecordingAttemptObserver::default();
@@ -9508,7 +9476,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_send_error_retries_only_connect_before_delivery() {
-        let connect_error = sample_reqwest_stream_error().await;
+        let connect_error = SendError::from(sample_reqwest_stream_error().await);
         let (classified, retry_safe) =
             classify_provider_send_error("provider send failed", &connect_error);
         assert!(retry_safe);
@@ -9518,7 +9486,7 @@ mod tests {
             astra_services::InferenceTerminalStatus::Failed
         );
 
-        let response_timeout = sample_reqwest_response_timeout_error().await;
+        let response_timeout = SendError::from(sample_reqwest_response_timeout_error().await);
         assert!(response_timeout.is_timeout());
         let (classified, retry_safe) =
             classify_provider_send_error("provider send failed", &response_timeout);
@@ -13267,14 +13235,20 @@ mod tests {
         .await
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-        assert!(err.message.contains("context_length_exceeded"));
+        assert!(!err.message.contains("context_length_exceeded"));
+        let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["http_status"], 400);
+        assert!(details["provider_bytes_received"].as_u64().unwrap() > 0);
     }
 
     /// Mock server that returns 401 Unauthorized.
     async fn mock_401() -> Response {
         Response::builder()
             .status(401)
-            .body(Body::from("Unauthorized"))
+            .body(Body::from(format!(
+                "{}private-provider-canary",
+                "私".repeat(40)
+            )))
             .unwrap()
     }
 
@@ -13317,6 +13291,87 @@ mod tests {
             err.message
         );
         assert!(err.message.contains("authentication failed"));
+        assert!(!format!("{err:?}").contains("private-provider-canary"));
+    }
+
+    #[tokio::test]
+    async fn both_http_modes_bound_error_bodies_and_keep_private_echoes_out_of_errors() {
+        for streaming in [true, false] {
+            for oversized in [false, true] {
+                let hits = Arc::new(AtomicUsize::new(0));
+                let body = if oversized {
+                    "x".repeat(DEFAULT_ERROR_RESPONSE_LIMIT_BYTES + 1)
+                } else {
+                    "private-provider-canary".to_string()
+                };
+                let app = Router::new().route(
+                    "/chat/completions",
+                    post({
+                        let hits = hits.clone();
+                        move || {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let body = body.clone();
+                            async move {
+                                Response::builder()
+                                    .status(if oversized { 502 } else { 401 })
+                                    .body(Body::from(body))
+                                    .unwrap()
+                            }
+                        }
+                    }),
+                );
+                let base = spawn_local_http_server(app).await;
+                let messages = [json!({"role":"user","content":"fixture"})];
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        model_name: "bounded-error-body",
+                        wire_model_name: None,
+                        api_key: "local-canary-key",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let transport =
+                    ProviderTransport::build(reqwest::Client::builder().no_proxy()).unwrap();
+                let error = if streaming {
+                    call_llm_and_collect(call, LlmCancel::None).await
+                } else {
+                    call_llm_nonstream(&transport, call, Duration::from_secs(30)).await
+                }
+                .unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    if oversized {
+                        astra_core::ErrorKind::ResourceLimit
+                    } else {
+                        astra_core::ErrorKind::Auth
+                    }
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                assert!(!format!("{error:?}").contains("canary"));
+                let details: Value =
+                    serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+                assert!(details["provider_bytes_received"].as_u64().unwrap() > 0);
+                if oversized {
+                    assert!(
+                        details["provider_bytes_received"].as_u64().unwrap()
+                            > DEFAULT_ERROR_RESPONSE_LIMIT_BYTES as u64
+                    );
+                }
+            }
+        }
     }
 
     #[test]

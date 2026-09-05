@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
+pub mod runner;
+
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
     ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology,
@@ -13,6 +15,15 @@ use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_off
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
+
+fn require_server_ledger_path(input: &InferenceInvocationInput) -> ServiceResult<()> {
+    if input.execution_placement != ModelExecutionPlacement::Server {
+        return Err(ServiceError::invalid(
+            "Runner inference requires exact remote grant and custody APIs",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
@@ -1530,6 +1541,7 @@ pub async fn admit_inference_invocation(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let db = pool.get();
     if let Some(persisted) = load_invocation_admission_fact(db, plan).await? {
         return Err(existing_invocation_error(plan, &persisted));
@@ -2768,6 +2780,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     invocation: &InferenceInvocationPlan,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&invocation.input)?;
     validate_first_provider_attempt_binding(invocation, attempt)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
@@ -3009,6 +3022,7 @@ pub async fn begin_inference_provider_attempt(
     pool: &SharedPool,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
     if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
@@ -4146,6 +4160,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     validate_first_provider_attempt_binding(plan, attempt)?;
     if terminal.status != InferenceTerminalStatus::Succeeded {
         return Err(ServiceError::invalid(
@@ -4333,6 +4348,7 @@ pub async fn finish_inference_provider_attempt(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
@@ -6013,6 +6029,23 @@ async fn recover_expired_inference_invocation(
             "inference owner generation exhausted for {user_id}/{invocation_id}"
         ))
     })?;
+    // A remote grant may have escaped and its Runner may still own response
+    // custody. Lease expiry cannot synthesize away that authority. The Runner
+    // recovery owner derives reconciliation/continuation work from these same
+    // attempt rows and accepts exact late terminal evidence.
+    if sqlx::query(
+        "SELECT 1 FROM inference_provider_attempts
+        WHERE user_id = ? AND invocation_id = ? AND runner_grant_json IS NOT NULL LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some()
+    {
+        tx.rollback().await?;
+        return Ok(0);
+    }
     let settlement_exists = sqlx::query(
         "SELECT 1 FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
@@ -6209,6 +6242,12 @@ async fn recover_expired_inference_invocations_batch(
              WHERE invocation.status = 'admitted'
                AND invocation.owner_lease_expires_at <= NOW(6)
                AND NOT EXISTS (
+                   SELECT 1 FROM inference_provider_attempts AS remote_attempt
+                   WHERE remote_attempt.user_id = invocation.user_id
+                     AND remote_attempt.invocation_id = invocation.invocation_id
+                     AND remote_attempt.runner_grant_json IS NOT NULL
+               )
+               AND NOT EXISTS (
                    SELECT 1 FROM inference_invocation_settlement_debts AS debt
                    WHERE debt.user_id = invocation.user_id
                      AND debt.invocation_id = invocation.invocation_id
@@ -6389,6 +6428,7 @@ pub async fn finish_inference_invocation(
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let db = pool.get();
