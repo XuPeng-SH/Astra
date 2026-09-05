@@ -1833,7 +1833,9 @@ impl ServerSummaryClient {
     ) -> Self {
         match self {
             Self::Server(client) => {
-                Self::Server(client.with_prompt_cache_context(tools, cache_capability))
+                Self::Server(Box::new(
+                    client.with_prompt_cache_context(tools, cache_capability),
+                ))
             }
             Self::Runner(mut client) => {
                 client.prompt_cache_tools = tools;
