@@ -807,6 +807,7 @@ fn physical_terminal(response: &RunnerInferenceResponse) -> InferenceInvocationT
         ) => InferenceTerminalStatus::Cancelled,
         (
             RunnerInferenceTransportStatus::Deadline
+            | RunnerInferenceTransportStatus::Transport
             | RunnerInferenceTransportStatus::CredentialUnavailable
             | RunnerInferenceTransportStatus::BindingUnavailable
             | RunnerInferenceTransportStatus::CapacityUnavailable

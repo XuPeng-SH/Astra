@@ -2321,8 +2321,6 @@ async fn call_runner_and_collect(
         response,
         model_name,
         started,
-        provider_budget.saturating_sub(started.elapsed()),
-        cancel,
         prepared.authorized_tool_names(),
         prepared.wire_output_limit(),
         stream_callback,
@@ -2333,10 +2331,7 @@ async fn call_runner_and_collect(
     // (for example an unauthorized tool call), but it may never rewrite the
     // Runner-observed usage or provider response identity.
     let physical = claim.physical_terminal().clone();
-    let mut logical = match &result {
-        Ok(_) => physical.clone(),
-        Err(error) => crate::turn::llm::durable::terminal_from_error(error),
-    };
+    let mut logical = runner_logical_terminal(&physical, &result);
     logical.usage = physical.usage.clone();
     logical.usage_status = physical.usage_status;
     logical.provider_response_id = physical.provider_response_id.clone();
@@ -2361,6 +2356,77 @@ async fn call_runner_and_collect(
         .observe_runner_terminal(attempt_index, physical, logical)
         .await;
     result
+}
+
+fn runner_logical_terminal(
+    physical: &astra_services::InferenceInvocationTerminal,
+    result: &Result<LlmCallResult, astra_core::ClassifiedError>,
+) -> astra_services::InferenceInvocationTerminal {
+    match result {
+        Ok(_) => physical.clone(),
+        Err(error) => {
+            let mut logical = crate::turn::llm::durable::terminal_from_error(error);
+            // The Runner's physical terminal owns delivery certainty. Server-side
+            // decoding may turn a complete provider response into a logical
+            // failure, but it cannot discard positive no-dispatch evidence or
+            // invent certainty for an ambiguous physical attempt.
+            logical.status = match physical.status {
+                astra_services::InferenceTerminalStatus::DeliveryUnknown => {
+                    astra_services::InferenceTerminalStatus::DeliveryUnknown
+                }
+                astra_services::InferenceTerminalStatus::Cancelled => {
+                    astra_services::InferenceTerminalStatus::Cancelled
+                }
+                astra_services::InferenceTerminalStatus::Succeeded
+                | astra_services::InferenceTerminalStatus::Failed => {
+                    astra_services::InferenceTerminalStatus::Failed
+                }
+            };
+            logical
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn runner_logical_failure_preserves_physical_delivery_certainty() {
+    use astra_services::{
+        InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus,
+    };
+
+    let physical = |status| InferenceInvocationTerminal {
+        status,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("runner_provider_transport".to_string()),
+        error_message: None,
+    };
+    let failure: Result<LlmCallResult, astra_core::ClassifiedError> =
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "Runner transport failed",
+        ));
+    let locally_definitive_failure: Result<LlmCallResult, astra_core::ClassifiedError> =
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "Runner response decoding exceeded its local bound",
+        ));
+
+    assert_eq!(
+        runner_logical_terminal(&physical(InferenceTerminalStatus::Failed), &failure).status,
+        InferenceTerminalStatus::Failed,
+        "positive no-dispatch evidence must remain safely terminal"
+    );
+    assert_eq!(
+        runner_logical_terminal(
+            &physical(InferenceTerminalStatus::DeliveryUnknown),
+            &locally_definitive_failure,
+        )
+        .status,
+        InferenceTerminalStatus::DeliveryUnknown,
+        "ambiguous physical delivery must never become retry-safe"
+    );
 }
 
 /// Test-only snapshot of the materials a single turn of the mock LLM path

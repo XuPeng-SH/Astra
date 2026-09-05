@@ -261,6 +261,24 @@ async fn cancellation_before_fence_is_durable_no_start_not_absence() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
+#[test]
+fn proven_connect_failure_is_a_definitive_physical_failure() {
+    let response = RunnerInferenceResponse {
+        events: Vec::new(),
+        transport: RunnerInferenceTransportTerminal {
+            status: RunnerInferenceTransportStatus::Transport,
+            delivery: RunnerInferenceDeliveryEvidence::NotDispatched,
+            provider_bytes: 0,
+            events_delivered: 0,
+        },
+    };
+
+    assert_eq!(
+        physical_terminal(&response).status,
+        InferenceTerminalStatus::Failed
+    );
+}
+
 #[tokio::test]
 async fn invalid_exact_material_is_rejected_but_forged_owner_or_boot_gets_no_proof() {
     let server = MockServer::start().await;
