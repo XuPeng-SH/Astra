@@ -93,7 +93,16 @@ pub fn runner_provider_client_builder()
 -> Result<reqwest::ClientBuilder, RunnerProviderNetworkConfigError> {
     const MAX_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
 
-    let mut builder = apply_env_proxy(reqwest::Client::builder().no_proxy());
+    // A provider credential is authorized for exactly the configured origin.
+    // Following even a seemingly harmless redirect would let an untrusted or
+    // compromised endpoint choose the next Authorization recipient. Provider
+    // migrations must therefore be an explicit binding revision, not HTTP
+    // control flow.
+    let mut builder = apply_env_proxy(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none()),
+    );
     let Some(path) = std::env::var_os("ASTRA_RUNNER_CA_BUNDLE") else {
         return Ok(builder);
     };

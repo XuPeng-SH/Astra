@@ -5667,6 +5667,13 @@ pub(crate) async fn collect_runner_response(
             RunnerInferenceTransportStatus::Deadline => astra_core::ErrorKind::ProviderDeadline,
             RunnerInferenceTransportStatus::HttpStatus(401 | 403) => astra_core::ErrorKind::Auth,
             RunnerInferenceTransportStatus::HttpStatus(429) => astra_core::ErrorKind::RateLimit,
+            RunnerInferenceTransportStatus::CredentialUnavailable => astra_core::ErrorKind::Auth,
+            RunnerInferenceTransportStatus::BindingUnavailable => {
+                astra_core::ErrorKind::MissingModelSelection
+            }
+            RunnerInferenceTransportStatus::CapacityUnavailable => {
+                astra_core::ErrorKind::ResourceLimit
+            }
             RunnerInferenceTransportStatus::HttpStatus(code) if code >= 500 => {
                 astra_core::ErrorKind::ServerError
             }

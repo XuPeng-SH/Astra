@@ -2369,12 +2369,12 @@ impl DatabaseModelService {
         let Some(pool) = self.pool.as_ref() else {
             return Ok(Vec::new());
         };
-        crate::runner_model_bindings::list_effective_runner_model_bindings(pool, user_id)
+        crate::runner_model_bindings::list_runner_model_catalog_bindings(pool, user_id)
             .await
             .map(|bindings| {
                 bindings
                     .iter()
-                    .map(crate::runner_model_bindings::ResolvedRunnerModelBinding::catalog_item)
+                    .map(crate::runner_model_bindings::RunnerModelCatalogBinding::catalog_item)
                     .collect()
             })
             .map_err(runner_model_error_response)
