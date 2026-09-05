@@ -75,6 +75,15 @@ pub(crate) enum ModelSetupCredentialDraft {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSetupAction {
+    /// Make one disclosed, bounded provider request, then select the model.
+    TestAndUse,
+    /// Persist the configuration without contacting the provider or selecting
+    /// it for the current turn.
+    SaveWithoutTest,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSetupDraft {
     pub(crate) name: String,
@@ -83,6 +92,7 @@ pub(crate) struct ModelSetupDraft {
     pub(crate) context_window: u32,
     pub(crate) max_output_tokens: u32,
     pub(crate) credential: ModelSetupCredentialDraft,
+    pub(crate) action: ModelSetupAction,
 }
 
 /// The only terminal outcomes of the config editor. The editor's internal
