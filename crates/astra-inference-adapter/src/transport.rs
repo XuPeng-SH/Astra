@@ -486,7 +486,7 @@ impl ProviderTransport {
                 }
             };
             let bounded = Box::pin(bounded);
-            let result = async {
+            async {
                 match mode {
                     ResponseMode::Sse => {
                         let mut decoded =
@@ -559,8 +559,7 @@ impl ProviderTransport {
                 }
                 Ok(())
             }
-            .await;
-            result
+            .await
         };
         let result = tokio::select! {
             biased;
