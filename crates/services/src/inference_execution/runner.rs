@@ -684,31 +684,38 @@ pub fn plan_runner_inference_dispatch(
     })
 }
 
+/// Exact immutable inputs for a single Runner provider-attempt dispatch.
+/// Keeping them together prevents independent callers from mixing an admitted
+/// invocation, request context, or wire identity from different attempts.
+pub struct RunnerProviderAttemptDispatchInput<'a> {
+    pub invocation: &'a InferenceInvocationPlan,
+    pub attempt_index: u32,
+    pub wire: InferenceProviderWireIdentity,
+    pub request_context: ModelRequestContextSeed,
+    pub canonical_transitions: &'a [astra_turn_types::ProviderCanonicalTransitionV2],
+    pub binding: &'a ResolvedRunnerModelBinding,
+    pub request: &'a [u8],
+    pub deadline_unix_ms: u64,
+}
+
 pub fn plan_runner_provider_attempt_dispatch(
-    invocation: &InferenceInvocationPlan,
-    attempt_index: u32,
-    wire: InferenceProviderWireIdentity,
-    request_context: ModelRequestContextSeed,
-    canonical_transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
-    binding: &ResolvedRunnerModelBinding,
-    request: &[u8],
-    deadline_unix_ms: u64,
+    input: RunnerProviderAttemptDispatchInput<'_>,
 ) -> ServiceResult<RunnerProviderAttemptDispatchPlan> {
-    let input = &invocation.input;
-    if input.user_id != binding.user_id
-        || input.scope.session_id().is_none()
-        || input.execution_placement != ModelExecutionPlacement::Edge
-        || input.access_kind != ModelAccessKind::ThisDevice
-        || input.upstream_model_name != binding.definition.model_name.as_str()
-        || input.resolved_model_name != binding.definition.model_name.as_str()
-        || input.provider != "openai"
-        || input.offering_id
+    let invocation_input = &input.invocation.input;
+    if invocation_input.user_id != input.binding.user_id
+        || invocation_input.scope.session_id().is_none()
+        || invocation_input.execution_placement != ModelExecutionPlacement::Edge
+        || invocation_input.access_kind != ModelAccessKind::ThisDevice
+        || invocation_input.upstream_model_name != input.binding.definition.model_name.as_str()
+        || invocation_input.resolved_model_name != input.binding.definition.model_name.as_str()
+        || invocation_input.provider != "openai"
+        || invocation_input.offering_id
             != crate::runner_model_bindings::runner_offering_id(
-                &input.user_id,
-                &binding.definition.identity,
+                &invocation_input.user_id,
+                &input.binding.definition.identity,
             )
         || !matches!(
-            input.purpose,
+            invocation_input.purpose,
             InferencePurpose::PrimaryAgent
                 | InferencePurpose::SubAgent
                 | InferencePurpose::RequiredCompaction
@@ -718,55 +725,55 @@ pub fn plan_runner_provider_attempt_dispatch(
             "Runner attempt does not match its admitted logical invocation and binding",
         ));
     }
-    if deadline_unix_ms == 0 || deadline_unix_ms > i64::MAX as u64 {
+    if input.deadline_unix_ms == 0 || input.deadline_unix_ms > i64::MAX as u64 {
         return Err(ServiceError::invalid(
             "Runner inference deadline is out of range",
         ));
     }
-    let request = validate_json_body(request)?;
+    let request = validate_json_body(input.request)?;
     let request_value: serde_json::Value = serde_json::from_str(&request)
         .map_err(|_| ServiceError::invalid("Runner request is not valid JSON"))?;
     if request_value
         .get("model")
         .and_then(serde_json::Value::as_str)
-        != Some(binding.definition.model_name.as_str())
-        || wire.provider_wire_hash != digest(request.as_bytes()).as_str()
-        || wire.provider_wire_bytes != request.len() as u64
-        || wire.protocol != "openai_compatible"
+        != Some(input.binding.definition.model_name.as_str())
+        || input.wire.provider_wire_hash != digest(request.as_bytes()).as_str()
+        || input.wire.provider_wire_bytes != request.len() as u64
+        || input.wire.protocol != "openai_compatible"
     {
         return Err(ServiceError::invalid(
             "Runner exact request identity or model does not match its admission",
         ));
     }
     let attempt = plan_inference_provider_attempt_with_context(
-        invocation,
-        attempt_index,
-        wire,
-        request_context,
+        input.invocation,
+        input.attempt_index,
+        input.wire,
+        input.request_context,
     )
-    .with_canonical_transitions(canonical_transitions)?;
+    .with_canonical_transitions(input.canonical_transitions)?;
     let request_ref = artifact_reference(
         hash_identity("rreq", &[attempt.attempt_id()]),
         request.as_bytes(),
     )?;
     let grant = RunnerInferenceDispatchGrant {
         attempt: RunnerInferenceAttemptIdentity {
-            user_id: input.user_id.clone(),
-            scope: input.scope.clone(),
-            invocation_id: RunnerInferenceId::new(invocation.invocation_id().to_string())
+            user_id: invocation_input.user_id.clone(),
+            scope: invocation_input.scope.clone(),
+            invocation_id: RunnerInferenceId::new(input.invocation.invocation_id().to_string())
                 .map_err(ServiceError::invalid)?,
             attempt_id: RunnerInferenceId::new(attempt.attempt_id().to_string())
                 .map_err(ServiceError::invalid)?,
-            binding: binding.definition.identity.clone(),
+            binding: input.binding.definition.identity.clone(),
             request: request_ref,
         },
         grant_id: RunnerInferenceId::new(new_admission_token()).map_err(ServiceError::invalid)?,
-        process_boot_nonce: binding.process_boot_nonce.clone(),
-        start_before_unix_ms: deadline_unix_ms,
-        deadline_unix_ms,
+        process_boot_nonce: input.binding.process_boot_nonce.clone(),
+        start_before_unix_ms: input.deadline_unix_ms,
+        deadline_unix_ms: input.deadline_unix_ms,
     };
     Ok(RunnerProviderAttemptDispatchPlan {
-        invocation: invocation.clone(),
+        invocation: input.invocation.clone(),
         attempt,
         grant,
         request,
