@@ -248,7 +248,7 @@ async fn runner_grants_pin_exact_private_request_and_fence_owner_session_boot_an
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 #[serial]
-async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_once_atomically() {
+async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_run() {
     let mut f = Fixture::new().await;
     let (plan, grant) = f.admit().await;
     sqlx::query("UPDATE inference_invocations SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
@@ -347,7 +347,7 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
         .is_err()
     );
     let mut tx = f.pool.get().begin().await.unwrap();
-    consume_runner_continuation_tx(&mut tx, &claim, &terminal)
+    settle_runner_continuation_tx(&mut tx, &claim, &terminal)
         .await
         .unwrap();
     tx.rollback().await.unwrap();
@@ -364,7 +364,7 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
     logical_terminal.status = InferenceTerminalStatus::Failed;
     logical_terminal.error_kind = Some("canonical_response_invalid".into());
     let mut tx = f.pool.get().begin().await.unwrap();
-    consume_runner_continuation_tx(&mut tx, &claim, &logical_terminal)
+    settle_runner_continuation_tx(&mut tx, &claim, &logical_terminal)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -386,9 +386,97 @@ async fn runner_late_custody_survives_owner_loss_and_reconnect_then_consumes_onc
     .unwrap();
     assert_eq!(physical_status, "succeeded");
     assert_eq!(logical_status, "failed");
+    assert!(
+        list_pending_runner_continuations(&f.pool, 128)
+            .await
+            .unwrap()
+            .contains(&grant.attempt),
+        "logical settlement must not acknowledge Agent Backbone absorption"
+    );
+    let mut active_tx = f.pool.get().begin().await.unwrap();
+    assert!(
+        acknowledge_runner_continuations_for_terminal_run_tx(
+            &mut active_tx,
+            &f.connection.user_id,
+            f.input.scope.session_id().unwrap(),
+            f.input.scope.run_id().unwrap(),
+            1,
+        )
+        .await
+        .is_err(),
+        "an active run has not durably absorbed its Runner response"
+    );
+    active_tx.rollback().await.unwrap();
+
+    // A second terminal may arrive after cancellation has already fenced
+    // logical continuation. Final run settlement must acknowledge only the
+    // response already absorbed by the Agent Backbone and retain this one for
+    // explicit discard/reconciliation.
+    let mut unsettled_input = f.input.clone();
+    unsettled_input.scope = unsettled_input.scope.with_logical_attempt(1);
+    let current_binding = resolve_runner_model_binding(
+        &f.pool,
+        &f.connection.user_id,
+        &f.binding.definition.identity,
+    )
+    .await
+    .unwrap();
+    let unsettled_plan = plan_runner_inference_dispatch(
+        unsettled_input,
+        &current_binding,
+        REQUEST,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .unwrap();
+    let unsettled_grant = admit_runner_inference_dispatch(&f.pool, &unsettled_plan)
+        .await
+        .unwrap();
+    let unsettled_hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &unsettled_grant.attempt,
+        &terminal,
+        RESPONSE,
+        &unsettled_hash,
+    )
+    .await
+    .unwrap();
+    let mut tx = f.pool.get().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'failed' WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(f.input.scope.session_id())
+    .bind(f.input.scope.run_id())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        acknowledge_runner_continuations_for_terminal_run_tx(
+            &mut tx,
+            &f.connection.user_id,
+            f.input.scope.session_id().unwrap(),
+            f.input.scope.run_id().unwrap(),
+            1,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    tx.commit().await.unwrap();
+    let pending = list_pending_runner_continuations(&f.pool, 128)
+        .await
+        .unwrap();
+    assert!(!pending.contains(&grant.attempt));
+    assert!(
+        pending.contains(&unsettled_grant.attempt),
+        "terminal run settlement retains an unsettled late Runner response"
+    );
     let mut tx = f.pool.get().begin().await.unwrap();
     assert!(
-        consume_runner_continuation_tx(&mut tx, &claim, &terminal)
+        settle_runner_continuation_tx(&mut tx, &claim, &terminal)
             .await
             .is_err()
     );
@@ -470,6 +558,136 @@ async fn runner_cancelled_run_keeps_real_usage_and_response_without_resuming() {
             .unwrap()
             .contains(&grant.attempt)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn cancelled_discard_never_rewrites_an_existing_logical_failure() {
+    let f = Fixture::new().await;
+    let (plan, grant) = f.admit().await;
+    let physical = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&physical, RESPONSE).unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &grant.attempt,
+        &physical,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    let claim = claim_runner_continuation(
+        &f.pool,
+        f.input.clone(),
+        &grant.attempt,
+        Some(plan.invocation().owner_token()),
+    )
+    .await
+    .unwrap();
+    let mut logical = physical.clone();
+    logical.status = InferenceTerminalStatus::Failed;
+    logical.error_kind = Some("canonical_response_invalid".into());
+    let mut tx = f.pool.get().begin().await.unwrap();
+    settle_runner_continuation_tx(&mut tx, &claim, &logical)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'cancelled', cancellation_requested_at = NOW(6)
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(f.input.scope.run_id())
+    .execute(f.pool.get())
+    .await
+    .unwrap();
+
+    discard_cancelled_runner_continuation(&f.pool, &f.connection.user_id, &grant.attempt)
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT status, error_kind FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(grant.attempt.invocation_id.as_str())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert_eq!(
+        row.get::<Option<String>, _>("error_kind").as_deref(),
+        Some("canonical_response_invalid")
+    );
+    assert!(
+        !list_pending_runner_continuations(&f.pool, 128)
+            .await
+            .unwrap()
+            .contains(&grant.attempt)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn paused_or_waiting_run_cannot_discard_a_resumable_continuation() {
+    let f = Fixture::new().await;
+    let (plan, grant) = f.admit().await;
+    let physical = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&physical, RESPONSE).unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &grant.attempt,
+        &physical,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    let claim = claim_runner_continuation(
+        &f.pool,
+        f.input.clone(),
+        &grant.attempt,
+        Some(plan.invocation().owner_token()),
+    )
+    .await
+    .unwrap();
+    let mut tx = f.pool.get().begin().await.unwrap();
+    settle_runner_continuation_tx(&mut tx, &claim, &physical)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    for status in ["paused", "waiting"] {
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, cancellation_requested_at = NULL
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(status)
+        .bind(&f.connection.user_id)
+        .bind(f.input.scope.run_id())
+        .execute(f.pool.get())
+        .await
+        .unwrap();
+        assert!(
+            discard_cancelled_runner_continuation(&f.pool, &f.connection.user_id, &grant.attempt,)
+                .await
+                .is_err(),
+            "{status} remains resumable and cannot discard custody"
+        );
+        assert!(
+            list_pending_runner_continuations(&f.pool, 128)
+                .await
+                .unwrap()
+                .contains(&grant.attempt)
+        );
+    }
 }
 
 #[tokio::test]

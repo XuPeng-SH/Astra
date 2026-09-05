@@ -1342,10 +1342,12 @@ pub async fn claim_runner_continuation(
     Ok(claim)
 }
 
-/// Finish in the *same transaction* that commits the canonical model response
-/// and its continuation. Callers must not acknowledge consumption before that
-/// commit. The exact run/inference owners are revalidated, including cancellation.
-pub async fn consume_runner_continuation_tx(
+/// Settle the logical inference invocation from a durably custodied Runner
+/// response. This deliberately does not acknowledge Agent Backbone
+/// absorption: `runner_continuation_pending` remains set until the canonical
+/// run transaction calls `acknowledge_runner_continuations_for_terminal_run_tx`.
+/// Exact run/inference owners are revalidated, including cancellation.
+pub async fn settle_runner_continuation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     claim: &RunnerContinuationClaim,
     logical_terminal: &InferenceInvocationTerminal,
@@ -1415,16 +1417,66 @@ async fn settle_runner_invocation_tx(
         .bind(&terminal.provider_response_id).bind(&terminal.error_kind).bind(&terminal.error_message)
         .bind(&identity.user_id).bind(identity.invocation_id.as_str())
         .execute(&mut **tx).await.map_err(persistence)?;
-    sqlx::query(
-        "UPDATE inference_provider_attempts SET runner_continuation_pending = FALSE
-        WHERE user_id = ? AND attempt_id = ?",
+    Ok(())
+}
+
+/// A Runner response remains a continuation obligation after its logical
+/// inference invocation is settled. Only the transaction that makes the
+/// complete run result durable may acknowledge that the Agent Backbone has
+/// absorbed every response for this run.
+pub async fn acknowledge_runner_continuations_for_terminal_run_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    expected_run_generation: u64,
+) -> ServiceResult<u64> {
+    let row = sqlx::query(
+        "SELECT status, run_generation FROM agent_runs
+         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE",
     )
-    .bind(&identity.user_id)
-    .bind(identity.attempt_id.as_str())
+    .bind(user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(persistence)?
+    .ok_or_else(|| ServiceError::not_found("Runner continuation run absent"))?;
+    let status: String = row.try_get("status").map_err(persistence)?;
+    let generation: i64 = row.try_get("run_generation").map_err(persistence)?;
+    let expected_generation = i64::try_from(expected_run_generation)
+        .map_err(|_| ServiceError::invalid("Runner continuation run generation overflow"))?;
+    if generation != expected_generation
+        || !matches!(
+            status.as_str(),
+            "completed" | "delegated" | "failed" | "cancelled"
+        )
+    {
+        return Err(ServiceError::conflict(
+            "Runner continuations require the exact terminal run generation",
+        ));
+    }
+
+    let result = sqlx::query(
+        "UPDATE inference_provider_attempts
+         SET runner_continuation_pending = FALSE
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND runner_continuation_pending = TRUE
+           AND runner_terminal_conflict = FALSE
+           AND EXISTS (
+             SELECT 1 FROM inference_invocations AS invocation
+             WHERE invocation.user_id = inference_provider_attempts.user_id
+               AND invocation.invocation_id = inference_provider_attempts.invocation_id
+               AND invocation.status IN ('succeeded', 'failed', 'cancelled', 'delivery_unknown')
+           )",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(run_id)
     .execute(&mut **tx)
     .await
     .map_err(persistence)?;
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 pub async fn list_pending_runner_continuations(
@@ -1460,18 +1512,31 @@ pub async fn discard_cancelled_runner_continuation(
     crate::storage::admit_session_event_write(&mut tx, session, authenticated_user_id, false)
         .await
         .map_err(persistence)?;
-    let run_cancelled = if let Some(run_id) = identity.scope.run_id() {
-        let row = sqlx::query("SELECT IF(status <> 'running' OR cancellation_requested_at IS NOT NULL, 1, 0) AS cancelled
-            FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE")
-            .bind(authenticated_user_id).bind(session).bind(run_id).fetch_optional(&mut *tx).await.map_err(persistence)?
-            .ok_or_else(|| ServiceError::not_found("Runner continuation run absent"))?;
-        row.try_get::<i64, _>("cancelled").map_err(persistence)? == 1
+    let run_allows_discard = if let Some(run_id) = identity.scope.run_id() {
+        let row = sqlx::query(
+            "SELECT status,
+            IF(cancellation_requested_at IS NOT NULL, 1, 0) AS cancelled
+            FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE",
+        )
+        .bind(authenticated_user_id)
+        .bind(session)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(persistence)?
+        .ok_or_else(|| ServiceError::not_found("Runner continuation run absent"))?;
+        let status: String = row.try_get("status").map_err(persistence)?;
+        matches!(
+            status.as_str(),
+            "completed" | "delegated" | "failed" | "cancelled"
+        ) || row.try_get::<i64, _>("cancelled").map_err(persistence)? == 1
     } else {
         false
     };
-    sqlx::query("SELECT invocation_id FROM inference_invocations WHERE user_id = ? AND invocation_id = ? FOR UPDATE")
+    let invocation = sqlx::query("SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ? FOR UPDATE")
         .bind(authenticated_user_id).bind(identity.invocation_id.as_str()).fetch_optional(&mut *tx).await.map_err(persistence)?
         .ok_or_else(|| ServiceError::not_found("Runner continuation invocation absent"))?;
+    let invocation_status: String = invocation.try_get("status").map_err(persistence)?;
     let row = sqlx::query(
         "SELECT runner_grant_json, runner_continuation_pending, runner_terminal_conflict,
         IF(runner_cancel_requested_at IS NOT NULL, 1, 0) AS cancelled,
@@ -1494,7 +1559,7 @@ pub async fn discard_cancelled_runner_continuation(
             "Runner discard identity mismatch or terminal quarantined",
         ));
     }
-    if !run_cancelled && row.try_get::<i64, _>("cancelled").map_err(persistence)? != 1 {
+    if !run_allows_discard && row.try_get::<i64, _>("cancelled").map_err(persistence)? != 1 {
         return Err(ServiceError::conflict(
             "live Runner continuation cannot be discarded",
         ));
@@ -1506,6 +1571,23 @@ pub async fn discard_cancelled_runner_continuation(
         return Ok(());
     }
     let terminal = DurableInferenceTerminal::decode(&row).map_err(persistence)?;
-    settle_runner_invocation_tx(&mut tx, identity, &terminal).await?;
+    match invocation_status.as_str() {
+        "admitted" => settle_runner_invocation_tx(&mut tx, identity, &terminal).await?,
+        "succeeded" | "failed" | "cancelled" | "delivery_unknown" => {}
+        _ => {
+            return Err(ServiceError::conflict(
+                "Runner discard found an invalid logical invocation state",
+            ));
+        }
+    }
+    sqlx::query(
+        "UPDATE inference_provider_attempts SET runner_continuation_pending = FALSE
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(authenticated_user_id)
+    .bind(identity.attempt_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(persistence)?;
     tx.commit().await.map_err(persistence)
 }
