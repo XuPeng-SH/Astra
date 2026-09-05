@@ -532,6 +532,94 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 #[serial]
+async fn runner_recovery_loads_one_bounded_contiguous_attempt_chain() {
+    let f = Fixture::new().await;
+    let (first_plan, first_grant) = f.admit().await;
+    let first_terminal = terminal();
+    let first_hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&first_terminal, RESPONSE)
+            .unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &first_grant.attempt,
+        &first_terminal,
+        RESPONSE,
+        &first_hash,
+    )
+    .await
+    .unwrap();
+    let first_claim = claim_runner_continuation(
+        &f.pool,
+        f.input.clone(),
+        &first_grant.attempt,
+        Some(first_plan.invocation().owner_token()),
+    )
+    .await
+    .unwrap();
+    let mut tx = f.pool.get().begin().await.unwrap();
+    settle_runner_continuation_tx(&mut tx, &first_claim, &first_terminal)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut suffix_input = f.input.clone();
+    suffix_input.scope = suffix_input.scope.with_logical_attempt(1);
+    let suffix_plan = plan_runner_inference_dispatch(
+        suffix_input.clone(),
+        &f.binding,
+        REQUEST,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .unwrap();
+    let suffix_grant = admit_runner_inference_dispatch(&f.pool, &suffix_plan)
+        .await
+        .unwrap();
+    let suffix_terminal = terminal();
+    let suffix_hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&suffix_terminal, RESPONSE)
+            .unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &suffix_grant.attempt,
+        &suffix_terminal,
+        RESPONSE,
+        &suffix_hash,
+    )
+    .await
+    .unwrap();
+    let suffix_claim = claim_runner_continuation(
+        &f.pool,
+        suffix_input,
+        &suffix_grant.attempt,
+        Some(suffix_plan.invocation().owner_token()),
+    )
+    .await
+    .unwrap();
+    let mut tx = f.pool.get().begin().await.unwrap();
+    settle_runner_continuation_tx(&mut tx, &suffix_claim, &suffix_terminal)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let chain = load_next_runner_continuation_chain(&f.pool, &f.input, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        chain.len(),
+        2,
+        "one recovered logical response is bounded to a prefix and suffix"
+    );
+    assert_eq!(chain[0].receipt, first_claim.checkpoint_receipt());
+    assert_eq!(chain[1].receipt, suffix_claim.checkpoint_receipt());
+    assert_eq!(chain[0].request.as_bytes(), REQUEST);
+    assert_eq!(chain[1].response.as_bytes(), RESPONSE);
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
 async fn runner_cancelled_run_keeps_real_usage_and_response_without_resuming() {
     let f = Fixture::new().await;
     let (_, grant) = f.admit().await;
