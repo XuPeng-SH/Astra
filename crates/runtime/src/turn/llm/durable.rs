@@ -4156,14 +4156,16 @@ impl DurableProviderAttemptObserver {
             .clone();
         let plan =
             astra_services::inference_execution::runner::plan_runner_provider_attempt_dispatch(
-                &self.invocation,
-                attempt_index,
-                service_wire,
-                self.request_context.clone(),
-                &transitions,
-                binding,
-                exact_body,
-                deadline_unix_ms,
+                astra_services::inference_execution::runner::RunnerProviderAttemptDispatchInput {
+                    invocation: &self.invocation,
+                    attempt_index,
+                    wire: service_wire,
+                    request_context: self.request_context.clone(),
+                    canonical_transitions: &transitions,
+                    binding,
+                    request: exact_body,
+                    deadline_unix_ms,
+                },
             )
             .map_err(|error| service_error("Runner provider attempt planning", error))?;
         let request = DurableProviderRequestIdentity {

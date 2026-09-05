@@ -749,7 +749,6 @@ impl AdmittedModelExecution {
 
     /// Borrow transport material only at a Server execution boundary. This
     /// exhaustive match must be revisited when another executor is implemented.
-    #[must_use]
     pub fn server_material(&self) -> Result<&ServerModelExecutionMaterial, &'static str> {
         match &self.execution_material {
             ModelExecutionMaterial::Server(material) => Ok(material),
