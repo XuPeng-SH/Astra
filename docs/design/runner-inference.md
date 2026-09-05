@@ -314,6 +314,41 @@ by a fork. Explicit model removal owns shared binding deletion. Retention also
 covers local loss receipts and never treats an unresolved dispatch fence as
 ordinary cache cleanup.
 
+### Continuation consumption and checkpoint fence
+
+`runner_continuation_pending` means that an authenticated Runner transferred a
+terminal response; it does **not** mean that a freshly constructed Agent Loop
+may replay every pending response for the run. A multi-round run deliberately
+keeps prior custody until terminal retention/acknowledgement, so an in-memory
+round counter, timestamp ordering, or “latest pending” query cannot distinguish
+an already projected tool round from a crash-window response.
+
+The Agent Backbone therefore persists a typed continuation-consumption marker
+only with a canonical round checkpoint. The marker is keyed by the exact
+invocation/attempt terminal hash and records:
+
+- the canonical checkpoint identity and durable sequence it extends;
+- the complete logical-attempt chain for an output-cap continuation, including
+  each response artifact hash and aggregate provider usage;
+- the canonical response/tool-call projection hash; and
+- whether the checkpoint is before tool admission, after an idempotent tool
+  ledger boundary, or terminal.
+
+Recovery restores the canonical checkpoint first, then claims only the next
+unconsumed exact continuation chain. It verifies every artifact/hash and
+reconstructs the same merged response and aggregate usage before entering the
+ordinary post-response owner. A marker whose checkpoint is already durable is
+never replayed. A terminal ACK may clear retained payload only after all of its
+markers are durably accounted for; it is retention cleanup, not the sole proof
+of per-round consumption.
+
+Checkpoint publication and marker insertion use an idempotent two-phase
+protocol keyed by the same immutable checkpoint identity. If publication is
+visible but marker insertion was interrupted, recovery reconciles the marker
+from the checkpoint; if neither is visible, custody remains unconsumed. No path
+may infer consumption from a new process's zero-valued counters, a viewer
+projection, or a successful tool result alone.
+
 Local hosting implements UX-02/04/07/09/11; setup below implements UX-01/03/10;
 selection and typed event projection implement UX-05/06; the shared ledger and
 recovery protocol implement UX-08; the existing Work/branch, fork, and lifecycle

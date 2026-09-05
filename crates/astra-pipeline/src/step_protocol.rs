@@ -709,6 +709,17 @@ pub struct HeavyCheckpoint {
     /// signal.
     pub budget_remaining_tokens: u64,
     pub budget_remaining_rounds: u32,
+    /// Number of provider rounds whose canonical results have been absorbed
+    /// into `messages` at this checkpoint boundary.  This is a durable cursor,
+    /// not a request counter: resumed loops use it to select the next logical
+    /// provider round and must never infer it from an attempt row.
+    #[serde(default)]
+    pub llm_rounds_completed: u32,
+    /// Agent-loop iteration that produced this checkpoint.  Kept separately
+    /// from `llm_rounds_completed` because retries and non-provider phases can
+    /// advance the loop without consuming a provider round.
+    #[serde(default)]
+    pub current_round_index: u32,
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
@@ -920,6 +931,8 @@ impl StepCheckpoint {
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
             activated_deferred_tool_names: Vec::new(),
@@ -2979,6 +2992,8 @@ mod tests {
             messages: vec![], // empty for non-Perceive!
             budget_remaining_tokens: 1000,
             budget_remaining_rounds: 5,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
             blocked_tools: vec![],
             recent_tools: vec![],
             activated_deferred_tool_names: vec![],
@@ -3017,6 +3032,8 @@ mod tests {
             messages: vec![],
             budget_remaining_tokens: 4000,
             budget_remaining_rounds: 10,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
             blocked_tools: vec![],
             recent_tools: vec![],
             activated_deferred_tool_names: vec![],

@@ -1680,6 +1680,12 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
             restored.workspace_observation_quarantine;
     }
     loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    // Do not derive these cursors from the attempt ledger.  The checkpoint is
+    // the only durable statement that its conversation has absorbed exactly
+    // these provider rounds; attempt rows can include retries, continuations,
+    // and work from a later executor.
+    loop_state.llm_rounds_completed = restored.llm_rounds_completed;
+    loop_state.current_round_index = restored.current_round_index;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
