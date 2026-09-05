@@ -22,11 +22,19 @@ pub(crate) enum ViewResult {
     },
     Model {
         name: String,
+        /// Opaque Offering identity selected from the catalog. The display
+        /// name is retained for the footer and context budget, but must never
+        /// be used to resolve the request when the catalog contains duplicate
+        /// names (for example, two personal Runners).
+        offering_id: Option<String>,
     },
     ModelSetup(ModelSetupDraft),
     ModelThinking {
         base_model: String,
         config: astra_turn_core::thinking_config::ThinkingConfig,
+        /// Preserve the Offering selected by the preceding model picker while
+        /// the user chooses a thinking mode.
+        offering_id: Option<String>,
     },
     Session {
         session_id: String,
