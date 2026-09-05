@@ -101,6 +101,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            &user.user_id,
             &selection,
             None,
             None,

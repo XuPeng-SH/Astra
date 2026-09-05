@@ -583,10 +583,92 @@ impl PreparedProviderRequest {
         &self.identity
     }
 
+    #[must_use]
+    pub(crate) fn exact_body(&self) -> Bytes {
+        self.request.body()
+    }
+
     #[cfg(test)]
     fn body_bytes(&self) -> Bytes {
         self.request.body()
     }
+}
+
+/// Server-compiled, credential-free request handed to a selected inference
+/// Runner. The exact bytes and durable identity come from the same compiler
+/// used by Server transport; the Runner may add transport authorization only.
+pub(crate) struct PreparedRunnerRequest {
+    prepared: PreparedProviderRequest,
+    authorized_tool_names: HashSet<String>,
+    wire_output_limit: Option<usize>,
+}
+
+impl PreparedRunnerRequest {
+    pub(crate) fn identity(&self) -> &ProviderWireRequestIdentity {
+        self.prepared.identity()
+    }
+
+    pub(crate) fn exact_body(&self) -> Bytes {
+        self.prepared.exact_body()
+    }
+
+    pub(crate) fn authorized_tool_names(&self) -> &HashSet<String> {
+        &self.authorized_tool_names
+    }
+
+    pub(crate) fn wire_output_limit(&self) -> Option<usize> {
+        self.wire_output_limit
+    }
+}
+
+pub(crate) fn prepare_runner_request(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    max_output_tokens: Option<usize>,
+    thinking: &ThinkingConfig,
+    cache_capability: Option<CacheCapability>,
+    no_tool_choice: bool,
+) -> Result<PreparedRunnerRequest, astra_core::ClassifiedError> {
+    let provider = "openai";
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
+    validate_append_only_transport_history(&messages, provider, cache_capability)?;
+    let mut body = build_provider_request_body_with_cache_capability(
+        &messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        None,
+        true,
+        thinking,
+        None,
+        cache_capability,
+    );
+    thinking.apply_openai_suppression(&mut body, provider, "");
+    if no_tool_choice {
+        apply_no_tool_choice(&mut body, provider, tools)?;
+    }
+    let authorized_tool_names = if no_tool_choice {
+        HashSet::new()
+    } else {
+        tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter_map(canonical_valid_tool_name)
+            .map(ToString::to_string)
+            .collect()
+    };
+    let wire_output_limit = provider_request_output_limit(&body);
+    Ok(PreparedRunnerRequest {
+        prepared: PreparedProviderRequest::from_json_with_cache_capability(
+            &body,
+            ProviderProtocol::OpenAiCompatible,
+            cache_capability,
+        )?,
+        authorized_tool_names,
+        wire_output_limit,
+    })
 }
 
 pub(crate) fn provider_uses_anthropic_messages(provider: &str) -> bool {
@@ -5491,6 +5573,124 @@ async fn collect_llm_stream_for_wire(
     .await
 }
 
+/// Interpret Runner-custodied OpenAI events through the canonical Server
+/// collector. Runner records framing only; tool authorization, DSML filtering,
+/// usage normalization and user-visible deltas remain owned here.
+pub(crate) async fn collect_runner_response(
+    response: astra_turn_types::runner_inference::RunnerInferenceResponse,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: std::time::Duration,
+    cancel: LlmCancel<'_>,
+    authorized_tool_names: &HashSet<String>,
+    wire_output_limit: Option<usize>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    use astra_turn_types::runner_inference::{
+        RunnerInferenceProviderEvent, RunnerInferenceTransportStatus,
+    };
+
+    let mut saw_eof = false;
+    let mut chunks = Vec::with_capacity(response.events.len());
+    for event in &response.events {
+        if saw_eof {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "Runner response contains provider events after EOF",
+            ));
+        }
+        match event {
+            RunnerInferenceProviderEvent::Json(value) => {
+                let mut chunk = Vec::from("data: ".as_bytes());
+                serde_json::to_writer(&mut chunk, value).map_err(|_| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "Runner response event serialization failed",
+                    )
+                })?;
+                chunk.extend_from_slice(b"\n\n");
+                chunks.push(Ok(Bytes::from(chunk)));
+            }
+            RunnerInferenceProviderEvent::Done => {
+                chunks.push(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+            }
+            RunnerInferenceProviderEvent::Eof => saw_eof = true,
+        }
+    }
+    if !saw_eof {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "Runner response is missing its provider EOF evidence",
+        ));
+    }
+    let collected = collect_llm_stream_for_wire(
+        futures_util::stream::iter(chunks),
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+        authorized_tool_names,
+        stream_callback,
+    )
+    .await
+    .map_err(|error| match error {
+        StreamCollectError::Cancelled { partial } => attach_llm_result_details(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Runner response collection cancelled",
+            ),
+            &partial,
+        ),
+        StreamCollectError::ProviderWorkDeadline { partial, .. }
+        | StreamCollectError::IdleTimeout { partial, .. }
+        | StreamCollectError::SemanticProgressTimeout { partial, .. } => attach_llm_result_details(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "Runner response collection exceeded its bounded deadline",
+            ),
+            &partial,
+        ),
+        StreamCollectError::Transport { partial, .. } => attach_llm_result_details(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "Runner response contains invalid OpenAI-compatible events",
+            ),
+            &partial,
+        ),
+    })?;
+
+    if response.transport.status != RunnerInferenceTransportStatus::Complete {
+        let kind = match response.transport.status {
+            RunnerInferenceTransportStatus::Cancelled => astra_core::ErrorKind::Cancelled,
+            RunnerInferenceTransportStatus::Deadline => astra_core::ErrorKind::ProviderDeadline,
+            RunnerInferenceTransportStatus::HttpStatus(401 | 403) => astra_core::ErrorKind::Auth,
+            RunnerInferenceTransportStatus::HttpStatus(429) => astra_core::ErrorKind::RateLimit,
+            RunnerInferenceTransportStatus::HttpStatus(code) if code >= 500 => {
+                astra_core::ErrorKind::ServerError
+            }
+            RunnerInferenceTransportStatus::Protocol | RunnerInferenceTransportStatus::Limit => {
+                astra_core::ErrorKind::ContractViolation
+            }
+            _ => astra_core::ErrorKind::StreamTransport,
+        };
+        return Err(attach_llm_result_details(
+            astra_core::ClassifiedError::new(
+                kind,
+                format!(
+                    "Runner provider attempt ended with {:?}",
+                    response.transport.status
+                ),
+            ),
+            &collected,
+        ));
+    }
+    let mut collected = collected;
+    reconcile_missing_output_cap_finish_reason(&mut collected, wire_output_limit);
+    Ok(collected)
+}
+
 #[cfg(test)]
 async fn collect_llm_stream_with_semantic_progress_deadline(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
@@ -7307,7 +7507,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Set thread-local stream idle timeouts for the duration of a test.

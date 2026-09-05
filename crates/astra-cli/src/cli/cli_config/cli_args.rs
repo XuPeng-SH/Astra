@@ -1040,6 +1040,12 @@ pub(crate) struct ModelAddArgs {
     /// Provider model identifier
     #[arg(long = "provider-model")]
     pub provider_model: Option<String>,
+    /// Declared provider context window; prompted when omitted in a terminal
+    #[arg(long)]
+    pub context_window: Option<u32>,
+    /// Declared maximum completion tokens; prompted when omitted in a terminal
+    #[arg(long)]
+    pub max_output_tokens: Option<u32>,
     /// Read the credential from this environment variable in each attaching terminal
     #[arg(long, conflicts_with_all = ["no_auth", "store_secret"])]
     pub credential_env: Option<String>,

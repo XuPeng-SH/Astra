@@ -14,16 +14,18 @@ use super::view::{
     ViewCompletion, ViewResult,
 };
 
-const LABELS: [&str; 5] = [
-    "Name       ",
-    "API base   ",
-    "Model      ",
-    "Credential ",
-    "Value      ",
+const LABELS: [&str; 7] = [
+    "Name        ",
+    "API base    ",
+    "Model       ",
+    "Context     ",
+    "Max output  ",
+    "Credential  ",
+    "Value       ",
 ];
 
 pub(crate) struct ModelSetupView {
-    values: [String; 5],
+    values: [String; 7],
     focus: usize,
     error: Option<String>,
     submitted: Option<ViewResult>,
@@ -37,6 +39,8 @@ impl ModelSetupView {
                 String::new(),
                 "https://api.openai.com/v1".to_string(),
                 String::new(),
+                String::new(),
+                String::new(),
                 "environment".to_string(),
                 "OPENAI_API_KEY".to_string(),
             ],
@@ -48,13 +52,13 @@ impl ModelSetupView {
     }
 
     fn credential_source(&self) -> &str {
-        self.values[3].trim()
+        self.values[5].trim()
     }
 
     fn rendered_value(&self, index: usize) -> String {
-        if index == 4 && matches!(self.credential_source(), "stored" | "file") {
+        if index == 6 && matches!(self.credential_source(), "stored" | "file") {
             "•".repeat(self.values[index].chars().count())
-        } else if index == 4 && matches!(self.credential_source(), "none" | "keyless") {
+        } else if index == 6 && matches!(self.credential_source(), "none" | "keyless") {
             "—".to_string()
         } else {
             self.values[index].clone()
@@ -62,36 +66,53 @@ impl ModelSetupView {
     }
 
     fn submit(&mut self) {
-        for index in 0..3 {
+        for index in 0..5 {
             if self.values[index].trim().is_empty() {
                 self.error = Some(format!("{} cannot be empty", LABELS[index].trim()));
                 self.focus = index;
                 return;
             }
         }
+        let context_window = match self.values[3].trim().parse::<u32>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.error = Some("Context must be a positive integer".to_string());
+                self.focus = 3;
+                return;
+            }
+        };
+        let max_output_tokens = match self.values[4].trim().parse::<u32>() {
+            Ok(value) if value > 0 && value <= context_window => value,
+            _ => {
+                self.error =
+                    Some("Max output must be positive and no larger than context".to_string());
+                self.focus = 4;
+                return;
+            }
+        };
         let credential = match self.credential_source().to_ascii_lowercase().as_str() {
-            "environment" | "env" if !self.values[4].trim().is_empty() => {
+            "environment" | "env" if !self.values[6].trim().is_empty() => {
                 ModelSetupCredentialDraft::Environment {
-                    name: self.values[4].trim().to_string(),
+                    name: self.values[6].trim().to_string(),
                 }
             }
-            "stored" | "file" if !self.values[4].is_empty() => ModelSetupCredentialDraft::Stored {
-                secret: SecretInput::new(self.values[4].clone()),
+            "stored" | "file" if !self.values[6].is_empty() => ModelSetupCredentialDraft::Stored {
+                secret: SecretInput::new(self.values[6].clone()),
             },
             "none" | "keyless" => ModelSetupCredentialDraft::None,
             "environment" | "env" => {
                 self.error = Some("Environment variable cannot be empty".to_string());
-                self.focus = 4;
+                self.focus = 6;
                 return;
             }
             "stored" | "file" => {
                 self.error = Some("Provider API key cannot be empty".to_string());
-                self.focus = 4;
+                self.focus = 6;
                 return;
             }
             _ => {
                 self.error = Some("Credential must be environment, stored, or none".to_string());
-                self.focus = 3;
+                self.focus = 5;
                 return;
             }
         };
@@ -99,6 +120,8 @@ impl ModelSetupView {
             name: self.values[0].trim().to_string(),
             base_url: self.values[1].trim().to_string(),
             provider_model: self.values[2].trim().to_string(),
+            context_window,
+            max_output_tokens,
             credential,
         }));
     }
@@ -110,8 +133,8 @@ impl ModelSetupView {
             ("stored" | "file", true) | ("none" | "keyless", false) => "environment",
             _ => "environment",
         };
-        self.values[3] = next.to_string();
-        self.values[4] = if next == "environment" {
+        self.values[5] = next.to_string();
+        self.values[6] = if next == "environment" {
             "OPENAI_API_KEY".to_string()
         } else {
             String::new()
@@ -169,7 +192,7 @@ impl BottomPaneView for ModelSetupView {
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        9 + u16::from(self.error.is_some())
+        11 + u16::from(self.error.is_some())
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -183,22 +206,22 @@ impl BottomPaneView for ModelSetupView {
                 self.focus = self.focus.saturating_sub(1);
                 self.error = None;
             }
-            (KeyCode::Left, _) if self.focus == 3 => self.cycle_credential(true),
-            (KeyCode::Right, _) if self.focus == 3 => self.cycle_credential(false),
+            (KeyCode::Left, _) if self.focus == 5 => self.cycle_credential(true),
+            (KeyCode::Right, _) if self.focus == 5 => self.cycle_credential(false),
             (KeyCode::Enter, _) => self.submit(),
-            (KeyCode::Backspace, _) if self.focus != 3 => {
+            (KeyCode::Backspace, _) if self.focus != 5 => {
                 self.values[self.focus].pop();
                 self.error = None;
             }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.focus != 3 => {
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.focus != 5 => {
                 self.values[self.focus].clear();
                 self.error = None;
             }
             (KeyCode::Char(character), modifiers)
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
             {
-                if self.focus != 3
-                    && !(self.focus == 4 && matches!(self.credential_source(), "none" | "keyless"))
+                if self.focus != 5
+                    && !(self.focus == 6 && matches!(self.credential_source(), "none" | "keyless"))
                 {
                     self.values[self.focus].push(character);
                 }
@@ -279,11 +302,13 @@ mod tests {
             "work".into(),
             "https://provider.example/v1".into(),
             "coding-model".into(),
+            "128000".into(),
+            "8192".into(),
             "stored".into(),
             "provider-secret-canary".into(),
         ];
-        view.focus = 4;
-        let rendered = buffer_to_string(&draw_widget(Widget(&view), 100, 12));
+        view.focus = 6;
+        let rendered = buffer_to_string(&draw_widget(Widget(&view), 100, 14));
         assert!(!rendered.contains("provider-secret-canary"));
         assert!(rendered.contains("••••"));
         view.handle_key(key(KeyCode::Enter));
@@ -294,7 +319,7 @@ mod tests {
     #[test]
     fn escape_cancels_without_emitting_partial_secret() {
         let mut view = ModelSetupView::new();
-        view.values[4] = "provider-secret-canary".into();
+        view.values[6] = "provider-secret-canary".into();
         view.handle_key(key(KeyCode::Esc));
         assert!(view.completion().unwrap().result.is_none());
     }
@@ -302,16 +327,16 @@ mod tests {
     #[test]
     fn credential_picker_never_carries_one_sources_value_into_another() {
         let mut view = ModelSetupView::new();
-        view.focus = 3;
+        view.focus = 5;
         view.handle_key(key(KeyCode::Right));
         assert_eq!(view.credential_source(), "stored");
-        assert!(view.values[4].is_empty());
-        view.values[4] = "secret-canary".into();
+        assert!(view.values[6].is_empty());
+        view.values[6] = "secret-canary".into();
         view.handle_key(key(KeyCode::Right));
         assert_eq!(view.credential_source(), "none");
-        assert!(view.values[4].is_empty());
+        assert!(view.values[6].is_empty());
         view.handle_key(key(KeyCode::Right));
         assert_eq!(view.credential_source(), "environment");
-        assert_eq!(view.values[4], "OPENAI_API_KEY");
+        assert_eq!(view.values[6], "OPENAI_API_KEY");
     }
 }

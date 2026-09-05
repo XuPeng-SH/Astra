@@ -1,6 +1,5 @@
 use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -139,6 +138,11 @@ impl InferenceInvocationPlan {
     #[must_use]
     pub fn owner_generation(&self) -> u64 {
         self.owner_generation
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &InferenceInvocationInput {
+        &self.input
     }
 
     /// Stable attempt identity within the caller-owned inference round.
@@ -332,58 +336,9 @@ impl InferenceProviderWireIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceTerminalStatus {
-    Succeeded,
-    Failed,
-    Cancelled,
-    DeliveryUnknown,
-}
-
-impl InferenceTerminalStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::DeliveryUnknown => "delivery_unknown",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InferenceUsage {
-    /// Provider-normalized input buckets. Fresh input, cache reads, and cache
-    /// creation are disjoint and have one shared representation everywhere.
-    pub input: astra_turn_types::NormalizedPromptCacheUsage,
-    pub output_tokens: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceUsageStatus {
-    /// The provider supplied terminal usage for the complete response.
-    ProviderExact,
-    /// The provider supplied usage before an interrupted/uncertain terminal.
-    ProviderPartial,
-    /// No provider usage fact was available. Numeric zeroes are placeholders,
-    /// not measured zero-token billing.
-    #[default]
-    Unavailable,
-}
-
-impl InferenceUsageStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProviderExact => "provider_exact",
-            Self::ProviderPartial => "provider_partial",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
+pub use astra_turn_types::runner_inference::{
+    InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus,
+};
 
 /// Provider-I/O authority at an exact-attempt settlement boundary.
 ///
@@ -435,30 +390,6 @@ impl InferenceProviderDeliveryState {
         match self {
             Self::PreDelivery => "pre_delivery",
             Self::DeliveryAuthorized => "delivery_authorized",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceInvocationTerminal {
-    pub status: InferenceTerminalStatus,
-    pub usage: InferenceUsage,
-    pub usage_status: InferenceUsageStatus,
-    pub provider_response_id: Option<String>,
-    pub error_kind: Option<String>,
-    pub error_message: Option<String>,
-}
-
-impl InferenceInvocationTerminal {
-    #[must_use]
-    pub fn succeeded(usage: InferenceUsage, provider_response_id: Option<String>) -> Self {
-        Self {
-            status: InferenceTerminalStatus::Succeeded,
-            usage,
-            usage_status: InferenceUsageStatus::ProviderExact,
-            provider_response_id,
-            error_kind: None,
-            error_message: None,
         }
     }
 }
@@ -702,22 +633,13 @@ fn checked_i64(value: u64, label: &str) -> ServiceResult<i64> {
 }
 
 fn terminal_fingerprint(terminal: &InferenceInvocationTerminal) -> ServiceResult<String> {
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "status": terminal.status,
-        "usage": terminal.usage,
-        "usage_status": terminal.usage_status,
-        "provider_response_id": terminal.provider_response_id,
-        "error_kind": terminal.error_kind,
-        "error_message": terminal.error_message,
-    }))
-    .map_err(|error| {
+    astra_turn_types::runner_inference::inference_terminal_fingerprint(terminal).map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Internal,
             "serialize inference terminal fingerprint",
             error,
         )
-    })?;
-    Ok(format!("{:x}", Sha256::digest(payload)))
+    })
 }
 
 fn checked_optional_i64(value: Option<u64>, label: &str) -> ServiceResult<Option<i64>> {

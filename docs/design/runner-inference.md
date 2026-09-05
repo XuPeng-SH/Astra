@@ -930,12 +930,15 @@ An example desired definition contains no literal credential:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "revision": 3,
   "models": {
     "work": {
       "protocol": "openai_compatible",
       "base_url": "https://model.example.com/v1",
       "model": "coding-model",
+      "context_window": 128000,
+      "max_output_tokens": 8192,
       "credential": { "kind": "environment", "name": "WORK_LLM_API_KEY" }
     }
   }

@@ -184,7 +184,12 @@ struct WorkStartCompletion {
 
 struct ModelSetupCompletion {
     name: String,
-    result: Result<String, String>,
+    result: Result<ModelSetupReady, String>,
+}
+
+struct ModelSetupReady {
+    offering_id: String,
+    catalog: Vec<crate::cli::slash::slash_router::ModelCatalogEntry>,
 }
 
 fn work_start_request_id(session_id: &str, goal: &str) -> String {
@@ -5382,12 +5387,23 @@ pub(crate) async fn run_tui_session(
             }
             Some(completion) = model_setup_rx.recv() => {
                 match completion.result {
-                    Ok(_) => chat_widget.commit_system(
-                        history_cell::system::SystemCell::response(format!(
-                            "Local model '{}' passed its provider stream check. Connecting the Runner…",
-                            completion.name
-                        )),
-                    ),
+                    Ok(ready) => {
+                        state.model = Some(completion.name.clone());
+                        crate::cli::slash::slash_config::set_active_model_for_display(
+                            Some(completion.name.clone()),
+                        );
+                        crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                            Some(ready.offering_id),
+                        );
+                        bottom_pane.footer.model = Some(completion.name.clone());
+                        model_catalog_cache = Some(ready.catalog);
+                        chat_widget.commit_system(
+                            history_cell::system::SystemCell::response(format!(
+                                "Local model '{}' is connected and selected.",
+                                completion.name
+                            )),
+                        );
+                    }
                     Err(error) => chat_widget.commit_system(
                         history_cell::system::SystemCell::error(format!(
                             "Local model '{}' needs repair: {error}",
@@ -8091,6 +8107,8 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::ModelSetup(draft) = &result {
                                         let draft = draft.clone();
                                         let model_name = draft.name.clone();
+                                        let api = api.clone();
+                                        let profile = profile.map(str::to_string);
                                         let completion_tx = model_setup_tx.clone();
                                         model_setup_tasks.spawn(async move {
                                             let credential = match draft.credential {
@@ -8109,6 +8127,8 @@ pub(crate) async fn run_tui_session(
                                                     draft.name,
                                                     draft.base_url,
                                                     draft.provider_model,
+                                                    draft.context_window,
+                                                    draft.max_output_tokens,
                                                     credential,
                                                 )
                                             })
@@ -8121,8 +8141,51 @@ pub(crate) async fn run_tui_session(
                                                         name: model_name.clone(),
                                                     },
                                                 )
-                                                .await,
+                                                .await
+                                                .map(|_| ()),
                                                 Err(error) => Err(error),
+                                            };
+                                            let result = match result {
+                                                Err(error) => Err(error),
+                                                Ok(()) => {
+                                                    let deadline = tokio::time::Instant::now()
+                                                        + std::time::Duration::from_secs(12);
+                                                    loop {
+                                                        match slash_dispatch::load_model_catalog(
+                                                            api.clone(),
+                                                            profile.clone(),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(catalog) => {
+                                                                let offering = catalog.iter().find(|entry| {
+                                                                    entry.name.eq_ignore_ascii_case(&model_name)
+                                                                        && entry.execution_placement
+                                                                            == astra_services::ModelExecutionPlacement::Edge
+                                                                });
+                                                                if let Some(offering) = offering {
+                                                                    break Ok(ModelSetupReady {
+                                                                        offering_id: offering.offering_id.clone(),
+                                                                        catalog,
+                                                                    });
+                                                                }
+                                                            }
+                                                            Err(error) if tokio::time::Instant::now() >= deadline => {
+                                                                break Err(format!(
+                                                                    "provider check passed, but the Runner catalog could not be refreshed: {error}"
+                                                                ));
+                                                            }
+                                                            Err(_) => {}
+                                                        }
+                                                        if tokio::time::Instant::now() >= deadline {
+                                                            break Err(
+                                                                "provider check passed and the model was saved, but the local Runner did not publish it within 12 seconds; keep the session open and retry /model"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                                    }
+                                                }
                                             };
                                             let _ = completion_tx
                                                 .send(ModelSetupCompletion {

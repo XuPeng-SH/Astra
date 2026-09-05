@@ -80,6 +80,8 @@ pub(crate) struct ModelSetupDraft {
     pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) provider_model: String,
+    pub(crate) context_window: u32,
+    pub(crate) max_output_tokens: u32,
     pub(crate) credential: ModelSetupCredentialDraft,
 }
 

@@ -33,6 +33,7 @@ pub mod journal_diff;
 pub mod journal_digest;
 pub mod journal_tree;
 pub(crate) mod local_model_command;
+pub(crate) mod local_runner_lifecycle;
 pub mod mcp_config;
 pub mod mock_llm;
 pub mod notifications;
