@@ -288,9 +288,15 @@ fn apply_model_catalog_effect(
         ModelCatalogEffect::Ready(Ok(catalog)) => {
             let names = catalog
                 .iter()
+                .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
                 .filter_map(crate::cli::slash::slash_router::entry_model_name)
                 .map(ToOwned::to_owned)
                 .collect();
+            if let Some(message) =
+                crate::cli::slash::slash_router::unavailable_model_repair_summary(&catalog)
+            {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(message));
+            }
             *cached_catalog = Some(catalog);
             slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names)
         }
@@ -14265,6 +14271,20 @@ mod tests {
             "context_window": 128000,
             "max_completion_tokens": null,
             "architecture": null
+        }, {
+            "offering_id": "offer-local-offline",
+            "access_id": "runner-personal",
+            "access_kind": "this_device",
+            "access_label": "Personal Runner",
+            "execution_placement": "edge",
+            "name": "local-offline",
+            "provider": "openai",
+            "description": "Runner offline",
+            "thinking_capability": null,
+            "is_active": false,
+            "context_window": 128000,
+            "max_completion_tokens": 8192,
+            "architecture": null
         }]))
         .expect("canonical model catalog");
 
@@ -14282,8 +14302,17 @@ mod tests {
                 .map(|models| models[0].offering_id.as_str()),
             Some("offer-gpt-5")
         );
+        assert_eq!(cached_catalog.as_ref().map(Vec::len), Some(2));
         assert!(matches!(
             widget.history()[0].to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::System {
+                level: crate::tui::turn_event::SystemLevel::Info,
+                text,
+                ..
+            }) if text.contains("local-offline") && text.contains("Reconnect")
+        ));
+        assert!(matches!(
+            widget.history()[1].to_persist(),
             Some(crate::tui::turn_event::TurnEvent::System {
                 level: crate::tui::turn_event::SystemLevel::Response,
                 text,

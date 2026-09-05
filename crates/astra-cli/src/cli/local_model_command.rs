@@ -539,6 +539,48 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn provider_probe_never_forwards_authorization_across_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/capture"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&redirect_target)
+            .await;
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/capture", redirect_target.uri())),
+            )
+            .expect(1)
+            .mount(&provider)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add_from_tui(
+            "work".to_string(),
+            format!("{}/v1", provider.uri()),
+            "coding-model".to_string(),
+            128_000,
+            8_192,
+            LocalModelCredentialInput::Stored("secret-canary".to_string()),
+        )
+        .unwrap();
+        check(ModelCheckArgs {
+            name: "work".to_string(),
+        })
+        .await
+        .expect_err("redirect must not be followed");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn provider_error_envelope_is_not_mistaken_for_a_successful_probe() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
