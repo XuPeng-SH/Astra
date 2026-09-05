@@ -1832,11 +1832,9 @@ impl ServerSummaryClient {
         cache_capability: astra_turn_core::cache_placement::CacheCapability,
     ) -> Self {
         match self {
-            Self::Server(client) => {
-                Self::Server(Box::new(
-                    client.with_prompt_cache_context(tools, cache_capability),
-                ))
-            }
+            Self::Server(client) => Self::Server(Box::new(
+                client.with_prompt_cache_context(tools, cache_capability),
+            )),
             Self::Runner(mut client) => {
                 client.prompt_cache_tools = tools;
                 client.cache_capability = Some(cache_capability);
