@@ -2364,6 +2364,124 @@ async fn call_runner_and_collect(
     result.map(|result| (result, claim.checkpoint_receipt()))
 }
 
+/// Decode an already custodied Runner response after a crash without making a
+/// second provider request.  The original request is the authority for tool
+/// parsing: a tool which was not on that wire surface cannot become valid just
+/// because a later restored host happens to expose it.  Conversely, a tool
+/// removed by current policy is not resurrected from history.
+async fn collect_recovered_runner_continuation_chain(
+    chain: Vec<astra_services::inference_execution::runner::RunnerRecoveredContinuation>,
+    model_name: &str,
+    current_wire_tools: &HashSet<String>,
+) -> Result<
+    (
+        LlmCallResult,
+        Vec<astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt>,
+        crate::turn::token_usage::TokenUsage,
+    ),
+    astra_core::ClassifiedError,
+> {
+    if chain.is_empty() || chain.len() > 2 {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "Runner recovery requires one bounded continuation chain",
+        ));
+    }
+
+    let mut aggregate_usage = crate::turn::token_usage::TokenUsage::default();
+    let mut receipts = Vec::with_capacity(chain.len());
+    let mut prefix: Option<LlmCallResult> = None;
+    let chain_len = chain.len();
+    for (index, recovered) in chain.into_iter().enumerate() {
+        let request: Value =
+            serde_json::from_slice(recovered.request.as_bytes()).map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Runner recovery request custody contains invalid provider JSON",
+                )
+            })?;
+        let historical_tools: HashSet<String> = request
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect();
+        let authorized_tools = historical_tools
+            .intersection(current_wire_tools)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let output_limit = [
+            request.get("max_completion_tokens"),
+            request.get("max_tokens"),
+            request.pointer("/inferenceConfig/maxTokens"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|value| value.as_u64().filter(|value| *value > 0))
+        .and_then(|value| usize::try_from(value).ok());
+        let response: astra_turn_types::runner_inference::RunnerInferenceResponse =
+            serde_json::from_slice(recovered.response.as_bytes()).map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Runner recovery response custody contains an invalid response envelope",
+                )
+            })?;
+        // Never replay historical SSE as live deltas.  The shared result path
+        // below publishes only after Work/terminal admission has settled.
+        let mut result = collect_runner_response(
+            response,
+            model_name,
+            Instant::now(),
+            &authorized_tools,
+            output_limit,
+            None,
+        )
+        .await?;
+        let usage = recovered.physical_terminal.usage;
+        aggregate_usage.input_tokens = aggregate_usage
+            .input_tokens
+            .saturating_add(usage.input.fresh_input_tokens);
+        aggregate_usage.cached_input_tokens = aggregate_usage
+            .cached_input_tokens
+            .saturating_add(usage.input.cache_read_tokens);
+        aggregate_usage.cache_creation_tokens = aggregate_usage
+            .cache_creation_tokens
+            .saturating_add(usage.input.cache_creation_tokens);
+        aggregate_usage.output_tokens = aggregate_usage
+            .output_tokens
+            .saturating_add(usage.output_tokens);
+        if index + 1 < chain_len {
+            if result.lifecycle_finish_reason() != Some("length") || !result.tool_calls.is_empty() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Runner recovery continuation prefix is not an output-capped text response",
+                ));
+            }
+            if prefix.replace(result).is_some() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Runner recovery contains more than one output-cap prefix",
+                ));
+            }
+            receipts.push(recovered.receipt);
+            continue;
+        }
+        if let Some(prefix) = prefix.take() {
+            result.full_text = merge_output_cap_continuation(&prefix.full_text, &result.full_text);
+            if !prefix.reasoning.is_empty() {
+                result.reasoning =
+                    merge_output_cap_continuation(&prefix.reasoning, &result.reasoning);
+            }
+        }
+        receipts.push(recovered.receipt);
+        result.usage = aggregate_usage.to_json_map();
+        return Ok((result, receipts, aggregate_usage));
+    }
+    unreachable!("non-empty bounded Runner continuation chain returns at its terminal")
+}
+
 fn runner_logical_terminal(
     physical: &astra_services::InferenceInvocationTerminal,
     result: &Result<LlmCallResult, astra_core::ClassifiedError>,
@@ -2998,6 +3116,11 @@ pub struct ServerAgenticLoopHost {
     /// Recovery validation for receipt markers is one bounded pre-admission
     /// fence per host/run, not a query on every ordinary provider round.
     runner_checkpoint_markers_verified: bool,
+    /// A restored checkpoint gets exactly one lookup for the next unconsumed
+    /// Runner response chain. Normal in-process rounds deliberately do not
+    /// scan durable pending terminals: those remain pending until irreversible
+    /// run settlement and are not candidates for replay.
+    runner_continuation_recovery_checked: bool,
 
     // ── Context ──
     /// Final prompt-visible tool schemas after provider declaration, binding,
@@ -4155,6 +4278,7 @@ impl ServerAgenticLoopHostBuilder {
             execution_time_budget: self.execution_time_budget,
             canonical_transition_hydrated: false,
             runner_checkpoint_markers_verified: false,
+            runner_continuation_recovery_checked: false,
             tool_schemas,
             admission_tool_schemas,
             deferred_tool_schemas,
@@ -13254,19 +13378,90 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             };
+            let inference_scope = astra_turn_types::InferenceInvocationScope::Run {
+                session_id: self.session_id.clone(),
+                run_id: run_id.clone(),
+                turn: state.session_turn,
+                round: prompt_round,
+                operation_id: "agent_turn".to_string(),
+                logical_attempt: attempt_in_round,
+            };
+            // Recovery is a checkpoint fence, not a second inference route.
+            // Only the first turn of a restored host may inspect the exact
+            // post-checkpoint scope. A normal live host retains pending Runner
+            // terminals until irreversible run settlement, so scanning them
+            // here would replay its own already-applied history.
+            if state.stall.restored_from_heavy_checkpoint
+                && !self.runner_continuation_recovery_checked
+                && matches!(&llm_cfg.executor, ResolvedTurnLlmExecutor::Runner(_))
+            {
+                self.runner_continuation_recovery_checked = true;
+                let pool = self.shared_pool.as_ref().ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "Runner continuation recovery requires durable database custody",
+                    )
+                })?;
+                let recovery_input = durable_ledger.checkpoint_marker_input(
+                    inference_scope.clone(),
+                    state.inference_purpose,
+                    &llm_cfg.model_name,
+                    llm_cfg
+                        .wire_model_name
+                        .as_deref()
+                        .unwrap_or(&llm_cfg.model_name),
+                    &llm_cfg.provider,
+                );
+                let chain = astra_services::inference_execution::runner::load_next_runner_continuation_chain(
+                    pool,
+                    &recovery_input,
+                    &state.stall.runner_continuation_receipts,
+                )
+                .await
+                .map_err(|error| runner_service_error("continuation recovery", error))?;
+                if !chain.is_empty() {
+                    let (recovered, receipts, usage) = collect_recovered_runner_continuation_chain(
+                        chain,
+                        &llm_cfg.model_name,
+                        &wire_authorized_tool_names,
+                    )
+                    .await?;
+                    // A recovered response has no license to bypass the
+                    // structural contract that its live counterpart had to
+                    // satisfy.  There is no safe retry of an already
+                    // custodied response here: fail closed and retain its
+                    // terminal for explicit recovery rather than projecting
+                    // prose which skipped required Work establishment.
+                    if self.canonical_work_establishment_pending(state)
+                        && recovered.tool_calls.is_empty()
+                    {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "recovered Runner response did not establish required canonical Work",
+                        ));
+                    }
+                    // No provider request is admitted, sent, or settled here.
+                    // The recovered result joins the identical post-response
+                    // Work, terminal-control, output, and checkpoint path.
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Succeeded,
+                    );
+                    runner_continuation_receipts.extend(receipts);
+                    physical_attempt_usage = usage;
+                    physical_attempt_usage_reported = !physical_attempt_usage.is_empty();
+                    break recovered;
+                }
+            }
             let request_context =
                 self.model_request_context_seed(state.last_llm_context_manifest_trace.as_ref());
             let requested_logical_attempt = attempt_in_round;
             let durable_invocation = match durable_ledger
                 .admit_with_request_context(
-                    astra_turn_types::InferenceInvocationScope::Run {
-                        session_id: self.session_id.clone(),
-                        run_id,
-                        turn: state.session_turn,
-                        round: prompt_round,
-                        operation_id: "agent_turn".to_string(),
-                        logical_attempt: attempt_in_round,
-                    },
+                    inference_scope,
                     state.inference_purpose,
                     &llm_cfg.model_name,
                     llm_cfg
