@@ -463,7 +463,8 @@ behavior assertions:
   acknowledgement or closed overlay cannot falsely undo an accepted command;
 - replay/snapshot after lost progress does not duplicate committed scrollback
   or falsely complete a response; delayed terminal usage updates attribution once;
-- Ctrl-C/Esc in each context, terminal exit with a shared managed host/service,
+- Ctrl-C/Esc in each context, terminal exit with an independent managed host or
+  explicitly shared service,
   reconnect, and 40/80/120-column rendering preserve the stated semantics;
 - two surfaces observing one branch agree on model/run state; closing either
   does not send cancel, change executor, or transfer credentials;

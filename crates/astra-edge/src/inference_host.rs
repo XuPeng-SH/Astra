@@ -245,19 +245,20 @@ impl InferenceHost {
         if config.models.is_empty() {
             return Ok(Vec::new());
         }
-        let revision =
-            NonZeroU64::new(config.revision).ok_or(InferenceHostError::BindingUnavailable)?;
         let published = self.with_journal(|journal| Ok(journal.published())).await?;
         config
             .models
             .iter()
             .map(|(name, model)| {
+                let profile_revision = NonZeroU64::new(model.binding_revision)
+                    .ok_or(InferenceHostError::BindingUnavailable)?;
                 let binding_id =
                     RunnerInferenceId::new(format!("{:x}", Sha256::digest(name.as_bytes())))
                         .map_err(|_| InferenceHostError::BindingUnavailable)?;
                 let binding_revision = match published.get(binding_id.as_str()) {
                     Some(previous)
-                        if previous.enabled && previous.identity.profile_revision == revision =>
+                        if previous.enabled
+                            && previous.identity.profile_revision == profile_revision =>
                     {
                         previous.identity.binding_revision
                     }
@@ -275,8 +276,10 @@ impl InferenceHost {
                         journal_id: self.journal_id.clone(),
                         binding_id,
                         binding_revision,
-                        profile_revision: revision,
+                        profile_revision,
                     },
+                    display_name: RunnerInferenceModelName::new(name.clone())
+                        .map_err(|_| InferenceHostError::BindingUnavailable)?,
                     model_name: RunnerInferenceModelName::new(model.model.clone())
                         .map_err(|_| InferenceHostError::BindingUnavailable)?,
                     protocol: RunnerInferenceProtocol::OpenAiChatCompletions,
@@ -294,21 +297,20 @@ impl InferenceHost {
     pub async fn attach_environment(
         &self,
         name: String,
-        revision: u64,
+        binding_revision: u64,
         credential: ResolvedLocalCredential,
     ) -> Result<(), InferenceHostError> {
         let mut state = self.state.lock().await;
         let config = self.config().await?;
-        if config.revision != revision
-            || !config.models.get(&name).is_some_and(|model| {
-                matches!(model.credential, LocalCredentialRef::Environment { .. })
-            })
-        {
+        if !config.models.get(&name).is_some_and(|model| {
+            model.binding_revision == binding_revision
+                && matches!(model.credential, LocalCredentialRef::Environment { .. })
+        }) {
             return Err(InferenceHostError::BindingUnavailable);
         }
         state
             .attached_environment
-            .insert(name, (revision, Arc::new(credential)));
+            .insert(name, (binding_revision, Arc::new(credential)));
         Ok(())
     }
 
@@ -460,7 +462,7 @@ impl InferenceHost {
                 LocalCredentialRef::Environment { .. } => state
                     .attached_environment
                     .get(name)
-                    .filter(|(revision, _)| *revision == config.revision)
+                    .filter(|(revision, _)| *revision == model.binding_revision)
                     .map(|(_, key)| key.expose_to_local_transport())
                     .ok_or(InferenceHostError::CredentialUnavailable)?,
                 LocalCredentialRef::None => "",

@@ -89,9 +89,10 @@ First-release scope is deliberately constrained:
 | Existing cross-pod authority/recovery and one bounded progress path | A new general-purpose inter-pod streaming platform or direct Runner-to-TUI shortcut |
 | OpenAI-compatible text/tools, streaming/nonstreaming, required compaction | Private body transforms, inference pools, speculative execution, or universal provider coverage |
 
-The shared local host exists to preserve a stable capacity/journal and isolate
-multiple terminal attachments, not to own work. Implement its narrow lifecycle
-with the existing Runner library, one local endpoint, and bounded attachment
+The session-managed local host exists to preserve a stable capacity/journal and
+isolate one terminal's credential attachment, not to own work. The current
+implementation gives each terminal its own host identity; a future shared host
+may use the same Runner library with one local endpoint and bounded attachment
 state. Setup stage names below are progress projections of candidate/applied
 configuration and receipts, not an invitation to build a workflow framework.
 Add a new abstraction only when an existing owner cannot express a required
@@ -133,11 +134,27 @@ as a BYOK compatibility branch.
 
 ### Automatic local host
 
-Use a session-managed child process by default. The installed `astra` executable
-has an internal `runner-host` entrypoint that hosts the `astra-edge` library.
-No separately downloaded executable, privileged service, or second terminal is
-required. The host runs independently of the TUI render loop and can serve
-multiple local clients; the CLI does not embed a second inference implementation.
+Use a session-managed `astra-edge` child process by default. The installed Astra
+distribution supplies the Runner executable beside the CLI; no separately
+downloaded executable, privileged service, or second terminal is required. The
+host runs independently of the TUI render loop; the CLI does not embed a second
+inference implementation.
+
+The current CLI-managed implementation deliberately chooses the independent
+identity variant of this contract: every interactive invocation receives a
+unique Edge/Runner ID and an isolated journal root. It therefore never shares
+`host.lock`, an inference host, or an environment attachment with another
+terminal. This is the first-release implementation of UX-07: two terminals may
+use the same model configuration and environment-variable name while resolving
+different provider credentials, and closing one child cannot stop the other.
+The catalog publication handshake remains the readiness boundary for selecting
+the local Offering; child liveness failures are surfaced with bounded captured
+diagnostics before that wait begins.
+
+An explicitly installed, long-lived service may instead use the shared-host
+variant described below, but it must add attachment-scoped IPC credential
+handles before it is enabled for multiple terminals. The session-managed CLI
+path does not silently fall back to that shared mode.
 
 The host scope is the authenticated Astra deployment and account under the
 current OS user. Resolve it through the existing CLI profile/owner machinery,
@@ -932,7 +949,11 @@ repair. These use the same application services as `astra model ...`. The
 [TUI Model Access contract](client-surfaces-and-deployment.md#model-access-in-the-tui)
 owns picker/form layout, masked input, active-run feedback, keyboard behavior,
 model-switch timing, and terminal lifecycle. Setup must be completable inside
-the TUI without losing the chat draft or interrupting an active run.
+the TUI without losing the chat draft or interrupting an active run. After
+validation, the user explicitly chooses **Test and use** (one disclosed,
+bounded provider request followed by Offering selection) or **Save without
+test** (persist as unverified, make no provider request, and leave the current
+selection unchanged).
 
 The command surface extends existing `astra model list/show` with `add`, `check`,
 `rotate`, `disable`, and `remove`. Each is an adapter over the same local
@@ -972,6 +993,7 @@ An example desired definition contains no literal credential:
       "protocol": "openai_compatible",
       "base_url": "https://model.example.com/v1",
       "model": "coding-model",
+      "binding_revision": 1,
       "context_window": 128000,
       "max_output_tokens": 8192,
       "credential": { "kind": "environment", "name": "WORK_LLM_API_KEY" }
@@ -999,6 +1021,13 @@ by hashing secret bytes. Empty/missing variables fail visibly. The host pins the
 slot for an admitted attempt, denies new work after lease expiry, and clears the
 slot after its outstanding attempts settle or reach their bounded deadline.
 Do not persist environment values or promote them to service use automatically.
+
+In the current session-managed CLI path, the attaching CLI and its Runner child
+are the same terminal boundary, so the child resolves the environment value in
+that process and keeps it in its own host state; no other terminal can attach to
+that host or journal. The lease/IPC slot rules above apply when an explicitly
+shared Runner service is introduced and are the conditions for safely enabling
+that mode.
 
 Persisted file or supported keychain bindings can be shared by clients of the same
 enrolled owner. Rotation creates a fresh material generation under the binding

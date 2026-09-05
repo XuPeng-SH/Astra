@@ -179,7 +179,7 @@ async fn local_inference_host(
                     std::env::var(name).ok()
                 })
             {
-                host.attach_environment(name.clone(), models.revision, credential)
+                host.attach_environment(name.clone(), model.binding_revision, credential)
                     .await?;
             }
         }

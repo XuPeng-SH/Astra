@@ -39,6 +39,7 @@ impl Fixture {
                 protocol: LocalInferenceProtocol::OpenaiCompatible,
                 base_url: endpoint.into(),
                 model: "fixture".into(),
+                binding_revision: 1,
                 context_window: 1024,
                 max_output_tokens: 64,
                 credential,
@@ -449,6 +450,15 @@ async fn publication_operation_is_persisted_before_send_and_replayed_after_resta
     .await
     .unwrap();
     assert!(host.next_publication().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn published_binding_keeps_friendly_and_provider_names_separate() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let bindings = fixture.host.bindings().await.unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].display_name.as_str(), "local");
+    assert_eq!(bindings[0].model_name.as_str(), "fixture");
 }
 
 #[tokio::test]

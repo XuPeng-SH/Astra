@@ -59,7 +59,7 @@ impl Fixture {
             "protocol_version":1,"operation_id":"publish","expected_publication_revision":0,
             "change":{"action":"publish","definition":{
                 "identity":{"runner_id":"runner","journal_id":"journal","binding_id":"model","binding_revision":1,"profile_revision":1},
-                "model_name":"model","protocol":"openai_chat_completions","context_window":8192,"max_output_tokens":1024
+                "display_name":"Work","model_name":"model","protocol":"openai_chat_completions","context_window":8192,"max_output_tokens":1024
             }}
         })).unwrap();
         publish_runner_binding(&pool, &connection, &publication)

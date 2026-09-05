@@ -41,7 +41,7 @@ impl ResolvedRunnerModelBinding {
             access_kind: crate::models::ModelAccessKind::ThisDevice,
             access_label: "This device".into(),
             execution_placement: crate::models::ModelExecutionPlacement::Edge,
-            name: self.definition.model_name.as_str().into(),
+            name: self.definition.display_name.as_str().into(),
             provider: "openai".into(),
             description: None,
             is_active: true,
@@ -74,7 +74,7 @@ impl RunnerModelCatalogBinding {
             // device” only after their private host handshake.
             access_label: "Personal Runner".into(),
             execution_placement: crate::models::ModelExecutionPlacement::Edge,
-            name: self.definition.model_name.as_str().into(),
+            name: self.definition.display_name.as_str().into(),
             provider: "openai".into(),
             description: (!self.online)
                 .then(|| "Runner offline — reconnect this device to use the model".into()),

@@ -79,6 +79,7 @@ pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
                 protocol: LocalInferenceProtocol::OpenaiCompatible,
                 base_url,
                 model: provider_model,
+                binding_revision: 0,
                 context_window,
                 max_output_tokens,
                 credential,
@@ -131,6 +132,7 @@ pub(crate) fn add_from_tui(
                 protocol: LocalInferenceProtocol::OpenaiCompatible,
                 base_url,
                 model: provider_model,
+                binding_revision: 0,
                 context_window,
                 max_output_tokens,
                 credential,
@@ -153,6 +155,12 @@ fn save_definition(
 ) -> Result<String, String> {
     let LocalModelDefinitionInput { name, definition } = input;
     let mut config = store.load().map_err(|error| error.to_string())?;
+    let mut definition = definition;
+    definition.binding_revision = config.models.get(&name).map_or(Ok(1), |previous| {
+        previous.binding_revision.checked_add(1).ok_or_else(|| {
+            "local model binding revision is exhausted; remove and recreate the model".to_string()
+        })
+    })?;
     let previous = config.models.insert(name.clone(), definition);
     let expected_revision = config.revision;
     let applied = match store.replace(expected_revision, config) {
@@ -177,6 +185,11 @@ fn save_definition(
         "name": name,
         "status": "saved_locally",
         "revision": applied.revision,
+        "binding_revision": applied
+            .models
+            .get(&name)
+            .map(|definition| definition.binding_revision)
+            .unwrap_or_default(),
         "provider_probe": "not_run",
         "config_path": store.path(),
         "next": next,
@@ -349,9 +362,11 @@ pub(crate) fn show(name: &str) -> Result<Option<String>, String> {
         "protocol": definition.protocol,
         "base_url": definition.base_url,
         "model": definition.model,
+        "binding_revision": definition.binding_revision,
         "context_window": definition.context_window,
         "max_output_tokens": definition.max_output_tokens,
         "credential_source": credential_kind(&definition.credential),
+        "credential_storage": credential_storage(&definition.credential),
         "revision": config.revision,
         "config_path": store.path(),
     }))
@@ -423,6 +438,15 @@ fn credential_kind(reference: &LocalCredentialRef) -> &'static str {
     }
 }
 
+fn credential_storage(reference: &LocalCredentialRef) -> &'static str {
+    match reference {
+        LocalCredentialRef::Environment { .. } => "process_environment",
+        LocalCredentialRef::ProtectedFile { .. } => "owner_only_plaintext_file",
+        LocalCredentialRef::SystemKeychain { .. } => "system_keychain_unavailable",
+        LocalCredentialRef::None => "none",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +473,23 @@ mod tests {
 
         let added = add(no_auth_add("work")).unwrap();
         assert!(added.contains("saved_locally"));
-        assert!(show("work").unwrap().unwrap().contains("runner_local"));
+        let first: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(first["binding_revision"], 1);
+
+        add(no_auth_add("other")).unwrap();
+        let other: serde_json::Value =
+            serde_json::from_str(&show("other").unwrap().unwrap()).unwrap();
+        assert_eq!(other["binding_revision"], 1);
+
+        add(no_auth_add("work")).unwrap();
+        let updated: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(updated["binding_revision"], 2);
+        let other_after: serde_json::Value =
+            serde_json::from_str(&show("other").unwrap().unwrap()).unwrap();
+        assert_eq!(other_after["binding_revision"], 1);
+
         let removed = remove(ModelRemoveArgs {
             name: "work".to_string(),
         })

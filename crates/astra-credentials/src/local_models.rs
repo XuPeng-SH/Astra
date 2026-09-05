@@ -60,6 +60,11 @@ pub struct LocalModelDefinition {
     pub protocol: LocalInferenceProtocol,
     pub base_url: String,
     pub model: String,
+    /// Revision of this model's provider configuration. Unlike the enclosing
+    /// file CAS revision, this only changes when this model changes, so an
+    /// unrelated model update does not invalidate its Runner binding.
+    #[serde(default = "default_binding_revision")]
+    pub binding_revision: u64,
     /// User-declared provider capacity. These values are part of the binding
     /// revision and are never guessed from a mutable model name.
     pub context_window: u32,
@@ -81,6 +86,12 @@ impl LocalModelDefinition {
     pub fn validate(&self) -> Result<(), LocalModelConfigError> {
         validate_component("model", &self.model)?;
         validate_base_url(&self.base_url)?;
+        if self.binding_revision == 0 {
+            return Err(LocalModelConfigError::Invalid {
+                field: "model binding revision",
+                reason: "must be greater than zero".to_string(),
+            });
+        }
         if self.context_window == 0 {
             return Err(LocalModelConfigError::Invalid {
                 field: "context window",
@@ -96,6 +107,10 @@ impl LocalModelDefinition {
         }
         self.credential.validate()
     }
+}
+
+fn default_binding_revision() -> u64 {
+    1
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +779,7 @@ mod tests {
             protocol: LocalInferenceProtocol::OpenaiCompatible,
             base_url: "https://provider.example/v1".to_string(),
             model: "coding-model".to_string(),
+            binding_revision: 1,
             context_window: 128_000,
             max_output_tokens: 8_192,
             credential,

@@ -475,6 +475,10 @@ pub enum RunnerInferenceProtocol {
 #[serde(deny_unknown_fields)]
 pub struct RunnerInferenceBindingDefinition {
     pub identity: RunnerInferenceBindingIdentity,
+    /// User-facing name chosen in local setup. This is deliberately separate
+    /// from `model_name`, which is the exact provider wire identifier.
+    pub display_name: RunnerInferenceModelName,
+    /// Exact provider model identifier placed in the compiled request body.
     pub model_name: RunnerInferenceModelName,
     pub protocol: RunnerInferenceProtocol,
     pub context_window: NonZeroU32,
@@ -750,7 +754,7 @@ mod tests {
                 "action": "publish",
                 "definition": {
                     "identity": {"runner_id": "runner-1", "journal_id": "journal-1", "binding_id": "binding-1", "binding_revision": 1, "profile_revision": 1},
-                    "model_name": "public-model", "protocol": "openai_chat_completions",
+                    "display_name": "Work", "model_name": "public-model", "protocol": "openai_chat_completions",
                     "context_window": 8192, "max_output_tokens": 1024
                 }
             }

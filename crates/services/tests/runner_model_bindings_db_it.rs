@@ -25,7 +25,7 @@ fn publication(operation: &str, expected: u64, revision: u64) -> RunnerInference
         "change": {"action": "publish", "definition": {
             "identity": {"runner_id": "personal", "journal_id": "journal", "binding_id": "model",
                 "binding_revision": revision, "profile_revision": 1},
-            "model_name": "public-model", "protocol": "openai_chat_completions",
+            "display_name": "Work", "model_name": "public-model", "protocol": "openai_chat_completions",
             "context_window": 8192, "max_output_tokens": 1024
         }}
     }))

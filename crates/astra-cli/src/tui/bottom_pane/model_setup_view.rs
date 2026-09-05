@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::view::{
-    BottomPaneView, CancellationEvent, ModelSetupCredentialDraft, ModelSetupDraft, SecretInput,
-    ViewCompletion, ViewResult,
+    BottomPaneView, CancellationEvent, ModelSetupAction, ModelSetupCredentialDraft,
+    ModelSetupDraft, SecretInput, ViewCompletion, ViewResult,
 };
 
 const LABELS: [&str; 7] = [
@@ -28,6 +28,8 @@ pub(crate) struct ModelSetupView {
     values: [String; 7],
     focus: usize,
     error: Option<String>,
+    pending: Option<ModelSetupDraft>,
+    action_focus: usize,
     submitted: Option<ViewResult>,
     cancelled: bool,
 }
@@ -46,6 +48,8 @@ impl ModelSetupView {
             ],
             focus: 0,
             error: None,
+            pending: None,
+            action_focus: 0,
             submitted: None,
             cancelled: false,
         }
@@ -116,14 +120,29 @@ impl ModelSetupView {
                 return;
             }
         };
-        self.submitted = Some(ViewResult::ModelSetup(ModelSetupDraft {
+        self.pending = Some(ModelSetupDraft {
             name: self.values[0].trim().to_string(),
             base_url: self.values[1].trim().to_string(),
             provider_model: self.values[2].trim().to_string(),
             context_window,
             max_output_tokens,
             credential,
-        }));
+            action: ModelSetupAction::TestAndUse,
+        });
+        self.action_focus = 0;
+        self.error = None;
+    }
+
+    fn confirm_action(&mut self) {
+        let Some(mut draft) = self.pending.take() else {
+            return;
+        };
+        draft.action = if self.action_focus == 0 {
+            ModelSetupAction::TestAndUse
+        } else {
+            ModelSetupAction::SaveWithoutTest
+        };
+        self.submitted = Some(ViewResult::ModelSetup(draft));
     }
 
     fn cycle_credential(&mut self, backwards: bool) {
@@ -163,20 +182,49 @@ impl BottomPaneView for ModelSetupView {
             "  Your key stays on this machine and is never sent to Astra Server.",
             Style::default().fg(Color::Gray),
         ))];
-        for (index, label) in LABELS.iter().enumerate() {
-            let focused = index == self.focus;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if focused { "  ▸ " } else { "    " },
-                    Style::default().fg(crate::tui::theme::current().accent),
-                ),
-                Span::styled(*label, Style::default().fg(Color::Gray)),
-                Span::raw("  "),
-                Span::styled(
-                    self.rendered_value(index),
-                    Style::default().fg(if focused { Color::White } else { Color::Gray }),
-                ),
-            ]));
+        lines.push(Line::from(Span::styled(
+            "  Stored keys use owner-only local file permissions; they are not encrypted.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if self.pending.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  Choose what happens after saving this configuration:",
+                Style::default().fg(Color::White),
+            )));
+            for (index, label) in ["Test and use", "Save without test"].iter().enumerate() {
+                let focused = index == self.action_focus;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if focused { "  ▸ " } else { "    " },
+                        Style::default().fg(crate::tui::theme::current().accent),
+                    ),
+                    Span::styled(
+                        *label,
+                        Style::default().fg(if focused { Color::White } else { Color::Gray }),
+                    ),
+                    Span::raw(if index == 0 {
+                        "  one bounded provider request; select this model"
+                    } else {
+                        "  save as unverified; no provider request"
+                    }),
+                ]));
+            }
+        } else {
+            for (index, label) in LABELS.iter().enumerate() {
+                let focused = index == self.focus;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if focused { "  ▸ " } else { "    " },
+                        Style::default().fg(crate::tui::theme::current().accent),
+                    ),
+                    Span::styled(*label, Style::default().fg(Color::Gray)),
+                    Span::raw("  "),
+                    Span::styled(
+                        self.rendered_value(index),
+                        Style::default().fg(if focused { Color::White } else { Color::Gray }),
+                    ),
+                ]));
+            }
         }
         if let Some(error) = &self.error {
             lines.push(Line::from(Span::styled(
@@ -185,17 +233,38 @@ impl BottomPaneView for ModelSetupView {
             )));
         }
         lines.push(Line::from(Span::styled(
-            "  Tab / ↑↓ field · ←→ credential source · Enter save · Esc cancel",
+            if self.pending.is_some() {
+                "  ←→ choose · Enter confirm · Esc back"
+            } else {
+                "  Tab / ↑↓ field · ←→ credential source · Enter continue · Esc cancel"
+            },
             Style::default().fg(Color::DarkGray),
         )));
         Paragraph::new(lines).render(inner, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        11 + u16::from(self.error.is_some())
+        if self.pending.is_some() {
+            7 + u16::from(self.error.is_some())
+        } else {
+            12 + u16::from(self.error.is_some())
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.pending.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.pending = None;
+                    self.error = None;
+                }
+                KeyCode::Left | KeyCode::Up => self.action_focus = 0,
+                KeyCode::Right | KeyCode::Down => self.action_focus = 1,
+                KeyCode::Enter => self.confirm_action(),
+                _ => {}
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.cancelled = true,
             (KeyCode::Tab | KeyCode::Down, _) => {
@@ -232,7 +301,7 @@ impl BottomPaneView for ModelSetupView {
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if self.cancelled || self.submitted.is_some() {
+        if self.cancelled || self.submitted.is_some() || self.pending.is_some() {
             return None;
         }
         let value_width = self.rendered_value(self.focus).width() as u16;
@@ -312,8 +381,31 @@ mod tests {
         assert!(!rendered.contains("provider-secret-canary"));
         assert!(rendered.contains("••••"));
         view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter));
         let result = view.completion().unwrap().result.unwrap();
         assert!(!format!("{result:?}").contains("provider-secret-canary"));
+    }
+
+    #[test]
+    fn save_without_test_is_an_explicit_non_provider_action() {
+        let mut view = ModelSetupView::new();
+        view.values = [
+            "work".into(),
+            "https://provider.example/v1".into(),
+            "coding-model".into(),
+            "128000".into(),
+            "8192".into(),
+            "none".into(),
+            String::new(),
+        ];
+        view.handle_key(key(KeyCode::Enter));
+        assert!(view.completion().is_none());
+        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Enter));
+        let ViewResult::ModelSetup(draft) = view.completion().unwrap().result.unwrap() else {
+            panic!("expected model setup result");
+        };
+        assert_eq!(draft.action, ModelSetupAction::SaveWithoutTest);
     }
 
     #[test]
