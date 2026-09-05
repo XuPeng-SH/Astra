@@ -239,6 +239,7 @@ pub async fn verify_runner_checkpoint_consumption(
 pub struct RunnerRecoveredContinuation {
     pub receipt: astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
     pub physical_terminal: InferenceInvocationTerminal,
+    pub request: RunnerCustodyBytes,
     pub response: RunnerCustodyBytes,
 }
 
@@ -361,13 +362,16 @@ pub async fn load_next_runner_continuation_chain(
             terminal_sha256: terminal_hash,
             response,
         };
-        let bytes = load_exact_artifact_tx(&mut tx, &receipt.attempt, &receipt.response).await?;
+        let request =
+            load_exact_artifact_tx(&mut tx, &receipt.attempt, &receipt.attempt.request).await?;
+        let response = load_exact_artifact_tx(&mut tx, &receipt.attempt, &receipt.response).await?;
         let physical_terminal =
             public_terminal(&DurableInferenceTerminal::decode(&row).map_err(persistence)?)?;
         chain.push(RunnerRecoveredContinuation {
             receipt,
             physical_terminal,
-            response: bytes,
+            request,
+            response,
         });
         expected_attempt = expected_attempt.saturating_add(1);
     }

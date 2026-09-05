@@ -2227,6 +2227,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
     assert_eq!(state.activated_deferred_tool_names, vec!["github"]);
     assert_eq!(state.llm_rounds_completed, 7);
     assert_eq!(state.current_round_index, 9);
+    assert!(state.stall.restored_from_heavy_checkpoint);
     assert!(
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"
