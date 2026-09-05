@@ -229,6 +229,7 @@ fn build_restored_from_scan(
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         llm_rounds_completed: heavy.llm_rounds_completed,
         current_round_index: heavy.current_round_index,
+        runner_continuation_receipts: heavy.runner_continuation_receipts.clone(),
         blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
         activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),

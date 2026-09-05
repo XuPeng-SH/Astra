@@ -2188,6 +2188,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         budget_remaining_rounds: 0,
         llm_rounds_completed: 7,
         current_round_index: 9,
+        runner_continuation_receipts: Vec::new(),
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
         activated_deferred_tool_names: vec!["github".into()],

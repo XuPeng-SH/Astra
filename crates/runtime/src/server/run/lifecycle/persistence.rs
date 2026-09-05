@@ -1686,6 +1686,7 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     // and work from a later executor.
     loop_state.llm_rounds_completed = restored.llm_rounds_completed;
     loop_state.current_round_index = restored.current_round_index;
+    loop_state.stall.runner_continuation_receipts = restored.runner_continuation_receipts;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(

@@ -588,6 +588,22 @@ pub struct RunnerInferenceTerminalAck {
     pub terminal_sha256: RunnerInferenceDigest,
 }
 
+/// Immutable proof that the Server obtained one exact terminal response from
+/// a Runner.  It is intentionally transport-neutral and contains neither a
+/// credential nor response bytes: a checkpoint may retain this receipt, while
+/// recovery must re-open the owner-scoped artifact and verify its hash.
+///
+/// This proves custody only.  A receipt becomes consumption evidence only
+/// when it is embedded in a canonical Agent Loop checkpoint after the normal
+/// post-response path has absorbed the response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceContinuationReceipt {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub terminal_sha256: RunnerInferenceDigest,
+    pub response: RunnerInferenceArtifactReference,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerInferenceStartEvidence {

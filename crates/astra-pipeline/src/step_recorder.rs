@@ -1420,6 +1420,7 @@ impl StepRecorder {
             budget_remaining_rounds,
             llm_rounds_completed: 0,
             current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
             activated_deferred_tool_names: Vec::new(),

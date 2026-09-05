@@ -1960,7 +1960,7 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RunnerSummaryClient {
         )
         .await;
         match result {
-            Ok(result) => {
+            Ok((result, _receipt)) => {
                 invocation
                     .finish_result(&result)
                     .await
@@ -2243,7 +2243,13 @@ async fn call_runner_and_collect(
     provider_budget: Duration,
     cancel: LlmCancel<'_>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+) -> Result<
+    (
+        LlmCallResult,
+        astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
+    ),
+    astra_core::ClassifiedError,
+> {
     let started = Instant::now();
     let deadline_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2355,7 +2361,7 @@ async fn call_runner_and_collect(
     durable_invocation
         .observe_runner_terminal(attempt_index, physical, logical)
         .await;
-    result
+    result.map(|result| (result, claim.checkpoint_receipt()))
 }
 
 fn runner_logical_terminal(
@@ -2989,6 +2995,9 @@ pub struct ServerAgenticLoopHost {
     /// opened exactly once, after session history restoration and before any
     /// real provider dispatch owned by this host.
     canonical_transition_hydrated: bool,
+    /// Recovery validation for receipt markers is one bounded pre-admission
+    /// fence per host/run, not a query on every ordinary provider round.
+    runner_checkpoint_markers_verified: bool,
 
     // ── Context ──
     /// Final prompt-visible tool schemas after provider declaration, binding,
@@ -4145,6 +4154,7 @@ impl ServerAgenticLoopHostBuilder {
             summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
             execution_time_budget: self.execution_time_budget,
             canonical_transition_hydrated: false,
+            runner_checkpoint_markers_verified: false,
             tool_schemas,
             admission_tool_schemas,
             deferred_tool_schemas,
@@ -13007,6 +13017,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.hooks.completion_settlement.output_cap_continuations;
         let mut output_cap_partial_text = String::new();
         let mut output_cap_partial_reasoning = String::new();
+        // A capped response can require several physical Runner attempts.
+        // Keep their receipts local until the complete logical response has
+        // passed the same post-response validation as any other provider.
+        // Publishing a prefix receipt here would allow recovery to lose the
+        // suffix or double-count usage.
+        let mut runner_continuation_receipts = Vec::new();
         // A logical host turn may contain a bounded provider retry.  Keep
         // accounting for every physical request while `result` below remains
         // the authoritative final response payload.
@@ -13186,6 +13202,41 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             };
+            // A restored checkpoint may contain Runner receipts for responses
+            // that are already represented in its canonical conversation.
+            // Validate those immutable markers before admitting anything new;
+            // never deserialize their artifacts here, because that would
+            // replay an already-consumed response.
+            if !self.runner_checkpoint_markers_verified
+                && !state.stall.runner_continuation_receipts.is_empty()
+            {
+                let pool = self.shared_pool.as_ref().ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "Runner checkpoint consumption requires durable database custody",
+                    )
+                })?;
+                for receipt in &state.stall.runner_continuation_receipts {
+                    let marker_input = durable_ledger.checkpoint_marker_input(
+                        receipt.attempt.scope.clone(),
+                        state.inference_purpose,
+                        &llm_cfg.model_name,
+                        llm_cfg
+                            .wire_model_name
+                            .as_deref()
+                            .unwrap_or(&llm_cfg.model_name),
+                        &llm_cfg.provider,
+                    );
+                    astra_services::inference_execution::runner::verify_runner_checkpoint_consumption(
+                        pool,
+                        &marker_input,
+                        receipt,
+                    )
+                    .await
+                    .map_err(|error| runner_service_error("checkpoint consumption", error))?;
+                }
+            }
+            self.runner_checkpoint_markers_verified = true;
             let run_id = match state.current_run_id.clone() {
                 Some(run_id) => run_id,
                 None => {
@@ -13669,6 +13720,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 Some(&mut on_stream_update),
                             )
                             .await
+                            .map(|(result, receipt)| {
+                                runner_continuation_receipts.push(receipt);
+                                result
+                            })
                         }
                         ResolvedTurnLlmExecutor::Server {
                             api_key,
@@ -14552,6 +14607,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
         }
         self.reconcile_work_activation_from_primary(&result.tool_calls);
+        // Only bind Runner custody after the shared post-response lifecycle
+        // has accepted this logical response.  This is intentionally below
+        // Work admission (and above the early lifecycle-carrier return), so
+        // recovery observes the exact same semantic boundary as Server-side
+        // inference rather than a Runner-only shortcut.
+        if !runner_continuation_receipts.is_empty() {
+            state
+                .stall
+                .runner_continuation_receipts
+                .extend(runner_continuation_receipts);
+        }
         if let Some(admitted_work) = self.admitted_work_turn_result(
             state,
             turn_started,

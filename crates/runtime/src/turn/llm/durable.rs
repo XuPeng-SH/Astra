@@ -2723,6 +2723,26 @@ impl DurableInferenceLedger {
         }
     }
 
+    /// Rebuild the fenced authority input for validating a historical
+    /// checkpoint marker before a new provider admission.  This is validation
+    /// only; it neither reserves an invocation nor authorizes provider I/O.
+    pub(crate) fn checkpoint_marker_input(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        purpose: astra_turn_types::InferencePurpose,
+        resolved_model_name: &str,
+        upstream_model_name: &str,
+        provider: &str,
+    ) -> astra_services::InferenceInvocationInput {
+        self.invocation_input(
+            scope,
+            purpose,
+            resolved_model_name,
+            upstream_model_name,
+            provider,
+        )
+    }
+
     pub(crate) async fn next_logical_attempt_pair_base(
         &self,
         scope: astra_turn_types::InferenceInvocationScope,
