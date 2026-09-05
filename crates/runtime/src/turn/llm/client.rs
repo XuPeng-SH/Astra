@@ -5580,8 +5580,6 @@ pub(crate) async fn collect_runner_response(
     response: astra_turn_types::runner_inference::RunnerInferenceResponse,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
-    cancel: LlmCancel<'_>,
     authorized_tool_names: &HashSet<String>,
     wire_output_limit: Option<usize>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
@@ -5617,49 +5615,80 @@ pub(crate) async fn collect_runner_response(
             RunnerInferenceProviderEvent::Eof => saw_eof = true,
         }
     }
-    if !saw_eof {
+    if response.transport.status == RunnerInferenceTransportStatus::Complete && !saw_eof {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
-            "Runner response is missing its provider EOF evidence",
+            "successful Runner response is missing its provider EOF evidence",
         ));
     }
-    let collected = collect_llm_stream_for_wire(
-        futures_util::stream::iter(chunks),
-        model_name,
-        started,
-        provider_work_budget,
-        cancel,
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_secs(30),
-        authorized_tool_names,
-        stream_callback,
-    )
-    .await
-    .map_err(|error| match error {
-        StreamCollectError::Cancelled { partial } => attach_llm_result_details(
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Cancelled,
-                "Runner response collection cancelled",
-            ),
-            &partial,
-        ),
-        StreamCollectError::ProviderWorkDeadline { partial, .. }
-        | StreamCollectError::IdleTimeout { partial, .. }
-        | StreamCollectError::SemanticProgressTimeout { partial, .. } => attach_llm_result_details(
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ProviderDeadline,
-                "Runner response collection exceeded its bounded deadline",
-            ),
-            &partial,
-        ),
-        StreamCollectError::Transport { partial, .. } => attach_llm_result_details(
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                "Runner response contains invalid OpenAI-compatible events",
-            ),
-            &partial,
-        ),
-    })?;
+    let collected = if chunks.is_empty()
+        && response.transport.status != RunnerInferenceTransportStatus::Complete
+    {
+        // HTTP rejection and local no-start outcomes legitimately contain no
+        // provider stream. Preserve their typed terminal instead of asking the
+        // success-stream decoder to manufacture a protocol diagnosis.
+        LlmCallResult::default()
+    } else {
+        // These bytes are already durably custodied: provider execution and
+        // its cancellation/deadline have ended. Decode them under a fresh,
+        // bounded local budget so an expired invocation clock or late user
+        // cancellation cannot erase provider facts that already exist.
+        let decode_started = Instant::now();
+        let decoded = collect_llm_stream_for_wire(
+            futures_util::stream::iter(chunks),
+            model_name,
+            decode_started,
+            std::time::Duration::from_secs(30),
+            LlmCancel::None,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+            authorized_tool_names,
+            stream_callback,
+        )
+        .await;
+        match decoded {
+            Ok(collected) => collected,
+            Err(error) if response.transport.status != RunnerInferenceTransportStatus::Complete => {
+                // The Runner's durable transport terminal owns failure
+                // classification. The OpenAI-compatible decoder may reject a
+                // truncated event sequence, but its partial result remains
+                // useful evidence and must survive into the classified error.
+                error.into_partial()
+            }
+            Err(error) => {
+                return Err(match error {
+                    StreamCollectError::Cancelled { partial } => attach_llm_result_details(
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "Runner response collection cancelled",
+                        ),
+                        &partial,
+                    ),
+                    StreamCollectError::ProviderWorkDeadline { partial, .. }
+                    | StreamCollectError::IdleTimeout { partial, .. }
+                    | StreamCollectError::SemanticProgressTimeout { partial, .. } => {
+                        attach_llm_result_details(
+                            astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ProviderDeadline,
+                                "Runner response collection exceeded its bounded deadline",
+                            ),
+                            &partial,
+                        )
+                    }
+                    StreamCollectError::Transport { partial, .. } => attach_llm_result_details(
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "Runner response contains invalid OpenAI-compatible events",
+                        ),
+                        &partial,
+                    ),
+                });
+            }
+        }
+    };
+
+    let mut collected = collected;
+    collected.duration_ms = started.elapsed().as_millis() as u64;
 
     if response.transport.status != RunnerInferenceTransportStatus::Complete {
         let kind = match response.transport.status {
@@ -5667,6 +5696,9 @@ pub(crate) async fn collect_runner_response(
             RunnerInferenceTransportStatus::Deadline => astra_core::ErrorKind::ProviderDeadline,
             RunnerInferenceTransportStatus::HttpStatus(401 | 403) => astra_core::ErrorKind::Auth,
             RunnerInferenceTransportStatus::HttpStatus(429) => astra_core::ErrorKind::RateLimit,
+            RunnerInferenceTransportStatus::HttpStatus(code) if (300..500).contains(&code) => {
+                astra_core::ErrorKind::InvalidRequest
+            }
             RunnerInferenceTransportStatus::CredentialUnavailable => astra_core::ErrorKind::Auth,
             RunnerInferenceTransportStatus::BindingUnavailable => {
                 astra_core::ErrorKind::MissingModelSelection
@@ -6864,6 +6896,18 @@ enum StreamCollectError {
     },
     /// [`LlmCancel`] fired during collection.
     Cancelled { partial: LlmCallResult },
+}
+
+impl StreamCollectError {
+    fn into_partial(self) -> LlmCallResult {
+        match self {
+            Self::IdleTimeout { partial, .. }
+            | Self::SemanticProgressTimeout { partial, .. }
+            | Self::ProviderWorkDeadline { partial, .. }
+            | Self::Transport { partial, .. }
+            | Self::Cancelled { partial } => partial,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -13398,6 +13442,138 @@ mod tests {
         .expect_err("an accepted provider stream cannot be safely reissued");
         assert_eq!(error.kind, astra_core::ErrorKind::StreamIdle);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_http_failure_keeps_typed_status_without_success_eof() {
+        use astra_turn_types::runner_inference::{
+            RunnerInferenceDeliveryEvidence, RunnerInferenceResponse,
+            RunnerInferenceTransportStatus, RunnerInferenceTransportTerminal,
+        };
+
+        let error = collect_runner_response(
+            RunnerInferenceResponse {
+                events: Vec::new(),
+                transport: RunnerInferenceTransportTerminal {
+                    status: RunnerInferenceTransportStatus::HttpStatus(401),
+                    delivery: RunnerInferenceDeliveryEvidence::ResponseHeaders,
+                    provider_bytes: 0,
+                    events_delivered: 0,
+                },
+            },
+            "fixture",
+            Instant::now(),
+            &HashSet::new(),
+            Some(64),
+            None,
+        )
+        .await
+        .expect_err("provider authentication failure must remain a failure");
+        assert_eq!(error.kind, astra_core::ErrorKind::Auth);
+        assert!(error.message.contains("HttpStatus(401)"));
+    }
+
+    #[tokio::test]
+    async fn runner_http_bad_request_is_a_definitive_invalid_request() {
+        use astra_turn_types::runner_inference::{
+            RunnerInferenceDeliveryEvidence, RunnerInferenceResponse,
+            RunnerInferenceTransportStatus, RunnerInferenceTransportTerminal,
+        };
+
+        let error = collect_runner_response(
+            RunnerInferenceResponse {
+                events: Vec::new(),
+                transport: RunnerInferenceTransportTerminal {
+                    status: RunnerInferenceTransportStatus::HttpStatus(400),
+                    delivery: RunnerInferenceDeliveryEvidence::ResponseHeaders,
+                    provider_bytes: 0,
+                    events_delivered: 0,
+                },
+            },
+            "fixture",
+            Instant::now(),
+            &HashSet::new(),
+            Some(64),
+            None,
+        )
+        .await
+        .expect_err("HTTP rejection must remain a definitive provider failure");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn incomplete_runner_transport_preserves_partial_events_without_fabricating_eof() {
+        use astra_turn_types::runner_inference::{
+            RunnerInferenceDeliveryEvidence, RunnerInferenceProviderEvent, RunnerInferenceResponse,
+            RunnerInferenceTransportStatus, RunnerInferenceTransportTerminal,
+        };
+
+        let error = collect_runner_response(
+            RunnerInferenceResponse {
+                events: vec![RunnerInferenceProviderEvent::Json(json!({
+                    "choices": [{"delta": {"content": "partial"}}]
+                }))],
+                transport: RunnerInferenceTransportTerminal {
+                    status: RunnerInferenceTransportStatus::Transport,
+                    delivery: RunnerInferenceDeliveryEvidence::MayHaveDispatched,
+                    provider_bytes: 42,
+                    events_delivered: 1,
+                },
+            },
+            "fixture",
+            Instant::now() - Duration::from_secs(3_600),
+            &HashSet::new(),
+            Some(64),
+            None,
+        )
+        .await
+        .expect_err("partial transport must not become success");
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("partial Runner result details"),
+        )
+        .unwrap();
+        assert_eq!(details["partial_full_text"], "partial");
+    }
+
+    #[tokio::test]
+    async fn custodied_success_decodes_after_original_provider_deadline() {
+        use astra_turn_types::runner_inference::{
+            RunnerInferenceDeliveryEvidence, RunnerInferenceProviderEvent, RunnerInferenceResponse,
+            RunnerInferenceTransportStatus, RunnerInferenceTransportTerminal,
+        };
+
+        let result = collect_runner_response(
+            RunnerInferenceResponse {
+                events: vec![
+                    RunnerInferenceProviderEvent::Json(json!({
+                        "choices": [{"delta": {"content": "durable"}}]
+                    })),
+                    RunnerInferenceProviderEvent::Done,
+                    RunnerInferenceProviderEvent::Eof,
+                ],
+                transport: RunnerInferenceTransportTerminal {
+                    status: RunnerInferenceTransportStatus::Complete,
+                    delivery: RunnerInferenceDeliveryEvidence::ResponseHeaders,
+                    provider_bytes: 64,
+                    events_delivered: 3,
+                },
+            },
+            "fixture",
+            Instant::now() - Duration::from_secs(3_600),
+            &HashSet::new(),
+            Some(64),
+            None,
+        )
+        .await
+        .expect("custodied success is independent of its expired provider clock");
+
+        assert_eq!(result.full_text, "durable");
+        assert!(result.duration_ms >= Duration::from_secs(3_600).as_millis() as u64);
     }
 
     /// Mock server that returns 400 with context_length_exceeded.
