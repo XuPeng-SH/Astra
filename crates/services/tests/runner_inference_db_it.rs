@@ -405,6 +405,19 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
             .is_err(),
         "a checkpoint marker cannot substitute another terminal for the same attempt"
     );
+    let recovered = load_next_runner_continuation_chain(&f.pool, &f.input, &[])
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].receipt, receipt);
+    assert_eq!(recovered[0].response.as_bytes(), RESPONSE);
+    assert!(
+        load_next_runner_continuation_chain(&f.pool, &f.input, &[receipt])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a checkpoint marker excludes its exact custody from future recovery"
+    );
     let mut active_tx = f.pool.get().begin().await.unwrap();
     assert!(
         acknowledge_runner_continuations_for_terminal_run_tx(

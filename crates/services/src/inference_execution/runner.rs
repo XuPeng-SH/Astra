@@ -2,7 +2,7 @@
 //! state machine. A grant is immutable before transport; terminal ACK means
 //! payload custody plus a recoverable continuation obligation, not just usage.
 
-use std::num::NonZeroU64;
+use std::{collections::HashSet, num::NonZeroU64};
 
 use astra_turn_types::runner_inference::{
     RunnerInferenceArtifactReference, RunnerInferenceAttemptIdentity, RunnerInferenceDigest,
@@ -230,6 +230,154 @@ pub async fn verify_runner_checkpoint_consumption(
         ));
     }
     tx.commit().await.map_err(persistence)
+}
+
+/// One exact Runner response that follows a restored canonical checkpoint.
+/// The bytes are loaded only after the ledger row, identity, and artifact
+/// reference have been locked and verified.
+#[derive(Debug)]
+pub struct RunnerRecoveredContinuation {
+    pub receipt: astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
+    pub physical_terminal: InferenceInvocationTerminal,
+    pub response: RunnerCustodyBytes,
+}
+
+/// Load the bounded, contiguous logical-attempt chain for exactly one next
+/// Runner round.  Callers supply the post-checkpoint scope (normally logical
+/// attempt zero) and every receipt already embedded in that checkpoint.  The
+/// query is by the full durable scope; it never falls back to latest-by-run.
+///
+/// A receipt in `consumed` removes exactly the matching terminal from
+/// consideration.  Its authenticity must have been checked with
+/// [`verify_runner_checkpoint_consumption`] before this call.  At most two
+/// attempts are returned because the Agent Loop's output-cap continuation is
+/// bounded to one suffix; a third contiguous terminal is a contract failure,
+/// not an invitation to replay an unbounded history.
+pub async fn load_next_runner_continuation_chain(
+    pool: &SharedPool,
+    input: &InferenceInvocationInput,
+    consumed: &[astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt],
+) -> ServiceResult<Vec<RunnerRecoveredContinuation>> {
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    if !matches!(
+        lock_invocation_scope_authority(&mut tx, input).await?,
+        InvocationScopeAuthority::Live
+    ) {
+        return Err(ServiceError::conflict(
+            "Runner continuation recovery run authority unavailable",
+        ));
+    }
+    let scope = &input.scope;
+    let consumed: HashSet<(String, String)> = consumed
+        .iter()
+        .map(|receipt| {
+            (
+                receipt.attempt.attempt_id.as_str().to_string(),
+                receipt.terminal_sha256.as_str().to_string(),
+            )
+        })
+        .collect();
+    let rows = sqlx::query(
+        "SELECT attempt.runner_grant_json, attempt.runner_terminal_hash,
+         attempt.runner_response_artifact_id, attempt.runner_response_hash,
+         attempt.runner_response_bytes, attempt.status, attempt.terminal_fingerprint,
+         attempt.usage_status, attempt.input_tokens, attempt.output_tokens,
+         attempt.cache_read_tokens, attempt.cache_creation_tokens,
+         attempt.provider_response_id, attempt.error_kind, attempt.error_message,
+         invocation.logical_attempt
+         FROM inference_provider_attempts AS attempt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = attempt.user_id
+          AND invocation.invocation_id = attempt.invocation_id
+         WHERE attempt.user_id = ?
+           AND invocation.scope_kind = ?
+           AND invocation.session_id <=> ? AND invocation.run_id <=> ?
+           AND invocation.harness_run_id <=> ? AND invocation.turn_index <=> ?
+           AND invocation.round_index <=> ? AND invocation.operation_id = ?
+           AND invocation.purpose = ?
+           AND invocation.logical_attempt >= ?
+           AND invocation.status IN ('succeeded', 'failed', 'cancelled', 'delivery_unknown')
+           AND attempt.runner_continuation_pending = TRUE
+           AND attempt.runner_terminal_conflict = FALSE
+         ORDER BY invocation.logical_attempt ASC LIMIT 3 FOR UPDATE",
+    )
+    .bind(&input.user_id)
+    .bind(scope.kind())
+    .bind(scope.session_id())
+    .bind(scope.run_id())
+    .bind(scope.harness_run_id())
+    .bind(scope.turn().map(i64::from))
+    .bind(scope.round().map(i64::from))
+    .bind(scope.operation_id())
+    .bind(input.purpose.as_str())
+    .bind(i64::from(scope.logical_attempt()))
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(persistence)?;
+
+    let mut chain = Vec::new();
+    let mut expected_attempt = i64::from(scope.logical_attempt());
+    for row in rows {
+        let identity = decode_grant(&row)?.attempt;
+        let terminal_hash = RunnerInferenceDigest::new(
+            row.try_get::<String, _>("runner_terminal_hash")
+                .map_err(persistence)?,
+        )
+        .map_err(ServiceError::invalid)?;
+        if consumed.contains(&(
+            identity.attempt_id.as_str().to_string(),
+            terminal_hash.as_str().to_string(),
+        )) {
+            continue;
+        }
+        let logical_attempt: i64 = row.try_get("logical_attempt").map_err(persistence)?;
+        if logical_attempt != expected_attempt {
+            return Err(ServiceError::conflict(
+                "Runner continuation recovery has a logical-attempt gap",
+            ));
+        }
+        let response = RunnerInferenceArtifactReference {
+            artifact_id: RunnerInferenceId::new(
+                row.try_get::<String, _>("runner_response_artifact_id")
+                    .map_err(persistence)?,
+            )
+            .map_err(ServiceError::invalid)?,
+            sha256: RunnerInferenceDigest::new(
+                row.try_get::<String, _>("runner_response_hash")
+                    .map_err(persistence)?,
+            )
+            .map_err(ServiceError::invalid)?,
+            byte_len: NonZeroU64::new(
+                u64::try_from(
+                    row.try_get::<i64, _>("runner_response_bytes")
+                        .map_err(persistence)?,
+                )
+                .map_err(|_| ServiceError::invalid("Runner recovery response length invalid"))?,
+            )
+            .ok_or_else(|| ServiceError::invalid("Runner recovery response is empty"))?,
+        };
+        let receipt = astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt {
+            attempt: identity,
+            terminal_sha256: terminal_hash,
+            response,
+        };
+        let bytes = load_exact_artifact_tx(&mut tx, &receipt.attempt, &receipt.response).await?;
+        let physical_terminal =
+            public_terminal(&DurableInferenceTerminal::decode(&row).map_err(persistence)?)?;
+        chain.push(RunnerRecoveredContinuation {
+            receipt,
+            physical_terminal,
+            response: bytes,
+        });
+        expected_attempt = expected_attempt.saturating_add(1);
+    }
+    if chain.len() > 2 {
+        return Err(ServiceError::conflict(
+            "Runner continuation recovery exceeds output-cap chain bound",
+        ));
+    }
+    tx.commit().await.map_err(persistence)?;
+    Ok(chain)
 }
 
 /// Positive and negative evidence stay on the original attempt. Absence of a
