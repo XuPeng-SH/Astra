@@ -2186,6 +2186,8 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         messages: Vec::new(),
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
+        llm_rounds_completed: 7,
+        current_round_index: 9,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
         activated_deferred_tool_names: vec!["github".into()],
@@ -2222,6 +2224,8 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
     assert!(state.restricted_tools.contains("flaky_tool"));
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
     assert_eq!(state.activated_deferred_tool_names, vec!["github"]);
+    assert_eq!(state.llm_rounds_completed, 7);
+    assert_eq!(state.current_round_index, 9);
     assert!(
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"
