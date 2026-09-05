@@ -1,4 +1,4 @@
-//! Public control protocol for the Runner inference facet.
+//! Shared public identity and control protocol for the Runner inference facet.
 //!
 //! These messages contain public model facts and opaque identities only. Local
 //! URLs, credentials, headers, and file references never belong in this module.
@@ -132,6 +132,93 @@ pub struct RunnerInferenceBindingPublication {
     pub operation_id: RunnerInferenceId,
     pub expected_publication_revision: u64,
     pub change: RunnerInferenceBindingChange,
+}
+
+/// Durable receipt for an exact publication operation. Replaying a receipt does
+/// not make that historical revision current again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceBindingReceipt {
+    pub operation_id: RunnerInferenceId,
+    pub publication_revision: NonZeroU64,
+    pub identity: RunnerInferenceBindingIdentity,
+}
+
+/// Owner-scoped immutable Astra artifact, never an arbitrary fetch URL. Content
+/// hashes establish integrity; they do not authorize cross-owner access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceArtifactReference {
+    pub artifact_id: RunnerInferenceId,
+    pub sha256: RunnerInferenceDigest,
+    pub byte_len: NonZeroU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RunnerInferenceDigest(String);
+
+impl RunnerInferenceDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("inference digest must be 64 lowercase hexadecimal characters");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RunnerInferenceDigest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceAttemptIdentity {
+    pub user_id: String,
+    pub scope: crate::InferenceInvocationScope,
+    pub invocation_id: RunnerInferenceId,
+    pub attempt_id: RunnerInferenceId,
+    pub binding: RunnerInferenceBindingIdentity,
+    pub request: RunnerInferenceArtifactReference,
+}
+
+/// One persisted grant, replayed verbatim. Socket delivery generations are not
+/// durable start authority and cannot extend either deadline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceDispatchGrant {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub grant_id: RunnerInferenceId,
+    pub process_boot_nonce: RunnerInferenceId,
+    pub start_before_unix_ms: u64,
+    pub deadline_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceTerminalAck {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub terminal_sha256: RunnerInferenceDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerInferenceStartEvidence {
+    FenceCommitted,
+    ProviderStarted,
+    ExpiredWithoutFence,
+    CancelledWithoutFence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

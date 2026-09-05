@@ -1018,10 +1018,13 @@ pub(crate) struct SessionShowArgs {
     after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
 )]
 pub(crate) enum ModelCmd {
+    /// Manage This device models; credentials stay on this device
+    #[command(subcommand)]
+    Local(LocalModelCmd),
     /// List available models
     List,
     /// Add a personal Cloud BYOK model
-    Add(ModelAddArgs),
+    Add(CloudModelAddArgs),
     /// Show model details
     Show(ModelShowArgs),
     /// Check a personal model credential and endpoint
@@ -1031,7 +1034,7 @@ pub(crate) enum ModelCmd {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelAddArgs {
+pub(crate) struct CloudModelAddArgs {
     /// Configuration alias used with chat --model (wizard default: provider model ID)
     #[arg(value_name = "ALIAS")]
     pub name: Option<String>,
@@ -1055,9 +1058,52 @@ pub(crate) struct ModelAddArgs {
     pub context_window: i32,
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum LocalModelCmd {
+    /// Save a model on this device without uploading its credential
+    Add(ModelAddArgs),
+    /// Test a local model with one explicit provider request
+    Check(ModelCheckArgs),
+    /// Show the saved local configuration
+    Show(ModelShowArgs),
+    /// Remove the local configuration and its owned credential
+    Remove(ModelRemoveArgs),
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct ModelShowArgs {
     pub model_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelAddArgs {
+    /// Friendly local name; prompted when omitted in a terminal
+    pub name: Option<String>,
+    /// OpenAI-compatible API base URL
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Provider model identifier
+    #[arg(long = "provider-model")]
+    pub provider_model: Option<String>,
+    /// Read the credential from this environment variable in each attaching terminal
+    #[arg(long, conflicts_with_all = ["no_auth", "store_secret"])]
+    pub credential_env: Option<String>,
+    /// Configure a keyless local endpoint
+    #[arg(long, conflicts_with_all = ["credential_env", "store_secret"])]
+    pub no_auth: bool,
+    /// Prompt for and save a credential in an owner-private local file
+    #[arg(long, conflicts_with_all = ["credential_env", "no_auth"])]
+    pub store_secret: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelCheckArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelRemoveArgs {
+    pub name: String,
 }
 
 #[derive(Subcommand, Debug)]

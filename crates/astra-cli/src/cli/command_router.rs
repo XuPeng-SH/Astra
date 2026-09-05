@@ -2124,6 +2124,19 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Model(ModelCmd::Local(command))) => {
+            use crate::cli::cli_config::cli_args::LocalModelCmd;
+            let body = match command {
+                LocalModelCmd::Add(args) => crate::cli::local_model_command::add(args)?,
+                LocalModelCmd::Check(args) => crate::cli::local_model_command::check(args).await?,
+                LocalModelCmd::Show(args) => crate::cli::local_model_command::show(&args.model_name)?
+                    .ok_or_else(|| format!("Local model '{}' is not configured", args.model_name))?,
+                LocalModelCmd::Remove(args) => crate::cli::local_model_command::remove(args)?,
+            };
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Model(ModelCmd::Add(args))) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let interactive =

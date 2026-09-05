@@ -93,7 +93,8 @@ impl RuntimeSkillifyAgentExecutor {
                     messages: &messages,
                     tools: &[],
                     cache_capability: None,
-                    route: LlmExecutionRoute::from_admitted(&execution.admitted),
+                    route: LlmExecutionRoute::from_admitted(&execution.admitted)
+                        .map_err(str::to_string)?,
                     max_output_tokens: Some(max_output_tokens),
                     temperature: None,
                     has_fallback: false,

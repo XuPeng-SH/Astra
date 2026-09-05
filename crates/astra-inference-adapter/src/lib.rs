@@ -4,8 +4,10 @@
 //! Compilation here serializes the final provider JSON; canonical message and
 //! tool projection remain owned by the runtime until their separate extraction.
 
+pub mod openai;
 pub mod request;
 pub mod sse;
+pub mod transport;
 
 pub use request::{ExactProviderRequest, ProviderProtocol, RequestCompileError, RequestIdentity};
 

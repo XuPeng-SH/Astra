@@ -1943,7 +1943,7 @@ async fn resolve_llm_model_for_turn(
                 "model override does not match the Offering admitted for this run".to_string(),
             );
         }
-        let material = execution.server_material();
+        let material = execution.server_material()?;
         return Ok(ResolvedTurnLlmConfig {
             model_name: execution.model_name.clone(),
             wire_model_name: execution.wire_model_name.clone(),
@@ -6212,6 +6212,23 @@ impl ServerAgenticLoopHost {
                 return Ok(());
             }
             astra_services::ModelAdmissionSource::ServerCatalog => {}
+            astra_services::ModelAdmissionSource::RunnerBinding => {
+                let pool = self.shared_pool.as_ref().ok_or_else(|| {
+                    "Runner model revalidation requires durable storage".to_string()
+                })?;
+                let binding = astra_services::runner_model_bindings::resolve_runner_offering(
+                    pool,
+                    &self.user_id,
+                    &admitted.offering_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                self.admitted_model_execution = Some(
+                    astra_services::AdmittedModelExecution::from_runner_binding(binding),
+                );
+                self.clear_resolved_llm_config();
+                return Ok(());
+            }
         }
         let execution = astra_services::revalidate_admitted_model_execution(
             &self.matrixone,

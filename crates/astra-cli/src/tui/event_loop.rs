@@ -182,6 +182,11 @@ struct WorkStartCompletion {
     result: Result<serde_json::Value, String>,
 }
 
+struct ModelSetupCompletion {
+    name: String,
+    result: Result<String, String>,
+}
+
 fn work_start_request_id(session_id: &str, goal: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -5067,6 +5072,9 @@ pub(crate) async fn run_tui_session(
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
     let mut model_catalog_loading = false;
     let mut model_catalog_cache = None;
+    let (model_setup_tx, mut model_setup_rx) =
+        tokio::sync::mpsc::channel::<ModelSetupCompletion>(2);
+    let mut model_setup_tasks = tokio::task::JoinSet::new();
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
@@ -5368,6 +5376,33 @@ pub(crate) async fn run_tui_session(
                         ));
                     }
                 }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(completion) = model_setup_rx.recv() => {
+                match completion.result {
+                    Ok(_) => chat_widget.commit_system(
+                        history_cell::system::SystemCell::response(format!(
+                            "Local model '{}' passed its provider stream check. Connecting the Runner…",
+                            completion.name
+                        )),
+                    ),
+                    Err(error) => chat_widget.commit_system(
+                        history_cell::system::SystemCell::error(format!(
+                            "Local model '{}' needs repair: {error}",
+                            completion.name
+                        )),
+                    ),
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(Err(error)) = model_setup_tasks.join_next(), if !model_setup_tasks.is_empty() => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Local model setup stopped unexpectedly: {error}"
+                )));
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 frame_requester.schedule_frame();
@@ -8053,6 +8088,62 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
 
+                                    if let bottom_pane::view::ViewResult::ModelSetup(draft) = &result {
+                                        let draft = draft.clone();
+                                        let model_name = draft.name.clone();
+                                        let completion_tx = model_setup_tx.clone();
+                                        model_setup_tasks.spawn(async move {
+                                            let credential = match draft.credential {
+                                                bottom_pane::view::ModelSetupCredentialDraft::Environment { name } => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::Environment(name)
+                                                }
+                                                bottom_pane::view::ModelSetupCredentialDraft::Stored { secret } => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::Stored(secret.expose().to_owned())
+                                                }
+                                                bottom_pane::view::ModelSetupCredentialDraft::None => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::None
+                                                }
+                                            };
+                                            let saved = tokio::task::spawn_blocking(move || {
+                                                crate::cli::local_model_command::add_from_tui(
+                                                    draft.name,
+                                                    draft.base_url,
+                                                    draft.provider_model,
+                                                    credential,
+                                                )
+                                            })
+                                            .await
+                                            .map_err(|_| "local model setup task stopped unexpectedly".to_string())
+                                            .and_then(|result| result);
+                                            let result = match saved {
+                                                Ok(_) => crate::cli::local_model_command::check(
+                                                    crate::cli::cli_config::cli_args::ModelCheckArgs {
+                                                        name: model_name.clone(),
+                                                    },
+                                                )
+                                                .await,
+                                                Err(error) => Err(error),
+                                            };
+                                            let _ = completion_tx
+                                                .send(ModelSetupCompletion {
+                                                    name: model_name,
+                                                    result,
+                                                })
+                                                .await;
+                                        });
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::info(
+                                                "Saving local model and running one bounded provider stream check…",
+                                            ),
+                                        );
+                                        pending_deferred_slash_flush = false;
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
                                     // `/model` picker → check thinking capability.
                                     if let bottom_pane::view::ViewResult::Model { name: base_model } = &result {
                                         let base_model = base_model.clone();
@@ -8937,6 +9028,8 @@ pub(crate) async fn run_tui_session(
     }
     slash_background_read_tasks.abort_all();
     while slash_background_read_tasks.join_next().await.is_some() {}
+    model_setup_tasks.abort_all();
+    while model_setup_tasks.join_next().await.is_some() {}
     work_start_tasks.abort_all();
     while work_start_tasks.join_next().await.is_some() {}
     // Post-commit projections are recoverable from the canonical journal.
