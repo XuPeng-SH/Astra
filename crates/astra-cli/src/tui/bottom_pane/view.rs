@@ -23,6 +23,7 @@ pub(crate) enum ViewResult {
     Model {
         name: String,
     },
+    ModelSetup(ModelSetupDraft),
     ModelThinking {
         base_model: String,
         config: astra_turn_core::thinking_config::ThinkingConfig,
@@ -43,6 +44,43 @@ pub(crate) enum ViewResult {
     },
     Memory(MemorySelection),
     InsertCommand(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SecretInput(String);
+
+impl SecretInput {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretInput")
+            .field("present", &!self.0.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSetupCredentialDraft {
+    Environment { name: String },
+    Stored { secret: SecretInput },
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSetupDraft {
+    pub(crate) name: String,
+    pub(crate) base_url: String,
+    pub(crate) provider_model: String,
+    pub(crate) credential: ModelSetupCredentialDraft,
 }
 
 /// The only terminal outcomes of the config editor. The editor's internal

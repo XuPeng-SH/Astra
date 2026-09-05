@@ -136,6 +136,7 @@ dependencies = [
  "astra-core",
  "astra-credentials",
  "astra-harness",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-mcp",
  "astra-messaging",
@@ -268,6 +269,7 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "fs2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -327,12 +329,15 @@ name = "astra-inference-adapter"
 version = "0.2.0"
 dependencies = [
  "async-stream",
+ "axum",
  "bytes",
  "futures-util",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

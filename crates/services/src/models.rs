@@ -676,6 +676,7 @@ impl ModelExecutionPlacement {
 pub enum ModelAdmissionSource {
     ServerCatalog,
     ProviderGateway,
+    RunnerBinding,
 }
 
 /// Server-local transport material. Never serialize it into an admitted identity,
@@ -705,11 +706,12 @@ impl std::fmt::Debug for ServerModelExecutionMaterial {
     }
 }
 
-/// Material for the actual executor. Only Server HTTP is implemented today;
-/// add a Runner variant when its admitted binding and dispatch path exist.
+/// Material for the actual executor. Runner material is an owner-scoped public
+/// binding reference; Server cannot resolve its endpoint or credentials.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelExecutionMaterial {
     Server(ServerModelExecutionMaterial),
+    Runner(crate::runner_model_bindings::ResolvedRunnerModelBinding),
 }
 
 /// Non-serializable admitted identity, request configuration and executor
@@ -741,15 +743,42 @@ impl AdmittedModelExecution {
     pub fn execution_placement(&self) -> ModelExecutionPlacement {
         match &self.execution_material {
             ModelExecutionMaterial::Server(_) => ModelExecutionPlacement::Server,
+            ModelExecutionMaterial::Runner(_) => ModelExecutionPlacement::Edge,
         }
     }
 
     /// Borrow transport material only at a Server execution boundary. This
     /// exhaustive match must be revisited when another executor is implemented.
     #[must_use]
-    pub fn server_material(&self) -> &ServerModelExecutionMaterial {
+    pub fn server_material(&self) -> Result<&ServerModelExecutionMaterial, &'static str> {
         match &self.execution_material {
-            ModelExecutionMaterial::Server(material) => material,
+            ModelExecutionMaterial::Server(material) => Ok(material),
+            ModelExecutionMaterial::Runner(_) => {
+                Err("Runner execution has no Server transport material")
+            }
+        }
+    }
+
+    pub fn from_runner_binding(
+        binding: crate::runner_model_bindings::ResolvedRunnerModelBinding,
+    ) -> Self {
+        let definition = &binding.definition;
+        Self {
+            offering_id: crate::runner_model_bindings::runner_offering_id(
+                &binding.user_id,
+                &definition.identity,
+            ),
+            access_kind: ModelAccessKind::ThisDevice,
+            source: ModelAdmissionSource::RunnerBinding,
+            model_name: definition.model_name.as_str().to_owned(),
+            wire_model_name: None,
+            provider: "openai".into(),
+            cache_capability: None,
+            thinking_capability: None,
+            request_body_overrides: None,
+            context_window: Some(definition.context_window.get()),
+            max_completion_tokens: Some(definition.max_output_tokens.get()),
+            execution_material: ModelExecutionMaterial::Runner(binding),
         }
     }
 

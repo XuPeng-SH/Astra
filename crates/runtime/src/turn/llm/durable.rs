@@ -3074,7 +3074,7 @@ impl DurableInferenceLedger {
 
     pub(crate) async fn execute_nonstream(
         &self,
-        client: &reqwest::Client,
+        client: &astra_inference_adapter::transport::ProviderTransport,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
         timeout: std::time::Duration,
@@ -4692,10 +4692,10 @@ mod tests {
         let base = spawn_test_server(app).await;
         let (ledger, persistence) = test_ledger(&base);
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
+        let client = astra_inference_adapter::transport::ProviderTransport::build(
+            reqwest::Client::builder().no_proxy(),
+        )
+        .expect("test client");
         let started = std::time::Instant::now();
 
         let error = ledger
@@ -4738,10 +4738,10 @@ mod tests {
         let (ledger, persistence) = test_ledger(&base);
         let caller = tokio::spawn(async move {
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
+            let client = astra_inference_adapter::transport::ProviderTransport::build(
+                reqwest::Client::builder().no_proxy(),
+            )
+            .expect("test client");
             ledger
                 .execute_nonstream(
                     &client,
@@ -4834,10 +4834,10 @@ mod tests {
         let persistence = Arc::new(DelayedTrackedTerminalPersistence::default());
         let ledger = test_ledger_with_persistence(&base, persistence.clone());
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
+        let client = astra_inference_adapter::transport::ProviderTransport::build(
+            reqwest::Client::builder().no_proxy(),
+        )
+        .expect("test client");
 
         let error = ledger
             .execute_nonstream(
@@ -6341,10 +6341,10 @@ mod tests {
             let mut ledger = test_ledger_with_persistence(&base, persistence.clone());
             ledger.settlement_coordinator = coordinator.clone();
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
+            let client = astra_inference_adapter::transport::ProviderTransport::build(
+                reqwest::Client::builder().no_proxy(),
+            )
+            .expect("test client");
 
             let result = ledger
                 .execute_nonstream(

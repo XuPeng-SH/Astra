@@ -43,7 +43,7 @@ impl LocalCredentialRef {
         match self {
             Self::Environment { name } => validate_environment_name(name),
             Self::ProtectedFile { secret_id } => {
-                validate_component("protected secret id", secret_id)
+                validate_file_component("protected secret id", secret_id)
             }
             Self::SystemKeychain { service, account } => {
                 validate_component("keychain service", service)?;
@@ -248,6 +248,10 @@ pub struct LocalModelConfigStore {
 }
 
 impl LocalModelConfigStore {
+    pub fn new() -> Self {
+        Self::with_path(super::default_path().with_file_name("models.json"))
+    }
+
     pub fn with_path(path: PathBuf) -> Self {
         Self { path }
     }
@@ -336,6 +340,121 @@ impl LocalModelConfigStore {
     }
 }
 
+impl Default for LocalModelConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Owner-private storage for provider credentials selected explicitly by a user.
+///
+/// Configuration contains only an opaque reference. This backend deliberately
+/// makes no encryption claim: on Unix it relies on the local account's
+/// filesystem boundary and rejects unsafe ownership or modes when reading.
+/// Other platforms fail closed until a native protected-storage backend is
+/// available; callers may still use environment-variable credentials there.
+pub struct LocalSecretStore {
+    root: PathBuf,
+}
+
+impl LocalSecretStore {
+    pub fn new() -> Self {
+        Self::with_root(super::default_path().with_file_name("model-secrets"))
+    }
+
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn put(&self, secret_id: &str, value: &str) -> Result<(), LocalModelConfigError> {
+        ensure_protected_store_supported()?;
+        validate_file_component("protected secret id", secret_id)?;
+        if value.is_empty() {
+            return Err(LocalModelConfigError::CredentialUnavailable(
+                "credential is empty".to_string(),
+            ));
+        }
+        if value.len() > 1024 * 1024 {
+            return Err(LocalModelConfigError::CredentialUnavailable(
+                "credential exceeds the 1 MiB limit".to_string(),
+            ));
+        }
+        ensure_private_directory(&self.root)?;
+        write_new_private(&self.path(secret_id), value.as_bytes())
+    }
+
+    pub fn resolve(
+        &self,
+        reference: &LocalCredentialRef,
+    ) -> Result<Option<ResolvedLocalCredential>, LocalModelConfigError> {
+        reference.validate()?;
+        match reference {
+            LocalCredentialRef::ProtectedFile { secret_id } => {
+                ensure_protected_store_supported()?;
+                let path = self.path(secret_id);
+                let bytes = read_private_file(&path)?;
+                let value =
+                    String::from_utf8(bytes).map_err(|_| LocalModelConfigError::Invalid {
+                        field: "protected credential",
+                        reason: "must be UTF-8".to_string(),
+                    })?;
+                if value.is_empty() {
+                    return Err(LocalModelConfigError::CredentialUnavailable(
+                        "protected credential is empty".to_string(),
+                    ));
+                }
+                Ok(Some(ResolvedLocalCredential(value)))
+            }
+            LocalCredentialRef::None => Ok(None),
+            LocalCredentialRef::Environment { .. } => {
+                Err(LocalModelConfigError::CredentialUnavailable(
+                    "environment credential must be resolved by the attaching process".to_string(),
+                ))
+            }
+            LocalCredentialRef::SystemKeychain { .. } => {
+                Err(LocalModelConfigError::CredentialUnavailable(
+                    "system keychain backend is not available on this build".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub fn remove(&self, secret_id: &str) -> Result<bool, LocalModelConfigError> {
+        ensure_protected_store_supported()?;
+        validate_file_component("protected secret id", secret_id)?;
+        let path = self.path(secret_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(LocalModelConfigError::Io { path, source }),
+        }
+    }
+
+    fn path(&self, secret_id: &str) -> PathBuf {
+        self.root.join(secret_id)
+    }
+}
+
+fn ensure_protected_store_supported() -> Result<(), LocalModelConfigError> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(LocalModelConfigError::CredentialUnavailable(
+            "protected-file credentials are not supported on this platform; use an environment credential"
+                .to_string(),
+        ))
+    }
+}
+
+impl Default for LocalSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn validate_component(field: &'static str, value: &str) -> Result<(), LocalModelConfigError> {
     if value.trim().is_empty() {
         return Err(LocalModelConfigError::Invalid {
@@ -350,6 +469,89 @@ fn validate_component(field: &'static str, value: &str) -> Result<(), LocalModel
         });
     }
     Ok(())
+}
+
+fn validate_file_component(field: &'static str, value: &str) -> Result<(), LocalModelConfigError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(LocalModelConfigError::Invalid {
+            field,
+            reason: "must contain only ASCII letters, digits, '-' or '_' and be at most 128 bytes"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), LocalModelConfigError> {
+    fs::create_dir_all(path).map_err(|source| LocalModelConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            LocalModelConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn read_private_file(path: &Path) -> Result<Vec<u8>, LocalModelConfigError> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().read(true).open(path);
+    let file = file.map_err(|source| LocalModelConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = file
+            .metadata()
+            .map_err(|source| LocalModelConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(LocalModelConfigError::CredentialUnavailable(
+                "protected credential has unsafe ownership, type, or permissions".to_string(),
+            ));
+        }
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| LocalModelConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(LocalModelConfigError::CredentialUnavailable(
+            "protected credential exceeds the 1 MiB limit".to_string(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate_environment_name(name: &str) -> Result<(), LocalModelConfigError> {
@@ -451,6 +653,43 @@ fn write_atomic_private(path: &Path, body: &[u8]) -> Result<(), LocalModelConfig
         })?;
     temporary
         .persist(path)
+        .map_err(|error| LocalModelConfigError::Io {
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| LocalModelConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
+fn write_new_private(path: &Path, body: &[u8]) -> Result<(), LocalModelConfigError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LocalModelConfigError::Invalid {
+            field: "secret path",
+            reason: "must have a parent directory".to_string(),
+        })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".astra-secret-")
+        .tempfile_in(parent)
+        .map_err(|source| LocalModelConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .write_all(body)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| LocalModelConfigError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist_noclobber(path)
         .map_err(|error| LocalModelConfigError::Io {
             path: path.to_path_buf(),
             source: error.error,
@@ -694,5 +933,111 @@ mod tests {
             fs::metadata(legacy).unwrap().permissions().mode() & 0o777,
             0o666
         );
+    }
+
+    #[test]
+    fn protected_secret_roundtrips_without_entering_configuration() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalSecretStore::with_root(root.path().join("secrets"));
+        let reference = LocalCredentialRef::ProtectedFile {
+            secret_id: "model_01".to_string(),
+        };
+        store
+            .put("model_01", "private-provider-canary")
+            .expect("store secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.path().join("secrets"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(root.path().join("secrets/model_01"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let resolved = store
+            .resolve(&reference)
+            .expect("resolve secret")
+            .expect("secret is present");
+        assert_eq!(
+            resolved.expose_to_local_transport(),
+            "private-provider-canary"
+        );
+        assert!(!format!("{resolved:?}").contains("private-provider-canary"));
+        assert!(store.remove("model_01").expect("remove secret"));
+        assert!(!store.remove("model_01").expect("idempotent remove"));
+    }
+
+    #[test]
+    fn protected_secret_generation_is_immutable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalSecretStore::with_root(root.path().join("secrets"));
+        store.put("generation_1", "first").unwrap();
+        assert!(store.put("generation_1", "second").is_err());
+        assert_eq!(
+            store
+                .resolve(&LocalCredentialRef::ProtectedFile {
+                    secret_id: "generation_1".to_string(),
+                })
+                .unwrap()
+                .unwrap()
+                .expose_to_local_transport(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn protected_secret_id_cannot_escape_its_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalSecretStore::with_root(root.path().join("secrets"));
+        for id in ["../outside", "nested/value", ".", "with space", ""] {
+            assert!(
+                store.put(id, "canary").is_err(),
+                "accepted unsafe id {id:?}"
+            );
+        }
+        assert!(!root.path().join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_secret_rejects_symlinks_and_permissive_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let secrets = root.path().join("secrets");
+        fs::create_dir(&secrets).unwrap();
+        let store = LocalSecretStore::with_root(secrets.clone());
+
+        let outside = root.path().join("outside");
+        fs::write(&outside, "symlink-canary").unwrap();
+        symlink(&outside, secrets.join("linked")).unwrap();
+        assert!(
+            store
+                .resolve(&LocalCredentialRef::ProtectedFile {
+                    secret_id: "linked".to_string()
+                })
+                .is_err()
+        );
+
+        let permissive = secrets.join("permissive");
+        fs::write(&permissive, "mode-canary").unwrap();
+        fs::set_permissions(&permissive, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = store
+            .resolve(&LocalCredentialRef::ProtectedFile {
+                secret_id: "permissive".to_string(),
+            })
+            .unwrap_err();
+        assert!(!error.to_string().contains("mode-canary"));
     }
 }

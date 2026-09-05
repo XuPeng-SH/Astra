@@ -288,6 +288,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /model                   → open the picker (legacy default)
         //   /model list              → explicit alias for the picker
         //   /model info              → details panel for current model
+        //   /model add               → native Runner-local setup
         //   /model clear             → clear the active model selection
         //   /model <name>            → direct switch to <name>
         //
@@ -303,6 +304,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let (sub, rest) = split_sub(trimmed);
             match sub {
                 "info" => handle_model_info(ctx, rest).await,
+                "add" if rest.is_empty() => {
+                    ctx.open_deferred_view(
+                        "Opened local model setup",
+                        Box::new(crate::tui::bottom_pane::model_setup_view::ModelSetupView::new()),
+                    );
+                    SlashResult::Deferred
+                }
+                "add" => {
+                    ctx.show_error("Use `/model add` and complete the private setup form.".into());
+                    SlashResult::Handled
+                }
                 "clear" => handle_model_clear(ctx).await,
                 // Everything else is the `/model <name>` shorthand.
                 _ => {
@@ -1434,6 +1446,7 @@ pub(crate) fn handle_view_result(
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
         | ViewResult::ModelThinking { .. }
+        | ViewResult::ModelSetup(_)
         | ViewResult::Session { .. }
         | ViewResult::WorkspaceTrust(_) => {}
     }

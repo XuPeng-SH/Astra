@@ -40,6 +40,7 @@ pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
 pub mod replay;
 pub mod resource_governor;
+pub mod runner_model_bindings;
 pub mod runs;
 pub mod runtime_maintenance;
 pub mod sandbox;

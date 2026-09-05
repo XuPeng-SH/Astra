@@ -14,7 +14,8 @@ mod local_models;
 
 pub use local_models::{
     LOCAL_MODELS_FILE_VERSION, LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig,
-    LocalModelConfigError, LocalModelConfigStore, LocalModelDefinition, ResolvedLocalCredential,
+    LocalModelConfigError, LocalModelConfigStore, LocalModelDefinition, LocalSecretStore,
+    ResolvedLocalCredential,
 };
 
 #[derive(Debug, Error)]
