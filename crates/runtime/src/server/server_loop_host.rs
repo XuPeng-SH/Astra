@@ -8214,15 +8214,17 @@ impl ServerAgenticLoopHost {
             provider: provider.clone(),
             model_name: model.clone(),
             wire_model_name: None,
-            api_key: String::new(),
-            base_url: String::new(),
+            executor: ResolvedTurnLlmExecutor::Server {
+                api_key: String::new(),
+                base_url: String::new(),
+                header_overrides: HashMap::new(),
+                completions_url_override: None,
+                request_timeout: None,
+            },
             fallback_chain: Vec::new(),
             cache_capability: self.mock_cache_capability,
             thinking_capability: None,
-            header_overrides: HashMap::new(),
             request_body_overrides: None,
-            completions_url_override: None,
-            request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
         };
@@ -31437,7 +31439,7 @@ mod tests {
         assert!(
             llm_events[1]["metadata"]["response"]["response"]["error"]
                 .as_str()
-                .is_some_and(|message| message.contains("LLM error 500")),
+                .is_some_and(|message| message.contains("HTTP 500")),
             "expected stored error payload: {}",
             llm_events[1]
         );
