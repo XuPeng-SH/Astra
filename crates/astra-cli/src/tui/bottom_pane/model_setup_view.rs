@@ -66,9 +66,9 @@ impl ModelSetupView {
     }
 
     fn submit(&mut self) {
-        for index in 0..5 {
+        for (index, label) in LABELS.iter().enumerate().take(5) {
             if self.values[index].trim().is_empty() {
-                self.error = Some(format!("{} cannot be empty", LABELS[index].trim()));
+                self.error = Some(format!("{} cannot be empty", label.trim()));
                 self.focus = index;
                 return;
             }

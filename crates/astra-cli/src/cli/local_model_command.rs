@@ -73,12 +73,17 @@ pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
     save_definition(
         &store,
         &secrets,
-        name,
-        base_url,
-        provider_model,
-        context_window,
-        max_output_tokens,
-        credential,
+        LocalModelDefinitionInput {
+            name,
+            definition: LocalModelDefinition {
+                protocol: LocalInferenceProtocol::OpenaiCompatible,
+                base_url,
+                model: provider_model,
+                context_window,
+                max_output_tokens,
+                credential,
+            },
+        },
         created_secret,
     )
 }
@@ -120,39 +125,35 @@ pub(crate) fn add_from_tui(
     save_definition(
         &store,
         &secrets,
-        name,
-        base_url,
-        provider_model,
-        context_window,
-        max_output_tokens,
-        credential,
+        LocalModelDefinitionInput {
+            name,
+            definition: LocalModelDefinition {
+                protocol: LocalInferenceProtocol::OpenaiCompatible,
+                base_url,
+                model: provider_model,
+                context_window,
+                max_output_tokens,
+                credential,
+            },
+        },
         created_secret,
     )
+}
+
+struct LocalModelDefinitionInput {
+    name: String,
+    definition: LocalModelDefinition,
 }
 
 fn save_definition(
     store: &LocalModelConfigStore,
     secrets: &LocalSecretStore,
-    name: String,
-    base_url: String,
-    provider_model: String,
-    context_window: u32,
-    max_output_tokens: u32,
-    credential: LocalCredentialRef,
+    input: LocalModelDefinitionInput,
     created_secret: Option<String>,
 ) -> Result<String, String> {
+    let LocalModelDefinitionInput { name, definition } = input;
     let mut config = store.load().map_err(|error| error.to_string())?;
-    let previous = config.models.insert(
-        name.clone(),
-        LocalModelDefinition {
-            protocol: LocalInferenceProtocol::OpenaiCompatible,
-            base_url,
-            model: provider_model,
-            context_window,
-            max_output_tokens,
-            credential,
-        },
-    );
+    let previous = config.models.insert(name.clone(), definition);
     let expected_revision = config.revision;
     let applied = match store.replace(expected_revision, config) {
         Ok(applied) => applied,
@@ -171,13 +172,14 @@ fn save_definition(
             let _ = secrets.remove(secret_id);
         }
     }
+    let next = format!("astra model check {name}");
     serde_json::to_string_pretty(&serde_json::json!({
         "name": name,
         "status": "saved_locally",
         "revision": applied.revision,
         "provider_probe": "not_run",
         "config_path": store.path(),
-        "next": format!("astra model check {}", name),
+        "next": next,
     }))
     .map_err(|error| error.to_string())
 }
