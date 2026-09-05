@@ -637,23 +637,6 @@ fn tombstone_expired(now: u64, acknowledged_at: u64, grant_deadline: u64) -> boo
         .is_some_and(|expires_at| now >= expires_at)
 }
 
-#[cfg(test)]
-mod retention_tests {
-    use super::*;
-
-    #[test]
-    fn tombstones_outlive_both_ack_and_grant_replay_horizons() {
-        let day = ACK_TOMBSTONE_RETENTION_MS;
-        assert!(!tombstone_expired(day - 1, 0, 0));
-        assert!(tombstone_expired(day, 0, 0));
-        assert!(!tombstone_expired(day + 99, 100, 0));
-        assert!(tombstone_expired(day + 100, 100, 0));
-        assert!(!tombstone_expired(day + 199, 100, 200));
-        assert!(tombstone_expired(day + 200, 100, 200));
-        assert!(!tombstone_expired(u64::MAX, u64::MAX, 0));
-    }
-}
-
 fn ensure_private_directory(path: &Path) -> Result<(), InferenceHostError> {
     #[cfg(not(unix))]
     {
@@ -742,4 +725,21 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), InferenceHostError> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| InferenceHostError::JournalIo)
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn tombstones_outlive_both_ack_and_grant_replay_horizons() {
+        let day = ACK_TOMBSTONE_RETENTION_MS;
+        assert!(!tombstone_expired(day - 1, 0, 0));
+        assert!(tombstone_expired(day, 0, 0));
+        assert!(!tombstone_expired(day + 99, 100, 0));
+        assert!(tombstone_expired(day + 100, 100, 0));
+        assert!(!tombstone_expired(day + 199, 100, 200));
+        assert!(tombstone_expired(day + 200, 100, 200));
+        assert!(!tombstone_expired(u64::MAX, u64::MAX, 0));
+    }
 }

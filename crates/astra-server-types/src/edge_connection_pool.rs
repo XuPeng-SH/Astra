@@ -534,10 +534,11 @@ impl EdgeConnectionPool {
     /// Wake a currently hosted Runner after durable admission/cancellation.
     /// Missing wakeups are recovered by the connection worker's bounded batch.
     pub fn notify_runner_inference(&self, user_id: &str, runner_id: &str) {
-        if let Some(connection) = self.connections.get(&pool_key(user_id, runner_id)) {
-            if connection.user_id == user_id && connection.edge_agent_id == runner_id {
-                connection.inference_wakeup.notify_one();
-            }
+        if let Some(connection) = self.connections.get(&pool_key(user_id, runner_id))
+            && connection.user_id == user_id
+            && connection.edge_agent_id == runner_id
+        {
+            connection.inference_wakeup.notify_one();
         }
     }
 
