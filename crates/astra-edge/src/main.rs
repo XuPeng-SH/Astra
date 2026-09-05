@@ -1408,11 +1408,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 | EdgeServerMessage::InferenceTerminalAck { .. }
                                 | EdgeServerMessage::InferenceResponseCredit { .. }
                                 | EdgeServerMessage::InferenceRejected { .. })) => {
-                                if let Some(worker) = &inference {
-                                    if worker.commands.try_send(message).is_err() {
-                                        tracing::warn!("Runner inference input unavailable; reconnecting with durable custody");
-                                        break;
-                                    }
+                                if let Some(worker) = &inference
+                                    && worker.commands.try_send(message).is_err()
+                                {
+                                    tracing::warn!("Runner inference input unavailable; reconnecting with durable custody");
+                                    break;
                                 }
                             }
                             Err(e) => {

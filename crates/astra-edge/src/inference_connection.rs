@@ -324,18 +324,18 @@ impl InferenceConnection {
         let mut messages = Vec::new();
         // Configuration repair must not prevent custody delivery for an
         // already-fenced attempt. Publication remains pending until repaired.
-        if let Ok(Some(publication)) = self.host.next_publication().await {
-            if self.publication_sent.as_ref() != Some(&publication.operation_id) {
-                self.publication_sent = Some(publication.operation_id.clone());
-                messages.push(EdgeClientMessage::InferenceBindingPublish {
-                    publication: Box::new(publication),
-                });
-            }
+        if let Ok(Some(publication)) = self.host.next_publication().await
+            && self.publication_sent.as_ref() != Some(&publication.operation_id)
+        {
+            self.publication_sent = Some(publication.operation_id.clone());
+            messages.push(EdgeClientMessage::InferenceBindingPublish {
+                publication: Box::new(publication),
+            });
         }
-        if self.outgoing.is_none() {
-            if let Some((grant, payload)) = self.host.pending(1).await?.pop() {
-                messages.extend(self.begin_transfer(grant, payload)?);
-            }
+        if self.outgoing.is_none()
+            && let Some((grant, payload)) = self.host.pending(1).await?.pop()
+        {
+            messages.extend(self.begin_transfer(grant, payload)?);
         }
         if let Some(clock) = self.clock {
             let expired: Vec<_> = self
