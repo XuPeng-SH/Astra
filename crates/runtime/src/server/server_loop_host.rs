@@ -1821,7 +1821,7 @@ struct SummaryClientSkillAutoRouteJudge {
 
 #[derive(Clone)]
 enum ServerSummaryClient {
-    Server(RuntimeSummaryClient),
+    Server(Box<RuntimeSummaryClient>),
     Runner(Box<RunnerSummaryClient>),
 }
 
@@ -7023,7 +7023,7 @@ impl ServerAgenticLoopHost {
         match &config.executor {
             ResolvedTurnLlmExecutor::Server { .. } => {
                 let route = config.execution_route().ok()?;
-                Some(ServerSummaryClient::Server(
+                Some(ServerSummaryClient::Server(Box::new(
                     RuntimeSummaryClient::new_with_attempt_allocator(
                         route,
                         max_output_tokens,
@@ -7031,7 +7031,7 @@ impl ServerAgenticLoopHost {
                         scope,
                         self.summary_attempt_allocator.clone(),
                     ),
-                ))
+                )))
             }
             ResolvedTurnLlmExecutor::Runner(binding) => {
                 Some(ServerSummaryClient::Runner(Box::new(RunnerSummaryClient {
