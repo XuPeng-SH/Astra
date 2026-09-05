@@ -894,6 +894,28 @@ fn model_offering_resolution_error_response(
     error_response_coded(status, error.to_string(), code)
 }
 
+fn runner_model_error_response(
+    error: crate::service_error::ServiceError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::service_error::ServiceErrorKind;
+
+    let (status, code) = match error.kind {
+        ServiceErrorKind::NotFound | ServiceErrorKind::Conflict => {
+            (StatusCode::NOT_FOUND, "model_offering_unavailable")
+        }
+        ServiceErrorKind::Invalid | ServiceErrorKind::Verification => {
+            (StatusCode::BAD_REQUEST, "model_selection_invalid")
+        }
+        ServiceErrorKind::ConflictTransient
+        | ServiceErrorKind::Persistence
+        | ServiceErrorKind::Network
+        | ServiceErrorKind::Internal => {
+            (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
+        }
+    };
+    error_response_coded(status, error.message, code)
+}
+
 impl std::fmt::Display for ModelOfferingResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2198,6 +2220,19 @@ pub trait ModelService: Send + Sync {
         self.resolve_model_offering(offering_id).await
     }
 
+    /// Resolve the exact executor material for one authenticated user. The
+    /// default preserves Server-catalog implementations; the database service
+    /// additionally resolves the user's live Runner inventory. Callers must
+    /// use this boundary instead of inferring execution from an Offering id.
+    async fn revalidate_model_execution(
+        &self,
+        _user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        let offering = self.revalidate_model_offering(offering_id).await?;
+        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    }
+
     async fn update_model(
         &self,
         model_name: String,
@@ -2222,20 +2257,6 @@ pub struct DatabaseModelService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
-    catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CachedCatalogRevision {
-    fingerprint: CatalogRevisionFingerprint,
-    revision: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CatalogRevisionFingerprint {
-    total: i64,
-    min_updated_at: Option<String>,
-    max_updated_at: Option<String>,
 }
 
 /// Parse a required JSON column without degrading malformed persisted data to defaults.
@@ -2256,7 +2277,6 @@ impl DatabaseModelService {
             matrixone,
             encryptor,
             pool: None,
-            catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2338,15 +2358,26 @@ impl DatabaseModelService {
         self
     }
 
-    fn invalidate_catalog_revision_cache(&self) {
-        self.catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .clear();
-    }
-
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
         crate::require_shared_pool(self.pool.as_ref(), "DatabaseModelService", &self.matrixone)
+    }
+
+    async fn runner_catalog_items(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        crate::runner_model_bindings::list_effective_runner_model_bindings(pool, user_id)
+            .await
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .map(crate::runner_model_bindings::ResolvedRunnerModelBinding::catalog_item)
+                    .collect()
+            })
+            .map_err(runner_model_error_response)
     }
 
     fn model_list_item_from_row(
@@ -2507,7 +2538,6 @@ impl ModelService for DatabaseModelService {
         .await
         .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
 
         // Thinking probe is NOT run during create — it's a separate
         // concern triggered by `model check`.  create_model only validates
@@ -2530,7 +2560,7 @@ impl ModelService for DatabaseModelService {
 
     async fn list_models(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -2578,12 +2608,14 @@ impl ModelService for DatabaseModelService {
                 },
             });
         }
+        models.extend(self.runner_catalog_items(&user_id).await?);
+        sort_model_list_items(&mut models);
         Ok(models)
     }
 
     async fn list_models_page(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
         limit: u32,
         cursor: Option<ModelListCursor>,
@@ -2594,6 +2626,7 @@ impl ModelService for DatabaseModelService {
             .map(validate_model_list_cursor)
             .transpose()?;
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let mut runner_items = self.runner_catalog_items(&user_id).await?;
 
         let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
         let count_sql =
@@ -2604,6 +2637,9 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?
             .try_get("total")
             .map_err(internal_error)?;
+        let total_i64 = total_i64
+            .checked_add(i64::try_from(runner_items.len()).map_err(internal_error)?)
+            .ok_or_else(|| internal_error("model list total overflow"))?;
         let total = u32::try_from(total_i64)
             .map_err(|error| internal_error(format!("model list total exceeds u32: {error}")))?;
 
@@ -2632,6 +2668,11 @@ impl ModelService for DatabaseModelService {
             .iter()
             .map(Self::model_list_item_from_row)
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(cursor) = &cursor {
+            runner_items.retain(|item| model_list_item_after_cursor(item, cursor));
+        }
+        items.extend(runner_items);
+        sort_model_list_items(&mut items);
         let has_more = items.len() > limit as usize;
         if has_more {
             items.truncate(limit as usize);
@@ -2651,53 +2692,16 @@ impl ModelService for DatabaseModelService {
 
     async fn model_catalog_revision(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
-        let fingerprint_sql = format!(
-            "SELECT COUNT(*) AS total, \
-                    CAST(MIN(updated_at) AS CHAR) AS min_updated_at, \
-                    CAST(MAX(updated_at) AS CHAR) AS max_updated_at \
-             FROM infra_llm_models WHERE {visibility}"
-        );
-        let row = query(&fingerprint_sql)
-            .fetch_one(&pool)
+        // Runner availability is user-scoped and can change through heartbeat
+        // expiry without passing through this service instance. Derive the
+        // revision from the complete current projection so a stale process
+        // cache can never keep a disappeared personal model selectable.
+        self.list_models(user_id, is_admin)
             .await
-            .map_err(internal_error)?;
-        let fingerprint = CatalogRevisionFingerprint {
-            total: row.try_get("total").map_err(internal_error)?,
-            min_updated_at: row.try_get("min_updated_at").map_err(internal_error)?,
-            max_updated_at: row.try_get("max_updated_at").map_err(internal_error)?,
-        };
-        if let Some(cached) = self
-            .catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .get(&is_admin)
-            .filter(|cached| cached.fingerprint == fingerprint)
-        {
-            return Ok(cached.revision.clone());
-        }
-
-        // The fingerprint is cheap and changes on every catalog mutation made
-        // through this service. Only a new fingerprint pays the full
-        // canonical serialization cost; page drains therefore stay O(pages),
-        // not O(rows × pages).
-        let items = self.list_models(String::new(), is_admin).await?;
-        let revision = model_catalog_revision(&items);
-        self.catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .insert(
-                is_admin,
-                CachedCatalogRevision {
-                    fingerprint,
-                    revision: revision.clone(),
-                },
-            );
-        Ok(revision)
+            .map(|items| model_catalog_revision(&items))
     }
 
     async fn get_model(
@@ -2735,6 +2739,25 @@ impl ModelService for DatabaseModelService {
         )
         .await
         .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn revalidate_model_execution(
+        &self,
+        user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id.starts_with("runner-") {
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                internal_error("Runner model resolution requires durable storage")
+            })?;
+            let binding =
+                crate::runner_model_bindings::resolve_runner_offering(pool, &user_id, &offering_id)
+                    .await
+                    .map_err(runner_model_error_response)?;
+            return Ok(AdmittedModelExecution::from_runner_binding(binding));
+        }
+        let offering = self.revalidate_model_offering(offering_id).await?;
+        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
     }
 
     async fn revalidate_model_offering(
@@ -2892,7 +2915,6 @@ impl ModelService for DatabaseModelService {
         let mut record = Self::model_record_from_row(row)?;
         record.connectivity = conn_result;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 
@@ -2919,7 +2941,6 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(())
     }
 
@@ -3034,7 +3055,6 @@ impl ModelService for DatabaseModelService {
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
         record.thinking_probe = thinking_probe;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 }

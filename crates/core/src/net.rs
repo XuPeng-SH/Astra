@@ -83,6 +83,57 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
     builder
 }
 
+/// Build the client used by Runner-local model traffic.
+///
+/// Proxy settings use the same explicit external-egress policy as Server
+/// providers. Enterprises may additionally point `ASTRA_RUNNER_CA_BUNDLE` at
+/// a PEM bundle. The path and certificate contents are deliberately excluded
+/// from errors because this function is also used by user-facing diagnostics.
+pub fn runner_provider_client_builder()
+-> Result<reqwest::ClientBuilder, RunnerProviderNetworkConfigError> {
+    const MAX_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+
+    let mut builder = apply_env_proxy(reqwest::Client::builder().no_proxy());
+    let Some(path) = std::env::var_os("ASTRA_RUNNER_CA_BUNDLE") else {
+        return Ok(builder);
+    };
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&bytes)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleInvalid)?;
+    if certificates.is_empty() {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerProviderNetworkConfigError {
+    CaBundleUnreadable,
+    CaBundleInvalid,
+}
+
+impl std::fmt::Display for RunnerProviderNetworkConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CaBundleUnreadable => "Runner private CA bundle cannot be read",
+            Self::CaBundleInvalid => {
+                "Runner private CA bundle must be a non-empty PEM certificate bundle of at most 4 MiB"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RunnerProviderNetworkConfigError {}
+
 fn parse_environment_proxy(
     var: &str,
     proxy_url: &str,
@@ -175,7 +226,7 @@ mod client_builder_for_target_tests {
 
 #[cfg(test)]
 mod apply_env_proxy_tests {
-    use super::{apply_env_proxy, parse_environment_proxy};
+    use super::{apply_env_proxy, parse_environment_proxy, runner_provider_client_builder};
 
     #[test]
     fn proxy_configuration_logs_never_include_private_material() {
@@ -316,5 +367,18 @@ mod apply_env_proxy_tests {
                 assert!(builder.build().is_ok());
             },
         );
+    }
+
+    #[test]
+    fn runner_ca_failures_do_not_disclose_private_paths() {
+        let private_path = "/private/customer/canary-ca.pem";
+        temp_env::with_var("ASTRA_RUNNER_CA_BUNDLE", Some(private_path), || {
+            let diagnostic = runner_provider_client_builder()
+                .expect_err("missing CA bundle must fail closed")
+                .to_string();
+            assert!(diagnostic.contains("cannot be read"));
+            assert!(!diagnostic.contains(private_path));
+            assert!(!diagnostic.contains("customer"));
+        });
     }
 }

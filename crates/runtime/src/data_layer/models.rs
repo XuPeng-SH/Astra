@@ -191,14 +191,28 @@ async fn effective_model_catalog(
         .model_service
         .model_catalog_revision(user.user_id, is_admin)
         .await?;
+    let mut declared = vec![DeclaredModelAccess {
+        id: "self-hosted".to_string(),
+        kind: ModelAccessKind::SelfHosted,
+        label: "Self-hosted".to_string(),
+        execution_placement: ModelExecutionPlacement::Server,
+        availability: ModelAccessAvailability::Ready,
+    }];
+    for item in &page.items {
+        if item.access_kind == ModelAccessKind::ThisDevice
+            && !declared.iter().any(|access| access.id == item.access_id)
+        {
+            declared.push(DeclaredModelAccess {
+                id: item.access_id.clone(),
+                kind: ModelAccessKind::ThisDevice,
+                label: item.access_label.clone(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
+            });
+        }
+    }
     Ok(EffectiveModelCatalog {
-        declared: vec![DeclaredModelAccess {
-            id: "self-hosted".to_string(),
-            kind: ModelAccessKind::SelfHosted,
-            label: "Self-hosted".to_string(),
-            execution_placement: ModelExecutionPlacement::Server,
-            availability: ModelAccessAvailability::Ready,
-        }],
+        declared,
         offerings: page.items,
         provider_default: None,
         default_catalog: None,

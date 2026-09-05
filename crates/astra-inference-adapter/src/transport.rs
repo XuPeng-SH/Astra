@@ -483,14 +483,10 @@ impl ProviderTransport {
                     ResponseMode::Sse => {
                         let mut decoded =
                             Box::pin(decode_provider_sse(bounded, limits.event_bytes));
-                        let mut done = false;
                         while let Some(event) = decoded.next().await {
                             let event = match event {
                                 Ok(ParsedSseEvent::Data(value)) => ProviderEvent::Json(value),
-                                Ok(ParsedSseEvent::Done) => {
-                                    done = true;
-                                    ProviderEvent::Done
-                                }
+                                Ok(ParsedSseEvent::Done) => ProviderEvent::Done,
                                 Err(SseDecodeError::Transport) => {
                                     return Err(
                                         if byte_count.load(std::sync::atomic::Ordering::Relaxed)
@@ -510,15 +506,18 @@ impl ProviderTransport {
                             deliver(events, event, &mut terminal.events_delivered, limits.events)
                                 .await?;
                         }
-                        if !done {
-                            deliver(
-                                events,
-                                ProviderEvent::Eof,
-                                &mut terminal.events_delivered,
-                                limits.events,
-                            )
-                            .await?;
-                        }
+                        // `[DONE]` is provider-level semantic framing; EOF is
+                        // transport-level evidence. Retain both so durable
+                        // consumers can distinguish a complete response from
+                        // a stream that ended immediately after `[DONE]` was
+                        // observed but before the body actually closed.
+                        deliver(
+                            events,
+                            ProviderEvent::Eof,
+                            &mut terminal.events_delivered,
+                            limits.events,
+                        )
+                        .await?;
                     }
                     ResponseMode::Json => {
                         let decoded =

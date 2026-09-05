@@ -1,10 +1,15 @@
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test runner_model_bindings_db_it -- --ignored --test-threads=1
 mod common;
 
+use std::sync::Arc;
+
 use astra_services::runner_model_bindings::{
     AuthenticatedRunnerConnection, enroll_runner_inference, list_effective_runner_model_bindings,
     publish_runner_binding, resolve_runner_model_binding, resolve_runner_offering,
     runner_offering_id,
+};
+use astra_services::{
+    DatabaseModelService, FernetTokenEncryptor, ModelExecutionMaterial, ModelService,
 };
 use astra_turn_types::runner_inference::*;
 use serial_test::serial;
@@ -229,4 +234,61 @@ async fn runner_reconnect_requires_executor_enrollment_but_preserves_publication
             .is_err(),
         "retired journal cannot restore stale inventory"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn effective_model_catalog_and_admission_are_authenticated_owner_scoped() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let user = format!("runner-catalog-{}", uuid::Uuid::new_v4());
+    let other_user = format!("runner-catalog-{}", uuid::Uuid::new_v4());
+    let connection = register(&pool, &user).await;
+    let other = register(&pool, &other_user).await;
+    for connection in [&connection, &other] {
+        enroll_runner_inference(
+            &pool,
+            connection,
+            RUNNER_INFERENCE_PROTOCOL_VERSION,
+            &id("journal"),
+            &id("boot"),
+        )
+        .await
+        .unwrap();
+        publish_runner_binding(&pool, connection, &publication("publish", 0, 1))
+            .await
+            .unwrap();
+    }
+    let offering_id = runner_offering_id(&user, publication("identity", 0, 1).change.identity());
+    let other_offering_id = runner_offering_id(
+        &other_user,
+        publication("other-identity", 0, 1).change.identity(),
+    );
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("runner-catalog-test-key").unwrap()),
+    )
+    .with_pool(pool);
+
+    let catalog = service.list_models(user.clone(), false).await.unwrap();
+    assert!(catalog.iter().any(|item| item.offering_id == offering_id));
+    assert!(
+        !catalog
+            .iter()
+            .any(|item| item.offering_id == other_offering_id)
+    );
+
+    let admitted = service
+        .revalidate_model_execution(user.clone(), offering_id.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        admitted.execution_material,
+        ModelExecutionMaterial::Runner(_)
+    ));
+    let error = service
+        .revalidate_model_execution(other_user, offering_id)
+        .await
+        .expect_err("another principal must not resolve this personal Offering");
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
 }

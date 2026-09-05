@@ -19,6 +19,7 @@ use crate::{error_response_coded, internal_error};
 /// non-serializable value.
 pub(crate) async fn admit_model_execution(
     model_service: &Arc<dyn ModelService>,
+    authenticated_user_id: &str,
     selection: &ModelSelection,
     resolved: Option<&ResolvedModelSelection>,
     gateway: Option<&RuntimeCapabilityDescriptorRequest>,
@@ -83,10 +84,12 @@ pub(crate) async fn admit_model_execution(
             "model_selection_invalid",
         ));
     }
-    let offering = model_service
-        .revalidate_model_offering(selection.offering_id.clone())
-        .await?;
-    AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    model_service
+        .revalidate_model_execution(
+            authenticated_user_id.to_string(),
+            selection.offering_id.clone(),
+        )
+        .await
 }
 
 fn is_exact_runtime_identity(value: &str) -> bool {
@@ -252,11 +255,14 @@ mod tests {
         let selected = ModelSelection {
             offering_id: "offer-server".into(),
         };
-        let catalog = admit_model_execution(&service, &selected, None, None, None)
+        let catalog = admit_model_execution(&service, "user", &selected, None, None, None)
             .await
             .expect("catalog admission");
         assert_eq!(catalog.model_name, "server-model");
-        assert_eq!(catalog.server_material().api_key, "server-secret");
+        assert_eq!(
+            catalog.server_material().expect("Server material").api_key,
+            "server-secret"
+        );
         assert_eq!(catalog.context_window, Some(128_000));
         assert_eq!(
             catalog.source,
@@ -269,7 +275,7 @@ mod tests {
         assert_eq!(catalog_service.revalidations.load(Ordering::SeqCst), 1);
 
         catalog_service.revoked.store(true, Ordering::SeqCst);
-        let error = admit_model_execution(&service, &selected, None, None, None)
+        let error = admit_model_execution(&service, "user", &selected, None, None, None)
             .await
             .expect_err("revocation must not reuse the prior credential");
         assert_eq!(error.0, StatusCode::FORBIDDEN);
@@ -287,6 +293,7 @@ mod tests {
         let service: Arc<dyn ModelService> = catalog_service.clone();
         let endpoint = admit_model_execution(
             &service,
+            "user",
             &selection(),
             Some(&resolved()),
             Some(&gateway()),
@@ -299,6 +306,7 @@ mod tests {
         assert_eq!(
             endpoint
                 .server_material()
+                .expect("Server material")
                 .completions_url_override
                 .as_deref(),
             Some("https://gateway.example/chat/completions")
@@ -314,6 +322,7 @@ mod tests {
         assert_eq!(
             endpoint
                 .server_material()
+                .expect("Server material")
                 .header_overrides
                 .get("authorization"),
             Some(&runtime_auth().authorization)
@@ -327,6 +336,7 @@ mod tests {
         for context_window in [None, Some(0)] {
             let error = admit_model_execution(
                 &service,
+                "user",
                 &selection(),
                 Some(&resolved()),
                 Some(&RuntimeCapabilityDescriptorRequest {
@@ -349,6 +359,7 @@ mod tests {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService::default());
         let error = admit_model_execution(
             &service,
+            "user",
             &ModelSelection {
                 offering_id: "offer-requested".into(),
             },
@@ -382,6 +393,7 @@ mod tests {
             });
             let error = admit_model_execution(
                 &service,
+                "user",
                 &selection(),
                 Some(&resolved()),
                 Some(&gateway()),
@@ -413,6 +425,7 @@ mod tests {
             };
             let error = admit_model_execution(
                 &service,
+                "user",
                 &selection(),
                 Some(&resolved()),
                 Some(&descriptor),
@@ -435,6 +448,7 @@ mod tests {
         let service: Arc<dyn ModelService> = catalog_service.clone();
         let error = admit_model_execution(
             &service,
+            "user",
             &selection(),
             Some(&resolved()),
             None,
@@ -448,6 +462,7 @@ mod tests {
         );
         let error = admit_model_execution(
             &service,
+            "user",
             &selection(),
             None,
             Some(&gateway()),

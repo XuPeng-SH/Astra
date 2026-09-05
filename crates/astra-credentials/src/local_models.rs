@@ -7,7 +7,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LOCAL_MODELS_FILE_VERSION: u32 = 1;
+pub const LOCAL_MODELS_FILE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +60,10 @@ pub struct LocalModelDefinition {
     pub protocol: LocalInferenceProtocol,
     pub base_url: String,
     pub model: String,
+    /// User-declared provider capacity. These values are part of the binding
+    /// revision and are never guessed from a mutable model name.
+    pub context_window: u32,
+    pub max_output_tokens: u32,
     pub credential: LocalCredentialRef,
 }
 
@@ -77,6 +81,19 @@ impl LocalModelDefinition {
     pub fn validate(&self) -> Result<(), LocalModelConfigError> {
         validate_component("model", &self.model)?;
         validate_base_url(&self.base_url)?;
+        if self.context_window == 0 {
+            return Err(LocalModelConfigError::Invalid {
+                field: "context window",
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+        if self.max_output_tokens == 0 || self.max_output_tokens > self.context_window {
+            return Err(LocalModelConfigError::Invalid {
+                field: "maximum output tokens",
+                reason: "must be greater than zero and no larger than the context window"
+                    .to_string(),
+            });
+        }
         self.credential.validate()
     }
 }
@@ -247,6 +264,24 @@ pub struct LocalModelConfigStore {
     path: PathBuf,
 }
 
+/// Validated configuration snapshot with the store's shared OS lock retained.
+/// Keeping this value alive prevents a concurrent CLI writer from replacing
+/// the binding material between validation and a local execution fence.
+pub struct LocalModelConfigLease {
+    config: LocalModelConfig,
+    _lock: File,
+}
+
+impl LocalModelConfigLease {
+    pub fn config(&self) -> &LocalModelConfig {
+        &self.config
+    }
+
+    pub fn into_config(self) -> LocalModelConfig {
+        self.config
+    }
+}
+
 impl LocalModelConfigStore {
     pub fn new() -> Self {
         Self::with_path(super::default_path().with_file_name("models.json"))
@@ -261,12 +296,22 @@ impl LocalModelConfigStore {
     }
 
     pub fn load(&self) -> Result<LocalModelConfig, LocalModelConfigError> {
-        if !self.path.exists() {
-            return Ok(LocalModelConfig::default());
+        Ok(self.lease()?.into_config())
+    }
+
+    /// Load a validated snapshot and retain the shared revision lock until
+    /// the returned lease is dropped.
+    pub fn lease(&self) -> Result<LocalModelConfigLease, LocalModelConfigError> {
+        if let Some(parent) = self.path.parent() {
+            ensure_private_directory(parent)?;
         }
         let lock = open_lock(&self.lock_path())?;
         lock.lock_shared().map_err(|source| self.io(source))?;
-        self.load_unlocked()
+        let config = self.load_unlocked()?;
+        Ok(LocalModelConfigLease {
+            config,
+            _lock: lock,
+        })
     }
 
     /// Atomically replace the desired configuration under a revision CAS.
@@ -278,10 +323,7 @@ impl LocalModelConfigStore {
     ) -> Result<LocalModelConfig, LocalModelConfigError> {
         candidate.validate()?;
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LocalModelConfigError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+            ensure_private_directory(parent)?;
         }
         let lock_path = self.lock_path();
         let lock = open_lock(&lock_path)?;
@@ -318,7 +360,7 @@ impl LocalModelConfigStore {
         if !self.path.exists() {
             return Ok(LocalModelConfig::default());
         }
-        let bytes = fs::read(&self.path).map_err(|source| self.io(source))?;
+        let bytes = read_private_file(&self.path)?;
         let config: LocalModelConfig =
             serde_json::from_slice(&bytes).map_err(|source| LocalModelConfigError::Json {
                 path: self.path.clone(),
@@ -424,7 +466,16 @@ impl LocalSecretStore {
         validate_file_component("protected secret id", secret_id)?;
         let path = self.path(secret_id);
         match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                #[cfg(unix)]
+                File::open(&self.root)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|source| LocalModelConfigError::Io {
+                        path: self.root.clone(),
+                        source,
+                    })?;
+                Ok(true)
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(source) => Err(LocalModelConfigError::Io { path, source }),
         }
@@ -713,6 +764,8 @@ mod tests {
             protocol: LocalInferenceProtocol::OpenaiCompatible,
             base_url: "https://provider.example/v1".to_string(),
             model: "coding-model".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
             credential,
         }
     }
@@ -740,7 +793,7 @@ mod tests {
         assert!(json.contains("WORK_LLM_API_KEY"));
         assert!(!json.contains("provider-secret-canary"));
         assert!(serde_json::from_str::<LocalModelConfig>(&json).is_ok());
-        let inline = r#"{"version":1,"revision":0,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","credential":{"kind":"environment","name":"WORK_LLM_API_KEY","value":"provider-secret-canary"}}}}"#;
+        let inline = r#"{"version":2,"revision":0,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","context_window":128000,"max_output_tokens":8192,"credential":{"kind":"environment","name":"WORK_LLM_API_KEY","value":"provider-secret-canary"}}}}"#;
         assert!(serde_json::from_str::<LocalModelConfig>(inline).is_err());
     }
 
@@ -798,8 +851,48 @@ mod tests {
     }
 
     #[test]
+    fn leased_snapshot_fences_concurrent_revision_replacement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("models.json");
+        let store = LocalModelConfigStore::with_path(path.clone());
+        let mut first = LocalModelConfig::default();
+        first
+            .models
+            .insert("work".to_string(), model(LocalCredentialRef::None));
+        let applied = store.replace(0, first).expect("first revision");
+        let lease = store.lease().expect("lease first revision");
+        assert_eq!(lease.config().revision, 1);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut next = applied;
+        next.models.get_mut("work").unwrap().model = "next-model".to_string();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = LocalModelConfigStore::with_path(path).replace(1, next);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(lease);
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("writer unblocked")
+                .expect("second revision")
+                .revision,
+            2
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
     fn config_rejects_unknown_fields_and_unsafe_sources() {
-        let unknown = r#"{"version":1,"revision":0,"models":{},"secret":"leak"}"#;
+        let unknown = r#"{"version":2,"revision":0,"models":{},"secret":"leak"}"#;
         assert!(serde_json::from_str::<LocalModelConfig>(unknown).is_err());
         assert!(
             model(LocalCredentialRef::Environment {
@@ -867,7 +960,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                r#"{{"version":1,"revision":0,"models":{{"work":{{"protocol":"{canary}","base_url":"https://provider.example/v1","model":"m","credential":{{"kind":"none"}}}}}}}}"#
+                r#"{{"version":2,"revision":0,"models":{{"work":{{"protocol":"{canary}","base_url":"https://provider.example/v1","model":"m","context_window":128000,"max_output_tokens":8192,"credential":{{"kind":"none"}}}}}}}}"#
             ),
         )
         .unwrap();

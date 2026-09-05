@@ -157,13 +157,45 @@ pub enum EdgeClientMessage {
     /// Negotiate inference independently of tool execution. A declaration is
     /// not authority to publish an executable model.
     #[serde(rename = "inference_hello")]
-    InferenceHello { protocol_version: u16 },
+    InferenceHello {
+        protocol_version: u16,
+        journal_id: crate::runner_inference::RunnerInferenceId,
+        process_boot_nonce: crate::runner_inference::RunnerInferenceId,
+    },
 
     /// Publish or disable one complete public binding revision. Transport
     /// secrets and caller-claimed principal/session ownership are forbidden.
     #[serde(rename = "inference_binding_publish")]
     InferenceBindingPublish {
         publication: Box<crate::runner_inference::RunnerInferenceBindingPublication>,
+    },
+
+    #[serde(rename = "inference_start_evidence")]
+    InferenceStartEvidence {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+        evidence: crate::runner_inference::RunnerInferenceStartEvidence,
+    },
+
+    #[serde(rename = "inference_terminal")]
+    InferenceTerminal {
+        transfer: Box<crate::runner_inference::RunnerInferenceTerminalTransfer>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_response_chunk")]
+    InferenceResponseChunk {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        chunk: crate::runner_inference::RunnerInferencePayloadChunk,
+    },
+
+    #[serde(rename = "inference_request_credit")]
+    InferenceRequestCredit {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        next_offset: u32,
+        credit_bytes: u32,
     },
 }
 
@@ -239,6 +271,56 @@ pub enum EdgeServerMessage {
     InferenceBindingRejected {
         rejection: crate::runner_inference::RunnerInferenceBindingRejection,
     },
+
+    #[serde(rename = "inference_binding_ack")]
+    InferenceBindingAck {
+        receipt: crate::runner_inference::RunnerInferenceBindingReceipt,
+    },
+
+    #[serde(rename = "inference_dispatch")]
+    InferenceDispatch {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_request_chunk")]
+    InferenceRequestChunk {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        chunk: crate::runner_inference::RunnerInferencePayloadChunk,
+    },
+
+    #[serde(rename = "inference_cancel")]
+    InferenceCancel {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_reconcile")]
+    InferenceReconcile {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_terminal_ack")]
+    InferenceTerminalAck {
+        ack: Box<crate::runner_inference::RunnerInferenceTerminalAck>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_response_credit")]
+    InferenceResponseCredit {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        next_offset: u32,
+        credit_bytes: u32,
+    },
+
+    #[serde(rename = "inference_rejected")]
+    InferenceRejected {
+        attempt_id: Option<crate::runner_inference::RunnerInferenceId>,
+        reason: crate::runner_inference::RunnerInferenceRejection,
+    },
 }
 
 impl EdgeServerMessage {
@@ -254,6 +336,14 @@ impl EdgeServerMessage {
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
             EdgeServerMessage::InferenceHelloAck { .. } => "inference_hello_ack",
             EdgeServerMessage::InferenceBindingRejected { .. } => "inference_binding_rejected",
+            EdgeServerMessage::InferenceBindingAck { .. } => "inference_binding_ack",
+            EdgeServerMessage::InferenceDispatch { .. } => "inference_dispatch",
+            EdgeServerMessage::InferenceRequestChunk { .. } => "inference_request_chunk",
+            EdgeServerMessage::InferenceCancel { .. } => "inference_cancel",
+            EdgeServerMessage::InferenceReconcile { .. } => "inference_reconcile",
+            EdgeServerMessage::InferenceTerminalAck { .. } => "inference_terminal_ack",
+            EdgeServerMessage::InferenceResponseCredit { .. } => "inference_response_credit",
+            EdgeServerMessage::InferenceRejected { .. } => "inference_rejected",
         }
     }
 }
@@ -296,13 +386,15 @@ mod tests {
     #[test]
     fn inference_negotiation_is_a_separate_strict_protocol_facet() {
         let message: EdgeClientMessage = serde_json::from_value(json!({
-            "type": "inference_hello", "protocol_version": 1
+            "type": "inference_hello", "protocol_version": 1,
+            "journal_id": "journal", "process_boot_nonce": "boot"
         }))
         .unwrap();
         assert!(matches!(
             message,
             EdgeClientMessage::InferenceHello {
-                protocol_version: 1
+                protocol_version: 1,
+                ..
             }
         ));
         for field in [
@@ -313,19 +405,19 @@ mod tests {
             "tool",
             "args",
         ] {
-            let mut frame = json!({"type": "inference_hello", "protocol_version": 1});
+            let mut frame = json!({"type": "inference_hello", "protocol_version": 1,
+                "journal_id": "journal", "process_boot_nonce": "boot"});
             frame[field] = json!("canary-secret");
             assert!(serde_json::from_value::<EdgeClientMessage>(frame).is_err());
         }
         let response = EdgeServerMessage::InferenceHelloAck {
-            negotiation: crate::runner_inference::RunnerInferenceNegotiation::for_protocol_version(
-                1,
-            ),
+            negotiation: crate::runner_inference::RunnerInferenceNegotiation::accepted(1, 7, 1000),
         };
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             json!({
-                "type": "inference_hello_ack", "negotiation": {"status": "unavailable", "reason": "inference_unsupported"}
+                "type": "inference_hello_ack", "negotiation": {"status": "accepted", "protocol_version": 1,
+                    "delivery_generation": 7, "max_artifact_bytes": 16777216, "server_unix_ms": 1000}
             })
         );
     }
