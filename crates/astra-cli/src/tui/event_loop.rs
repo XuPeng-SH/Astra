@@ -314,19 +314,15 @@ fn apply_model_catalog_effect(
 ) -> bool {
     match effect {
         ModelCatalogEffect::Ready(Ok(catalog)) => {
-            let names = catalog
-                .iter()
-                .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
-                .map(ToOwned::to_owned)
-                .collect();
             if let Some(message) =
                 crate::cli::slash::slash_router::unavailable_model_repair_summary(&catalog)
             {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(message));
             }
+            let opened =
+                slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, &catalog);
             *cached_catalog = Some(catalog);
-            slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names)
+            opened
         }
         ModelCatalogEffect::Ready(Err(error)) => {
             chat_widget.commit_system(history_cell::system::SystemCell::error(error));
@@ -8292,20 +8288,43 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     // `/model` picker → check thinking capability.
-                                    if let bottom_pane::view::ViewResult::Model { name: base_model } = &result {
+                                    if let bottom_pane::view::ViewResult::Model {
+                                        name: base_model,
+                                        offering_id,
+                                    } = &result
+                                    {
                                         let base_model = base_model.clone();
+                                        let selected_offering_id = offering_id.clone();
                                         let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
-                                        );
+                                        let entry = match selected_offering_id.as_deref() {
+                                            Some(offering_id) => raw
+                                                .iter()
+                                                .find(|entry| entry.offering_id == offering_id),
+                                            None => crate::cli::slash::slash_router::find_model_entry_by_name(
+                                                &raw,
+                                                &base_model,
+                                            ),
+                                        };
+                                        if offering_id.is_some() && entry.is_none() {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "The selected model is no longer available; reopen /model and choose it again.",
+                                                ),
+                                            );
+                                            pending_deferred_slash_flush = false;
+                                            let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            bottom_pane.sync_popups();
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
                                         let thinking_cap = entry
                                             .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
                                         let provider =
                                             entry.and_then(crate::cli::slash::slash_router::entry_provider);
-                                        let offering_id = entry
+                                        let offering_id = selected_offering_id.or_else(|| entry
                                             .map(crate::cli::slash::slash_router::entry_offering_id)
-                                            .map(ToOwned::to_owned);
+                                            .map(ToOwned::to_owned));
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
                                             provider,
@@ -8352,6 +8371,7 @@ pub(crate) async fn run_tui_session(
                                                     .map(|option| bottom_pane::view::ViewResult::ModelThinking {
                                                         base_model: base_model.clone(),
                                                         config: option.config,
+                                                        offering_id: offering_id.clone(),
                                                     })
                                                     .collect(),
                                             );
@@ -8366,15 +8386,15 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::ModelThinking {
                                         base_model,
                                         config,
+                                        offering_id,
                                     } = &result {
                                         let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
-                                        );
-                                        let offering_id = entry
+                                        let entry = offering_id.as_deref().and_then(|offering_id| {
+                                            raw.iter().find(|entry| entry.offering_id == offering_id)
+                                        });
+                                        let offering_id = offering_id.clone().or_else(|| entry
                                             .map(crate::cli::slash::slash_router::entry_offering_id)
-                                            .map(ToOwned::to_owned);
+                                            .map(ToOwned::to_owned));
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
                                         state.model = Some(composed.clone());

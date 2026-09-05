@@ -2576,8 +2576,20 @@ pub(crate) fn push_model_picker(
     state: &SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
-    models: Vec<String>,
+    models: &[crate::cli::slash::slash_router::ModelCatalogEntry],
 ) -> bool {
+    let active_models: Vec<_> = models
+        .iter()
+        .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
+        .collect();
+    let mut name_counts = std::collections::HashMap::new();
+    for entry in &active_models {
+        if let Some(name) = crate::cli::slash::slash_router::entry_model_name(entry) {
+            *name_counts
+                .entry(name.to_ascii_lowercase())
+                .or_insert(0usize) += 1;
+        }
+    }
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
@@ -2586,15 +2598,37 @@ pub(crate) fn push_model_picker(
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
         .unwrap_or(current_raw);
-    let items: Vec<SelectionItem> = models
+    let active_offering_id = crate::cli::slash::slash_config::active_offering_id_for_request();
+    let items: Vec<SelectionItem> = active_models
         .iter()
-        .map(|m| {
-            let is_current = *m == current_base;
-            SelectionItem {
-                name: m.clone(),
-                description: None,
+        .filter_map(|entry| {
+            let name = crate::cli::slash::slash_router::entry_model_name(entry)?;
+            let is_duplicate = name_counts
+                .get(&name.to_ascii_lowercase())
+                .is_some_and(|count| *count > 1);
+            let is_current = active_offering_id
+                .as_deref()
+                .is_some_and(|offering_id| offering_id == entry.offering_id)
+                || (active_offering_id.is_none() && !is_duplicate && name == current_base);
+            let description = if is_duplicate {
+                let tail = entry
+                    .offering_id
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>();
+                Some(format!("{} · offering …{tail}", entry.access_label))
+            } else {
+                entry.description.clone()
+            };
+            Some(SelectionItem {
+                name: name.to_string(),
+                description,
                 is_current,
-            }
+            })
         })
         .collect();
     if items.is_empty() {
@@ -2604,9 +2638,15 @@ pub(crate) fn push_model_picker(
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_results(
-                models
+                active_models
                     .into_iter()
-                    .map(|name| ViewResult::Model { name })
+                    .filter_map(|entry| {
+                        Some(ViewResult::Model {
+                            name: crate::cli::slash::slash_router::entry_model_name(entry)?
+                                .to_string(),
+                            offering_id: Some(entry.offering_id.clone()),
+                        })
+                    })
                     .collect(),
             );
         chat_widget.commit_system(SystemCell::response("Opened model picker"));
@@ -2673,18 +2713,12 @@ pub(crate) async fn load_model_catalog(
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string)).await {
         Ok(models) => {
-            let names = models
-                .iter()
-                .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
-                .map(ToOwned::to_owned)
-                .collect();
             if let Some(message) =
                 crate::cli::slash::slash_router::unavailable_model_repair_summary(&models)
             {
                 ctx.show_info(message);
             }
-            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
+            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, &models) {
                 return SlashResult::Deferred;
             }
         }
