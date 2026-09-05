@@ -4930,6 +4930,53 @@ impl ServerAgenticLoopHost {
         Ok((projected, new_append_only_runtime_message))
     }
 
+    /// Stage the one permitted output-cap suffix request.  This is shared by
+    /// the live transport path and the crash-recovery path so a custodied
+    /// prefix creates the same canonical continuation authority before any
+    /// new provider request is admitted.
+    fn stage_output_cap_continuation(
+        &self,
+        state: &mut AgenticLoopState,
+        llm_messages: &mut Vec<Value>,
+        result: &LlmCallResult,
+        provider: &str,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let partial_assistant = provider_retry_assistant(result);
+        llm_messages.push(partial_assistant.clone());
+        let mut continuation_canonical_prefix = state.messages.clone();
+        continuation_canonical_prefix.push(partial_assistant.clone());
+        let (projected, new_frame) = Self::project_required_runtime_authority(
+            llm_messages,
+            &continuation_canonical_prefix,
+            output_cap_continuation_prompt(),
+            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            provider,
+            cache_capability,
+        )?;
+        if matches!(
+            cache_capability.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+        ) {
+            let frame = new_frame.ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "append-only output continuation did not produce fresh canonical authority",
+                )
+            })?;
+            state.append_provider_retry_transition(partial_assistant, frame)?;
+        } else {
+            state.push_prompt_history_message(partial_assistant);
+            state.push_volatile_payload_for_active_attempt(
+                crate::turn::agentic_loop::host::VolatileKind::OutputCapContinuation,
+                Value::String(output_cap_continuation_prompt().to_string()),
+            );
+        }
+        *llm_messages = projected;
+        Ok(())
+    }
+
     fn messages_with_current_execution_time_budget(
         &self,
         provider_messages: &[Value],
@@ -13426,6 +13473,45 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         &wire_authorized_tool_names,
                     )
                     .await?;
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Succeeded,
+                    );
+                    runner_continuation_receipts.extend(receipts);
+                    physical_attempt_usage = usage;
+                    physical_attempt_usage_reported = !physical_attempt_usage.is_empty();
+                    // If the Runner crashed after the capped prefix but
+                    // before a suffix was dispatched, the prefix is known
+                    // custody, not a completed assistant answer. Recreate
+                    // the canonical continuation frame and admit exactly one
+                    // new logical suffix request through the normal path.
+                    if recovered.lifecycle_finish_reason() == Some("length")
+                        && recovered.tool_calls.is_empty()
+                        && output_cap_continuations < MAX_OUTPUT_CAP_CONTINUATIONS
+                    {
+                        self.stage_output_cap_continuation(
+                            state,
+                            &mut llm_messages,
+                            &recovered,
+                            &llm_cfg.provider,
+                            cache_cap,
+                        )?;
+                        output_cap_partial_text = recovered.full_text;
+                        output_cap_partial_reasoning = recovered.reasoning;
+                        output_cap_continuations = output_cap_continuations.saturating_add(1);
+                        state.hooks.completion_settlement.output_cap_continuations =
+                            output_cap_continuations;
+                        attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
+                            astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                "durable host logical attempt space is exhausted",
+                            )
+                        })?;
+                        continue;
+                    }
                     // A recovered response has no license to bypass the
                     // structural contract that its live counterpart had to
                     // satisfy.  There is no safe retry of an already
@@ -13443,16 +13529,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     // No provider request is admitted, sent, or settled here.
                     // The recovered result joins the identical post-response
                     // Work, terminal-control, output, and checkpoint path.
-                    self.complete_request_preparation_phase(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Succeeded,
-                    );
-                    runner_continuation_receipts.extend(receipts);
-                    physical_attempt_usage = usage;
-                    physical_attempt_usage_reported = !physical_attempt_usage.is_empty();
                     break recovered;
                 }
             }
@@ -14559,38 +14635,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             {
                 output_cap_partial_text = r.full_text.clone();
                 output_cap_partial_reasoning = r.reasoning.clone();
-                let partial_assistant = provider_retry_assistant(&r);
-                llm_messages.push(partial_assistant.clone());
-                let mut continuation_canonical_prefix = state.messages.clone();
-                continuation_canonical_prefix.push(partial_assistant.clone());
-                let (projected, new_frame) = Self::project_required_runtime_authority(
-                    &llm_messages,
-                    &continuation_canonical_prefix,
-                    output_cap_continuation_prompt(),
-                    crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
-                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                self.stage_output_cap_continuation(
+                    state,
+                    &mut llm_messages,
+                    &r,
                     &llm_cfg.provider,
                     cache_cap,
                 )?;
-                if matches!(
-                    cache_cap.volatile_placement,
-                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
-                ) {
-                    let frame = new_frame.ok_or_else(|| {
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "append-only output continuation did not produce fresh canonical authority",
-                        )
-                    })?;
-                    state.append_provider_retry_transition(partial_assistant, frame)?;
-                } else {
-                    state.push_prompt_history_message(partial_assistant);
-                    state.push_volatile_payload_for_active_attempt(
-                        crate::turn::agentic_loop::host::VolatileKind::OutputCapContinuation,
-                        Value::String(output_cap_continuation_prompt().to_string()),
-                    );
-                }
-                llm_messages = projected;
                 output_cap_continuations = output_cap_continuations.saturating_add(1);
                 state.hooks.completion_settlement.output_cap_continuations =
                     output_cap_continuations;
