@@ -410,6 +410,7 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
         .unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].receipt, receipt);
+    assert_eq!(recovered[0].request.as_bytes(), REQUEST);
     assert_eq!(recovered[0].response.as_bytes(), RESPONSE);
     assert!(
         load_next_runner_continuation_chain(&f.pool, &f.input, &[receipt])
