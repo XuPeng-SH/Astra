@@ -70,6 +70,10 @@ def main() -> None:
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
         Path("scripts/ci/test_github_release_lookup.sh"),
+        Path("scripts/ci/test_github_release_assets.py"),
+        Path("scripts/ci/test_github_release_body.py"),
+        Path("scripts/ci/test_release_owner_artifacts.sh"),
+        Path("scripts/ci/test_release_candidate_tags.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
         Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
@@ -145,7 +149,9 @@ def main() -> None:
         "release_id=${release_id}",
         "steps.stage_release.outputs.id",
         "Create or validate the immutable release tag",
+        "Prepare canonical GitHub Release body",
         "Stage GitHub Release and verified assets",
+        "Verify canonical staged GitHub Release body",
         "Create or verify the immutable Docker version manifest",
         "scripts/reconcile-docker-manifest.sh",
         "Publish GitHub Release",
@@ -190,6 +196,9 @@ def main() -> None:
         "make stack-up",
         "make stack-verify",
         "release-digest-",
+        "Retain candidate with a run-scoped immutable tag",
+        "scripts/reconcile-docker-candidate-tag.sh",
+        "retention-days: 30",
         "Write container candidate summary",
         "Candidate image version",
     ):
@@ -247,17 +256,72 @@ def main() -> None:
     for required in (
         "workflow_call:",
         "Execute client candidates",
+        "Verify Darwin session execution lease contract",
+        "macos_session_execution_lease",
         "--locked",
         "source_sha",
         "astra-edge",
+        "create_reproducible_release_archive.py",
         "scripts/verify-release-artifacts.sh",
         "release-client-assets",
+        "retention-days: 30",
     ):
         if required not in binary_release_workflow:
             errors.append(
                 ".github/workflows/release-binaries.yml: missing verified client candidate contract "
                 f"({required})"
             )
+
+    for required in (
+        "owner_run_id:",
+        "inputs.recover_existing_tag != true",
+        "Download original verified client candidates for recovery",
+        "Download original verified server candidates for recovery",
+        "Verify retained server candidates before publication approval",
+        "astra-candidate-${OWNER_RUN_ID}-${slug}-${digest}",
+        "run-id: ${{ needs.preflight.outputs.owner_run_id }}",
+        "scripts/verify-release-owner-artifacts.sh",
+        "scripts/prepare_github_release_body.py",
+        "Verify exact staged GitHub Release assets",
+        "scripts/verify_github_release_assets.py",
+        'git worktree add --detach "${source_dir}" "${source_sha}"',
+        'validate-release-version.sh "${version}" --root "${source_dir}"',
+    ):
+        if required not in release_controller:
+            errors.append(
+                ".github/workflows/release.yml: recovery must reuse the original "
+                f"verified candidate set ({required})"
+            )
+
+    publish_job = release_controller.split("\n  publish:\n", 1)[1].split(
+        "\n  registry-mirror:\n", 1
+    )[0]
+    for required in (
+        "!cancelled()",
+        "needs.clients.result == 'skipped'",
+        "needs.containers.result == 'skipped'",
+        "inputs.recover_existing_tag != true",
+        "ref: ${{ github.sha }}",
+    ):
+        if required not in publish_job:
+            errors.append(
+                ".github/workflows/release.yml: publication must remain cancellable "
+                f"and execute the trusted controller revision ({required})"
+            )
+    for forbidden in (
+        "always()",
+        "ref: ${{ needs.preflight.outputs.source_sha }}",
+    ):
+        if forbidden in publish_job:
+            errors.append(
+                ".github/workflows/release.yml: publication must not resist cancellation "
+                f"or execute historical controller scripts ({forbidden})"
+            )
+    if 'git checkout --detach "${source_sha}"' in release_controller:
+        errors.append(
+            ".github/workflows/release.yml: the release controller must inspect the "
+            "historical source in a separate worktree instead of executing from it"
+        )
 
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     if "cargo chef cook --release --locked" not in dockerfile \
