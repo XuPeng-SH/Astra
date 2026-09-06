@@ -5,18 +5,171 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def workflow_run_script(path, step_name):
+    """Extract one literal Bash run block from a workflow."""
+    workflow = (ROOT / path).read_text()
+    block = workflow.split(f"      - name: {step_name}\n", 1)[1]
+    block = block.split("        run: |\n", 1)[1]
+    lines = []
+    for line in block.splitlines():
+        if line and len(line) - len(line.lstrip()) < 10:
+            break
+        lines.append(line[10:] if line else "")
+    return "\n".join(lines)
+
+
 class ReleaseShellTests(unittest.TestCase):
+    def run_idc_settings(self, **overrides):
+        script = workflow_run_script(
+            ".github/workflows/build_push_to_idc.yml",
+            "Resolve IDC target and immutable build identity",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            origin = temporary / "origin.git"
+            checkout = temporary / "checkout"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True,
+                           capture_output=True)
+            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True,
+                           capture_output=True)
+            for key, value in (("user.name", "Release Test"),
+                               ("user.email", "release-test@example.invalid")):
+                subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+            marker = checkout / "marker"
+            marker.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "add", "marker"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-m", "base"],
+                           check=True, capture_output=True)
+            base_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(origin)],
+                           check=True)
+            subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "switch", "-c", "moi-dev"],
+                           check=True, capture_output=True)
+            marker.write_text("moi-dev\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "commit", "-am", "moi-dev"],
+                           check=True, capture_output=True)
+            moi_dev_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(checkout), "push", "origin", "moi-dev"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "switch", "main"],
+                           check=True, capture_output=True)
+            main_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            source_ref = overrides.pop("SOURCE_REF", "main")
+            if source_ref == "__base_sha__":
+                source_ref = base_sha
+            env = {
+                **os.environ,
+                "DEFAULT_BRANCH": "main",
+                "SOURCE_REF": source_ref,
+                "IDC_REGISTRY": "registry.example:5000",
+                "IDC_IMAGE": "registry.example:5000/team/astra",
+                "IDC_RUNNER": "idc-amd64",
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_SHA": main_sha,
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_OUTPUT": "/dev/stdout",
+                **overrides,
+            }
+            result = subprocess.run(["bash", "-c", script], env=env, cwd=checkout,
+                                    capture_output=True, text=True)
+            return result, {"main": main_sha, "moi-dev": moi_dev_sha, "base": base_sha}
+
+    def test_idc_build_identity(self):
+        result, revisions = self.run_idc_settings()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(outputs["controller_sha"], revisions["main"])
+        self.assertEqual(outputs["source_sha"], revisions["main"])
+        self.assertEqual(outputs["source_ref"], "main")
+        self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
+
+    def test_idc_build_stays_local_until_smoke_succeeds(self):
+        workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
+        build = workflow.index("Build the IDC candidate locally")
+        smoke = workflow.index("Verify health and exact memory round trip")
+        login = workflow.index("docker/login-action")
+        publish = workflow.index('docker push "${target}"')
+        self.assertLess(build, smoke)
+        self.assertLess(smoke, login)
+        self.assertLess(login, publish)
+        self.assertIn("environment: idc-publication", workflow)
+        self.assertIn("load: true", workflow)
+        self.assertIn("push: false", workflow)
+        self.assertNotIn("release-container-candidates.yml", workflow)
+
+    def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
+        result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_sha=" + revisions["moi-dev"], result.stdout)
+        self.assertIn("source_ref=moi-dev", result.stdout)
+        result, revisions = self.run_idc_settings(SOURCE_REF="__base_sha__")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_sha=" + revisions["base"], result.stdout)
+        self.assertIn("source_ref=" + revisions["base"], result.stdout)
+
+    def test_idc_registry_credentials_are_required_before_build(self):
+        script = workflow_run_script(
+            ".github/workflows/build_push_to_idc.yml",
+            "Require IDC registry credentials",
+        )
+        for missing in ("IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
+            with self.subTest(missing=missing):
+                env = {
+                    **os.environ,
+                    "IDC_REGISTRY_USERNAME": "release-user",
+                    "IDC_REGISTRY_PASSWORD": "release-password",
+                    missing: "",
+                }
+                result = subprocess.run(
+                    ["bash", "-c", script], env=env, capture_output=True, text=True
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Missing required IDC credential: " + missing, result.stdout)
+                self.assertNotIn("release-password", result.stdout + result.stderr)
+
+    def test_idc_rejects_non_main_controller_and_arbitrary_ref(self):
+        result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Run this workflow from main", result.stdout)
+        result, _ = self.run_idc_settings(SOURCE_REF="feature/test")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source_ref must be main, moi-dev, or a full commit SHA", result.stdout)
+
+    def test_idc_missing_configuration_stops_before_build(self):
+        for key in ("IDC_REGISTRY", "IDC_IMAGE", "IDC_RUNNER"):
+            with self.subTest(key=key):
+                result, _ = self.run_idc_settings(**{key: ""})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Missing required IDC configuration: " + key, result.stdout)
+                self.assertNotIn("image_version=", result.stdout)
+
+    def test_idc_rejects_wrong_or_tagged_repository(self):
+        for image in ("docker.io/team/astra", "registry.example:5000/",
+                      "registry.example:5000/team/astra:latest",
+                      "registry.example:5000/team/astra@sha256:abc",
+                      "registry.example:5000/team/astra bad"):
+            with self.subTest(image=image):
+                result, _ = self.run_idc_settings(IDC_IMAGE=image)
+                self.assertNotEqual(result.returncode, 0)
+        result, _ = self.run_idc_settings(IDC_REGISTRY="https://registry.example")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_client_arguments_with_and_without_features(self):
-        workflow = (ROOT / ".github/workflows/release-binaries.yml").read_text()
-        step = workflow.split("      - name: Build client candidates\n", 1)[1]
-        script = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-        script = "\n".join(line[10:] for line in script.splitlines())
+        script = workflow_run_script(
+            ".github/workflows/release-binaries.yml", "Build client candidates"
+        )
         script = script.replace("${{ matrix.target }}", "test-target")
         # POSIX positional parameters also work on macOS's Bash 3.2.
         # Run that portion under sh as well as bash to guard portability.
