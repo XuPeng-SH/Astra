@@ -84,11 +84,21 @@ Sets up a demo environment and performs prerequisite checks.
 
 ### `scripts/setup/stack-setup.sh`
 Runs the human-facing first-run flow behind `make stack-setup`. It validates the
-embedding endpoint before startup, inventories current Compose state, repairs
-disconnected containers without deleting volumes, checks host-port conflicts,
-and gives explicit retry/stop/inspect choices. It keeps keys out of output,
-verifies the complete stack, and delegates admin/model configuration to
-`astra admin setup`. Use `make stack-up` and explicit variables for automation.
+intended installation before asking for provider configuration, validates the
+embedding endpoint before startup, inventories current Compose state, and gives
+explicit update/separate/leave and retry/stop/inspect choices. It keeps keys out
+of output, verifies the complete stack, persists the CLI API URL, shows
+administrator/model status, and optionally delegates admin/model configuration
+to `astra admin setup`. Use `make stack-up` and
+explicit variables for automation. Installation naming, independent volume/log
+paths, automatic port selection, and final host-port uniqueness checks are owned by
+`scripts/setup/stack_identity.sh` and its contract tests.
+
+`scripts/setup/stack_env_write.sh` owns credential-safe environment updates and
+the EXIT cleanup contract for setup staging and per-write temporary files.
+
+`scripts/setup/stack_status.sh` owns the read-only model-catalog projection
+used by the wizard's status summary, including active and inactive model names.
 
 ### `scripts/setup/check_embedding.py`
 Performs the credential-safe OpenAI-compatible embedding probe used by the
