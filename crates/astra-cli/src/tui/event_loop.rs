@@ -5438,8 +5438,8 @@ pub(crate) async fn run_tui_session(
                         } else {
                             chat_widget.commit_system(
                                 history_cell::system::SystemCell::response(format!(
-                                    "Local model '{}' saved as unverified. Use /model to test and select it.",
-                                    completion.name
+                                    "Local model '{}' saved without a provider test. /model selects it without testing; run `astra model check {}` for an explicit provider test.",
+                                    completion.name, completion.name
                                 )),
                             );
                         }

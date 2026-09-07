@@ -18,6 +18,132 @@ fn id(value: &str) -> RunnerInferenceId {
     RunnerInferenceId::new(value).unwrap()
 }
 
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn reconnect_after_real_unregister_preserves_journal() {
+    use astra_services::multi_agent::edge_registry::{
+        DatabaseEdgeRegistryService, EdgeRegistryService,
+    };
+    let pool = common::setup_pool().await;
+    let user = format!("runner-disconnect-{}", uuid::Uuid::new_v4());
+    let old = register(&pool, &user).await;
+    enroll_runner_inference(&pool, &old, 1, &id("journal"), &id("boot-1"))
+        .await
+        .unwrap();
+    publish_runner_binding(&pool, &old, &publication("publish-1", 0, 1))
+        .await
+        .unwrap();
+    let registry = DatabaseEdgeRegistryService::new(pool.get().clone());
+    assert!(
+        registry
+            .unregister_generation(&user, "personal", "socket-1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        list_effective_runner_model_bindings(&pool, &user)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !list_runner_model_catalog_bindings(&pool, &user)
+            .await
+            .unwrap()[0]
+            .online
+    );
+    assert!(
+        !registry
+            .unregister_generation(&user, "personal", "socket-1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        publish_runner_binding(&pool, &old, &publication("stale-publish", 1, 2))
+            .await
+            .is_err()
+    );
+    for finalize in [false, true] {
+        let failed = registry
+            .register_or_update_with_lease(
+                &user,
+                "personal",
+                "failed-socket",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(failed.previous.is_none());
+        if finalize {
+            assert!(registry.finalize_registration(&failed).await.unwrap());
+        }
+        assert!(registry.rollback_registration(&failed).await.unwrap());
+        assert!(!registry.rollback_registration(&failed).await.unwrap());
+        assert!(
+            list_effective_runner_model_bindings(&pool, &user)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let reconnected = registry
+        .register_or_update_with_lease(&user, "personal", "socket-2", None, None, None, None)
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&reconnected).await.unwrap());
+    assert!(registry.release_registration(&reconnected).await.unwrap());
+    let current = AuthenticatedRunnerConnection {
+        edge_id: "socket-2".into(),
+        ..old.clone()
+    };
+    enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-2"))
+        .await
+        .expect("ordinary disconnect must not retire the durable Runner journal");
+    let replay = publish_runner_binding(&pool, &current, &publication("publish-1", 0, 1))
+        .await
+        .unwrap();
+    assert_eq!(replay.publication_revision.get(), 1);
+    assert_eq!(
+        list_effective_runner_model_bindings(&pool, &user)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !registry
+            .unregister_generation(&user, "personal", "socket-1")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        list_effective_runner_model_bindings(&pool, &user)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    enroll_runner_inference(
+        &pool,
+        &current,
+        1,
+        &id("replacement-journal"),
+        &id("boot-3"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-4"))
+            .await
+            .is_err(),
+        "explicit journal replacement must still fence the retired journal"
+    );
+}
+
 fn publication(operation: &str, expected: u64, revision: u64) -> RunnerInferenceBindingPublication {
     serde_json::from_value(serde_json::json!({
         "protocol_version": 1, "operation_id": operation,

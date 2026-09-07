@@ -202,6 +202,11 @@ credentials. Other clients and their requests continue. When the last lease
 ends, stop admitting session-managed work, drain already-started attempts within
 their original deadlines, and make a bounded terminal-flush attempt. Then exit,
 leaving unacknowledged payloads and replay fences recoverable on next startup.
+On Server disconnect, an inference-enrolled registry row becomes unpublished;
+its journal identity and publication revision remain durable. Failed reconnect
+registration likewise retains that unpublished anchor. Neither state grants
+execution authority. Re-enrollment of the same journal preserves its revision;
+explicit journal replacement still fences the retired journal.
 An idle host exits after a short grace period (initially 30 seconds). It does not
 run indefinitely waiting for a disconnected Server. An installed background
 service has explicit independent ownership and does not use client-count exit.
@@ -954,6 +959,12 @@ validation, the user explicitly chooses **Test and use** (one disclosed,
 bounded provider request followed by Offering selection) or **Save without
 test** (persist as unverified, make no provider request, and leave the current
 selection unchanged).
+
+Implementation note: the current setup stores the definition but not durable
+probe evidence. **Save without test** therefore reports only that no provider
+test ran; `/model` selects without probing. Use `astra model check <name>` for
+an explicit provider test. The probe-status UX specified below remains a target
+contract, not a current capability.
 
 The command surface extends existing `astra model list/show` with `add`, `check`,
 `rotate`, `disable`, and `remove`. Each is an adapter over the same local

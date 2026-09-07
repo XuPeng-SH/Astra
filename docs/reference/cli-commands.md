@@ -126,6 +126,22 @@ astra skill status [--per-group 50]
 
 `astra login --username alice` explicitly selects password login. `astra login --manual` accepts a scoped connection key when browser handoff is unavailable. Older Servers returning 404 for `/auth/methods` retain the password journey; network errors do not silently select another provider. Browser addresses come from the target Server's `MEMORIA_WEB_URL`, not the CLI environment.
 
+### Interactive model selection
+
+In the interactive CLI/TUI, `/model` opens the Offering picker. `/model <name>`
+accepts a unique name (case-insensitive); when multiple Offerings have the same
+name, including an offline Runner, choose from the picker or use
+`/model <offering_id>`. Exact Offering IDs take precedence over display names.
+An ambiguous, unknown, or unavailable selection leaves the current selection
+unchanged. Existing thinking suffixes such as `(thinking:high)` are preserved.
+
+`/model add` opens local model setup. **Save without test** saves configuration
+without a provider call and leaves the current selection unchanged. Selecting
+that model later with `/model` does not test it. Run `astra model check <name>`
+for an explicit provider test; this can incur provider charges. The current
+implementation does not persist probe status or show saved probe evidence in
+the picker.
+
 ## astra admin
 
 Global options:

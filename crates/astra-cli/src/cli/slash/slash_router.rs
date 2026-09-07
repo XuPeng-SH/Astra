@@ -19,10 +19,7 @@ use crate::cli::slash::{
     slash_state::{StateCommandContext, handle_state_command},
 };
 use crate::cli::{
-    cli_config::{
-        cli_output,
-        cli_utils::{self, interactive_select},
-    },
+    cli_config::cli_utils::{self, interactive_select},
     command_registry, command_usage, diff_presenter,
     project_instructions::discover_project_instructions,
     session::{session_checkpointing, session_runtime, session_state::SessionState},
@@ -61,10 +58,40 @@ fn find_model_list_entry<'a>(
     models: &'a [ModelCatalogEntry],
     name: &str,
 ) -> Option<&'a ModelCatalogEntry> {
-    models.iter().find(|m| {
-        model_list_entry_offering_id(m) == name
-            || model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name))
-    })
+    resolve_model_catalog_entry(models, name).ok()
+}
+
+/// Exact Offering IDs win over display names. A friendly name is not authority
+/// when several devices/accounts publish it, including an offline predecessor.
+pub(crate) fn resolve_model_catalog_entry<'a>(
+    models: &'a [ModelCatalogEntry],
+    name: &str,
+) -> Result<&'a ModelCatalogEntry, String> {
+    if let Some(entry) = models.iter().find(|entry| entry.offering_id == name) {
+        return Ok(entry);
+    }
+    let mut matching = models.iter().filter(|entry| {
+        model_list_entry_name(entry).is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+    });
+    let first = matching.next().ok_or_else(|| {
+        format!("Model '{name}' was not found. Use /model to choose an available Offering.")
+    })?;
+    if matching.next().is_some() {
+        let candidates = models
+            .iter()
+            .filter(|entry| {
+                model_list_entry_name(entry)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            })
+            .take(3)
+            .map(|entry| format!("{} ({})", entry.offering_id, entry.access_label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Model '{name}' is ambiguous: {candidates}. Choose an exact Offering ID or use /model."
+        ));
+    }
+    Ok(first)
 }
 
 /// Shared slash-command implementation for non-TUI command-line use.
@@ -136,17 +163,25 @@ pub(crate) async fn handle_slash_command(
                             return None;
                         }
                         let desc = m.description.clone().unwrap_or_default();
-                        Some((name.to_string(), desc))
+                        Some((
+                            m.offering_id.clone(),
+                            format!("{name} · {} · {desc}", m.access_label),
+                        ))
                     })
                     .collect();
 
+                let current_offering = slash_config::active_offering_id_for_request();
                 if let Some(chosen) = interactive_select(
                     "Select model (type to search):",
                     &items,
-                    state.model.as_deref(),
+                    current_offering.as_deref(),
                 ) {
                     // Two-level selection: if model supports thinking, prompt for mode
                     let selected_model = find_model_list_entry(&models, &chosen);
+                    let chosen = selected_model
+                        .and_then(model_list_entry_name)
+                        .unwrap_or(&chosen)
+                        .to_owned();
                     if selected_model.is_none() {
                         tracing::warn!(
                             model = %chosen,
@@ -235,10 +270,17 @@ pub(crate) async fn handle_slash_command(
                             return Ok(false);
                         }
 
-                        let matched_entry = find_model_list_entry(&models, arg);
-                        if let Some(entry) = matched_entry {
-                            if !model_list_entry_is_active(entry) {
-                                eprintln!(
+                        let registry_name =
+                            astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
+                        let entry = match resolve_model_catalog_entry(&models, registry_name) {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                eprintln!("  {error}");
+                                return Ok(false);
+                            }
+                        };
+                        if !model_list_entry_is_active(entry) {
+                            eprintln!(
                                     "{}",
                                     format!(
                                         "  Model '{}' is registered but inactive (server will not use it). \
@@ -247,75 +289,12 @@ pub(crate) async fn handle_slash_command(
                                     )
                                     .yellow()
                                 );
-                                return Ok(false);
-                            }
-                            selected_offering_id = Some(entry.offering_id.clone());
-                            selected_model_name =
-                                model_list_entry_name(entry).map(ToOwned::to_owned);
-                            context_window =
-                                session_runtime::model_list_entry_context_window(entry);
-                        }
-
-                        let available: Vec<String> = models
-                            .iter()
-                            .filter_map(|m| {
-                                let name = model_list_entry_name(m)?;
-                                if model_list_entry_is_active(m) {
-                                    Some(name.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        let mut exact_lookup_error = None;
-                        if matched_entry.is_none() {
-                            // The catalog has already been fully drained. A
-                            // missing entry is therefore a definitive
-                            // admission failure, not a first-page omission.
-                            match session_runtime::resolve_server_model_selection_from_catalog(
-                                api, tok, arg, &models,
-                            )
-                            .await
-                            {
-                                Ok(selection) => {
-                                    selected_offering_id = Some(selection.offering_id);
-                                    selected_model_name = Some(arg.to_string());
-                                    context_window = selection.context_window;
-                                }
-                                Err(error) => exact_lookup_error = Some(error),
-                            }
-                        }
-
-                        let model_exists = matched_entry.is_some()
-                            || selected_offering_id.is_some()
-                            || available.iter().any(|m| m.eq_ignore_ascii_case(arg));
-
-                        if !model_exists && !available.is_empty() {
-                            if let Some(error) = exact_lookup_error {
-                                eprintln!("  {}", error.yellow());
-                                return Ok(false);
-                            }
-                            let suggestions = cli_output::suggest_models(arg, &available);
-                            let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
-                            cli_output::format_not_found_error(
-                                "Model",
-                                arg,
-                                &refs,
-                                Some("/model to see available models"),
-                            );
                             return Ok(false);
                         }
-
-                        if !model_exists && available.is_empty() && !models.is_empty() {
-                            eprintln!(
-                                "{}",
-                                "  No active models returned by the server. \
-                                 Add or activate a model (admin), or run a connectivity check."
-                                    .yellow()
-                            );
-                            return Ok(false);
-                        }
+                        selected_offering_id = Some(entry.offering_id.clone());
+                        selected_model_name =
+                            Some(format!("{}{}", entry.name, &arg[registry_name.len()..]));
+                        context_window = session_runtime::model_list_entry_context_window(entry);
                     }
                     Err(err) => {
                         eprintln!("{}", format!("  Failed to list models: {err}").yellow());
@@ -812,6 +791,52 @@ mod model_list_json_tests {
             "total": 1,
             "catalog_revision": "sha256:test-catalog"
         })
+    }
+
+    #[test]
+    fn model_selection_rejects_duplicate_names_but_accepts_exact_offering() {
+        let mut first = canonical_catalog_json()["items"][0].clone();
+        first["name"] = serde_json::json!("Work");
+        first["offering_id"] = serde_json::json!("runner-personal");
+        let mut second = first.clone();
+        second["offering_id"] = serde_json::json!("runner-enterprise");
+        second["is_active"] = serde_json::json!(false);
+        let models = vec![
+            serde_json::from_value(first).unwrap(),
+            serde_json::from_value(second).unwrap(),
+        ];
+        let error = super::resolve_model_catalog_entry(&models, "work").unwrap_err();
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("runner-personal"));
+        assert!(error.contains("runner-enterprise"));
+        assert!(find_model_entry_by_name(&models, "Work").is_none());
+        assert_eq!(
+            super::resolve_model_catalog_entry(&models, "runner-personal")
+                .unwrap()
+                .offering_id,
+            "runner-personal"
+        );
+        assert!(super::resolve_model_catalog_entry(&models, "unknown").is_err());
+    }
+
+    #[test]
+    fn exact_offering_identity_wins_over_another_entries_display_name() {
+        let mut alias = canonical_catalog_json()["items"][0].clone();
+        alias["offering_id"] = serde_json::json!("alias-offering");
+        alias["name"] = serde_json::json!("exact-offering");
+        let mut exact = alias.clone();
+        exact["offering_id"] = serde_json::json!("exact-offering");
+        exact["name"] = serde_json::json!("Work");
+        let models = vec![
+            serde_json::from_value(alias).unwrap(),
+            serde_json::from_value(exact).unwrap(),
+        ];
+        assert_eq!(
+            super::resolve_model_catalog_entry(&models, "exact-offering")
+                .unwrap()
+                .name,
+            "Work"
+        );
     }
 
     #[test]

@@ -318,7 +318,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "clear" => handle_model_clear(ctx).await,
                 // Everything else is the `/model <name>` shorthand.
                 _ => {
-                    handle_model_set(ctx, trimmed);
+                    handle_model_set(ctx, trimmed).await;
                     SlashResult::Handled
                 }
             }
@@ -2729,7 +2729,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
 
 /// `/model set <name>` — apply immediately.  Also used as the
 /// fallback for `/model <name>` shorthand.
-fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
+async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
     if name.is_empty() {
         ctx.show_error("Model name cannot be empty — try `/model list`.".into());
@@ -2743,11 +2743,39 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
-    ctx.state.model = Some(name.to_string());
-    crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
-    ctx.bottom_pane.footer.model = Some(name.to_string());
-    ctx.show_response(format!("Set model to {name}"));
+    let catalog = match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_owned)).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            ctx.show_error(error);
+            return;
+        }
+    };
+    let registry_name = astra_turn_core::thinking_config::resolve_model_thinking(name).0;
+    let selected = match crate::cli::slash::slash_router::resolve_model_catalog_entry(
+        &catalog,
+        registry_name,
+    ) {
+        Ok(selected) if selected.is_active => selected,
+        Ok(_) => {
+            ctx.show_error("Selected model is unavailable. Reconnect its Runner or choose another Offering with /model.".into());
+            return;
+        }
+        Err(error) => {
+            ctx.show_error(error);
+            return;
+        }
+    };
+    let display_name = format!("{}{}", selected.name, &name[registry_name.len()..]);
+    ctx.state.model = Some(display_name.clone());
+    crate::cli::slash::slash_config::set_active_model_for_display(Some(display_name.clone()));
+    crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
+        selected.offering_id.clone(),
+    ));
+    ctx.bottom_pane.footer.model = Some(display_name.clone());
+    ctx.show_response(format!(
+        "Set model to {} · {}",
+        display_name, selected.access_label
+    ));
 }
 
 /// `/model clear` — unset the session model. Reports the change to
