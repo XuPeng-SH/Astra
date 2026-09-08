@@ -135,6 +135,296 @@ fn terminal() -> InferenceInvocationTerminal {
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 #[serial]
+async fn runner_multi_user_multi_session_custody_and_trace_stay_isolated() {
+    use astra_services::inference_execution::runner_wait::{
+        RunnerContinuationWaiters, RunnerReadiness,
+    };
+    use std::{sync::Arc, time::Duration};
+    let a = Fixture::new().await;
+    let b = Fixture::new().await;
+    let ((_, ga), (_, gb)) = tokio::join!(a.admit(), b.admit());
+    assert_ne!(ga.attempt.invocation_id, gb.attempt.invocation_id);
+    let waiters = Arc::new(RunnerContinuationWaiters::default());
+    let mut ra = waiters
+        .subscribe(a.pool.clone(), &ga.attempt)
+        .await
+        .unwrap();
+    // One AppState pool may observe any of its tenants, but must never switch
+    // to another pool based on one caller's mutable input.
+    assert!(waiters.reserve(&b.pool, &b.input.user_id).is_err());
+    let mut rb = waiters
+        .subscribe(a.pool.clone(), &gb.attempt)
+        .await
+        .unwrap();
+    let wrong_owner = waiters.reserve(&a.pool, &a.input.user_id).unwrap();
+    assert!(wrong_owner.subscribe(&gb.attempt).is_err());
+    let terminal = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    assert!(
+        take_runner_terminal_custody(
+            &a.pool,
+            &a.connection,
+            &gb.attempt,
+            &terminal,
+            RESPONSE,
+            &hash
+        )
+        .await
+        .is_err()
+    );
+    let mut forged = ga.attempt.clone();
+    forged.scope = gb.attempt.scope.clone();
+    assert!(
+        take_runner_terminal_custody(&a.pool, &a.connection, &forged, &terminal, RESPONSE, &hash)
+            .await
+            .is_err()
+    );
+    take_runner_terminal_custody(
+        &a.pool,
+        &a.connection,
+        &ga.attempt,
+        &terminal,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    waiters.notify();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ra.wait_for(|r| *r == RunnerReadiness::Ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        *rb.borrow(),
+        RunnerReadiness::Waiting,
+        "tenant A's result cannot wake tenant B's session"
+    );
+    take_runner_terminal_custody(
+        &b.pool,
+        &b.connection,
+        &gb.attempt,
+        &terminal,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        rb.wait_for(|r| *r == RunnerReadiness::Ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    for (fixture, grant) in [(&a, &ga), (&b, &gb)] {
+        // Replayed terminals must not duplicate canonical trace or usage facts.
+        take_runner_terminal_custody(
+            &fixture.pool,
+            &fixture.connection,
+            &grant.attempt,
+            &terminal,
+            RESPONSE,
+            &hash,
+        )
+        .await
+        .unwrap();
+        let rows = sqlx::query("SELECT event_json FROM model_request_context_events WHERE user_id = ? AND attempt_id = ? ORDER BY event_stage")
+            .bind(&fixture.input.user_id).bind(grant.attempt.attempt_id.as_str()).fetch_all(fixture.pool.get()).await.unwrap();
+        assert_eq!(rows.len(), 2, "one accepted and one terminal context event");
+        for row in rows {
+            let encoded: String = row.get("event_json");
+            assert!(!encoded.contains("private-request-canary"));
+            assert!(!encoded.contains("private-response-canary"));
+            let event: astra_services::model_request_context::ModelRequestContextEvent =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(event.identity.owner_scope, fixture.input.user_id);
+            assert_eq!(
+                event.identity.session_id.as_deref(),
+                fixture.input.scope.session_id()
+            );
+            assert_eq!(
+                event.identity.run_id.as_deref(),
+                fixture.input.scope.run_id()
+            );
+            assert_eq!(event.identity.offering_id, fixture.input.offering_id);
+            assert_eq!(event.identity.execution_binding, "edge");
+        }
+    }
+    drop((ra, rb));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut resumed = waiters
+        .subscribe(a.pool.clone(), &ga.attempt)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        resumed.wait_for(|r| *r == RunnerReadiness::Ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn runner_logical_admission_is_binding_scoped_and_only_undispatched_failures_can_settle_locally()
+ {
+    let f = Fixture::new().await;
+    let plan = plan_inference_invocation(f.input.clone()).unwrap();
+    assert!(
+        admit_inference_invocation(&f.pool, &plan).await.is_err(),
+        "Server admission remains closed to Runner routes"
+    );
+    let mut foreign = f.binding.clone();
+    foreign.user_id = "another-owner".into();
+    assert!(
+        admit_runner_invocation(&f.pool, &plan, &foreign)
+            .await
+            .is_err()
+    );
+    admit_runner_invocation(&f.pool, &plan, &f.binding)
+        .await
+        .unwrap();
+    let pinned: String = sqlx::query_scalar(
+        "SELECT runner_binding_json FROM inference_routes WHERE user_id = ? AND route_id = ?",
+    )
+    .bind(&f.input.user_id)
+    .bind(plan.route_id())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<RunnerInferenceBindingIdentity>(&pinned).unwrap(),
+        f.binding.definition.identity
+    );
+    let failure = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("binding_changed".into()),
+        error_message: None,
+    };
+    finish_undispatched_runner_invocation(&f.pool, &plan, &failure)
+        .await
+        .unwrap();
+    finish_undispatched_runner_invocation(&f.pool, &plan, &failure)
+        .await
+        .unwrap();
+    let delivery: String = sqlx::query_scalar("SELECT provider_delivery_state FROM inference_invocations WHERE user_id = ? AND invocation_id = ?")
+        .bind(&f.input.user_id).bind(plan.invocation_id()).fetch_one(f.pool.get()).await.unwrap();
+    assert_eq!(delivery, "pre_delivery");
+    let f = Fixture::new().await;
+    let (dispatched, _) = f.admit().await;
+    assert!(
+        finish_undispatched_runner_invocation(&f.pool, dispatched.invocation(), &failure)
+            .await
+            .is_err(),
+        "absence of a local terminal is not negative evidence after a grant"
+    );
+    assert!(
+        finish_undispatched_runner_invocation(&f.pool, dispatched.invocation(), &terminal())
+            .await
+            .is_err()
+    );
+    for purpose in [
+        InferencePurpose::MemoryExtraction,
+        InferencePurpose::MemoryRetrievalRerank,
+        InferencePurpose::Reflection,
+        InferencePurpose::Introspection,
+        InferencePurpose::VerificationJudge,
+        InferencePurpose::SkillSynthesis,
+        InferencePurpose::Embedding,
+    ] {
+        let mut input = f.input.clone();
+        input.purpose = purpose;
+        assert!(validate_runner_invocation(&input, &f.binding).is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
+async fn runner_readiness_is_batched_cross_pod_and_does_not_acquire_session_locks() {
+    use astra_services::inference_execution::runner_wait::{
+        RunnerContinuationWaiters, RunnerReadiness,
+    };
+    use std::{sync::Arc, time::Duration};
+    let mut f = Fixture::new().await;
+    let a = Arc::new(RunnerContinuationWaiters::default());
+    let b = Arc::new(RunnerContinuationWaiters::default());
+    let mut attempts = Vec::new();
+    for round in 0..16 {
+        if let InferenceInvocationScope::Run { round: index, .. } = &mut f.input.scope {
+            *index = round;
+        }
+        let (_, grant) = f.admit().await;
+        let left = a.subscribe(f.pool.clone(), &grant.attempt).await.unwrap();
+        let right = b.subscribe(f.pool.clone(), &grant.attempt).await.unwrap();
+        assert_eq!(*left.borrow(), RunnerReadiness::Waiting);
+        attempts.push((grant, left, right));
+    }
+    let terminal = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    for (grant, _, _) in &attempts {
+        take_runner_terminal_custody(
+            &f.pool,
+            &f.connection,
+            &grant.attempt,
+            &terminal,
+            RESPONSE,
+            &hash,
+        )
+        .await
+        .unwrap();
+    }
+    // Pod B gets no local wakeup. Both see the same durable custody; neither
+    // waiting path needs the session lock used by exact continuation claims.
+    let mut lock = f.pool.get().begin().await.unwrap();
+    sqlx::query(
+        "SELECT session_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&f.input.user_id)
+    .bind(f.input.scope.session_id())
+    .fetch_one(&mut *lock)
+    .await
+    .unwrap();
+    a.notify();
+    let mut wrong_owner = attempts[0].0.attempt.clone();
+    for (_, mut left, mut right) in attempts {
+        for receiver in [&mut left, &mut right] {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                receiver.wait_for(|state| *state != RunnerReadiness::Waiting),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(*receiver.borrow(), RunnerReadiness::Ready);
+        }
+    }
+    lock.rollback().await.unwrap();
+    wrong_owner.user_id = "not-the-owner".into();
+    let mut receiver = a.subscribe(f.pool.clone(), &wrong_owner).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        receiver.wait_for(|state| *state != RunnerReadiness::Waiting),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(*receiver.borrow(), RunnerReadiness::Unavailable);
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+#[serial]
 async fn runner_grants_pin_exact_private_request_and_fence_owner_session_boot_and_start() {
     let f = Fixture::new().await;
     let (plan, grant) = f.admit().await;

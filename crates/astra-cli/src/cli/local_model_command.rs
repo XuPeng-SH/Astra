@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use astra_credentials::{
     LocalCredentialRef, LocalInferenceProtocol, LocalModelConfigStore, LocalModelDefinition,
-    LocalSecretStore, ResolvedLocalCredential,
+    LocalModelScope, LocalSecretStore, ResolvedLocalCredential,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -21,7 +21,7 @@ struct LocalModelStatus<'a> {
     config_path: String,
 }
 
-pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
+pub(crate) fn add(scope: &LocalModelScope, args: ModelAddArgs) -> Result<String, String> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let name = required("model name", args.name, interactive)?;
     let base_url = required("API base URL", args.base_url, interactive)?;
@@ -30,8 +30,8 @@ pub(crate) fn add(args: ModelAddArgs) -> Result<String, String> {
     let max_output_tokens =
         required_u32("Maximum output tokens", args.max_output_tokens, interactive)?;
 
-    let store = LocalModelConfigStore::new();
-    let secrets = LocalSecretStore::new();
+    let store = scope.models();
+    let secrets = scope.secrets();
     let mut created_secret = None;
     let credential = if let Some(name) = args.credential_env {
         LocalCredentialRef::Environment { name }
@@ -96,6 +96,7 @@ pub(crate) enum LocalModelCredentialInput {
 }
 
 pub(crate) fn add_from_tui(
+    scope: &LocalModelScope,
     name: String,
     base_url: String,
     provider_model: String,
@@ -103,8 +104,8 @@ pub(crate) fn add_from_tui(
     max_output_tokens: u32,
     credential_input: LocalModelCredentialInput,
 ) -> Result<String, String> {
-    let store = LocalModelConfigStore::new();
-    let secrets = LocalSecretStore::new();
+    let store = scope.models();
+    let secrets = scope.secrets();
     let (credential, created_secret) = match credential_input {
         LocalModelCredentialInput::Environment(name) => {
             (LocalCredentialRef::Environment { name }, None)
@@ -154,22 +155,40 @@ fn save_definition(
     created_secret: Option<String>,
 ) -> Result<String, String> {
     let LocalModelDefinitionInput { name, definition } = input;
-    let mut config = store.load().map_err(|error| error.to_string())?;
-    let mut definition = definition;
-    definition.binding_revision = config.models.get(&name).map_or(Ok(1), |previous| {
-        previous.binding_revision.checked_add(1).ok_or_else(|| {
-            "local model binding revision is exhausted; remove and recreate the model".to_string()
-        })
-    })?;
-    let previous = config.models.insert(name.clone(), definition);
-    let expected_revision = config.revision;
-    let applied = match store.replace(expected_revision, config) {
+    let mut publication_attempted = false;
+    let apply = (|| {
+        let mut config = store.load().map_err(|error| error.to_string())?;
+        let mut definition = definition;
+        definition.binding_revision = config.models.get(&name).map_or(Ok(1), |previous| {
+            previous.binding_revision.checked_add(1).ok_or_else(|| {
+                "local model binding revision is exhausted; remove and recreate the model"
+                    .to_string()
+            })
+        })?;
+        let previous = config.models.insert(name.clone(), definition);
+        let expected_revision = config.revision;
+        publication_attempted = true;
+        store
+            .replace(expected_revision, config)
+            .map(|applied| (previous, applied))
+            .map_err(|error| error.to_string())
+    })();
+    let (previous, applied) = match apply {
         Ok(applied) => applied,
         Err(error) => {
             if let Some(secret_id) = created_secret.as_deref() {
-                let _ = secrets.remove(secret_id);
+                // A rename may have committed before its final sync failed.
+                // Never delete a secret that the visible configuration might
+                // now reference. Early failures have not attempted publication.
+                let unreferenced = !publication_attempted || store.load().is_ok_and(|config| {
+                    !config.models.values().any(|model| matches!(&model.credential,
+                        LocalCredentialRef::ProtectedFile { secret_id: referenced } if referenced == secret_id))
+                });
+                if unreferenced {
+                    let _ = secrets.remove(secret_id);
+                }
             }
-            return Err(error.to_string());
+            return Err(error);
         }
     };
 
@@ -215,8 +234,8 @@ fn required_u32(label: &'static str, value: Option<u32>, interactive: bool) -> R
         .ok_or_else(|| format!("{label} must be a positive integer"))
 }
 
-pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
-    let store = LocalModelConfigStore::new();
+pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Result<String, String> {
+    let store = scope.models();
     let config = store.load().map_err(|error| error.to_string())?;
     let definition = config
         .models
@@ -230,7 +249,7 @@ pub(crate) async fn check(args: ModelCheckArgs) -> Result<String, String> {
             })
         }
         LocalCredentialRef::ProtectedFile { .. } | LocalCredentialRef::SystemKeychain { .. } => {
-            LocalSecretStore::new().resolve(&definition.credential)
+            scope.secrets().resolve(&definition.credential)
         }
     }
     .map_err(|error| error.to_string())?;
@@ -350,8 +369,8 @@ fn chat_completions_endpoint(base_url: &str) -> Result<String, String> {
     Ok(base.to_string())
 }
 
-pub(crate) fn show(name: &str) -> Result<Option<String>, String> {
-    let store = LocalModelConfigStore::new();
+pub(crate) fn show(scope: &LocalModelScope, name: &str) -> Result<Option<String>, String> {
+    let store = scope.models();
     let config = store.load().map_err(|error| error.to_string())?;
     let Some(definition) = config.models.get(name) else {
         return Ok(None);
@@ -374,9 +393,9 @@ pub(crate) fn show(name: &str) -> Result<Option<String>, String> {
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn remove(args: ModelRemoveArgs) -> Result<String, String> {
-    let store = LocalModelConfigStore::new();
-    let secrets = LocalSecretStore::new();
+pub(crate) fn remove(scope: &LocalModelScope, args: ModelRemoveArgs) -> Result<String, String> {
+    let store = scope.models();
+    let secrets = scope.secrets();
     let mut config = store.load().map_err(|error| error.to_string())?;
     let removed = config
         .models
@@ -452,6 +471,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn scope() -> LocalModelScope {
+        LocalModelScope::for_owner("https://astra.example", "fixture-owner").unwrap()
+    }
+    fn add(args: ModelAddArgs) -> Result<String, String> {
+        super::add(&scope(), args)
+    }
+    async fn check(args: ModelCheckArgs) -> Result<String, String> {
+        super::check(&scope(), args).await
+    }
+    fn show(name: &str) -> Result<Option<String>, String> {
+        super::show(&scope(), name)
+    }
+    fn remove(args: ModelRemoveArgs) -> Result<String, String> {
+        super::remove(&scope(), args)
+    }
+
     fn no_auth_add(name: &str) -> ModelAddArgs {
         ModelAddArgs {
             name: Some(name.to_string()),
@@ -496,6 +531,45 @@ mod tests {
         .unwrap();
         assert!(removed.contains("removed_locally"));
         assert!(show("work").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn failed_local_model_update_removes_new_secret_on_early_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(no_auth_add("work")).unwrap();
+        let scope = scope();
+        let mut config = scope.models().load().unwrap();
+        config.models.get_mut("work").unwrap().binding_revision = u64::MAX;
+        scope.models().replace(config.revision, config).unwrap();
+        for malformed in [false, true] {
+            if malformed {
+                std::fs::write(scope.models().path(), "malformed-test-config").unwrap();
+            }
+            let before = std::fs::read(scope.models().path()).unwrap();
+            assert!(
+                add_from_tui(
+                    &scope,
+                    "work".into(),
+                    "https://provider.example/v1".into(),
+                    "coding-model".into(),
+                    128000,
+                    8192,
+                    LocalModelCredentialInput::Stored("canary-key".into())
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(scope.models().path()).unwrap(), before);
+            assert_eq!(
+                std::fs::read_dir(scope.root().join("model-secrets"))
+                    .unwrap()
+                    .count(),
+                0,
+                "failed validation/load must not orphan newly created secrets"
+            );
+        }
     }
 
     #[test]
@@ -606,6 +680,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
         add_from_tui(
+            &scope(),
             "work".to_string(),
             format!("{}/v1", provider.uri()),
             "coding-model".to_string(),

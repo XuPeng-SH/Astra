@@ -122,6 +122,9 @@ pub(crate) struct SessionState {
     pub session_name: Option<String>,
     pub cli_context: CliContext,
     pub model: Option<String>,
+    /// Exact selected capacity. Display names never authorize a different
+    /// Offering during metadata refresh, reconnect, or the next turn.
+    pub offering_id: Option<String>,
     pub turn: u32,
     pub last_response: Option<String>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
@@ -458,6 +461,7 @@ impl Default for SessionState {
             session_name: None,
             cli_context: CliContext::default(),
             model: None,
+            offering_id: None,
             turn: 0,
             last_response: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(

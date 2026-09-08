@@ -89,6 +89,15 @@ struct Args {
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
+
+    /// Host only local model inference. This process never advertises or
+    /// constructs a tool executor; provider credentials stay on this boundary.
+    #[arg(long)]
+    inference_only: bool,
+
+    /// Internal account fence for a CLI-managed inference attachment.
+    #[arg(long, hide = true, requires = "inference_only")]
+    expected_inference_owner: Option<String>,
 }
 
 #[derive(Debug)]
@@ -101,12 +110,24 @@ struct EdgeConfig {
     edge_id: String,
     reconnect: bool,
     invocation_journal_root: Option<PathBuf>,
+    inference_only: bool,
+    expected_inference_owner: Option<String>,
     inference_host:
         tokio::sync::Mutex<Option<(String, Arc<astra_edge::inference_host::InferenceHost>)>>,
 }
 
 #[derive(Debug)]
 struct PermanentEdgeConnectionError(String);
+
+fn validate_inference_owner(
+    expected: Option<&str>,
+    actual: &str,
+) -> Result<(), PermanentEdgeConnectionError> {
+    if expected.is_some_and(|owner| owner != actual) {
+        return Err(PermanentEdgeConnectionError("Local inference account changed. Sign in to the intended profile and restart Astra; no local model credentials were loaded.".into()));
+    }
+    Ok(())
+}
 
 async fn local_inference_host(
     config: &EdgeConfig,
@@ -120,6 +141,8 @@ async fn local_inference_host(
     use astra_inference_adapter::transport::ProviderTransport;
     use astra_turn_types::runner_inference::RunnerInferenceId;
 
+    validate_inference_owner(config.expected_inference_owner.as_deref(), &user_id)
+        .map_err(|_| InferenceHostError::OwnerMismatch)?;
     let scope = format!(
         "{:x}",
         Sha256::digest(
@@ -134,11 +157,10 @@ async fn local_inference_host(
         }
         return Ok(host.clone());
     }
-    let models_path = LocalModelConfigStore::new().path().to_owned();
-    let local_root = models_path
-        .parent()
-        .ok_or(InferenceHostError::UnsafeStorage)?
-        .to_owned();
+    let model_scope = astra_credentials::LocalModelScope::for_owner(&config.server_url, &user_id)
+        .map_err(|_| InferenceHostError::OwnerMismatch)?;
+    let models_path = model_scope.models().path().to_owned();
+    let local_root = model_scope.root().to_owned();
     // Provider traffic follows the shared external-egress policy. Proxy
     // credentials and NO_PROXY stay in this local process and never enter a
     // binding publication or Server request.
@@ -493,7 +515,13 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     // still holds the previous (revoked-but-unexpired) one; preferring the
     // file unconditionally would leave the edge permanently rejected.
     let env_token = resolve_token(&args);
-    let file_token = token_renewal::read_valid_file_token(&token_file, now);
+    let file_token = if args.inference_only && env_token.is_err() {
+        // Missing selected credentials must not silently attach local model
+        // capacity as the owner of a retained workspace token.
+        None
+    } else {
+        token_renewal::read_valid_file_token(&token_file, now)
+    };
     let mut fallback_token = None;
     let token = match (file_token, &env_token) {
         (Some(file_token), Ok(env)) => {
@@ -579,6 +607,8 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         edge_id,
         reconnect: args.reconnect,
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
+        inference_only: args.inference_only,
+        expected_inference_owner: args.expected_inference_owner,
         inference_host: tokio::sync::Mutex::new(None),
     })
 }
@@ -628,6 +658,17 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
     advertisement
+}
+
+fn edge_auth_message(edge_id: &str, workspace: &Path, inference_only: bool) -> EdgeClientMessage {
+    EdgeClientMessage::Auth {
+        edge_agent_id: edge_id.to_owned(),
+        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
+        hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
+        workspace_dir: (!inference_only).then(|| workspace.to_string_lossy().to_string()),
+        capabilities: (!inference_only)
+            .then(|| edge_runtime_environment_capabilities(edge_id, workspace)),
+    }
 }
 
 // ─── Proxy helpers ───────────────────────────────────────────────────────────
@@ -1061,20 +1102,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     tracing::info!("WebSocket connected, authenticating...");
 
     // Send auth
-    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
     let workspace = canonical_workspace_dir(&config.workspace_dir).map_err(|e| {
         Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
     })?;
-    let auth_msg = EdgeClientMessage::Auth {
-        edge_agent_id: config.edge_id.clone(),
-        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
-        hostname,
-        workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(edge_runtime_environment_capabilities(
-            &config.edge_id,
-            &workspace,
-        )),
-    };
+    let auth_msg = edge_auth_message(&config.edge_id, &workspace, config.inference_only);
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
         .await?;
@@ -1135,13 +1166,48 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         }
     };
 
-    let mut inference = match local_inference_host(config, authenticated_user).await {
-        Ok(host) => Some(astra_edge::inference_connection::InferenceConnectionWorker::spawn(host)),
-        Err(error) => {
-            tracing::warn!(category = %error, "Runner inference unavailable; tool execution remains available");
-            None
+    validate_inference_owner(
+        config.expected_inference_owner.as_deref(),
+        &authenticated_user,
+    )?;
+    if config.inference_only {
+        let host = local_inference_host(config, authenticated_user).await?;
+        let mut worker = astra_edge::inference_connection::InferenceConnectionWorker::spawn(host);
+        let mut heartbeat =
+            tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                frame = read.next() => match frame {
+                    Some(Ok(Message::Text(text))) => match decode_edge_server_message(&text) {
+                        Ok(EdgeServerMessage::Closing { .. }) => break,
+                        Ok(message) if message.is_inference_message() => {
+                            if worker.commands.try_send(message).is_err() { break; }
+                        }
+                        Ok(EdgeServerMessage::ToolRequest { .. }) => {
+                            // Even a stale/malicious dispatch cannot cross the capacity boundary.
+                            tracing::warn!("Tool dispatch rejected by inference-only Runner");
+                            break;
+                        }
+                        _ => {}
+                    },
+                    Some(Ok(Message::Ping(data))) => { write.send(Message::Pong(data)).await?; }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                },
+                message = worker.messages.recv() => match message {
+                    Some(message) => write.send(Message::Text(serde_json::to_string(&message)?.into())).await?,
+                    None => break,
+                },
+                _ = heartbeat.tick() => {
+                    write.send(Message::Text(serde_json::to_string(&EdgeClientMessage::Ping {})?.into())).await?;
+                }
+            }
         }
-    };
+        return Ok(());
+    }
+    // A general-purpose tool Runner never opens model configuration/secrets.
+    let mut inference: Option<astra_edge::inference_connection::InferenceConnectionWorker> = None;
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
@@ -1812,6 +1878,42 @@ mod tests {
                 .iter()
                 .any(|name| name.as_str() == Some("bash"))
         );
+    }
+
+    #[test]
+    fn inference_only_is_explicit_and_cannot_advertise_tools_or_workspace() {
+        assert!(
+            Args::try_parse_from(["astra-edge", "--expected-inference-owner", "owner"]).is_err()
+        );
+        assert!(validate_inference_owner(Some("owner-a"), "owner-a").is_ok());
+        assert!(validate_inference_owner(Some("owner-a"), "owner-b").is_err());
+        assert!(!Args::try_parse_from(["astra-edge"]).unwrap().inference_only);
+        assert!(
+            Args::try_parse_from(["astra-edge", "--inference-only"])
+                .unwrap()
+                .inference_only
+        );
+        let auth = edge_auth_message("local-inference", Path::new("/private/workspace"), true);
+        let EdgeClientMessage::Auth {
+            workspace_dir,
+            capabilities,
+            ..
+        } = auth
+        else {
+            panic!("auth")
+        };
+        assert!(workspace_dir.is_none());
+        assert!(capabilities.is_none());
+        let message = EdgeServerMessage::ToolCancel {
+            request_id: "tool".into(),
+            delivery_generation: 1,
+        };
+        assert!(!message.is_inference_message());
+        assert!(EdgeServerMessage::InferenceHelloAck {
+            negotiation: astra_server_types::runner_inference::RunnerInferenceNegotiation::Unavailable {
+                reason: astra_server_types::runner_inference::RunnerInferenceRejection::ProtocolVersionUnsupported,
+            },
+        }.is_inference_message());
     }
 
     #[test]

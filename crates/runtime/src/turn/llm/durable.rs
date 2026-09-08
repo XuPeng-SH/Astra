@@ -305,6 +305,7 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
 
 struct DatabaseInferenceLedgerPersistence {
     shared_pool: SharedPool,
+    runner_binding: Option<astra_services::runner_model_bindings::ResolvedRunnerModelBinding>,
 }
 
 #[async_trait]
@@ -320,7 +321,17 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
         &self,
         plan: &astra_services::InferenceInvocationPlan,
     ) -> astra_services::ServiceResult<()> {
-        astra_services::admit_inference_invocation(&self.shared_pool, plan).await
+        match self.runner_binding.as_ref() {
+            Some(binding) => {
+                astra_services::inference_execution::runner::admit_runner_invocation(
+                    &self.shared_pool,
+                    plan,
+                    binding,
+                )
+                .await
+            }
+            None => astra_services::admit_inference_invocation(&self.shared_pool, plan).await,
+        }
     }
 
     async fn renew_invocation_owner(
@@ -377,7 +388,19 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
         plan: &astra_services::InferenceInvocationPlan,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> astra_services::ServiceResult<()> {
-        astra_services::finish_inference_invocation(&self.shared_pool, plan, terminal).await
+        match self.runner_binding.as_ref() {
+            Some(_) => {
+                astra_services::inference_execution::runner::finish_undispatched_runner_invocation(
+                    &self.shared_pool,
+                    plan,
+                    terminal,
+                )
+                .await
+            }
+            None => {
+                astra_services::finish_inference_invocation(&self.shared_pool, plan, terminal).await
+            }
+        }
     }
 
     async fn begin_provider_attempt(
@@ -2635,7 +2658,15 @@ impl DurableInferenceLedger {
         admitted_execution: astra_services::AdmittedModelExecution,
     ) -> Self {
         Self {
-            persistence: Arc::new(DatabaseInferenceLedgerPersistence { shared_pool }),
+            persistence: Arc::new(DatabaseInferenceLedgerPersistence {
+                shared_pool,
+                runner_binding: match &admitted_execution.execution_material {
+                    astra_services::ModelExecutionMaterial::Runner(binding) => {
+                        Some(binding.clone())
+                    }
+                    astra_services::ModelExecutionMaterial::Server(_) => None,
+                },
+            }),
             settlement_coordinator: ProviderSettlementCoordinator::runtime(),
             user_id: user_id.into(),
             admitted_execution,
@@ -2668,6 +2699,14 @@ impl DurableInferenceLedger {
                 })?;
                 Arc::new(DatabaseInferenceLedgerPersistence {
                     shared_pool: shared_pool.clone(),
+                    runner_binding: admitted_execution.and_then(|execution| {
+                        match &execution.execution_material {
+                            astra_services::ModelExecutionMaterial::Runner(binding) => {
+                                Some(binding.clone())
+                            }
+                            astra_services::ModelExecutionMaterial::Server(_) => None,
+                        }
+                    }),
                 })
             }
         };

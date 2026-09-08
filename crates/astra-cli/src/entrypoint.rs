@@ -390,10 +390,20 @@ async fn run_async() -> i32 {
                 | Some(cli::cli_config::cli_args::Command::Team(_))
                 | Some(cli::cli_config::cli_args::Command::Work(_))
         );
-    let local_models_configured = astra_credentials::LocalModelConfigStore::new()
-        .load()
-        .map(|config| !config.models.is_empty())
-        .unwrap_or(false);
+    let local_models_configured = match astra_credentials::LocalModelScope::for_profile(
+        &api.api_origin(),
+        profile.as_deref(),
+    ) {
+        Ok(scope) => match scope.models().load() {
+            Ok(config) => !config.models.is_empty(),
+            Err(error) => {
+                eprintln!("Error: local model configuration is invalid: {error}");
+                return i32::from(ExitCode::ApiError);
+            }
+        },
+        // Authentication bootstrap has no provider configuration authority.
+        Err(_) => false,
+    };
     let interactive_runner_surface = !print_mode
         && (continue_last
             || resume.is_some()
@@ -439,7 +449,6 @@ async fn run_async() -> i32 {
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());
-    slash_config::set_active_offering_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
@@ -763,7 +772,6 @@ mod tests {
         let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState::default();
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -776,11 +784,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("Display Model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-model")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-model"));
     }
 
     #[serial_test::serial]
@@ -801,7 +805,7 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
+        state.offering_id = Some("offer-old".to_string());
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -814,11 +818,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-old"));
     }
 
     #[serial_test::serial]
@@ -842,7 +842,7 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
+        state.offering_id = Some("offer-old".to_string());
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -855,11 +855,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-old"));
     }
 
     #[tokio::test]

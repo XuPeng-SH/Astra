@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 pub mod runner;
+pub mod runner_wait;
 
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
@@ -1464,6 +1465,22 @@ pub async fn admit_inference_invocation(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     require_server_ledger_path(&plan.input)?;
+    admit_inference_invocation_for_execution(pool, plan, None).await
+}
+
+/// One logical admission transaction for both placements. Runner callers must
+/// supply the exact admitted binding, which is revalidated under its registry
+/// lock before any route or invocation is inserted.
+async fn admit_inference_invocation_for_execution(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    runner: Option<&crate::runner_model_bindings::ResolvedRunnerModelBinding>,
+) -> ServiceResult<()> {
+    if let Some(binding) = runner {
+        self::runner::validate_runner_invocation(&plan.input, binding)?;
+    } else {
+        require_server_ledger_path(&plan.input)?;
+    }
     let db = pool.get();
     if let Some(persisted) = load_invocation_admission_fact(db, plan).await? {
         return Err(existing_invocation_error(plan, &persisted));
@@ -1482,7 +1499,18 @@ pub async fn admit_inference_invocation(
         {
             return Err(unavailable_scope_error(&plan.input));
         }
-        insert_inference_invocation_admission(&mut tx, plan).await
+        if let Some(binding) = runner {
+            crate::runner_model_bindings::lock_resolved_binding(
+                &mut tx, &plan.input.user_id, &binding.definition.identity).await?;
+        }
+        insert_inference_invocation_admission(&mut tx, plan).await?;
+        if let Some(binding) = runner {
+            sqlx::query("UPDATE inference_routes SET runner_binding_json = ? WHERE user_id = ? AND route_id = ?")
+                .bind(serde_json::to_string(&binding.definition.identity).map_err(|_| ServiceError::invalid("Runner binding encoding failed"))?)
+                .bind(&plan.input.user_id).bind(plan.route_id()).execute(&mut *tx).await
+                .map_err(|error| ServiceError::with_source(ServiceErrorKind::Persistence, "pin Runner logical route", error))?;
+        }
+        Ok(())
     }
     .await;
 

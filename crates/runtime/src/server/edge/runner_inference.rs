@@ -464,10 +464,13 @@ async fn handle_message(
                     )
                     .await
                     {
-                        Ok(ack) => Some(EdgeServerMessage::InferenceTerminalAck {
-                            ack: Box::new(ack),
-                            delivery_generation: generation,
-                        }),
+                        Ok(ack) => {
+                            pool.runner_continuation_waiters.notify();
+                            Some(EdgeServerMessage::InferenceTerminalAck {
+                                ack: Box::new(ack),
+                                delivery_generation: generation,
+                            })
+                        }
                         Err(error) => Some(EdgeServerMessage::InferenceRejected {
                             attempt_id: Some(attempt_id),
                             reason: rejection(&error),

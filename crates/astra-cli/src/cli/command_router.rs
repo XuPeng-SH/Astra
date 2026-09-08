@@ -357,7 +357,12 @@ async fn resolve_one_shot_model(
         Some(model.to_string())
     } else {
         match session_runtime::resolve_server_default_model(api, token).await {
-            session_runtime::ServerDefaultModel::Selected(selection) => Some(selection.name),
+            session_runtime::ServerDefaultModel::Selected(selection) => {
+                return Ok(ResolvedOneShotModel {
+                    model: Some(selection.name),
+                    offering_id: Some(selection.offering_id),
+                });
+            }
             session_runtime::ServerDefaultModel::NoModels
             | session_runtime::ServerDefaultModel::Unavailable => None,
         }
@@ -372,9 +377,14 @@ async fn resolve_one_shot_model(
         .await
         .map_err(|error| format!("failed to resolve selected model '{model}': {error}"))?;
     Ok(ResolvedOneShotModel {
-        // Preserve the caller's thinking suffix and spelling in the turn
-        // payload; the shared resolver owns the canonical Offering identity.
-        model: Some(model),
+        // IDs are request authority, not provider-facing model names.
+        model: Some(format!(
+            "{}{}",
+            selection.name,
+            &model[astra_turn_core::thinking_config::resolve_model_thinking(&model)
+                .0
+                .len()..]
+        )),
         offering_id: Some(selection.offering_id),
     })
 }
@@ -417,7 +427,7 @@ mod exact_model_resolution_tests {
         let error = resolve_one_shot_model(&api, "token", Some("overflow-model"), None, None)
             .await
             .expect_err("missing Offering must fail closed");
-        assert!(error.contains("authoritative catalog"), "{error}");
+        assert!(error.contains("was not found"), "{error}");
     }
 }
 
@@ -2126,12 +2136,15 @@ async fn execute_cli_command_impl(
 
         Some(Command::Model(ModelCmd::Local(command))) => {
             use crate::cli::cli_config::cli_args::LocalModelCmd;
+            let scope = astra_credentials::LocalModelScope::for_profile(
+                &api.api_origin(), profile.as_deref(),
+            )?;
             let body = match command {
-                LocalModelCmd::Add(args) => crate::cli::local_model_command::add(args)?,
-                LocalModelCmd::Check(args) => crate::cli::local_model_command::check(args).await?,
-                LocalModelCmd::Show(args) => crate::cli::local_model_command::show(&args.model_name)?
+                LocalModelCmd::Add(args) => crate::cli::local_model_command::add(&scope, args)?,
+                LocalModelCmd::Check(args) => crate::cli::local_model_command::check(&scope, args).await?,
+                LocalModelCmd::Show(args) => crate::cli::local_model_command::show(&scope, &args.model_name)?
                     .ok_or_else(|| format!("Local model '{}' is not configured", args.model_name))?,
-                LocalModelCmd::Remove(args) => crate::cli::local_model_command::remove(args)?,
+                LocalModelCmd::Remove(args) => crate::cli::local_model_command::remove(&scope, args)?,
             };
             print_json_or_raw(&body);
             Ok(ExitCode::Success)

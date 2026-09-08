@@ -324,6 +324,28 @@ pub enum EdgeServerMessage {
 }
 
 impl EdgeServerMessage {
+    pub fn is_inference_message(&self) -> bool {
+        match self {
+            Self::InferenceHelloAck { .. }
+            | Self::InferenceBindingRejected { .. }
+            | Self::InferenceBindingAck { .. }
+            | Self::InferenceDispatch { .. }
+            | Self::InferenceRequestChunk { .. }
+            | Self::InferenceCancel { .. }
+            | Self::InferenceReconcile { .. }
+            | Self::InferenceTerminalAck { .. }
+            | Self::InferenceResponseCredit { .. }
+            | Self::InferenceRejected { .. } => true,
+            Self::AuthOk { .. }
+            | Self::AuthError { .. }
+            | Self::Pong { .. }
+            | Self::Closing { .. }
+            | Self::ToolRequest { .. }
+            | Self::ToolCancel { .. }
+            | Self::ToolResultAck { .. } => false,
+        }
+    }
+
     /// Short stable label for diagnostic logging (no payload).
     pub fn diagnostic_kind(&self) -> &'static str {
         match self {

@@ -298,10 +298,6 @@ impl LocalModelConfigLease {
 }
 
 impl LocalModelConfigStore {
-    pub fn new() -> Self {
-        Self::with_path(super::default_path().with_file_name("models.json"))
-    }
-
     pub fn with_path(path: PathBuf) -> Self {
         Self { path }
     }
@@ -397,12 +393,6 @@ impl LocalModelConfigStore {
     }
 }
 
-impl Default for LocalModelConfigStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Owner-private storage for provider credentials selected explicitly by a user.
 ///
 /// Configuration contains only an opaque reference. This backend deliberately
@@ -415,10 +405,6 @@ pub struct LocalSecretStore {
 }
 
 impl LocalSecretStore {
-    pub fn new() -> Self {
-        Self::with_root(super::default_path().with_file_name("model-secrets"))
-    }
-
     pub fn with_root(root: PathBuf) -> Self {
         Self { root }
     }
@@ -515,12 +501,6 @@ fn ensure_protected_store_supported() -> Result<(), LocalModelConfigError> {
     }
 }
 
-impl Default for LocalSecretStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn validate_component(field: &'static str, value: &str) -> Result<(), LocalModelConfigError> {
     if value.trim().is_empty() {
         return Err(LocalModelConfigError::Invalid {
@@ -554,19 +534,49 @@ fn validate_file_component(field: &'static str, value: &str) -> Result<(), Local
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), LocalModelConfigError> {
-    fs::create_dir_all(path).map_err(|source| LocalModelConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            LocalModelConfigError::Io {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .map_err(|source| LocalModelConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|source| LocalModelConfigError::Io {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
+        let metadata = directory
+            .metadata()
+            .map_err(|source| LocalModelConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(LocalModelConfigError::CredentialUnavailable(
+                "local model directory must be owned by this user and not a symlink".into(),
+            ));
+        }
+        // Tighten an existing owned directory via its descriptor, never by
+        // following a replaceable symlink to an unrelated directory.
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|source| LocalModelConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
     }
     Ok(())
 }
@@ -772,6 +782,23 @@ fn write_new_private(path: &Path, body: &[u8]) -> Result<(), LocalModelConfigErr
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn model_directory_symlink_is_rejected_without_changing_its_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("unrelated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = directory.path().join("models-alias");
+        symlink(&target, &alias).unwrap();
+        assert!(super::ensure_private_directory(&alias).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
     use super::*;
 
     fn model(credential: LocalCredentialRef) -> LocalModelDefinition {

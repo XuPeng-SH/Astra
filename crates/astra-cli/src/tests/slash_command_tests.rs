@@ -61,8 +61,8 @@ async fn slash_model_catalog_selection_is_exact_and_preserves_state_on_rejection
             };
             axum::Json(serde_json::json!({
                 "items": [item("runner-one", "Work", true), item("runner-two", "Work", false),
-                    item("runner-unique", "Unique", true)],
-                "next_cursor": null, "limit": 50, "total": 3, "catalog_revision": "sha256:test"
+                    item("runner-unique", "Unique", true), item("runner-three", "Work", true)],
+                "next_cursor": null, "limit": 50, "total": 4, "catalog_revision": "sha256:test"
             }))
         }),
     );
@@ -92,12 +92,44 @@ async fn slash_model_catalog_selection_is_exact_and_preserves_state_on_rejection
             .unwrap()
         );
         assert_eq!(state.model.as_deref(), Some(expected_name));
-        assert_eq!(
-            slash_config::active_offering_id_for_request().as_deref(),
-            Some(expected_offering)
-        );
+        assert_eq!(state.offering_id.as_deref(), Some(expected_offering));
     }
-    slash_config::set_active_offering_id_for_request(None);
+    handle_slash_command(
+        "/model runner-three",
+        &api,
+        None,
+        &mut state,
+        Some("fake-token"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.offering_id.as_deref(), Some("runner-three"));
+    crate::cli::session::session_runtime::ensure_state_default_model(
+        &api,
+        "fake-token",
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        state.offering_id.as_deref(),
+        Some("runner-three"),
+        "the next-turn refresh must preserve the explicitly selected Offering"
+    );
+    let mut other_session = SessionState::default();
+    handle_slash_command(
+        "/model runner-one",
+        &api,
+        None,
+        &mut other_session,
+        Some("fake-token"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state.offering_id.as_deref(),
+        Some("runner-three"),
+        "a second session cannot overwrite the first selection"
+    );
     slash_config::set_active_model_for_display(None);
 }
 

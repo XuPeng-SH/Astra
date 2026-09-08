@@ -172,6 +172,10 @@ fn pool_key(user_id: &str, edge_agent_id: &str) -> String {
 /// Thread-safe pool of live edge WebSocket connections.
 #[derive(Debug, Clone)]
 pub struct EdgeConnectionPool {
+    /// One bounded readiness observer per Server; database reads also observe
+    /// custody committed by sockets on other pods.
+    pub runner_continuation_waiters:
+        Arc<astra_services::inference_execution::runner_wait::RunnerContinuationWaiters>,
     connections: Arc<DashMap<String, EdgeConnection>>,
     /// Pending tool requests dispatched to edges, keyed by request_id.
     /// Used for reconnection dedup: when an edge reconnects, cloud can
@@ -212,6 +216,7 @@ struct PendingRequestEntry {
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
+            runner_continuation_waiters: Arc::default(),
             connections: Arc::new(DashMap::new()),
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),

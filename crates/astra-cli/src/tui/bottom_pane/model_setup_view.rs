@@ -4,9 +4,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::view::{
@@ -16,8 +17,8 @@ use super::view::{
 
 const LABELS: [&str; 7] = [
     "Name        ",
-    "API base    ",
-    "Model       ",
+    "API URL     ",
+    "Model ID    ",
     "Context     ",
     "Max output  ",
     "Credential  ",
@@ -57,6 +58,56 @@ impl ModelSetupView {
 
     fn credential_source(&self) -> &str {
         self.values[5].trim()
+    }
+
+    fn form_layout(&self, inner: Rect) -> (Rect, Rect, usize) {
+        let footer_height = inner.height.min(2);
+        let hint_height = if inner.height >= 5 { 2 } else { 0 };
+        let fields_height = inner.height.saturating_sub(footer_height + hint_height);
+        let fields = Rect::new(inner.x, inner.y, inner.width, fields_height);
+        let hint = Rect::new(inner.x, fields.bottom(), inner.width, hint_height);
+        let first = self
+            .focus
+            .saturating_sub(usize::from(fields_height) / 2)
+            .min(LABELS.len().saturating_sub(usize::from(fields_height)));
+        (fields, hint, first)
+    }
+
+    fn field_hint(&self) -> &str {
+        match self.focus {
+            0 => "A name you recognize in /model. An existing name updates that configuration.",
+            1 => "OpenAI-compatible API base URL. Use HTTPS, or HTTP on loopback only.",
+            2 => "The exact model ID accepted by your provider, not your display name.",
+            3 => "Context capacity in tokens. Use your provider's documented limit.",
+            4 => "Output limit in tokens; must be positive and fit within the context.",
+            5 => "Left / Right: environment variable, stored API key, or no authentication.",
+            _ if self.credential_source() == "environment" => {
+                "Variable name only. Export its value before starting Astra in this terminal."
+            }
+            _ if self.credential_source() == "stored" => {
+                "Paste your API key. Stored locally with owner-only permissions, not encrypted."
+            }
+            _ => "No credential will be sent to the provider.",
+        }
+    }
+
+    fn visible_value(&self, index: usize, width: u16) -> String {
+        let value = self.rendered_value(index);
+        let available = usize::from(width.saturating_sub(1));
+        if value.width() <= available {
+            return value;
+        }
+        // Keep the insertion point visible without splitting a UTF-8 grapheme.
+        let mut used = 0;
+        let mut suffix = Vec::new();
+        for grapheme in value.graphemes(true).rev() {
+            if used + grapheme.width() > available {
+                break;
+            }
+            used += grapheme.width();
+            suffix.push(grapheme);
+        }
+        suffix.into_iter().rev().collect()
     }
 
     fn rendered_value(&self, index: usize) -> String {
@@ -120,6 +171,48 @@ impl ModelSetupView {
                 return;
             }
         };
+        // Validate against the canonical local configuration contract before
+        // closing the form; validation performs no disk or provider I/O.
+        use astra_credentials::{
+            LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig, LocalModelDefinition,
+        };
+        let definition = LocalModelDefinition {
+            protocol: LocalInferenceProtocol::OpenaiCompatible,
+            base_url: self.values[1].trim().to_string(),
+            model: self.values[2].trim().to_string(),
+            binding_revision: 1,
+            context_window,
+            max_output_tokens,
+            credential: match &credential {
+                ModelSetupCredentialDraft::Environment { name } => {
+                    LocalCredentialRef::Environment { name: name.clone() }
+                }
+                ModelSetupCredentialDraft::Stored { .. } => LocalCredentialRef::ProtectedFile {
+                    secret_id: "pending".into(),
+                },
+                ModelSetupCredentialDraft::None => LocalCredentialRef::None,
+            },
+        };
+        let config = LocalModelConfig {
+            models: [(self.values[0].trim().to_string(), definition)].into(),
+            ..Default::default()
+        };
+        if let Err(error) = config.validate() {
+            let error = match &error {
+                astra_credentials::LocalModelConfigError::Model { source, .. } => source.as_ref(),
+                _ => &error,
+            };
+            if let astra_credentials::LocalModelConfigError::Invalid { field, .. } = error {
+                self.focus = match *field {
+                    "base URL" => 1,
+                    "model" => 2,
+                    "environment credential name" => 6,
+                    _ => 0,
+                };
+            }
+            self.error = Some(error.to_string());
+            return;
+        }
         self.pending = Some(ModelSetupDraft {
             name: self.values[0].trim().to_string(),
             base_url: self.values[1].trim().to_string(),
@@ -167,87 +260,128 @@ impl BottomPaneView for ModelSetupView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let theme = crate::tui::theme::current();
         let outer = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme.dim))
             .title(Line::from(Span::styled(
-                " /model add · Runner-local ",
+                if self.pending.is_some() {
+                    " Add model · 2/2 Review "
+                } else {
+                    " Add model · 1/2 Configure "
+                },
                 Style::default()
                     .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )));
         let inner = outer.inner(area);
         outer.render(area, buf);
-        let mut lines = vec![Line::from(Span::styled(
-            "  Your key stays on this machine and is never sent to Astra Server.",
-            Style::default().fg(Color::Gray),
-        ))];
-        lines.push(Line::from(Span::styled(
-            "  Stored keys use owner-only local file permissions; they are not encrypted.",
-            Style::default().fg(Color::DarkGray),
-        )));
+        let footer_height = inner.height.min(2);
+        let footer = Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(footer_height),
+            inner.width,
+            footer_height,
+        );
         if self.pending.is_some() {
-            lines.push(Line::from(Span::styled(
-                "  Choose what happens after saving this configuration:",
-                Style::default().fg(Color::White),
-            )));
-            for (index, label) in ["Test and use", "Save without test"].iter().enumerate() {
-                let focused = index == self.action_focus;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if focused { "  ▸ " } else { "    " },
-                        Style::default().fg(crate::tui::theme::current().accent),
+            let lines = vec![
+                Line::from("Your key stays on this machine."),
+                Line::from("Saved for this deployment and account."),
+                Line::default(),
+                Line::from(Span::styled(
+                    format!(
+                        "{} Test and use",
+                        if self.action_focus == 0 { "▸" } else { " " }
                     ),
-                    Span::styled(
-                        *label,
-                        Style::default().fg(if focused { Color::White } else { Color::Gray }),
+                    Style::default()
+                        .fg(if self.action_focus == 0 {
+                            theme.accent
+                        } else {
+                            theme.fg
+                        })
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  One short request; charges may apply."),
+                Line::from(Span::styled(
+                    format!(
+                        "{} Save without test",
+                        if self.action_focus == 1 { "▸" } else { " " }
                     ),
-                    Span::raw(if index == 0 {
-                        "  one bounded provider request; select this model"
-                    } else {
-                        "  save as unverified; no provider request"
-                    }),
-                ]));
-            }
-        } else {
-            for (index, label) in LABELS.iter().enumerate() {
-                let focused = index == self.focus;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if focused { "  ▸ " } else { "    " },
-                        Style::default().fg(crate::tui::theme::current().accent),
-                    ),
-                    Span::styled(*label, Style::default().fg(Color::Gray)),
-                    Span::raw("  "),
-                    Span::styled(
-                        self.rendered_value(index),
-                        Style::default().fg(if focused { Color::White } else { Color::Gray }),
-                    ),
-                ]));
-            }
+                    Style::default()
+                        .fg(if self.action_focus == 1 {
+                            theme.accent
+                        } else {
+                            theme.fg
+                        })
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("  No request. Current model unchanged."),
+            ];
+            Paragraph::new(lines).wrap(Wrap { trim: false }).render(
+                Rect::new(
+                    inner.x,
+                    inner.y,
+                    inner.width,
+                    inner.height.saturating_sub(footer_height),
+                ),
+                buf,
+            );
+            Paragraph::new("Tab / arrows choose\nEnter confirm · Esc edit")
+                .style(Style::default().fg(theme.dim))
+                .render(footer, buf);
+            return;
         }
-        if let Some(error) = &self.error {
-            lines.push(Line::from(Span::styled(
-                format!("  {error}"),
-                Style::default().fg(Color::Red),
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            if self.pending.is_some() {
-                "  ←→ choose · Enter confirm · Esc back"
+        let (fields, hint, first) = self.form_layout(inner);
+        for (offset, index) in (first..LABELS.len())
+            .take(usize::from(fields.height))
+            .enumerate()
+        {
+            let focused = index == self.focus;
+            let row = Rect::new(fields.x, fields.y + offset as u16, fields.width, 1);
+            let style = if focused {
+                Style::default().fg(theme.selected_fg).bg(theme.selected_bg)
             } else {
-                "  Tab / ↑↓ field · ←→ credential source · Enter continue · Esc cancel"
-            },
-            Style::default().fg(Color::DarkGray),
-        )));
-        Paragraph::new(lines).render(inner, buf);
+                Style::default().fg(theme.fg)
+            };
+            buf.set_style(row, style);
+            let label = if index == 6 {
+                match self.credential_source() {
+                    "environment" => "Env var     ",
+                    "stored" => "API key     ",
+                    _ => LABELS[index],
+                }
+            } else {
+                LABELS[index]
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    if focused { "▸ " } else { "  " },
+                    Style::default().fg(theme.accent),
+                ),
+                Span::raw(label),
+                Span::raw(" "),
+                Span::raw(self.visible_value(index, row.width.saturating_sub(15))),
+            ]);
+            Paragraph::new(line).style(style).render(row, buf);
+        }
+        Paragraph::new(self.error.as_deref().unwrap_or_else(|| self.field_hint()))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if self.error.is_some() {
+                theme.error
+            } else {
+                theme.dim
+            }))
+            .render(hint, buf);
+        Paragraph::new("Tab / ↑↓ field · Ctrl+U clear\nEnter review · Esc cancel")
+            .style(Style::default().fg(theme.dim))
+            .render(footer, buf);
     }
 
-    fn desired_height(&self, _width: u16) -> u16 {
-        if self.pending.is_some() {
-            7 + u16::from(self.error.is_some())
+    fn desired_height(&self, width: u16) -> u16 {
+        if self.pending.is_some() && width < 46 {
+            16
         } else {
-            12 + u16::from(self.error.is_some())
+            13
         }
     }
 
@@ -260,6 +394,7 @@ impl BottomPaneView for ModelSetupView {
                 }
                 KeyCode::Left | KeyCode::Up => self.action_focus = 0,
                 KeyCode::Right | KeyCode::Down => self.action_focus = 1,
+                KeyCode::Tab | KeyCode::BackTab => self.action_focus = 1 - self.action_focus,
                 KeyCode::Enter => self.confirm_action(),
                 _ => {}
             }
@@ -268,18 +403,22 @@ impl BottomPaneView for ModelSetupView {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.cancelled = true,
             (KeyCode::Tab | KeyCode::Down, _) => {
-                self.focus = (self.focus + 1).min(LABELS.len() - 1);
+                self.focus = (self.focus + 1) % LABELS.len();
                 self.error = None;
             }
             (KeyCode::BackTab | KeyCode::Up, _) => {
-                self.focus = self.focus.saturating_sub(1);
+                self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
                 self.error = None;
             }
             (KeyCode::Left, _) if self.focus == 5 => self.cycle_credential(true),
             (KeyCode::Right, _) if self.focus == 5 => self.cycle_credential(false),
             (KeyCode::Enter, _) => self.submit(),
             (KeyCode::Backspace, _) if self.focus != 5 => {
-                self.values[self.focus].pop();
+                if let Some((offset, _)) =
+                    self.values[self.focus].grapheme_indices(true).next_back()
+                {
+                    self.values[self.focus].truncate(offset);
+                }
                 self.error = None;
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) if self.focus != 5 => {
@@ -289,12 +428,7 @@ impl BottomPaneView for ModelSetupView {
             (KeyCode::Char(character), modifiers)
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
             {
-                if self.focus != 5
-                    && !(self.focus == 6 && matches!(self.credential_source(), "none" | "keyless"))
-                {
-                    self.values[self.focus].push(character);
-                }
-                self.error = None;
+                self.handle_paste(&character.to_string());
             }
             _ => {}
         }
@@ -304,12 +438,45 @@ impl BottomPaneView for ModelSetupView {
         if self.cancelled || self.submitted.is_some() || self.pending.is_some() {
             return None;
         }
-        let value_width = self.rendered_value(self.focus).width() as u16;
-        Some((
-            area.x
-                .saturating_add(6 + LABELS[self.focus].width() as u16 + value_width),
-            area.y.saturating_add(2 + self.focus as u16),
-        ))
+        if self.focus == 5
+            || (self.focus == 6 && matches!(self.credential_source(), "none" | "keyless"))
+        {
+            return None;
+        }
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        if inner.width <= 15 {
+            return None;
+        }
+        let (fields, _, first) = self.form_layout(inner);
+        if fields.height == 0 {
+            return None;
+        }
+        let row = self.focus.saturating_sub(first) as u16;
+        let value_width = self
+            .visible_value(self.focus, inner.width.saturating_sub(15))
+            .width() as u16;
+        Some((inner.x + 15 + value_width, fields.y + row))
+    }
+
+    fn handle_paste(&mut self, text: &str) -> bool {
+        // Always consume while the private form is open, including review
+        // and disabled fields. Falling through would paste keys into chat.
+        if self.pending.is_none()
+            && !self.is_complete()
+            && self.focus != 5
+            && !(self.focus == 6 && matches!(self.credential_source(), "none" | "keyless"))
+        {
+            if text.chars().any(char::is_control) {
+                self.error =
+                    Some("Paste one value without line breaks or control characters.".into());
+            } else if self.values[self.focus].len().saturating_add(text.len()) > 8192 {
+                self.error = Some("Value is too long (maximum 8192 bytes).".into());
+            } else {
+                self.values[self.focus].push_str(text);
+                self.error = None;
+            }
+        }
+        true
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -430,5 +597,95 @@ mod tests {
         view.handle_key(key(KeyCode::Right));
         assert_eq!(view.credential_source(), "environment");
         assert_eq!(view.values[6], "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn model_setup_paste_never_reaches_the_composer() {
+        use crate::tui::bottom_pane::BottomPane;
+        for focus in [0, 5, 6] {
+            for review in [false, true] {
+                let mut view = ModelSetupView::new();
+                view.values = [
+                    "Work",
+                    "https://provider.example/v1",
+                    "coding-model",
+                    "128000",
+                    "8192",
+                    "stored",
+                    "key",
+                ]
+                .map(str::to_owned);
+                view.focus = focus;
+                if review {
+                    view.submit();
+                    assert!(view.pending.is_some());
+                }
+                let mut pane = BottomPane::new();
+                pane.composer.set_text("existing chat draft");
+                pane.push_view(Box::new(view));
+                pane.handle_paste("provider-secret-canary");
+                pane.handle_paste("multi\nline-secret-canary");
+                assert_eq!(pane.composer.text(), "existing chat draft");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_model_setup_preserves_input_and_explains_the_field() {
+        let mut view = ModelSetupView::new();
+        view.values = [
+            "Work",
+            "http://remote.example/v1",
+            "coding-model",
+            "128000",
+            "8192",
+            "environment",
+            "BAD=NAME",
+        ]
+        .map(str::to_owned);
+        view.submit();
+        assert!(view.pending.is_none());
+        assert_eq!(view.focus, 1);
+        view.values[1] = "https://provider.example/v1".into();
+        view.submit();
+        assert!(view.pending.is_none());
+        assert_eq!(view.focus, 6);
+        assert_eq!(view.values[2], "coding-model");
+        view.values[6] = "WORK_API_KEY".into();
+        view.submit();
+        assert!(view.pending.is_some());
+        let rendered = buffer_to_string(&draw_widget(Widget(&view), 44, 16));
+        assert!(rendered.contains("charges may apply"));
+        assert!(rendered.contains("Current model unchanged"));
+        view.handle_key(key(KeyCode::Esc));
+        assert!(view.pending.is_none());
+        assert_eq!(view.values[6], "WORK_API_KEY");
+    }
+
+    #[test]
+    fn model_setup_cursor_stays_in_bounds_and_paste_is_bounded() {
+        let mut view = ModelSetupView::new();
+        view.values[0] = "模型-很长的名称-e\u{301}".repeat(10);
+        let before = view.values[0].clone();
+        view.handle_paste("invalid\nvalue");
+        assert_eq!(view.values[0], before);
+        view.handle_paste(&"x".repeat(8193));
+        assert_eq!(view.values[0], before);
+        view.handle_key(key(KeyCode::Backspace));
+        assert!(!view.values[0].ends_with('e'));
+        for focus in [0, 4, 6] {
+            view.focus = focus;
+            for width in [0, 1, 18, 24, 40, 80] {
+                for height in [0, 1, 4, 8, 13] {
+                    let area = Rect::new(2, 3, width, height);
+                    let mut buf = Buffer::empty(area);
+                    view.render(area, &mut buf);
+                    if let Some((x, y)) = view.cursor_pos(area) {
+                        assert!(x > area.x && x < area.right() - 1, "{area:?}: {x},{y}");
+                        assert!(y > area.y && y < area.bottom() - 1, "{area:?}: {x},{y}");
+                    }
+                }
+            }
+        }
     }
 }

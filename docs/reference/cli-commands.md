@@ -134,6 +134,10 @@ name, including an offline Runner, choose from the picker or use
 `/model <offering_id>`. Exact Offering IDs take precedence over display names.
 An ambiguous, unknown, or unavailable selection leaves the current selection
 unchanged. Existing thinking suffixes such as `(thinking:high)` are preserved.
+The exact Offering selection belongs to the current session. Refreshing model
+metadata for the next turn does not select a different account with the same
+display name. `--model <offering_id>` also accepts an exact ID; unavailable IDs
+fail with a repair message, without falling back to a namesake.
 
 `/model add` opens local model setup. **Save without test** saves configuration
 without a provider call and leaves the current selection unchanged. Selecting
@@ -141,6 +145,46 @@ that model later with `/model` does not test it. Run `astra model check <name>`
 for an explicit provider test; this can incur provider charges. The current
 implementation does not persist probe status or show saved probe evidence in
 the picker.
+
+The setup form validates fields before saving and keeps invalid input available
+for correction. Tab or Up/Down moves between fields; Left/Right changes the
+credential source; Ctrl+U clears a field. Enter opens a review step, and Esc
+returns to editing or cancels without saving. API keys are masked, and paste
+stays inside the form, never in the chat draft. A provider test may incur charges.
+If your account, session, or model changes while **Test and use** runs, the
+completed setup does not override that newer selection. Use `/model` to select
+the ready model explicitly.
+
+The picker always shows the access source and disambiguates duplicate names.
+`/model info` displays the current exact Offering ID and session-wide usage.
+It does not present a previous model's cached prices as BYOK pricing; consult
+your provider for rates. Availability is refreshed through `/model`.
+
+Local model configuration requires a signed-in profile (`astra login`). Desired
+definitions and stored secrets are scoped to the Astra deployment URL and the
+server-issued account ID, not the profile's display name. `astra model show
+<name>` reports the selected configuration path. A different deployment or
+account starts with no inherited local definitions or provider credentials.
+Older unscoped `models.json` / `model-secrets` files are not automatically loaded
+or copied; re-add the intended definitions in the signed-in scope. Existing
+files are left intact.
+
+CLI-managed model capacity uses `astra-edge --inference-only`. This process does
+not advertise a workspace/tool executor. The launcher pins the selected profile
+and account; inherited `ASTRA_TOKEN`, `ASTRA_TOKEN_FILE`, and token-renewal URL
+overrides do not replace that identity. An authenticated account mismatch stops
+the attachment before loading model credentials. A separately managed inference Runner
+must also opt in with `--inference-only`; an ordinary `astra-edge` tool Runner
+does not load local model configuration. Bash tools inherit the canonical safe
+environment baseline plus explicit host-provided call environment, not all
+variables exported by the launching terminal. This is an inheritance boundary,
+not an OS sandbox against other programs running as the same local user.
+
+Personal Runner bindings currently cover agent/subagent inference and required
+compaction. Optional operations on `/v1/chat/completions` (memory extraction,
+reranking, turn/skill routing, verification) require a Server Offering. Selecting
+a Runner there reports `runner_inference_purpose_unsupported`; it does not
+silently charge that personal key or switch accounts.
 
 ## astra admin
 

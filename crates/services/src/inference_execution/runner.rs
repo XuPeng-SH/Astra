@@ -23,6 +23,120 @@ use crate::session_artifact_store::{
 const MAX_CUSTODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_START_WINDOW_MS: u64 = 15_000;
 
+pub fn validate_runner_invocation(
+    input: &InferenceInvocationInput,
+    binding: &ResolvedRunnerModelBinding,
+) -> ServiceResult<()> {
+    if input.user_id != binding.user_id
+        || input.scope.session_id().is_none()
+        || input.execution_placement != ModelExecutionPlacement::Edge
+        || input.access_kind != ModelAccessKind::ThisDevice
+        || input.upstream_model_name != binding.definition.model_name.as_str()
+        || input.resolved_model_name != binding.definition.model_name.as_str()
+        || input.provider != "openai"
+        || input.offering_id
+            != crate::runner_model_bindings::runner_offering_id(
+                &input.user_id,
+                &binding.definition.identity,
+            )
+    {
+        return Err(ServiceError::invalid(
+            "Runner admission must match the personal session binding",
+        ));
+    }
+    require_runner_purpose(input.purpose)
+}
+
+/// Optional background inference needs an explicit publication-policy opt-in,
+/// which this binding contract does not yet support. Keep one policy owner.
+pub fn require_runner_purpose(purpose: InferencePurpose) -> ServiceResult<()> {
+    if !matches!(
+        purpose,
+        InferencePurpose::PrimaryAgent
+            | InferencePurpose::SubAgent
+            | InferencePurpose::RequiredCompaction
+    ) {
+        return Err(ServiceError::invalid(
+            "Personal Runner bindings do not authorize this optional inference purpose; select a Server Offering",
+        ));
+    }
+    Ok(())
+}
+
+pub async fn admit_runner_invocation(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    binding: &ResolvedRunnerModelBinding,
+) -> ServiceResult<()> {
+    admit_inference_invocation_for_execution(pool, plan, Some(binding)).await
+}
+
+/// Settle only a proven pre-dispatch failure. Holding the invocation lock
+/// excludes a racing grant; once any attempt exists, custody owns settlement.
+pub async fn finish_undispatched_runner_invocation(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    terminal: &InferenceInvocationTerminal,
+) -> ServiceResult<()> {
+    if plan.input.execution_placement != ModelExecutionPlacement::Edge
+        || !matches!(
+            terminal.status,
+            InferenceTerminalStatus::Failed | InferenceTerminalStatus::Cancelled
+        )
+        || terminal.usage != InferenceUsage::default()
+        || terminal.usage_status != InferenceUsageStatus::Unavailable
+        || terminal.provider_response_id.is_some()
+    {
+        return Err(ServiceError::invalid(
+            "Runner pre-dispatch settlement cannot invent provider facts",
+        ));
+    }
+    let fingerprint = terminal_fingerprint(terminal)?;
+    if let Some(existing) = existing_terminal_fingerprint(pool.get(), plan).await? {
+        return if existing == fingerprint {
+            Ok(())
+        } else {
+            Err(ServiceError::conflict("Runner terminal already differs"))
+        };
+    }
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    lock_admitted_inference_invocation(
+        &mut tx,
+        &plan.input.user_id,
+        plan.invocation_id(),
+        plan.owner_token(),
+        plan.owner_generation(),
+        "settle undispatched Runner invocation",
+    )
+    .await?;
+    if sqlx::query(
+        "SELECT 1 FROM inference_provider_attempts WHERE user_id = ? AND invocation_id = ? LIMIT 1",
+    )
+    .bind(&plan.input.user_id)
+    .bind(plan.invocation_id())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .is_some()
+    {
+        return Err(ServiceError::conflict(
+            "Runner attempt custody owns this invocation",
+        ));
+    }
+    let terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
+    write_runner_invocation_terminal_tx(
+        &mut tx,
+        &plan.input.user_id,
+        plan.invocation_id(),
+        &terminal,
+        "pre_delivery",
+    )
+    .await?;
+    sqlx::query("DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?")
+        .bind(&plan.input.user_id).bind(plan.invocation_id()).bind(&fingerprint).execute(&mut *tx).await.map_err(persistence)?;
+    tx.commit().await.map_err(persistence)
+}
+
 /// Authorize a terminal-transfer header before reserving any body capacity.
 /// Reconnect generation is checked by registry ownership, not stored as attempt
 /// authority; historical matching attempts remain eligible for custody replay.
@@ -602,33 +716,7 @@ pub fn plan_runner_inference_dispatch(
     request: &[u8],
     deadline_unix_ms: u64,
 ) -> ServiceResult<RunnerInferenceDispatchPlan> {
-    if input.user_id != binding.user_id
-        || input.scope.session_id().is_none()
-        || input.execution_placement != ModelExecutionPlacement::Edge
-        || input.access_kind != ModelAccessKind::ThisDevice
-        || input.upstream_model_name != binding.definition.model_name.as_str()
-        || input.resolved_model_name != binding.definition.model_name.as_str()
-        || input.provider != "openai"
-        || input.offering_id
-            != crate::runner_model_bindings::runner_offering_id(
-                &input.user_id,
-                &binding.definition.identity,
-            )
-    {
-        return Err(ServiceError::invalid(
-            "Runner admission must match the personal session binding",
-        ));
-    }
-    if !matches!(
-        input.purpose,
-        InferencePurpose::PrimaryAgent
-            | InferencePurpose::SubAgent
-            | InferencePurpose::RequiredCompaction
-    ) {
-        return Err(ServiceError::invalid(
-            "Runner binding has no authority for optional background inference",
-        ));
-    }
+    validate_runner_invocation(&input, binding)?;
     if deadline_unix_ms == 0 || deadline_unix_ms > i64::MAX as u64 {
         return Err(ServiceError::invalid(
             "Runner inference deadline is out of range",
@@ -702,29 +790,7 @@ pub fn plan_runner_provider_attempt_dispatch(
     input: RunnerProviderAttemptDispatchInput<'_>,
 ) -> ServiceResult<RunnerProviderAttemptDispatchPlan> {
     let invocation_input = &input.invocation.input;
-    if invocation_input.user_id != input.binding.user_id
-        || invocation_input.scope.session_id().is_none()
-        || invocation_input.execution_placement != ModelExecutionPlacement::Edge
-        || invocation_input.access_kind != ModelAccessKind::ThisDevice
-        || invocation_input.upstream_model_name != input.binding.definition.model_name.as_str()
-        || invocation_input.resolved_model_name != input.binding.definition.model_name.as_str()
-        || invocation_input.provider != "openai"
-        || invocation_input.offering_id
-            != crate::runner_model_bindings::runner_offering_id(
-                &invocation_input.user_id,
-                &input.binding.definition.identity,
-            )
-        || !matches!(
-            invocation_input.purpose,
-            InferencePurpose::PrimaryAgent
-                | InferencePurpose::SubAgent
-                | InferencePurpose::RequiredCompaction
-        )
-    {
-        return Err(ServiceError::invalid(
-            "Runner attempt does not match its admitted logical invocation and binding",
-        ));
-    }
+    validate_runner_invocation(invocation_input, input.binding)?;
     if input.deadline_unix_ms == 0 || input.deadline_unix_ms > i64::MAX as u64 {
         return Err(ServiceError::invalid(
             "Runner inference deadline is out of range",
@@ -986,6 +1052,20 @@ pub async fn admit_runner_provider_attempt_dispatch(
         return Ok(persisted);
     }
     let resolved = lock_resolved_binding(&mut tx, &identity.user_id, &identity.binding).await?;
+    let pinned: Option<String> = sqlx::query_scalar(
+        "SELECT runner_binding_json FROM inference_routes WHERE user_id = ? AND route_id = ? FOR UPDATE")
+        .bind(&identity.user_id).bind(plan.invocation.route_id()).fetch_one(&mut *tx).await.map_err(persistence)?;
+    let pinned: astra_turn_types::runner_inference::RunnerInferenceBindingIdentity = pinned
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .ok_or_else(|| {
+            ServiceError::conflict("Runner logical route has no exact binding authority")
+        })?;
+    if pinned != identity.binding {
+        return Err(ServiceError::conflict(
+            "Runner attempt cannot replace its logical route binding",
+        ));
+    }
     if resolved.process_boot_nonce != plan.grant.process_boot_nonce {
         return Err(ServiceError::conflict(
             "Runner process boot changed before attempt admission",
@@ -1032,18 +1112,6 @@ pub async fn admit_runner_provider_attempt_dispatch(
             "persist Runner request custody",
         )
     })?;
-    sqlx::query(
-        "UPDATE inference_routes SET runner_binding_json = ? WHERE user_id = ? AND route_id = ?",
-    )
-    .bind(
-        serde_json::to_string(&identity.binding)
-            .map_err(|_| ServiceError::invalid("Runner binding encoding failed"))?,
-    )
-    .bind(&identity.user_id)
-    .bind(plan.invocation.route_id())
-    .execute(&mut *tx)
-    .await
-    .map_err(persistence)?;
     sqlx::query(
         "UPDATE inference_provider_attempts SET runner_id = ?, runner_journal_id = ?,
          runner_grant_json = ?, runner_grant_expires_at = FROM_UNIXTIME(? / 1000.0),
@@ -1667,14 +1735,31 @@ async fn settle_runner_invocation_tx(
     identity: &RunnerInferenceAttemptIdentity,
     terminal: &DurableInferenceTerminal,
 ) -> ServiceResult<()> {
+    write_runner_invocation_terminal_tx(
+        tx,
+        &identity.user_id,
+        identity.invocation_id.as_str(),
+        terminal,
+        "delivery_authorized",
+    )
+    .await
+}
+
+async fn write_runner_invocation_terminal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    terminal: &DurableInferenceTerminal,
+    delivery_state: &str,
+) -> ServiceResult<()> {
     sqlx::query("UPDATE inference_invocations SET status = ?, terminal_fingerprint = ?, usage_status = ?,
         input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?,
-        provider_response_id = ?, error_kind = ?, error_message = ?, provider_delivery_state = 'delivery_authorized', terminal_at = NOW(6)
+        provider_response_id = ?, error_kind = ?, error_message = ?, provider_delivery_state = ?, terminal_at = NOW(6)
         WHERE user_id = ? AND invocation_id = ?")
         .bind(&terminal.status).bind(&terminal.terminal_fingerprint).bind(&terminal.usage_status)
         .bind(terminal.input_tokens).bind(terminal.output_tokens).bind(terminal.cache_read_tokens).bind(terminal.cache_creation_tokens)
         .bind(&terminal.provider_response_id).bind(&terminal.error_kind).bind(&terminal.error_message)
-        .bind(&identity.user_id).bind(identity.invocation_id.as_str())
+        .bind(delivery_state).bind(user_id).bind(invocation_id)
         .execute(&mut **tx).await.map_err(persistence)?;
     Ok(())
 }

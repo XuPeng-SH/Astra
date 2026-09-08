@@ -73,6 +73,19 @@ fn runner_binary(current_exe: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot locate the Astra installation directory".to_string())
 }
 
+fn configure_managed_identity(command: &mut tokio::process::Command, profile: &str, owner: &str) {
+    command
+        .arg("--profile")
+        .arg(profile)
+        .arg("--expected-inference-owner")
+        .arg(owner)
+        // The selected CLI profile is authoritative. Unrelated container/tool
+        // Runner settings must not replace or renew this attachment's identity.
+        .env_remove("ASTRA_TOKEN")
+        .env_remove("ASTRA_TOKEN_FILE")
+        .env_remove("ASTRA_TOKEN_RENEW_URL");
+}
+
 /// Start the inference-capable User Runner beside the CLI. The child resolves
 /// environment credentials from this exact terminal and reads stored secrets
 /// only through its owner-protected backend; neither reaches Server.
@@ -90,6 +103,14 @@ pub(crate) fn start(
             executable.display()
         ));
     }
+    let credentials = astra_credentials::CredentialStore::new()
+        .load()
+        .map_err(|_| "Cannot read the selected Astra profile for local inference")?;
+    let profile = astra_credentials::CredentialStore::resolve_profile_name(
+        profile,
+        credentials.current_profile.as_deref(),
+    );
+    let scope = astra_credentials::LocalModelScope::for_profile(api_origin, Some(&profile))?;
     // A CLI invocation is one credential attachment. Give it an independent
     // Edge/Runner identity and journal so another terminal can use the same
     // environment-variable name with a different value without inheriting
@@ -97,6 +118,7 @@ pub(crate) fn start(
     let edge_id = format!("edge-session-{}", uuid::Uuid::new_v4().simple());
     let mut command = tokio::process::Command::new(executable);
     command
+        .arg("--inference-only")
         .arg("--server-url")
         .arg(api_origin)
         .arg("--workspace-dir")
@@ -108,9 +130,7 @@ pub(crate) fn start(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some(profile) = profile {
-        command.arg("--profile").arg(profile);
-    }
+    configure_managed_identity(&mut command, &profile, scope.account_id());
     let mut child = command
         .spawn()
         .map_err(|error| format!("start User Runner: {error}"))?;
@@ -152,6 +172,34 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_runner_identity_ignores_unrelated_terminal_authentication() {
+        let mut command = tokio::process::Command::new("astra-edge");
+        configure_managed_identity(&mut command, "selected-profile", "selected-account");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--profile",
+                "selected-profile",
+                "--expected-inference-owner",
+                "selected-account"
+            ]
+        );
+        for key in ["ASTRA_TOKEN", "ASTRA_TOKEN_FILE", "ASTRA_TOKEN_RENEW_URL"] {
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, value)| name == key && value.is_none())
+            );
+        }
+    }
 
     #[test]
     fn sibling_binary_path_is_platform_specific_and_not_shell_interpreted() {

@@ -184,7 +184,38 @@ struct WorkStartCompletion {
 
 struct ModelSetupCompletion {
     name: String,
+    selection: ModelSetupSelection,
     result: Result<ModelSetupReady, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelSetupSelection {
+    session_id: Option<String>,
+    model: Option<String>,
+    offering_id: Option<String>,
+    owner_scope: Option<String>,
+}
+
+impl ModelSetupSelection {
+    fn capture(
+        state: &crate::cli::session::session_state::SessionState,
+        owner_scope: Option<&str>,
+    ) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            model: state.model.clone(),
+            offering_id: state.offering_id.clone(),
+            owner_scope: owner_scope.map(str::to_owned),
+        }
+    }
+
+    fn can_select(
+        &self,
+        state: &crate::cli::session::session_state::SessionState,
+        owner_scope: Option<&str>,
+    ) -> bool {
+        owner_scope.is_some() && *self == Self::capture(state, owner_scope)
+    }
 }
 
 struct ModelSetupReady {
@@ -5420,13 +5451,13 @@ pub(crate) async fn run_tui_session(
                 match completion.result {
                     Ok(ready) => {
                         if let Some(offering_id) = ready.offering_id {
+                            let current_scope = astra_credentials::LocalModelScope::for_profile(&api.api_origin(), profile).ok();
+                            if completion.selection.can_select(&state, current_scope.as_ref().map(|scope| scope.identity())) {
                             state.model = Some(completion.name.clone());
                             crate::cli::slash::slash_config::set_active_model_for_display(
                                 Some(completion.name.clone()),
                             );
-                            crate::cli::slash::slash_config::set_active_offering_id_for_request(
-                                Some(offering_id),
-                            );
+                            state.offering_id = Some(offering_id);
                             bottom_pane.footer.model = Some(completion.name.clone());
                             model_catalog_cache = Some(ready.catalog);
                             chat_widget.commit_system(
@@ -5435,10 +5466,15 @@ pub(crate) async fn run_tui_session(
                                     completion.name
                                 )),
                             );
+                            } else {
+                                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                                    "Model '{}' is ready in the account that configured it. Your account, session, or model selection changed during setup, so it was not selected. Open /model to choose it.", completion.name
+                                )));
+                            }
                         } else {
                             chat_widget.commit_system(
                                 history_cell::system::SystemCell::response(format!(
-                                    "Local model '{}' saved without a provider test. /model selects it without testing; run `astra model check {}` for an explicit provider test.",
+                                    "Model '{}' saved locally, not tested or selected. Open /model to check availability. Run `astra model check {}` for an explicit provider test.",
                                     completion.name, completion.name
                                 )),
                             );
@@ -5446,7 +5482,7 @@ pub(crate) async fn run_tui_session(
                     }
                     Err(error) => chat_widget.commit_system(
                         history_cell::system::SystemCell::error(format!(
-                            "Local model '{}' needs repair: {error}",
+                            "Model setup for '{}' stopped: {error}",
                             completion.name
                         )),
                     ),
@@ -8152,7 +8188,19 @@ pub(crate) async fn run_tui_session(
                                         let api = api.clone();
                                         let profile = profile.map(str::to_string);
                                         let completion_tx = model_setup_tx.clone();
+                                        // Capture account and selection at confirmation, not after
+                                        // an asynchronous provider check or subsequent login.
+                                        let scope = astra_credentials::LocalModelScope::for_profile(&api.api_origin(), profile.as_deref());
+                                        let selection = ModelSetupSelection::capture(&state, scope.as_ref().ok().map(|scope| scope.identity()));
                                         model_setup_tasks.spawn(async move {
+                                            let scope = match scope {
+                                                Ok(scope) => scope,
+                                                Err(error) => {
+                                                    let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, result: Err(format!("Not saved. {error}")) }).await;
+                                                    return;
+                                                }
+                                            };
+                                            let save_scope = scope.clone();
                                             let credential = match draft.credential {
                                                 bottom_pane::view::ModelSetupCredentialDraft::Environment { name } => {
                                                     crate::cli::local_model_command::LocalModelCredentialInput::Environment(name)
@@ -8166,6 +8214,7 @@ pub(crate) async fn run_tui_session(
                                             };
                                             let saved = tokio::task::spawn_blocking(move || {
                                                 crate::cli::local_model_command::add_from_tui(
+                                                    &save_scope,
                                                     draft.name,
                                                     draft.base_url,
                                                     draft.provider_model,
@@ -8178,7 +8227,7 @@ pub(crate) async fn run_tui_session(
                                             .map_err(|_| "local model setup task stopped unexpectedly".to_string())
                                             .and_then(|result| result);
                                             let result = match (saved, action) {
-                                                (Err(error), _) => Err(error),
+                                                (Err(error), _) => Err(format!("Save could not be confirmed. No provider test was run; inspect the local configuration before retrying. {error}")),
                                                 (Ok(_), bottom_pane::view::ModelSetupAction::SaveWithoutTest) => {
                                                     Ok(ModelSetupReady {
                                                         offering_id: None,
@@ -8187,6 +8236,7 @@ pub(crate) async fn run_tui_session(
                                                 }
                                                 (Ok(_), bottom_pane::view::ModelSetupAction::TestAndUse) => {
                                                     if let Err(error) = crate::cli::local_model_command::check(
+                                                        &scope,
                                                         crate::cli::cli_config::cli_args::ModelCheckArgs {
                                                             name: model_name.clone(),
                                                         },
@@ -8196,7 +8246,8 @@ pub(crate) async fn run_tui_session(
                                                         let _ = completion_tx
                                                             .send(ModelSetupCompletion {
                                                                 name: model_name,
-                                                                result: Err(error),
+                                                                selection,
+                                                                result: Err(format!("Saved locally, but the provider check failed. Current model unchanged. {error}")),
                                                             })
                                                             .await;
                                                         return;
@@ -8205,6 +8256,7 @@ pub(crate) async fn run_tui_session(
                                                         let _ = completion_tx
                                                             .send(ModelSetupCompletion {
                                                                 name: model_name,
+                                                                selection,
                                                                 result: Err(
                                                                     "provider check passed, but this CLI has no managed Runner identity; restart the interactive session to attach it".to_string(),
                                                                 ),
@@ -8264,6 +8316,7 @@ pub(crate) async fn run_tui_session(
                                             let _ = completion_tx
                                                 .send(ModelSetupCompletion {
                                                     name: model_name,
+                                                    selection,
                                                     result,
                                                 })
                                                 .await;
@@ -8273,7 +8326,7 @@ pub(crate) async fn run_tui_session(
                                                 if action
                                                     == bottom_pane::view::ModelSetupAction::TestAndUse
                                                 {
-                                                    "Saving local model, then running one disclosed bounded provider stream check…"
+                                                    "Saving configuration, then checking the provider once… Current model stays active until setup succeeds."
                                                 } else {
                                                     "Saving local model without contacting the provider…"
                                                 },
@@ -8335,9 +8388,7 @@ pub(crate) async fn run_tui_session(
                                             crate::cli::slash::slash_config::set_active_model_for_display(
                                                 Some(base_model.clone()),
                                             );
-                                            crate::cli::slash::slash_config::set_active_offering_id_for_request(
-                                                offering_id,
-                                            );
+                                            state.offering_id = offering_id;
                                             bottom_pane.footer.model = Some(base_model.clone());
                                             chat_widget.commit_system(
                                                 history_cell::system::SystemCell::response(
@@ -8401,9 +8452,7 @@ pub(crate) async fn run_tui_session(
                                         crate::cli::slash::slash_config::set_active_model_for_display(
                                             Some(composed.clone()),
                                         );
-                                        crate::cli::slash::slash_config::set_active_offering_id_for_request(
-                                            offering_id,
-                                        );
+                                        state.offering_id = offering_id;
                                         bottom_pane.footer.model = Some(composed.clone());
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::response(format!(
@@ -14348,6 +14397,27 @@ mod tests {
         assert!(widget.history().is_empty());
 
         assert!(widget.history().is_empty());
+    }
+
+    #[test]
+    fn model_setup_completion_cannot_override_another_session_account_or_selection() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.session_id = Some("session-a".into());
+        state.model = Some("Work".into());
+        state.offering_id = Some("runner-a".into());
+        let captured = ModelSetupSelection::capture(&state, Some("deployment-a/account-a"));
+        assert!(captured.can_select(&state, Some("deployment-a/account-a")));
+        assert!(!captured.can_select(&state, None));
+        assert!(!captured.can_select(&state, Some("deployment-b/account-a")));
+        assert!(!captured.can_select(&state, Some("deployment-a/account-b")));
+        state.offering_id = Some("runner-b".into());
+        assert!(
+            !captured.can_select(&state, Some("deployment-a/account-a")),
+            "same display name is not the same selection"
+        );
+        state.offering_id = Some("runner-a".into());
+        state.session_id = Some("session-b".into());
+        assert!(!captured.can_select(&state, Some("deployment-a/account-a")));
     }
 
     #[test]

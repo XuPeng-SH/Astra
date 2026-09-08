@@ -140,6 +140,15 @@ downloaded executable, privileged service, or second terminal is required. The
 host runs independently of the TUI render loop; the CLI does not embed a second
 inference implementation.
 
+The child is explicitly inference-only: it authenticates and drives the existing
+inference connection worker, but never constructs a general tool executor or
+advertises workspace capacity. Conversely the normal tool Runner does not open
+model definitions or provider secrets. Foreground Bash environment filtering
+uses the existing sandbox baseline and runs before installing the execution
+supervisor's private lease descriptors; call-specific authorization remains
+explicit. Local protected files still rely on the OS user boundary, not secrecy
+from arbitrary code already running as that same user.
+
 The current CLI-managed implementation deliberately chooses the independent
 identity variant of this contract: every interactive invocation receives a
 unique Edge/Runner ID and an isolated journal root. It therefore never shares
@@ -980,8 +989,14 @@ or key through Server while claiming remote-only custody.
 
 ### Configuration and credential sources
 
-Store a versioned `models.json` under the existing deployment/profile-owned
-local data root; `astra model show` reports its resolved path. It contains desired
+Store a versioned `models.json` under `local-models/<owner-scope>/` beside the
+existing credentials file; `astra model show` reports its resolved path. The
+scope hashes the canonical deployment URL (including a path prefix) and the
+server-issued account ID. HTTP/WebSocket forms of the same deployment normalize
+to one scope; another account or deployment cannot load its configuration or
+resolve its protected-file references. Setup requires a signed-in profile.
+Legacy global files are retained but never silently migrated or activated for
+an account. It contains desired
 local model definitions and secret references. Restrict it to the owner because
 endpoints can be private. The applied binding generations, setup receipts, and
 publication outbox are runtime facts in the Runner-owned local manifest/journal;
@@ -992,6 +1007,44 @@ previous applied generation and produce field-level diagnostics.
 This file configures local execution. It is not the administrator's Server-side
 `.models.yaml`, and normal BYOK setup neither edits that file nor creates an
 `infra_llm_models` row containing the user's key.
+
+### Shared execution and readiness
+
+Agent rounds and required summaries use the same Runner coordinator and logical
+admission transaction. Runner admission supplies and revalidates an exact
+binding; it cannot enter the Server-only admission path. Non-streaming collection
+preserves the wire model, token budget, and temperature. The durable attempt/
+custody owner remains responsible after caller cancellation or an ambiguous
+admission acknowledgement; a pre-dispatch failure can settle only while the
+invocation lock proves that no attempt exists.
+
+The current publication policy authorizes primary, subagent, and required
+compaction purposes only. `/v1/chat/completions` checks this policy before
+admission: its current optional operations return HTTP 400 with
+`runner_inference_purpose_unsupported`, even for an online Runner. This is not
+an offline error or permission to fall back to Server credentials. Use an
+explicit Server Offering for those operations until publication supports
+explicit optional-purpose opt-in.
+
+Foreground continuation waiting uses a bounded shared observer (1,024 attempts,
+128 per user). Capacity is reserved before authorizing provider I/O; failed
+admission or a dropped caller releases the reservation. The observer is pinned
+to one AppState database pool and reads exact owner/attempt keys in batches of
+at most 128. A local custody commit wakes it promptly; a 500 ms read-only fallback observes
+other pods and lost notifications. A 50 ms minimum observation interval coalesces
+notification storms, and each batch has a two-second observation timeout.
+Storage errors retain subscriptions until the caller deadline; they are not
+negative delivery evidence. Readiness is only a hint: the exact
+scope/owner/custody claim still runs transactionally after readiness. Waiting
+does not acquire session/run/invocation locks or create another lifecycle store.
+
+Runner calls retain the canonical accepted/terminal model-request-context events
+and their usage metrics. The `runner_inference` tracing span correlates user,
+session, run, invocation, attempt, and Runner IDs; phase events distinguish grant,
+cancellation, and terminal commit with elapsed time. It deliberately skips all
+request arguments, credentials, private endpoints, and response contents. Tenant
+and attempt IDs belong in traces, not unbounded metric labels. Terminal replay
+must leave exactly one accepted and one terminal context event per attempt.
 
 An example desired definition contains no literal credential:
 
@@ -1297,6 +1350,28 @@ Historical records with misleading Edge placement remain historical evidence
 with an explicit provenance correction, not rewritten as verified Runner work.
 
 ## Verification before release
+
+### Current implementation limits
+
+The isolation and custody regression tests are not a production SaaS acceptance
+claim. The following gates remain open in the current CLI-managed path:
+
+- The CLI starts a per-invocation inference-only Runner with a fresh identity;
+  shared host lifetime, stable journal discovery across CLI restart, attachment
+  leases, and bounded cleanup of obsolete catalog entries are not implemented.
+- Runner response events are collected from committed terminal custody. Live
+  preview/TTFB across the Runner-to-Server hop is not implemented; buffered
+  delivery must not be described as live streaming.
+- The causal resume provider projection does not yet carry the exact Offering
+  selection. In-process session pinning is not evidence of quit/relaunch/resume
+  continuity, and a friendly-name lookup is not a replacement for that authority.
+- Bounded readiness and multi-tenant functional tests do not replace the
+  100/500/1,000-session performance lane below. Throughput, tail latency, memory,
+  fairness under noisy tenants, and recovery SLOs still require measurement.
+
+These are release gates, not optional polish. Keep the same Agent Backbone and
+durable custody authority when completing them; do not add a second scheduler,
+resume state machine, or token-by-token SQL log to make a demo appear complete.
 
 Tests assert public behavior, provider request counts/bytes, and persisted facts.
 Use a controllable local provider and isolated Server/Runner processes; normal

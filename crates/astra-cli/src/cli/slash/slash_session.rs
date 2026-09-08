@@ -5587,7 +5587,7 @@ async fn apply_restored_session(
         }
     }
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    state.offering_id = None;
 
     if use_typed_continuation {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);

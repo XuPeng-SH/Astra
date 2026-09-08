@@ -305,6 +305,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             match sub {
                 "info" => handle_model_info(ctx, rest).await,
                 "add" if rest.is_empty() => {
+                    if let Err(error) = astra_credentials::LocalModelScope::for_profile(
+                        &ctx.api.api_origin(),
+                        ctx.profile,
+                    ) {
+                        ctx.show_error(format!("Sign in before configuring a local model so it belongs to the correct account. {error}"));
+                        return SlashResult::Handled;
+                    }
                     ctx.open_deferred_view(
                         "Opened local model setup",
                         Box::new(crate::tui::bottom_pane::model_setup_view::ModelSetupView::new()),
@@ -2583,22 +2590,19 @@ pub(crate) fn push_model_picker(
         .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
         .collect();
     let mut name_counts = std::collections::HashMap::new();
-    for entry in &active_models {
+    for entry in models {
         if let Some(name) = crate::cli::slash::slash_router::entry_model_name(entry) {
             *name_counts
                 .entry(name.to_ascii_lowercase())
                 .or_insert(0usize) += 1;
         }
     }
-    // Strip any `-thinking:*` suffix from the cached model when
-    // highlighting the current row — the picker shows base names only,
-    // and the suffix is re-applied by the thinking stage.
-    let current_raw = state.model.clone().unwrap_or_default();
-    let current_base = current_raw
-        .split_once("-thinking:")
-        .map(|(b, _)| b.to_string())
-        .unwrap_or(current_raw);
-    let active_offering_id = crate::cli::slash::slash_config::active_offering_id_for_request();
+    // Use the canonical thinking parser; model labels are presentation only.
+    let current_base = astra_turn_core::thinking_config::resolve_model_thinking(
+        state.model.as_deref().unwrap_or_default(),
+    )
+    .0;
+    let active_offering_id = state.offering_id.clone();
     let items: Vec<SelectionItem> = active_models
         .iter()
         .filter_map(|entry| {
@@ -2622,7 +2626,12 @@ pub(crate) fn push_model_picker(
                     .collect::<String>();
                 Some(format!("{} · offering …{tail}", entry.access_label))
             } else {
-                entry.description.clone()
+                Some(
+                    match entry.description.as_deref().filter(|text| !text.is_empty()) {
+                        Some(description) => format!("{} · {description}", entry.access_label),
+                        None => entry.access_label.clone(),
+                    },
+                )
             };
             Some(SelectionItem {
                 name: name.to_string(),
@@ -2632,7 +2641,7 @@ pub(crate) fn push_model_picker(
         })
         .collect();
     if items.is_empty() {
-        chat_widget.commit_system(SystemCell::info("No models available"));
+        chat_widget.commit_system(SystemCell::info("No models are ready. Reconnect your Runner or ask your administrator for model access. Use /model add to configure your own."));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
@@ -2738,7 +2747,7 @@ async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
-        crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+        ctx.state.offering_id = None;
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
@@ -2768,9 +2777,7 @@ async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let display_name = format!("{}{}", selected.name, &name[registry_name.len()..]);
     ctx.state.model = Some(display_name.clone());
     crate::cli::slash::slash_config::set_active_model_for_display(Some(display_name.clone()));
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-        selected.offering_id.clone(),
-    ));
+    ctx.state.offering_id = Some(selected.offering_id.clone());
     ctx.bottom_pane.footer.model = Some(display_name.clone());
     ctx.show_response(format!(
         "Set model to {} · {}",
@@ -2783,7 +2790,7 @@ async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    ctx.state.offering_id = None;
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
@@ -2795,39 +2802,22 @@ async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
 async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
     use crate::tui::bottom_pane::info_view::InfoView;
 
-    let target = if arg.is_empty() {
-        ctx.state.model.clone()
-    } else {
-        Some(arg.trim().to_string())
-    };
-    let Some(name) = target else {
-        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+    let Some(name) = ctx.state.model.clone() else {
+        ctx.show_error(
+            "No model selected. Use /model to choose one, or /model add to configure your own."
+                .into(),
+        );
         return SlashResult::Handled;
     };
-
-    // Prefer the cached pricing the session already carries so
-    // `/model info` is instant — live refetch happens via
-    // `/model list` when the user explicitly asks.
-    let pricing = &ctx.state.cached_pricing;
-    let prompt_usd = if pricing.prompt > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
-    } else {
-        "— (not cached)".into()
-    };
-    let completion_usd = if pricing.completion > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
-    } else {
-        "— (not cached)".into()
-    };
-    let cache_read = pricing
-        .cache_read
-        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
-        .unwrap_or_else(|| "—".into());
-    let cache_write = pricing
-        .cache_write
-        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
-        .unwrap_or_else(|| "—".into());
-
+    if !arg.trim().is_empty()
+        && arg.trim() != name
+        && ctx.state.offering_id.as_deref() != Some(arg.trim())
+    {
+        ctx.show_error("Model info describes the current selection. Choose the model with /model first, then run /model info.".into());
+        return SlashResult::Handled;
+    }
+    // Session pricing is a name-based estimate and may belong to a previous
+    // model. Never present it as the rate for an exact BYOK Offering.
     let cumulative_tokens = ctx
         .state
         .total_prompt_tokens
@@ -2835,17 +2825,21 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     let pairs: Vec<(&str, String)> = vec![
         ("model", name.clone()),
         (
-            "current",
-            if ctx.state.model.as_deref() == Some(name.as_str()) {
-                "yes".into()
-            } else {
-                "no (info for override target)".into()
-            },
+            "offering ID",
+            ctx.state
+                .offering_id
+                .clone()
+                .unwrap_or_else(|| "Not resolved; open /model".into()),
         ),
-        ("prompt cost", prompt_usd),
-        ("completion cost", completion_usd),
-        ("cache read", cache_read),
-        ("cache write", cache_write),
+        ("availability", "Open /model to refresh the catalog".into()),
+        (
+            "model rates",
+            "Not available for this exact Offering; check your provider".into(),
+        ),
+        (
+            "usage scope",
+            "Entire session, across all selected models".into(),
+        ),
         (
             "session prompt tokens",
             fmt_tokens(ctx.state.total_prompt_tokens),
@@ -2864,7 +2858,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ),
         ("session total tokens", fmt_tokens(cumulative_tokens)),
         (
-            "session cost",
+            "estimated session cost",
             format!("${:.4}", ctx.state.total_session_cost),
         ),
     ];

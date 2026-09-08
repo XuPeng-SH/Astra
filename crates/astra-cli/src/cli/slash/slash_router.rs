@@ -170,7 +170,7 @@ pub(crate) async fn handle_slash_command(
                     })
                     .collect();
 
-                let current_offering = slash_config::active_offering_id_for_request();
+                let current_offering = state.offering_id.clone();
                 if let Some(chosen) = interactive_select(
                     "Select model (type to search):",
                     &items,
@@ -235,9 +235,7 @@ pub(crate) async fn handle_slash_command(
                     };
 
                     state.model = Some(model_with_suffix.clone());
-                    slash_config::set_active_offering_id_for_request(
-                        selected_model.map(|entry| entry.offering_id.clone()),
-                    );
+                    state.offering_id = selected_model.map(|entry| entry.offering_id.clone());
                     state.cached_pricing = slash_stats::fallback_pricing(&chosen);
                     let context_window =
                         selected_model.and_then(session_runtime::model_list_entry_context_window);
@@ -305,7 +303,7 @@ pub(crate) async fn handle_slash_command(
 
             let selected_model = selected_model_name.unwrap_or_else(|| arg.to_string());
             state.model = Some(selected_model.clone());
-            slash_config::set_active_offering_id_for_request(selected_offering_id);
+            state.offering_id = selected_offering_id;
             slash_config::set_active_model_for_display(Some(selected_model.clone()));
             let base_model =
                 astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;

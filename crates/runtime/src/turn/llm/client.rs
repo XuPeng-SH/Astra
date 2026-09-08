@@ -621,15 +621,27 @@ impl PreparedRunnerRequest {
     }
 }
 
+pub(crate) struct RunnerRequestOptions<'a> {
+    pub max_output_tokens: Option<usize>,
+    pub temperature: Option<f64>,
+    pub thinking: &'a ThinkingConfig,
+    pub cache_capability: Option<CacheCapability>,
+    pub no_tool_choice: bool,
+}
+
 pub(crate) fn prepare_runner_request(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
-    max_output_tokens: Option<usize>,
-    thinking: &ThinkingConfig,
-    cache_capability: Option<CacheCapability>,
-    no_tool_choice: bool,
+    options: RunnerRequestOptions<'_>,
 ) -> Result<PreparedRunnerRequest, astra_core::ClassifiedError> {
+    let RunnerRequestOptions {
+        max_output_tokens,
+        temperature,
+        thinking,
+        cache_capability,
+        no_tool_choice,
+    } = options;
     let provider = "openai";
     let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
     validate_append_only_transport_history(&messages, provider, cache_capability)?;
@@ -639,7 +651,7 @@ pub(crate) fn prepare_runner_request(
         model_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         true,
         thinking,
         None,

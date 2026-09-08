@@ -1,0 +1,355 @@
+//! Canonical Runner execution coordinator shared by turns and auxiliary/API calls.
+//! Transport readiness is a hint; durable attempt/custody rows remain authority.
+
+use super::client::{LlmCallResult, LlmCancel, LlmStreamCallback, collect_runner_response};
+use astra_core::SharedPool;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Auxiliary calls use the same admission, custody and continuation owner as
+/// agent rounds. Dropping this future leaves the durable Runner grant with the
+/// existing reconciliation owner; it never synthesizes a Server terminal.
+pub(crate) async fn execute_nonstream(
+    pool: &SharedPool,
+    edge_pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    ledger: &super::durable::DurableInferenceLedger,
+    admitted: &astra_services::AdmittedModelExecution,
+    scope: astra_turn_types::InferenceInvocationScope,
+    call: RunnerAuxiliaryCall<'_>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let astra_services::ModelExecutionMaterial::Runner(binding) = &admitted.execution_material
+    else {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "Runner coordinator requires an admitted Runner Offering",
+        ));
+    };
+    let wire_model = admitted
+        .wire_model_name
+        .as_deref()
+        .unwrap_or(&admitted.model_name);
+    let prepared = super::client::prepare_runner_request(
+        call.messages,
+        &[],
+        wire_model,
+        super::client::RunnerRequestOptions {
+            max_output_tokens: Some(call.max_output_tokens),
+            temperature: Some(call.temperature),
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            cache_capability: None,
+            no_tool_choice: true,
+        },
+    )?;
+    let invocation = ledger
+        .admit(
+            scope,
+            call.purpose,
+            &admitted.model_name,
+            wire_model,
+            &admitted.provider,
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+    let result = call_runner_and_collect(
+        pool,
+        edge_pool,
+        &invocation,
+        binding,
+        prepared,
+        &admitted.model_name,
+        call.timeout,
+        LlmCancel::None,
+        None,
+    )
+    .await;
+    match result {
+        Ok((result, _receipt)) => {
+            invocation.finish_result(&result).await?;
+            Ok(result)
+        }
+        Err(error) => {
+            invocation.finish_error(&error).await?;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) struct RunnerAuxiliaryCall<'a> {
+    pub purpose: astra_turn_types::InferencePurpose,
+    pub messages: &'a [serde_json::Value],
+    pub max_output_tokens: usize,
+    pub temperature: f64,
+    pub timeout: Duration,
+}
+
+#[cfg(test)]
+#[test]
+fn runner_auxiliary_compilation_preserves_wire_model_budget_and_temperature() {
+    use super::client::{RunnerRequestOptions, prepare_runner_request};
+    let messages = [serde_json::json!({"role":"user", "content":"hello"})];
+    let prepared = prepare_runner_request(
+        &messages,
+        &[],
+        "private-wire-model",
+        RunnerRequestOptions {
+            max_output_tokens: Some(123),
+            temperature: Some(0.37),
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            cache_capability: None,
+            no_tool_choice: true,
+        },
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&prepared.exact_body()).unwrap();
+    assert_eq!(body["model"], "private-wire-model");
+    assert_eq!(body["temperature"], 0.37);
+    assert_eq!(body["max_completion_tokens"], 123);
+    assert_eq!(body["stream"], true);
+    assert!(prepared.authorized_tool_names().is_empty());
+    assert_eq!(prepared.wire_output_limit(), Some(123));
+}
+
+pub(crate) fn runner_service_error(
+    stage: &'static str,
+    error: astra_services::ServiceError,
+) -> astra_core::ClassifiedError {
+    let kind = match error.kind {
+        astra_services::ServiceErrorKind::Persistence => astra_core::ErrorKind::DatabaseError,
+        astra_services::ServiceErrorKind::Network => astra_core::ErrorKind::Network,
+        astra_services::ServiceErrorKind::Invalid | astra_services::ServiceErrorKind::NotFound => {
+            astra_core::ErrorKind::InvalidRequest
+        }
+        astra_services::ServiceErrorKind::Verification
+        | astra_services::ServiceErrorKind::Conflict
+        | astra_services::ServiceErrorKind::ConflictTransient
+        | astra_services::ServiceErrorKind::Internal => astra_core::ErrorKind::ContractViolation,
+    };
+    astra_core::ClassifiedError::new(kind, format!("Runner {stage} failed: {error}"))
+}
+
+#[tracing::instrument(name = "runner_inference", skip_all, fields(
+    user_id = %binding.user_id,
+    runner_id = %binding.definition.identity.runner_id.as_str(),
+    session_id = tracing::field::Empty,
+    run_id = tracing::field::Empty,
+    invocation_id = tracing::field::Empty,
+    attempt_id = tracing::field::Empty,
+))]
+pub(crate) async fn call_runner_and_collect(
+    pool: &SharedPool,
+    edge_pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    durable_invocation: &crate::turn::llm::durable::DurableInferenceInvocation,
+    binding: &astra_services::runner_model_bindings::ResolvedRunnerModelBinding,
+    prepared: crate::turn::llm::client::PreparedRunnerRequest,
+    model_name: &str,
+    provider_budget: Duration,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<
+    (
+        LlmCallResult,
+        astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
+    ),
+    astra_core::ClassifiedError,
+> {
+    let started = Instant::now();
+    let input = durable_invocation.runner_continuation_input();
+    tracing::Span::current().record("session_id", input.scope.session_id().unwrap_or_default());
+    tracing::Span::current().record("run_id", input.scope.run_id().unwrap_or_default());
+    let reservation = edge_pool.runner_continuation_waiters.reserve(pool, &binding.user_id)
+        .map_err(|error| {
+            if error.kind == astra_services::ServiceErrorKind::ConflictTransient {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::RateLimit,
+                    "Runner request capacity is full. No provider request was authorized; try again shortly.")
+            } else { runner_service_error("readiness reservation", error) }
+        })?;
+    let deadline_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+        .saturating_add(provider_budget.as_millis().try_into().unwrap_or(u64::MAX));
+    let (attempt_index, grant) = durable_invocation
+        .admit_runner_attempt(&prepared, binding, deadline_unix_ms)
+        .await?;
+    tracing::Span::current().record("invocation_id", grant.attempt.invocation_id.as_str());
+    tracing::Span::current().record("attempt_id", grant.attempt.attempt_id.as_str());
+    tracing::debug!(stage = "grant_committed", "Runner request authorized");
+    let runner_id = binding.definition.identity.runner_id.as_str();
+    edge_pool.notify_runner_inference(&binding.user_id, runner_id);
+
+    use astra_services::inference_execution::runner_wait::RunnerReadiness;
+    let wait_deadline =
+        tokio::time::Instant::now() + provider_budget.saturating_sub(started.elapsed());
+    let mut readiness = reservation
+        .subscribe(&grant.attempt)
+        .map_err(|error| runner_service_error("readiness subscription", error))?;
+    let mut cancellation_recorded = false;
+    loop {
+        let ready = *readiness.borrow_and_update();
+        match ready {
+            RunnerReadiness::Ready => break,
+            RunnerReadiness::Unavailable => {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Runner continuation is absent or quarantined",
+                ));
+            }
+            RunnerReadiness::Waiting => {}
+        }
+        tokio::select! {
+            changed = readiness.changed() => {
+                if changed.is_err() {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation, "Runner readiness observer stopped"));
+                }
+            }
+            _ = super::client::wait_llm_cancel(cancel), if !cancellation_recorded => {
+                astra_services::inference_execution::runner::request_runner_cancellation(
+                    pool, &binding.user_id, &grant.attempt).await
+                    .map_err(|error| runner_service_error("cancellation", error))?;
+                edge_pool.notify_runner_inference(&binding.user_id, runner_id);
+                cancellation_recorded = true;
+                tracing::debug!(stage = "cancellation_requested", "Runner cancellation recorded");
+            }
+            _ = tokio::time::sleep_until(wait_deadline) => return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "Runner did not return a durable provider terminal before the inference deadline")),
+        }
+    }
+    // Only readiness observation is shared/batched; this exact claim remains
+    // the sole authorization boundary and revalidates all scope/owner facts.
+    let claim = astra_services::inference_execution::runner::claim_runner_continuation(
+        pool,
+        durable_invocation.runner_continuation_input(),
+        &grant.attempt,
+        Some(durable_invocation.owner_token()),
+    )
+    .await
+    .map_err(|error| runner_service_error("continuation claim", error))?;
+
+    let response_bytes =
+        astra_services::inference_execution::runner::load_runner_response_custody(pool, &claim)
+            .await
+            .map_err(|error| runner_service_error("response custody load", error))?;
+    let response: astra_turn_types::runner_inference::RunnerInferenceResponse =
+        serde_json::from_slice(response_bytes.as_bytes()).map_err(|_| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "Runner response custody contains an invalid response envelope",
+            )
+        })?;
+    let result = collect_runner_response(
+        response,
+        model_name,
+        started,
+        prepared.authorized_tool_names(),
+        prepared.wire_output_limit(),
+        stream_callback,
+    )
+    .await;
+
+    // Parsing may downgrade a physically complete stream to a logical failure
+    // (for example an unauthorized tool call), but it may never rewrite the
+    // Runner-observed usage or provider response identity.
+    let physical = claim.physical_terminal().clone();
+    let mut logical = runner_logical_terminal(&physical, &result);
+    logical.usage = physical.usage.clone();
+    logical.usage_status = physical.usage_status;
+    logical.provider_response_id = physical.provider_response_id.clone();
+    let mut tx = pool.get().begin().await.map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::DatabaseError,
+            format!("Runner continuation transaction failed: {error}"),
+        )
+    })?;
+    astra_services::inference_execution::runner::settle_runner_continuation_tx(
+        &mut tx, &claim, &logical,
+    )
+    .await
+    .map_err(|error| runner_service_error("continuation commit", error))?;
+    tx.commit().await.map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::DatabaseError,
+            format!("Runner continuation commit failed: {error}"),
+        )
+    })?;
+    tracing::debug!(stage = "terminal_committed", elapsed_ms = started.elapsed().as_millis() as u64,
+        physical_status = ?physical.status, logical_status = ?logical.status,
+        "Runner inference settled from durable custody");
+    durable_invocation
+        .observe_runner_terminal(attempt_index, physical, logical)
+        .await;
+    result.map(|result| (result, claim.checkpoint_receipt()))
+}
+
+fn runner_logical_terminal(
+    physical: &astra_services::InferenceInvocationTerminal,
+    result: &Result<LlmCallResult, astra_core::ClassifiedError>,
+) -> astra_services::InferenceInvocationTerminal {
+    match result {
+        Ok(_) => physical.clone(),
+        Err(error) => {
+            let mut logical = crate::turn::llm::durable::terminal_from_error(error);
+            // The Runner's physical terminal owns delivery certainty. Server-side
+            // decoding may turn a complete provider response into a logical
+            // failure, but it cannot discard positive no-dispatch evidence or
+            // invent certainty for an ambiguous physical attempt.
+            logical.status = match physical.status {
+                astra_services::InferenceTerminalStatus::DeliveryUnknown => {
+                    astra_services::InferenceTerminalStatus::DeliveryUnknown
+                }
+                astra_services::InferenceTerminalStatus::Cancelled => {
+                    astra_services::InferenceTerminalStatus::Cancelled
+                }
+                astra_services::InferenceTerminalStatus::Succeeded
+                | astra_services::InferenceTerminalStatus::Failed => {
+                    astra_services::InferenceTerminalStatus::Failed
+                }
+            };
+            logical
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn runner_logical_failure_preserves_physical_delivery_certainty() {
+    use astra_services::{
+        InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus,
+    };
+
+    let physical = |status| InferenceInvocationTerminal {
+        status,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("runner_provider_transport".to_string()),
+        error_message: None,
+    };
+    let failure: Result<LlmCallResult, astra_core::ClassifiedError> =
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "Runner transport failed",
+        ));
+    let locally_definitive_failure: Result<LlmCallResult, astra_core::ClassifiedError> =
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "Runner response decoding exceeded its local bound",
+        ));
+
+    assert_eq!(
+        runner_logical_terminal(&physical(InferenceTerminalStatus::Failed), &failure).status,
+        InferenceTerminalStatus::Failed,
+        "positive no-dispatch evidence must remain safely terminal"
+    );
+    assert_eq!(
+        runner_logical_terminal(
+            &physical(InferenceTerminalStatus::DeliveryUnknown),
+            &locally_definitive_failure,
+        )
+        .status,
+        InferenceTerminalStatus::DeliveryUnknown,
+        "ambiguous physical delivery must never become retry-safe"
+    );
+}
