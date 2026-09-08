@@ -847,6 +847,200 @@ pub(crate) enum LlmStreamUpdate {
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 
+/// A stable, append-only speculative prefix with a byte cursor into the
+/// canonical replay. Keeping the consumed offset avoids shifting the whole
+/// prefix for every small terminal delta (which made long streams quadratic).
+#[derive(Default)]
+struct PreviewPrefix {
+    bytes: String,
+    consumed: usize,
+}
+
+impl PreviewPrefix {
+    fn push_str(&mut self, value: &str) {
+        if self.consumed == self.bytes.len() {
+            self.bytes.clear();
+            self.consumed = 0;
+        }
+        self.bytes.push_str(value);
+    }
+
+    fn consume(&mut self, incoming: String) -> Option<String> {
+        if incoming.is_empty() {
+            return None;
+        }
+        let remaining_len = self.bytes.len() - self.consumed;
+        if remaining_len == 0 {
+            self.bytes.clear();
+            self.consumed = 0;
+            return Some(incoming);
+        }
+        if self.bytes[self.consumed..].starts_with(incoming.as_str()) {
+            // The canonical delta is wholly covered by the preview prefix.
+            // Advance a cursor instead of draining the String.
+            self.consumed += incoming.len();
+            if self.consumed == self.bytes.len() {
+                self.bytes.clear();
+                self.consumed = 0;
+            }
+            None
+        } else if incoming.starts_with(&self.bytes[self.consumed..]) {
+            // The canonical delta crosses the end of the preview prefix. Only
+            // the unseen suffix is forwarded.
+            let suffix = incoming[remaining_len..].to_owned();
+            self.bytes.clear();
+            self.consumed = 0;
+            Some(suffix)
+        } else {
+            // The terminal collector emits deltas, not cumulative snapshots.
+            // Once it diverges, preserve every terminal byte; fuzzy overlap
+            // would delete legitimate repeated prose such as "ha", "ha".
+            self.bytes.clear();
+            self.consumed = 0;
+            Some(incoming)
+        }
+    }
+}
+
+/// Best-effort decoder for disposable Runner progress.
+///
+/// This deliberately shares the normal visible-text and hidden-reasoning
+/// filters with the terminal collector, but it never interprets tool calls,
+/// usage, or finish markers.  The durable terminal is still the only source
+/// of those facts.  Once a sequence gap is observed, previews are disabled for
+/// this attempt: the next canonical terminal response can then be forwarded
+/// from its beginning without guessing which provider delta was lost.
+pub(crate) struct RunnerInferencePreviewDecoder {
+    hidden_reasoning_state: HiddenReasoningStreamState,
+    visible_text_filter: astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter,
+    visible_reasoning_filter: astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter,
+    last_sequence: Option<u64>,
+    preview_usable: bool,
+    /// Prefixes already rendered provisionally but not yet consumed by the
+    /// canonical terminal replay. This is a stable buffer plus cursor, not the
+    /// full delivered string: terminal deltas may be split differently from
+    /// preview deltas, and repeated tokens after the prefix are real output
+    /// rather than duplicates.
+    preview_text_remaining: PreviewPrefix,
+    preview_reasoning_remaining: PreviewPrefix,
+}
+
+impl Default for RunnerInferencePreviewDecoder {
+    fn default() -> Self {
+        Self {
+            hidden_reasoning_state: HiddenReasoningStreamState::default(),
+            visible_text_filter: Default::default(),
+            visible_reasoning_filter: Default::default(),
+            last_sequence: None,
+            preview_usable: true,
+            preview_text_remaining: PreviewPrefix::default(),
+            preview_reasoning_remaining: PreviewPrefix::default(),
+        }
+    }
+}
+
+impl RunnerInferencePreviewDecoder {
+    pub(crate) fn mark_gap(&mut self) {
+        self.preview_usable = false;
+    }
+
+    /// Consume one authenticated batch. Sequence gaps are valid at the wire
+    /// boundary, but they make subsequent provisional decoding unsafe because
+    /// a delimiter or UTF-8-adjacent provider fragment may be missing.
+    pub(crate) fn push_batch(
+        &mut self,
+        batch: &astra_turn_types::runner_inference::RunnerInferenceProgressBatch,
+    ) -> Vec<LlmStreamUpdate> {
+        if batch.validate_wire_bounds().is_err() {
+            self.mark_gap();
+            return Vec::new();
+        }
+        let mut updates = Vec::new();
+        for item in &batch.events {
+            if self.last_sequence.is_some_and(|last| item.sequence <= last) {
+                continue;
+            }
+            if (self.last_sequence.is_none() && item.sequence != 0)
+                || self
+                    .last_sequence
+                    .is_some_and(|last| item.sequence != last.saturating_add(1))
+            {
+                self.mark_gap();
+            }
+            self.last_sequence = Some(item.sequence);
+            if !self.preview_usable {
+                continue;
+            }
+            let astra_turn_types::runner_inference::RunnerInferenceProviderEvent::Json(value) =
+                &item.event
+            else {
+                // Done/Eof are terminal custody facts only. Do not use them
+                // to flush a provisional parser or manufacture completion.
+                continue;
+            };
+            let payload = OpenAiPayload::stream(value);
+            if let Some(content) = payload.text
+                && !content.is_empty()
+            {
+                for (chunk, is_reasoning) in
+                    split_hidden_reasoning_chunks(content, &mut self.hidden_reasoning_state)
+                {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if is_reasoning {
+                        let visible = self.visible_reasoning_filter.push(&chunk);
+                        if !visible.is_empty() {
+                            self.preview_reasoning_remaining.push_str(&visible);
+                            updates.push(LlmStreamUpdate::Reasoning(visible));
+                        }
+                    } else {
+                        let visible = self.visible_text_filter.push(&chunk);
+                        if !visible.is_empty() {
+                            self.preview_text_remaining.push_str(&visible);
+                            updates.push(LlmStreamUpdate::Text(visible));
+                        }
+                    }
+                }
+            }
+            if let Some(reasoning) = payload.reasoning
+                && !reasoning.is_empty()
+            {
+                let visible = self.visible_reasoning_filter.push(reasoning);
+                if !visible.is_empty() {
+                    self.preview_reasoning_remaining.push_str(&visible);
+                    updates.push(LlmStreamUpdate::Reasoning(visible));
+                }
+            }
+        }
+        updates
+    }
+
+    /// Forward one update from the durable terminal, removing only a prefix
+    /// that was already shown provisionally. If a gap disabled previews, this
+    /// naturally forwards the complete terminal delta sequence exactly once.
+    pub(crate) fn forward_terminal_update(
+        &mut self,
+        update: LlmStreamUpdate,
+    ) -> Option<LlmStreamUpdate> {
+        match update {
+            LlmStreamUpdate::Text(text) => self
+                .preview_text_remaining
+                .consume(text)
+                .map(LlmStreamUpdate::Text),
+            LlmStreamUpdate::Reasoning(reasoning) => self
+                .preview_reasoning_remaining
+                .consume(reasoning)
+                .map(LlmStreamUpdate::Reasoning),
+            LlmStreamUpdate::ToolCall { index, tool_call } => {
+                // Progress intentionally omits tool calls. Only terminal
+                // custody may reach the canonical tool executor.
+                Some(LlmStreamUpdate::ToolCall { index, tool_call })
+            }
+        }
+    }
+}
+
 /// Short-lived provider route material for one model call.
 ///
 /// This is deliberately neither serializable nor cloneable. It may borrow a
@@ -7675,6 +7869,7 @@ mod tests {
     use futures_util::StreamExt;
     use futures_util::stream;
     use serde_json::json;
+    use std::num::NonZeroU64;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -7699,6 +7894,197 @@ mod tests {
             }
         }
         Guard
+    }
+
+    fn preview_attempt(
+        user_id: &str,
+    ) -> astra_turn_types::runner_inference::RunnerInferenceAttemptIdentity {
+        use astra_turn_types::runner_inference::{
+            RunnerInferenceArtifactReference, RunnerInferenceBindingIdentity,
+            RunnerInferenceDigest, RunnerInferenceId,
+        };
+        astra_turn_types::runner_inference::RunnerInferenceAttemptIdentity {
+            user_id: user_id.to_string(),
+            scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-preview".to_string(),
+                turn: 1,
+                round: 0,
+                operation_id: "primary_agent".to_string(),
+                logical_attempt: 0,
+            },
+            invocation_id: RunnerInferenceId::new("invocation-preview").unwrap(),
+            attempt_id: RunnerInferenceId::new("attempt-preview").unwrap(),
+            binding: RunnerInferenceBindingIdentity {
+                runner_id: RunnerInferenceId::new("runner-preview").unwrap(),
+                journal_id: RunnerInferenceId::new("journal-preview").unwrap(),
+                binding_id: RunnerInferenceId::new("binding-preview").unwrap(),
+                binding_revision: NonZeroU64::new(1).unwrap(),
+                profile_revision: NonZeroU64::new(1).unwrap(),
+            },
+            request: RunnerInferenceArtifactReference {
+                artifact_id: RunnerInferenceId::new("request-preview").unwrap(),
+                sha256: RunnerInferenceDigest::new("a".repeat(64)).unwrap(),
+                byte_len: NonZeroU64::new(1).unwrap(),
+            },
+        }
+    }
+
+    fn preview_batch(
+        attempt: &astra_turn_types::runner_inference::RunnerInferenceAttemptIdentity,
+        sequence: u64,
+        event: serde_json::Value,
+    ) -> astra_turn_types::runner_inference::RunnerInferenceProgressBatch {
+        astra_turn_types::runner_inference::RunnerInferenceProgressBatch::new(
+            attempt.clone(),
+            vec![
+                astra_turn_types::runner_inference::RunnerInferenceProgressEvent {
+                    sequence,
+                    event: astra_turn_types::runner_inference::RunnerInferenceProviderEvent::Json(
+                        event,
+                    ),
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runner_preview_is_visible_before_terminal_and_terminal_prefix_is_deduplicated() {
+        let attempt = preview_attempt("user-preview");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        let updates = decoder.push_batch(&preview_batch(
+            &attempt,
+            0,
+            json!({"choices":[{"delta":{"content":"hello"}}]}),
+        ));
+        assert_eq!(updates, vec![LlmStreamUpdate::Text("hello".to_string())]);
+
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("hello".to_string())),
+            None,
+            "terminal replay of the preview prefix must not duplicate output"
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text(" world".to_string())),
+            Some(LlmStreamUpdate::Text(" world".to_string()))
+        );
+    }
+
+    #[test]
+    fn runner_preview_gap_disables_speculation_but_terminal_still_replays_once() {
+        let attempt = preview_attempt("user-preview-gap");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        assert_eq!(
+            decoder.push_batch(&preview_batch(
+                &attempt,
+                0,
+                json!({"choices":[{"delta":{"content":"hello"}}]}),
+            )),
+            vec![LlmStreamUpdate::Text("hello".to_string())]
+        );
+        // Sequence 1 was lost. Do not render the later speculative fragment;
+        // otherwise a terminal replay could duplicate or reorder it.
+        assert!(
+            decoder
+                .push_batch(&preview_batch(
+                    &attempt,
+                    2,
+                    json!({"choices":[{"delta":{"content":" speculative"}}]}),
+                ))
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("hello".to_string())),
+            None
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text(" world".to_string())),
+            Some(LlmStreamUpdate::Text(" world".to_string()))
+        );
+    }
+
+    #[test]
+    fn runner_preview_prefix_cursor_handles_delta_boundaries_and_repeated_tokens() {
+        let attempt = preview_attempt("user-preview-boundaries");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        assert_eq!(
+            decoder.push_batch(&preview_batch(
+                &attempt,
+                0,
+                json!({"choices":[{"delta":{"content":"he"}}]}),
+            )),
+            vec![LlmStreamUpdate::Text("he".to_string())]
+        );
+        assert_eq!(
+            decoder.push_batch(&preview_batch(
+                &attempt,
+                1,
+                json!({"choices":[{"delta":{"content":"llo"}}]}),
+            )),
+            vec![LlmStreamUpdate::Text("llo".to_string())]
+        );
+
+        // The terminal parser may coalesce the two preview deltas. Consume
+        // exactly the rendered prefix, then preserve a repeated token.
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("hello".to_string())),
+            None
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("hello".to_string())),
+            Some(LlmStreamUpdate::Text("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn runner_preview_prefix_cursor_handles_long_repeated_fragments() {
+        let attempt = preview_attempt("user-preview-long-prefix");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        const FRAGMENTS: u64 = 4096;
+        let mut preview_updates = 0;
+        for sequence in 0..FRAGMENTS {
+            preview_updates += decoder
+                .push_batch(&preview_batch(
+                    &attempt,
+                    sequence,
+                    json!({"choices":[{"delta":{"content":"ha"}}]}),
+                ))
+                .len();
+        }
+        assert_eq!(preview_updates, FRAGMENTS as usize);
+
+        // Repeated terminal fragments are consumed through the stable cursor;
+        // the first post-prefix repetition remains real canonical output.
+        for _ in 0..FRAGMENTS {
+            assert_eq!(
+                decoder.forward_terminal_update(LlmStreamUpdate::Text("ha".to_string())),
+                None
+            );
+        }
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("ha".to_string())),
+            Some(LlmStreamUpdate::Text("ha".to_string()))
+        );
+    }
+
+    #[test]
+    fn runner_preview_missing_initial_sequence_disables_speculation() {
+        let attempt = preview_attempt("user-preview-missing-first");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        assert!(
+            decoder
+                .push_batch(&preview_batch(
+                    &attempt,
+                    1,
+                    json!({"choices":[{"delta":{"content":"missing-prefix"}}]}),
+                ))
+                .is_empty(),
+            "a first sequence gap must not render a fragment without its delimiter"
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text("canonical".to_string())),
+            Some(LlmStreamUpdate::Text("canonical".to_string()))
+        );
     }
 
     #[cfg(feature = "e2e-hooks")]

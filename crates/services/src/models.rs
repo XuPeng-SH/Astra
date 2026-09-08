@@ -1563,11 +1563,7 @@ pub async fn resolve_active_llm_model(
 }
 
 pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferingResolutionError> {
-    if offering_id.is_empty()
-        || offering_id.len() > 64
-        || offering_id.trim() != offering_id
-        || offering_id.chars().any(char::is_control)
-    {
+    if !astra_turn_types::is_valid_offering_id(offering_id) {
         return Err(ModelOfferingResolutionError::InvalidOfferingId);
     }
     Ok(offering_id)
@@ -5340,7 +5336,13 @@ fn resolve_model_default(
         Some(_) => ModelDefaultResolution::Invalid {
             reason: ModelDefaultInvalidReason::NotEffectiveOffering,
         },
-        None => match offerings.first() {
+        // A catalog's sort order is not consent to spend a personal/enterprise
+        // Runner credential. In particular another terminal may publish the
+        // same friendly name with a different provider account. Only an
+        // explicit preference may make a Runner the default.
+        None => match offerings.iter().find(|offering| {
+            offering.execution_placement == ModelExecutionPlacement::Server && offering.is_active
+        }) {
             Some(offering) => ModelDefaultResolution::Selected {
                 offering_id: offering.offering_id.clone(),
                 source: ModelDefaultSource::Astra,
@@ -5373,6 +5375,29 @@ mod tests {
         for invalid in ["", "cloud", "CLOUD-BYOK", " cloud-byok "] {
             assert!(deployment_mode_allows_shared_models(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn model_default_never_implicitly_selects_runner_credentials() {
+        let mut local = ModelListItemResponse::from(test_model_list_item(
+            "openai",
+            "a-local",
+            "runner-explicit",
+        ));
+        local.execution_placement = ModelExecutionPlacement::Edge;
+        local.access_kind = ModelAccessKind::ThisDevice;
+        assert!(matches!(
+            resolve_model_default(&[local.clone()], None),
+            ModelDefaultResolution::Missing
+        ));
+        let server = ModelListItemResponse::from(test_model_list_item(
+            "openai",
+            "z-server",
+            "server-default",
+        ));
+        assert!(
+            matches!(resolve_model_default(&[local.clone(), server], None), ModelDefaultResolution::Selected { offering_id, .. } if offering_id == "server-default")
+        );
     }
 
     fn test_model_list_item(provider: &str, name: &str, offering_id: &str) -> ModelListItem {

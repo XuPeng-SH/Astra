@@ -135,6 +135,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-credentials",
+ "astra-edge",
  "astra-harness",
  "astra-inference-adapter",
  "astra-logging",

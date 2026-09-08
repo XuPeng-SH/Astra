@@ -186,11 +186,13 @@ struct ModelSetupCompletion {
     name: String,
     selection: ModelSetupSelection,
     result: Result<ModelSetupReady, String>,
+    runner: Option<crate::cli::local_runner_lifecycle::ManagedLocalRunner>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ModelSetupSelection {
     session_id: Option<String>,
+    session_attachment_epoch: u64,
     model: Option<String>,
     offering_id: Option<String>,
     owner_scope: Option<String>,
@@ -203,6 +205,7 @@ impl ModelSetupSelection {
     ) -> Self {
         Self {
             session_id: state.session_id.clone(),
+            session_attachment_epoch: state.session_attachment_epoch,
             model: state.model.clone(),
             offering_id: state.offering_id.clone(),
             owner_scope: owner_scope.map(str::to_owned),
@@ -227,6 +230,7 @@ fn local_runner_offering<'a>(
     catalog: &'a [crate::cli::slash::slash_router::ModelCatalogEntry],
     runner_id: &str,
     display_name: &str,
+    expected_offering_id: &str,
 ) -> Result<&'a crate::cli::slash::slash_router::ModelCatalogEntry, String> {
     // The local model name is the user's configuration key, not a routing
     // identity. Restrict this one-time catalog reconciliation to the exact
@@ -235,6 +239,7 @@ fn local_runner_offering<'a>(
     let access_id = format!("runner-{runner_id}");
     let mut matches = catalog.iter().filter(|entry| {
         entry.access_id == access_id
+            && entry.offering_id == expected_offering_id
             && crate::cli::slash::slash_router::entry_model_name(entry)
                 .is_some_and(|name| name.eq_ignore_ascii_case(display_name))
     });
@@ -5141,7 +5146,8 @@ pub(crate) async fn run_tui_session(
     let (model_setup_tx, mut model_setup_rx) =
         tokio::sync::mpsc::channel::<ModelSetupCompletion>(2);
     let mut model_setup_tasks = tokio::task::JoinSet::new();
-    let local_runner_id = cli_context.local_runner_id.clone();
+    let mut local_runner_context = cli_context.clone();
+    let mut _setup_runner = None;
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
@@ -5448,6 +5454,18 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(completion) = model_setup_rx.recv() => {
+                // Hosting belongs to the attached view, not the result of an
+                // optional provider probe. A failed check must not immediately
+                // retire the newly saved model's environment lease.
+                let current_scope = astra_credentials::LocalModelScope::for_profile(&api.api_origin(), profile).ok();
+                if let Some(runner) = completion.runner {
+                    let mut candidate_context = local_runner_context.clone();
+                    runner.attach_context(&mut candidate_context);
+                    if current_scope.as_ref().is_some_and(|scope| crate::cli::local_runner_lifecycle::has_attachment(&candidate_context, scope)) {
+                        local_runner_context = candidate_context;
+                        _setup_runner = Some(runner);
+                    }
+                }
                 match completion.result {
                     Ok(ready) => {
                         if let Some(offering_id) = ready.offering_id {
@@ -5458,6 +5476,7 @@ pub(crate) async fn run_tui_session(
                                 Some(completion.name.clone()),
                             );
                             state.offering_id = Some(offering_id);
+                            state.provider_selection_requires_explicit = false;
                             bottom_pane.footer.model = Some(completion.name.clone());
                             model_catalog_cache = Some(ready.catalog);
                             chat_widget.commit_system(
@@ -8181,10 +8200,15 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     if let bottom_pane::view::ViewResult::ModelSetup(draft) = &result {
+                                        if !model_setup_tasks.is_empty() {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::info("A model setup is already running. Wait for its result before starting another provider check."));
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
                                         let draft = draft.clone();
                                         let model_name = draft.name.clone();
                                         let action = draft.action;
-                                        let runner_id = local_runner_id.clone();
+                                        let mut runner_context = local_runner_context.clone();
                                         let api = api.clone();
                                         let profile = profile.map(str::to_string);
                                         let completion_tx = model_setup_tx.clone();
@@ -8196,7 +8220,7 @@ pub(crate) async fn run_tui_session(
                                             let scope = match scope {
                                                 Ok(scope) => scope,
                                                 Err(error) => {
-                                                    let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, result: Err(format!("Not saved. {error}")) }).await;
+                                                    let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Not saved. {error}")) }).await;
                                                     return;
                                                 }
                                             };
@@ -8226,6 +8250,27 @@ pub(crate) async fn run_tui_session(
                                             .await
                                             .map_err(|_| "local model setup task stopped unexpectedly".to_string())
                                             .and_then(|result| result);
+                                            let scope_still_current = || {
+                                                astra_credentials::LocalModelScope::for_profile(&api.api_origin(), profile.as_deref())
+                                                    .is_ok_and(|current| current.identity() == scope.identity())
+                                            };
+                                            if saved.is_ok() && !scope_still_current() {
+                                                let _ = completion_tx.send(ModelSetupCompletion {
+                                                    name: model_name, selection, runner: None,
+                                                    result: Err("Saved in the original account, but your selected account changed. No provider test was run. Open /model in the intended account to continue.".into()),
+                                                }).await;
+                                                return;
+                                            }
+                                            let mut new_runner = None;
+                                            if saved.is_ok() && !crate::cli::local_runner_lifecycle::has_attachment(&runner_context, &scope) {
+                                                match crate::cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), scope.root()).await {
+                                                    Ok(runner) => { runner.attach_context(&mut runner_context); new_runner = Some(runner); }
+                                                    Err(error) => {
+                                                        let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Saved locally, but local model hosting is unavailable. No provider test was run. {error}")) }).await;
+                                                        return;
+                                                    }
+                                                }
+                                            }
                                             let result = match (saved, action) {
                                                 (Err(error), _) => Err(format!("Save could not be confirmed. No provider test was run; inspect the local configuration before retrying. {error}")),
                                                 (Ok(_), bottom_pane::view::ModelSetupAction::SaveWithoutTest) => {
@@ -8235,6 +8280,13 @@ pub(crate) async fn run_tui_session(
                                                     })
                                                 }
                                                 (Ok(_), bottom_pane::view::ModelSetupAction::TestAndUse) => {
+                                                    if !scope_still_current() {
+                                                        let _ = completion_tx.send(ModelSetupCompletion {
+                                                            name: model_name, selection, runner: new_runner,
+                                                            result: Err("Saved in the original account, but your selected account changed while connecting. No provider test was run. Open /model in the intended account to continue.".into()),
+                                                        }).await;
+                                                        return;
+                                                    }
                                                     if let Err(error) = crate::cli::local_model_command::check(
                                                         &scope,
                                                         crate::cli::cli_config::cli_args::ModelCheckArgs {
@@ -8247,18 +8299,20 @@ pub(crate) async fn run_tui_session(
                                                             .send(ModelSetupCompletion {
                                                                 name: model_name,
                                                                 selection,
+                                                                runner: new_runner,
                                                                 result: Err(format!("Saved locally, but the provider check failed. Current model unchanged. {error}")),
                                                             })
                                                             .await;
                                                         return;
                                                     }
-                                                    let Some(runner_id) = runner_id else {
+                                                    let Some(runner_id) = runner_context.local_runner_id.clone() else {
                                                         let _ = completion_tx
                                                             .send(ModelSetupCompletion {
                                                                 name: model_name,
                                                                 selection,
+                                                                runner: new_runner,
                                                                 result: Err(
-                                                                    "provider check passed, but this CLI has no managed Runner identity; restart the interactive session to attach it".to_string(),
+                                                                    "Provider check passed, but this window has no local model connection. Reopen Astra to reconnect; your saved configuration is unchanged.".to_string(),
                                                                 ),
                                                             })
                                                             .await;
@@ -8268,6 +8322,7 @@ pub(crate) async fn run_tui_session(
                                                         + std::time::Duration::from_secs(12);
                                                     let mut last_catalog_error = None;
                                                     loop {
+                                                        let expected = crate::cli::local_runner_lifecycle::offering_for_model(&runner_context, &scope, &model_name);
                                                         match slash_dispatch::load_model_catalog(
                                                             api.clone(),
                                                             profile.clone(),
@@ -8279,6 +8334,7 @@ pub(crate) async fn run_tui_session(
                                                                     &catalog,
                                                                     &runner_id,
                                                                     &model_name,
+                                                                    expected.as_deref().unwrap_or(""),
                                                                 ) {
                                                                     Ok(offering)
                                                                         if offering.execution_placement
@@ -8301,11 +8357,11 @@ pub(crate) async fn run_tui_session(
                                                         if tokio::time::Instant::now() >= deadline {
                                                             break Err(if let Some(error) = last_catalog_error {
                                                                 format!(
-                                                                    "provider check passed, but the local Runner catalog could not be refreshed after 12 seconds (Runner {runner_id}): {error}"
+                                                                    "Provider check passed, but Astra could not refresh model availability after 12 seconds: {error}. Current model unchanged. Open /model to retry."
                                                                 )
                                                             } else {
                                                                 format!(
-                                                                    "provider check passed and the model was saved, but Runner {runner_id} did not publish an active Offering for '{model_name}' within 12 seconds; keep the session open and retry /model"
+                                                                    "Provider check passed and '{model_name}' was saved, but it is not yet available through this window's local connection. Current model unchanged. Keep Astra open and retry /model; if the connection ended, reopen Astra."
                                                                 )
                                                             });
                                                         }
@@ -8317,6 +8373,7 @@ pub(crate) async fn run_tui_session(
                                                 .send(ModelSetupCompletion {
                                                     name: model_name,
                                                     selection,
+                                                    runner: new_runner,
                                                     result,
                                                 })
                                                 .await;
@@ -8326,7 +8383,7 @@ pub(crate) async fn run_tui_session(
                                                 if action
                                                     == bottom_pane::view::ModelSetupAction::TestAndUse
                                                 {
-                                                    "Saving configuration, then checking the provider once… Current model stays active until setup succeeds."
+                                                    "Saving configuration and connecting local model capacity, then checking the provider once… Current model stays active until setup succeeds."
                                                 } else {
                                                     "Saving local model without contacting the provider…"
                                                 },
@@ -8389,6 +8446,7 @@ pub(crate) async fn run_tui_session(
                                                 Some(base_model.clone()),
                                             );
                                             state.offering_id = offering_id;
+                                            state.provider_selection_requires_explicit = state.offering_id.is_none();
                                             bottom_pane.footer.model = Some(base_model.clone());
                                             chat_widget.commit_system(
                                                 history_cell::system::SystemCell::response(
@@ -8453,6 +8511,7 @@ pub(crate) async fn run_tui_session(
                                             Some(composed.clone()),
                                         );
                                         state.offering_id = offering_id;
+                                        state.provider_selection_requires_explicit = state.offering_id.is_none();
                                         bottom_pane.footer.model = Some(composed.clone());
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::response(format!(
@@ -14418,6 +14477,11 @@ mod tests {
         state.offering_id = Some("runner-a".into());
         state.session_id = Some("session-b".into());
         assert!(!captured.can_select(&state, Some("deployment-a/account-a")));
+        // Returning to the same session ID is a new view attachment, not
+        // permission for the old background setup to change its model.
+        state.session_id = Some("session-a".into());
+        state.session_attachment_epoch += 1;
+        assert!(!captured.can_select(&state, Some("deployment-a/account-a")));
     }
 
     #[test]
@@ -14567,7 +14631,7 @@ mod tests {
             }
         ]))
         .unwrap();
-        let selected = local_runner_offering(&catalog, "local", "work").unwrap();
+        let selected = local_runner_offering(&catalog, "local", "work", "offer-local").unwrap();
         assert_eq!(selected.offering_id, "offer-local");
     }
 

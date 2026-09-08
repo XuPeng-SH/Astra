@@ -51,6 +51,10 @@ pub enum InferenceHostError {
     InvalidRequest,
     #[error("inference grant is for a different process incarnation")]
     WrongIncarnation,
+    #[error(
+        "local model host uses different proxy or CA settings; close other local Astra sessions and reopen, or use an explicitly managed Runner"
+    )]
+    NetworkPolicyMismatch,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -353,6 +357,17 @@ impl InferenceJournal {
                 enabled: matches!(pending.change, RunnerInferenceBindingChange::Publish { .. }),
             },
         );
+        // Environment attachment IDs are never reused. Once their disable is
+        // acknowledged, the publication watermark fences replay and attempt
+        // records retain all custody authority. Do not accumulate one local
+        // catalog entry per terminal launch forever.
+        if receipt.identity.binding_id.as_str().starts_with("env-")
+            && matches!(pending.change, RunnerInferenceBindingChange::Disable { .. })
+        {
+            self.identity
+                .published
+                .remove(receipt.identity.binding_id.as_str());
+        }
         self.identity.publication_revision = receipt.publication_revision.get();
         self.identity.pending_publication = None;
         self.persist_identity()
@@ -637,7 +652,7 @@ fn tombstone_expired(now: u64, acknowledged_at: u64, grant_deadline: u64) -> boo
         .is_some_and(|expires_at| now >= expires_at)
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), InferenceHostError> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), InferenceHostError> {
     #[cfg(not(unix))]
     {
         let _ = path;
@@ -667,7 +682,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), InferenceHostError> {
     }
 }
 
-fn open_private(path: &Path, create: bool) -> Result<File, InferenceHostError> {
+pub(crate) fn open_private(path: &Path, create: bool) -> Result<File, InferenceHostError> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -697,7 +712,7 @@ fn open_private(path: &Path, create: bool) -> Result<File, InferenceHostError> {
     Ok(file)
 }
 
-fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>, InferenceHostError> {
+pub(crate) fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>, InferenceHostError> {
     let file = open_private(path, false)?;
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1)
@@ -709,7 +724,7 @@ fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>, InferenceHostError
     Ok(bytes)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), InferenceHostError> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), InferenceHostError> {
     let parent = path.parent().ok_or(InferenceHostError::UnsafeStorage)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".inference-")

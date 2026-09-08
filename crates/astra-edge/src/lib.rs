@@ -4,3 +4,5 @@
 pub mod inference_connection;
 pub mod inference_host;
 mod inference_journal;
+#[cfg(unix)]
+pub mod local_host;

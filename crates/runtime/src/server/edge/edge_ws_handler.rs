@@ -998,6 +998,7 @@ async fn handle_edge_connection(
                                 Ok(message @ (EdgeClientMessage::InferenceHello { .. }
                                     | EdgeClientMessage::InferenceBindingPublish { .. }
                                     | EdgeClientMessage::InferenceStartEvidence { .. }
+                                    | EdgeClientMessage::InferenceProgress { .. }
                                     | EdgeClientMessage::InferenceTerminal { .. }
                                     | EdgeClientMessage::InferenceResponseChunk { .. }
                                     | EdgeClientMessage::InferenceRequestCredit { .. })) => {
@@ -1006,7 +1007,25 @@ async fn handle_edge_connection(
                                         break;
                                     }
                                     if let Some(sender) = &inference_tx {
+                                        let disposable_progress = matches!(
+                                            &message,
+                                            EdgeClientMessage::InferenceProgress { .. }
+                                        );
                                         if sender.try_send(message).is_err() {
+                                            if disposable_progress {
+                                                // A full control queue is a normal
+                                                // preview gap, not a reason to tear
+                                                // down the authenticated socket. The
+                                                // terminal transfer has its own
+                                                // custody/reconciliation path.
+                                                tracing::debug!(
+                                                    target: "astra_runtime::edge_ws",
+                                                    user_id = %user_id,
+                                                    edge_agent_id = %edge_agent_id,
+                                                    "dropping Runner progress because the inference queue is full"
+                                                );
+                                                continue;
+                                            }
                                             let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Closing { reason: "inference control capacity unavailable".into() }).await;
                                             break;
                                         }

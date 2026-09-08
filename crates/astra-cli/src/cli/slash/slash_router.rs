@@ -236,6 +236,7 @@ pub(crate) async fn handle_slash_command(
 
                     state.model = Some(model_with_suffix.clone());
                     state.offering_id = selected_model.map(|entry| entry.offering_id.clone());
+                    state.provider_selection_requires_explicit = false;
                     state.cached_pricing = slash_stats::fallback_pricing(&chosen);
                     let context_window =
                         selected_model.and_then(session_runtime::model_list_entry_context_window);
@@ -304,6 +305,7 @@ pub(crate) async fn handle_slash_command(
             let selected_model = selected_model_name.unwrap_or_else(|| arg.to_string());
             state.model = Some(selected_model.clone());
             state.offering_id = selected_offering_id;
+            state.provider_selection_requires_explicit = false;
             slash_config::set_active_model_for_display(Some(selected_model.clone()));
             let base_model =
                 astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;

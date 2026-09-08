@@ -2748,6 +2748,7 @@ async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
         ctx.state.offering_id = None;
+        ctx.state.provider_selection_requires_explicit = false;
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
@@ -2778,6 +2779,7 @@ async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     ctx.state.model = Some(display_name.clone());
     crate::cli::slash::slash_config::set_active_model_for_display(Some(display_name.clone()));
     ctx.state.offering_id = Some(selected.offering_id.clone());
+    ctx.state.provider_selection_requires_explicit = false;
     ctx.bottom_pane.footer.model = Some(display_name.clone());
     ctx.show_response(format!(
         "Set model to {} · {}",
@@ -2791,6 +2793,7 @@ async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
     ctx.state.offering_id = None;
+    ctx.state.provider_selection_requires_explicit = false;
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled

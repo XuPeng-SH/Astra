@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
 use astra_turn_types::runner_inference::*;
@@ -11,8 +12,24 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::inference_host::{
-    DispatchOutcome, GrantClock, InferenceHost, InferenceHostError, RetainedTerminal,
+    DispatchOutcome, GrantClock, InferenceHost, InferenceHostError, InferencePreview,
+    RetainedTerminal,
 };
+
+struct PendingProgress {
+    attempt: RunnerInferenceAttemptIdentity,
+    events: Vec<RunnerInferenceProgressEvent>,
+    last_sequence: u64,
+    created: Instant,
+}
+
+/// The host admits at most four provider executions. Keep disposable progress
+/// assembly no larger than that active set even if terminal polling is delayed
+/// by a storage outage; terminal custody remains the recovery path.
+const MAX_PENDING_PROGRESS: usize = 4;
+
+#[cfg(test)]
+pub(crate) const MAX_PENDING_PROGRESS_FOR_TEST: usize = MAX_PENDING_PROGRESS;
 
 struct Assembly {
     grant: RunnerInferenceDispatchGrant,
@@ -33,6 +50,7 @@ pub struct InferenceConnection {
     incoming: HashMap<String, Assembly>,
     outgoing: Option<Outgoing>,
     publication_sent: Option<RunnerInferenceId>,
+    pending_progress: HashMap<String, PendingProgress>,
 }
 
 impl InferenceConnection {
@@ -45,7 +63,13 @@ impl InferenceConnection {
             incoming: HashMap::new(),
             outgoing: None,
             publication_sent: None,
+            pending_progress: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_progress_len_for_test(&self) -> usize {
+        self.pending_progress.len()
     }
 
     pub fn hello(&mut self) -> EdgeClientMessage {
@@ -64,6 +88,187 @@ impl InferenceConnection {
         Ok(())
     }
 
+    /// Convert one disposable host preview into a bounded wire batch.  The
+    /// first event is sent immediately to minimize TTFB; subsequent events are
+    /// coalesced until the byte/timer budget or a provider terminal marker.
+    pub(crate) fn handle_preview(
+        &mut self,
+        preview: InferencePreview,
+    ) -> Result<Vec<EdgeClientMessage>, InferenceHostError> {
+        let Some(generation) = self.generation else {
+            // Negotiation has not completed (or was refused).  The host keeps
+            // terminal custody independently; dropping this preview is safe.
+            return Ok(Vec::new());
+        };
+        let key = preview.attempt.attempt_id.as_str().to_owned();
+        let item = RunnerInferenceProgressEvent {
+            sequence: preview.sequence,
+            event: preview.event,
+        };
+        let terminal_marker = matches!(
+            &item.event,
+            RunnerInferenceProviderEvent::Done | RunnerInferenceProviderEvent::Eof
+        );
+        let first = !self.pending_progress.contains_key(&key);
+        if first {
+            let Ok(batch) = RunnerInferenceProgressBatch::new(preview.attempt, vec![item.clone()])
+            else {
+                // The event is too large for the complete bounded envelope.
+                // It remains available in terminal custody; expose the gap.
+                return Ok(Vec::new());
+            };
+            if !terminal_marker {
+                if self.pending_progress.len() >= MAX_PENDING_PROGRESS {
+                    // Do not evict another active attempt's sequence
+                    // watermark. The next terminal poll retires stale entries;
+                    // this attempt still has complete custody available.
+                    return Ok(Vec::new());
+                }
+                self.pending_progress.insert(
+                    key,
+                    PendingProgress {
+                        attempt: batch.attempt.clone(),
+                        events: Vec::new(),
+                        last_sequence: item.sequence,
+                        created: Instant::now(),
+                    },
+                );
+            }
+            // The first provider event is deliberately prompt.  This is still
+            // one bounded batch and does not couple provider I/O to the socket.
+            return Ok(vec![Self::progress_message(batch, generation)]);
+        }
+
+        let (attempt, mut events, last_sequence) = {
+            let pending = self
+                .pending_progress
+                .get(&key)
+                .ok_or(InferenceHostError::IdentityConflict)?;
+            if pending.attempt != preview.attempt {
+                return Err(InferenceHostError::IdentityConflict);
+            }
+            (
+                pending.attempt.clone(),
+                pending.events.clone(),
+                pending.last_sequence,
+            )
+        };
+        // Duplicate provider events can only be a faulty host or a replay from
+        // a reconnect.  They are disposable and must never duplicate client
+        // output, so silently retain the monotonic watermark and drop them.
+        if item.sequence <= last_sequence {
+            return Ok(Vec::new());
+        }
+        events.push(item.clone());
+        let mut messages = Vec::new();
+        match RunnerInferenceProgressBatch::new(attempt.clone(), events.clone()) {
+            Ok(batch) => {
+                let flush_now = terminal_marker
+                    || serde_json::to_vec(&batch)
+                        .map(|bytes| bytes.len() >= RUNNER_INFERENCE_PROGRESS_BATCH_BYTES)
+                        .unwrap_or(true);
+                if flush_now {
+                    {
+                        let pending = self
+                            .pending_progress
+                            .get_mut(&key)
+                            .ok_or(InferenceHostError::IdentityConflict)?;
+                        pending.last_sequence = item.sequence;
+                        pending.events.clear();
+                        pending.created = Instant::now();
+                    }
+                    messages.push(Self::progress_message(batch, generation));
+                    if terminal_marker {
+                        self.pending_progress.remove(&key);
+                    }
+                } else {
+                    let pending = self
+                        .pending_progress
+                        .get_mut(&key)
+                        .ok_or(InferenceHostError::IdentityConflict)?;
+                    pending.last_sequence = item.sequence;
+                    pending.events = events;
+                }
+            }
+            Err(_) => {
+                // The candidate crossed the byte budget.  Flush the previous
+                // batch and retain this event as the first event of the next
+                // bounded batch.  An oversized singleton is a visible gap.
+                let (pending_attempt, previous) = {
+                    let pending = self
+                        .pending_progress
+                        .get_mut(&key)
+                        .ok_or(InferenceHostError::IdentityConflict)?;
+                    let previous = if !pending.events.is_empty() {
+                        RunnerInferenceProgressBatch::new(
+                            pending.attempt.clone(),
+                            std::mem::take(&mut pending.events),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+                    pending.last_sequence = item.sequence;
+                    pending.created = Instant::now();
+                    (pending.attempt.clone(), previous)
+                };
+                if let Some(previous) = previous {
+                    messages.push(Self::progress_message(previous, generation));
+                }
+                if terminal_marker {
+                    if let Ok(singleton) =
+                        RunnerInferenceProgressBatch::new(pending_attempt, vec![item])
+                    {
+                        messages.push(Self::progress_message(singleton, generation));
+                    }
+                    self.pending_progress.remove(&key);
+                } else if RunnerInferenceProgressBatch::new(pending_attempt, vec![item.clone()])
+                    .is_ok()
+                    && let Some(pending) = self.pending_progress.get_mut(&key)
+                {
+                    pending.events.push(item);
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    fn progress_message(batch: RunnerInferenceProgressBatch, generation: u64) -> EdgeClientMessage {
+        EdgeClientMessage::InferenceProgress {
+            progress: Box::new(batch),
+            delivery_generation: generation,
+        }
+    }
+
+    /// Flush progress that has reached the 50ms latency budget.  Progress is
+    /// best-effort; terminal/control polling remains on the awaited channel.
+    pub(crate) fn flush_progress(&mut self) -> Vec<EdgeClientMessage> {
+        let Some(generation) = self.generation else {
+            self.pending_progress.clear();
+            return Vec::new();
+        };
+        let expired = self
+            .pending_progress
+            .iter()
+            .filter(|(_, pending)| {
+                !pending.events.is_empty() && pending.created.elapsed() >= Duration::from_millis(50)
+            })
+            .map(|(attempt_id, _)| attempt_id.clone())
+            .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        for attempt_id in expired {
+            let Some(pending) = self.pending_progress.get_mut(&attempt_id) else {
+                continue;
+            };
+            let events = std::mem::take(&mut pending.events);
+            pending.created = Instant::now();
+            if let Ok(batch) = RunnerInferenceProgressBatch::new(pending.attempt.clone(), events) {
+                messages.push(Self::progress_message(batch, generation));
+            }
+        }
+        messages
+    }
+
     pub async fn handle(
         &mut self,
         message: EdgeServerMessage,
@@ -74,6 +279,7 @@ impl InferenceConnection {
                     RunnerInferenceNegotiation::Unavailable { .. } => {
                         self.generation = None;
                         self.clock = None;
+                        self.pending_progress.clear();
                         return Ok(Vec::new());
                     }
                     RunnerInferenceNegotiation::Accepted {
@@ -87,6 +293,12 @@ impl InferenceConnection {
                             || delivery_generation == 0
                         {
                             return Err(InferenceHostError::InvalidRequest);
+                        }
+                        if self.generation != Some(delivery_generation) {
+                            // A reconnect has a new transport generation. Any
+                            // old preview assembly is disposable and must not
+                            // be mixed with the new socket's sequence stream.
+                            self.pending_progress.clear();
                         }
                         self.clock = Some(GrantClock::observed(
                             server_unix_ms,
@@ -230,6 +442,8 @@ impl InferenceConnection {
             } => {
                 self.fence_generation(delivery_generation)?;
                 self.host.acknowledge((*ack).clone()).await?;
+                self.pending_progress
+                    .remove(ack.attempt.attempt_id.as_str());
                 if self
                     .outgoing
                     .as_ref()
@@ -289,30 +503,35 @@ impl InferenceConnection {
                 outgoing.sent = outgoing.sent.max(offset);
                 Ok(messages)
             }
-            EdgeServerMessage::InferenceRejected { attempt_id, reason } => match reason {
-                RunnerInferenceRejection::StorageUnavailable
-                | RunnerInferenceRejection::CapacityUnavailable
-                | RunnerInferenceRejection::PublicationConflict => {
-                    // The Server did not accept custody. Drop only disposable
-                    // transfer state; the journal remains the source of truth
-                    // and the next bounded poll reoffers the identical fact.
-                    if attempt_id.as_ref().is_some_and(|attempt_id| {
-                        self.outgoing.as_ref().is_some_and(|outgoing| {
-                            outgoing.grant.attempt.attempt_id == *attempt_id
-                        })
-                    }) {
-                        self.outgoing = None;
+            EdgeServerMessage::InferenceRejected { attempt_id, reason } => {
+                if let Some(attempt_id) = attempt_id.as_ref() {
+                    self.pending_progress.remove(attempt_id.as_str());
+                }
+                match reason {
+                    RunnerInferenceRejection::StorageUnavailable
+                    | RunnerInferenceRejection::CapacityUnavailable
+                    | RunnerInferenceRejection::PublicationConflict => {
+                        // The Server did not accept custody. Drop only disposable
+                        // transfer state; the journal remains the source of truth
+                        // and the next bounded poll reoffers the identical fact.
+                        if attempt_id.as_ref().is_some_and(|attempt_id| {
+                            self.outgoing.as_ref().is_some_and(|outgoing| {
+                                outgoing.grant.attempt.attempt_id == *attempt_id
+                            })
+                        }) {
+                            self.outgoing = None;
+                        }
+                        Ok(Vec::new())
                     }
-                    Ok(Vec::new())
+                    RunnerInferenceRejection::InferenceUnsupported
+                    | RunnerInferenceRejection::ProtocolVersionUnsupported
+                    | RunnerInferenceRejection::ConnectionSuperseded
+                    | RunnerInferenceRejection::BindingIdentityMismatch
+                    | RunnerInferenceRejection::InvalidEvidence => {
+                        Err(InferenceHostError::InvalidRequest)
+                    }
                 }
-                RunnerInferenceRejection::InferenceUnsupported
-                | RunnerInferenceRejection::ProtocolVersionUnsupported
-                | RunnerInferenceRejection::ConnectionSuperseded
-                | RunnerInferenceRejection::BindingIdentityMismatch
-                | RunnerInferenceRejection::InvalidEvidence => {
-                    Err(InferenceHostError::InvalidRequest)
-                }
-            },
+            }
             _ => Err(InferenceHostError::InvalidRequest),
         }
     }
@@ -332,8 +551,16 @@ impl InferenceConnection {
                 publication: Box::new(publication),
             });
         }
+        let pending = self.host.pending(MAX_PENDING_PROGRESS).await?;
+        for (grant, _) in &pending {
+            // A terminal outcome (including provider transport failure) owns
+            // the sequence's end. Retire only the disposable preview assembly;
+            // response bytes remain in the journal until its ACK.
+            self.pending_progress
+                .remove(grant.attempt.attempt_id.as_str());
+        }
         if self.outgoing.is_none()
-            && let Some((grant, payload)) = self.host.pending(1).await?.pop()
+            && let Some((grant, payload)) = pending.into_iter().next()
         {
             messages.extend(self.begin_transfer(grant, payload)?);
         }
@@ -375,16 +602,28 @@ impl InferenceConnection {
                 }])
             }
             DispatchOutcome::NotStarted(evidence) => {
+                self.pending_progress
+                    .remove(grant.attempt.attempt_id.as_str());
                 Ok(vec![EdgeClientMessage::InferenceStartEvidence {
                     grant: Box::new(grant),
                     delivery_generation,
                     evidence,
                 }])
             }
-            DispatchOutcome::Terminal(payload) if self.outgoing.is_none() => {
-                self.begin_transfer(grant, payload)
+            DispatchOutcome::Terminal(payload) => {
+                self.pending_progress
+                    .remove(grant.attempt.attempt_id.as_str());
+                if self.outgoing.is_none() {
+                    self.begin_transfer(grant, payload)
+                } else {
+                    Ok(Vec::new())
+                }
             }
-            _ => Ok(Vec::new()),
+            DispatchOutcome::Acknowledged | DispatchOutcome::Unknown => {
+                self.pending_progress
+                    .remove(grant.attempt.attempt_id.as_str());
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -434,24 +673,43 @@ impl InferenceConnectionWorker {
         let (output, messages) = tokio::sync::mpsc::channel(16);
         let task = tokio::spawn(async move {
             let mut connection = InferenceConnection::new(host.clone());
+            let mut preview_rx = host.subscribe_preview();
+            let mut preview_open = true;
             if output.send(connection.hello()).await.is_err() {
                 return;
             }
             let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut progress_flush = tokio::time::interval(Duration::from_millis(10));
+            progress_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let result = tokio::select! {
                     message = input.recv() => match message {
                         Some(message) => connection.handle(message).await,
                         None => break,
                     },
+                    preview = preview_rx.recv(), if preview_open => match preview {
+                        Ok(preview) => connection.handle_preview(preview),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Ok(Vec::new()),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            preview_open = false;
+                            Ok(Vec::new())
+                        }
+                    },
                     _ = host.terminal_ready() => connection.poll().await,
                     _ = poll.tick() => connection.poll().await,
+                    _ = progress_flush.tick() => Ok(connection.flush_progress()),
                 };
                 match result {
                     Ok(messages) => {
                         for message in messages {
-                            if output.send(message).await.is_err() {
+                            // Progress is disposable and must not occupy the
+                            // bounded control/terminal output lane. A full
+                            // lane is represented by a sequence gap; terminal
+                            // custody remains available on the next poll.
+                            if matches!(&message, EdgeClientMessage::InferenceProgress { .. }) {
+                                let _ = output.try_send(message);
+                            } else if output.send(message).await.is_err() {
                                 return;
                             }
                         }

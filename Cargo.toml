@@ -39,6 +39,7 @@ license = "Apache-2.0"
 astra-core = { path = "crates/core" }
 astra-inference-adapter = { path = "crates/astra-inference-adapter" }
 astra-credentials = { path = "crates/astra-credentials" }
+astra-edge = { path = "crates/astra-edge" }
 astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }
 astra-config = { path = "crates/astra-config" }

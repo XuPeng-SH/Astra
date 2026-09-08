@@ -1,9 +1,75 @@
 //! Canonical Runner execution coordinator shared by turns and auxiliary/API calls.
 //! Transport readiness is a hint; durable attempt/custody rows remain authority.
 
-use super::client::{LlmCallResult, LlmCancel, LlmStreamCallback, collect_runner_response};
+use super::client::{
+    LlmCallResult, LlmCancel, LlmStreamCallback, LlmStreamUpdate, RunnerInferencePreviewDecoder,
+    collect_runner_response,
+};
 use astra_core::SharedPool;
+use astra_turn_types::runner_inference::{
+    RunnerInferenceAttemptIdentity, RunnerInferenceProgressBatch,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn emit_runner_preview(
+    batch: &RunnerInferenceProgressBatch,
+    expected: &RunnerInferenceAttemptIdentity,
+    decoder: &mut RunnerInferencePreviewDecoder,
+    stream_callback: &mut Option<&mut LlmStreamCallback<'_>>,
+) {
+    if batch.attempt != *expected {
+        // The pool is keyed by (user, attempt), and ingress validates the same
+        // full identity. Treat a mismatch as disposable corruption rather
+        // than allowing another user's preview into this turn.
+        decoder.mark_gap();
+        tracing::warn!(
+            expected_attempt_id = %expected.attempt_id.as_str(),
+            received_attempt_id = %batch.attempt.attempt_id.as_str(),
+            "discarding Runner progress for a different immutable attempt"
+        );
+        return;
+    }
+    for update in decoder.push_batch(batch) {
+        if let Some(callback) = stream_callback.as_deref_mut() {
+            callback(update);
+        }
+    }
+}
+
+// A wake is consumed immediately, never queued. Keep the bounded batch inline
+// instead of allocating a second heap object for every preview delivery.
+#[allow(clippy::large_enum_variant)]
+enum RunnerWake {
+    Readiness(Result<(), tokio::sync::watch::error::RecvError>),
+    Cancel,
+    Deadline,
+    Preview(Result<RunnerInferenceProgressBatch, tokio::sync::broadcast::error::RecvError>),
+}
+
+/// Transport observation only. All durable state transitions remain in the
+/// coordinator below; provisional output has strictly lower priority.
+async fn next_runner_wake(
+    readiness: &mut tokio::sync::watch::Receiver<
+        astra_services::inference_execution::runner_wait::RunnerReadiness,
+    >,
+    preview: &mut Option<tokio::sync::broadcast::Receiver<RunnerInferenceProgressBatch>>,
+    preview_open: bool,
+    cancel: Option<LlmCancel<'_>>,
+    deadline: tokio::time::Instant,
+) -> RunnerWake {
+    tokio::select! {
+        biased;
+        changed = readiness.changed() => RunnerWake::Readiness(changed),
+        _ = super::client::wait_llm_cancel(cancel.unwrap_or(LlmCancel::None)), if cancel.is_some() => RunnerWake::Cancel,
+        _ = tokio::time::sleep_until(deadline) => RunnerWake::Deadline,
+        message = async {
+            match preview.as_mut() {
+                Some(receiver) => receiver.recv().await,
+                None => std::future::pending().await,
+            }
+        }, if preview_open => RunnerWake::Preview(message),
+    }
+}
 
 /// Auxiliary calls use the same admission, custody and continuation owner as
 /// agent rounds. Dropping this future leaves the durable Runner grant with the
@@ -143,7 +209,7 @@ pub(crate) async fn call_runner_and_collect(
     model_name: &str,
     provider_budget: Duration,
     cancel: LlmCancel<'_>,
-    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<
     (
         LlmCallResult,
@@ -176,6 +242,15 @@ pub(crate) async fn call_runner_and_collect(
     tracing::Span::current().record("attempt_id", grant.attempt.attempt_id.as_str());
     tracing::debug!(stage = "grant_committed", "Runner request authorized");
     let runner_id = binding.definition.identity.runner_id.as_str();
+    // Subscribe before waking the Runner so a first preview cannot race past
+    // the owner. This hub is same-pod and disposable; terminal custody below
+    // remains the only authoritative response/usage/tool path.
+    let mut preview_rx = stream_callback
+        .is_some()
+        .then(|| edge_pool.subscribe_runner_inference_progress(&grant.attempt))
+        .flatten();
+    let mut preview_open = preview_rx.is_some();
+    let mut preview_decoder = RunnerInferencePreviewDecoder::default();
     edge_pool.notify_runner_inference(&binding.user_id, runner_id);
 
     use astra_services::inference_execution::runner_wait::RunnerReadiness;
@@ -197,24 +272,97 @@ pub(crate) async fn call_runner_and_collect(
             }
             RunnerReadiness::Waiting => {}
         }
-        tokio::select! {
-            changed = readiness.changed() => {
+        match next_runner_wake(
+            &mut readiness,
+            &mut preview_rx,
+            preview_open,
+            (!cancellation_recorded).then_some(cancel),
+            wait_deadline,
+        )
+        .await
+        {
+            RunnerWake::Readiness(changed) => {
                 if changed.is_err() {
                     return Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation, "Runner readiness observer stopped"));
+                        astra_core::ErrorKind::ContractViolation,
+                        "Runner readiness observer stopped",
+                    ));
                 }
             }
-            _ = super::client::wait_llm_cancel(cancel), if !cancellation_recorded => {
+            // Disposable output must never starve cancellation or the
+            // original deadline, even when a peer floods valid progress.
+            RunnerWake::Cancel => {
                 astra_services::inference_execution::runner::request_runner_cancellation(
-                    pool, &binding.user_id, &grant.attempt).await
-                    .map_err(|error| runner_service_error("cancellation", error))?;
+                    pool,
+                    &binding.user_id,
+                    &grant.attempt,
+                )
+                .await
+                .map_err(|error| runner_service_error("cancellation", error))?;
                 edge_pool.notify_runner_inference(&binding.user_id, runner_id);
                 cancellation_recorded = true;
-                tracing::debug!(stage = "cancellation_requested", "Runner cancellation recorded");
+                tracing::debug!(
+                    stage = "cancellation_requested",
+                    "Runner cancellation recorded"
+                );
             }
-            _ = tokio::time::sleep_until(wait_deadline) => return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ProviderDeadline,
-                "Runner did not return a durable provider terminal before the inference deadline")),
+            RunnerWake::Deadline => {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ProviderDeadline,
+                    "Runner did not return a durable provider terminal before the inference deadline",
+                ));
+            }
+            RunnerWake::Preview(preview) => {
+                match preview {
+                    Ok(batch) => emit_runner_preview(
+                        &batch,
+                        &grant.attempt,
+                        &mut preview_decoder,
+                        &mut stream_callback,
+                    ),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // A gap is intentionally terminal for provisional
+                        // rendering. The canonical response will replay from
+                        // custody and the final-update filter will avoid
+                        // duplicating the prefix already shown.
+                        preview_decoder.mark_gap();
+                        preview_open = false;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        preview_open = false;
+                    }
+                }
+            }
+        }
+    }
+    // Readiness and the final local journal commit can become visible in
+    // either order. Drain already queued previews once before custody claim;
+    // anything arriving later is safely converged by the terminal collector.
+    // A fixed work budget prevents a concurrent/malicious progress producer
+    // from postponing the authoritative custody claim indefinitely. Any
+    // undisplayed bytes are supplied by the terminal collector below.
+    for _ in 0..8 {
+        if !preview_open {
+            break;
+        }
+        let next = match preview_rx.as_mut() {
+            Some(receiver) => receiver.try_recv(),
+            None => break,
+        };
+        match next {
+            Ok(batch) => emit_runner_preview(
+                &batch,
+                &grant.attempt,
+                &mut preview_decoder,
+                &mut stream_callback,
+            ),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                preview_decoder.mark_gap();
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                preview_open = false;
+            }
         }
     }
     // Only readiness observation is shared/batched; this exact claim remains
@@ -239,15 +387,34 @@ pub(crate) async fn call_runner_and_collect(
                 "Runner response custody contains an invalid response envelope",
             )
         })?;
-    let result = collect_runner_response(
-        response,
-        model_name,
-        started,
-        prepared.authorized_tool_names(),
-        prepared.wire_output_limit(),
-        stream_callback,
-    )
-    .await;
+    let result = if stream_callback.is_some() {
+        let mut terminal_callback = |update: LlmStreamUpdate| {
+            if let Some(update) = preview_decoder.forward_terminal_update(update)
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(update);
+            }
+        };
+        collect_runner_response(
+            response,
+            model_name,
+            started,
+            prepared.authorized_tool_names(),
+            prepared.wire_output_limit(),
+            Some(&mut terminal_callback),
+        )
+        .await
+    } else {
+        collect_runner_response(
+            response,
+            model_name,
+            started,
+            prepared.authorized_tool_names(),
+            prepared.wire_output_limit(),
+            None,
+        )
+        .await
+    };
 
     // Parsing may downgrade a physically complete stream to a logical failure
     // (for example an unauthorized tool call), but it may never rewrite the
@@ -281,6 +448,40 @@ pub(crate) async fn call_runner_and_collect(
         .observe_runner_terminal(attempt_index, physical, logical)
         .await;
     result.map(|result| (result, claim.checkpoint_receipt()))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn runner_control_and_deadline_take_priority_over_ready_preview() {
+    use astra_services::inference_execution::runner_wait::RunnerReadiness;
+    let (_state, mut readiness) = tokio::sync::watch::channel(RunnerReadiness::Waiting);
+    let (sender, receiver) = tokio::sync::broadcast::channel(1);
+    drop(sender); // recv is immediately ready, like a continuously busy peer.
+    let mut preview = Some(receiver);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    assert!(matches!(
+        next_runner_wake(
+            &mut readiness,
+            &mut preview,
+            true,
+            Some(LlmCancel::Token(&cancellation)),
+            tokio::time::Instant::now() + Duration::from_secs(60)
+        )
+        .await,
+        RunnerWake::Cancel
+    ));
+    assert!(matches!(
+        next_runner_wake(
+            &mut readiness,
+            &mut preview,
+            true,
+            None,
+            tokio::time::Instant::now()
+        )
+        .await,
+        RunnerWake::Deadline
+    ));
 }
 
 fn runner_logical_terminal(

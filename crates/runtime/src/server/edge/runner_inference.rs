@@ -21,6 +21,10 @@ use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 pub(super) const CONTROL_CAPACITY: usize = 32;
 const WINDOW_BYTES: usize = 8 * RUNNER_INFERENCE_CHUNK_BYTES;
 const MAX_CONNECTION_TRANSFERS: usize = 8;
+/// One authenticated identity check per attempt is enough for the disposable
+/// progress stream. Keep the connection-local cache bounded; terminal custody
+/// does not depend on this cache and remains recoverable after eviction.
+const MAX_CONNECTION_PROGRESS_ATTEMPTS: usize = 128;
 // Global request/response body reservation; queued chunks add at most the
 // bounded transport channel window. No unbounded per-connection body inventory.
 static TRANSFER_KIB: Semaphore = Semaphore::const_new(64 * 1024);
@@ -193,6 +197,14 @@ pub(super) fn validate_ingress(
             delivery_generation,
             ..
         } => *delivery_generation == generation && matches_identity(&grant.attempt),
+        EdgeClientMessage::InferenceProgress {
+            progress,
+            delivery_generation,
+        } => {
+            *delivery_generation == generation
+                && matches_identity(&progress.attempt)
+                && progress.validate_wire_bounds().is_ok()
+        }
         EdgeClientMessage::InferenceTerminal {
             transfer,
             delivery_generation,
@@ -232,6 +244,7 @@ pub(super) async fn run(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut negotiated = false;
     let mut buffers = TransportBuffers::default();
+    let mut progress_attempts = HashMap::<String, RunnerInferenceAttemptIdentity>::new();
     loop {
         if !pool.is_current_inference_connection(
             &connection.user_id,
@@ -240,8 +253,9 @@ pub(super) async fn run(
         ) {
             break;
         }
+        // Use fair polling: a continuously readable progress channel must
+        // not starve dispatch/cancellation wakeups or terminal maintenance.
         tokio::select! {
-            biased;
             message = receiver.recv() => {
                 let Some(message) = message else { break; };
                 if !validate_ingress(&message, &connection.user_id, connection.runner_id.as_str(), generation) { break; }
@@ -252,7 +266,16 @@ pub(super) async fn run(
                     continue;
                 };
                 let wake_delivery = matches!(message, EdgeClientMessage::InferenceHello { .. } | EdgeClientMessage::InferenceBindingPublish { .. });
-                let response = handle_message(db, &pool, &connection, generation, &mut negotiated, &mut buffers, message).await;
+                let response = handle_message(
+                    db,
+                    &pool,
+                    &connection,
+                    generation,
+                    &mut negotiated,
+                    &mut buffers,
+                    &mut progress_attempts,
+                    message,
+                ).await;
                 if let Some(response) = response {
                     if !send(&pool, &connection, generation, response).await { break; }
                 }
@@ -293,6 +316,7 @@ async fn handle_message(
     generation: u64,
     negotiated: &mut bool,
     buffers: &mut TransportBuffers,
+    progress_attempts: &mut HashMap<String, RunnerInferenceAttemptIdentity>,
     message: EdgeClientMessage,
 ) -> Option<EdgeServerMessage> {
     if !*negotiated
@@ -328,6 +352,10 @@ async fn handle_message(
             {
                 Ok(()) => {
                     *negotiated = true;
+                    // A repeated hello is a new logical transport session from
+                    // the protocol's point of view. Do not carry identity
+                    // authorizations across that boundary.
+                    progress_attempts.clear();
                     RunnerInferenceNegotiation::accepted(
                         protocol_version,
                         generation,
@@ -377,6 +405,46 @@ async fn handle_message(
                 reason: rejection(&error),
             }),
         },
+        EdgeClientMessage::InferenceProgress { progress, .. } => {
+            let attempt_id = progress.attempt.attempt_id.clone();
+            if progress_attempts
+                .get(attempt_id.as_str())
+                .is_some_and(|known| known != &progress.attempt)
+            {
+                return Some(EdgeServerMessage::InferenceRejected {
+                    attempt_id: Some(attempt_id),
+                    reason: RunnerInferenceRejection::InvalidEvidence,
+                });
+            }
+            if !progress_attempts.contains_key(attempt_id.as_str()) {
+                if progress_attempts.len() >= MAX_CONNECTION_PROGRESS_ATTEMPTS {
+                    return Some(EdgeServerMessage::InferenceRejected {
+                        attempt_id: Some(attempt_id),
+                        reason: RunnerInferenceRejection::CapacityUnavailable,
+                    });
+                }
+                // Authenticate the immutable attempt once per connection. The
+                // subsequent preview batches use this exact identity cache,
+                // avoiding per-token/per-batch SQL while preventing a Runner
+                // from injecting text for a different durable attempt.
+                if let Err(error) =
+                    validate_runner_terminal_attempt(db, connection, &progress.attempt).await
+                {
+                    return Some(EdgeServerMessage::InferenceRejected {
+                        attempt_id: Some(attempt_id),
+                        reason: rejection(&error),
+                    });
+                }
+                progress_attempts.insert(attempt_id.as_str().to_owned(), progress.attempt.clone());
+            }
+            match pool.publish_runner_inference_progress(*progress) {
+                Ok(()) => None,
+                Err(reason) => Some(EdgeServerMessage::InferenceRejected {
+                    attempt_id: Some(attempt_id),
+                    reason,
+                }),
+            }
+        }
         EdgeClientMessage::InferenceTerminal { transfer, .. } => {
             let id = transfer.attempt.attempt_id.clone();
             if let Some(existing) = transfers.get_mut(&id) {
@@ -465,6 +533,7 @@ async fn handle_message(
                     .await
                     {
                         Ok(ack) => {
+                            progress_attempts.remove(attempt_id.as_str());
                             pool.runner_continuation_waiters.notify();
                             Some(EdgeServerMessage::InferenceTerminalAck {
                                 ack: Box::new(ack),
@@ -763,6 +832,25 @@ mod tests {
         };
         assert!(!validate_ingress(&forged, "owner", "runner", 7));
         assert!(!format!("{forged:?}").contains("private-canary"));
+
+        let progress = EdgeClientMessage::InferenceProgress {
+            progress: Box::new(
+                RunnerInferenceProgressBatch::new(
+                    header(16).attempt,
+                    vec![RunnerInferenceProgressEvent {
+                        sequence: 0,
+                        event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                            "choices": [{"delta": {"content": "preview"}}]
+                        })),
+                    }],
+                )
+                .unwrap(),
+            ),
+            delivery_generation: 7,
+        };
+        assert!(validate_ingress(&progress, "owner", "runner", 7));
+        assert!(!validate_ingress(&progress, "other-owner", "runner", 7));
+        assert!(!validate_ingress(&progress, "owner", "runner", 8));
     }
 
     #[tokio::test]

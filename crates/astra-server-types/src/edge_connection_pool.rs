@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use dashmap::{DashMap, mapref::entry::Entry};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::edge_ws_protocol::{
@@ -21,7 +21,8 @@ use crate::edge_ws_protocol::{
     MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
 };
 use crate::runner_inference::{
-    RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceBindingPublication, RunnerInferenceRejection,
+    RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceAttemptIdentity,
+    RunnerInferenceBindingPublication, RunnerInferenceProgressBatch, RunnerInferenceRejection,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -45,6 +46,15 @@ fn edge_result_wait_timeout(execution_timeout_secs: u64) -> Duration {
 /// Maximum capacity for the channel between the tool router and an edge agent's
 /// WebSocket write loop. When full, senders apply backpressure to prevent OOM.
 pub const EDGE_WS_CHANNEL_CAPACITY: usize = 256;
+
+/// Provisional Runner progress is process-local and disposable. Cross-pod
+/// recovery still uses the durable terminal; a future typed relay may bridge
+/// this exact facet without changing the custody contract. Each slot is one
+/// bounded 32KiB batch, so four slots per attempt and 128 stale/live attempt
+/// entries cap payload retention at roughly 16MiB before receiver cleanup.
+const RUNNER_PROGRESS_CHANNEL_CAPACITY: usize = 4;
+const MAX_RUNNER_PROGRESS_ATTEMPTS_PER_USER: usize = 16;
+const MAX_RUNNER_PROGRESS_ATTEMPTS: usize = 128;
 
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
 pub type EdgeWsSender = mpsc::Sender<EdgeServerMessage>;
@@ -205,6 +215,15 @@ pub struct EdgeConnectionPool {
     /// interleave their DB registration and pool commit (which could leave the
     /// DB pointing at one incarnation and the pool at another).
     reconnect_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Same-pod live preview hub keyed by authenticated owner and immutable
+    /// attempt ID.  This is not a terminal/result store and has no replay
+    /// obligation; a missing hub entry is an expected delayed-preview path.
+    runner_progress:
+        Arc<DashMap<(String, String), broadcast::Sender<RunnerInferenceProgressBatch>>>,
+    /// Serializes capacity admission for the bounded progress hub. DashMap's
+    /// shard locks protect individual entries but cannot make a global length
+    /// check atomic across concurrent run owners.
+    runner_progress_capacity: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +246,8 @@ impl EdgeConnectionPool {
             next_delivery_generation: Arc::new(AtomicU64::new(0)),
             reconnect_intents: Arc::new(DashMap::new()),
             reconnect_locks: Arc::new(DashMap::new()),
+            runner_progress: Arc::new(DashMap::new()),
+            runner_progress_capacity: Arc::new(Mutex::new(())),
         }
     }
 
@@ -545,6 +566,78 @@ impl EdgeConnectionPool {
         {
             connection.inference_wakeup.notify_one();
         }
+    }
+
+    /// Subscribe to one attempt's same-pod provisional progress.  The full
+    /// attempt identity is retained by the caller so the subscription cannot
+    /// be accidentally reused for another user or invocation.  A missing
+    /// receiver is a normal degraded path (for example cross-pod ownership or
+    /// a late subscription). If the bounded 128-attempt hub is saturated, the
+    /// caller gets `None` and must report no live preview; terminal custody
+    /// remains independently usable.
+    pub fn subscribe_runner_inference_progress(
+        &self,
+        identity: &RunnerInferenceAttemptIdentity,
+    ) -> Option<broadcast::Receiver<RunnerInferenceProgressBatch>> {
+        let Ok(_capacity_guard) = self.runner_progress_capacity.lock() else {
+            // Preview is disposable; a poisoned admission mutex must not take
+            // down the request/terminal path. The caller will use custody.
+            return None;
+        };
+        self.runner_progress
+            .retain(|_, sender| sender.receiver_count() > 0);
+        let key = (
+            identity.user_id.clone(),
+            identity.attempt_id.as_str().to_owned(),
+        );
+        if let Some(sender) = self.runner_progress.get(&key) {
+            return Some(sender.subscribe());
+        }
+        if self.runner_progress.len() >= MAX_RUNNER_PROGRESS_ATTEMPTS {
+            return None;
+        }
+        if self
+            .runner_progress
+            .iter()
+            .filter(|entry| entry.key().0 == identity.user_id)
+            .count()
+            >= MAX_RUNNER_PROGRESS_ATTEMPTS_PER_USER
+        {
+            return None;
+        }
+        let (sender, receiver) = broadcast::channel(RUNNER_PROGRESS_CHANNEL_CAPACITY);
+        match self.runner_progress.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Some(entry.get().subscribe()),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(sender);
+                Some(receiver)
+            }
+        }
+    }
+
+    /// Publish one already-authenticated progress batch to same-pod run
+    /// owners.  No await or backpressure occurs here: previews are
+    /// disposable, and terminal delivery has a separate reserved path.
+    pub fn publish_runner_inference_progress(
+        &self,
+        progress: RunnerInferenceProgressBatch,
+    ) -> Result<(), RunnerInferenceRejection> {
+        progress
+            .validate_wire_bounds()
+            .map_err(|_| RunnerInferenceRejection::InvalidEvidence)?;
+        let key = (
+            progress.attempt.user_id.clone(),
+            progress.attempt.attempt_id.as_str().to_owned(),
+        );
+        let Some(sender) = self.runner_progress.get(&key) else {
+            return Ok(());
+        };
+        if sender.send(progress).is_err() {
+            drop(sender);
+            self.runner_progress
+                .remove_if(&key, |_, sender| sender.receiver_count() == 0);
+        }
+        Ok(())
     }
 
     /// Reserve bounded outbound channel space without retaining a map lock.
@@ -1215,6 +1308,41 @@ pub struct EdgeConnectionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner_inference::{
+        RunnerInferenceId, RunnerInferenceProgressEvent, RunnerInferenceProviderEvent,
+    };
+
+    fn progress_identity(user_id: &str) -> RunnerInferenceAttemptIdentity {
+        use crate::runner_inference::{
+            RunnerInferenceArtifactReference, RunnerInferenceBindingIdentity,
+            RunnerInferenceDigest, RunnerInferenceId,
+        };
+        use std::num::NonZeroU64;
+        RunnerInferenceAttemptIdentity {
+            user_id: user_id.to_string(),
+            scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-progress".to_string(),
+                turn: 1,
+                round: 0,
+                operation_id: "primary_agent".to_string(),
+                logical_attempt: 0,
+            },
+            invocation_id: RunnerInferenceId::new("invocation-progress").unwrap(),
+            attempt_id: RunnerInferenceId::new("attempt-progress").unwrap(),
+            binding: RunnerInferenceBindingIdentity {
+                runner_id: RunnerInferenceId::new("runner-progress").unwrap(),
+                journal_id: RunnerInferenceId::new("journal-progress").unwrap(),
+                binding_id: RunnerInferenceId::new("binding-progress").unwrap(),
+                binding_revision: NonZeroU64::new(1).unwrap(),
+                profile_revision: NonZeroU64::new(1).unwrap(),
+            },
+            request: RunnerInferenceArtifactReference {
+                artifact_id: RunnerInferenceId::new("request-progress").unwrap(),
+                sha256: RunnerInferenceDigest::new("c".repeat(64)).unwrap(),
+                byte_len: NonZeroU64::new(1).unwrap(),
+            },
+        }
+    }
 
     fn inference_publication(runner_id: &str) -> RunnerInferenceBindingPublication {
         serde_json::from_value(serde_json::json!({
@@ -1313,6 +1441,115 @@ mod tests {
             .await
             .unwrap();
         assert!(pool.runner_inference_wakeup("bob", "runner", new).is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_progress_is_attempt_and_user_isolated() {
+        let pool = EdgeConnectionPool::new();
+        let alice = progress_identity("alice");
+        let bob = progress_identity("bob");
+        let mut alice_rx = pool
+            .subscribe_runner_inference_progress(&alice)
+            .expect("alice subscriber");
+        let mut bob_rx = pool
+            .subscribe_runner_inference_progress(&bob)
+            .expect("bob subscriber");
+        let batch = RunnerInferenceProgressBatch::new(
+            alice.clone(),
+            vec![RunnerInferenceProgressEvent {
+                sequence: 0,
+                event: RunnerInferenceProviderEvent::Json(
+                    serde_json::json!({"choices":[{"delta":{"content":"alice-only"}}]}),
+                ),
+            }],
+        )
+        .unwrap();
+        pool.publish_runner_inference_progress(batch).unwrap();
+        let received = alice_rx.recv().await.unwrap();
+        assert_eq!(received.attempt, alice);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), bob_rx.recv())
+                .await
+                .is_err(),
+            "a same-attempt ID under another user must not receive progress"
+        );
+
+        let invalid = RunnerInferenceProgressBatch {
+            attempt: progress_identity("alice"),
+            events: vec![
+                RunnerInferenceProgressEvent {
+                    sequence: 1,
+                    event: RunnerInferenceProviderEvent::Done,
+                },
+                RunnerInferenceProgressEvent {
+                    sequence: 1,
+                    event: RunnerInferenceProviderEvent::Eof,
+                },
+            ],
+        };
+        assert_eq!(
+            pool.publish_runner_inference_progress(invalid),
+            Err(RunnerInferenceRejection::InvalidEvidence)
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_progress_does_not_cross_pool_without_a_typed_relay() {
+        let owner = progress_identity("cross-pod-user");
+        let local_pool = EdgeConnectionPool::new();
+        let remote_pool = EdgeConnectionPool::new();
+        let mut local_rx = local_pool
+            .subscribe_runner_inference_progress(&owner)
+            .expect("local subscriber");
+        let batch = RunnerInferenceProgressBatch::new(
+            owner,
+            vec![RunnerInferenceProgressEvent {
+                sequence: 0,
+                event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                    "choices": [{"delta": {"content": "remote-only"}}]
+                })),
+            }],
+        )
+        .unwrap();
+        remote_pool
+            .publish_runner_inference_progress(batch)
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), local_rx.recv())
+                .await
+                .is_err(),
+            "a process-local hub must not masquerade as cross-pod transport"
+        );
+    }
+
+    #[test]
+    fn runner_progress_user_cap_does_not_starve_another_user() {
+        let pool = EdgeConnectionPool::new();
+        let mut alice_receivers = Vec::new();
+        for index in 0..MAX_RUNNER_PROGRESS_ATTEMPTS_PER_USER {
+            let mut identity = progress_identity("alice");
+            identity.attempt_id =
+                RunnerInferenceId::new(format!("alice-attempt-{index}")).expect("test attempt id");
+            alice_receivers.push(
+                pool.subscribe_runner_inference_progress(&identity)
+                    .expect("alice stays within her preview cap"),
+            );
+        }
+        let mut alice_over_cap = progress_identity("alice");
+        alice_over_cap.attempt_id = RunnerInferenceId::new("alice-attempt-over-cap").unwrap();
+        assert!(
+            pool.subscribe_runner_inference_progress(&alice_over_cap)
+                .is_none(),
+            "one noisy user must not exceed the per-user preview cap"
+        );
+
+        let bob = progress_identity("bob");
+        assert!(
+            pool.subscribe_runner_inference_progress(&bob).is_some(),
+            "alice's cap must not starve another user's live preview"
+        );
+        assert!(pool.runner_progress.len() <= MAX_RUNNER_PROGRESS_ATTEMPTS);
+        drop(alice_receivers);
     }
     use serde_json::json;
 

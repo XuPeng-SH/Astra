@@ -83,6 +83,20 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
     builder
 }
 
+/// The local host startup/attachment boundary uses this complete set of
+/// supported network settings. It is not a general environment allowlist.
+pub const RUNNER_NETWORK_ENV_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ASTRA_RUNNER_CA_BUNDLE",
+];
+
 /// Build the client used by Runner-local model traffic.
 ///
 /// Proxy settings use the same explicit external-egress policy as Server

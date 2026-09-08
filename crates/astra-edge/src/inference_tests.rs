@@ -1,9 +1,12 @@
 use super::*;
-use crate::inference_connection::InferenceConnection;
+use crate::inference_connection::{InferenceConnection, MAX_PENDING_PROGRESS_FOR_TEST};
 use astra_credentials::{LocalInferenceProtocol, LocalModelDefinition};
 use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+#[path = "managed_host_tests.rs"]
+mod managed_host_tests;
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -223,6 +226,70 @@ async fn durable_fence_precedes_exact_single_http_call_and_ack_erases_only_paylo
             .unwrap(),
         DispatchOutcome::Acknowledged
     ));
+}
+
+#[tokio::test]
+async fn runner_preview_is_attempt_keyed_and_does_not_replace_terminal_custody() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "data: {\"id\":\"preview-response\",\"choices\":[{\"delta\":{\"content\":\"live\"}}]}\n\ndata: [DONE]\n\n",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = Fixture::new(&server.uri()).await;
+    let grant = fixture.grant("preview", REQUEST).await;
+    let mut previews = fixture.host.subscribe_preview();
+
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(grant.clone(), REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::Started
+    ));
+
+    let mut observed = Vec::new();
+    for _ in 0..3 {
+        observed.push(
+            tokio::time::timeout(Duration::from_secs(2), previews.recv())
+                .await
+                .expect("preview should arrive")
+                .expect("preview channel should remain open"),
+        );
+    }
+    assert_eq!(
+        observed
+            .iter()
+            .map(|preview| preview.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(observed.iter().all(|preview| {
+        preview.attempt == grant.attempt && !format!("{preview:?}").contains("live")
+    }));
+    assert!(matches!(
+        observed[0].event,
+        RunnerInferenceProviderEvent::Json(_)
+    ));
+    assert!(matches!(
+        observed[1].event,
+        RunnerInferenceProviderEvent::Done
+    ));
+    assert!(matches!(
+        observed[2].event,
+        RunnerInferenceProviderEvent::Eof
+    ));
+
+    let payload = fixture.terminal().await;
+    let response: RunnerInferenceResponse = serde_json::from_str(&payload.response_json).unwrap();
+    assert_eq!(response.events.len(), 3);
+    assert_eq!(
+        response.transport.status,
+        RunnerInferenceTransportStatus::Complete
+    );
 }
 
 #[tokio::test]
@@ -517,6 +584,148 @@ async fn request_credit_generation_and_offset_gate_precede_provider_execution() 
         fixture.host.reconcile(&grant).await.unwrap(),
         DispatchOutcome::Unknown
     ));
+}
+
+#[tokio::test]
+async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequences() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let grant = fixture.grant("preview-connection", REQUEST).await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::Accepted {
+                protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+                delivery_generation: 7,
+                max_artifact_bytes: RUNNER_INFERENCE_ARTIFACT_BYTES as u32,
+                server_unix_ms: 1_000_000,
+            },
+        })
+        .await
+        .unwrap();
+
+    let first = connection
+        .handle_preview(InferencePreview {
+            attempt: grant.attempt.clone(),
+            sequence: 0,
+            event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                "choices": [{"delta": {"content": "first"}}]
+            })),
+        })
+        .unwrap();
+    assert!(matches!(
+        first.as_slice(),
+        [EdgeClientMessage::InferenceProgress { progress, delivery_generation }]
+            if *delivery_generation == 7
+                && progress.events.len() == 1
+                && progress.events[0].sequence == 0
+    ));
+
+    // The first event is no longer in the pending batch, so the duplicate is
+    // still rejected by the retained sequence watermark rather than echoed.
+    assert!(
+        connection
+            .handle_preview(InferencePreview {
+                attempt: grant.attempt.clone(),
+                sequence: 0,
+                event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                    "choices": [{"delta": {"content": "first"}}]
+                })),
+            })
+            .unwrap()
+            .is_empty()
+    );
+
+    let terminal_batch = connection
+        .handle_preview(InferencePreview {
+            attempt: grant.attempt,
+            sequence: 1,
+            event: RunnerInferenceProviderEvent::Done,
+        })
+        .unwrap();
+    assert!(matches!(
+        terminal_batch.as_slice(),
+        [EdgeClientMessage::InferenceProgress { progress, .. }]
+            if progress.events.len() == 1
+                && progress.events[0].sequence == 1
+                && matches!(progress.events[0].event, RunnerInferenceProviderEvent::Done)
+    ));
+}
+
+#[tokio::test]
+async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_marker() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::Accepted {
+                protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+                delivery_generation: 7,
+                max_artifact_bytes: RUNNER_INFERENCE_ARTIFACT_BYTES as u32,
+                server_unix_ms: 1_000_000,
+            },
+        })
+        .await
+        .unwrap();
+
+    for index in 0..MAX_PENDING_PROGRESS_FOR_TEST {
+        let grant = fixture
+            .grant(&format!("failed-preview-{index}"), REQUEST)
+            .await;
+        assert!(
+            !connection
+                .handle_preview(InferencePreview {
+                    attempt: grant.attempt.clone(),
+                    sequence: 0,
+                    event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                        "choices": [{"delta": {"content": "partial"}}]
+                    })),
+                })
+                .unwrap()
+                .is_empty()
+        );
+        let response = RunnerInferenceResponse {
+            events: vec![RunnerInferenceProviderEvent::Json(serde_json::json!({
+                "choices": [{"delta": {"content": "partial"}}]
+            }))],
+            transport: RunnerInferenceTransportTerminal {
+                status: RunnerInferenceTransportStatus::Transport,
+                delivery: RunnerInferenceDeliveryEvidence::MayHaveDispatched,
+                provider_bytes: 1,
+                events_delivered: 1,
+            },
+        };
+        let payload = RetainedTerminal::new(
+            physical_terminal(&response),
+            serde_json::to_string(&response).unwrap(),
+        )
+        .unwrap();
+        let stored = grant.clone();
+        fixture
+            .host
+            .with_journal(move |journal| {
+                assert!(journal.fence(&stored)?);
+                journal.complete(&stored, payload)
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        connection.pending_progress_len_for_test(),
+        MAX_PENDING_PROGRESS_FOR_TEST
+    );
+    let messages = connection.poll().await.unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, EdgeClientMessage::InferenceTerminal { .. }))
+    );
+    assert!(
+        connection.pending_progress_len_for_test() == 0,
+        "terminal polling must retire failed streams even without Done/Eof"
+    );
 }
 
 #[tokio::test]

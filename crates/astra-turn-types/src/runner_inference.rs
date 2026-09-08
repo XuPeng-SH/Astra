@@ -13,6 +13,12 @@ use sha2::{Digest, Sha256};
 pub const RUNNER_INFERENCE_FRAME_BYTES: usize = 256 * 1024;
 pub const RUNNER_INFERENCE_CHUNK_BYTES: usize = 32 * 1024;
 pub const RUNNER_INFERENCE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum wire size of one provisional progress batch.  Progress is
+/// disposable and must never consume the larger terminal-transfer budget.
+pub const RUNNER_INFERENCE_PROGRESS_BATCH_BYTES: usize = RUNNER_INFERENCE_CHUNK_BYTES;
+/// A batch is deliberately bounded by both bytes and event count.  The count
+/// protects the decoder from a peer sending many tiny frames in one message.
+pub const RUNNER_INFERENCE_PROGRESS_MAX_EVENTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -322,6 +328,86 @@ impl std::fmt::Debug for RunnerInferenceProviderEvent {
             Self::Done => "Done",
             Self::Eof => "Eof",
         })
+    }
+}
+
+/// One provisional provider event.  The sequence is local to the immutable
+/// attempt and is not a custody watermark: gaps are allowed when the
+/// disposable preview ring or a connection drops an event.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceProgressEvent {
+    pub sequence: u64,
+    pub event: RunnerInferenceProviderEvent,
+}
+
+impl std::fmt::Debug for RunnerInferenceProgressEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerInferenceProgressEvent")
+            .field("sequence", &self.sequence)
+            .field("event", &self.event)
+            .finish()
+    }
+}
+
+/// A bounded, attempt-keyed provisional progress batch.  This value is never
+/// terminal/usage authority and is not persisted.  The full response remains
+/// in Runner custody and is transferred through the existing terminal path.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceProgressBatch {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub events: Vec<RunnerInferenceProgressEvent>,
+}
+
+impl std::fmt::Debug for RunnerInferenceProgressBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerInferenceProgressBatch")
+            .field("attempt_id", &self.attempt.attempt_id)
+            .field("event_count", &self.events.len())
+            .field(
+                "sequence_range",
+                &self
+                    .events
+                    .first()
+                    .zip(self.events.last())
+                    .map(|(first, last)| (first.sequence, last.sequence)),
+            )
+            .finish()
+    }
+}
+
+impl RunnerInferenceProgressBatch {
+    pub fn new(
+        attempt: RunnerInferenceAttemptIdentity,
+        events: Vec<RunnerInferenceProgressEvent>,
+    ) -> Result<Self, &'static str> {
+        let batch = Self { attempt, events };
+        batch.validate_wire_bounds()?;
+        Ok(batch)
+    }
+
+    /// Validate bounds before any fanout or decoder allocation.  Sequence
+    /// gaps are valid (a preview may be dropped), but a batch itself must be
+    /// ordered and may not repeat one sequence number.
+    pub fn validate_wire_bounds(&self) -> Result<(), &'static str> {
+        if self.events.is_empty() || self.events.len() > RUNNER_INFERENCE_PROGRESS_MAX_EVENTS {
+            return Err("inference progress event count exceeds bound");
+        }
+        if self
+            .events
+            .windows(2)
+            .any(|events| events[0].sequence >= events[1].sequence)
+        {
+            return Err("inference progress sequence is not strictly increasing");
+        }
+        let encoded = serde_json::to_vec(self).map_err(|_| "inference progress encoding failed")?;
+        if encoded.len() > RUNNER_INFERENCE_PROGRESS_BATCH_BYTES {
+            return Err("inference progress batch exceeds byte bound");
+        }
+        Ok(())
     }
 }
 
@@ -855,5 +941,80 @@ mod tests {
         assert_eq!(normalized.input.cache_read_tokens, 800);
         assert_eq!(normalized.input.cache_creation_tokens, 100);
         assert_eq!(normalized.output_tokens, 75);
+    }
+
+    fn progress_attempt(user_id: &str) -> RunnerInferenceAttemptIdentity {
+        RunnerInferenceAttemptIdentity {
+            user_id: user_id.to_string(),
+            scope: crate::InferenceInvocationScope::Session {
+                session_id: "session-progress".to_string(),
+                turn: 1,
+                round: 0,
+                operation_id: "primary_agent".to_string(),
+                logical_attempt: 0,
+            },
+            invocation_id: RunnerInferenceId::new("invocation-progress").unwrap(),
+            attempt_id: RunnerInferenceId::new("attempt-progress").unwrap(),
+            binding: RunnerInferenceBindingIdentity {
+                runner_id: RunnerInferenceId::new("runner-progress").unwrap(),
+                journal_id: RunnerInferenceId::new("journal-progress").unwrap(),
+                binding_id: RunnerInferenceId::new("binding-progress").unwrap(),
+                binding_revision: NonZeroU64::new(1).unwrap(),
+                profile_revision: NonZeroU64::new(1).unwrap(),
+            },
+            request: RunnerInferenceArtifactReference {
+                artifact_id: RunnerInferenceId::new("request-progress").unwrap(),
+                sha256: RunnerInferenceDigest::new("b".repeat(64)).unwrap(),
+                byte_len: NonZeroU64::new(1).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn progress_batch_is_bounded_and_allows_explicit_gaps() {
+        let attempt = progress_attempt("user-progress");
+        let batch = RunnerInferenceProgressBatch::new(
+            attempt.clone(),
+            vec![
+                RunnerInferenceProgressEvent {
+                    sequence: 2,
+                    event: RunnerInferenceProviderEvent::Json(json!({"delta":"a"})),
+                },
+                RunnerInferenceProgressEvent {
+                    sequence: 5,
+                    event: RunnerInferenceProviderEvent::Json(json!({"delta":"b"})),
+                },
+            ],
+        )
+        .expect("dropped previews are represented by sequence gaps");
+        assert_eq!(batch.attempt, attempt);
+        assert!(
+            RunnerInferenceProgressBatch::new(
+                batch.attempt.clone(),
+                vec![
+                    RunnerInferenceProgressEvent {
+                        sequence: 5,
+                        event: RunnerInferenceProviderEvent::Done,
+                    },
+                    RunnerInferenceProgressEvent {
+                        sequence: 5,
+                        event: RunnerInferenceProviderEvent::Eof,
+                    },
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            RunnerInferenceProgressBatch::new(
+                batch.attempt,
+                vec![RunnerInferenceProgressEvent {
+                    sequence: 1,
+                    event: RunnerInferenceProviderEvent::Json(
+                        json!({"content":"x".repeat(RUNNER_INFERENCE_PROGRESS_BATCH_BYTES)}),
+                    ),
+                }],
+            )
+            .is_err()
+        );
     }
 }

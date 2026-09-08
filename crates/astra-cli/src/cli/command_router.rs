@@ -329,12 +329,10 @@ pub(crate) fn finalize_one_shot_stream_result_with_request_lease(
 
 fn effective_one_shot_model<'a>(
     explicit_model: Option<&'a str>,
-    restored_model: Option<&'a str>,
     fallback_model: Option<&'a str>,
 ) -> Option<&'a str> {
     explicit_model
         .filter(|model| !model.trim().is_empty())
-        .or_else(|| restored_model.filter(|model| !model.trim().is_empty()))
         .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
 }
 
@@ -349,11 +347,44 @@ async fn resolve_one_shot_model(
     token: &str,
     explicit_model: Option<&str>,
     restored_model: Option<&str>,
+    restored_offering_id: Option<&str>,
+    resume_requires_explicit_provider: bool,
     fallback_model: Option<&str>,
 ) -> Result<ResolvedOneShotModel, String> {
-    let model = if let Some(model) =
-        effective_one_shot_model(explicit_model, restored_model, fallback_model)
+    // An explicit model is a fresh user admission and therefore wins over a
+    // resumed preference. A resumed exact Offering is next: resolve that
+    // opaque identity directly, never by looking up its old display name.
+    let model = if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
+        Some(model.to_string())
+    } else if let Some(offering_id) = restored_offering_id.filter(|id| !id.trim().is_empty()) {
+        let selection = session_runtime::resolve_pinned_model_selection(
+            api,
+            token,
+            restored_model.unwrap_or_default(),
+            Some(offering_id),
+        )
+        .await
+        .map_err(|error| format!("failed to restore Offering '{offering_id}': {error}"))?;
+        let model = restored_model
+            .map(|requested| {
+                let base = astra_turn_core::thinking_config::resolve_model_thinking(requested).0;
+                format!("{}{}", selection.name, &requested[base.len()..])
+            })
+            .unwrap_or_else(|| selection.name.clone());
+        return Ok(ResolvedOneShotModel {
+            model: Some(model),
+            offering_id: Some(selection.offering_id),
+        });
+    } else if restored_model.is_some_and(|model| !model.trim().is_empty())
+        || resume_requires_explicit_provider
     {
+        return Err(
+            "resumed session has no exact causal Offering; choose one explicitly with --model or /model"
+                .to_string(),
+        );
+    } else if let Some(model) = effective_one_shot_model(None, fallback_model) {
+        // A legacy/session display model without an exact Offering is not
+        // authority. A configured invocation model is a new admission.
         Some(model.to_string())
     } else {
         match session_runtime::resolve_server_default_model(api, token).await {
@@ -424,10 +455,162 @@ mod exact_model_resolution_tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
-        let error = resolve_one_shot_model(&api, "token", Some("overflow-model"), None, None)
-            .await
-            .expect_err("missing Offering must fail closed");
+        let error = resolve_one_shot_model(
+            &api,
+            "token",
+            Some("overflow-model"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("missing Offering must fail closed");
         assert!(error.contains("was not found"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn resumed_one_shot_uses_exact_offering_instead_of_old_model_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "offering_id": "runner-offer",
+                    "access_id": "runner-binding",
+                    "access_kind": "this_device",
+                    "access_label": "This device",
+                    "execution_placement": "edge",
+                    "name": "renamed-model",
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 128000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                }],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 1,
+                "catalog_revision": "sha256:test"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        let resolved = resolve_one_shot_model(
+            &api,
+            "token",
+            None,
+            Some("stale-model-name"),
+            Some("runner-offer"),
+            false,
+            Some("configured-fallback"),
+        )
+        .await
+        .expect("exact Offering should be resolved");
+
+        assert_eq!(resolved.model.as_deref(), Some("renamed-model"));
+        assert_eq!(resolved.offering_id.as_deref(), Some("runner-offer"));
+    }
+
+    #[tokio::test]
+    async fn explicit_one_shot_model_wins_over_resumed_offering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {
+                        "offering_id": "explicit-offer",
+                        "access_id": "server-binding",
+                        "access_kind": "self_hosted",
+                        "access_label": "Server",
+                        "execution_placement": "server",
+                        "name": "explicit-model",
+                        "provider": "openai",
+                        "description": null,
+                        "is_active": true,
+                        "context_window": 128000,
+                        "max_completion_tokens": null,
+                        "architecture": null,
+                        "thinking_capability": null
+                    },
+                    {
+                        "offering_id": "runner-offer",
+                        "access_id": "runner-binding",
+                        "access_kind": "this_device",
+                        "access_label": "This device",
+                        "execution_placement": "edge",
+                        "name": "renamed-model",
+                        "provider": "openai",
+                        "description": null,
+                        "is_active": true,
+                        "context_window": 128000,
+                        "max_completion_tokens": null,
+                        "architecture": null,
+                        "thinking_capability": null
+                    }
+                ],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 2,
+                "catalog_revision": "sha256:test"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+
+        let resolved = resolve_one_shot_model(
+            &api,
+            "token",
+            Some("explicit-model"),
+            Some("stale-model-name"),
+            Some("runner-offer"),
+            false,
+            Some("configured-fallback"),
+        )
+        .await
+        .expect("explicit model should be admitted");
+
+        assert_eq!(resolved.model.as_deref(), Some("explicit-model"));
+        assert_eq!(resolved.offering_id.as_deref(), Some("explicit-offer"));
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_model_requires_explicit_new_admission() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("client");
+        let error = resolve_one_shot_model(
+            &api,
+            "token",
+            None,
+            Some("stale-model-name"),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("legacy resume must not use a model-name fallback");
+
+        assert!(error.contains("no exact causal Offering"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_without_model_or_offering_requires_explicit_admission() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("client");
+        let error = resolve_one_shot_model(
+            &api,
+            "token",
+            None,
+            None,
+            None,
+            true,
+            Some("configured-fallback"),
+        )
+        .await
+        .expect_err("legacy resume must not use configured or Server defaults");
+
+        assert!(error.contains("no exact causal Offering"), "{error}");
     }
 }
 
@@ -875,6 +1058,11 @@ async fn execute_cli_command_impl(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    let explicit_global_model = cli_context.explicit_model.as_deref();
+    let fallback_global_model = explicit_global_model
+        .is_none()
+        .then_some(global_model.as_deref())
+        .flatten();
     match command {
         // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
@@ -955,9 +1143,11 @@ async fn execute_cli_command_impl(
             let resolved_model = resolve_one_shot_model(
                 api,
                 &token,
-                None,
+                explicit_global_model,
                 session_routing.restored_model(),
-                global_model.as_deref(),
+                session_routing.restored_offering_id(),
+                session_routing.resume_requires_explicit_provider(),
+                fallback_global_model,
             )
             .await?;
             let effective_model = resolved_model.model;
@@ -1412,6 +1602,11 @@ async fn execute_cli_command_impl(
                 let mut interactive_context = cli_context
                     .clone()
                     .with_permission_mode(args.permission_mode.clone());
+                if let Some(model) = args.model.as_deref() {
+                    interactive_context.explicit_model =
+                        crate::cli::cli_config::cli_utils::normalize_model_override(Some(model))
+                            .map(str::to_owned);
+                }
                 let resume_session_id = args
                     .session_id
                     .clone()
@@ -1485,12 +1680,15 @@ async fn execute_cli_command_impl(
                 }
             }
             let session_id = session_routing.server_session_id.clone();
+            let explicit_model = args.model.as_deref().or(explicit_global_model);
             let model_future = resolve_one_shot_model(
                 api,
                 &token,
-                args.model.as_deref(),
+                explicit_model,
                 session_routing.restored_model(),
-                global_model.as_deref(),
+                session_routing.restored_offering_id(),
+                session_routing.resume_requires_explicit_provider(),
+                fallback_global_model,
             );
             let resolved_model = if let Some(deadline) = one_shot_terminal_deadline {
                 tokio::time::timeout_at(deadline, model_future)
@@ -2746,11 +2944,13 @@ fn final_json_output_with_context(
 
 /// `--print` / `-p` mode: headless single-shot query, prints response and exits.
 /// Reads message from positional args (Message variant) or stdin.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_print_mode(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     output_format: &str,
-    model: Option<&str>,
+    explicit_model: Option<&str>,
+    fallback_model: Option<&str>,
     system_prompt: Option<&str>,
     command: Option<Command>,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
@@ -2795,8 +2995,16 @@ pub(crate) async fn run_print_mode(
         }
     }
     let session_id = session_routing.server_session_id.clone();
-    let resolved_model =
-        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
+    let resolved_model = resolve_one_shot_model(
+        api,
+        &token,
+        explicit_model,
+        session_routing.restored_model(),
+        session_routing.restored_offering_id(),
+        session_routing.resume_requires_explicit_provider(),
+        fallback_model,
+    )
+    .await?;
     let effective_model = resolved_model.model;
     let effective_offering_id = resolved_model.offering_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
@@ -3927,17 +4135,13 @@ mod one_shot_effective_settings_tests {
     use crate::cli::permission_manager::PermissionMode;
 
     #[test]
-    fn effective_one_shot_model_prefers_explicit_then_restored_then_fallback() {
+    fn effective_one_shot_model_prefers_explicit_then_fallback() {
         assert_eq!(
-            effective_one_shot_model(Some("chat-explicit"), Some("restored"), Some("fallback")),
+            effective_one_shot_model(Some("chat-explicit"), Some("fallback")),
             Some("chat-explicit")
         );
         assert_eq!(
-            effective_one_shot_model(None, Some("restored"), Some("fallback")),
-            Some("restored")
-        );
-        assert_eq!(
-            effective_one_shot_model(None, None, Some("fallback")),
+            effective_one_shot_model(None, Some("fallback")),
             Some("fallback")
         );
     }

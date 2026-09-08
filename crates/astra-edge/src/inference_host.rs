@@ -20,7 +20,7 @@ use astra_inference_adapter::{ExactProviderRequest, ProviderProtocol, RequestIde
 use astra_turn_types::runner_inference::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +29,38 @@ use crate::inference_journal::{InferenceJournal, JournalRecord, RecordState};
 
 const MAX_ACTIVE: usize = 4;
 const RESPONSE_OVERHEAD_RESERVE: usize = 64 * 1024;
+
+/// Provisional preview events are intentionally disposable.  A bounded
+/// broadcast keeps a slow/reconnecting Server from applying backpressure to
+/// provider I/O or terminal custody.  Sequence gaps are observable by the
+/// protocol consumer and the durable terminal remains the recovery boundary.
+pub const INFERENCE_PREVIEW_CHANNEL_CAPACITY: usize = 32;
+/// Keep each preview payload within the normal response-chunk budget.  The
+/// complete provider event is still retained for canonical custody; an
+/// oversized event is simply represented by a sequence gap in the preview.
+const INFERENCE_PREVIEW_EVENT_BYTES: usize = RUNNER_INFERENCE_CHUNK_BYTES;
+
+/// One normalized provider event for live, provisional Runner progress.
+///
+/// This value is never persisted and is not response/usage authority.  It is
+/// keyed by the immutable attempt identity so a shared host cannot mix
+/// sessions or users in a consumer, even when several attempts are active.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InferencePreview {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub sequence: u64,
+    pub event: RunnerInferenceProviderEvent,
+}
+
+impl std::fmt::Debug for InferencePreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferencePreview")
+            .field("attempt_id", &self.attempt.attempt_id)
+            .field("sequence", &self.sequence)
+            .field("event", &self.event)
+            .finish()
+    }
+}
 
 #[cfg(all(test, unix))]
 #[path = "inference_tests.rs"]
@@ -111,6 +143,24 @@ pub enum DispatchOutcome {
 struct HostState {
     active: HashMap<String, CancellationToken>,
     attached_environment: HashMap<String, (u64, Arc<ResolvedLocalCredential>)>,
+    managed: bool,
+    clients: HashMap<String, HashMap<String, (u64, Arc<ResolvedLocalCredential>)>>,
+}
+
+/// Local attachment identity is deliberately separate from the durable host.
+/// A terminal's environment cannot replace another terminal's provider account.
+pub fn local_binding_id(name: &str, client: Option<&str>) -> String {
+    match client {
+        None => format!("{:x}", Sha256::digest(name.as_bytes())),
+        Some(client) => {
+            let mut hash = Sha256::new();
+            for field in ["astra-environment-attachment-v1", client, name] {
+                hash.update((field.len() as u64).to_be_bytes());
+                hash.update(field.as_bytes());
+            }
+            format!("env-{}", &format!("{:x}", hash.finalize())[..60])
+        }
+    }
 }
 
 pub struct InferenceHost {
@@ -123,6 +173,7 @@ pub struct InferenceHost {
     transport: ProviderTransport,
     state: Mutex<HostState>,
     terminal_ready: Notify,
+    preview_tx: broadcast::Sender<InferencePreview>,
 }
 
 impl std::fmt::Debug for InferenceHost {
@@ -161,6 +212,7 @@ impl InferenceHost {
                 .await
                 .map_err(|_| InferenceHostError::JournalIo)??;
         let journal_id = journal.journal_id().clone();
+        let (preview_tx, _) = broadcast::channel(INFERENCE_PREVIEW_CHANNEL_CAPACITY);
         let host = Arc::new(Self {
             owner,
             journal_id,
@@ -172,6 +224,7 @@ impl InferenceHost {
             transport,
             state: Mutex::new(HostState::default()),
             terminal_ready: Notify::new(),
+            preview_tx,
         });
         // Recovered fences are evidence of possible delivery, never requests to
         // replay. Persist their unknown terminal before advertising capacity.
@@ -206,6 +259,13 @@ impl InferenceHost {
         &self.process_boot_nonce
     }
 
+    /// Subscribe to disposable live provider previews.  The stream is
+    /// intentionally not replayable: a lagging/reconnecting observer must
+    /// converge from the same durable terminal custody as every other client.
+    pub fn subscribe_preview(&self) -> broadcast::Receiver<InferencePreview> {
+        self.preview_tx.subscribe()
+    }
+
     async fn config(&self) -> Result<LocalModelConfig, InferenceHostError> {
         let path = self.models_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -232,12 +292,14 @@ impl InferenceHost {
         &self,
     ) -> Result<Vec<RunnerInferenceBindingDefinition>, InferenceHostError> {
         let config = self.config().await?;
-        self.project_bindings(&config).await
+        let state = self.state.lock().await;
+        self.project_bindings(&config, &state).await
     }
 
     async fn project_bindings(
         &self,
         config: &LocalModelConfig,
+        state: &HostState,
     ) -> Result<Vec<RunnerInferenceBindingDefinition>, InferenceHostError> {
         if config.models.len() > 256 {
             return Err(InferenceHostError::Capacity);
@@ -246,15 +308,18 @@ impl InferenceHost {
             return Ok(Vec::new());
         }
         let published = self.with_journal(|journal| Ok(journal.published())).await?;
-        config
-            .models
-            .iter()
-            .map(|(name, model)| {
+        let candidates = Self::binding_candidates(config, state);
+        if candidates.len() > 256 {
+            return Err(InferenceHostError::Capacity);
+        }
+        candidates
+            .into_iter()
+            .map(|(name, client)| {
+                let model = &config.models[name];
                 let profile_revision = NonZeroU64::new(model.binding_revision)
                     .ok_or(InferenceHostError::BindingUnavailable)?;
-                let binding_id =
-                    RunnerInferenceId::new(format!("{:x}", Sha256::digest(name.as_bytes())))
-                        .map_err(|_| InferenceHostError::BindingUnavailable)?;
+                let binding_id = RunnerInferenceId::new(local_binding_id(name, client))
+                    .map_err(|_| InferenceHostError::BindingUnavailable)?;
                 let binding_revision = match published.get(binding_id.as_str()) {
                     Some(previous)
                         if previous.enabled
@@ -290,6 +355,90 @@ impl InferenceHost {
                 })
             })
             .collect()
+    }
+
+    fn binding_candidates<'a>(
+        config: &'a LocalModelConfig,
+        state: &'a HostState,
+    ) -> Vec<(&'a String, Option<&'a str>)> {
+        let mut candidates = Vec::new();
+        for (name, model) in &config.models {
+            if !state.managed {
+                candidates.push((name, None));
+            } else if matches!(model.credential, LocalCredentialRef::Environment { .. }) {
+                for (client, credentials) in &state.clients {
+                    if credentials
+                        .get(name)
+                        .is_some_and(|(revision, _)| *revision == model.binding_revision)
+                    {
+                        candidates.push((name, Some(client.as_str())));
+                    }
+                }
+            } else if !state.clients.is_empty() {
+                candidates.push((name, None));
+            }
+        }
+        candidates
+    }
+
+    /// Must be set before the managed connection can publish or accept work.
+    pub async fn enable_managed(&self) {
+        self.state.lock().await.managed = true;
+    }
+
+    pub async fn attach_client(&self, client: String) -> Result<(), InferenceHostError> {
+        let mut state = self.state.lock().await;
+        if !state.managed || state.clients.len() >= 32 || state.clients.contains_key(&client) {
+            return Err(InferenceHostError::Capacity);
+        }
+        state.clients.insert(client, HashMap::new());
+        Ok(())
+    }
+
+    pub async fn refresh_client(
+        &self,
+        client: &str,
+        credentials: Vec<(String, u64, ResolvedLocalCredential)>,
+    ) -> Result<(), InferenceHostError> {
+        let config = self.config().await?;
+        let mut state = self.state.lock().await;
+        let current = state
+            .clients
+            .get_mut(client)
+            .ok_or(InferenceHostError::OwnerMismatch)?;
+        let mut replacement = HashMap::new();
+        for (name, revision, credential) in credentials {
+            if !config.models.get(&name).is_some_and(|model| {
+                model.binding_revision == revision
+                    && matches!(model.credential, LocalCredentialRef::Environment { .. })
+            }) {
+                // A concurrent local save is retried on the next refresh, not
+                // evidence that another configuration generation is authorized.
+                continue;
+            }
+            replacement.insert(name, (revision, Arc::new(credential)));
+        }
+        let previous = std::mem::replace(current, replacement);
+        if Self::binding_candidates(&config, &state).len() > 256 {
+            *state
+                .clients
+                .get_mut(client)
+                .ok_or(InferenceHostError::OwnerMismatch)? = previous;
+            return Err(InferenceHostError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub async fn detach_client(&self, client: &str) {
+        // Active requests already own their exact prepared headers. Detach
+        // prevents new dispatch and retires this attachment's publication; it
+        // is not a cancel command and never destroys retained custody.
+        self.state.lock().await.clients.remove(client);
+        self.terminal_ready.notify_one();
+    }
+
+    pub async fn active_count(&self) -> usize {
+        self.state.lock().await.active.len()
     }
 
     /// Environment material must come from the attaching process, never from
@@ -407,19 +556,18 @@ impl InferenceHost {
             }
             let config_lease = self.config_lease().await?;
             let config = config_lease.config();
-            let definitions = self.project_bindings(config).await?;
+            let definitions = self.project_bindings(config, &state).await?;
             let definition = definitions
                 .iter()
                 .find(|definition| definition.identity == grant.attempt.binding)
                 .ok_or(InferenceHostError::BindingUnavailable)?;
-            let (name, model) = config
-                .models
-                .iter()
-                .find(|(name, _)| {
-                    format!("{:x}", Sha256::digest(name.as_bytes()))
-                        == definition.identity.binding_id.as_str()
+            let (name, client) = Self::binding_candidates(config, &state)
+                .into_iter()
+                .find(|(name, client)| {
+                    local_binding_id(name, *client) == definition.identity.binding_id.as_str()
                 })
                 .ok_or(InferenceHostError::BindingUnavailable)?;
+            let model = &config.models[name];
             let artifact = ExactProviderRequest::verify_received(
                 bytes::Bytes::from(request_json),
                 &RequestIdentity {
@@ -459,8 +607,9 @@ impl InferenceHost {
             };
             let protected;
             let key = match &model.credential {
-                LocalCredentialRef::Environment { .. } => state
-                    .attached_environment
+                LocalCredentialRef::Environment { .. } => client
+                    .and_then(|client| state.clients.get(client))
+                    .unwrap_or(&state.attached_environment)
                     .get(name)
                     .filter(|(revision, _)| *revision == model.binding_revision)
                     .map(|(_, key)| key.expose_to_local_transport())
@@ -559,6 +708,8 @@ impl InferenceHost {
             cancellation.clone(),
         );
         let host = self.clone();
+        let preview_tx = self.preview_tx.clone();
+        let preview_attempt = grant.attempt.clone();
         tokio::spawn(async move {
             // A slow durable commit can cross the start cutoff. The fence is
             // already conservative, but no HTTP request may begin afterwards.
@@ -567,8 +718,16 @@ impl InferenceHost {
             } else {
                 deadline
             };
-            let payload =
-                execute_and_retain(&host.transport, request, mode, deadline, &cancellation).await;
+            let payload = execute_and_retain(
+                &host.transport,
+                request,
+                mode,
+                deadline,
+                &cancellation,
+                &preview_tx,
+                preview_attempt,
+            )
+            .await;
             let stored = grant.clone();
             let result = match payload {
                 Ok(payload) => {
@@ -717,12 +876,40 @@ fn outcome(record: JournalRecord) -> DispatchOutcome {
     }
 }
 
+fn publish_preview(
+    sender: &broadcast::Sender<InferencePreview>,
+    attempt: &RunnerInferenceAttemptIdentity,
+    sequence: &mut u64,
+    event: &RunnerInferenceProviderEvent,
+) {
+    let current = *sequence;
+    *sequence = sequence.saturating_add(1);
+    // Provider event limits are intentionally larger than the live preview
+    // budget.  Do not copy a large event into a broadcast ring: the canonical
+    // response collector will still receive it from terminal custody.  The
+    // sequence advance makes the omission visible to a protocol consumer.
+    if matches!(event, RunnerInferenceProviderEvent::Json(_))
+        && serde_json::to_vec(event).map_or(true, |encoded| {
+            encoded.len() > INFERENCE_PREVIEW_EVENT_BYTES
+        })
+    {
+        return;
+    }
+    let _ = sender.send(InferencePreview {
+        attempt: attempt.clone(),
+        sequence: current,
+        event: event.clone(),
+    });
+}
+
 async fn execute_and_retain(
     transport: &ProviderTransport,
     request: astra_inference_adapter::transport::PreparedHttpAttempt,
     mode: ResponseMode,
     deadline: Instant,
     cancellation: &CancellationToken,
+    preview_tx: &broadcast::Sender<InferencePreview>,
+    preview_attempt: RunnerInferenceAttemptIdentity,
 ) -> Result<RetainedTerminal, InferenceHostError> {
     let (sender, mut receiver) = mpsc::channel(4);
     let limits = ExecutionLimits {
@@ -735,12 +922,19 @@ async fn execute_and_retain(
     let mut events = Vec::new();
     let mut encoded_bytes = RESPONSE_OVERHEAD_RESERVE;
     let mut overflow = false;
+    let mut preview_sequence = 0u64;
     let mut terminal;
     loop {
         tokio::select! {
             biased;
             Some(event) = receiver.recv() => {
                     let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
+                    publish_preview(
+                        preview_tx,
+                        &preview_attempt,
+                        &mut preview_sequence,
+                        &event,
+                    );
                     let bytes = serde_json::to_vec(&event).map_err(|_| InferenceHostError::TooLarge)?.len() + 1;
                     if bytes > RUNNER_INFERENCE_ARTIFACT_BYTES.saturating_sub(encoded_bytes) { overflow = true; cancellation.cancel(); receiver.close(); }
                     else if !overflow { encoded_bytes += bytes; events.push(event); }
@@ -752,6 +946,12 @@ async fn execute_and_retain(
                 // become ready. Drain the bounded queue before sealing custody.
                 while let Ok(event) = receiver.try_recv() {
                     let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
+                    publish_preview(
+                        preview_tx,
+                        &preview_attempt,
+                        &mut preview_sequence,
+                        &event,
+                    );
                     let bytes = serde_json::to_vec(&event).map_err(|_| InferenceHostError::TooLarge)?.len() + 1;
                     if bytes > RUNNER_INFERENCE_ARTIFACT_BYTES.saturating_sub(encoded_bytes) { overflow = true; }
                     else if !overflow { encoded_bytes += bytes; events.push(event); }

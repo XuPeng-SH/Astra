@@ -180,6 +180,42 @@ environment baseline plus explicit host-provided call environment, not all
 variables exported by the launching terminal. This is an inheritance boundary,
 not an OS sandbox against other programs running as the same local user.
 
+On Linux/macOS, terminals signed into the same deployment/account share one
+inference-only host and durable journal. Each terminal owns a separate private
+socket lease. Saved/keyless model Offerings survive host restart; environment
+keys stay in memory and are available only through that terminal's Offering.
+**Test and use** selects the exact local attachment, even when two terminals
+use the same variable name with different keys. Closing a terminal removes its
+environment Offering but does not cancel requests already started. Once all
+terminals close, the host drains those requests within their original deadlines,
+tries to flush retained results, and exits after its idle grace. Restart reopens
+the same journal; ambiguous attempts are not sent to the provider again.
+
+If an environment Offering has expired, reopen `/model` and explicitly select
+the new attachment. Neither a namesake nor another terminal's key is an automatic
+replacement. A catalog containing only Runner models also requires explicit
+selection; catalog order is not permission to spend a personal key.
+
+With no saved local models, opening Astra does not start a local inference host.
+The first successful `/model add` save starts it when needed. A failed explicit
+provider test leaves the configuration saved and the current model unchanged;
+the window keeps its local connection so you can inspect or retry setup.
+Local-host startup failures do not prevent reading existing work. Sign-out or
+switching the selected profile to another account expires that window's local
+credential lease; it never transfers the lease to the new account. After a host
+crash or expired connection, retrying local model setup reconnects in the same
+window; it does not revive the old environment lease or replay provider work.
+Reopening Astra also reconnects. Same-account profile
+aliases share saved local definitions, while environment values stay terminal-local.
+
+Proxy variables and `ASTRA_RUNNER_CA_BUNDLE` are the supported host network
+settings. Terminals with different settings cannot share the same host: the
+attachment reports a network-policy mismatch without showing private values.
+Close other local Astra sessions and reopen with the intended settings, or use
+an explicitly managed inference Runner. No lock or journal should be deleted
+to force a takeover. Automatic shared hosting currently supports Linux/macOS;
+Windows named-pipe hosting is not implemented.
+
 Personal Runner bindings currently cover agent/subagent inference and required
 compaction. Optional operations on `/v1/chat/completions` (memory extraction,
 reranking, turn/skill routing, verification) require a Server Offering. Selecting

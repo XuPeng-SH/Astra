@@ -356,8 +356,12 @@ async fn run_async() -> i32 {
         }
     }
 
-    // Resolve model: --model flag > config default_model > None
-    let config_default_model = if cli_model.is_none() {
+    // Resolve model: --model flag > config default_model > None. Keep the
+    // two sources separate so headless resume can distinguish an explicit
+    // admission from an ordinary configured fallback.
+    let cli_model_was_provided = cli_model.is_some();
+    let explicit_model = normalize_model_override_owned(cli_model);
+    let config_default_model = if !cli_model_was_provided {
         match cli::config_manager::read_config_default_model() {
             Ok(model) => model,
             Err(err) => {
@@ -376,7 +380,9 @@ async fn run_async() -> i32 {
     } else {
         None
     };
-    let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
+    let fallback_model = normalize_model_override_owned(config_default_model);
+    let resolved_model = explicit_model.clone().or_else(|| fallback_model.clone());
+    cli_context.explicit_model = explicit_model.clone();
 
     let runner_surface = print_mode
         || continue_last
@@ -397,45 +403,36 @@ async fn run_async() -> i32 {
         Ok(scope) => match scope.models().load() {
             Ok(config) => !config.models.is_empty(),
             Err(error) => {
-                eprintln!("Error: local model configuration is invalid: {error}");
-                return i32::from(ExitCode::ApiError);
+                eprintln!(
+                    "Warning: local model configuration needs repair: {error}. You can still inspect work or select another Offering."
+                );
+                false
             }
         },
         // Authentication bootstrap has no provider configuration authority.
         Err(_) => false,
     };
-    let interactive_runner_surface = !print_mode
-        && (continue_last
-            || resume.is_some()
-            || matches!(
-                command.as_ref(),
-                None | Some(cli::cli_config::cli_args::Command::Interactive)
-            ));
-    let local_runner = if runner_surface && (local_models_configured || interactive_runner_surface)
-    {
+    let local_runner = if runner_surface && local_models_configured {
         let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         match cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), &workspace)
+            .await
         {
             Ok(mut runner) => match runner
                 .wait_until_alive(std::time::Duration::from_millis(500))
                 .await
             {
                 Ok(()) => Some(runner),
-                Err(error) if local_models_configured => {
-                    eprintln!("{}", format!("Error: {error}").red());
-                    return i32::from(ExitCode::ApiError);
-                }
                 Err(error) => {
-                    tracing::debug!(%error, "User Runner exited before model setup was requested");
+                    eprintln!(
+                        "Warning: {error}. Work remains readable; local inference needs repair or an explicit model change."
+                    );
                     None
                 }
             },
-            Err(error) if local_models_configured => {
-                eprintln!("{}", format!("Error: {error}").red());
-                return i32::from(ExitCode::ApiError);
-            }
             Err(error) => {
-                tracing::debug!(%error, "User Runner is not installed; Server models remain available");
+                eprintln!(
+                    "Warning: {error}. Work remains readable; local inference needs repair or an explicit model change."
+                );
                 None
             }
         }
@@ -445,6 +442,12 @@ async fn run_async() -> i32 {
     cli_context.local_runner_id = local_runner
         .as_ref()
         .map(|runner| runner.edge_id().to_owned());
+    #[cfg(unix)]
+    {
+        cli_context.local_runner_attachment = local_runner
+            .as_ref()
+            .map(|runner| runner.attachment().clone());
+    }
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
@@ -456,7 +459,8 @@ async fn run_async() -> i32 {
             &api,
             profile.as_deref(),
             &output_format,
-            resolved_model.as_deref(),
+            explicit_model.as_deref(),
+            fallback_model.as_deref(),
             system_prompt.as_deref(),
             command,
             &cli_context,

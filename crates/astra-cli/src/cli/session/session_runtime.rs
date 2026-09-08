@@ -557,7 +557,7 @@ pub(crate) fn default_model_selection_from_access(
                 Ok(None)
             } else {
                 Err(
-                    "Model Access has no resolved default for a non-empty effective catalog"
+                    "Choose a model with /model or --model <offering_id>; Runner credentials are not selected automatically"
                         .to_string(),
                 )
             };
@@ -774,18 +774,39 @@ pub(crate) async fn ensure_state_default_model(
     token: &str,
     state: &mut SessionState,
 ) -> Option<String> {
-    if let Some(mut model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
-        match resolve_pinned_model_selection(api, token, &model, state.offering_id.as_deref()).await
+    if state.provider_selection_requires_explicit {
+        tracing::warn!(
+            target: "astra_cli::model_selection",
+            "resume has no exact causal Offering; refusing implicit provider admission"
+        );
+        return None;
+    }
+    let mut model = normalize_model_override(state.model.as_deref()).map(str::to_string);
+    if model.is_some() || state.offering_id.is_some() {
+        let requested_model = model.as_deref().unwrap_or_default();
+        match resolve_pinned_model_selection(
+            api,
+            token,
+            requested_model,
+            state.offering_id.as_deref(),
+        )
+        .await
         {
             Ok(selection) => {
-                let base = astra_turn_core::thinking_config::resolve_model_thinking(&model).0;
-                model = format!("{}{}", selection.name, &model[base.len()..]);
-                state.model = Some(model.clone());
+                let selected_model = if requested_model.is_empty() {
+                    selection.name.clone()
+                } else {
+                    let base =
+                        astra_turn_core::thinking_config::resolve_model_thinking(requested_model).0;
+                    format!("{}{}", selection.name, &requested_model[base.len()..])
+                };
+                model = Some(selected_model);
+                state.model = model.clone();
                 state.offering_id = Some(selection.offering_id);
                 if let Some(context_window) = selection.context_window {
                     state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
                         &state.runtime_config,
-                        Some(&model),
+                        model.as_deref(),
                         Some(context_window),
                     );
                 }
@@ -793,14 +814,14 @@ pub(crate) async fn ensure_state_default_model(
             Err(error) => {
                 tracing::warn!(
                     target: "astra_cli::model_selection",
-                    model,
+                    model = ?model,
                     error = %error,
                     "could not resolve explicit model context_window from server registry"
                 );
                 eprintln!("warning: {error}; keeping current context budget");
             }
         }
-        return Some(model);
+        return model;
     }
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
@@ -2396,6 +2417,41 @@ mod tests {
             state.context_budget.model_limit, 1_000_000,
             "state diagnostics must reflect the server model context_window, not the client default"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_state_default_model_refuses_unpinned_resume_preference() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.model = Some("stale-runner-model".into());
+        state.provider_selection_requires_explicit = true;
+
+        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+
+        assert!(selected.is_none());
+        assert_eq!(state.model.as_deref(), Some("stale-runner-model"));
+        assert!(state.offering_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_state_default_model_revalidates_offering_without_display_name() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry("offer-exact", "current-model", true, 128_000),
+            ])))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.offering_id = Some("offer-exact".into());
+
+        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+
+        assert_eq!(selected.as_deref(), Some("current-model"));
+        assert_eq!(state.model.as_deref(), Some("current-model"));
+        assert_eq!(state.offering_id.as_deref(), Some("offer-exact"));
     }
 
     #[test]

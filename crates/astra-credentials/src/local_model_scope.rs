@@ -68,7 +68,9 @@ impl LocalModelScope {
             .map_err(|error| error.to_string())?;
         let profile =
             CredentialStore::resolve_profile_name(profile, file.current_profile.as_deref());
-        let account = file.profiles.get(&profile).and_then(|profile| profile.account_id.as_deref())
+        let account = file.profiles.get(&profile)
+            .filter(|profile| profile.access_token.as_deref().is_some_and(|token| !token.trim().is_empty()))
+            .and_then(|profile| profile.account_id.as_deref())
             .ok_or("Local model setup requires a signed-in Astra account; run astra login with this profile")?;
         Self::for_owner(deployment, account)
     }
@@ -101,6 +103,33 @@ impl std::fmt::Debug for LocalModelScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_account_identity_after_logout_does_not_authorize_local_models() {
+        let directory = tempfile::tempdir().unwrap();
+        let _scope = crate::set_test_credentials_dir(directory.path().to_owned());
+        let store = CredentialStore::new();
+        store
+            .mutate(|file| {
+                file.current_profile = Some("fixture".into());
+                file.profiles.insert(
+                    "fixture".into(),
+                    crate::Profile {
+                        account_id: Some("owner".into()),
+                        access_token: Some("synthetic-token".into()),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+        assert!(LocalModelScope::for_profile("https://fixture.invalid", None).is_ok());
+        store
+            .mutate(|file| {
+                file.profiles.get_mut("fixture").unwrap().access_token = None;
+            })
+            .unwrap();
+        assert!(LocalModelScope::for_profile("https://fixture.invalid", None).is_err());
+    }
 
     #[test]
     fn scopes_separate_deployments_accounts_and_path_prefixes() {

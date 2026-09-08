@@ -177,6 +177,15 @@ pub enum EdgeClientMessage {
         evidence: crate::runner_inference::RunnerInferenceStartEvidence,
     },
 
+    /// Provisional normalized provider progress.  It is keyed by the full
+    /// immutable attempt identity; the Server may drop or lag this message,
+    /// but it must never treat it as terminal/usage/tool authority.
+    #[serde(rename = "inference_progress")]
+    InferenceProgress {
+        progress: Box<crate::runner_inference::RunnerInferenceProgressBatch>,
+        delivery_generation: u64,
+    },
+
     #[serde(rename = "inference_terminal")]
     InferenceTerminal {
         transfer: Box<crate::runner_inference::RunnerInferenceTerminalTransfer>,
@@ -442,6 +451,54 @@ mod tests {
                     "delivery_generation": 7, "max_artifact_bytes": 16777216, "server_unix_ms": 1000}
             })
         );
+    }
+
+    #[test]
+    fn inference_progress_roundtrips_as_bounded_non_authoritative_batches() {
+        let attempt: crate::runner_inference::RunnerInferenceAttemptIdentity =
+            serde_json::from_value(json!({
+                "user_id": "user-progress",
+                "scope": {
+                    "kind": "session", "session_id": "session-progress",
+                    "turn": 1, "round": 0, "operation_id": "primary_agent",
+                    "logical_attempt": 0
+                },
+                "invocation_id": "invocation-progress",
+                "attempt_id": "attempt-progress",
+                "binding": {
+                    "runner_id": "runner-progress", "journal_id": "journal-progress",
+                    "binding_id": "binding-progress", "binding_revision": 1,
+                    "profile_revision": 1
+                },
+                "request": {
+                    "artifact_id": "request-progress",
+                    "sha256": "d".repeat(64), "byte_len": 1
+                }
+            }))
+            .unwrap();
+        let message = EdgeClientMessage::InferenceProgress {
+            progress: Box::new(
+                crate::runner_inference::RunnerInferenceProgressBatch::new(
+                    attempt,
+                    vec![crate::runner_inference::RunnerInferenceProgressEvent {
+                        sequence: 0,
+                        event: crate::runner_inference::RunnerInferenceProviderEvent::Json(
+                            json!({"choices":[{"delta":{"content":"preview"}}]}),
+                        ),
+                    }],
+                )
+                .unwrap(),
+            ),
+            delivery_generation: 7,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["type"], "inference_progress");
+        assert_eq!(encoded["delivery_generation"], 7);
+        let decoded: EdgeClientMessage = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        let mut with_unknown = encoded;
+        with_unknown["progress"]["unexpected"] = json!("must-reject");
+        assert!(serde_json::from_value::<EdgeClientMessage>(with_unknown).is_err());
     }
 
     #[test]

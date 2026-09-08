@@ -90,10 +90,9 @@ First-release scope is deliberately constrained:
 | OpenAI-compatible text/tools, streaming/nonstreaming, required compaction | Private body transforms, inference pools, speculative execution, or universal provider coverage |
 
 The session-managed local host exists to preserve a stable capacity/journal and
-isolate one terminal's credential attachment, not to own work. The current
-implementation gives each terminal its own host identity; a future shared host
-may use the same Runner library with one local endpoint and bounded attachment
-state. Setup stage names below are progress projections of candidate/applied
+isolate one terminal's credential attachment, not to own work. Linux/macOS use
+one inference-only host per deployment/account and owner-protected local IPC
+with bounded client leases. Setup stage names below are progress projections of candidate/applied
 configuration and receipts, not an invitation to build a workflow framework.
 Add a new abstraction only when an existing owner cannot express a required
 invariant; each new durable record needs a concrete recovery use and retention
@@ -149,30 +148,41 @@ supervisor's private lease descriptors; call-specific authorization remains
 explicit. Local protected files still rely on the OS user boundary, not secrecy
 from arbitrary code already running as that same user.
 
-The current CLI-managed implementation deliberately chooses the independent
-identity variant of this contract: every interactive invocation receives a
-unique Edge/Runner ID and an isolated journal root. It therefore never shares
-`host.lock`, an inference host, or an environment attachment with another
-terminal. This is the first-release implementation of UX-07: two terminals may
-use the same model configuration and environment-variable name while resolving
-different provider credentials, and closing one child cannot stop the other.
-The catalog publication handshake remains the readiness boundary for selecting
-the local Offering; child liveness failures are surfaced with bounded captured
-diagnostics before that wait begins.
+The CLI-managed implementation uses a persisted random installation identity,
+separate from process boot and terminal leases. An exclusive process lock elects
+one host; concurrent launchers attach to its private Unix socket. It runs in its
+own OS session, has no inherited stdout/stderr pipes, and is not killed when the
+first launcher exits. The handshake checks the full deployment/account scope
+and peer UID and occurs only after Server authentication and journal recovery.
 
-An explicitly installed, long-lived service may instead use the shared-host
-variant described below, but it must add attachment-scoped IPC credential
-handles before it is enabled for multiple terminals. The session-managed CLI
-path does not silently fall back to that shared mode.
+Saved/keyless model bindings keep their exact Offering identity across ordinary
+restart. Environment bindings belong to an individual live terminal lease:
+the CLI sends only configured values through private IPC, and setup reconciles
+the exact lease-scoped Offering rather than a same-name catalog entry. Detach
+withdraws that binding without cancelling already-fenced requests. An expired
+environment Offering requires explicit reselection; it never acquires another
+terminal's key. After disable acknowledgement its local publication entry can
+be discarded; durable attempt records and the publication watermark still fence
+replay. The catalog does not choose a Runner as an implicit fallback default.
+
+The shared host inherits only local-state coordinates and the canonical supported
+proxy/CA settings, not arbitrary terminal variables. Each attachment compares
+that network policy through private IPC. A different policy yields an explicit
+repair error instead of silently using the first terminal's private proxy.
+The current bounds are 32 clients, 256 active model bindings, 64 KiB IPC frames,
+one-second configuration/heartbeat refresh and a 30-second missed-heartbeat
+expiry. Unchanged configuration sends no provider key in heartbeat frames.
 
 The host scope is the authenticated Astra deployment and account under the
 current OS user. Resolve it through the existing CLI profile/owner machinery,
 including deployment identity; profile names and hostnames are not ownership
 proof. Persistent binding and journal identities survive host restart. A boot
 nonce, local discovery endpoint, and attached-client leases do not.
-If multiple existing profiles resolve to this same host scope, their source
-configuration identities still namespace local bindings and saved defaults.
-Identical friendly names cannot overwrite another profile's applied binding.
+Profiles resolving to the same deployment/account are aliases of this local
+scope: saved model definitions are shared, not duplicated by profile label.
+An explicit edit uses the configuration owner's generation check; environment
+values still belong to individual terminal leases. Different accounts or
+deployments never share definitions, secrets, or host identities.
 
 `ensure_host(scope)` follows one algorithm for setup, normal startup, and repair:
 
@@ -205,8 +215,8 @@ caller's stdout pipe open. Management progress uses IPC and cannot pollute
 machine-readable command output.
 
 Client leases are operational attachment state, not inference authorization.
-IPC liveness plus heartbeats detects dead clients; initial heartbeat/expiry are
-10/30 seconds. Closing one client releases only its lease and session-local
+IPC liveness plus heartbeats detects dead clients; current heartbeat/expiry are
+1/30 seconds. Closing one client releases only its lease and session-local
 credentials. Other clients and their requests continue. When the last lease
 ends, stop admitting session-managed work, drain already-started attempts within
 their original deadlines, and make a bounded terminal-flush attempt. Then exit,
@@ -795,11 +805,14 @@ invocation IDs. The local host is the sole publisher of its bindings; concurrent
 setup operations serialize their revisions there. Publishing one binding never
 replaces the complete inventory or enables an unrelated client attachment.
 
-Progress has contiguous sequence numbers and a bounded replay ring. Identical
-duplicate batches are ignored; conflicting duplicates are protocol violations.
-A gap requests replay. If a ring segment has expired, use a numbered canonical
-snapshot plus its watermark, then continue deltas. Do not append a replayed
-snapshot to existing UI text or declare a gap-corrupted answer complete.
+Progress carries a monotonic provider sequence and bounded batches. Each batch
+is strictly ordered, while a dropped frame, lagged receiver, oversized event,
+or full disposable queue can create a visible gap. Identical/out-of-order
+batches are ignored and conflicting attempt identities are rejected. The
+current consumer treats a gap as the end of speculative preview and lets the
+canonical terminal replay from custody; it does not pretend that a missing
+preview fragment was recovered. Do not append a replayed snapshot to existing
+UI text or declare a gap-corrupted answer complete.
 
 Progress is provisional. The canonical final response is a separate aggregate
 including text, admitted opaque provider continuation blocks, thinking/tool-call
@@ -856,7 +869,7 @@ output bound. The following are initial defaults to validate, not measurements:
 | Grant start window | At most 15 seconds; also bounded by inference deadline. |
 | Transport frame | 256 KiB after decompression; strict collection/string limits. |
 | Progress batch | Send first visible delta promptly; batch subsequent progress at 32 KiB or 50 ms, whichever comes first. Control/terminal evidence bypasses the timer. |
-| Replay memory | 1 MiB per attempt, additionally capped per Runner and pod. |
+| Same-pod progress memory | Four 32 KiB ring slots per attempt; at most 128 live/stale attempt entries per Server pod (about 16 MiB of batch payload), with at most 16 entries per user. When a per-user or global cap is saturated, new run owners receive no live preview; terminal custody is unaffected. |
 | Request / response artifact | 16 MiB request and 16 MiB response per attempt by default; admit explicit larger profiles only with capacity. |
 | Local response spool | 256 MiB personal default; aggregate reservation, owner-protected, bounded by local quota and retention. Additional encryption follows deployment policy. |
 | Unacknowledged response retention | 24 hours default; visible expiry, no silent successful settlement. |
@@ -885,16 +898,16 @@ Terminal evidence is ingested into the inference ledger by any authorized socket
 owner. A run-owner wakeup is an optimization; a shared batch sweeper can recover
 the committed continuation if that notification is lost.
 
-Live progress uses bounded same-pod channels and the existing authenticated
-run-event delivery path where it supports cross-pod progress. If a missing hop
-requires an internal relay, implement only a typed attempt-progress facet, not a
-new messaging platform. Peer destinations come from trusted deployment membership;
-authorization checks the attempt owner and current observer generation. No
-user-supplied pod endpoint or external message broker is required. Test the actual
-socket/run/viewer placement rather than assuming sticky routing. If the progress
-path is unavailable, show delayed/reconnecting preview and converge from the
-durable terminal; do not retry provider execution. Normal cross-pod preview must
-pass the latency gate; failure fallback is not a substitute for that happy path.
+The current implementation carries live progress over the authenticated Runner
+socket into a bounded, process-local same-pod channel keyed by the full owner
+and attempt identity. There is no trusted inter-pod ephemeral progress relay in
+the existing registry/connection machinery. When the socket-owner pod and
+run-owner pod differ, the run receives delayed/reconnecting preview and then
+converges from durable terminal custody; provider execution is never retried.
+If a future cross-pod hop is justified by measurement, implement only a typed
+attempt-progress facet sourced from trusted deployment membership, with owner
+and observer-generation authorization—not a broker or user-supplied endpoint.
+Test actual socket/run/viewer placement rather than assuming sticky routing.
 
 Do not use per-token database writes or a database polling loop per invocation.
 Batch control/terminal work and use existing wakeup/shared polling patterns.
@@ -1356,15 +1369,28 @@ with an explicit provenance correction, not rewritten as verified Runner work.
 The isolation and custody regression tests are not a production SaaS acceptance
 claim. The following gates remain open in the current CLI-managed path:
 
-- The CLI starts a per-invocation inference-only Runner with a fresh identity;
-  shared host lifetime, stable journal discovery across CLI restart, attachment
-  leases, and bounded cleanup of obsolete catalog entries are not implemented.
-- Runner response events are collected from committed terminal custody. Live
-  preview/TTFB across the Runner-to-Server hop is not implemented; buffered
-  delivery must not be described as live streaming.
-- The causal resume provider projection does not yet carry the exact Offering
-  selection. In-process session pinning is not evidence of quit/relaunch/resume
-  continuity, and a friendly-name lookup is not a replacement for that authority.
+- Shared-host isolation has real Unix-socket and multi-credential regression
+  coverage. A subprocess test runs the actual `astra-edge` binary against an
+  authenticated synthetic Server and local provider, kills it before terminal
+  acknowledgement, and verifies same-journal replay without provider redispatch.
+  The complete installed CLI/TUI/Server journey and public repair actions remain
+  distinct deployment gates; the synthetic Server is not a MatrixOne authority
+  or full end-user journey test.
+- Runner response events remain collected from committed terminal custody.
+  Same-pod Runner-to-Server progress now provides bounded live preview/TTFB
+  before terminal commit. The preview hub is process-local (four 32 KiB slots
+  per attempt, 128 attempts per pod and 16 per user); lag, queue pressure, or
+  saturation disables preview only. Cross-pod preview has no trusted ephemeral
+  relay yet, so that placement deliberately falls back to delayed/reconnecting
+  preview and durable terminal convergence. Buffered or cross-pod fallback
+  must not be described as live streaming.
+- The causal manifest now binds the exact admitted Offering; resume and fork
+  carry that preference through the existing context owner, never a live grant
+  or credential lease. CLI resume resolves that exact identity, while an
+  explicit `--model` is a new selection. Legacy state without that identity
+  requires an explicit choice instead of a name-based or Server fallback.
+  Complete installed quit/relaunch/resume testing remains part of the journey
+  gate above; in-memory projection tests alone do not establish that evidence.
 - Bounded readiness and multi-tenant functional tests do not replace the
   100/500/1,000-session performance lane below. Throughput, tail latency, memory,
   fairness under noisy tenants, and recovery SLOs still require measurement.
