@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
+
 use sha2::{Digest, Sha256};
 
 const MAX_MANIFEST_ENTRIES: usize = 16_384;
@@ -458,12 +461,18 @@ impl WorkspaceObservationLease {
 /// Kernel-backed sticky evidence that a coordination inode or any lexical
 /// binding component was modified, renamed, or unlinked while a writer held
 /// the generation. End-state inode checks alone miss unlink→recreate→restore
-/// attacks, which can briefly admit a second lock generation. Darwin uses the
-/// stable file/inode contract below; Linux additionally gets event history from
-/// the process-level inotify watcher.
+/// attacks, which can briefly admit a second lock generation. Linux uses a
+/// process-level inotify watcher and Darwin uses a per-lease kqueue vnode
+/// watch; both retain event history until settlement.
 struct GenerationTamperWatch {
     #[cfg(target_os = "linux")]
     subscription: GenerationWatchSubscription,
+    #[cfg(target_os = "macos")]
+    kqueue: std::os::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    _watched: Vec<std::os::fd::OwnedFd>,
+    #[cfg(target_os = "macos")]
+    tampered: std::sync::atomic::AtomicBool,
 }
 
 impl GenerationTamperWatch {
@@ -507,13 +516,56 @@ impl GenerationTamperWatch {
         }
         #[cfg(target_os = "macos")]
         {
-            // Darwin has no inotify equivalent in the portable stdlib path
-            // used by this crate. The stable owner-scoped file lock and the
-            // inode/path checks in `WorkspaceObservationLease` still fence a
-            // replaced authority at admission and settlement; unlike
-            // Windows, macOS therefore has an explicit supported contract.
-            let _ = (lock_paths, binding_paths, cancel_token);
-            Ok(Self {})
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "workspace generation watcher registration was cancelled",
+                ));
+            }
+            let lock_mask = libc::NOTE_DELETE
+                | libc::NOTE_EXTEND
+                | libc::NOTE_WRITE
+                | libc::NOTE_ATTRIB
+                | libc::NOTE_LINK
+                | libc::NOTE_RENAME
+                | libc::NOTE_REVOKE;
+            let binding_mask =
+                libc::NOTE_DELETE | libc::NOTE_ATTRIB | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+            let mut specifications = HashMap::<PathBuf, u32>::new();
+            for path in lock_paths {
+                specifications
+                    .entry(path)
+                    .and_modify(|mask| *mask |= lock_mask)
+                    .or_insert(lock_mask);
+            }
+            for path in binding_paths {
+                // Watch the lexical inode itself. `O_SYMLINK` makes this
+                // meaningful for a symlink binding rather than silently
+                // following it to a replacement target. Ordinary writes
+                // below a workspace directory are not in this mask, so they
+                // remain receiptable.
+                specifications
+                    .entry(path)
+                    .and_modify(|mask| *mask |= binding_mask)
+                    .or_insert(binding_mask);
+            }
+
+            let raw_kqueue = unsafe { libc::kqueue() };
+            if raw_kqueue < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let kqueue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_kqueue) };
+            let mut watched = Vec::with_capacity(specifications.len());
+            for (path, mask) in specifications {
+                let fd = open_generation_watch_path(&path)?;
+                register_generation_watch(kqueue.as_raw_fd(), fd.as_raw_fd(), mask)?;
+                watched.push(fd);
+            }
+            Ok(Self {
+                kqueue,
+                _watched: watched,
+                tampered: std::sync::atomic::AtomicBool::new(false),
+            })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -532,13 +584,99 @@ impl GenerationTamperWatch {
         }
         #[cfg(target_os = "macos")]
         {
-            true
+            if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            loop {
+                let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+                let result = unsafe {
+                    libc::kevent(
+                        self.kqueue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        &mut event,
+                        1,
+                        &timeout,
+                    )
+                };
+                if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    self.tampered
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return false;
+                }
+                if result == 0 {
+                    return true;
+                }
+                // EVFILT_VNODE notifications are sticky evidence. Even when
+                // the inode has been restored before settlement, an observed
+                // rename/unlink/write event means this generation can no
+                // longer issue an authoritative receipt.
+                self.tampered
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return false;
+            }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             false
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_generation_watch_path(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workspace generation watch path contains NUL",
+        )
+    })?;
+    // O_SYMLINK observes the lexical inode itself, including a symlink used
+    // as a workspace binding. O_EVTONLY avoids requiring read permission on
+    // a private directory while retaining vnode event delivery.
+    let raw_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn register_generation_watch(kqueue_fd: i32, watched_fd: i32, mask: u32) -> std::io::Result<()> {
+    let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+    event.ident = watched_fd as libc::uintptr_t;
+    event.filter = libc::EVFILT_VNODE;
+    event.flags = libc::EV_ADD | libc::EV_CLEAR;
+    event.fflags = mask;
+    let result = unsafe {
+        libc::kevent(
+            kqueue_fd,
+            &event,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1414,11 +1552,11 @@ fn coordination_key_digest(path: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CoordinationLockSpec {
     /// Kernel-owned, cross-UID mutual exclusion key when the platform provides
-    /// one. Darwin uses the owner-scoped stable witness file instead.
+    /// one. Darwin uses the shared stable witness file instead.
     kernel_namespace_key: String,
-    /// Persistent integrity witness owned and trusted only by this effective
-    /// UID. Linux pairs this with a global kernel key; Darwin keeps the
-    /// owner-scoped file authority and verifies inode continuity.
+    /// Persistent integrity witness. Linux keeps one owner-only inode per UID
+    /// and pairs it with a global kernel key; Darwin uses one mode-0644 inode
+    /// shared by all users and verifies inode continuity plus vnode history.
     witness_path: PathBuf,
 }
 
@@ -1427,6 +1565,8 @@ fn workspace_coordination_lock_specs_for_uid(
     kind: CoordinationLockKind,
     effective_uid: u32,
 ) -> Option<(Vec<CoordinationLockSpec>, WorkspaceBindingIdentity)> {
+    #[cfg(target_os = "macos")]
+    let _ = effective_uid;
     let coordination_root = stable_coordination_root()?;
     let binding_identity = WorkspaceBindingIdentity::capture(workspace_root)?;
     let lexical = workspace_lexical_key(workspace_root)?;
@@ -1438,12 +1578,16 @@ fn workspace_coordination_lock_specs_for_uid(
         .iter()
         .map(|key| {
             let digest = coordination_key_digest(key);
+            #[cfg(target_os = "macos")]
+            let witness_name = format!(".astra-workspace-{digest}-{}-shared.lock", kind.suffix());
+            #[cfg(not(target_os = "macos"))]
+            let witness_name = format!(
+                ".astra-workspace-{digest}-{}-uid-{effective_uid}.lock",
+                kind.suffix()
+            );
             CoordinationLockSpec {
                 kernel_namespace_key: format!("astra-ws-v2-{digest}-{}", kind.suffix()),
-                witness_path: coordination_root.join(format!(
-                    ".astra-workspace-{digest}-{}-uid-{effective_uid}.lock",
-                    kind.suffix()
-                )),
+                witness_path: coordination_root.join(witness_name),
             }
         })
         .collect::<Vec<_>>();
@@ -1507,7 +1651,7 @@ fn open_coordination_lock(path: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        create_options.mode(0o600);
+        create_options.mode(coordination_lock_file_mode());
     }
     let created_file = match create_options.open(path) {
         Ok(file) => Some(file),
@@ -1517,7 +1661,7 @@ fn open_coordination_lock(path: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     if let Some(file) = created_file.as_ref() {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        file.set_permissions(fs::Permissions::from_mode(coordination_lock_file_mode()))
             .ok()?;
     }
     // Advisory flock does not need write access. Reopen read-only so a
@@ -1545,13 +1689,39 @@ fn open_coordination_lock(path: &Path) -> Option<std::fs::File> {
 }
 
 #[cfg(unix)]
+const fn coordination_lock_file_mode() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        // A single stable inode is the Darwin cross-UID authority. Users can
+        // open and flock it, but cannot rewrite or remove it in a sticky
+        // root-owned coordination directory.
+        0o644
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0o600
+    }
+}
+
+#[cfg(unix)]
 fn unix_coordination_lock_metadata_is_trusted(metadata: &fs::Metadata, effective_uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
-    metadata.is_file()
-        && metadata.uid() == effective_uid
-        && metadata.nlink() == 1
-        && metadata.len() == 0
-        && metadata.mode() & 0o777 == 0o600
+    #[cfg(target_os = "macos")]
+    {
+        let _ = effective_uid;
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.len() == 0
+            && metadata.mode() & 0o777 == coordination_lock_file_mode()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        metadata.is_file()
+            && metadata.uid() == effective_uid
+            && metadata.nlink() == 1
+            && metadata.len() == 0
+            && metadata.mode() & 0o777 == coordination_lock_file_mode()
+    }
 }
 
 fn locked_coordination_file(
@@ -1645,10 +1815,11 @@ fn try_acquire_kernel_coordination_namespace(
     }
     #[cfg(target_os = "macos")]
     {
-        // Darwin's owner-scoped stable file is the documented authority. The
-        // empty marker keeps the common acquisition path uniform; inode and
-        // advisory-lock checks below fence replacement at admission and
-        // settlement.
+        // Darwin has no Linux-style abstract Unix namespace. The shared
+        // mode-0644 witness inode is opened and flocked by every user, while
+        // kqueue event history and inode checks provide the integrity fence.
+        // Keep this marker so the common acquisition path retains one owned
+        // value per lock generation.
         let _ = namespace_key;
         Ok(Some(CrossProcessKernelLock {}))
     }
@@ -5977,7 +6148,7 @@ mod tests {
         drop(replacement);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn transient_lock_generation_split_is_sticky_even_after_inode_restore() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6091,7 +6262,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn transient_parent_replacement_is_detected_after_original_is_restored() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6110,6 +6281,33 @@ mod tests {
         assert!(
             !lease.integrity_valid(),
             "transient parent replacement cannot restore receipt authority"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transient_symlink_replacement_is_sticky_after_original_is_restored() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("workspace");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let binding = temp.path().join("binding");
+        let saved = temp.path().join("saved-binding");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        symlink(&first, &binding).unwrap();
+        let lease = acquire_workspace_observation_lease_sync(&binding, Duration::from_secs(1))
+            .expect("symlink binding lease");
+
+        fs::rename(&binding, &saved).unwrap();
+        symlink(&second, &binding).unwrap();
+        fs::remove_file(&binding).unwrap();
+        fs::rename(&saved, &binding).unwrap();
+
+        assert!(
+            !lease.integrity_valid(),
+            "kqueue must retain lexical symlink replacement history even after restoration"
         );
     }
 
@@ -6142,7 +6340,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn foreign_owner_precreation_is_rejected_by_lock_shape_contract() {
         use std::os::unix::fs::PermissionsExt;
@@ -6255,6 +6453,63 @@ mod tests {
         let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
             .expect("macOS stable file authority");
         assert!(lease.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_one_shared_cross_uid_witness_and_advisory_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let uid_a = unsafe { libc::geteuid() };
+        let uid_b = uid_a.wrapping_add(1);
+        let (specifications_a, _) = workspace_coordination_lock_specs_for_uid(
+            workspace.path(),
+            CoordinationLockKind::Observation,
+            uid_a,
+        )
+        .expect("UID A coordination specification");
+        let (specifications_b, _) = workspace_coordination_lock_specs_for_uid(
+            workspace.path(),
+            CoordinationLockKind::Observation,
+            uid_b,
+        )
+        .expect("UID B coordination specification");
+        assert_eq!(specifications_a.len(), specifications_b.len());
+        assert_eq!(
+            specifications_a[0].witness_path, specifications_b[0].witness_path,
+            "Darwin must use one shared witness inode so users cannot bypass the lease"
+        );
+
+        let first = acquire_cross_process_lock_sync(
+            specifications_a[0].clone(),
+            CrossProcessLockMode::Exclusive,
+            None,
+            Duration::from_secs(1),
+        )
+        .expect("first Darwin generation");
+        let metadata = fs::symlink_metadata(&first.path).expect("shared witness metadata");
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+        assert!(unix_coordination_lock_metadata_is_trusted(&metadata, uid_b));
+        assert!(
+            acquire_cross_process_lock_sync(
+                specifications_b[0].clone(),
+                CrossProcessLockMode::Exclusive,
+                None,
+                Duration::from_millis(25),
+            )
+            .is_none(),
+            "a second user must not bypass the shared advisory lock"
+        );
+        drop(first);
+        let second = acquire_cross_process_lock_sync(
+            specifications_b[0].clone(),
+            CrossProcessLockMode::Exclusive,
+            None,
+            Duration::from_secs(1),
+        )
+        .expect("second Darwin generation after release");
+        assert!(second.path_identity_is_unchanged());
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -56,9 +56,12 @@ Checkpoint must include enough information to resume safely:
 - Local client session execution leases use one stable, never-rotated file
   authority in the owner-local state directory. Linux adds a kernel-named
   abstract Unix socket so path replacement cannot admit a second executor;
-  macOS rejects symlink authorities and verifies path-to-inode continuity
-  around its advisory lock. Unsupported platforms fail closed rather than
-  running without an execution owner.
+  macOS uses one mode-0644 witness shared across users, an advisory flock,
+  and a kqueue vnode event history so cross-user contention and transient
+  rename/unlink/recreate operations cannot be hidden by restoring the final
+  inode. Both platforms re-check the complete lexical binding at settlement.
+  Unsupported platforms fail closed rather than running without an execution
+  owner.
 
 ## Terminal outcomes
 
