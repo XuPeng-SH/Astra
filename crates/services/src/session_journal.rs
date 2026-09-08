@@ -2058,20 +2058,21 @@ pub enum SessionExecutionLeaseError {
 /// macOS has no abstract Unix socket namespace, so it pairs the owner-local
 /// lock file with a byte-range lock on the root-owned `/dev/dtracehelper`
 /// device. The device inode cannot be renamed by the local user and the range
-/// is derived from the session identity, so independent sessions remain
-/// concurrent while a replacement pathname cannot admit a second executor. A
-/// kqueue vnode watch keeps rename, unlink, and replacement evidence sticky
-/// until settlement. Dropping the token releases every held authority.
+/// set is derived from both lexical and canonical session identities, so
+/// aliases and ancestor rebindings share admission while independent sessions
+/// remain concurrent. A kqueue vnode watch keeps rename, unlink, and
+/// replacement evidence sticky until settlement. Dropping the token releases
+/// every held authority.
 #[derive(Debug)]
 pub struct SessionExecutionLease {
     #[cfg(target_os = "linux")]
-    _kernel_authority: std::os::unix::net::UnixDatagram,
+    _kernel_authority: LinuxExecutionKernelAuthority,
     #[cfg(target_os = "macos")]
     _kernel_authority: DarwinExecutionKernelAuthority,
     #[cfg(target_os = "macos")]
     tamper_watch: SessionExecutionTamperWatch,
     #[cfg(target_os = "macos")]
-    process_key: PathBuf,
+    process_keys: Vec<PathBuf>,
     _file: std::fs::File,
     session_id: String,
     lock_path: PathBuf,
@@ -2081,40 +2082,49 @@ pub struct SessionExecutionLease {
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct DarwinSessionExecutionReservation {
-    key: Option<PathBuf>,
+    keys: Option<Vec<PathBuf>>,
 }
 
 #[cfg(target_os = "macos")]
 impl DarwinSessionExecutionReservation {
-    fn reserve(key: &Path, session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
+    fn reserve(keys: &[PathBuf], session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
         let mut active = ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.insert(key.to_path_buf()) {
-            return Err(SessionExecutionLeaseError::Conflict {
-                session_id: session_id.to_string(),
-            });
+        let mut reserved = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !active.insert(key.clone()) {
+                for reserved_key in reserved {
+                    active.remove(&reserved_key);
+                }
+                return Err(SessionExecutionLeaseError::Conflict {
+                    session_id: session_id.to_string(),
+                });
+            }
+            reserved.push(key.clone());
         }
         Ok(Self {
-            key: Some(key.to_path_buf()),
+            keys: Some(reserved),
         })
     }
 
-    fn commit(mut self) -> PathBuf {
-        self.key.take().expect("uncommitted Darwin reservation")
+    fn commit(mut self) -> Vec<PathBuf> {
+        self.keys.take().expect("uncommitted Darwin reservation")
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for DarwinSessionExecutionReservation {
     fn drop(&mut self) {
-        let Some(key) = self.key.take() else {
+        let Some(keys) = self.keys.take() else {
             return;
         };
-        ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
+        let mut active = ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys {
+            active.remove(&key);
+        }
     }
 }
 
@@ -2129,19 +2139,26 @@ impl SessionExecutionLease {
                 }
             })?;
         let lock_path = execution_lease_path(&journal_path, session_id);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let identity_keys = session_execution_identity_keys(&journal_path).map_err(|source| {
+            SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            }
+        })?;
         #[cfg(target_os = "macos")]
         let process_reservation =
-            DarwinSessionExecutionReservation::reserve(&lock_path, session_id)?;
+            DarwinSessionExecutionReservation::reserve(&identity_keys, session_id)?;
         // Linux binds a kernel-held guard that must live for the whole lease.
         // Darwin binds an unlink-resistant device byte-range plus the
         // owner-local file fence and kqueue generation watch; unsupported
         // platforms fail closed before any journal work starts.
         #[cfg(target_os = "linux")]
         let _kernel_authority =
-            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+            acquire_execution_kernel_authority(&owner_scope, &identity_keys, session_id)?;
         #[cfg(target_os = "macos")]
         let _kernel_authority =
-            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+            acquire_execution_kernel_authority(&owner_scope, &identity_keys, session_id)?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _unsupported_authority =
             acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
@@ -2197,14 +2214,14 @@ impl SessionExecutionLease {
                     });
                 }
                 #[cfg(target_os = "macos")]
-                let process_key = process_reservation.commit();
+                let process_keys = process_reservation.commit();
                 Ok(Self {
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     _kernel_authority,
                     #[cfg(target_os = "macos")]
                     tamper_watch,
                     #[cfg(target_os = "macos")]
-                    process_key,
+                    process_keys,
                     _file: file,
                     session_id: session_id.to_string(),
                     lock_path,
@@ -2264,10 +2281,14 @@ impl Drop for SessionExecutionLease {
         // the next turn can be admitted.
         let _ = <std::fs::File as fs2::FileExt>::unlock(&self._file);
         #[cfg(target_os = "macos")]
-        ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.process_key);
+        {
+            let mut active = ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in &self.process_keys {
+                active.remove(key);
+            }
+        }
     }
 }
 
@@ -2359,46 +2380,51 @@ impl SessionExecutionTamperWatch {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxExecutionKernelAuthority {
+    sockets: Vec<std::os::unix::net::UnixDatagram>,
+}
+
+#[cfg(target_os = "linux")]
 fn acquire_execution_kernel_authority(
     owner_scope: &OwnerScope,
-    journal_path: &Path,
+    identity_keys: &[PathBuf],
     session_id: &str,
-) -> Result<std::os::unix::net::UnixDatagram, SessionExecutionLeaseError> {
+) -> Result<LinuxExecutionKernelAuthority, SessionExecutionLeaseError> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram};
 
-    let normalized_journal_path = normalized_path_for_identity(journal_path).map_err(|source| {
-        SessionExecutionLeaseError::Io {
-            session_id: session_id.to_string(),
-            source,
-        }
-    })?;
-    let mut identity = Sha256::new();
-    identity.update(b"astra-session-execution-authority-v1\0");
-    identity.update(owner_scope.id().as_bytes());
-    identity.update(b"\0");
-    identity.update(normalized_journal_path.as_os_str().as_encoded_bytes());
-    identity.update(b"\0");
-    identity.update(session_id.as_bytes());
-    let name = format!("astra-exec-v1-{:x}", identity.finalize());
-    let address = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|source| {
-        SessionExecutionLeaseError::Io {
-            session_id: session_id.to_string(),
-            source,
-        }
-    })?;
-    UnixDatagram::bind_addr(&address).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::AddrInUse {
-            SessionExecutionLeaseError::Conflict {
-                session_id: session_id.to_string(),
-            }
-        } else {
+    let mut sockets = Vec::with_capacity(identity_keys.len());
+    for identity_path in identity_keys {
+        let mut identity = Sha256::new();
+        identity.update(b"astra-session-execution-authority-v1\0");
+        identity.update(owner_scope.id().as_bytes());
+        identity.update(b"\0");
+        identity.update(identity_path.as_os_str().as_encoded_bytes());
+        identity.update(b"\0");
+        identity.update(session_id.as_bytes());
+        let name = format!("astra-exec-v1-{:x}", identity.finalize());
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|source| {
             SessionExecutionLeaseError::Io {
                 session_id: session_id.to_string(),
                 source,
             }
-        }
-    })
+        })?;
+        let socket = UnixDatagram::bind_addr(&address).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AddrInUse {
+                SessionExecutionLeaseError::Conflict {
+                    session_id: session_id.to_string(),
+                }
+            } else {
+                SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source,
+                }
+            }
+        })?;
+        sockets.push(socket);
+    }
+    Ok(LinuxExecutionKernelAuthority { sockets })
 }
 
 /// Darwin does not expose Linux's abstract Unix socket namespace.  A regular
@@ -2406,23 +2432,39 @@ fn acquire_execution_kernel_authority(
 /// by another process with the same UID while the original process still owns
 /// the old inode.  `/dev/dtracehelper` is a root-owned device node whose inode
 /// cannot be replaced by the Astra user.  Darwin record locks are keyed by a
-/// byte range, so hashing the normalized absolute owner/session identity gives
-/// each session an independent kernel-owned admission slot without serializing
-/// all sessions behind one global file lock.
+/// byte ranges, so hashing both the lexical and canonical owner/session
+/// identities keeps aliases and ancestor rebindings in the same admission
+/// domain while independent sessions remain concurrent.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct DarwinExecutionKernelAuthority {
-    offset: i64,
+    offsets: Vec<i64>,
     released: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+fn lexical_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = lexical_path_for_identity(path)?;
 
     // The journal itself may not exist during first admission. Canonicalize
     // the deepest existing parent, then append the unresolved suffix. This
@@ -2456,10 +2498,20 @@ fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn session_execution_identity_keys(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let lexical = lexical_path_for_identity(path)?;
+    let canonical = normalized_path_for_identity(path)?;
+    let mut keys = vec![lexical, canonical];
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 #[cfg(target_os = "macos")]
 fn acquire_execution_kernel_authority(
     owner_scope: &OwnerScope,
-    journal_path: &Path,
+    identity_keys: &[PathBuf],
     session_id: &str,
 ) -> Result<DarwinExecutionKernelAuthority, SessionExecutionLeaseError> {
     let file = match &*DARWIN_SESSION_AUTHORITY_FILE {
@@ -2471,55 +2523,61 @@ fn acquire_execution_kernel_authority(
             });
         }
     };
-    let normalized_journal_path = normalized_path_for_identity(journal_path).map_err(|source| {
-        SessionExecutionLeaseError::Io {
-            session_id: session_id.to_string(),
-            source,
+    let mut offsets = Vec::with_capacity(identity_keys.len());
+    for identity_path in identity_keys {
+        let mut identity = Sha256::new();
+        identity.update(b"astra-darwin-session-execution-range-v1\0");
+        identity.update(owner_scope.id().as_bytes());
+        identity.update(b"\0");
+        identity.update(identity_path.as_os_str().as_encoded_bytes());
+        identity.update(b"\0");
+        identity.update(session_id.as_bytes());
+        let digest = identity.finalize();
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        // Keep the offset non-negative for Darwin's off_t record-lock ABI.
+        let offset = i64::from_be_bytes(bytes) & i64::MAX;
+        if offsets.contains(&offset) {
+            continue;
         }
-    })?;
-    let mut identity = Sha256::new();
-    identity.update(b"astra-darwin-session-execution-range-v1\0");
-    identity.update(owner_scope.id().as_bytes());
-    identity.update(b"\0");
-    identity.update(normalized_journal_path.as_os_str().as_encoded_bytes());
-    identity.update(b"\0");
-    identity.update(session_id.as_bytes());
-    let digest = identity.finalize();
-    let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    // Keep the offset non-negative for Darwin's off_t record-lock ABI.
-    let offset = i64::from_be_bytes(bytes) & i64::MAX;
-    let mut range = libc::flock {
-        l_start: offset,
-        l_len: 1,
-        l_pid: 0,
-        l_type: libc::F_WRLCK,
-        l_whence: libc::SEEK_SET as libc::c_short,
-    };
-    let result = unsafe {
-        libc::fcntl(
-            std::os::fd::AsRawFd::as_raw_fd(file),
-            libc::F_SETLK,
-            &mut range,
-        )
-    };
-    if result < 0 {
-        let source = std::io::Error::last_os_error();
-        if matches!(
-            source.raw_os_error(),
-            Some(libc::EACCES | libc::EAGAIN | libc::EDEADLK)
-        ) {
-            return Err(SessionExecutionLeaseError::Conflict {
+        let mut range = libc::flock {
+            l_start: offset,
+            l_len: 1,
+            l_pid: 0,
+            l_type: libc::F_WRLCK,
+            l_whence: libc::SEEK_SET as libc::c_short,
+        };
+        let result = unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(file),
+                libc::F_SETLK,
+                &mut range,
+            )
+        };
+        if result < 0 {
+            let source = std::io::Error::last_os_error();
+            let mut partial = DarwinExecutionKernelAuthority {
+                offsets,
+                released: false,
+            };
+            partial.release();
+            if matches!(
+                source.raw_os_error(),
+                Some(libc::EACCES | libc::EAGAIN | libc::EDEADLK)
+            ) {
+                return Err(SessionExecutionLeaseError::Conflict {
+                    session_id: session_id.to_string(),
+                });
+            }
+            return Err(SessionExecutionLeaseError::Io {
                 session_id: session_id.to_string(),
+                source,
             });
         }
-        return Err(SessionExecutionLeaseError::Io {
-            session_id: session_id.to_string(),
-            source,
-        });
+        offsets.push(offset);
     }
     Ok(DarwinExecutionKernelAuthority {
-        offset,
+        offsets,
         released: false,
     })
 }
@@ -2534,23 +2592,26 @@ impl DarwinExecutionKernelAuthority {
         let Ok(file) = &*DARWIN_SESSION_AUTHORITY_FILE else {
             return;
         };
-        let mut range = libc::flock {
-            l_start: self.offset,
-            l_len: 1,
-            l_pid: 0,
-            l_type: libc::F_UNLCK,
-            l_whence: libc::SEEK_SET as libc::c_short,
-        };
-        // The authority descriptor is process-global and intentionally kept
-        // open until process exit. Unlock only this lease's byte range so a
-        // different live lease cannot be released by closing another FD.
-        let _ = unsafe {
-            libc::fcntl(
-                std::os::fd::AsRawFd::as_raw_fd(file),
-                libc::F_SETLK,
-                &mut range,
-            )
-        };
+        for offset in &self.offsets {
+            let mut range = libc::flock {
+                l_start: *offset,
+                l_len: 1,
+                l_pid: 0,
+                l_type: libc::F_UNLCK,
+                l_whence: libc::SEEK_SET as libc::c_short,
+            };
+            // The authority descriptor is process-global and intentionally
+            // kept open until process exit. Unlock only this lease's byte
+            // range so a different live lease cannot be released by closing
+            // another FD.
+            let _ = unsafe {
+                libc::fcntl(
+                    std::os::fd::AsRawFd::as_raw_fd(file),
+                    libc::F_SETLK,
+                    &mut range,
+                )
+            };
+        }
     }
 }
 
@@ -12578,11 +12639,13 @@ mod turn_event_buffer_tests {
         let owner_scope = OwnerScope::local_user();
         let journal_path =
             journal_file_path_for_owner(&owner_scope, session_id).expect("journal path");
-        let mut first = acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)
-            .expect("first kernel authority");
+        let identity_keys = session_execution_identity_keys(&journal_path).unwrap();
+        let mut first =
+            acquire_execution_kernel_authority(&owner_scope, &identity_keys, session_id)
+                .expect("first kernel authority");
         first.release();
 
-        let second = acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)
+        let second = acquire_execution_kernel_authority(&owner_scope, &identity_keys, session_id)
             .expect("handoff kernel authority");
         // The predecessor's deferred destructor must be a no-op after its
         // explicit release; otherwise it would unlock the successor's
@@ -12678,6 +12741,84 @@ mod turn_event_buffer_tests {
         assert!(
             output.status.success(),
             "canonical and alias state roots must share the authority key:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_authority_ancestor_retarget_cannot_admit() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let first_root = temp.path().join("first-root");
+        let second_root = temp.path().join("second-root");
+        let alias_root = temp.path().join("alias-root");
+        std::fs::create_dir(&first_root).unwrap();
+        std::fs::create_dir(&second_root).unwrap();
+        symlink(&first_root, &alias_root).unwrap();
+
+        let _guard = JournalDirGuard::new(&alias_root);
+        let session_id = "sess-macos-ancestor-retarget";
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        std::fs::rename(&alias_root, temp.path().join("detached-alias-root")).unwrap();
+        symlink(&second_root, &alias_root).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(
+                "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+            )
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &alias_root)
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "an ancestor retarget must not create a second session executor:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(first);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_alias_contender_cannot_release_original_authority() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let real_root = temp.path().join("real-root");
+        let alias_root = temp.path().join("alias-root");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let _guard = JournalDirGuard::new(&real_root);
+        let session_id = "sess-macos-alias-handoff";
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let detached_lock_path = first.lock_path.with_extension("detached-lock");
+        std::fs::rename(&first.lock_path, &detached_lock_path).unwrap();
+        std::fs::write(&first.lock_path, b"replacement generation").unwrap();
+
+        {
+            let _alias_guard = JournalDirGuard::new(&alias_root);
+            assert!(matches!(
+                SessionExecutionLease::try_acquire(session_id),
+                Err(SessionExecutionLeaseError::Conflict { .. })
+            ));
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(
+                "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+            )
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &real_root)
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "an alias contender must not release the original authority:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

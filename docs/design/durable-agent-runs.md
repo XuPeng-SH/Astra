@@ -55,14 +55,15 @@ Checkpoint must include enough information to resume safely:
 - Session execution slots prevent conflicting root runs when required by product semantics.
 - Local client session execution leases use one stable, never-rotated file
   witness in the owner-local state directory plus a kernel-owned authority.
-  Linux uses a kernel-named abstract Unix socket; macOS uses a byte-range lock
-  on the root-owned `/dev/dtracehelper` device. The device lock is derived from
-  the owner/session identity, so independent sessions remain concurrent while
-  a same-UID pathname replacement cannot admit a second executor. The file
-  witness and macOS kqueue vnode history retain replacement evidence, and both
-  platforms re-check the lease generation at canonical settlement. Platforms
-  without a rename-resistant authority fail closed rather than running without
-  an execution owner.
+  Linux uses kernel-named abstract Unix sockets; macOS uses byte-range locks
+  on the root-owned `/dev/dtracehelper` device. The kernel authority holds both
+  a deterministic lexical path key and the currently canonical path key: this
+  keeps aliases and ancestor rebindings in one admission domain while
+  independent sessions remain concurrent. The file witness and macOS kqueue
+  vnode history retain replacement evidence, and both platforms re-check the
+  lease generation at canonical settlement. Platforms without a
+  rename-resistant authority fail closed rather than running without an
+  execution owner.
 - Workspace mutation leases (typed writers, Bash observation, and recursive
   writers) use a separate cross-user coordination authority when the workspace
   is shared. Linux uses the abstract socket plus an owner-only witness; macOS
@@ -106,3 +107,5 @@ Buffered completion may finalize without resuming execution when the answer is a
 - Provider offline during resume.
 - Native client release targets acquire, conflict, release, and reacquire the
   session execution authority before they are packaged.
+- Session execution tests cover lexical aliases, missing-then-created journals,
+  ancestor rebindings, and failed handoff cleanup.
