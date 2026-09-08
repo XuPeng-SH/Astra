@@ -10,6 +10,7 @@ use thiserror::Error;
 /// The first published local-model schema. There is no pre-existing on-disk
 /// format to migrate in this feature, so new installations start at version 1.
 pub const LOCAL_MODELS_FILE_VERSION: u32 = 1;
+const PROBE_FINGERPRINT_KEY_ID: &str = "probe_fingerprint_key_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,7 +88,7 @@ pub enum LocalModelProbeState {
     NotRun,
     Passed {
         checked_at_unix_ms: u64,
-        /// Secret-safe identity of the credential material used by the
+        /// Keyed, secret-safe identity of the credential material used by the
         /// probe. The raw credential is never persisted. `None` is retained
         /// for compatibility with pre-fingerprint probe records and is not
         /// trusted for environment-backed credentials.
@@ -100,8 +101,8 @@ pub enum LocalModelProbeState {
         /// `transport`. Raw provider messages and endpoint details never go
         /// into the local configuration file.
         code: String,
-        /// Secret-safe identity of the credential material used by the probe,
-        /// when credential resolution succeeded.
+        /// Keyed, secret-safe identity of the credential material used by the
+        /// probe, when credential resolution succeeded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential_fingerprint: Option<String>,
     },
@@ -259,15 +260,14 @@ impl ResolvedLocalCredential {
         &self.0
     }
 
-    /// Return a stable, secret-safe identity for this credential material.
+    /// Return a stable, keyed identity for this credential material.
     ///
-    /// Probe evidence stores this digest instead of the raw provider key so
+    /// Probe evidence stores this HMAC instead of the raw provider key so
     /// another terminal can tell whether its environment-backed attachment
-    /// is the material that was actually checked. The domain separator keeps
-    /// this digest from being confused with hashes used by other Astra
-    /// artifacts.
-    pub fn fingerprint(&self) -> String {
-        fingerprint_value(&self.0)
+    /// is the material that was actually checked. The key is kept in the
+    /// owner-private secret store and never written to `models.json`.
+    pub fn fingerprint_with_key(&self, key: &ResolvedLocalCredential) -> String {
+        keyed_fingerprint(key.0.as_bytes(), self.0.as_bytes())
     }
 
     /// Return the stable identity used for a keyless (`None`) credential.
@@ -286,6 +286,38 @@ fn fingerprint_value(value: &str) -> String {
     hasher.update(b"astra-local-model-credential-v1\0");
     hasher.update(value.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn keyed_fingerprint(key: &[u8], value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_SIZE: usize = 64;
+    let mut normalized_key = [0_u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = normalized_key;
+    let mut outer_pad = normalized_key;
+    for byte in &mut inner_pad {
+        *byte ^= 0x36;
+    }
+    for byte in &mut outer_pad {
+        *byte ^= 0x5c;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(b"astra-local-model-credential-v2\0");
+    inner.update(value);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    format!("hmac-sha256:{:x}", outer.finalize())
 }
 
 impl std::fmt::Debug for ResolvedLocalCredential {
@@ -527,6 +559,59 @@ impl LocalSecretStore {
         }
         ensure_private_directory(&self.root)?;
         write_new_private(&self.path(secret_id), value.as_bytes())
+    }
+
+    /// Load the owner-local key used to bind probe evidence to credential
+    /// material, creating it once during an explicit provider check. Status
+    /// reads must use [`Self::resolve_probe_fingerprint_key`] so they never
+    /// mutate local state just by displaying a model.
+    pub fn ensure_probe_fingerprint_key(
+        &self,
+    ) -> Result<Option<ResolvedLocalCredential>, LocalModelConfigError> {
+        let reference = LocalCredentialRef::ProtectedFile {
+            secret_id: PROBE_FINGERPRINT_KEY_ID.to_string(),
+        };
+        match self.resolve(&reference) {
+            Ok(Some(key)) => Ok(Some(key)),
+            Ok(None) => Err(LocalModelConfigError::CredentialUnavailable(
+                "probe fingerprint key reference resolved without key material".to_string(),
+            )),
+            Err(LocalModelConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let generated = uuid::Uuid::new_v4().simple().to_string();
+                match self.put(PROBE_FINGERPRINT_KEY_ID, &generated) {
+                    Ok(()) => self.resolve(&reference),
+                    Err(LocalModelConfigError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        self.resolve(&reference)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read the owner-local probe key without creating it. A missing key means
+    /// previously persisted environment-backed evidence cannot be trusted and
+    /// must be shown as stale until the next explicit check recreates it.
+    pub fn resolve_probe_fingerprint_key(
+        &self,
+    ) -> Result<Option<ResolvedLocalCredential>, LocalModelConfigError> {
+        let reference = LocalCredentialRef::ProtectedFile {
+            secret_id: PROBE_FINGERPRINT_KEY_ID.to_string(),
+        };
+        match self.resolve(&reference) {
+            Ok(value) => Ok(value),
+            Err(LocalModelConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn resolve(
@@ -981,6 +1066,14 @@ mod tests {
 
     #[test]
     fn credential_fingerprint_is_stable_and_does_not_reveal_material() {
+        let key = ResolvedLocalCredential::from_environment(
+            &LocalCredentialRef::Environment {
+                name: "ASTRA_PROBE_KEY".to_string(),
+            },
+            |_| Some("owner-local-hmac-key".to_string()),
+        )
+        .unwrap()
+        .unwrap();
         let first = ResolvedLocalCredential::from_environment(
             &LocalCredentialRef::Environment {
                 name: "WORK_LLM_API_KEY".to_string(),
@@ -1006,13 +1099,51 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(first.fingerprint(), same.fingerprint());
-        assert_ne!(first.fingerprint(), rotated.fingerprint());
-        assert!(!first.fingerprint().contains("first-terminal-secret"));
+        let first_fingerprint = first.fingerprint_with_key(&key);
+        assert_eq!(first_fingerprint, same.fingerprint_with_key(&key));
+        assert_ne!(first_fingerprint, rotated.fingerprint_with_key(&key));
+        assert!(!first_fingerprint.contains("first-terminal-secret"));
         assert_ne!(
-            first.fingerprint(),
+            first_fingerprint,
             ResolvedLocalCredential::no_credential_fingerprint()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_fingerprint_key_is_created_once_in_private_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalSecretStore::with_root(root.path().join("model-secrets"));
+        let first = store
+            .ensure_probe_fingerprint_key()
+            .unwrap()
+            .expect("supported platforms create a probe key");
+        let second = store
+            .resolve_probe_fingerprint_key()
+            .unwrap()
+            .expect("the key remains available");
+        assert_eq!(
+            first.expose_to_local_transport(),
+            second.expose_to_local_transport()
+        );
+        assert_eq!(first.expose_to_local_transport().len(), 32);
+        assert!(
+            root.path()
+                .join("model-secrets")
+                .join(PROBE_FINGERPRINT_KEY_ID)
+                .is_file()
+        );
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn probe_fingerprint_key_fails_closed_without_protected_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalSecretStore::with_root(root.path().join("model-secrets"));
+        assert!(matches!(
+            store.ensure_probe_fingerprint_key(),
+            Err(LocalModelConfigError::CredentialUnavailable(_))
+        ));
     }
 
     #[test]

@@ -378,7 +378,14 @@ impl Fixture {
                 if let Some((_, payload)) = self.host.pending(1).await.unwrap().pop() {
                     return payload;
                 }
-                self.host.terminal_ready().await;
+                // Another connection may consume the best-effort wake-up
+                // before this observer starts waiting. Keep a bounded polling
+                // fallback so terminal custody is never hidden by a lost
+                // notification in tests or in a reconnecting client.
+                tokio::select! {
+                    _ = self.host.terminal_ready() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
             }
         })
         .await

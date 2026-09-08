@@ -42,7 +42,7 @@ pub(crate) struct LocalModelStatusRow {
 /// terminal-local environment value from being detached from its evidence.
 struct LocalProbeResult {
     body: String,
-    credential_fingerprint: String,
+    credential_fingerprint: Option<String>,
 }
 
 struct LocalProbeError {
@@ -153,13 +153,19 @@ impl LocalModelCandidate {
         let result = check_definition(&self.scope, &self.name, &self.definition)
             .await
             .map_err(|error| error.to_string())?;
+        let Some(credential_fingerprint) = result.credential_fingerprint else {
+            return Err(
+                "provider check completed, but protected local probe identity is unavailable; the candidate was not applied"
+                    .to_string(),
+            );
+        };
         // Keep the probe result on the candidate until the atomic apply. This
         // makes TUI "Test and use" honest: a successful test is visible as
         // ready after saving, while a canceled/failed candidate never mutates
         // the existing binding or its evidence.
         self.definition.probe = LocalModelProbeState::Passed {
             checked_at_unix_ms: now_unix_ms(),
-            credential_fingerprint: Some(result.credential_fingerprint),
+            credential_fingerprint: Some(credential_fingerprint),
         };
         Ok(result.body)
     }
@@ -383,7 +389,7 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                 binding_revision,
                 LocalModelProbeState::Passed {
                     checked_at_unix_ms: now_unix_ms(),
-                    credential_fingerprint: Some(result.credential_fingerprint),
+                    credential_fingerprint: result.credential_fingerprint,
                 },
             );
             let (persisted, warning) = match persisted {
@@ -392,6 +398,13 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                     false,
                     Some(
                         "the provider check result was not persisted because another credential observation is retained"
+                            .to_string(),
+                    ),
+                ),
+                Ok(ProbePersistOutcome::CredentialFingerprintUnavailable) => (
+                    false,
+                    Some(
+                        "the provider check result was not persisted because protected local probe identity is unavailable"
                             .to_string(),
                     ),
                 ),
@@ -443,6 +456,10 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                     "{} (failure evidence was not persisted because the saved observation belongs to different credential material; run the check again to refresh this terminal's status)",
                     error
                 )),
+                Ok(ProbePersistOutcome::CredentialFingerprintUnavailable) => Err(format!(
+                    "{} (failure evidence was not persisted because protected local probe identity is unavailable)",
+                    error
+                )),
                 Ok(ProbePersistOutcome::BindingChanged) => Err(format!(
                     "provider probe failed for an older local model configuration; the binding changed while the check was running, so the result was discarded ({}). Re-run `astra model local check {}` for the current binding",
                     error, args.name
@@ -479,10 +496,19 @@ async fn check_definition(
         }
     }
     .map_err(|error| LocalProbeError::new(error.to_string(), None))?;
-    let credential_fingerprint = credential
-        .as_ref()
-        .map(ResolvedLocalCredential::fingerprint)
-        .unwrap_or_else(ResolvedLocalCredential::no_credential_fingerprint);
+    let probe_key = credential.as_ref().and_then(|_| {
+        scope
+            .secrets()
+            .ensure_probe_fingerprint_key()
+            .ok()
+            .flatten()
+    });
+    let credential_fingerprint = match credential.as_ref() {
+        Some(credential) => probe_key
+            .as_ref()
+            .map(|key| credential.fingerprint_with_key(key)),
+        None => Some(ResolvedLocalCredential::no_credential_fingerprint()),
+    };
     let api_key = credential
         .as_ref()
         .map(ResolvedLocalCredential::expose_to_local_transport)
@@ -502,28 +528,21 @@ async fn check_definition(
         astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
         64 * 1024,
     )
-    .map_err(|error| {
-        LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-    })?;
-    let endpoint = chat_completions_endpoint(&definition.base_url).map_err(|error| {
-        LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-    })?;
+    .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
+    let endpoint = chat_completions_endpoint(&definition.base_url)
+        .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
     let transport = astra_inference_adapter::transport::ProviderTransport::build(
         astra_core::net::runner_provider_client_builder().map_err(|error| {
-            LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
+            LocalProbeError::new(error.to_string(), credential_fingerprint.clone())
         })?,
     )
-    .map_err(|error| {
-        LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-    })?;
+    .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
     let headers = astra_inference_adapter::transport::provider_headers(
         astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
         api_key,
         std::iter::empty::<(&str, &str)>(),
     )
-    .map_err(|error| {
-        LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-    })?;
+    .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
     let attempt = transport
         .prepare(
             &endpoint,
@@ -531,9 +550,7 @@ async fn check_definition(
             &request,
             Some(std::time::Duration::from_secs(20)),
         )
-        .map_err(|error| {
-            LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-        })?;
+        .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
     let (events_tx, mut events_rx) = mpsc::channel(8);
     let cancellation = CancellationToken::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -598,7 +615,7 @@ async fn check_definition(
                 "provider probe failed ({:?}); no retry was attempted",
                 terminal.status
             ),
-            Some(credential_fingerprint),
+            credential_fingerprint.clone(),
         ));
     }
     let body = serde_json::to_string_pretty(&LocalModelStatus {
@@ -613,9 +630,7 @@ async fn check_definition(
         },
         config_path: scope.models().path().display().to_string(),
     })
-    .map_err(|error| {
-        LocalProbeError::new(error.to_string(), Some(credential_fingerprint.clone()))
-    })?;
+    .map_err(|error| LocalProbeError::new(error.to_string(), credential_fingerprint.clone()))?;
     drop(credential);
     Ok(LocalProbeResult {
         body,
@@ -627,6 +642,7 @@ async fn check_definition(
 enum ProbePersistOutcome {
     Persisted,
     CredentialChanged,
+    CredentialFingerprintUnavailable,
     BindingChanged,
     ModelMissing,
 }
@@ -651,6 +667,14 @@ fn persist_probe_state(
         // not attach stale evidence to the newer provider configuration.
         if definition.binding_revision != binding_revision {
             return Ok(ProbePersistOutcome::BindingChanged);
+        }
+        if probe_credential_fingerprint(&probe).is_none()
+            && !matches!(definition.credential, LocalCredentialRef::None)
+        {
+            // Never persist an environment/protected-credential observation
+            // without a keyed material identity. Such a record would look
+            // like a shared success to another terminal.
+            return Ok(ProbePersistOutcome::CredentialFingerprintUnavailable);
         }
         // A failed check from another terminal must not erase a known-good
         // observation for the credential material that this terminal uses.
@@ -883,21 +907,20 @@ fn current_credential_fingerprint(
     reference: &LocalCredentialRef,
 ) -> Option<String> {
     match reference {
-        LocalCredentialRef::Environment { .. } | LocalCredentialRef::None => {
+        LocalCredentialRef::Environment { .. } => {
+            let key = secrets.resolve_probe_fingerprint_key().ok().flatten()?;
             ResolvedLocalCredential::from_environment(reference, |name| std::env::var(name).ok())
                 .ok()
                 .flatten()
-                .map(|credential| credential.fingerprint())
-                .or_else(|| {
-                    matches!(reference, LocalCredentialRef::None)
-                        .then(ResolvedLocalCredential::no_credential_fingerprint)
-                })
+                .map(|credential| credential.fingerprint_with_key(&key))
         }
         LocalCredentialRef::ProtectedFile { .. } => secrets
-            .resolve(reference)
+            .resolve_probe_fingerprint_key()
             .ok()
             .flatten()
-            .map(|credential| credential.fingerprint()),
+            .zip(secrets.resolve(reference).ok().flatten())
+            .map(|(key, credential)| credential.fingerprint_with_key(&key)),
+        LocalCredentialRef::None => Some(ResolvedLocalCredential::no_credential_fingerprint()),
         LocalCredentialRef::SystemKeychain { .. } => None,
     }
 }
@@ -927,7 +950,20 @@ fn probe_matches_current_credential(
         return matches!(definition.credential, LocalCredentialRef::None);
     };
     current_credential_fingerprint(secrets, &definition.credential)
-        .is_some_and(|current| current == stored)
+        .is_some_and(|current| fingerprints_equal(&current, stored))
+}
+
+fn fingerprints_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 fn probe_status(secrets: &LocalSecretStore, definition: &LocalModelDefinition) -> &'static str {
@@ -1698,14 +1734,16 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[cfg(unix)]
     async fn environment_probe_evidence_is_scoped_to_current_terminal_material() {
+        use sha2::{Digest, Sha256};
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .and(header("authorization", "Bearer terminal-a-key"))
+            .and(header("authorization", "Bearer password"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -1718,7 +1756,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .and(header("authorization", "Bearer terminal-b-key"))
+            .and(header("authorization", "Bearer other-password"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
@@ -1728,7 +1766,10 @@ mod tests {
         let terminal_a = scope();
         let terminal_b = scope();
         let variable = "ASTRA_TEST_TERMINAL_PROVIDER_KEY";
-        let mut environment = TestEnvironmentVariable::set(variable, "terminal-a-key");
+        // Keep the canary intentionally low entropy. A plain digest stored in
+        // models.json would be offline-enumerable; the persisted HMAC must
+        // remain unverifiable without the owner-local probe key.
+        let mut environment = TestEnvironmentVariable::set(variable, "password");
         add(ModelAddArgs {
             name: Some("work".into()),
             base_url: Some(format!("{}/v1", server.uri())),
@@ -1754,10 +1795,26 @@ mod tests {
         assert_eq!(listed["models"][0]["provider_probe"], "stream_verified");
         assert_eq!(listed["models"][0]["status"], "ready");
 
+        let models_json = std::fs::read_to_string(terminal_a.models().path()).unwrap();
+        assert!(models_json.contains("hmac-sha256:"));
+        assert!(!models_json.contains("password"));
+        let mut legacy = Sha256::new();
+        legacy.update(b"astra-local-model-credential-v1\0");
+        legacy.update(b"password");
+        assert!(!models_json.contains(&format!("sha256:{:x}", legacy.finalize())));
+
+        let probe_key_path = terminal_a
+            .root()
+            .join("model-secrets")
+            .join("probe_fingerprint_key_v1");
+        assert!(probe_key_path.is_file());
+        let probe_key = std::fs::read_to_string(probe_key_path).unwrap();
+        assert!(!models_json.contains(&probe_key));
+
         // A second terminal can use the same owner-scoped config, but its
         // environment value is a different credential attachment. Listing is
         // local-only and must never claim that terminal B was checked.
-        environment.replace("terminal-b-key");
+        environment.replace("other-password");
         let listed: serde_json::Value =
             serde_json::from_str(&super::list(&terminal_b).unwrap()).unwrap();
         assert_eq!(listed["models"][0]["provider_probe"], "stale");
@@ -1792,7 +1849,7 @@ mod tests {
         // A failed check from terminal B does not erase terminal A's known-good
         // observation. Rotating back therefore remains ready, while terminal
         // B must explicitly check its own material before it can be selected.
-        environment.replace("terminal-a-key");
+        environment.replace("password");
         let listed: serde_json::Value =
             serde_json::from_str(&super::list(&terminal_a).unwrap()).unwrap();
         assert_eq!(listed["models"][0]["provider_probe"], "stream_verified");

@@ -1034,18 +1034,22 @@ test** (persist as unverified, make no provider request, and leave the current
 selection unchanged).
 
 Implementation note: the current setup stores the definition and secret-safe
-probe evidence on that exact binding revision. The evidence also carries a
-non-secret fingerprint of the credential material used by the request. For an
-environment-backed model, `list`/`show` report `provider_probe=stream_verified`
-only when the current process has the same material; a different terminal or a
-rotated value is reported as `stale` and requires an explicit check. Listing
-and status never trigger a provider request or silently retry a potentially
-billable probe. **Save without test** records `provider_probe=not_run`;
-`/model` selects without probing. Use `/model check <name>` or
-`astra model local check <name>` for an explicit provider test. A later
-endpoint, model, limit, or credential change invalidates prior evidence (the
-stored observation remains historical). The full picker projection of this
-state and public repair actions remain deployment gates.
+probe evidence on that exact binding revision. For credential-backed models,
+the evidence carries an HMAC fingerprint of the material used by the request;
+the random owner-local HMAC key lives in the protected `model-secrets` store,
+never in `models.json`, so a low-entropy provider key cannot be checked offline
+from the configuration file alone. For an environment-backed model,
+`list`/`show` report `provider_probe=stream_verified` only when the current
+process has the same material; a different terminal or a rotated value is
+reported as `stale` and requires an explicit check. If protected local storage
+is unavailable, the check result is shown but is not persisted as trusted
+evidence. Listing and status never trigger a provider request or silently retry
+a potentially billable probe. **Save without test** records
+`provider_probe=not_run`; `/model` selects without probing. Use `/model check
+<name>` or `astra model local check <name>` for an explicit provider test. A
+later endpoint, model, limit, or credential change invalidates prior evidence
+(the stored observation remains historical). The full picker projection of
+this state and public repair actions remain deployment gates.
 
 The command surface extends existing `astra model list/show` with local `list`,
 `add`, `check`, `rotate`, `disable`, and `remove`. Each is an adapter over the same local
