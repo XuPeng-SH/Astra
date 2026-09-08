@@ -2345,6 +2345,7 @@ async fn execute_cli_command_impl(
                 profile.as_deref(),
             )?;
             let body = match command {
+                LocalModelCmd::List => crate::cli::local_model_command::list(&scope)?,
                 LocalModelCmd::Add(args) => crate::cli::local_model_command::add(&scope, args)?,
                 LocalModelCmd::Check(args) => {
                     crate::cli::local_model_command::check(&scope, args).await?

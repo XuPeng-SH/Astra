@@ -1022,7 +1022,7 @@ it must use the same sequenced provisional events and Server terminal authority.
 ## Local setup implementation
 
 TUI is a first-class entry point: `/model` selects an Offering; `/model add`
-opens native setup; `/model check` and `/model manage` provide diagnostics and
+opens native setup; `/model check <name>` and `/model manage` provide diagnostics and
 repair. These use the same application services as `astra model ...`. The
 [TUI Model Access contract](client-surfaces-and-deployment.md#model-access-in-the-tui)
 owns picker/form layout, masked input, active-run feedback, keyboard behavior,
@@ -1033,14 +1033,16 @@ bounded provider request followed by Offering selection) or **Save without
 test** (persist as unverified, make no provider request, and leave the current
 selection unchanged).
 
-Implementation note: the current setup stores the definition but not durable
-probe evidence. **Save without test** therefore reports only that no provider
-test ran; `/model` selects without probing. Use `astra model local check <name>` for
-an explicit provider test. The probe-status UX specified below remains a target
-contract, not a current capability.
+Implementation note: the current setup stores the definition and secret-safe
+probe evidence on that exact binding revision. **Save without test** records
+`provider_probe=not_run`; `/model` selects without probing. Use `/model check <name>`
+or `astra model local check <name>` for an explicit provider test. A later
+endpoint, model, limit, or credential change resets the evidence. The full
+picker projection of this state and public repair actions remain deployment
+gates.
 
-The command surface extends existing `astra model list/show` with `add`, `check`,
-`rotate`, `disable`, and `remove`. Each is an adapter over the same local
+The command surface extends existing `astra model list/show` with local `list`,
+`add`, `check`, `rotate`, `disable`, and `remove`. Each is an adapter over the same local
 application operation used by TUI. Server administrator commands remain
 explicitly `astra admin model ...`. Existing `--model`, resume/continue, print,
 and structured-output entrypoints use the same model resolution and host attach.
@@ -1227,6 +1229,8 @@ host connected, policy eligible) and provider verification are separate fields.
 A selectable untested model shows `Available; not tested`, not `Connection tested`.
 An actual known failure keeps its typed repair/degradation status; skipping a
 probe does not erase it. The first real request still uses normal admission.
+Probe evidence is stored with the local definition as a bounded status and
+timestamp; raw provider errors, URLs, and credentials are never retained.
 
 Probe evidence binds the tested local material generation, protocol profile,
 probe kind, and timestamp. Rotation or transport changes make earlier evidence

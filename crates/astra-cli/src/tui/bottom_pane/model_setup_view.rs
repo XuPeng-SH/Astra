@@ -24,6 +24,8 @@ const LABELS: [&str; 7] = [
     "Credential  ",
     "Value       ",
 ];
+const DEFAULT_CONTEXT_WINDOW: &str = "128000";
+const DEFAULT_MAX_OUTPUT_TOKENS: &str = "8192";
 
 pub(crate) struct ModelSetupView {
     values: [String; 7],
@@ -42,8 +44,8 @@ impl ModelSetupView {
                 String::new(),
                 "https://api.openai.com/v1".to_string(),
                 String::new(),
-                String::new(),
-                String::new(),
+                DEFAULT_CONTEXT_WINDOW.to_string(),
+                DEFAULT_MAX_OUTPUT_TOKENS.to_string(),
                 "environment".to_string(),
                 "OPENAI_API_KEY".to_string(),
             ],
@@ -76,10 +78,12 @@ impl ModelSetupView {
     fn field_hint(&self) -> &str {
         match self.focus {
             0 => "A name you recognize in /model. An existing name updates that configuration.",
-            1 => "OpenAI-compatible API base URL. Use HTTPS, or HTTP on loopback only.",
+            1 => "Provider URL or base URL. Use HTTPS, or HTTP on loopback only.",
             2 => "The exact model ID accepted by your provider, not your display name.",
-            3 => "Context capacity in tokens. Use your provider's documented limit.",
-            4 => "Output limit in tokens; must be positive and fit within the context.",
+            3 => {
+                "Context capacity in tokens. Default 128000; change it when your provider documents another limit."
+            }
+            4 => "Output limit in tokens. Default 8192; it must fit within the context.",
             5 => "Left / Right: environment variable, stored API key, or no authentication.",
             _ if self.credential_source() == "environment" => {
                 "Variable name only. Export its value before starting Astra in this terminal."
@@ -175,6 +179,7 @@ impl ModelSetupView {
         // closing the form; validation performs no disk or provider I/O.
         use astra_credentials::{
             LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig, LocalModelDefinition,
+            LocalModelProbeState,
         };
         let definition = LocalModelDefinition {
             protocol: LocalInferenceProtocol::OpenaiCompatible,
@@ -192,6 +197,7 @@ impl ModelSetupView {
                 },
                 ModelSetupCredentialDraft::None => LocalCredentialRef::None,
             },
+            probe: LocalModelProbeState::default(),
         };
         let config = LocalModelConfig {
             models: [(self.values[0].trim().to_string(), definition)].into(),
@@ -372,9 +378,11 @@ impl BottomPaneView for ModelSetupView {
                 theme.dim
             }))
             .render(hint, buf);
-        Paragraph::new("Tab / ↑↓ field · Ctrl+U clear\nEnter review · Esc cancel")
-            .style(Style::default().fg(theme.dim))
-            .render(footer, buf);
+        Paragraph::new(
+            "Tab / ↑↓ field · Ctrl+U clear · Defaults editable\nEnter review · Esc cancel",
+        )
+        .style(Style::default().fg(theme.dim))
+        .render(footer, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -551,6 +559,16 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
         let result = view.completion().unwrap().result.unwrap();
         assert!(!format!("{result:?}").contains("provider-secret-canary"));
+    }
+
+    #[test]
+    fn first_run_form_starts_with_documented_provider_defaults() {
+        let view = ModelSetupView::new();
+        assert_eq!(view.values[1], "https://api.openai.com/v1");
+        assert_eq!(view.values[3], DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(view.values[4], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(view.values[5], "environment");
+        assert_eq!(view.values[6], "OPENAI_API_KEY");
     }
 
     #[test]

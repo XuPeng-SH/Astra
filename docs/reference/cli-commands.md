@@ -131,8 +131,10 @@ astra skill status [--per-group 50]
 Cloud BYOK and This device are explicit, separate credential locations:
 
 - `astra model add`, `probe`, and `delete` manage Cloud BYOK on Astra Server.
-- `astra model local add`, `check`, `show`, and `remove` manage this device's
-  deployment/account-scoped configuration. Provider keys are never uploaded.
+- `astra model local list`, `add`, `check`, `show`, and `remove` manage this
+  device's deployment/account-scoped configuration. `list` and `show` are
+  local-only status views: they report credential availability and the next
+  action without contacting the provider. Provider keys are never uploaded.
 - `/model add` in the TUI opens **local** setup; `/model` selects from the shared
   catalog, including Cloud BYOK and available Runner Offerings.
 
@@ -149,12 +151,14 @@ metadata for the next turn does not select a different account with the same
 display name. `--model <offering_id>` also accepts an exact ID; unavailable IDs
 fail with a repair message, without falling back to a namesake.
 
-`/model add` opens local model setup. **Save without test** saves configuration
+`/model add` opens local model setup. `/model status` (also `/model manage`)
+shows saved device models, local credential readiness, and a concrete next
+action without starting a Runner or contacting a provider. **Save without test** saves configuration
 without a provider call and leaves the current selection unchanged. Selecting
 that model later with `/model` does not test it. Run `astra model local check <name>`
-for an explicit provider test; this can incur provider charges. The current
-implementation does not persist probe status or show saved probe evidence in
-the picker.
+for an explicit provider test; this can incur provider charges. A successful or
+failed check is recorded against the exact binding revision as secret-safe
+evidence; changing the endpoint, model, limits, or credential resets it.
 
 Local Chat Completions setup accepts a base URL (for example,
 `https://provider.example/v1`) or the full `/chat/completions` endpoint, including

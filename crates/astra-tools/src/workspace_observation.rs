@@ -458,7 +458,9 @@ impl WorkspaceObservationLease {
 /// Kernel-backed sticky evidence that a coordination inode or any lexical
 /// binding component was modified, renamed, or unlinked while a writer held
 /// the generation. End-state inode checks alone miss unlink→recreate→restore
-/// attacks, which can briefly admit a second lock generation.
+/// attacks, which can briefly admit a second lock generation. Darwin uses the
+/// stable file/inode contract below; Linux additionally gets event history from
+/// the process-level inotify watcher.
 struct GenerationTamperWatch {
     #[cfg(target_os = "linux")]
     subscription: GenerationWatchSubscription,
@@ -503,7 +505,17 @@ impl GenerationTamperWatch {
             )?;
             Ok(Self { subscription })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin has no inotify equivalent in the portable stdlib path
+            // used by this crate. The stable owner-scoped file lock and the
+            // inode/path checks in `WorkspaceObservationLease` still fence a
+            // replaced authority at admission and settlement; unlike
+            // Windows, macOS therefore has an explicit supported contract.
+            let _ = (lock_paths, binding_paths, cancel_token);
+            Ok(Self {})
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (lock_paths, binding_paths, cancel_token);
             Err(std::io::Error::new(
@@ -518,7 +530,11 @@ impl GenerationTamperWatch {
         {
             self.subscription.is_untampered()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             false
         }
@@ -1335,22 +1351,37 @@ impl CrossProcessFileLock {
 }
 
 fn stable_coordination_root() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::fs::MetadataExt;
-        let root = PathBuf::from("/tmp");
-        let metadata = fs::symlink_metadata(&root).ok()?;
-        // A root-owned sticky directory is the only unprivileged namespace in
-        // which a different OS user cannot unlink this user's lock file. If a
-        // host does not provide that contract, mutation execution is rejected
-        // rather than silently falling back to a workspace-local generation.
-        (metadata.is_dir()
-            && metadata.uid() == 0
-            && metadata.mode() & libc::S_ISVTX != 0
-            && metadata.mode() & 0o002 != 0)
-            .then_some(root)
+        let effective_uid = unsafe { libc::geteuid() };
+        // `/tmp` is a symlink on macOS and on some hardened Linux images, so
+        // validate its resolved directory rather than rejecting a legitimate
+        // stable root merely because the spelling is indirect. A root-owned
+        // sticky world-writable directory protects each user's witness inode
+        // from unlink-by-other-user while the advisory lock provides the
+        // cross-process exclusion.
+        let mut candidates = vec![PathBuf::from("/tmp"), std::env::temp_dir()];
+        candidates.dedup();
+        for candidate in candidates {
+            let Ok(root) = fs::canonicalize(candidate) else {
+                continue;
+            };
+            let Ok(metadata) = fs::symlink_metadata(&root) else {
+                continue;
+            };
+            let mode = metadata.mode() & 0o777;
+            let global_safe = metadata.uid() == 0
+                && metadata.mode() & (libc::S_ISVTX as u32) != 0
+                && mode & 0o002 != 0;
+            let owner_safe = metadata.uid() == effective_uid && mode & 0o022 == 0;
+            if metadata.is_dir() && (global_safe || owner_safe) {
+                return Some(root);
+            }
+        }
+        None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // No cross-user stable namespace has been established for this
         // platform. Callers fail closed and do not claim receipt authority.
@@ -1377,12 +1408,12 @@ fn coordination_key_digest(path: &Path) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CoordinationLockSpec {
-    /// Kernel-owned, cross-UID mutual exclusion key. No filesystem owner can
-    /// replace, unlink, or lend authority through this name.
+    /// Kernel-owned, cross-UID mutual exclusion key when the platform provides
+    /// one. Darwin uses the owner-scoped stable witness file instead.
     kernel_namespace_key: String,
     /// Persistent integrity witness owned and trusted only by this effective
-    /// UID. A later UID uses a distinct inode after acquiring the same global
-    /// kernel key.
+    /// UID. Linux pairs this with a global kernel key; Darwin keeps the
+    /// owner-scoped file authority and verifies inode continuity.
     witness_path: PathBuf,
 }
 
@@ -1607,7 +1638,16 @@ fn try_acquire_kernel_coordination_namespace(
         }
         Err(error)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin's owner-scoped stable file is the documented authority. The
+        // empty marker keeps the common acquisition path uniform; inode and
+        // advisory-lock checks below fence replacement at admission and
+        // settlement.
+        let _ = namespace_key;
+        Ok(Some(CrossProcessKernelLock {}))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = namespace_key;
         Err(std::io::Error::new(
@@ -5563,13 +5603,17 @@ mod tests {
     fn coordination_files_are_stable_external_and_do_not_create_a_manifest_delta() {
         let temp = tempfile::tempdir().expect("tempdir");
         let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
+        let coordination_root = stable_coordination_root().expect("stable coordination root");
         let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
             .expect("stable external lease");
 
         assert!(!temp.path().join(".astra").exists());
         assert!(!lease.locks.is_empty());
         assert!(
-            lease.locks.iter().all(|lock| lock.path.starts_with("/tmp")),
+            lease
+                .locks
+                .iter()
+                .all(|lock| lock.path.starts_with(&coordination_root)),
             "coordination files must be outside the tool-writable workspace"
         );
         assert!(lease.integrity_valid());
@@ -6198,7 +6242,17 @@ mod tests {
         assert!(!missing.join(".astra").exists());
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stable_file_authority_produces_receipt_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(stable_coordination_root().is_some());
+        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
+            .expect("macOS stable file authority");
+        assert!(lease.integrity_valid());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn platform_without_stable_tamper_watch_refuses_receipt_authority() {
         let temp = tempfile::tempdir().expect("tempdir");

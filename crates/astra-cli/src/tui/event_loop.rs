@@ -144,6 +144,10 @@ enum SlashBackgroundReadEffect {
     Memory(MemoryReadEffect),
     Mcp(String),
     Context(Box<crate::tui::context_panel::ContextBreakdown>),
+    LocalModelCheck {
+        name: String,
+        result: Result<String, String>,
+    },
     Failed {
         action: &'static str,
         error: String,
@@ -651,6 +655,14 @@ fn dispatch_slash_background_read(
                 breakdown.set_read_activity(read_activity);
                 SlashBackgroundReadEffect::Context(breakdown)
             }
+            slash_dispatch::SlashBackgroundRead::LocalModelCheck { scope, name } => {
+                let result = crate::cli::local_model_command::check(
+                    &scope,
+                    crate::cli::cli_config::cli_args::ModelCheckArgs { name: name.clone() },
+                )
+                .await;
+                SlashBackgroundReadEffect::LocalModelCheck { name, result }
+            }
         };
         let _ = effect_tx
             .send(SlashBackgroundReadCompletion { generation, effect })
@@ -963,6 +975,36 @@ fn apply_slash_background_read_effect(
             ));
             bottom_pane.push_view(Box::new(ContextPanelView::new(*breakdown)));
         }
+        SlashBackgroundReadEffect::LocalModelCheck { name, result } => match result {
+            Ok(body) => {
+                let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+                let persisted = value
+                    .as_ref()
+                    .and_then(|value| value.get("probe_persisted"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let probe = value
+                    .as_ref()
+                    .and_then(|value| value.get("provider_probe"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("verified");
+                let message = if persisted {
+                    format!(
+                        "Local model '{name}' is ready · provider stream verified. Evidence saved."
+                    )
+                } else {
+                    format!(
+                        "Local model '{name}' passed ({probe}), but its check evidence could not be saved. Run /model status before using it."
+                    )
+                };
+                chat_widget.commit_system(history_cell::system::SystemCell::response(message));
+            }
+            Err(error) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Local model '{name}' check failed: {error}. Fix it, then retry /model check {name}."
+                )));
+            }
+        },
         SlashBackgroundReadEffect::Failed { action, error } => {
             chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
                 "{action} failed: {error}"
@@ -8250,7 +8292,7 @@ pub(crate) async fn run_tui_session(
                                             .await
                                             .map_err(|_| "local model setup task stopped unexpectedly".to_string())
                                             .and_then(|result| result);
-                                            let candidate = match candidate {
+                                            let mut candidate = match candidate {
                                                 Ok(candidate) => candidate,
                                                 Err(error) => {
                                                     let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Not applied. {error}")) }).await;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::inference_connection::{InferenceConnection, MAX_PENDING_PROGRESS_FOR_TEST};
-use astra_credentials::{LocalInferenceProtocol, LocalModelDefinition};
+use astra_credentials::{LocalInferenceProtocol, LocalModelDefinition, LocalModelProbeState};
 use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
@@ -318,6 +318,7 @@ impl Fixture {
                 context_window: 1024,
                 max_output_tokens: 64,
                 credential,
+                probe: LocalModelProbeState::default(),
             },
         );
         LocalModelConfigStore::with_path(models_path.clone())

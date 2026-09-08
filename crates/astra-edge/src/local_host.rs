@@ -782,6 +782,7 @@ mod tests {
                 credential: LocalCredentialRef::Environment {
                     name: "OLD_KEY".into(),
                 },
+                probe: astra_credentials::LocalModelProbeState::default(),
             },
         );
         let original = store.replace(0, config).unwrap();
@@ -863,6 +864,7 @@ mod tests {
                     credential: LocalCredentialRef::Environment {
                         name: "TEST_KEY".into(),
                     },
+                    probe: astra_credentials::LocalModelProbeState::default(),
                 },
             );
         }

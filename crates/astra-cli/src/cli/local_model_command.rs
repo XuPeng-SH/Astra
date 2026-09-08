@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use astra_credentials::{
     LocalCredentialRef, LocalInferenceProtocol, LocalModelConfigStore, LocalModelDefinition,
-    LocalModelScope, LocalSecretStore, ResolvedLocalCredential,
+    LocalModelProbeState, LocalModelScope, LocalSecretStore, ResolvedLocalCredential,
 };
 use astra_inference_adapter::openai::chat_completions_endpoint;
 use serde::Serialize;
@@ -20,6 +20,20 @@ struct LocalModelStatus<'a> {
     credential: &'static str,
     provider_probe: &'static str,
     config_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LocalModelStatusRow {
+    pub(crate) name: String,
+    pub(crate) model: String,
+    pub(crate) binding_revision: u64,
+    pub(crate) credential_source: &'static str,
+    pub(crate) credential: &'static str,
+    pub(crate) provider_probe: &'static str,
+    pub(crate) probe_checked_at_unix_ms: Option<u64>,
+    pub(crate) probe_failure_code: Option<String>,
+    pub(crate) status: &'static str,
+    pub(crate) next: String,
 }
 
 pub(crate) fn add(scope: &LocalModelScope, args: ModelAddArgs) -> Result<String, String> {
@@ -84,6 +98,7 @@ pub(crate) fn add(scope: &LocalModelScope, args: ModelAddArgs) -> Result<String,
                 context_window,
                 max_output_tokens,
                 credential,
+                probe: LocalModelProbeState::default(),
             },
         },
         created_secret,
@@ -105,8 +120,16 @@ pub(crate) struct LocalModelCandidate {
 }
 
 impl LocalModelCandidate {
-    pub(crate) async fn check(&self) -> Result<String, String> {
-        check_definition(&self.scope, &self.name, &self.definition).await
+    pub(crate) async fn check(&mut self) -> Result<String, String> {
+        let body = check_definition(&self.scope, &self.name, &self.definition).await?;
+        // Keep the probe result on the candidate until the atomic apply. This
+        // makes TUI "Test and use" honest: a successful test is visible as
+        // ready after saving, while a canceled/failed candidate never mutates
+        // the existing binding or its evidence.
+        self.definition.probe = LocalModelProbeState::Passed {
+            checked_at_unix_ms: now_unix_ms(),
+        };
+        Ok(body)
     }
 
     pub(crate) fn apply(self) -> Result<String, String> {
@@ -179,6 +202,7 @@ pub(crate) fn prepare_from_tui(
             context_window,
             max_output_tokens,
             credential,
+            probe: LocalModelProbeState::default(),
         },
         created_secret,
     };
@@ -224,7 +248,13 @@ fn save_definition_at(
                     .to_string()
             })
         })?;
+        // Callers pass `NotRun` for a normal save. A TUI "Test and use"
+        // candidate may carry a freshly verified probe that must survive the
+        // atomic apply; never erase that evidence here.
         let previous = config.models.insert(name.clone(), definition);
+        // Any applied provider material change invalidates prior check
+        // evidence. `LocalModelConfigStore` keeps the binding revision
+        // monotonic while probe metadata remains separate from that identity.
         let expected_revision = config.revision;
         publication_attempted = true;
         store
@@ -258,6 +288,19 @@ fn save_definition_at(
             let _ = secrets.remove(secret_id);
         }
     }
+    let (provider_probe, probe_checked_at_unix_ms) = match applied
+        .models
+        .get(&name)
+        .map(|definition| &definition.probe)
+    {
+        Some(LocalModelProbeState::Passed { checked_at_unix_ms }) => {
+            ("stream_verified", Some(*checked_at_unix_ms))
+        }
+        Some(LocalModelProbeState::Failed {
+            checked_at_unix_ms, ..
+        }) => ("failed", Some(*checked_at_unix_ms)),
+        _ => ("not_run", None),
+    };
     let next = format!("astra model local check {name}");
     serde_json::to_string_pretty(&serde_json::json!({
         "name": name,
@@ -268,7 +311,8 @@ fn save_definition_at(
             .get(&name)
             .map(|definition| definition.binding_revision)
             .unwrap_or_default(),
-        "provider_probe": "not_run",
+        "provider_probe": provider_probe,
+        "probe_checked_at_unix_ms": probe_checked_at_unix_ms,
         "config_path": store.path(),
         "next": next,
     }))
@@ -299,8 +343,41 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
     let definition = config
         .models
         .get(&args.name)
-        .ok_or_else(|| format!("local model '{}' is not configured", args.name))?;
-    check_definition(scope, &args.name, definition).await
+        .ok_or_else(|| format!("local model '{}' is not configured", args.name))?
+        .clone();
+    let binding_revision = definition.binding_revision;
+    match check_definition(scope, &args.name, &definition).await {
+        Ok(body) => {
+            let persisted = persist_probe_state(
+                scope,
+                &args.name,
+                binding_revision,
+                LocalModelProbeState::Passed {
+                    checked_at_unix_ms: now_unix_ms(),
+                },
+            );
+            let (persisted, warning) = match persisted {
+                Ok(persisted) => (persisted, None),
+                Err(error) => (false, Some(error)),
+            };
+            Ok(annotate_probe_result(&body, persisted, warning.as_deref()))
+        }
+        Err(error) => {
+            // A failed probe never changes the provider binding or credential.
+            // Recording a secret-safe classification makes the next status
+            // view useful without retaining provider URLs or response bodies.
+            let _ = persist_probe_state(
+                scope,
+                &args.name,
+                binding_revision,
+                LocalModelProbeState::Failed {
+                    checked_at_unix_ms: now_unix_ms(),
+                    code: probe_failure_code(&error),
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 async fn check_definition(
@@ -427,6 +504,72 @@ async fn check_definition(
     .map_err(|error| error.to_string())
 }
 
+fn persist_probe_state(
+    scope: &LocalModelScope,
+    name: &str,
+    binding_revision: u64,
+    probe: LocalModelProbeState,
+) -> Result<bool, String> {
+    let store = scope.models();
+    let mut config = store.load().map_err(|error| error.to_string())?;
+    let Some(definition) = config.models.get_mut(name) else {
+        return Ok(false);
+    };
+    // A check may finish after another terminal replaced the binding. Do not
+    // attach stale evidence to the newer provider configuration.
+    if definition.binding_revision != binding_revision {
+        return Ok(false);
+    }
+    definition.probe = probe;
+    let expected_revision = config.revision;
+    store
+        .replace(expected_revision, config)
+        .map(|_| true)
+        .map_err(|error| error.to_string())
+}
+
+fn annotate_probe_result(body: &str, persisted: bool, warning: Option<&str>) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("probe_persisted".into(), serde_json::Value::Bool(persisted));
+        if let Some(warning) = warning {
+            object.insert(
+                "probe_persistence_warning".into(),
+                serde_json::Value::String(warning.to_string()),
+            );
+        }
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+fn probe_failure_code(error: &str) -> String {
+    let code = if error.contains("HttpStatus(401)") {
+        "http_401"
+    } else if error.contains("HttpStatus(403)") {
+        "http_403"
+    } else if error.contains("HttpStatus(404)") {
+        "http_404"
+    } else if error.contains("Deadline") || error.contains("timed out") {
+        "timeout"
+    } else if error.contains("Transport") || error.contains("connection") {
+        "transport"
+    } else if error.contains("Protocol") {
+        "protocol"
+    } else {
+        "probe_failed"
+    };
+    code.to_string()
+}
+
 pub(crate) fn show(scope: &LocalModelScope, name: &str) -> Result<Option<String>, String> {
     let store = scope.models();
     let config = store.load().map_err(|error| error.to_string())?;
@@ -444,10 +587,54 @@ pub(crate) fn show(scope: &LocalModelScope, name: &str) -> Result<Option<String>
         "max_output_tokens": definition.max_output_tokens,
         "credential_source": credential_kind(&definition.credential),
         "credential_storage": credential_storage(&definition.credential),
+        "configuration": "valid",
+        "credential": credential_availability(scope, &definition.credential),
+        "provider_probe": probe_status(&definition.probe),
+        "probe_checked_at_unix_ms": probe_checked_at(&definition.probe),
+        "probe_failure_code": probe_failure(&definition.probe),
+        "status": local_model_status(scope, definition),
+        "next": local_model_next_step(name, scope, definition),
         "revision": config.revision,
         "config_path": store.path(),
     }))
     .map(Some)
+    .map_err(|error| error.to_string())
+}
+
+/// Return all local model bindings and their actionable, local-only readiness
+/// state. This never contacts the provider, starts a Runner, or includes a
+/// secret value, so it is safe for a status screen and scripts.
+pub(crate) fn list(scope: &LocalModelScope) -> Result<String, String> {
+    let store = scope.models();
+    let config = store.load().map_err(|error| error.to_string())?;
+    let models: Vec<_> = config
+        .models
+        .iter()
+        .map(|(name, definition)| LocalModelStatusRow {
+            name: name.clone(),
+            model: definition.model.clone(),
+            binding_revision: definition.binding_revision,
+            credential_source: credential_kind(&definition.credential),
+            credential: credential_availability(scope, &definition.credential),
+            provider_probe: probe_status(&definition.probe),
+            probe_checked_at_unix_ms: probe_checked_at(&definition.probe),
+            probe_failure_code: probe_failure(&definition.probe),
+            status: local_model_status(scope, definition),
+            next: local_model_next_step(name, scope, definition),
+        })
+        .collect();
+    let has_models = !models.is_empty();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "scope": "runner_local",
+        "models": models,
+        "config_revision": config.revision,
+        "config_path": store.path(),
+        "next": if !has_models {
+            "astra model local add"
+        } else {
+            "astra model local check <name>"
+        },
+    }))
     .map_err(|error| error.to_string())
 }
 
@@ -524,6 +711,87 @@ fn credential_storage(reference: &LocalCredentialRef) -> &'static str {
     }
 }
 
+fn credential_availability(
+    scope: &LocalModelScope,
+    reference: &LocalCredentialRef,
+) -> &'static str {
+    match reference {
+        LocalCredentialRef::Environment { name } => match std::env::var(name) {
+            Ok(value) if !value.is_empty() => "available",
+            _ => "missing",
+        },
+        LocalCredentialRef::ProtectedFile { .. } => match scope.secrets().resolve(reference) {
+            Ok(Some(_)) => "available",
+            _ => "missing",
+        },
+        LocalCredentialRef::SystemKeychain { .. } => "unsupported",
+        LocalCredentialRef::None => "not_required",
+    }
+}
+
+fn probe_status(probe: &LocalModelProbeState) -> &'static str {
+    match probe {
+        LocalModelProbeState::NotRun => "not_run",
+        LocalModelProbeState::Passed { .. } => "stream_verified",
+        LocalModelProbeState::Failed { .. } => "failed",
+    }
+}
+
+fn probe_checked_at(probe: &LocalModelProbeState) -> Option<u64> {
+    match probe {
+        LocalModelProbeState::NotRun => None,
+        LocalModelProbeState::Passed { checked_at_unix_ms }
+        | LocalModelProbeState::Failed {
+            checked_at_unix_ms, ..
+        } => Some(*checked_at_unix_ms),
+    }
+}
+
+fn probe_failure(probe: &LocalModelProbeState) -> Option<String> {
+    match probe {
+        LocalModelProbeState::Failed { code, .. } => Some(code.clone()),
+        _ => None,
+    }
+}
+
+fn local_model_status(scope: &LocalModelScope, definition: &LocalModelDefinition) -> &'static str {
+    if !matches!(
+        credential_availability(scope, &definition.credential),
+        "available" | "not_required"
+    ) {
+        return "needs_attention";
+    }
+    match &definition.probe {
+        LocalModelProbeState::NotRun => "ready_for_check",
+        LocalModelProbeState::Passed { .. } => "ready",
+        LocalModelProbeState::Failed { .. } => "needs_attention",
+    }
+}
+
+fn local_model_next_step(
+    name: &str,
+    scope: &LocalModelScope,
+    definition: &LocalModelDefinition,
+) -> String {
+    match credential_availability(scope, &definition.credential) {
+        "missing" => {
+            format!("set the configured credential, then run astra model local check {name}")
+        }
+        "unsupported" => {
+            "use --credential-env or a supported protected credential backend".to_string()
+        }
+        _ => match &definition.probe {
+            LocalModelProbeState::NotRun => {
+                format!("run astra model local check {name} to verify the provider")
+            }
+            LocalModelProbeState::Passed { .. } => "select it with /model".to_string(),
+            LocalModelProbeState::Failed { .. } => {
+                format!("fix the reported issue, then run astra model local check {name}")
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,7 +845,7 @@ mod tests {
         .apply()
         .unwrap();
         let original = scope.models().load().unwrap();
-        let candidate = prepare_from_tui(
+        let mut candidate = prepare_from_tui(
             &scope,
             "work".into(),
             "http://127.0.0.1:9".into(),
@@ -667,6 +935,88 @@ mod tests {
             recreated["binding_revision"].as_u64().unwrap()
                 > updated["binding_revision"].as_u64().unwrap()
         );
+    }
+
+    #[test]
+    #[serial]
+    fn local_model_list_reports_safe_state_and_next_action_without_provider_io() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(no_auth_add("ready")).unwrap();
+        add(ModelAddArgs {
+            name: Some("missing-key".into()),
+            base_url: Some("http://127.0.0.1:8080/v1".into()),
+            provider_model: Some("coding-model".into()),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            credential_env: Some("ASTRA_MISSING_PROVIDER_KEY".into()),
+            no_auth: false,
+            store_secret: false,
+        })
+        .unwrap();
+
+        let listed: serde_json::Value = serde_json::from_str(&list(&scope()).unwrap()).unwrap();
+        assert_eq!(listed["models"].as_array().unwrap().len(), 2);
+        let ready = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["name"] == "ready")
+            .unwrap();
+        assert_eq!(ready["status"], "ready_for_check");
+        assert_eq!(ready["credential"], "not_required");
+        assert!(ready["next"].as_str().unwrap().contains("check ready"));
+        let missing = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["name"] == "missing-key")
+            .unwrap();
+        assert_eq!(missing["status"], "needs_attention");
+        assert_eq!(missing["credential"], "missing");
+        assert!(
+            missing["next"]
+                .as_str()
+                .unwrap()
+                .contains("set the configured credential")
+        );
+        assert!(
+            std::fs::read_dir(scope().root().join("model-secrets"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "status must not create or copy credentials"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn stale_probe_evidence_cannot_mark_a_newer_binding_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(no_auth_add("work")).unwrap();
+        let old_binding = scope().models().load().unwrap().models["work"].binding_revision;
+        add(ModelAddArgs {
+            provider_model: Some("new-model".into()),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+        assert!(
+            !persist_probe_state(
+                &scope(),
+                "work",
+                old_binding,
+                LocalModelProbeState::Passed {
+                    checked_at_unix_ms: 1,
+                },
+            )
+            .unwrap()
+        );
+        let current = scope().models().load().unwrap();
+        assert_eq!(current.models["work"].model, "new-model");
+        assert!(matches!(
+            current.models["work"].probe,
+            LocalModelProbeState::NotRun
+        ));
     }
 
     #[test]
@@ -909,7 +1259,7 @@ mod tests {
             )
             .and_then(|candidate| candidate.apply())
             .unwrap();
-            let before = std::fs::read(scope.models().path()).unwrap();
+            let before = scope.models().load().unwrap();
             let calls = server.received_requests().await.unwrap().len();
             let error = super::check(
                 &scope,
@@ -921,7 +1271,15 @@ mod tests {
             .unwrap_err();
             assert!(error.contains(status), "{error}");
             assert_eq!(server.received_requests().await.unwrap().len(), calls + 1);
-            assert_eq!(std::fs::read(scope.models().path()).unwrap(), before);
+            let after = scope.models().load().unwrap();
+            let before_definition = before.models["work"].clone();
+            let mut after_definition = after.models["work"].clone();
+            after_definition.probe = before_definition.probe.clone();
+            assert_eq!(after_definition, before_definition);
+            assert!(matches!(
+                after.models["work"].probe,
+                LocalModelProbeState::Failed { .. }
+            ));
         }
     }
 
@@ -960,6 +1318,57 @@ mod tests {
         .unwrap();
         assert!(checked.contains("\"configuration\": \"valid\""));
         assert!(checked.contains("\"provider_probe\": \"stream_verified\""));
+        assert!(checked.contains("\"probe_persisted\": true"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["provider_probe"], "stream_verified");
+        assert_eq!(saved["status"], "ready");
+        assert!(saved["probe_checked_at_unix_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tui_test_and_use_persists_the_successful_probe_on_apply() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        let mut candidate = prepare_from_tui(
+            &scope,
+            "work".into(),
+            format!("{}/v1", server.uri()),
+            "coding-model".into(),
+            128_000,
+            8_192,
+            LocalModelCredentialInput::None,
+        )
+        .unwrap();
+        candidate.check().await.unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&candidate.apply().unwrap()).unwrap();
+        assert_eq!(applied["provider_probe"], "stream_verified");
+        assert!(applied["probe_checked_at_unix_ms"].as_u64().unwrap() > 0);
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["provider_probe"], "stream_verified");
+        assert_eq!(saved["status"], "ready");
+        assert!(saved["probe_checked_at_unix_ms"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -990,7 +1399,11 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("HttpStatus(401)"));
         assert!(error.contains("no retry was attempted"));
-        assert!(show("work").unwrap().is_some());
+        let saved: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["provider_probe"], "failed");
+        assert_eq!(saved["probe_failure_code"], "http_401");
+        assert_eq!(saved["status"], "needs_attention");
     }
 
     #[tokio::test]

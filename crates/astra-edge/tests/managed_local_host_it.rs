@@ -4,7 +4,7 @@
 
 use astra_credentials::{
     CredentialStore, LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig,
-    LocalModelDefinition, LocalModelScope, Profile,
+    LocalModelDefinition, LocalModelProbeState, LocalModelScope, Profile,
 };
 use astra_edge::local_host::{Installation, ManagedClient};
 use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
@@ -294,6 +294,7 @@ async fn managed_process_reopens_same_journal_after_ack_loss_without_provider_re
             context_window: 1024,
             max_output_tokens: 16,
             credential: LocalCredentialRef::None,
+            probe: LocalModelProbeState::default(),
         },
     );
     scope.models().replace(0, config).unwrap();

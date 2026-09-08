@@ -72,6 +72,28 @@ pub struct LocalModelDefinition {
     pub context_window: u32,
     pub max_output_tokens: u32,
     pub credential: LocalCredentialRef,
+    /// Last explicit provider probe for this exact binding. Probe evidence is
+    /// metadata, not binding material: recording it must not authorize a new
+    /// provider configuration or invalidate an active Runner attachment.
+    #[serde(default)]
+    pub probe: LocalModelProbeState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalModelProbeState {
+    #[default]
+    NotRun,
+    Passed {
+        checked_at_unix_ms: u64,
+    },
+    Failed {
+        checked_at_unix_ms: u64,
+        /// Stable, secret-safe classification such as `http_401` or
+        /// `transport`. Raw provider messages and endpoint details never go
+        /// into the local configuration file.
+        code: String,
+    },
 }
 
 impl std::fmt::Debug for LocalModelDefinition {
@@ -107,7 +129,24 @@ impl LocalModelDefinition {
                     .to_string(),
             });
         }
-        self.credential.validate()
+        self.credential.validate()?;
+        if let LocalModelProbeState::Failed { code, .. } = &self.probe {
+            validate_component("probe failure code", code)?;
+        }
+        Ok(())
+    }
+
+    /// Compare only the material that determines the provider binding. Probe
+    /// evidence is deliberately excluded so recording a check does not bump
+    /// the binding revision or invalidate a concurrent execution lease.
+    fn binding_material_eq(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.base_url == other.base_url
+            && self.model == other.model
+            && self.binding_revision == other.binding_revision
+            && self.context_window == other.context_window
+            && self.max_output_tokens == other.max_output_tokens
+            && self.credential == other.credential
     }
 }
 
@@ -368,7 +407,11 @@ impl LocalModelConfigStore {
         // endpoint or credential, including when another terminal missed the
         // intermediate deletion.
         for (name, definition) in &mut candidate.models {
-            if current.models.get(name) != Some(definition) {
+            let binding_changed = current
+                .models
+                .get(name)
+                .is_none_or(|previous| !previous.binding_material_eq(definition));
+            if binding_changed {
                 definition.binding_revision = definition.binding_revision.max(candidate.revision);
             }
         }
@@ -831,6 +874,7 @@ mod tests {
             context_window: 128_000,
             max_output_tokens: 8_192,
             credential,
+            probe: LocalModelProbeState::default(),
         }
     }
 
@@ -859,6 +903,16 @@ mod tests {
         assert!(serde_json::from_str::<LocalModelConfig>(&json).is_ok());
         let inline = r#"{"version":1,"revision":0,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","context_window":128000,"max_output_tokens":8192,"credential":{"kind":"environment","name":"WORK_LLM_API_KEY","value":"provider-secret-canary"}}}}"#;
         assert!(serde_json::from_str::<LocalModelConfig>(inline).is_err());
+    }
+
+    #[test]
+    fn pre_probe_configurations_default_to_not_run_evidence() {
+        let legacy = r#"{"version":1,"revision":1,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","binding_revision":1,"context_window":128000,"max_output_tokens":8192,"credential":{"kind":"none"}}}}"#;
+        let config: LocalModelConfig = serde_json::from_str(legacy).expect("legacy config");
+        assert!(matches!(
+            config.models["work"].probe,
+            LocalModelProbeState::NotRun
+        ));
     }
 
     #[test]
@@ -934,6 +988,31 @@ mod tests {
         let recreated = store.replace(empty.revision, recreated).unwrap();
         assert!(recreated.models["work"].binding_revision > first.models["work"].binding_revision);
         assert!(recreated.revision >= recreated.models["work"].binding_revision);
+    }
+
+    #[test]
+    fn probe_evidence_does_not_change_provider_binding_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalModelConfigStore::with_path(root.path().join("models.json"));
+        let mut config = LocalModelConfig::default();
+        config
+            .models
+            .insert("work".into(), model(LocalCredentialRef::None));
+        let first = store.replace(0, config).unwrap();
+        let binding_revision = first.models["work"].binding_revision;
+        let mut with_probe = first.clone();
+        with_probe.models.get_mut("work").unwrap().probe = LocalModelProbeState::Passed {
+            checked_at_unix_ms: 1,
+        };
+        let recorded = store.replace(first.revision, with_probe).unwrap();
+        assert_eq!(recorded.models["work"].binding_revision, binding_revision);
+        assert!(recorded.revision > first.revision);
+        assert!(matches!(
+            recorded.models["work"].probe,
+            LocalModelProbeState::Passed {
+                checked_at_unix_ms: 1
+            }
+        ));
     }
 
     #[test]

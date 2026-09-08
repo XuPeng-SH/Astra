@@ -18,7 +18,7 @@ pub use local_model_scope::LocalModelScope;
 pub use local_models::{
     LOCAL_MODELS_FILE_VERSION, LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig,
     LocalModelConfigError, LocalModelConfigLease, LocalModelConfigStore, LocalModelDefinition,
-    LocalSecretStore, ResolvedLocalCredential,
+    LocalModelProbeState, LocalSecretStore, ResolvedLocalCredential,
 };
 
 #[derive(Debug, Error)]

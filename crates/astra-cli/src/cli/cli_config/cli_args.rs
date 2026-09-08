@@ -1060,9 +1060,11 @@ pub(crate) struct CloudModelAddArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra model local add\n  astra model local check work\n  astra model local show work\n  astra model local remove work\n\nThese commands never upload your provider credential to Astra Server. Use astra model add for Cloud BYOK."
+    after_help = "Examples:\n  astra model local list\n  astra model local add\n  astra model local check work\n  astra model local show work\n  astra model local remove work\n\nThese commands never upload your provider credential to Astra Server. Use astra model add for Cloud BYOK."
 )]
 pub(crate) enum LocalModelCmd {
+    /// Show all local models and the next action for each one
+    List,
     /// Save a model on this device without uploading its credential
     Add(ModelAddArgs),
     /// Test a local model with one explicit provider request
@@ -1551,6 +1553,12 @@ mod tests {
             panic!("explicit device-local configuration");
         };
         assert_eq!(args.credential_env.as_deref(), Some("WORK_LLM_KEY"));
+        assert!(matches!(
+            Cli::try_parse_from(["astra", "model", "local", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Model(ModelCmd::Local(LocalModelCmd::List)))
+        ));
         for action in ["show", "check", "remove"] {
             assert!(matches!(
                 Cli::try_parse_from(["astra", "model", "local", action, "work"])

@@ -170,6 +170,7 @@ mod tests {
                 credential: crate::LocalCredentialRef::ProtectedFile {
                     secret_id: "fixture".into(),
                 },
+                probe: crate::LocalModelProbeState::default(),
             },
         );
         a.models().replace(0, config).unwrap();

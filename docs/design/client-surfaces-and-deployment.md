@@ -55,7 +55,9 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 
 ## Model Access in the TUI
 
-> Status: accepted BYOK interaction contract; implementation is staged and not yet available.
+> Status: accepted BYOK interaction contract; local CLI/TUI implementation is
+> available in the current staged path. Full installed Server deployment and
+> production performance gates remain open.
 
 TUI is a first-class Model Access surface. A user can discover, add, validate,
 select, inspect, rotate, disable, and repair a personal model without leaving the
@@ -117,8 +119,9 @@ and [local setup implementation](runner-inference.md#local-setup-implementation)
 ### Entry points and selection
 
 Extend the existing `/model` picker, `/model info` details, slash discovery, and
-bottom-pane overlay framework. Add `/model add`, `/model check`, and
-`/model manage` as discoverable native actions. Management exposes rotation,
+bottom-pane overlay framework. `/model add`, `/model status` (also
+`/model manage`), `/model check <name>`, and the local `astra model` commands
+are discoverable native actions. Management exposes rotation,
 disable/removal, Runner status, and eligible repair actions. The corresponding
 `astra model ...` commands and TUI forms call the same setup/application service;
 TUI does not spawn an interactive CLI subprocess or suspend into a second UI.
