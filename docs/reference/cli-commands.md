@@ -173,7 +173,11 @@ CLI-managed model capacity uses `astra-edge --inference-only`. This process does
 not advertise a workspace/tool executor. The launcher pins the selected profile
 and account; inherited `ASTRA_TOKEN`, `ASTRA_TOKEN_FILE`, and token-renewal URL
 overrides do not replace that identity. An authenticated account mismatch stops
-the attachment before loading model credentials. A separately managed inference Runner
+the attachment before loading model credentials. On reconnect, the shared host
+reloads the same profile's latest access token and checks the account again;
+normal CLI login renewal does not require creating a new Runner identity.
+Logout, a missing token, or a changed account stops that connection rather than
+borrowing another profile. A separately managed inference Runner
 must also opt in with `--inference-only`; an ordinary `astra-edge` tool Runner
 does not load local model configuration. Bash tools inherit the canonical safe
 environment baseline plus explicit host-provided call environment, not all

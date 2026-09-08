@@ -836,7 +836,7 @@ pub(crate) async fn complete_session_startup(
                 if state.offering_id.is_none() {
                     state.provider_selection_requires_explicit = true;
                     eprintln!(
-                        "  {} Explicit model '{}' is unavailable; choose a current Offering with /model.",
+                        "  {} Model '{}' is unavailable. No other model was selected; use /model to choose an available connection.",
                         theme::icon_warn(),
                         explicit_model
                     );
@@ -845,7 +845,7 @@ pub(crate) async fn complete_session_startup(
             None => {
                 state.provider_selection_requires_explicit = true;
                 eprintln!(
-                    "  {} Explicit model selection needs authentication; choose a current Offering with /model after signing in.",
+                    "  {} Sign in to use the requested model, then select it with /model. No other model was selected.",
                     theme::icon_warn()
                 );
             }

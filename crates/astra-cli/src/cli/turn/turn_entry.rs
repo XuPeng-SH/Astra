@@ -548,6 +548,8 @@ async fn ensure_multi_agent_runtime_for_turn(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::acquire_interactive_turn_admission;
     use super::{
         ShellPassthroughDecision, TurnContext, classify_shell_passthrough,
         ensure_interactive_session_identity, ensure_multi_agent_runtime_for_turn,

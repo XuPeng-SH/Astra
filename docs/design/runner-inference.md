@@ -1,7 +1,7 @@
 # Runner inference and BYOK
 
 > Status: accepted for staged implementation; Runner inference is not yet available.
-> Last updated: 2026-09-05.
+> Last updated: 2026-09-08.
 > Parent contract: [Model access and inference](model-access-and-inference.md).
 > Motivation and alternatives: [issue #702](https://github.com/matrixorigin/Astra/issues/702).
 
@@ -813,6 +813,13 @@ current consumer treats a gap as the end of speculative preview and lets the
 canonical terminal replay from custody; it does not pretend that a missing
 preview fragment was recovered. Do not append a replayed snapshot to existing
 UI text or declare a gap-corrupted answer complete.
+
+Each consumer also caps the rendered speculative text and reasoning prefix at
+256 KiB per attempt. Reaching that cap ends speculation for the attempt while
+retaining the already-rendered prefix for exact terminal de-duplication; the
+durable terminal remains complete and authoritative. This consumer-side cap is
+separate from the four 32 KiB same-pod progress ring slots and does not change
+terminal custody or response limits.
 
 Progress is provisional. The canonical final response is a separate aggregate
 including text, admitted opaque provider continuation blocks, thinking/tool-call

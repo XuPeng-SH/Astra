@@ -564,6 +564,11 @@ fn token_from_credentials(
         .access_token
         .clone()
         .ok_or_else(|| format!("profile '{profile_name}' is not logged in; run `astra login`"))?;
+    if token.trim().is_empty() {
+        return Err(format!(
+            "profile '{profile_name}' is not logged in; run `astra login`"
+        ));
+    }
     Ok((profile_name, token))
 }
 
@@ -581,6 +586,29 @@ fn resolve_token(args: &Args) -> Result<String, String> {
 
 fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
+    // Managed inference is bound to one explicit CLI profile for the entire
+    // process lifetime. Read it once for startup validation, then reload the
+    // same named profile at every reconnect; never use --token/ASTRA_TOKEN as
+    // a fallback for this private host.
+    let managed_profile_and_token = if args.managed_inference_host {
+        let expected_owner = args
+            .expected_inference_owner
+            .as_deref()
+            .ok_or("Missing local inference owner")?;
+        let credentials = CredentialStore::new()
+            .load()
+            .map_err(|error| format!("failed to read Astra credentials: {error}"))?;
+        let profile_name = CredentialStore::resolve_profile_name(
+            args.profile.as_deref(),
+            credentials.current_profile.as_deref(),
+        );
+        let token =
+            managed_profile_token_from_credentials(&credentials, &profile_name, expected_owner)
+                .map_err(|error| error.to_string())?;
+        Some((profile_name, token))
+    } else {
+        None
+    };
     let workspace_dir = if args.inference_only {
         // Inference needs no checkout, tool workspace, or retained workspace
         // token. The selected deployment/account owns its private state.
@@ -605,7 +633,10 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     // reuses the workspace volume injects a fresh env token while the file
     // still holds the previous (revoked-but-unexpired) one; preferring the
     // file unconditionally would leave the edge permanently rejected.
-    let env_token = resolve_token(&args);
+    let env_token: Result<String, String> = match &managed_profile_and_token {
+        Some((_, token)) => Ok(token.clone()),
+        None => resolve_token(&args),
+    };
     let file_token = if args.inference_only {
         // Missing selected credentials must not silently attach local model
         // capacity as the owner of a retained workspace token.
@@ -722,6 +753,7 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
         inference_only: args.inference_only,
         expected_inference_owner: args.expected_inference_owner,
+        managed_profile: managed_profile_and_token.map(|(profile, _)| profile),
         #[cfg(unix)]
         managed_host,
         inference_host: tokio::sync::Mutex::new(None),
@@ -1149,7 +1181,10 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
-async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_edge_connection(
+    config: &EdgeConfig,
+    token_snapshot: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
@@ -1181,9 +1216,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         })
     };
 
-    // Snapshot the live token per connection attempt: the renewal task may
-    // have replaced it since the previous (re)connect.
-    let token_snapshot = config.token_manager.snapshot().await;
     let ws_stream = if let Some(ref proxy_url) = proxy {
         connect_via_proxy(&url, proxy_url, &token_snapshot)
             .await
@@ -1251,8 +1283,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 // a later expiry (the renewal task owns forward progress).
                 // The token that just proved itself is the SNAPSHOT this
                 // connection authenticated with. The manager applies the
-                // generation rule and owns any persistence retry.
-                config.token_manager.mark_proven(&token_snapshot).await;
+                // generation rule and owns any persistence retry. Managed
+                // inference deliberately bypasses this manager: its profile
+                // file is the sole credential/refresh authority and must not
+                // be overwritten by the edge process.
+                if config.managed_profile.is_none() {
+                    config.token_manager.mark_proven(&token_snapshot).await;
+                }
                 user_id
             }
             Ok(EdgeServerMessage::AuthError { message }) => {
@@ -1724,19 +1761,39 @@ async fn main() {
     }
     eprintln!();
 
-    // Background self-renewal of moi-user-token-v1 edge-registration tokens.
-    token_renewal::spawn_renewal_task(config.token_manager.clone());
+    // Background self-renewal belongs to standalone edge-registration tokens.
+    // A managed inference host reloads its selected CLI profile at reconnect;
+    // starting the MOI token task here would create a second refresh authority.
+    if config.managed_profile.is_none() {
+        token_renewal::spawn_renewal_task(config.token_manager.clone());
+    }
 
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
     loop {
+        let attempted_token = match next_connection_token(&config).await {
+            Ok(token) => token,
+            Err(error) => {
+                #[cfg(unix)]
+                if let Some(host) = &config.managed_host {
+                    host.report_status(astra_edge::local_host::HostStatus::AuthenticationFailed);
+                }
+                tracing::error!(
+                    error = %error,
+                    "managed inference credentials are unavailable; stopping"
+                );
+                exit_with_error = true;
+                break;
+            }
+        };
         let edge_span = tracing::info_span!(
             "edge.agent",
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        let connection = run_edge_connection(&config).instrument(edge_span);
+        let connection =
+            run_edge_connection(&config, attempted_token.clone()).instrument(edge_span);
         #[cfg(unix)]
         let result = tokio::select! {
             result = connection => result,
@@ -1771,6 +1828,37 @@ async fn main() {
                     });
                 }
                 if is_permanent_connection_error(e.as_ref()) {
+                    if let Some(profile_name) = config.managed_profile.as_deref() {
+                        let expected_owner = config
+                            .expected_inference_owner
+                            .as_deref()
+                            .expect("managed profile has an owner fence");
+                        match load_managed_profile_token(profile_name, expected_owner) {
+                            Ok(refreshed_token) if refreshed_token != attempted_token => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "managed profile token was rejected; retrying with the refreshed profile token"
+                                );
+                                reconnect_delay_secs = 1;
+                                continue;
+                            }
+                            Ok(_) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "managed profile token was rejected and has not rotated"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    source_error = %e,
+                                    "managed profile is unavailable after authentication failure"
+                                );
+                            }
+                        }
+                        exit_with_error = true;
+                        break;
+                    }
                     // The chosen startup token may be revoked (e.g. a renewal
                     // rotated it away but the persist was lost). Before giving
                     // up, try the other startup candidate once.
@@ -2221,6 +2309,80 @@ mod tests {
         assert_eq!(
             token_from_credentials(&creds, Some("other")).unwrap(),
             ("other".to_string(), "other-token".to_string())
+        );
+    }
+
+    #[test]
+    fn managed_profile_reload_tracks_rotation_for_the_selected_profile() {
+        let mut creds = CredentialsFile {
+            current_profile: Some("current".to_string()),
+            profiles: Default::default(),
+        };
+        creds.profiles.insert(
+            "selected".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-a".to_string()),
+                access_token: Some("token-a".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "unrelated".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-b".to_string()),
+                access_token: Some("token-b".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").unwrap(),
+            "token-a"
+        );
+        creds.profiles.get_mut("selected").unwrap().access_token =
+            Some("token-a-rotated".to_string());
+        assert_eq!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").unwrap(),
+            "token-a-rotated",
+            "a reconnect must observe a token rotated in the canonical profile store"
+        );
+    }
+
+    #[test]
+    fn managed_profile_reload_fails_closed_on_owner_switch_or_logout() {
+        let mut creds = CredentialsFile {
+            current_profile: Some("selected".to_string()),
+            profiles: Default::default(),
+        };
+        creds.profiles.insert(
+            "selected".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-a".to_string()),
+                access_token: Some("token-a".to_string()),
+                ..Default::default()
+            },
+        );
+
+        creds.profiles.get_mut("selected").unwrap().account_id = Some("owner-b".to_string());
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "a profile switched to another account must not retain the old host lease"
+        );
+
+        {
+            let profile = creds.profiles.get_mut("selected").unwrap();
+            profile.account_id = Some("owner-a".to_string());
+            profile.access_token = None;
+        }
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "logout must not leave a credential-less managed host attached"
+        );
+
+        creds.profiles.get_mut("selected").unwrap().access_token = Some("  ".to_string());
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "a blank token is equivalent to logout"
         );
     }
 }

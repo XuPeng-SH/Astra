@@ -379,7 +379,7 @@ async fn resolve_one_shot_model(
         || resume_requires_explicit_provider
     {
         return Err(
-            "resumed session has no exact causal Offering; choose one explicitly with --model or /model"
+            "This session's previous model connection cannot be restored safely. Your history is available; select a model explicitly with --model, or use /model in interactive mode."
                 .to_string(),
         );
     } else if let Some(model) = effective_one_shot_model(None, fallback_model) {
@@ -592,7 +592,10 @@ mod exact_model_resolution_tests {
         .await
         .expect_err("legacy resume must not use a model-name fallback");
 
-        assert!(error.contains("no exact causal Offering"), "{error}");
+        assert!(
+            error.contains("previous model connection cannot be restored safely"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -610,7 +613,10 @@ mod exact_model_resolution_tests {
         .await
         .expect_err("legacy resume must not use configured or Server defaults");
 
-        assert!(error.contains("no exact causal Offering"), "{error}");
+        assert!(
+            error.contains("previous model connection cannot be restored safely"),
+            "{error}"
+        );
     }
 }
 

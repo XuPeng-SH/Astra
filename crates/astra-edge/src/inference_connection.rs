@@ -91,7 +91,7 @@ impl InferenceConnection {
     /// Convert one disposable host preview into a bounded wire batch.  The
     /// first event is sent immediately to minimize TTFB; subsequent events are
     /// coalesced until the byte/timer budget or a provider terminal marker.
-    pub(crate) fn handle_preview(
+    pub(crate) async fn handle_preview(
         &mut self,
         preview: InferencePreview,
     ) -> Result<Vec<EdgeClientMessage>, InferenceHostError> {
@@ -100,6 +100,13 @@ impl InferenceConnection {
             // terminal custody independently; dropping this preview is safe.
             return Ok(Vec::new());
         };
+        if !self.host.is_attempt_active(&preview.attempt).await {
+            // A provider task removes itself from the active-attempt set only
+            // after terminal custody is durable. A broadcast event that was
+            // queued before that transition is therefore stale; do not let it
+            // recreate connection-local progress after terminal delivery.
+            return Ok(Vec::new());
+        }
         let key = preview.attempt.attempt_id.as_str().to_owned();
         let item = RunnerInferenceProgressEvent {
             sequence: preview.sequence,
@@ -689,7 +696,7 @@ impl InferenceConnectionWorker {
                         None => break,
                     },
                     preview = preview_rx.recv(), if preview_open => match preview {
-                        Ok(preview) => connection.handle_preview(preview),
+                        Ok(preview) => connection.handle_preview(preview).await,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Ok(Vec::new()),
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             preview_open = false;

@@ -439,14 +439,8 @@ async fn run_async() -> i32 {
     } else {
         None
     };
-    cli_context.local_runner_id = local_runner
-        .as_ref()
-        .map(|runner| runner.edge_id().to_owned());
-    #[cfg(unix)]
-    {
-        cli_context.local_runner_attachment = local_runner
-            .as_ref()
-            .map(|runner| runner.attachment().clone());
+    if let Some(runner) = local_runner.as_ref() {
+        runner.attach_context(&mut cli_context);
     }
 
     // Make the resolved model available to slash commands that print

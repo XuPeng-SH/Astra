@@ -61,7 +61,14 @@ async fn next_runner_wake(
         biased;
         changed = readiness.changed() => RunnerWake::Readiness(changed),
         _ = super::client::wait_llm_cancel(cancel.unwrap_or(LlmCancel::None)), if cancel.is_some() => RunnerWake::Cancel,
-        _ = tokio::time::sleep_until(deadline) => RunnerWake::Deadline,
+        _ = async {
+            // A newly created Sleep may first wait for the timer driver even
+            // at an elapsed deadline. An always-ready preview must not win
+            // that poll and postpone the already-expired control boundary.
+            if deadline > tokio::time::Instant::now() {
+                tokio::time::sleep_until(deadline).await;
+            }
+        } => RunnerWake::Deadline,
         message = async {
             match preview.as_mut() {
                 Some(receiver) => receiver.recv().await,

@@ -5636,7 +5636,7 @@ async fn apply_restored_session(
         || (state.model.is_some() && state.offering_id.is_none());
     if state.provider_selection_requires_explicit {
         eprintln!(
-            "  {} Previous provider preference is not safely reusable at this causal boundary; choose a current Offering with /model before continuing.",
+            "  {} This session's previous model connection cannot be restored safely. Your history is available; use /model to select a connection before continuing.",
             theme::icon_warn()
         );
     }

@@ -134,12 +134,31 @@ impl Connection {
     }
 }
 
-async fn accept(listener: &TcpListener, generation: u64) -> Connection {
+// tungstenite's Callback contract fixes the unboxed HTTP error-response type.
+#[allow(clippy::result_large_err)]
+async fn accept(listener: &TcpListener, generation: u64, expected_token: &str) -> Connection {
     let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
         .unwrap()
         .unwrap();
-    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    let expected_authorization = format!("Bearer {expected_token}");
+    let mut socket = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            assert!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(expected_authorization.as_str()),
+                "managed host must authenticate with the current selected profile token"
+            );
+            Ok(response)
+        },
+    )
+    .await
+    .unwrap();
     let auth = socket.next().await.unwrap().unwrap();
     let auth: EdgeClientMessage = serde_json::from_str(auth.to_text().unwrap()).unwrap();
     assert!(
@@ -229,7 +248,7 @@ fn spawn(origin: &str, credentials: &std::path::Path) -> tokio::process::Child {
             origin,
             "--profile",
             "fixture",
-            "--reconnect=false",
+            "--reconnect=true",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -280,7 +299,7 @@ async fn managed_process_reopens_same_journal_after_ack_loss_without_provider_re
     scope.models().replace(0, config).unwrap();
     let installation = Installation::open(&scope).unwrap();
     let mut first = spawn(&origin, directory.path());
-    let mut connection = accept(&listener, 1).await;
+    let mut connection = accept(&listener, 1, "synthetic-fixture-token").await;
     let a = ManagedClient::connect(&installation, scope.clone(), &origin, Some("fixture"))
         .await
         .unwrap();
@@ -296,6 +315,23 @@ async fn managed_process_reopens_same_journal_after_ack_loss_without_provider_re
         "closing the first view must not stop shared host"
     );
     let binding = connection.binding().await;
+    let live_journal = connection.journal.clone();
+    let live_boot = connection.boot.clone();
+    CredentialStore::new()
+        .mutate(|file| {
+            file.profiles.get_mut("fixture").unwrap().access_token =
+                Some("synthetic-rotated-token".into());
+        })
+        .unwrap();
+    // Dropping the synthetic Server socket forces a reconnect in the SAME
+    // child, proving that it reloads credentials rather than using startup's
+    // token. Client leases and journal identity remain unchanged.
+    drop(connection);
+    let mut connection = accept(&listener, 2, "synthetic-rotated-token").await;
+    assert_eq!(connection.journal, live_journal);
+    assert_eq!(connection.boot, live_boot);
+    assert!(first.try_wait().unwrap().is_none());
+    assert!(b_liveness.is_alive());
     let grant = RunnerInferenceDispatchGrant {
         attempt: RunnerInferenceAttemptIdentity {
             user_id: OWNER.into(),
@@ -388,7 +424,7 @@ async fn managed_process_reopens_same_journal_after_ack_loss_without_provider_re
     let old_journal = connection.journal;
     let old_boot = connection.boot;
     let mut second = spawn(&origin, directory.path());
-    let mut recovered = accept(&listener, 2).await;
+    let mut recovered = accept(&listener, 3, "synthetic-rotated-token").await;
     assert_eq!(recovered.journal, old_journal);
     assert_ne!(recovered.boot, old_boot);
     let _view = ManagedClient::connect(&installation, scope, &origin, Some("fixture"))

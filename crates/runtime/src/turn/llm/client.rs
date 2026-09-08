@@ -100,6 +100,12 @@ const LLM_MANDATORY_SETTLEMENT_RESERVE_S: u64 = 10;
 /// completed answer stuck behind the ordinary multi-minute idle watchdog.
 const LLM_STREAM_TERMINAL_DRAIN_GRACE_MS: u64 = 500;
 
+/// Keep one decoder's total rendered speculative prefix within a bounded
+/// per-attempt budget. This is larger than one 32 KiB wire batch so a healthy
+/// stream can remain responsive for a useful window, while still preventing
+/// the terminal-sized (16 MiB) custody budget from becoming a UI buffer.
+const RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES: usize = 256 * 1024;
+
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 
 /// Per-model rate-limit cooldown tracker — shared with bridge_llm_stream.
@@ -857,12 +863,27 @@ struct PreviewPrefix {
 }
 
 impl PreviewPrefix {
-    fn push_str(&mut self, value: &str) {
+    fn try_push_str(&mut self, value: &str, max_bytes: usize) -> bool {
+        if value.is_empty() {
+            return true;
+        }
         if self.consumed == self.bytes.len() {
             self.bytes.clear();
             self.consumed = 0;
         }
+        if self.bytes.len().saturating_add(value.len()) > max_bytes && self.consumed > 0 {
+            self.bytes = self.bytes[self.consumed..].to_owned();
+            self.consumed = 0;
+        }
+        if self.bytes.len().saturating_add(value.len()) > max_bytes {
+            return false;
+        }
         self.bytes.push_str(value);
+        true
+    }
+
+    fn stored_bytes(&self) -> usize {
+        self.bytes.len()
     }
 
     fn consume(&mut self, incoming: String) -> Option<String> {
@@ -944,6 +965,26 @@ impl RunnerInferencePreviewDecoder {
         self.preview_usable = false;
     }
 
+    fn append_preview_text(&mut self, value: &str, reasoning: bool) -> bool {
+        let other_bytes = if reasoning {
+            self.preview_text_remaining.stored_bytes()
+        } else {
+            self.preview_reasoning_remaining.stored_bytes()
+        };
+        let available = RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES.saturating_sub(other_bytes);
+        if reasoning {
+            self.preview_reasoning_remaining
+                .try_push_str(value, available)
+        } else {
+            self.preview_text_remaining.try_push_str(value, available)
+        }
+    }
+
+    #[cfg(test)]
+    fn preview_prefix_bytes_for_test(&self) -> usize {
+        self.preview_text_remaining.stored_bytes() + self.preview_reasoning_remaining.stored_bytes()
+    }
+
     /// Consume one authenticated batch. Sequence gaps are valid at the wire
     /// boundary, but they make subsequent provisional decoding unsafe because
     /// a delimiter or UTF-8-adjacent provider fragment may be missing.
@@ -991,24 +1032,36 @@ impl RunnerInferencePreviewDecoder {
                     if is_reasoning {
                         let visible = self.visible_reasoning_filter.push(&chunk);
                         if !visible.is_empty() {
-                            self.preview_reasoning_remaining.push_str(&visible);
+                            if !self.append_preview_text(&visible, true) {
+                                self.mark_gap();
+                                break;
+                            }
                             updates.push(LlmStreamUpdate::Reasoning(visible));
                         }
                     } else {
                         let visible = self.visible_text_filter.push(&chunk);
                         if !visible.is_empty() {
-                            self.preview_text_remaining.push_str(&visible);
+                            if !self.append_preview_text(&visible, false) {
+                                self.mark_gap();
+                                break;
+                            }
                             updates.push(LlmStreamUpdate::Text(visible));
                         }
                     }
                 }
+            }
+            if !self.preview_usable {
+                continue;
             }
             if let Some(reasoning) = payload.reasoning
                 && !reasoning.is_empty()
             {
                 let visible = self.visible_reasoning_filter.push(reasoning);
                 if !visible.is_empty() {
-                    self.preview_reasoning_remaining.push_str(&visible);
+                    if !self.append_preview_text(&visible, true) {
+                        self.mark_gap();
+                        continue;
+                    }
                     updates.push(LlmStreamUpdate::Reasoning(visible));
                 }
             }
@@ -8064,6 +8117,95 @@ mod tests {
         assert_eq!(
             decoder.forward_terminal_update(LlmStreamUpdate::Text("ha".to_string())),
             Some(LlmStreamUpdate::Text("ha".to_string()))
+        );
+    }
+
+    #[test]
+    fn runner_preview_prefix_budget_stops_speculation_before_overflow() {
+        let attempt = preview_attempt("user-preview-prefix-budget");
+        let mut decoder = RunnerInferencePreviewDecoder::default();
+        let fragment = "ha".repeat(1024);
+        let accepted = RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES / fragment.len();
+
+        for sequence in 0..accepted as u64 {
+            assert_eq!(
+                decoder.push_batch(&preview_batch(
+                    &attempt,
+                    sequence,
+                    json!({"choices":[{"delta":{"content":fragment.as_str()}}]}),
+                )),
+                vec![LlmStreamUpdate::Text(fragment.clone())]
+            );
+        }
+        assert_eq!(
+            decoder.preview_prefix_bytes_for_test(),
+            RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES
+        );
+
+        // Do not retain or render a fragment that would cross the prefix
+        // budget. The durable terminal still owns the complete answer.
+        assert!(
+            decoder
+                .push_batch(&preview_batch(
+                    &attempt,
+                    accepted as u64,
+                    json!({"choices":[{"delta":{"content":fragment.as_str()}}]}),
+                ))
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.preview_prefix_bytes_for_test(),
+            RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES,
+            "speculation must not grow beyond the per-decoder budget"
+        );
+        assert_eq!(
+            decoder.forward_terminal_update(LlmStreamUpdate::Text(fragment.repeat(accepted + 1),)),
+            Some(LlmStreamUpdate::Text(fragment.clone())),
+            "terminal replay must deduplicate only the rendered prefix"
+        );
+
+        // Text and hidden reasoning share one decoder budget. Neither lane
+        // may consume a second independent cap and double retained memory.
+        let mut mixed = RunnerInferencePreviewDecoder::default();
+        let mixed_fragment = "xy".repeat(1024);
+        let half = RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES / 2;
+        let half_events = half / mixed_fragment.len();
+        for sequence in 0..half_events as u64 {
+            assert_eq!(
+                mixed.push_batch(&preview_batch(
+                    &attempt,
+                    sequence,
+                    json!({"choices":[{"delta":{"content":mixed_fragment.as_str()}}]}),
+                )),
+                vec![LlmStreamUpdate::Text(mixed_fragment.clone())]
+            );
+        }
+        for sequence in half_events as u64..(half_events * 2) as u64 {
+            assert_eq!(
+                mixed.push_batch(&preview_batch(
+                    &attempt,
+                    sequence,
+                    json!({"choices":[{"delta":{"reasoning_content":mixed_fragment.as_str()}}]}),
+                )),
+                vec![LlmStreamUpdate::Reasoning(mixed_fragment.clone())]
+            );
+        }
+        assert_eq!(
+            mixed.preview_prefix_bytes_for_test(),
+            RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES
+        );
+        assert!(
+            mixed
+                .push_batch(&preview_batch(
+                    &attempt,
+                    (half_events * 2) as u64,
+                    json!({"choices":[{"delta":{"content":"overflow"}}]}),
+                ))
+                .is_empty()
+        );
+        assert_eq!(
+            mixed.preview_prefix_bytes_for_test(),
+            RUNNER_INFERENCE_PREVIEW_PREFIX_BYTES
         );
     }
 

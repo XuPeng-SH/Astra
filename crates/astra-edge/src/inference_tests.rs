@@ -591,6 +591,10 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
     let fixture = Fixture::new("http://127.0.0.1:9").await;
     let grant = fixture.grant("preview-connection", REQUEST).await;
     let mut connection = InferenceConnection::new(fixture.host.clone());
+    fixture
+        .host
+        .set_attempt_active_for_test(&grant.attempt, true)
+        .await;
     connection.hello();
     connection
         .handle(EdgeServerMessage::InferenceHelloAck {
@@ -612,6 +616,7 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
                 "choices": [{"delta": {"content": "first"}}]
             })),
         })
+        .await
         .unwrap();
     assert!(matches!(
         first.as_slice(),
@@ -632,6 +637,7 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
                     "choices": [{"delta": {"content": "first"}}]
                 })),
             })
+            .await
             .unwrap()
             .is_empty()
     );
@@ -642,6 +648,7 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
             sequence: 1,
             event: RunnerInferenceProviderEvent::Done,
         })
+        .await
         .unwrap();
     assert!(matches!(
         terminal_batch.as_slice(),
@@ -656,6 +663,7 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
 async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_marker() {
     let fixture = Fixture::new("http://127.0.0.1:9").await;
     let mut connection = InferenceConnection::new(fixture.host.clone());
+    let mut completed_attempts = Vec::new();
     connection.hello();
     connection
         .handle(EdgeServerMessage::InferenceHelloAck {
@@ -673,6 +681,10 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
         let grant = fixture
             .grant(&format!("failed-preview-{index}"), REQUEST)
             .await;
+        fixture
+            .host
+            .set_attempt_active_for_test(&grant.attempt, true)
+            .await;
         assert!(
             !connection
                 .handle_preview(InferencePreview {
@@ -682,6 +694,7 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
                         "choices": [{"delta": {"content": "partial"}}]
                     })),
                 })
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -710,6 +723,11 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
             })
             .await
             .unwrap();
+        fixture
+            .host
+            .set_attempt_active_for_test(&grant.attempt, false)
+            .await;
+        completed_attempts.push(grant.attempt);
     }
 
     assert_eq!(
@@ -725,6 +743,22 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
     assert!(
         connection.pending_progress_len_for_test() == 0,
         "terminal polling must retire failed streams even without Done/Eof"
+    );
+    let delayed = connection
+        .handle_preview(InferencePreview {
+            attempt: completed_attempts[0].clone(),
+            sequence: 1,
+            event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                "choices": [{"delta": {"content": "late"}}]
+            })),
+        })
+        .await
+        .unwrap();
+    assert!(delayed.is_empty());
+    assert_eq!(
+        connection.pending_progress_len_for_test(),
+        0,
+        "a preview queued behind terminal custody must not reopen its assembly"
     );
 }
 

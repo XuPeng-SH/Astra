@@ -441,6 +441,42 @@ impl InferenceHost {
         self.state.lock().await.active.len()
     }
 
+    /// Live previews are disposable and may only be admitted while the exact
+    /// local attempt is still in the host's active-attempt set.  Once the
+    /// provider task persists terminal custody it is removed from this set;
+    /// queued broadcast events are then deliberately dropped instead of
+    /// reopening connection-local progress state after terminal delivery.
+    pub async fn is_attempt_active(&self, attempt: &RunnerInferenceAttemptIdentity) -> bool {
+        if attempt.user_id != self.owner.user_id
+            || attempt.binding.runner_id != self.owner.runner_id
+            || attempt.binding.journal_id != self.journal_id
+        {
+            return false;
+        }
+        self.state
+            .lock()
+            .await
+            .active
+            .contains_key(attempt.attempt_id.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_attempt_active_for_test(
+        &self,
+        attempt: &RunnerInferenceAttemptIdentity,
+        active: bool,
+    ) {
+        let mut state = self.state.lock().await;
+        if active {
+            state.active.insert(
+                attempt.attempt_id.as_str().to_owned(),
+                CancellationToken::new(),
+            );
+        } else {
+            state.active.remove(attempt.attempt_id.as_str());
+        }
+    }
+
     /// Environment material must come from the attaching process, never from
     /// whichever terminal happened to start a shared host. It is not persisted.
     pub async fn attach_environment(

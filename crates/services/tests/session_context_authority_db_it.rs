@@ -182,12 +182,18 @@ async fn provider_projection_survives_reopen_and_replacement_fails_closed_on_tam
         .await
         .expect("load head after reopen")
         .expect("first head");
-    assert_eq!(first_head.provider_projection, Some(first_projection.clone()));
+    assert_eq!(
+        first_head.provider_projection,
+        Some(first_projection.clone())
+    );
     let first_materialized = reopened
         .materialize(&first_head)
         .await
         .expect("materialize exact provider projection after reopen");
-    assert_eq!(first_materialized.head.provider_projection, Some(first_projection));
+    assert_eq!(
+        first_materialized.head.provider_projection,
+        Some(first_projection)
+    );
     assert_eq!(first_materialized.messages, first_messages);
 
     // A replacement turn is a new causal boundary. Its exact Offering must
@@ -245,12 +251,18 @@ async fn provider_projection_survives_reopen_and_replacement_fails_closed_on_tam
         .await
         .expect("load replacement head after reopen")
         .expect("replacement head");
-    assert_eq!(second_head.provider_projection, Some(second_projection.clone()));
+    assert_eq!(
+        second_head.provider_projection,
+        Some(second_projection.clone())
+    );
     let second_materialized = reopened_after_replacement
         .materialize(&second_head)
         .await
         .expect("materialize replacement projection after reopen");
-    assert_eq!(second_materialized.head.provider_projection, Some(second_projection));
+    assert_eq!(
+        second_materialized.head.provider_projection,
+        Some(second_projection)
+    );
     assert_eq!(second_materialized.messages, second_messages);
 
     // Keep the tampered Offering syntactically valid so this exercises the
@@ -269,8 +281,7 @@ async fn provider_projection_survives_reopen_and_replacement_fails_closed_on_tam
     .expect("load stored replacement head JSON");
     let mut tampered: serde_json::Value =
         serde_json::from_str(&stored_head_json).expect("decode stored head JSON");
-    tampered["provider_projection"]["offering_id"] =
-        serde_json::json!("offering-runner-tampered");
+    tampered["provider_projection"]["offering_id"] = serde_json::json!("offering-runner-tampered");
     sqlx::query(
         "UPDATE session_context_heads SET head_json = ?
          WHERE isolation_domain = ? AND owner_user_id = ?
@@ -291,13 +302,15 @@ async fn provider_projection_survives_reopen_and_replacement_fails_closed_on_tam
         .await
         .expect("load syntactically valid tampered head")
         .expect("tampered head");
-    assert_eq!(
-        tampered_coordinator.materialize(&tampered_head).await,
-        Err(SessionContextCoordinatorError::NeedsRepair(
-            "context head provider projection does not match its canonical manifest".into(),
-        )),
-        "a stale/tampered head Offering must not become resume authority"
-    );
+    let tamper_error = tampered_coordinator
+        .materialize(&tampered_head)
+        .await
+        .expect_err("a stale/tampered head Offering must not become resume authority");
+    assert!(matches!(
+        tamper_error,
+        SessionContextCoordinatorError::NeedsRepair(reason)
+            if reason == "context head provider projection does not match its canonical manifest"
+    ));
 
     for table in [
         "conversation_manifest_segments",
