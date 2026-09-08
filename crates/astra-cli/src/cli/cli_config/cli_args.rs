@@ -1059,6 +1059,9 @@ pub(crate) struct CloudModelAddArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Examples:\n  astra model local add\n  astra model local check work\n  astra model local show work\n  astra model local remove work\n\nThese commands never upload your provider credential to Astra Server. Use astra model add for Cloud BYOK."
+)]
 pub(crate) enum LocalModelCmd {
     /// Save a model on this device without uploading its credential
     Add(ModelAddArgs),
@@ -1460,7 +1463,7 @@ pub(crate) struct ConfigShowPolicyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
+    use super::{Cli, Command, LocalModelCmd, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::Parser;
 
     #[test]
@@ -1522,6 +1525,66 @@ mod tests {
 
         let message = Cli::try_parse_from(["astra", "explain", "history", "please"]).unwrap();
         assert!(message.validate_external_message_shorthand().is_ok());
+    }
+
+    #[test]
+    fn local_model_commands_cannot_silently_select_cloud_storage() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "local",
+            "add",
+            "work",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--provider-model",
+            "o3",
+            "--context-window",
+            "8192",
+            "--max-output-tokens",
+            "1024",
+            "--credential-env",
+            "WORK_LLM_KEY",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Local(LocalModelCmd::Add(args)))) = cli.command else {
+            panic!("explicit device-local configuration");
+        };
+        assert_eq!(args.credential_env.as_deref(), Some("WORK_LLM_KEY"));
+        for action in ["show", "check", "remove"] {
+            assert!(matches!(
+                Cli::try_parse_from(["astra", "model", "local", action, "work"])
+                    .unwrap()
+                    .command,
+                Some(Command::Model(ModelCmd::Local(_)))
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "model",
+                "add",
+                "work",
+                "--credential-env",
+                "WORK_LLM_KEY"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["astra", "model", "local", "add", "work", "--api-key-stdin"])
+                .is_err()
+        );
+        let error = Cli::try_parse_from([
+            "astra",
+            "model",
+            "local",
+            "add",
+            "work",
+            "--api-key",
+            "secret-canary",
+        ])
+        .unwrap_err();
+        assert!(!error.to_string().contains("secret-canary"));
     }
 
     #[test]

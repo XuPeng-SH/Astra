@@ -588,6 +588,7 @@ version = "0.2.2"
 dependencies = [
  "astra-config",
  "astra-core",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-runtime-env",
  "astra-sync-protocol",

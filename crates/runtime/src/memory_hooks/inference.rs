@@ -159,13 +159,16 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 format!("Memory model admission failed: {error}"),
             )
         })?;
+        let material = execution.server_material().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::PolicyDenied, error)
+        })?;
         let direct = DirectMemoryInferenceClient {
-            base_url: execution.base_url.clone(),
-            api_key: execution.api_key.clone(),
+            base_url: material.base_url.clone(),
+            api_key: material.api_key.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: execution.wire_model_name.clone(),
             provider: execution.provider.clone(),
-            header_overrides: execution.header_overrides.clone(),
+            header_overrides: material.header_overrides.clone(),
             request_body_overrides: execution.request_body_overrides.clone(),
             completions_url_override: None,
             request_timeout: None,

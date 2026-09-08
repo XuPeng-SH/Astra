@@ -128,6 +128,16 @@ astra skill status [--per-group 50]
 
 ### Interactive model selection
 
+Cloud BYOK and This device are explicit, separate credential locations:
+
+- `astra model add`, `probe`, and `delete` manage Cloud BYOK on Astra Server.
+- `astra model local add`, `check`, `show`, and `remove` manage this device's
+  deployment/account-scoped configuration. Provider keys are never uploaded.
+- `/model add` in the TUI opens **local** setup; `/model` selects from the shared
+  catalog, including Cloud BYOK and available Runner Offerings.
+
+Commands never fall back between these locations, even when aliases match.
+
 In the interactive CLI/TUI, `/model` opens the Offering picker. `/model <name>`
 accepts a unique name (case-insensitive); when multiple Offerings have the same
 name, including an offline Runner, choose from the picker or use
@@ -141,7 +151,7 @@ fail with a repair message, without falling back to a namesake.
 
 `/model add` opens local model setup. **Save without test** saves configuration
 without a provider call and leaves the current selection unchanged. Selecting
-that model later with `/model` does not test it. Run `astra model check <name>`
+that model later with `/model` does not test it. Run `astra model local check <name>`
 for an explicit provider test; this can incur provider charges. The current
 implementation does not persist probe status or show saved probe evidence in
 the picker.
@@ -171,7 +181,7 @@ your provider for rates. Availability is refreshed through `/model`.
 
 Local model configuration requires a signed-in profile (`astra login`). Desired
 definitions and stored secrets are scoped to the Astra deployment URL and the
-server-issued account ID, not the profile's display name. `astra model show
+server-issued account ID, not the profile's display name. `astra model local show
 <name>` reports the selected configuration path. A different deployment or
 account starts with no inherited local definitions or provider credentials.
 Older unscoped `models.json` / `model-secrets` files are not automatically loaded

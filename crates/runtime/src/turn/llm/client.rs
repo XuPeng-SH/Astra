@@ -4997,7 +4997,7 @@ async fn call_llm_and_collect_with_total_budget(
         // inference-ledger failure instead of racing an outer provider timer.
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
             Some(
-                astra_services::byok_endpoint::endpoint_client(&url)
+                astra_services::byok_endpoint::endpoint_transport(&url)
                     .await
                     .map_err(|error| {
                         astra_core::ClassifiedError::new(
@@ -7320,7 +7320,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
         Some(
-            astra_services::byok_endpoint::endpoint_client(&url)
+            astra_services::byok_endpoint::endpoint_transport(&url)
                 .await
                 .map_err(|error| {
                     astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
@@ -7901,7 +7901,7 @@ mod tests {
                 call_llm_and_collect(call, LlmCancel::None).await
             } else {
                 call_llm_nonstream(
-                    global_llm_client(),
+                    global_llm_client().expect("test provider transport"),
                     call,
                     std::time::Duration::from_secs(10),
                 )

@@ -153,7 +153,7 @@ pub(super) async fn completions_handler(
         };
         state
             .model_service
-            .admit_model_offering(user.user_id.clone(), offering_id)
+            .revalidate_model_execution(user.user_id.clone(), offering_id)
             .await?
     };
 

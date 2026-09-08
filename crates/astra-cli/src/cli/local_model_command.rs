@@ -200,7 +200,7 @@ fn save_definition(
             let _ = secrets.remove(secret_id);
         }
     }
-    let next = format!("astra model check {name}");
+    let next = format!("astra model local check {name}");
     serde_json::to_string_pretty(&serde_json::json!({
         "name": name,
         "status": "saved_locally",
@@ -679,7 +679,11 @@ mod tests {
             .await
             .unwrap();
             let mut body = serde_json::json!({"model":"o3", "messages":[{"role":"user","content":"Hello"}], "stream":true});
-            astra_core::model_wire::apply_chat_output_token_limit(&mut body, "openai-compatible", 4);
+            astra_core::model_wire::apply_chat_output_token_limit(
+                &mut body,
+                "openai-compatible",
+                4,
+            );
             let artifact =
                 ExactProviderRequest::compile(&body, ProviderProtocol::OpenAiCompatible, 65536)
                     .unwrap();

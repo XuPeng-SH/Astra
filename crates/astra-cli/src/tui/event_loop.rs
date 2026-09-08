@@ -5493,7 +5493,7 @@ pub(crate) async fn run_tui_session(
                         } else {
                             chat_widget.commit_system(
                                 history_cell::system::SystemCell::response(format!(
-                                    "Model '{}' saved locally, not tested or selected. Open /model to check availability. Run `astra model check {}` for an explicit provider test.",
+                                    "Model '{}' saved locally, not tested or selected. Open /model to check availability. Run `astra model local check {}` for an explicit provider test.",
                                     completion.name, completion.name
                                 )),
                             );

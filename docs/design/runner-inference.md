@@ -991,7 +991,7 @@ selection unchanged).
 
 Implementation note: the current setup stores the definition but not durable
 probe evidence. **Save without test** therefore reports only that no provider
-test ran; `/model` selects without probing. Use `astra model check <name>` for
+test ran; `/model` selects without probing. Use `astra model local check <name>` for
 an explicit provider test. The probe-status UX specified below remains a target
 contract, not a current capability.
 
@@ -1002,7 +1002,9 @@ explicitly `astra admin model ...`. Existing `--model`, resume/continue, print,
 and structured-output entrypoints use the same model resolution and host attach.
 This does not change the tool/interaction semantics of print mode.
 
-`astra model add` configures the machine on which it runs. For an enterprise
+`astra model local add` configures the machine on which it runs. The top-level
+`astra model add` is the separate, explicit Cloud BYOK upload path. Neither
+command imports credentials from the other location. For an enterprise
 Runner, run setup on that host or inject a local secret reference through its
 deployment manager. The workstation/browser must not relay a private endpoint
 or key through Server while claiming remote-only custody.

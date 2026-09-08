@@ -8945,7 +8945,11 @@ impl AgenticRunLifecycleService {
                 });
             let offering_views = offerings
                 .into_iter()
-                .filter(|offering| offering.is_active)
+                .filter(|offering| {
+                    offering.is_active
+                        && offering.execution_placement
+                            == astra_services::ModelExecutionPlacement::Server
+                })
                 .map(astra_services::ModelListItemResponse::from)
                 .collect::<Vec<_>>();
             let projection = astra_services::project_model_access_with_default(

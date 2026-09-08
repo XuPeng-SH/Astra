@@ -1742,19 +1742,20 @@ pub async fn revalidate_admitted_model_execution(
         return Ok(AdmittedModelExecution {
             offering_id: offering_id.to_string(),
             access_kind: ModelAccessKind::CloudByok,
-            execution_placement: ModelExecutionPlacement::Server,
+            source: ModelAdmissionSource::ServerCatalog,
+            execution_material: ModelExecutionMaterial::Server(ServerModelExecutionMaterial {
+                api_key,
+                base_url,
+                header_overrides: HashMap::new(),
+                completions_url_override: None,
+                request_timeout_ms: None,
+            }),
             model_name: alias,
             wire_model_name: Some(row.try_get("model_name").map_err(|error| {
                 ModelOfferingResolutionError::Backend(format!(
                     "invalid user_llm_models.model_name: {error}"
                 ))
             })?),
-            api_key,
-            base_url: row.try_get("base_url").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.base_url: {error}"
-                ))
-            })?,
             provider: row.try_get("provider").map_err(|error| {
                 ModelOfferingResolutionError::Backend(format!(
                     "invalid user_llm_models.provider: {error}"
@@ -1765,9 +1766,6 @@ pub async fn revalidate_admitted_model_execution(
             request_body_overrides: None,
             context_window: Some(context_window),
             max_completion_tokens: None,
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
         });
     }
 
@@ -2447,18 +2445,6 @@ pub trait ModelService: Send + Sync {
         Ok(true)
     }
 
-    /// Revalidate and materialize an Offering for one authenticated user.
-    /// The default implementation preserves the deployment catalog behavior;
-    /// database-backed services additionally resolve user-owned BYOK rows.
-    async fn admit_model_offering(
-        &self,
-        _user_id: String,
-        offering_id: String,
-    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
-        let offering = self.revalidate_model_offering(offering_id).await?;
-        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
-    }
-
     async fn create_model(
         &self,
         user_id: String,
@@ -3103,22 +3089,6 @@ impl ModelService for DatabaseModelService {
         .map_err(internal_error)
     }
 
-    async fn admit_model_offering(
-        &self,
-        user_id: String,
-        offering_id: String,
-    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
-        revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &user_id,
-            &offering_id,
-            self.pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(model_offering_resolution_error_response)
-    }
-
     async fn create_model(
         &self,
         user_id: String,
@@ -3479,8 +3449,15 @@ impl ModelService for DatabaseModelService {
                     .map_err(runner_model_error_response)?;
             return Ok(AdmittedModelExecution::from_runner_binding(binding));
         }
-        let offering = self.revalidate_model_offering(offering_id).await?;
-        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+        revalidate_admitted_model_execution(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &user_id,
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
     }
 
     async fn revalidate_model_offering(

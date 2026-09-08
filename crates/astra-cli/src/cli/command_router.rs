@@ -2341,14 +2341,22 @@ async fn execute_cli_command_impl(
         Some(Command::Model(ModelCmd::Local(command))) => {
             use crate::cli::cli_config::cli_args::LocalModelCmd;
             let scope = astra_credentials::LocalModelScope::for_profile(
-                &api.api_origin(), profile.as_deref(),
+                &api.api_origin(),
+                profile.as_deref(),
             )?;
             let body = match command {
                 LocalModelCmd::Add(args) => crate::cli::local_model_command::add(&scope, args)?,
-                LocalModelCmd::Check(args) => crate::cli::local_model_command::check(&scope, args).await?,
-                LocalModelCmd::Show(args) => crate::cli::local_model_command::show(&scope, &args.model_name)?
-                    .ok_or_else(|| format!("Local model '{}' is not configured", args.model_name))?,
-                LocalModelCmd::Remove(args) => crate::cli::local_model_command::remove(&scope, args)?,
+                LocalModelCmd::Check(args) => {
+                    crate::cli::local_model_command::check(&scope, args).await?
+                }
+                LocalModelCmd::Show(args) => {
+                    crate::cli::local_model_command::show(&scope, &args.model_name)?.ok_or_else(
+                        || format!("Local model '{}' is not configured", args.model_name),
+                    )?
+                }
+                LocalModelCmd::Remove(args) => {
+                    crate::cli::local_model_command::remove(&scope, args)?
+                }
             };
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
