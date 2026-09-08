@@ -2974,6 +2974,7 @@ fn friendly_local_model_probe(probe: &str) -> &str {
         "stream_verified" => "verified",
         "not_run" => "not tested",
         "failed" => "failed",
+        "stale" => "stale · credential changed; recheck",
         "stream_eof_verified" => "verified (stream ended)",
         _ => probe,
     }
@@ -3757,6 +3758,28 @@ mod routing_tests {
                 .all(|line| !line.contains("astra model local check"))
         );
         assert!(attention.iter().all(|line| !line.contains("base_url")));
+
+        let stale = local_model_management_lines(&serde_json::json!({
+            "models": [{
+                "name": "work",
+                "model": "coding-model",
+                "status": "ready_for_check",
+                "credential": "available",
+                "provider_probe": "stale",
+                "probe_checked_at_unix_ms": 1,
+                "next": "credential material changed since the last provider check; run astra model local check work"
+            }]
+        }));
+        assert!(
+            stale
+                .iter()
+                .any(|line| line.contains("credential changed; recheck"))
+        );
+        assert!(
+            stale
+                .iter()
+                .any(|line| line.contains("Configured · not tested"))
+        );
     }
 
     #[test]

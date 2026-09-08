@@ -72,9 +72,10 @@ pub struct LocalModelDefinition {
     pub context_window: u32,
     pub max_output_tokens: u32,
     pub credential: LocalCredentialRef,
-    /// Last explicit provider probe for this exact binding. Probe evidence is
-    /// metadata, not binding material: recording it must not authorize a new
-    /// provider configuration or invalidate an active Runner attachment.
+    /// Last explicit provider probe for this exact binding and credential
+    /// material. Probe evidence is metadata, not binding material: recording
+    /// it must not authorize a new provider configuration or invalidate an
+    /// active Runner attachment.
     #[serde(default)]
     pub probe: LocalModelProbeState,
 }
@@ -86,6 +87,12 @@ pub enum LocalModelProbeState {
     NotRun,
     Passed {
         checked_at_unix_ms: u64,
+        /// Secret-safe identity of the credential material used by the
+        /// probe. The raw credential is never persisted. `None` is retained
+        /// for compatibility with pre-fingerprint probe records and is not
+        /// trusted for environment-backed credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_fingerprint: Option<String>,
     },
     Failed {
         checked_at_unix_ms: u64,
@@ -93,6 +100,10 @@ pub enum LocalModelProbeState {
         /// `transport`. Raw provider messages and endpoint details never go
         /// into the local configuration file.
         code: String,
+        /// Secret-safe identity of the credential material used by the probe,
+        /// when credential resolution succeeded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_fingerprint: Option<String>,
     },
 }
 
@@ -247,6 +258,34 @@ impl ResolvedLocalCredential {
     pub fn expose_to_local_transport(&self) -> &str {
         &self.0
     }
+
+    /// Return a stable, secret-safe identity for this credential material.
+    ///
+    /// Probe evidence stores this digest instead of the raw provider key so
+    /// another terminal can tell whether its environment-backed attachment
+    /// is the material that was actually checked. The domain separator keeps
+    /// this digest from being confused with hashes used by other Astra
+    /// artifacts.
+    pub fn fingerprint(&self) -> String {
+        fingerprint_value(&self.0)
+    }
+
+    /// Return the stable identity used for a keyless (`None`) credential.
+    /// Keyless probes are not terminal-local, but using an explicit marker
+    /// lets new records be distinguished from legacy records that have no
+    /// fingerprint at all.
+    pub fn no_credential_fingerprint() -> String {
+        fingerprint_value("<none>")
+    }
+}
+
+fn fingerprint_value(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-local-model-credential-v1\0");
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 impl std::fmt::Debug for ResolvedLocalCredential {
@@ -941,6 +980,42 @@ mod tests {
     }
 
     #[test]
+    fn credential_fingerprint_is_stable_and_does_not_reveal_material() {
+        let first = ResolvedLocalCredential::from_environment(
+            &LocalCredentialRef::Environment {
+                name: "WORK_LLM_API_KEY".to_string(),
+            },
+            |_| Some("first-terminal-secret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        let same = ResolvedLocalCredential::from_environment(
+            &LocalCredentialRef::Environment {
+                name: "WORK_LLM_API_KEY".to_string(),
+            },
+            |_| Some("first-terminal-secret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        let rotated = ResolvedLocalCredential::from_environment(
+            &LocalCredentialRef::Environment {
+                name: "WORK_LLM_API_KEY".to_string(),
+            },
+            |_| Some("rotated-terminal-secret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first.fingerprint(), same.fingerprint());
+        assert_ne!(first.fingerprint(), rotated.fingerprint());
+        assert!(!first.fingerprint().contains("first-terminal-secret"));
+        assert_ne!(
+            first.fingerprint(),
+            ResolvedLocalCredential::no_credential_fingerprint()
+        );
+    }
+
+    #[test]
     fn invalid_candidate_and_stale_revision_preserve_previous_file() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = LocalModelConfigStore::with_path(root.path().join("models.json"));
@@ -1003,6 +1078,7 @@ mod tests {
         let mut with_probe = first.clone();
         with_probe.models.get_mut("work").unwrap().probe = LocalModelProbeState::Passed {
             checked_at_unix_ms: 1,
+            credential_fingerprint: Some(ResolvedLocalCredential::no_credential_fingerprint()),
         };
         let recorded = store.replace(first.revision, with_probe).unwrap();
         assert_eq!(recorded.models["work"].binding_revision, binding_revision);
@@ -1010,7 +1086,8 @@ mod tests {
         assert!(matches!(
             recorded.models["work"].probe,
             LocalModelProbeState::Passed {
-                checked_at_unix_ms: 1
+                checked_at_unix_ms: 1,
+                credential_fingerprint: Some(_),
             }
         ));
     }

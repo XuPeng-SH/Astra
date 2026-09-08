@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -24,6 +24,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, FromRawFd};
 
