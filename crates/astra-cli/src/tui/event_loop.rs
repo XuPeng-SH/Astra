@@ -1000,16 +1000,23 @@ fn apply_slash_background_read_effect(
                 chat_widget.commit_system(history_cell::system::SystemCell::response(message));
             }
             Err(error) => {
-                let message = if error.contains("current local model configuration was not checked")
-                {
-                    format!(
-                        "Local model '{name}' was not checked because its configuration changed during the request. No readiness state was published. Retry /model check {name}."
-                    )
-                } else if error.contains("evidence could not be saved")
+                let message = if error.contains("protected local probe identity is unavailable")
+                    || error.contains("evidence could not be saved")
                     || error.contains("persistence")
                 {
                     format!(
                         "Local model '{name}' was not marked ready because check evidence could not be saved. Retry /model check {name}; the provider response was not published as readiness."
+                    )
+                } else if error.contains("local credential or probe key changed")
+                    || error.contains("different credential material")
+                    || error.contains("another credential observation is retained")
+                {
+                    format!(
+                        "Local model '{name}' was not marked ready because its credential or probe key changed during the request. Retry /model check {name} for the current identity."
+                    )
+                } else if error.contains("current local model configuration was not checked") {
+                    format!(
+                        "Local model '{name}' was not checked because its configuration changed during the request. No readiness state was published. Retry /model check {name}."
                     )
                 } else {
                     format!(
@@ -14695,6 +14702,43 @@ mod tests {
         .unwrap();
         let selected = local_runner_offering(&catalog, "local", "work", "offer-local").unwrap();
         assert_eq!(selected.offering_id, "offer-local");
+    }
+
+    #[test]
+    fn local_model_check_identity_errors_are_not_reported_as_binding_changes() {
+        for error in [
+            "provider probe completed, but the current local model configuration was not checked: the provider check result was not persisted because protected local probe identity is unavailable. Re-run `astra model local check work`",
+            "provider probe failed (HttpStatus(401)) (failure evidence was not persisted because the local credential or probe key changed while the request was running; retry the check for the current identity)",
+        ] {
+            let mut bottom_pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session-1");
+            apply_slash_background_read_effect(
+                SlashBackgroundReadEffect::LocalModelCheck {
+                    name: "work".into(),
+                    result: Err(error.into()),
+                },
+                &mut bottom_pane,
+                &mut widget,
+            );
+
+            let message = widget
+                .history()
+                .iter()
+                .find_map(|cell| match cell.to_persist() {
+                    Some(crate::tui::turn_event::TurnEvent::System { text, .. }) => Some(text),
+                    _ => None,
+                })
+                .expect("local model check error should be visible");
+            assert!(
+                message.contains("check evidence could not be saved")
+                    || message.contains("credential or probe key changed"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("configuration changed during the request"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

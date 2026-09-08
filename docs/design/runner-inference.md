@@ -1042,7 +1042,9 @@ from the configuration file alone. The fingerprint also carries a non-secret
 key-generation identifier; if the owner-local key is lost or replaced, the
 next explicit check records evidence under the new generation instead of
 preserving an old success that can no longer be verified. For an
-environment-backed model,
+environment-backed model, persistence revalidates the current credential and
+probe-key identity immediately before its compare-and-swap; an in-flight
+result from an older identity is discarded.
 `list`/`show` report `provider_probe=stream_verified` only when the current
 process has the same material; a different terminal or a rotated value is
 reported as `stale` and requires an explicit check. If protected local storage

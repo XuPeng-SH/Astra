@@ -408,6 +408,13 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                             .to_string(),
                     ),
                 ),
+                Ok(ProbePersistOutcome::ProbeIdentityChanged) => (
+                    false,
+                    Some(
+                        "the provider check result was not persisted because the local credential or probe key changed while the request was running"
+                            .to_string(),
+                    ),
+                ),
                 Ok(ProbePersistOutcome::BindingChanged) => (
                     false,
                     Some(
@@ -458,6 +465,10 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                 )),
                 Ok(ProbePersistOutcome::CredentialFingerprintUnavailable) => Err(format!(
                     "{} (failure evidence was not persisted because protected local probe identity is unavailable)",
+                    error
+                )),
+                Ok(ProbePersistOutcome::ProbeIdentityChanged) => Err(format!(
+                    "{} (failure evidence was not persisted because the local credential or probe key changed while the request was running; retry the check for the current identity)",
                     error
                 )),
                 Ok(ProbePersistOutcome::BindingChanged) => Err(format!(
@@ -643,6 +654,7 @@ enum ProbePersistOutcome {
     Persisted,
     CredentialChanged,
     CredentialFingerprintUnavailable,
+    ProbeIdentityChanged,
     BindingChanged,
     ModelMissing,
 }
@@ -675,6 +687,23 @@ fn persist_probe_state(
             // without a keyed material identity. Such a record would look
             // like a shared success to another terminal.
             return Ok(ProbePersistOutcome::CredentialFingerprintUnavailable);
+        }
+        if !matches!(&definition.credential, LocalCredentialRef::None) {
+            // The credential and owner-local probe key can change while a
+            // provider request is in flight. Recompute the material-bound
+            // identity before the CAS so a delayed result from an older
+            // generation cannot overwrite a newer terminal's evidence.
+            let Some(incoming) = probe_credential_fingerprint(&probe) else {
+                return Ok(ProbePersistOutcome::CredentialFingerprintUnavailable);
+            };
+            let Some(current) =
+                current_credential_fingerprint(&scope.secrets(), &definition.credential)
+            else {
+                return Ok(ProbePersistOutcome::ProbeIdentityChanged);
+            };
+            if !fingerprints_equal(&current, incoming) {
+                return Ok(ProbePersistOutcome::ProbeIdentityChanged);
+            }
         }
         // A failed check from another terminal must not erase a known-good
         // observation for the credential material that this terminal uses.
@@ -1883,6 +1912,139 @@ mod tests {
         assert_eq!(listed["models"][0]["provider_probe"], "failed");
         assert_eq!(listed["models"][0]["status"], "needs_attention");
         assert_eq!(listed["models"][0]["probe_failure_code"], "http_401");
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn delayed_probe_from_old_key_cannot_overwrite_new_generation() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer password"))
+            .respond_with(
+                ResponseTemplate::new(401).set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer other-password"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        let variable = "ASTRA_TEST_TERMINAL_PROVIDER_KEY";
+        let mut environment = TestEnvironmentVariable::set(variable, "password");
+        add(ModelAddArgs {
+            name: Some("work".into()),
+            base_url: Some(format!("{}/v1", server.uri())),
+            provider_model: Some("coding-model".into()),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            credential_env: Some(variable.into()),
+            no_auth: false,
+            store_secret: false,
+        })
+        .unwrap();
+
+        let probe_key_path = scope
+            .root()
+            .join("model-secrets")
+            .join("probe_fingerprint_key_v1");
+        let first_scope = scope.clone();
+        let first = tokio::spawn(async move {
+            super::check(
+                &first_scope,
+                ModelCheckArgs {
+                    name: "work".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old-generation provider request must start");
+        let first_key_material = scope
+            .secrets()
+            .resolve(&LocalCredentialRef::ProtectedFile {
+                secret_id: "probe_fingerprint_key_v1".into(),
+            })
+            .unwrap()
+            .unwrap();
+        let first_key = std::fs::read_to_string(&probe_key_path).unwrap();
+        let binding_revision = scope.models().load().unwrap().models["work"].binding_revision;
+        std::fs::remove_file(&probe_key_path).unwrap();
+
+        environment.replace("other-password");
+        let second = super::check(
+            &scope,
+            ModelCheckArgs {
+                name: "work".to_string(),
+            },
+        )
+        .await
+        .expect("the new-generation provider check must succeed");
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert!(second["probe_persisted"].as_bool().unwrap());
+        let second_key = std::fs::read_to_string(&probe_key_path).unwrap();
+        assert_ne!(first_key, second_key);
+
+        // A successful result from the old key generation is rejected too;
+        // the guard is symmetric for late success and late failure.
+        let old_credential = ResolvedLocalCredential::from_environment(
+            &LocalCredentialRef::Environment {
+                name: variable.into(),
+            },
+            |_| Some("password".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            persist_probe_state(
+                &scope,
+                "work",
+                binding_revision,
+                LocalModelProbeState::Passed {
+                    checked_at_unix_ms: now_unix_ms(),
+                    credential_fingerprint: Some(
+                        old_credential.fingerprint_with_key(&first_key_material),
+                    ),
+                },
+            )
+            .unwrap(),
+            ProbePersistOutcome::ProbeIdentityChanged
+        );
+
+        let first = first
+            .await
+            .unwrap()
+            .expect_err("a delayed result from the old key generation must not be persisted");
+        assert!(first.contains("credential or probe key changed"), "{first}");
+        let listed: serde_json::Value =
+            serde_json::from_str(&super::list(&scope).unwrap()).unwrap();
+        assert_eq!(listed["models"][0]["provider_probe"], "stream_verified");
+        assert_eq!(listed["models"][0]["status"], "ready");
     }
 
     struct TestEnvironmentVariable {
