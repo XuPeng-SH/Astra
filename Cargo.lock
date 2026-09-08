@@ -270,6 +270,7 @@ version = "0.2.2"
 dependencies = [
  "dirs",
  "fs2",
+ "hmac",
  "libc",
  "serde",
  "serde_json",

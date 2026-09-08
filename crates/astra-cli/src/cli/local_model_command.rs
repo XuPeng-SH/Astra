@@ -686,7 +686,16 @@ fn persist_probe_state(
         } = &probe
         {
             let existing = probe_credential_fingerprint(&definition.probe);
-            if existing.is_some() && existing != incoming.as_deref() {
+            let same_key_generation = existing
+                .zip(incoming.as_deref())
+                .and_then(|(existing, incoming)| {
+                    Some((
+                        ResolvedLocalCredential::fingerprint_key_generation(existing)?,
+                        ResolvedLocalCredential::fingerprint_key_generation(incoming)?,
+                    ))
+                })
+                .is_some_and(|(existing, incoming)| existing == incoming);
+            if existing.is_some() && existing != incoming.as_deref() && same_key_generation {
                 return Ok(ProbePersistOutcome::CredentialChanged);
             }
         }
@@ -1796,7 +1805,7 @@ mod tests {
         assert_eq!(listed["models"][0]["status"], "ready");
 
         let models_json = std::fs::read_to_string(terminal_a.models().path()).unwrap();
-        assert!(models_json.contains("hmac-sha256:"));
+        assert!(models_json.contains("hmac-sha256-v1:"));
         assert!(!models_json.contains("password"));
         let mut legacy = Sha256::new();
         legacy.update(b"astra-local-model-credential-v1\0");
@@ -1808,7 +1817,7 @@ mod tests {
             .join("model-secrets")
             .join("probe_fingerprint_key_v1");
         assert!(probe_key_path.is_file());
-        let probe_key = std::fs::read_to_string(probe_key_path).unwrap();
+        let probe_key = std::fs::read_to_string(&probe_key_path).unwrap();
         assert!(!models_json.contains(&probe_key));
 
         // A second terminal can use the same owner-scoped config, but its
@@ -1854,6 +1863,26 @@ mod tests {
             serde_json::from_str(&super::list(&terminal_a).unwrap()).unwrap();
         assert_eq!(listed["models"][0]["provider_probe"], "stream_verified");
         assert_eq!(listed["models"][0]["status"], "ready");
+
+        // Losing the owner-local key invalidates the old HMAC generation. A
+        // failed recheck must replace that now-unverifiable success with the
+        // current failure instead of preserving stale evidence forever.
+        std::fs::remove_file(&probe_key_path).unwrap();
+        environment.replace("other-password");
+        let error = super::check(
+            &terminal_b,
+            ModelCheckArgs {
+                name: "work".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("HttpStatus(401)"), "{error}");
+        let listed: serde_json::Value =
+            serde_json::from_str(&super::list(&terminal_b).unwrap()).unwrap();
+        assert_eq!(listed["models"][0]["provider_probe"], "failed");
+        assert_eq!(listed["models"][0]["status"], "needs_attention");
+        assert_eq!(listed["models"][0]["probe_failure_code"], "http_401");
     }
 
     struct TestEnvironmentVariable {

@@ -11,6 +11,7 @@ use thiserror::Error;
 /// format to migrate in this feature, so new installations start at version 1.
 pub const LOCAL_MODELS_FILE_VERSION: u32 = 1;
 const PROBE_FINGERPRINT_KEY_ID: &str = "probe_fingerprint_key_v1";
+const PROBE_FINGERPRINT_PREFIX: &str = "hmac-sha256-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -270,6 +271,19 @@ impl ResolvedLocalCredential {
         keyed_fingerprint(key.0.as_bytes(), self.0.as_bytes())
     }
 
+    /// Return the non-secret generation identifier embedded in a keyed probe
+    /// fingerprint. A new identifier means the owner-local key was replaced,
+    /// so evidence produced with the previous key is no longer verifiable.
+    pub fn fingerprint_key_generation(fingerprint: &str) -> Option<&str> {
+        let rest = fingerprint.strip_prefix(PROBE_FINGERPRINT_PREFIX)?;
+        let (generation, digest) = rest.strip_prefix(':')?.split_once(':')?;
+        (generation.len() == 64
+            && digest.len() == 64
+            && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(generation)
+    }
+
     /// Return the stable identity used for a keyless (`None`) credential.
     /// Keyless probes are not terminal-local, but using an explicit marker
     /// lets new records be distinguished from legacy records that have no
@@ -289,35 +303,21 @@ fn fingerprint_value(value: &str) -> String {
 }
 
 fn keyed_fingerprint(key: &[u8], value: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
 
-    const BLOCK_SIZE: usize = 64;
-    let mut normalized_key = [0_u8; BLOCK_SIZE];
-    if key.len() > BLOCK_SIZE {
-        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        normalized_key[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner_pad = normalized_key;
-    let mut outer_pad = normalized_key;
-    for byte in &mut inner_pad {
-        *byte ^= 0x36;
-    }
-    for byte in &mut outer_pad {
-        *byte ^= 0x5c;
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(b"astra-local-model-credential-v2\0");
-    inner.update(value);
-    let inner_digest = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner_digest);
-    format!("hmac-sha256:{:x}", outer.finalize())
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts every owner-local key length");
+    mac.update(b"astra-local-model-credential-v2\0");
+    mac.update(value);
+    let digest = mac.finalize().into_bytes();
+    let mut generation = Sha256::new();
+    generation.update(b"astra-local-model-probe-key-generation-v1\0");
+    generation.update(key);
+    format!(
+        "{PROBE_FINGERPRINT_PREFIX}:{:x}:{digest:x}",
+        generation.finalize()
+    )
 }
 
 impl std::fmt::Debug for ResolvedLocalCredential {

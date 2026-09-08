@@ -1038,7 +1038,11 @@ probe evidence on that exact binding revision. For credential-backed models,
 the evidence carries an HMAC fingerprint of the material used by the request;
 the random owner-local HMAC key lives in the protected `model-secrets` store,
 never in `models.json`, so a low-entropy provider key cannot be checked offline
-from the configuration file alone. For an environment-backed model,
+from the configuration file alone. The fingerprint also carries a non-secret
+key-generation identifier; if the owner-local key is lost or replaced, the
+next explicit check records evidence under the new generation instead of
+preserving an old success that can no longer be verified. For an
+environment-backed model,
 `list`/`show` report `provider_probe=stream_verified` only when the current
 process has the same material; a different terminal or a rotated value is
 reported as `stale` and requires an explicit check. If protected local storage
