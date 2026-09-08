@@ -103,7 +103,18 @@ struct CanonicalCommitCasOpenHook {
 }
 
 #[cfg(test)]
+struct SessionExecutionIdentityHook {
+    path: PathBuf,
+    captured: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
 static CANONICAL_COMMIT_CAS_OPEN_HOOK: LazyLock<Mutex<Option<CanonicalCommitCasOpenHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+static SESSION_EXECUTION_IDENTITY_HOOK: LazyLock<Mutex<Option<SessionExecutionIdentityHook>>> =
     LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
@@ -133,6 +144,23 @@ fn run_canonical_commit_cas_open_hook(path: &Path) {
         });
     if let Some(hook) = hook {
         let _ = hook.opened.send(());
+        let _ = hook.resume.recv();
+    }
+}
+
+#[cfg(test)]
+fn run_session_execution_identity_hook(path: &Path) {
+    let hook = SESSION_EXECUTION_IDENTITY_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut slot| {
+            slot.as_ref()
+                .is_some_and(|hook| hook.path == path)
+                .then(|| slot.take())
+                .flatten()
+        });
+    if let Some(hook) = hook {
+        let _ = hook.captured.send(());
         let _ = hook.resume.recv();
     }
 }
@@ -2146,6 +2174,8 @@ impl SessionExecutionLease {
                 source,
             }
         })?;
+        #[cfg(test)]
+        run_session_execution_identity_hook(&journal_path);
         #[cfg(target_os = "macos")]
         let process_reservation =
             DarwinSessionExecutionReservation::reserve(&identity_keys, session_id)?;
@@ -2186,6 +2216,24 @@ impl SessionExecutionLease {
             Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(SessionExecutionLeaseError::Conflict {
                     session_id: session_id.to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source,
+                });
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        match session_execution_identity_keys(&journal_path) {
+            Ok(current_keys) if current_keys == identity_keys => {}
+            Ok(_) => {
+                return Err(SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source: std::io::Error::other(
+                        "session execution identity changed during acquisition",
+                    ),
                 });
             }
             Err(source) => {
@@ -12658,6 +12706,67 @@ mod turn_event_buffer_tests {
             session_execution_identity_keys(&through_symlink)
                 .unwrap()
                 .contains(&direct_canonical)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn session_execution_lease_fails_closed_if_identity_retargets_before_open() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc::sync_channel;
+
+        let temp = tempdir().unwrap();
+        let lexical_root = temp.path().join("lexical-root");
+        let old_root = temp.path().join("old-root");
+        let new_root = temp.path().join("new-root");
+        let old_target = old_root.join("target");
+        let new_target = new_root.join("target");
+        let old_state = old_root.join("state");
+        let new_state = new_root.join("state");
+        std::fs::create_dir_all(&old_target).unwrap();
+        std::fs::create_dir_all(&old_state).unwrap();
+        std::fs::create_dir_all(&new_target).unwrap();
+        std::fs::create_dir_all(&new_state).unwrap();
+        std::fs::create_dir(&lexical_root).unwrap();
+        let link = lexical_root.join("link");
+        symlink(&old_target, &link).unwrap();
+
+        let through_symlink = lexical_root.join("link").join("..").join("state");
+        let _guard = ProcessJournalDirGuard::new(&through_symlink);
+        let owner_scope = OwnerScope::local_user();
+        let session_id = "sess-execution-identity-retarget-window".to_string();
+        let journal_path =
+            journal_file_path_for_owner(&owner_scope, &session_id).expect("journal path");
+        let (captured_tx, captured_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        *SESSION_EXECUTION_IDENTITY_HOOK.lock().unwrap() = Some(SessionExecutionIdentityHook {
+            path: journal_path,
+            captured: captured_tx,
+            resume: resume_rx,
+        });
+
+        let thread_session_id = session_id.clone();
+        let contender =
+            std::thread::spawn(move || SessionExecutionLease::try_acquire(&thread_session_id));
+        captured_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lease acquisition should reach the identity/open window");
+
+        let detached_link = lexical_root.join("detached-link");
+        std::fs::rename(&link, &detached_link).unwrap();
+        symlink(&new_target, &link).unwrap();
+        resume_tx.send(()).unwrap();
+
+        let result = contender.join().unwrap();
+        assert!(
+            matches!(
+                &result,
+                Err(SessionExecutionLeaseError::Io { source, .. })
+                    if source
+                        .to_string()
+                        .contains("session execution identity changed during acquisition")
+            ),
+            "a path retarget between identity snapshot and witness open must fail closed: {result:?}"
         );
     }
 
