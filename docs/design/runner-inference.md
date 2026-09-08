@@ -172,6 +172,22 @@ repair error instead of silently using the first terminal's private proxy.
 The current bounds are 32 clients, 256 active model bindings, 64 KiB IPC frames,
 one-second configuration/heartbeat refresh and a 30-second missed-heartbeat
 expiry. Unchanged configuration sends no provider key in heartbeat frames.
+Private IPC version 3 stages up to 256 credential entries in bounded frames and
+applies the complete snapshot atomically; interruption never exposes a partial
+replacement. Every chunk names the same configuration revision; activation
+compares that revision while holding the local configuration lease. A concurrent
+edit rejects the snapshot and requests a fresh one without detaching the terminal.
+The configuration store assigns monotonically increasing model generations,
+including after deletion and recreation. Unrelated edits preserve existing model
+generations and Offering identities. Standalone environment refresh also replaces a complete snapshot,
+and a changed configuration or missing variable withdraws the old slot before
+new work can use it.
+
+Transient enrollment and binding-publication storage/capacity rejections retry
+on the same connection after five seconds. Publication retries preserve the
+durable operation ID; identity and revision conflicts remain explicit repair
+conditions. Both ends allow eight simultaneous transfer assemblies, independently
+of the four local provider execution slots.
 
 The host scope is the authenticated Astra deployment and account under the
 current OS user. Resolve it through the existing CLI profile/owner machinery,
@@ -213,6 +229,13 @@ inheritance from whichever terminal won the startup race. Redirect host stdio to
 its own bounded diagnostic sink; it must not inherit and keep a print-mode
 caller's stdout pipe open. Management progress uses IPC and cannot pollute
 machine-readable command output.
+
+The private local IPC uses version 3 for atomic, revisioned credential chunks.
+Version 2 peers are rejected before the network-policy or credential exchange.
+A new client may issue a metadata-only version 2 hello to diagnose an older
+shared host; it never sends a version 2 credential snapshot. A version mismatch
+requires matching Astra/Runner binaries and normal host drain/restart, preserving
+other clients, the installation lock, and all journal custody.
 
 Client leases are operational attachment state, not inference authorization.
 IPC liveness plus heartbeats detects dead clients; current heartbeat/expiry are
@@ -928,6 +951,28 @@ session locks. A failed personal device does not hold a global semaphore or stop
 other users. Provider connection pools are scoped by local origin, authentication,
 proxy/TLS policy, and credential generation; they never cross owner boundaries.
 
+The current personal Runner ceiling is four possible provider attempts per host
+and one per session. The Server's existing durable attempt ledger is the bounded
+waiting queue (128 unresolved attempts per Runner); waiting never extends the
+15-second start grant. Session-interleaved reconciliation prevents one session's
+backlog from filling every delivery batch. A delivery claim reserves a provider
+slot until terminal or definitive no-start evidence; claim expiry and cancellation
+intent alone cannot free a potentially executing slot. Cancellation and recovery
+continue even while admission capacity is exhausted.
+
+Local preparation uses per-attempt ordering and shared configuration/attachment
+leases. Concurrent sessions can prepare independently, while exact cancellation
+tokens are signalled before journal I/O. A cancelled preparation releases its
+capacity reservation; after the durable fence the provider task owns that
+reservation through terminal persistence.
+The connection runs bounded preparation actions separately from preview/control
+handling. Its ingress signals cancellation only for the accepted delivery
+generation and exact local grant, before waiting for ordered durable handling.
+Once fencing is submitted, a Host-owned task completes the fence-to-provider
+handoff even if the socket worker is dropped; reconnect cannot strand a fence
+without an execution owner. Disposable previews may still be delayed by shared
+storage maintenance and converge from terminal custody.
+
 ## Prompt cache and ContextPipeline
 
 Runner inference changes the transport location, not context ownership. Server
@@ -1131,6 +1176,15 @@ same explicit local generation rule, so a reused host never accidentally borrows
 another terminal's private network configuration.
 
 ### Setup transaction
+
+The current TUI probes an isolated in-memory candidate and its new protected
+secret before applying the configuration with an expected-revision comparison.
+Failed probes and cancelled candidates leave the applied descriptor unchanged;
+candidate cleanup retains any secret referenced by an ambiguous durable apply.
+After apply, connection/publication errors describe the saved state, rather than
+claiming that the previous model configuration is still active. CLI `model local
+add` remains an explicit apply without a probe; `model local check` diagnoses the
+already-saved definition.
 
 Setup has these typed stages, with the optional probe branch explicitly recorded:
 

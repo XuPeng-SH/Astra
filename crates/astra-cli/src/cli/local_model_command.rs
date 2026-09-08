@@ -96,6 +96,7 @@ pub(crate) enum LocalModelCredentialInput {
     None,
 }
 
+#[cfg(test)]
 pub(crate) fn add_from_tui(
     scope: &LocalModelScope,
     name: String,
@@ -105,7 +106,70 @@ pub(crate) fn add_from_tui(
     max_output_tokens: u32,
     credential_input: LocalModelCredentialInput,
 ) -> Result<String, String> {
+    prepare_from_tui(
+        scope,
+        name,
+        base_url,
+        provider_model,
+        context_window,
+        max_output_tokens,
+        credential_input,
+    )?
+    .apply()
+}
+
+pub(crate) struct LocalModelCandidate {
+    scope: LocalModelScope,
+    name: String,
+    definition: LocalModelDefinition,
+    expected_revision: u64,
+    created_secret: Option<String>,
+}
+
+impl LocalModelCandidate {
+    pub(crate) async fn check(&self) -> Result<String, String> {
+        check_definition(&self.scope, &self.name, &self.definition).await
+    }
+
+    pub(crate) fn apply(self) -> Result<String, String> {
+        save_definition_at(
+            &self.scope.models(),
+            &self.scope.secrets(),
+            LocalModelDefinitionInput {
+                name: self.name.clone(),
+                definition: self.definition.clone(),
+            },
+            self.created_secret.clone(),
+            Some(self.expected_revision),
+        )
+    }
+}
+
+impl Drop for LocalModelCandidate {
+    fn drop(&mut self) {
+        if let Some(secret_id) = &self.created_secret {
+            // Cancellation and failed probes discard only an unreferenced
+            // candidate. An ambiguous durable apply must retain its material.
+            if self.scope.models().load().is_ok_and(|config| !config.models.values().any(|model|
+                matches!(&model.credential, LocalCredentialRef::ProtectedFile { secret_id: referenced } if referenced == secret_id))) {
+                let _ = self.scope.secrets().remove(secret_id);
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_from_tui(
+    scope: &LocalModelScope,
+    name: String,
+    base_url: String,
+    provider_model: String,
+    context_window: u32,
+    max_output_tokens: u32,
+    credential_input: LocalModelCredentialInput,
+) -> Result<LocalModelCandidate, String> {
     let store = scope.models();
+    let mut prospective = store.load().map_err(|error| error.to_string())?;
+    let expected_revision = prospective.revision;
     let secrets = scope.secrets();
     let (credential, created_secret) = match credential_input {
         LocalModelCredentialInput::Environment(name) => {
@@ -125,23 +189,26 @@ pub(crate) fn add_from_tui(
         }
         LocalModelCredentialInput::None => (LocalCredentialRef::None, None),
     };
-    save_definition(
-        &store,
-        &secrets,
-        LocalModelDefinitionInput {
-            name,
-            definition: LocalModelDefinition {
-                protocol: LocalInferenceProtocol::OpenaiCompatible,
-                base_url,
-                model: provider_model,
-                binding_revision: 0,
-                context_window,
-                max_output_tokens,
-                credential,
-            },
+    let candidate = LocalModelCandidate {
+        scope: scope.clone(),
+        expected_revision,
+        name,
+        definition: LocalModelDefinition {
+            protocol: LocalInferenceProtocol::OpenaiCompatible,
+            base_url,
+            model: provider_model,
+            binding_revision: 1,
+            context_window,
+            max_output_tokens,
+            credential,
         },
         created_secret,
-    )
+    };
+    prospective
+        .models
+        .insert(candidate.name.clone(), candidate.definition.clone());
+    prospective.validate().map_err(|error| error.to_string())?;
+    Ok(candidate)
 }
 
 struct LocalModelDefinitionInput {
@@ -155,10 +222,23 @@ fn save_definition(
     input: LocalModelDefinitionInput,
     created_secret: Option<String>,
 ) -> Result<String, String> {
+    save_definition_at(store, secrets, input, created_secret, None)
+}
+
+fn save_definition_at(
+    store: &LocalModelConfigStore,
+    secrets: &LocalSecretStore,
+    input: LocalModelDefinitionInput,
+    created_secret: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<String, String> {
     let LocalModelDefinitionInput { name, definition } = input;
     let mut publication_attempted = false;
     let apply = (|| {
         let mut config = store.load().map_err(|error| error.to_string())?;
+        if expected_revision.is_some_and(|revision| revision != config.revision) {
+            return Err("Local configuration changed during setup. Reopen the model and try again; your candidate was not applied.".into());
+        }
         let mut definition = definition;
         definition.binding_revision = config.models.get(&name).map_or(Ok(1), |previous| {
             previous.binding_revision.checked_add(1).ok_or_else(|| {
@@ -242,6 +322,14 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
         .models
         .get(&args.name)
         .ok_or_else(|| format!("local model '{}' is not configured", args.name))?;
+    check_definition(scope, &args.name, definition).await
+}
+
+async fn check_definition(
+    scope: &LocalModelScope,
+    name: &str,
+    definition: &LocalModelDefinition,
+) -> Result<String, String> {
     definition.validate().map_err(|error| error.to_string())?;
     let credential = match &definition.credential {
         LocalCredentialRef::Environment { .. } | LocalCredentialRef::None => {
@@ -341,13 +429,13 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
         || saw_provider_error
     {
         return Err(format!(
-            "provider probe failed ({:?}); configuration remains saved and no retry was attempted",
+            "provider probe failed ({:?}); no retry was attempted",
             terminal.status
         ));
     }
     drop(credential);
     serde_json::to_string_pretty(&LocalModelStatus {
-        name: &args.name,
+        name,
         source: credential_kind(&definition.credential),
         configuration: "valid",
         credential: "available",
@@ -356,7 +444,7 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
         } else {
             "stream_eof_verified"
         },
-        config_path: store.path().display().to_string(),
+        config_path: scope.models().path().display().to_string(),
     })
     .map_err(|error| error.to_string())
 }
@@ -492,6 +580,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn failed_candidate_probe_preserves_old_configuration_and_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        add_from_tui(
+            &scope,
+            "work".into(),
+            "http://127.0.0.1:9".into(),
+            "original".into(),
+            1024,
+            64,
+            LocalModelCredentialInput::Stored("original-key".into()),
+        )
+        .unwrap();
+        let original = scope.models().load().unwrap();
+        let candidate = prepare_from_tui(
+            &scope,
+            "work".into(),
+            "http://127.0.0.1:9".into(),
+            "candidate".into(),
+            1024,
+            64,
+            LocalModelCredentialInput::Stored("candidate-key".into()),
+        )
+        .unwrap();
+        let candidate_ref = candidate.definition.credential.clone();
+        assert!(candidate.check().await.is_err());
+        drop(candidate);
+        assert!(scope.models().load().unwrap() == original);
+        assert!(
+            scope
+                .secrets()
+                .resolve(&original.models["work"].credential)
+                .unwrap()
+                .is_some()
+        );
+        assert!(scope.secrets().resolve(&candidate_ref).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn candidate_apply_rejects_concurrent_configuration_change() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        let candidate = prepare_from_tui(
+            &scope,
+            "work".into(),
+            "http://127.0.0.1:9".into(),
+            "candidate".into(),
+            1024,
+            64,
+            LocalModelCredentialInput::None,
+        )
+        .unwrap();
+        add(no_auth_add("other")).unwrap();
+        assert!(
+            candidate
+                .apply()
+                .unwrap_err()
+                .contains("changed during setup")
+        );
+        let current = scope.models().load().unwrap();
+        assert!(current.models.contains_key("other"));
+        assert!(!current.models.contains_key("work"));
+    }
+
     #[test]
     #[serial]
     fn local_model_lifecycle_is_offline_and_revisioned() {
@@ -507,15 +664,15 @@ mod tests {
         add(no_auth_add("other")).unwrap();
         let other: serde_json::Value =
             serde_json::from_str(&show("other").unwrap().unwrap()).unwrap();
-        assert_eq!(other["binding_revision"], 1);
+        assert_eq!(other["binding_revision"], 2);
 
         add(no_auth_add("work")).unwrap();
         let updated: serde_json::Value =
             serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
-        assert_eq!(updated["binding_revision"], 2);
+        assert_eq!(updated["binding_revision"], 3);
         let other_after: serde_json::Value =
             serde_json::from_str(&show("other").unwrap().unwrap()).unwrap();
-        assert_eq!(other_after["binding_revision"], 1);
+        assert_eq!(other_after["binding_revision"], other["binding_revision"]);
 
         let removed = remove(ModelRemoveArgs {
             name: "work".to_string(),
@@ -523,6 +680,13 @@ mod tests {
         .unwrap();
         assert!(removed.contains("removed_locally"));
         assert!(show("work").unwrap().is_none());
+        add(no_auth_add("work")).unwrap();
+        let recreated: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert!(
+            recreated["binding_revision"].as_u64().unwrap()
+                > updated["binding_revision"].as_u64().unwrap()
+        );
     }
 
     #[test]

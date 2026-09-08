@@ -42,6 +42,11 @@ struct Outgoing {
     sent: usize,
 }
 
+type HostActionResult = (
+    RunnerInferenceDispatchGrant,
+    Result<DispatchOutcome, InferenceHostError>,
+);
+
 pub struct InferenceConnection {
     host: Arc<InferenceHost>,
     hello_sent: Instant,
@@ -50,7 +55,10 @@ pub struct InferenceConnection {
     incoming: HashMap<String, Assembly>,
     outgoing: Option<Outgoing>,
     publication_sent: Option<RunnerInferenceId>,
+    hello_retry_at: Option<Instant>,
+    publication_retry_at: Option<Instant>,
     pending_progress: HashMap<String, PendingProgress>,
+    actions: tokio::task::JoinSet<HostActionResult>,
 }
 
 impl InferenceConnection {
@@ -63,7 +71,10 @@ impl InferenceConnection {
             incoming: HashMap::new(),
             outgoing: None,
             publication_sent: None,
+            hello_retry_at: None,
+            publication_retry_at: None,
             pending_progress: HashMap::new(),
+            actions: tokio::task::JoinSet::new(),
         }
     }
 
@@ -283,10 +294,16 @@ impl InferenceConnection {
         match message {
             EdgeServerMessage::InferenceHelloAck { negotiation } => {
                 match negotiation {
-                    RunnerInferenceNegotiation::Unavailable { .. } => {
+                    RunnerInferenceNegotiation::Unavailable { reason } => {
                         self.generation = None;
                         self.clock = None;
                         self.pending_progress.clear();
+                        self.hello_retry_at = matches!(
+                            reason,
+                            RunnerInferenceRejection::StorageUnavailable
+                                | RunnerInferenceRejection::CapacityUnavailable
+                        )
+                        .then(|| Instant::now() + Duration::from_secs(5));
                         return Ok(Vec::new());
                     }
                     RunnerInferenceNegotiation::Accepted {
@@ -313,6 +330,7 @@ impl InferenceConnection {
                             Instant::now(),
                         )?);
                         self.generation = Some(delivery_generation);
+                        self.hello_retry_at = None;
                     }
                 }
                 self.poll().await
@@ -320,11 +338,20 @@ impl InferenceConnection {
             EdgeServerMessage::InferenceBindingAck { receipt } => {
                 self.host.publication_ack(receipt).await?;
                 self.publication_sent = None;
+                self.publication_retry_at = None;
                 self.poll().await
             }
-            EdgeServerMessage::InferenceBindingRejected { .. } => {
+            EdgeServerMessage::InferenceBindingRejected { rejection } => {
                 // Do not manufacture a newer publication revision to override a
                 // rejection. Keep the durable operation available for repair.
+                if self.publication_sent.as_ref() == Some(&rejection.operation_id) {
+                    self.publication_retry_at = matches!(
+                        rejection.reason,
+                        RunnerInferenceRejection::StorageUnavailable
+                            | RunnerInferenceRejection::CapacityUnavailable
+                    )
+                    .then(|| Instant::now() + Duration::from_secs(5));
+                }
                 Ok(Vec::new())
             }
             EdgeServerMessage::InferenceDispatch {
@@ -347,7 +374,7 @@ impl InferenceConnection {
                     }
                     return Ok(Vec::new());
                 }
-                if self.incoming.len() >= 4 {
+                if self.incoming.len() >= RUNNER_INFERENCE_MAX_TRANSFERS {
                     return Err(InferenceHostError::Capacity);
                 }
                 let attempt_id = grant.attempt.attempt_id.clone();
@@ -416,15 +443,18 @@ impl InferenceConnection {
                     .ok_or(InferenceHostError::InvalidRequest)?;
                 let request_json = String::from_utf8(assembly.bytes)
                     .map_err(|_| InferenceHostError::InvalidRequest)?;
-                let result = self
-                    .host
-                    .dispatch(
-                        assembly.grant.clone(),
-                        request_json,
-                        self.clock.ok_or(InferenceHostError::WrongIncarnation)?,
-                    )
-                    .await?;
-                self.outcome(assembly.grant, result).await
+                if self.actions.len() >= RUNNER_INFERENCE_MAX_TRANSFERS * 2 {
+                    return Err(InferenceHostError::Capacity);
+                }
+                let host = self.host.clone();
+                let clock = self.clock.ok_or(InferenceHostError::WrongIncarnation)?;
+                self.actions.spawn(async move {
+                    let result = host
+                        .dispatch(assembly.grant.clone(), request_json, clock)
+                        .await;
+                    (assembly.grant, result)
+                });
+                Ok(Vec::new())
             }
             EdgeServerMessage::InferenceCancel {
                 grant,
@@ -432,15 +462,37 @@ impl InferenceConnection {
             } => {
                 self.fence_generation(delivery_generation)?;
                 self.incoming.remove(grant.attempt.attempt_id.as_str());
-                let result = self.host.cancel(&grant).await?;
-                self.outcome(*grant, result).await
+                let signal = self.host.signal_cancel(&grant)?;
+                if self.actions.len() >= RUNNER_INFERENCE_MAX_TRANSFERS * 2 {
+                    return Err(InferenceHostError::Capacity);
+                }
+                let host = self.host.clone();
+                self.actions.spawn(async move {
+                    let _signal = signal;
+                    let result = host.cancel(&grant).await;
+                    (*grant, result)
+                });
+                Ok(Vec::new())
             }
             EdgeServerMessage::InferenceReconcile {
                 grant,
                 delivery_generation,
             } => {
                 self.fence_generation(delivery_generation)?;
-                let result = self.host.reconcile(&grant).await?;
+                let mut result = self.host.reconcile(&grant).await?;
+                if matches!(result, DispatchOutcome::Unknown)
+                    && grant.process_boot_nonce == *self.host.process_boot_nonce()
+                    && let Some(clock) = self.clock
+                    && grant.start_before_unix_ms <= clock.latest_server_time()
+                {
+                    // A queued grant may expire before request transfer. Only
+                    // the exact current incarnation can now seal no-start;
+                    // a replaced process must keep absence as unknown.
+                    result = self
+                        .host
+                        .dispatch((*grant).clone(), String::new(), clock)
+                        .await?;
+                }
                 self.outcome(*grant, result).await
             }
             EdgeServerMessage::InferenceTerminalAck {
@@ -545,9 +597,24 @@ impl InferenceConnection {
 
     pub async fn poll(&mut self) -> Result<Vec<EdgeClientMessage>, InferenceHostError> {
         if self.generation.is_none() {
+            if self.hello_retry_at.is_some_and(|at| Instant::now() >= at) {
+                self.hello_retry_at = None;
+                return Ok(vec![self.hello()]);
+            }
             return Ok(Vec::new());
         }
+        if self
+            .publication_retry_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.publication_sent = None;
+            self.publication_retry_at = None;
+        }
         let mut messages = Vec::new();
+        while let Some(action) = self.actions.try_join_next() {
+            let (grant, result) = action.map_err(|_| InferenceHostError::JournalIo)?;
+            messages.extend(self.outcome(grant, result?).await?);
+        }
         // Configuration repair must not prevent custody delivery for an
         // already-fenced attempt. Publication remains pending until repaired.
         if let Ok(Some(publication)) = self.host.next_publication().await
@@ -672,11 +739,35 @@ pub struct InferenceConnectionWorker {
     pub commands: tokio::sync::mpsc::Sender<EdgeServerMessage>,
     pub messages: tokio::sync::mpsc::Receiver<EdgeClientMessage>,
     task: tokio::task::JoinHandle<()>,
+    ingress: tokio::task::JoinHandle<()>,
 }
 
 impl InferenceConnectionWorker {
     pub fn spawn(host: Arc<InferenceHost>) -> Self {
-        let (commands, mut input) = tokio::sync::mpsc::channel(32);
+        let (commands, mut ingress_input) = tokio::sync::mpsc::channel(32);
+        let (forward, mut input) = tokio::sync::mpsc::channel(32);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ingress_host = host.clone();
+        let ingress_generation = generation.clone();
+        let ingress = tokio::spawn(async move {
+            while let Some(message) = ingress_input.recv().await {
+                let signal = match &message {
+                    EdgeServerMessage::InferenceCancel {
+                        grant,
+                        delivery_generation,
+                    } if *delivery_generation != 0
+                        && *delivery_generation
+                            == ingress_generation.load(std::sync::atomic::Ordering::Acquire) =>
+                    {
+                        ingress_host.signal_cancel(grant).ok()
+                    }
+                    _ => None,
+                };
+                if forward.send((message, signal)).await.is_err() {
+                    break;
+                }
+            }
+        });
         let (output, messages) = tokio::sync::mpsc::channel(16);
         let task = tokio::spawn(async move {
             let mut connection = InferenceConnection::new(host.clone());
@@ -692,7 +783,7 @@ impl InferenceConnectionWorker {
             loop {
                 let result = tokio::select! {
                     message = input.recv() => match message {
-                        Some(message) => connection.handle(message).await,
+                        Some((message, _signal)) => connection.handle(message).await,
                         None => break,
                     },
                     preview = preview_rx.recv(), if preview_open => match preview {
@@ -706,7 +797,20 @@ impl InferenceConnectionWorker {
                     _ = host.terminal_ready() => connection.poll().await,
                     _ = poll.tick() => connection.poll().await,
                     _ = progress_flush.tick() => Ok(connection.flush_progress()),
+                    action = connection.actions.join_next(), if !connection.actions.is_empty() => {
+                        match action {
+                            Some(Ok((grant, result))) => match result {
+                                Ok(outcome) => connection.outcome(grant, outcome).await,
+                                Err(error) => Err(error),
+                            },
+                            _ => Err(InferenceHostError::JournalIo),
+                        }
+                    },
                 };
+                generation.store(
+                    connection.generation.unwrap_or(0),
+                    std::sync::atomic::Ordering::Release,
+                );
                 match result {
                     Ok(messages) => {
                         for message in messages {
@@ -732,6 +836,7 @@ impl InferenceConnectionWorker {
             commands,
             messages,
             task,
+            ingress,
         }
     }
 }
@@ -739,5 +844,6 @@ impl InferenceConnectionWorker {
 impl Drop for InferenceConnectionWorker {
     fn drop(&mut self) {
         self.task.abort();
+        self.ingress.abort();
     }
 }

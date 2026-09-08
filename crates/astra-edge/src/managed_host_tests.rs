@@ -58,7 +58,7 @@ async fn managed_terminal_credentials_are_independent_and_detach_does_not_cancel
         fixture.host.attach_client(client.into()).await.unwrap();
         fixture
             .host
-            .refresh_client(client, vec![("local".into(), 1, credential(key))])
+            .refresh_client(client, 1, vec![("local".into(), 1, credential(key))])
             .await
             .unwrap();
     }
@@ -162,7 +162,11 @@ async fn managed_environment_retirement_bounds_local_catalog_across_repeated_lau
         fixture.host.attach_client(client.clone()).await.unwrap();
         fixture
             .host
-            .refresh_client(&client, vec![("local".into(), 1, credential("synthetic"))])
+            .refresh_client(
+                &client,
+                1,
+                vec![("local".into(), 1, credential("synthetic"))],
+            )
             .await
             .unwrap();
         acknowledge_publications(&fixture.host).await;
@@ -243,7 +247,7 @@ async fn managed_attachment_bounds_and_foreign_refresh_fail_closed() {
     assert_eq!(
         fixture
             .host
-            .refresh_client("foreign", Vec::new())
+            .refresh_client("foreign", 1, Vec::new())
             .await
             .unwrap_err(),
         InferenceHostError::OwnerMismatch

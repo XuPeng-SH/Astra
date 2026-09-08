@@ -350,13 +350,32 @@ impl LocalModelConfigStore {
                 actual: current.revision,
             });
         }
-        candidate.revision =
-            expected_revision
-                .checked_add(1)
-                .ok_or_else(|| LocalModelConfigError::Invalid {
-                    field: "revision",
-                    reason: "revision is exhausted".to_string(),
-                })?;
+        candidate.revision = current
+            .models
+            .values()
+            .fold(expected_revision, |revision, model| {
+                revision.max(model.binding_revision)
+            })
+            .checked_add(1)
+            .ok_or_else(|| LocalModelConfigError::Invalid {
+                field: "revision",
+                reason: "revision is exhausted".to_string(),
+            })?;
+        // The file revision is also the generation high-water mark. A deleted
+        // name must never regain a profile revision that authorized an older
+        // endpoint or credential, including when another terminal missed the
+        // intermediate deletion.
+        for (name, definition) in &mut candidate.models {
+            if current.models.get(name) != Some(definition) {
+                definition.binding_revision = definition.binding_revision.max(candidate.revision);
+            }
+        }
+        candidate.revision = candidate
+            .models
+            .values()
+            .fold(candidate.revision, |revision, model| {
+                revision.max(model.binding_revision)
+            });
         let body = serde_json::to_vec_pretty(&candidate).map_err(|source| {
             LocalModelConfigError::Json {
                 path: self.path.clone(),
@@ -891,6 +910,28 @@ mod tests {
             })
         ));
         assert_eq!(store.load().expect("load after conflict"), applied);
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_model_never_reuses_its_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalModelConfigStore::with_path(root.path().join("models.json"));
+        let mut first = LocalModelConfig::default();
+        first
+            .models
+            .insert("work".into(), model(LocalCredentialRef::None));
+        first.models.get_mut("work").unwrap().binding_revision = 100;
+        let first = store.replace(0, first).unwrap();
+        let empty = store
+            .replace(first.revision, LocalModelConfig::default())
+            .unwrap();
+        let mut recreated = LocalModelConfig::default();
+        recreated
+            .models
+            .insert("work".into(), model(LocalCredentialRef::None));
+        let recreated = store.replace(empty.revision, recreated).unwrap();
+        assert!(recreated.models["work"].binding_revision > first.models["work"].binding_revision);
+        assert!(recreated.revision >= recreated.models["work"].binding_revision);
     }
 
     #[test]

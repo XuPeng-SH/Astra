@@ -212,7 +212,8 @@ pub(crate) async fn start(
             Err(
                 error @ (astra_edge::inference_host::InferenceHostError::OwnerMismatch
                 | astra_edge::inference_host::InferenceHostError::UnsafeStorage
-                | astra_edge::inference_host::InferenceHostError::NetworkPolicyMismatch),
+                | astra_edge::inference_host::InferenceHostError::NetworkPolicyMismatch
+                | astra_edge::inference_host::InferenceHostError::LocalProtocolMismatch),
             ) => return Err(error.to_string()),
             Err(_) => {}
         }
@@ -278,7 +279,8 @@ pub(crate) async fn start(
                     return Err("Local model host identity or socket permissions are invalid. Inspect the local installation; no takeover was attempted.".into());
                 }
                 Err(
-                    error @ astra_edge::inference_host::InferenceHostError::NetworkPolicyMismatch,
+                    error @ (astra_edge::inference_host::InferenceHostError::NetworkPolicyMismatch
+                    | astra_edge::inference_host::InferenceHostError::LocalProtocolMismatch),
                 ) => return Err(error.to_string()),
                 Err(_) => {}
             }

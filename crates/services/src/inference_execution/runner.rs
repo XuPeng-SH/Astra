@@ -22,6 +22,34 @@ use crate::session_artifact_store::{
 
 const MAX_CUSTODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_START_WINDOW_MS: u64 = 15_000;
+const MAX_RUNNER_PENDING_ATTEMPTS: i64 = 128;
+const MAX_RUNNER_ACTIVE_ATTEMPTS: i64 =
+    astra_turn_types::runner_inference::RUNNER_INFERENCE_MAX_ACTIVE_ATTEMPTS as i64;
+const MAX_RUNNER_SESSION_ACTIVE_ATTEMPTS: i64 = 1;
+
+/// Called with the registry row locked by binding admission. The existing
+/// durable attempts are the waiting queue; no socket-owned lifecycle is added.
+async fn check_runner_queue_capacity(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    identity: &RunnerInferenceAttemptIdentity,
+) -> ServiceResult<()> {
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND runner_id = ? AND status = 'started'
+           AND runner_terminal_hash IS NULL",
+    )
+    .bind(&identity.user_id)
+    .bind(identity.binding.runner_id.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(persistence)?;
+    if pending >= MAX_RUNNER_PENDING_ATTEMPTS {
+        return Err(ServiceError::conflict(
+            "Runner pending request capacity exhausted",
+        ));
+    }
+    Ok(())
+}
 
 pub fn validate_runner_invocation(
     input: &InferenceInvocationInput,
@@ -357,17 +385,41 @@ pub struct RunnerRecoveredContinuation {
     pub response: RunnerCustodyBytes,
 }
 
+fn next_unconsumed_attempt(mut next: u32, consumed: &HashSet<u32>) -> ServiceResult<u32> {
+    while consumed.contains(&next) {
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::conflict("Runner continuation attempt exhausted"))?;
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod continuation_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_prefix_advances_without_skipping_a_real_gap() {
+        assert_eq!(next_unconsumed_attempt(0, &HashSet::from([0])).unwrap(), 1);
+        assert_eq!(
+            next_unconsumed_attempt(0, &HashSet::from([1, 0, 0])).unwrap(),
+            2
+        );
+        assert_eq!(
+            next_unconsumed_attempt(0, &HashSet::from([0, 2])).unwrap(),
+            1
+        );
+        assert_eq!(next_unconsumed_attempt(1, &HashSet::from([0])).unwrap(), 1);
+        assert!(next_unconsumed_attempt(u32::MAX, &HashSet::from([u32::MAX])).is_err());
+    }
+}
+
 /// Load the bounded, contiguous logical-attempt chain for exactly one next
-/// Runner round.  Callers supply the post-checkpoint scope (normally logical
-/// attempt zero) and every receipt already embedded in that checkpoint.  The
-/// query is by the full durable scope; it never falls back to latest-by-run.
-///
-/// A receipt in `consumed` removes exactly the matching terminal from
-/// consideration.  Its authenticity must have been checked with
-/// [`verify_runner_checkpoint_consumption`] before this call.  At most two
-/// attempts are returned because the Agent Loop's output-cap continuation is
-/// bounded to one suffix; a third contiguous terminal is a contract failure,
-/// not an invitation to replay an unbounded history.
+/// Runner round. Callers supply the post-checkpoint scope and every receipt
+/// embedded in that checkpoint. Receipts must first be authenticated with
+/// [`verify_runner_checkpoint_consumption`]. A consumed prefix advances the
+/// query even after its pending bit has cleared. At most two unconsumed
+/// attempts are returned; a third is a contract failure.
 pub async fn load_next_runner_continuation_chain(
     pool: &SharedPool,
     input: &InferenceInvocationInput,
@@ -383,6 +435,22 @@ pub async fn load_next_runner_continuation_chain(
         ));
     }
     let scope = &input.scope;
+    // Authenticated checkpoint receipts can already have cleared the pending
+    // bit in storage. Advance across their contiguous prefix before querying,
+    // so ACKed rows need not remain pending to recover the next suffix.
+    let consumed_attempts: HashSet<u32> = consumed
+        .iter()
+        .filter(|receipt| {
+            receipt.attempt.user_id == input.user_id
+                && receipt
+                    .attempt
+                    .scope
+                    .with_logical_attempt(scope.logical_attempt())
+                    == *scope
+        })
+        .map(|receipt| receipt.attempt.scope.logical_attempt())
+        .collect();
+    let first_pending = next_unconsumed_attempt(scope.logical_attempt(), &consumed_attempts)?;
     let consumed: HashSet<(String, String)> = consumed
         .iter()
         .map(|receipt| {
@@ -425,13 +493,13 @@ pub async fn load_next_runner_continuation_chain(
     .bind(scope.round().map(i64::from))
     .bind(scope.operation_id())
     .bind(input.purpose.as_str())
-    .bind(i64::from(scope.logical_attempt()))
+    .bind(i64::from(first_pending))
     .fetch_all(&mut *tx)
     .await
     .map_err(persistence)?;
 
     let mut chain = Vec::new();
-    let mut expected_attempt = i64::from(scope.logical_attempt());
+    let mut expected_attempt = i64::from(first_pending);
     for row in rows {
         let identity = decode_grant(&row)?.attempt;
         let terminal_hash = RunnerInferenceDigest::new(
@@ -439,17 +507,18 @@ pub async fn load_next_runner_continuation_chain(
                 .map_err(persistence)?,
         )
         .map_err(ServiceError::invalid)?;
-        if consumed.contains(&(
-            identity.attempt_id.as_str().to_string(),
-            terminal_hash.as_str().to_string(),
-        )) {
-            continue;
-        }
         let logical_attempt: i64 = row.try_get("logical_attempt").map_err(persistence)?;
         if logical_attempt != expected_attempt {
             return Err(ServiceError::conflict(
                 "Runner continuation recovery has a logical-attempt gap",
             ));
+        }
+        expected_attempt = expected_attempt.saturating_add(1);
+        if consumed.contains(&(
+            identity.attempt_id.as_str().to_string(),
+            terminal_hash.as_str().to_string(),
+        )) {
+            continue;
         }
         let response = RunnerInferenceArtifactReference {
             artifact_id: RunnerInferenceId::new(
@@ -487,7 +556,6 @@ pub async fn load_next_runner_continuation_chain(
             request,
             response,
         });
-        expected_attempt = expected_attempt.saturating_add(1);
     }
     if chain.len() > 2 {
         return Err(ServiceError::conflict(
@@ -923,6 +991,7 @@ pub async fn admit_runner_inference_dispatch(
         return Ok(persisted);
     }
     let resolved = lock_resolved_binding(&mut tx, &identity.user_id, &identity.binding).await?;
+    check_runner_queue_capacity(&mut tx, identity).await?;
     if resolved.process_boot_nonce != plan.grant.process_boot_nonce {
         return Err(ServiceError::conflict(
             "Runner process boot changed before admission",
@@ -1052,6 +1121,7 @@ pub async fn admit_runner_provider_attempt_dispatch(
         return Ok(persisted);
     }
     let resolved = lock_resolved_binding(&mut tx, &identity.user_id, &identity.binding).await?;
+    check_runner_queue_capacity(&mut tx, identity).await?;
     let pinned: Option<String> = sqlx::query_scalar(
         "SELECT runner_binding_json FROM inference_routes WHERE user_id = ? AND route_id = ? FOR UPDATE")
         .bind(&identity.user_id).bind(plan.invocation.route_id()).fetch_one(&mut *tx).await.map_err(persistence)?;
@@ -1339,7 +1409,8 @@ pub async fn claim_runner_delivery(
         IF(runner_cancel_requested_at IS NOT NULL, 1, 0) AS cancelled,
         IF(runner_grant_expires_at > NOW(6), 1, 0) AS start_valid,
         IF(runner_local_fence_at IS NOT NULL OR runner_no_start_evidence IS NOT NULL, 1, 0) AS start_known,
-        IF(runner_dispatch_claim_expires_at > NOW(6), 1, 0) AS claimed
+        IF(runner_dispatch_claim_expires_at > NOW(6), 1, 0) AS claimed,
+        IF(runner_dispatch_claim_token IS NOT NULL, 1, 0) AS previously_claimed
         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
     )
     .bind(&identity.user_id)
@@ -1375,6 +1446,41 @@ pub async fn claim_runner_delivery(
         && current_boot.as_deref() == Some(grant.process_boot_nonce.as_str())
         && current_journal.as_deref() == Some(identity.binding.journal_id.as_str())
         && current_edge.as_deref() == Some(connection.edge_id.as_str());
+    if can_start
+        && !cancelled
+        && row
+            .try_get::<i64, _>("previously_claimed")
+            .map_err(persistence)?
+            == 0
+    {
+        // A delivery claim reserves local capacity until definitive terminal or
+        // no-start evidence. Claim timeout only permits replay of that same
+        // grant; it must not free a possibly executing provider slot. Cancel
+        // intent is likewise conservative until the Runner proves no start.
+        let capacity = sqlx::query(
+            "SELECT COUNT(*) AS active_count,
+                CAST(COALESCE(SUM(IF(invocation.session_id = ?, 1, 0)), 0) AS SIGNED) AS session_count
+             FROM inference_provider_attempts attempt
+             JOIN inference_invocations invocation ON invocation.user_id = attempt.user_id
+                AND invocation.invocation_id = attempt.invocation_id
+             WHERE attempt.user_id = ? AND attempt.runner_id = ?
+               AND attempt.runner_journal_id = ? AND attempt.status = 'started'
+               AND attempt.runner_terminal_hash IS NULL AND attempt.runner_no_start_evidence IS NULL
+               AND (attempt.runner_dispatch_claim_token IS NOT NULL
+                    OR attempt.runner_local_fence_at IS NOT NULL
+                    OR attempt.runner_cancel_requested_at IS NOT NULL)",
+        )
+        .bind(session).bind(&identity.user_id).bind(identity.binding.runner_id.as_str())
+        .bind(identity.binding.journal_id.as_str())
+        .fetch_one(&mut *tx).await.map_err(persistence)?;
+        let active: i64 = capacity.try_get("active_count").map_err(persistence)?;
+        let session_active: i64 = capacity.try_get("session_count").map_err(persistence)?;
+        if active >= MAX_RUNNER_ACTIVE_ATTEMPTS
+            || session_active >= MAX_RUNNER_SESSION_ACTIVE_ATTEMPTS
+        {
+            return Ok(None);
+        }
+    }
     let action = if cancelled {
         RunnerDeliveryAction::Cancel(grant)
     } else if can_start {
@@ -1443,10 +1549,17 @@ pub async fn list_runner_reconciliation(
     let mut tx = pool.get().begin().await.map_err(persistence)?;
     lock_connection(&mut tx, connection).await?;
     let rows = sqlx::query(
-        "SELECT runner_grant_json FROM inference_provider_attempts
-        WHERE user_id = ? AND runner_id = ? AND status = 'started'
-          AND (runner_dispatch_claim_expires_at IS NULL OR runner_dispatch_claim_expires_at <= NOW(6))
-        ORDER BY runner_grant_expires_at, attempt_id LIMIT ?",
+        "SELECT runner_grant_json FROM (
+            SELECT attempt.runner_grant_json, attempt.runner_grant_expires_at, attempt.attempt_id,
+                ROW_NUMBER() OVER (PARTITION BY invocation.session_id
+                    ORDER BY attempt.runner_grant_expires_at, attempt.attempt_id) AS session_position
+            FROM inference_provider_attempts attempt
+            JOIN inference_invocations invocation ON invocation.user_id = attempt.user_id
+                AND invocation.invocation_id = attempt.invocation_id
+            WHERE attempt.user_id = ? AND attempt.runner_id = ? AND attempt.status = 'started'
+              AND (attempt.runner_dispatch_claim_expires_at IS NULL OR attempt.runner_dispatch_claim_expires_at <= NOW(6))
+        ) pending
+        ORDER BY session_position, runner_grant_expires_at, attempt_id LIMIT ?",
     )
     .bind(&connection.user_id)
     .bind(connection.runner_id.as_str())

@@ -220,9 +220,18 @@ replacement. A catalog containing only Runner models also requires explicit
 selection; catalog order is not permission to spend a personal key.
 
 With no saved local models, opening Astra does not start a local inference host.
-The first successful `/model add` save starts it when needed. A failed explicit
-provider test leaves the configuration saved and the current model unchanged;
-the window keeps its local connection so you can inspect or retry setup.
+The first successful `/model add` save starts it when needed. **Test and use**
+checks a candidate before applying it: a failed test leaves the existing
+configuration and credentials unchanged. **Save without test** applies the
+configuration without a provider request. If publication or local hosting fails
+after apply, setup reports that the configuration is saved and needs connection
+repair; it does not claim to have rolled back. A fresh `--print` request with a
+confirmed Server Offering does not start an unrelated local host.
+If setup reports a local-host protocol version mismatch after an upgrade,
+upgrade Astra and `astra-edge` together. Close the other local Astra sessions,
+allow their active work to drain and the shared host to exit after its idle
+grace, then reopen Astra. Existing journals and provider results are retained;
+setup does not force another terminal's host to stop.
 Local-host startup failures do not prevent reading existing work. Sign-out or
 switching the selected profile to another account expires that window's local
 credential lease; it never transfers the lease to the new account. After a host

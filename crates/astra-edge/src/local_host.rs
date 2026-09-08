@@ -21,7 +21,9 @@ use crate::inference_journal::{
     atomic_write, ensure_private_directory, open_private, read_private,
 };
 
-const PROTOCOL: u32 = 1;
+// v3 commits a revisioned, chunked credential snapshot atomically. A v2
+// peer must never reach the credential exchange with these semantics.
+const PROTOCOL: u32 = 3;
 const FRAME_BYTES: usize = 64 * 1024;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -160,6 +162,7 @@ fn network_environment() -> Vec<(String, String)> {
 enum Handshake {
     Ready { attachment: Attachment },
     NetworkPolicyMismatch,
+    ProtocolMismatch,
 }
 
 // Only the private IPC decoder may deserialize this input. It intentionally
@@ -176,6 +179,9 @@ struct CredentialInput {
 #[serde(deny_unknown_fields)]
 struct Refresh {
     credentials: Option<Vec<CredentialInput>>,
+    revision: Option<u64>,
+    #[serde(default)]
+    more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,8 +339,12 @@ impl ManagedHost {
 
     async fn serve(&self, mut stream: UnixStream) -> Result<(), InferenceHostError> {
         let hello: Hello = read_frame(&mut stream).await?;
-        if hello.version != PROTOCOL || hello.scope != self.installation.scope {
+        if hello.scope != self.installation.scope {
             return Err(InferenceHostError::OwnerMismatch);
+        }
+        if hello.version != PROTOCOL {
+            write_frame(&mut stream, &Handshake::ProtocolMismatch).await?;
+            return Err(InferenceHostError::LocalProtocolMismatch);
         }
         let host = tokio::time::timeout(LEASE_TIMEOUT, async {
             loop {
@@ -370,16 +380,25 @@ impl ManagedHost {
             }
             host.attach_client(lease_id.clone()).await?;
             write_frame(&mut stream, &true).await?;
+            let mut pending_credentials = Vec::new();
+            let mut pending_revision = None;
             loop {
                 let refresh: Refresh = read_frame(&mut stream).await?;
                 let Some(inputs) = refresh.credentials else {
+                    if refresh.more || pending_revision.is_some() || refresh.revision.is_some() {
+                        return Err(InferenceHostError::InvalidRequest);
+                    }
                     write_frame(&mut stream, &PROTOCOL).await?;
                     continue;
                 };
-                if inputs.len() > 256 {
+                let revision = refresh.revision.ok_or(InferenceHostError::InvalidRequest)?;
+                if pending_revision.is_some_and(|previous| previous != revision) {
+                    return Err(InferenceHostError::InvalidRequest);
+                }
+                pending_revision = Some(revision);
+                if inputs.len() + pending_credentials.len() > 256 {
                     return Err(InferenceHostError::Capacity);
                 }
-                let mut credentials = Vec::new();
                 for input in inputs {
                     if input.name.len() > 256 || input.value.len() > 8192 {
                         return Err(InferenceHostError::TooLarge);
@@ -392,10 +411,27 @@ impl ManagedHost {
                     })
                     .map_err(|_| InferenceHostError::CredentialUnavailable)?
                     .ok_or(InferenceHostError::CredentialUnavailable)?;
-                    credentials.push((input.name, input.revision, credential));
+                    pending_credentials.push((input.name, input.revision, credential));
                 }
-                host.refresh_client(&lease_id, credentials).await?;
-                write_frame(&mut stream, &PROTOCOL).await?;
+                if refresh.more {
+                    continue;
+                }
+                let applied = host
+                    .refresh_client(
+                        &lease_id,
+                        revision,
+                        std::mem::take(&mut pending_credentials),
+                    )
+                    .await;
+                pending_revision = None;
+                let ack = match applied {
+                    Ok(()) => PROTOCOL,
+                    // The candidate was not applied. Keep the connection and
+                    // ask the terminal for its new complete snapshot.
+                    Err(InferenceHostError::BindingUnavailable) => 0,
+                    Err(error) => return Err(error),
+                };
+                write_frame(&mut stream, &ack).await?;
             }
         }
         .await;
@@ -454,14 +490,29 @@ impl ManagedClient {
             },
         )
         .await?;
-        let attachment = match read_frame(&mut stream).await? {
+        let handshake = match read_frame(&mut stream).await {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                drop(stream);
+                if legacy_host_is_running(installation).await {
+                    return Err(InferenceHostError::LocalProtocolMismatch);
+                }
+                return Err(error);
+            }
+        };
+        let attachment = match handshake {
             Handshake::Ready { attachment } => attachment,
             Handshake::NetworkPolicyMismatch => {
                 return Err(InferenceHostError::NetworkPolicyMismatch);
             }
+            Handshake::ProtocolMismatch => {
+                return Err(InferenceHostError::LocalProtocolMismatch);
+            }
         };
-        if attachment.version != PROTOCOL
-            || attachment.scope != installation.scope
+        if attachment.version != PROTOCOL {
+            return Err(InferenceHostError::LocalProtocolMismatch);
+        }
+        if attachment.scope != installation.scope
             || attachment.runner_id != installation.runner_id
             || uuid::Uuid::parse_str(&attachment.lease_id).is_err()
             || astra_turn_types::runner_inference::RunnerInferenceId::new(
@@ -525,6 +576,34 @@ impl Drop for ManagedClient {
     }
 }
 
+/// Diagnose an old shared host that closes an unsupported hello. This probe
+/// reads installation metadata only: no network settings or credentials follow,
+/// and it never attaches a lease or changes an existing client's snapshot.
+async fn legacy_host_is_running(installation: &Installation) -> bool {
+    tokio::time::timeout(Duration::from_millis(500), async {
+        let mut stream = UnixStream::connect(&installation.socket).await.ok()?;
+        installation.verify_peer(&stream).ok()?;
+        write_frame(
+            &mut stream,
+            &Hello {
+                version: 2,
+                scope: installation.scope.clone(),
+            },
+        )
+        .await
+        .ok()?;
+        let Handshake::Ready { attachment } = read_frame(&mut stream).await.ok()? else {
+            return None;
+        };
+        (attachment.version == 2
+            && attachment.scope == installation.scope
+            && attachment.runner_id == installation.runner_id)
+            .then_some(())
+    })
+    .await
+    .is_ok_and(|result| result.is_some())
+}
+
 async fn refresh(
     stream: &mut UnixStream,
     scope: &LocalModelScope,
@@ -560,8 +639,28 @@ async fn refresh(
     }
     // This is the only secret-bearing encoder, used exclusively on the verified
     // same-UID private socket. Never return its value or serialization errors.
-    write_frame(stream, &serde_json::json!({ "credentials": credentials })).await?;
+    // One credential fits even at JSON's maximum escaping expansion. Stage
+    // bounded chunks in the host and activate only the complete snapshot.
+    if credentials.len() > 256 {
+        return Err(InferenceHostError::Capacity);
+    }
+    for credential in credentials {
+        write_frame(
+            stream,
+            &serde_json::json!({ "credentials": [credential], "revision": revision, "more": true }),
+        )
+        .await?;
+    }
+    write_frame(
+        stream,
+        &serde_json::json!({ "credentials": [], "revision": revision, "more": false }),
+    )
+    .await?;
     let ack: u32 = read_frame(stream).await?;
+    if ack == 0 {
+        *previous_revision = None;
+        return Ok(());
+    }
     if ack != PROTOCOL {
         return Err(InferenceHostError::WrongIncarnation);
     }
@@ -679,11 +778,120 @@ mod tests {
             .await
             .unwrap();
         assert!(read_frame::<bool>(&mut stream).await.unwrap());
-        write_frame(&mut stream, &serde_json::json!({ "credentials": [] }))
+        write_frame(&mut stream, &serde_json::json!({ "credentials": null }))
             .await
             .unwrap();
         assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
         (stream, attachment)
+    }
+
+    #[tokio::test]
+    async fn old_client_is_rejected_before_touching_a_shared_hosts_snapshot() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let installation = installation(directory.path());
+        let control = ManagedHost::bind(installation.clone()).unwrap();
+        let host = host(directory.path(), &installation).await;
+        let store = astra_credentials::LocalModelConfigStore::with_path(
+            directory.path().join("models.json"),
+        );
+        let mut config = astra_credentials::LocalModelConfig::default();
+        config.models.insert(
+            "work".into(),
+            astra_credentials::LocalModelDefinition {
+                protocol: astra_credentials::LocalInferenceProtocol::OpenaiCompatible,
+                base_url: "http://127.0.0.1:9".into(),
+                model: "fixture".into(),
+                binding_revision: 1,
+                context_window: 1024,
+                max_output_tokens: 64,
+                credential: LocalCredentialRef::Environment {
+                    name: "TEST_KEY".into(),
+                },
+            },
+        );
+        store.replace(0, config).unwrap();
+        control.install(host.clone()).await.unwrap();
+        let (mut current, _) = attach(&installation).await;
+        write_frame(&mut current, &serde_json::json!({"credentials": [{"name":"work", "revision":1, "value":"existing-key"}], "revision":1, "more":false})).await.unwrap();
+        assert_eq!(read_frame::<u32>(&mut current).await.unwrap(), PROTOCOL);
+        let identity = host.bindings().await.unwrap().remove(0).identity;
+
+        let mut legacy = UnixStream::connect(&installation.socket).await.unwrap();
+        write_frame(
+            &mut legacy,
+            &Hello {
+                version: 2,
+                scope: installation.scope.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<Handshake>(&mut legacy).await.unwrap(),
+            Handshake::ProtocolMismatch
+        ));
+        assert!(read_frame::<u32>(&mut legacy).await.is_err());
+        assert_eq!(host.bindings().await.unwrap().remove(0).identity, identity);
+        write_frame(&mut current, &serde_json::json!({"credentials":null}))
+            .await
+            .unwrap();
+        assert_eq!(read_frame::<u32>(&mut current).await.unwrap(), PROTOCOL);
+        assert!(!control.shutdown.is_cancelled());
+        control.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn new_client_diagnoses_v2_host_without_sending_any_snapshot() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let scope = LocalModelScope::for_owner("https://fixture.invalid", "fixture-owner").unwrap();
+        let installation = Installation::open_at(
+            scope.identity(),
+            directory.path().join("identity"),
+            directory.path().join("runtime"),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&installation.socket).unwrap();
+        let expected = installation.clone();
+        let legacy = tokio::spawn(async move {
+            // Exact v2 behavior: close an unsupported hello before credentials.
+            let (mut current, _) = listener.accept().await.unwrap();
+            let hello: Hello = read_frame(&mut current).await.unwrap();
+            assert_eq!(hello.version, PROTOCOL);
+            assert_ne!(hello.version, 2);
+            drop(current);
+            // The diagnostic v2 handshake stops after public metadata. Existing
+            // v2 clients and credentials are never detached or replaced.
+            let (mut probe, _) = listener.accept().await.unwrap();
+            let hello: Hello = read_frame(&mut probe).await.unwrap();
+            assert_eq!(hello.version, 2);
+            write_frame(
+                &mut probe,
+                &Handshake::Ready {
+                    attachment: Attachment {
+                        runner_id: expected.runner_id,
+                        journal_id: "fixture-journal".into(),
+                        lease_id: uuid::Uuid::new_v4().to_string(),
+                        scope: expected.scope,
+                        version: 2,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let mut byte = [0];
+            assert_eq!(probe.read(&mut byte).await.unwrap(), 0);
+        });
+        let result =
+            ManagedClient::connect(&installation, scope, "https://fixture.invalid", None).await;
+        assert!(matches!(
+            result,
+            Err(InferenceHostError::LocalProtocolMismatch)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), legacy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(installation.socket.exists());
     }
 
     #[tokio::test]
@@ -695,6 +903,134 @@ mod tests {
             ManagedClient::connect(&installation, foreign, "https://fixture.invalid", None).await;
         assert!(matches!(result, Err(InferenceHostError::OwnerMismatch)));
         assert!(!installation.socket.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_chunked_snapshot_cannot_restore_a_recreated_models_old_credential() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let installation = installation(directory.path());
+        let control = ManagedHost::bind(installation.clone()).unwrap();
+        let host = host(directory.path(), &installation).await;
+        let store = astra_credentials::LocalModelConfigStore::with_path(
+            directory.path().join("models.json"),
+        );
+        let mut config = astra_credentials::LocalModelConfig::default();
+        config.models.insert(
+            "work".into(),
+            astra_credentials::LocalModelDefinition {
+                protocol: astra_credentials::LocalInferenceProtocol::OpenaiCompatible,
+                base_url: "http://127.0.0.1:9".into(),
+                model: "fixture".into(),
+                binding_revision: 1,
+                context_window: 1024,
+                max_output_tokens: 64,
+                credential: LocalCredentialRef::Environment {
+                    name: "OLD_KEY".into(),
+                },
+            },
+        );
+        let original = store.replace(0, config).unwrap();
+        control.install(host.clone()).await.unwrap();
+        let (mut stream, _) = attach(&installation).await;
+        let old_chunk = serde_json::json!({"revision": original.revision, "credentials": [{"name":"work", "revision":1, "value":"old-key"}], "more": true});
+        write_frame(&mut stream, &old_chunk).await.unwrap();
+        write_frame(
+            &mut stream,
+            &serde_json::json!({"revision": original.revision, "credentials": [], "more": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
+        let old_identity = host.bindings().await.unwrap().remove(0).identity;
+        let mut unrelated = original.clone();
+        let mut other = original.models["work"].clone();
+        other.credential = LocalCredentialRef::None;
+        unrelated.models.insert("other".into(), other);
+        let unrelated = store.replace(original.revision, unrelated).unwrap();
+        assert!(
+            host.bindings()
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.identity == old_identity)
+        );
+        write_frame(&mut stream, &old_chunk).await.unwrap();
+        let empty = store
+            .replace(
+                unrelated.revision,
+                astra_credentials::LocalModelConfig::default(),
+            )
+            .unwrap();
+        let mut recreated = original.clone();
+        recreated.models.get_mut("work").unwrap().credential = LocalCredentialRef::Environment {
+            name: "NEW_KEY".into(),
+        };
+        let recreated = store.replace(empty.revision, recreated).unwrap();
+        assert!(
+            recreated.models["work"].binding_revision > original.models["work"].binding_revision
+        );
+        assert!(host.bindings().await.unwrap().is_empty());
+        write_frame(
+            &mut stream,
+            &serde_json::json!({"revision": original.revision, "credentials": [], "more": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), 0);
+        assert!(host.bindings().await.unwrap().is_empty());
+        write_frame(&mut stream, &serde_json::json!({"revision": recreated.revision, "credentials": [{"name":"work", "revision":recreated.models["work"].binding_revision, "value":"new-key"}], "more":false})).await.unwrap();
+        assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
+        let bindings = host.bindings().await.unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].identity.profile_revision.get(),
+            recreated.models["work"].binding_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_snapshot_larger_than_a_frame_applies_only_when_complete() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let installation = installation(directory.path());
+        let control = ManagedHost::bind(installation.clone()).unwrap();
+        let host = host(directory.path(), &installation).await;
+        let mut config = astra_credentials::LocalModelConfig::default();
+        for index in 0..8 {
+            config.models.insert(
+                format!("model-{index}"),
+                astra_credentials::LocalModelDefinition {
+                    protocol: astra_credentials::LocalInferenceProtocol::OpenaiCompatible,
+                    base_url: "http://127.0.0.1:9".into(),
+                    model: "fixture".into(),
+                    binding_revision: 1,
+                    context_window: 1024,
+                    max_output_tokens: 64,
+                    credential: LocalCredentialRef::Environment {
+                        name: "TEST_KEY".into(),
+                    },
+                },
+            );
+        }
+        astra_credentials::LocalModelConfigStore::with_path(directory.path().join("models.json"))
+            .replace(0, config)
+            .unwrap();
+        control.install(host.clone()).await.unwrap();
+        let (mut stream, _) = attach(&installation).await;
+        for index in 0..8 {
+            write_frame(&mut stream, &serde_json::json!({
+                "credentials": [{ "name": format!("model-{index}"), "revision": 1, "value": "x".repeat(8192) }],
+                "revision": 1, "more": true,
+            })).await.unwrap();
+        }
+        assert!(host.bindings().await.unwrap().is_empty());
+        write_frame(
+            &mut stream,
+            &serde_json::json!({ "credentials": [], "revision": 1, "more": false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
+        assert_eq!(host.bindings().await.unwrap().len(), 8);
     }
 
     #[tokio::test]
@@ -733,9 +1069,12 @@ mod tests {
         })
         .await
         .unwrap();
-        write_frame(&mut b, &serde_json::json!({ "credentials": [] }))
-            .await
-            .unwrap();
+        write_frame(
+            &mut b,
+            &serde_json::json!({ "credentials": [], "revision": 0 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(read_frame::<u32>(&mut b).await.unwrap(), PROTOCOL);
         assert!(!control.shutdown.is_cancelled());
         control.shutdown.cancel();

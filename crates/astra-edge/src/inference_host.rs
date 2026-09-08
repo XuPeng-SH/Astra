@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use astra_credentials::{
@@ -20,14 +20,14 @@ use astra_inference_adapter::{ExactProviderRequest, ProviderProtocol, RequestIde
 use astra_turn_types::runner_inference::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::inference_journal::{InferenceHostError, RetainedTerminal};
 use crate::inference_journal::{InferenceJournal, JournalRecord, RecordState};
 
-const MAX_ACTIVE: usize = 4;
+const MAX_ACTIVE: usize = RUNNER_INFERENCE_MAX_ACTIVE_ATTEMPTS;
 const RESPONSE_OVERHEAD_RESERVE: usize = 64 * 1024;
 
 /// Provisional preview events are intentionally disposable.  A bounded
@@ -141,10 +141,35 @@ pub enum DispatchOutcome {
 
 #[derive(Default)]
 struct HostState {
-    active: HashMap<String, CancellationToken>,
     attached_environment: HashMap<String, (u64, Arc<ResolvedLocalCredential>)>,
     managed: bool,
     clients: HashMap<String, HashMap<String, (u64, Arc<ResolvedLocalCredential>)>>,
+}
+
+struct ActiveAttempt {
+    grant: RunnerInferenceDispatchGrant,
+    cancellation: CancellationToken,
+}
+
+struct AttemptControl {
+    grant: RunnerInferenceDispatchGrant,
+    gate: Arc<Mutex<()>>,
+    cancellation: CancellationToken,
+}
+
+pub(crate) struct CancelSignal(Arc<AttemptControl>);
+
+/// Releases preparation capacity even when its caller is cancelled before the
+/// durable fence. After fencing, ownership moves to the provider task.
+struct ActiveReservation {
+    host: Arc<InferenceHost>,
+    attempt_id: String,
+}
+
+impl Drop for ActiveReservation {
+    fn drop(&mut self) {
+        self.host.active.lock().unwrap().remove(&self.attempt_id);
+    }
 }
 
 /// Local attachment identity is deliberately separate from the durable host.
@@ -163,7 +188,22 @@ pub fn local_binding_id(name: &str, client: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
+type TestPreparationPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+type TestFencePause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 pub struct InferenceHost {
+    #[cfg(test)]
+    preparation_pause: std::sync::Mutex<Option<TestPreparationPause>>,
+    #[cfg(test)]
+    fence_pause: std::sync::Mutex<Option<TestFencePause>>,
     owner: InferenceOwner,
     journal_id: RunnerInferenceId,
     process_boot_nonce: RunnerInferenceId,
@@ -171,7 +211,9 @@ pub struct InferenceHost {
     models_path: PathBuf,
     secrets_root: PathBuf,
     transport: ProviderTransport,
-    state: Mutex<HostState>,
+    state: Arc<RwLock<HostState>>,
+    active: std::sync::Mutex<HashMap<String, ActiveAttempt>>,
+    attempt_locks: std::sync::Mutex<HashMap<String, Weak<AttemptControl>>>,
     terminal_ready: Notify,
     preview_tx: broadcast::Sender<InferencePreview>,
 }
@@ -214,6 +256,10 @@ impl InferenceHost {
         let journal_id = journal.journal_id().clone();
         let (preview_tx, _) = broadcast::channel(INFERENCE_PREVIEW_CHANNEL_CAPACITY);
         let host = Arc::new(Self {
+            #[cfg(test)]
+            preparation_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fence_pause: std::sync::Mutex::new(None),
             owner,
             journal_id,
             process_boot_nonce: RunnerInferenceId::new(uuid::Uuid::new_v4().to_string())
@@ -222,7 +268,9 @@ impl InferenceHost {
             models_path,
             secrets_root,
             transport,
-            state: Mutex::new(HostState::default()),
+            state: Arc::new(RwLock::new(HostState::default())),
+            active: std::sync::Mutex::new(HashMap::new()),
+            attempt_locks: std::sync::Mutex::new(HashMap::new()),
             terminal_ready: Notify::new(),
             preview_tx,
         });
@@ -292,7 +340,7 @@ impl InferenceHost {
         &self,
     ) -> Result<Vec<RunnerInferenceBindingDefinition>, InferenceHostError> {
         let config = self.config().await?;
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         self.project_bindings(&config, &state).await
     }
 
@@ -364,7 +412,14 @@ impl InferenceHost {
         let mut candidates = Vec::new();
         for (name, model) in &config.models {
             if !state.managed {
-                candidates.push((name, None));
+                if !matches!(model.credential, LocalCredentialRef::Environment { .. })
+                    || state
+                        .attached_environment
+                        .get(name)
+                        .is_some_and(|(revision, _)| *revision == model.binding_revision)
+                {
+                    candidates.push((name, None));
+                }
             } else if matches!(model.credential, LocalCredentialRef::Environment { .. }) {
                 for (client, credentials) in &state.clients {
                     if credentials
@@ -383,11 +438,11 @@ impl InferenceHost {
 
     /// Must be set before the managed connection can publish or accept work.
     pub async fn enable_managed(&self) {
-        self.state.lock().await.managed = true;
+        self.state.write().await.managed = true;
     }
 
     pub async fn attach_client(&self, client: String) -> Result<(), InferenceHostError> {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.write().await;
         if !state.managed || state.clients.len() >= 32 || state.clients.contains_key(&client) {
             return Err(InferenceHostError::Capacity);
         }
@@ -398,10 +453,15 @@ impl InferenceHost {
     pub async fn refresh_client(
         &self,
         client: &str,
+        config_revision: u64,
         credentials: Vec<(String, u64, ResolvedLocalCredential)>,
     ) -> Result<(), InferenceHostError> {
-        let config = self.config().await?;
-        let mut state = self.state.lock().await;
+        let lease = self.config_lease().await?;
+        let config = lease.config();
+        if config.revision != config_revision {
+            return Err(InferenceHostError::BindingUnavailable);
+        }
+        let mut state = self.state.write().await;
         let current = state
             .clients
             .get_mut(client)
@@ -412,14 +472,17 @@ impl InferenceHost {
                 model.binding_revision == revision
                     && matches!(model.credential, LocalCredentialRef::Environment { .. })
             }) {
-                // A concurrent local save is retried on the next refresh, not
-                // evidence that another configuration generation is authorized.
-                continue;
+                return Err(InferenceHostError::BindingUnavailable);
             }
-            replacement.insert(name, (revision, Arc::new(credential)));
+            if replacement
+                .insert(name, (revision, Arc::new(credential)))
+                .is_some()
+            {
+                return Err(InferenceHostError::InvalidRequest);
+            }
         }
         let previous = std::mem::replace(current, replacement);
-        if Self::binding_candidates(&config, &state).len() > 256 {
+        if Self::binding_candidates(config, &state).len() > 256 {
             *state
                 .clients
                 .get_mut(client)
@@ -433,12 +496,13 @@ impl InferenceHost {
         // Active requests already own their exact prepared headers. Detach
         // prevents new dispatch and retires this attachment's publication; it
         // is not a cancel command and never destroys retained custody.
-        self.state.lock().await.clients.remove(client);
+        let mut state = self.state.write().await;
+        state.clients.remove(client);
         self.terminal_ready.notify_one();
     }
 
     pub async fn active_count(&self) -> usize {
-        self.state.lock().await.active.len()
+        self.active.lock().unwrap().len()
     }
 
     /// Live previews are disposable and may only be admitted while the exact
@@ -453,11 +517,11 @@ impl InferenceHost {
         {
             return false;
         }
-        self.state
+        self.active
             .lock()
-            .await
-            .active
-            .contains_key(attempt.attempt_id.as_str())
+            .unwrap()
+            .get(attempt.attempt_id.as_str())
+            .is_some_and(|active| active.grant.attempt == *attempt)
     }
 
     #[cfg(test)]
@@ -466,14 +530,23 @@ impl InferenceHost {
         attempt: &RunnerInferenceAttemptIdentity,
         active: bool,
     ) {
-        let mut state = self.state.lock().await;
+        let mut state = self.active.lock().unwrap();
         if active {
-            state.active.insert(
+            state.insert(
                 attempt.attempt_id.as_str().to_owned(),
-                CancellationToken::new(),
+                ActiveAttempt {
+                    grant: RunnerInferenceDispatchGrant {
+                        attempt: attempt.clone(),
+                        grant_id: attempt.attempt_id.clone(),
+                        process_boot_nonce: self.process_boot_nonce.clone(),
+                        start_before_unix_ms: 1,
+                        deadline_unix_ms: 2,
+                    },
+                    cancellation: CancellationToken::new(),
+                },
             );
         } else {
-            state.active.remove(attempt.attempt_id.as_str());
+            state.remove(attempt.attempt_id.as_str());
         }
     }
 
@@ -485,8 +558,8 @@ impl InferenceHost {
         binding_revision: u64,
         credential: ResolvedLocalCredential,
     ) -> Result<(), InferenceHostError> {
-        let mut state = self.state.lock().await;
         let config = self.config().await?;
+        let mut state = self.state.write().await;
         if !config.models.get(&name).is_some_and(|model| {
             model.binding_revision == binding_revision
                 && matches!(model.credential, LocalCredentialRef::Environment { .. })
@@ -496,6 +569,33 @@ impl InferenceHost {
         state
             .attached_environment
             .insert(name, (binding_revision, Arc::new(credential)));
+        Ok(())
+    }
+
+    /// Replace the standalone terminal's complete snapshot. Missing variables
+    /// revoke old slots; a concurrent configuration update cannot apply stale material.
+    pub async fn refresh_environment(
+        &self,
+        config_revision: u64,
+        credentials: Vec<(String, u64, ResolvedLocalCredential)>,
+    ) -> Result<(), InferenceHostError> {
+        let lease = self.config_lease().await?;
+        let mut state = self.state.write().await;
+        let config = lease.config();
+        if config.revision != config_revision {
+            return Err(InferenceHostError::BindingUnavailable);
+        }
+        let mut replacement = HashMap::new();
+        for (name, revision, credential) in credentials {
+            if !config.models.get(&name).is_some_and(|model| {
+                model.binding_revision == revision
+                    && matches!(model.credential, LocalCredentialRef::Environment { .. })
+            }) {
+                return Err(InferenceHostError::BindingUnavailable);
+            }
+            replacement.insert(name, (revision, Arc::new(credential)));
+        }
+        state.attached_environment = replacement;
         Ok(())
     }
 
@@ -510,6 +610,57 @@ impl InferenceHost {
             return Err(InferenceHostError::OwnerMismatch);
         }
         Ok(())
+    }
+
+    fn attempt_lock(
+        &self,
+        grant: &RunnerInferenceDispatchGrant,
+    ) -> Result<Arc<AttemptControl>, InferenceHostError> {
+        let id = grant.attempt.attempt_id.as_str();
+        let mut locks = self.attempt_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            if lock.grant != *grant {
+                return Err(InferenceHostError::IdentityConflict);
+            }
+            return Ok(lock);
+        }
+        let lock = Arc::new(AttemptControl {
+            grant: grant.clone(),
+            gate: Arc::new(Mutex::new(())),
+            cancellation: CancellationToken::new(),
+        });
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        grant: &RunnerInferenceDispatchGrant,
+        cancellation: CancellationToken,
+    ) -> Result<(ActiveReservation, CancellationToken), InferenceHostError> {
+        let mut active = self.active.lock().unwrap();
+        if active.len() >= MAX_ACTIVE {
+            return Err(InferenceHostError::Capacity);
+        }
+        let attempt_id = grant.attempt.attempt_id.as_str().to_owned();
+        if active.contains_key(&attempt_id) {
+            return Err(InferenceHostError::IdentityConflict);
+        }
+        active.insert(
+            attempt_id.clone(),
+            ActiveAttempt {
+                grant: grant.clone(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        Ok((
+            ActiveReservation {
+                host: self.clone(),
+                attempt_id,
+            },
+            cancellation,
+        ))
     }
 
     async fn retain_no_start(
@@ -566,7 +717,8 @@ impl InferenceHost {
         clock: GrantClock,
     ) -> Result<DispatchOutcome, InferenceHostError> {
         self.validate_owner(&grant)?;
-        let mut state = self.state.lock().await;
+        let attempt_lock = self.attempt_lock(&grant)?;
+        let attempt_guard = attempt_lock.gate.clone().lock_owned().await;
         let existing = self.lookup(&grant).await?;
         if let Some(existing) = existing {
             return Ok(outcome(existing));
@@ -587,10 +739,21 @@ impl InferenceHost {
         }
         let preparation = async {
             let deadline = clock.deadline(&grant)?;
-            if state.active.len() >= MAX_ACTIVE {
-                return Err(InferenceHostError::Capacity);
+            let (reservation, cancellation) =
+                self.reserve(&grant, attempt_lock.cancellation.clone())?;
+            #[cfg(test)]
+            {
+                let pause = self.preparation_pause.lock().unwrap().take();
+                if let Some((entered, release)) = pause {
+                    let _ = entered.send(());
+                    release.await.map_err(|_| InferenceHostError::JournalIo)?;
+                }
             }
             let config_lease = self.config_lease().await?;
+            // Multiple attempts prepare concurrently. A read lease pins local
+            // attachments until their exact credential snapshot is fenced;
+            // active cancellation never needs this lease.
+            let state = self.state.clone().read_owned().await;
             let config = config_lease.config();
             let definitions = self.project_bindings(config, &state).await?;
             let definition = definitions
@@ -676,42 +839,62 @@ impl InferenceHost {
                 .transport
                 .prepare(endpoint.as_str(), headers, &artifact, None)
                 .map_err(|_| InferenceHostError::InvalidRequest)?;
-            Ok::<_, InferenceHostError>((request, mode, deadline, config_lease))
+            Ok::<_, InferenceHostError>((
+                request,
+                mode,
+                deadline,
+                config_lease,
+                state,
+                reservation,
+                cancellation,
+            ))
         }
         .await;
-        let (request, mode, deadline, config_lease) = match preparation {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                // Only an authenticated, exact current-incarnation grant may
-                // receive negative evidence. Persistence failure is not proof.
-                let status = match error {
-                    InferenceHostError::CredentialUnavailable => {
-                        RunnerInferenceTransportStatus::CredentialUnavailable
-                    }
-                    InferenceHostError::BindingUnavailable => {
-                        RunnerInferenceTransportStatus::BindingUnavailable
-                    }
-                    InferenceHostError::Capacity => {
-                        RunnerInferenceTransportStatus::CapacityUnavailable
-                    }
-                    InferenceHostError::JournalIo
-                    | InferenceHostError::Corrupt
-                    | InferenceHostError::UnsafeStorage
-                    | InferenceHostError::UnsupportedPlatform
-                    | InferenceHostError::AlreadyRunning => return Err(error),
-                    _ => RunnerInferenceTransportStatus::Protocol,
-                };
-                self.retain_no_start(
-                    &grant,
-                    RunnerInferenceStartEvidence::RejectedWithoutFence,
-                    status,
-                )
-                .await?;
-                return Ok(DispatchOutcome::NotStarted(
-                    RunnerInferenceStartEvidence::RejectedWithoutFence,
-                ));
-            }
-        };
+        let (request, mode, deadline, config_lease, state, reservation, cancellation) =
+            match preparation {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // Only an authenticated, exact current-incarnation grant may
+                    // receive negative evidence. Persistence failure is not proof.
+                    let status = match error {
+                        InferenceHostError::CredentialUnavailable => {
+                            RunnerInferenceTransportStatus::CredentialUnavailable
+                        }
+                        InferenceHostError::BindingUnavailable => {
+                            RunnerInferenceTransportStatus::BindingUnavailable
+                        }
+                        InferenceHostError::Capacity => {
+                            RunnerInferenceTransportStatus::CapacityUnavailable
+                        }
+                        InferenceHostError::JournalIo
+                        | InferenceHostError::Corrupt
+                        | InferenceHostError::UnsafeStorage
+                        | InferenceHostError::UnsupportedPlatform
+                        | InferenceHostError::AlreadyRunning => return Err(error),
+                        _ => RunnerInferenceTransportStatus::Protocol,
+                    };
+                    self.retain_no_start(
+                        &grant,
+                        RunnerInferenceStartEvidence::RejectedWithoutFence,
+                        status,
+                    )
+                    .await?;
+                    return Ok(DispatchOutcome::NotStarted(
+                        RunnerInferenceStartEvidence::RejectedWithoutFence,
+                    ));
+                }
+            };
+        if cancellation.is_cancelled() {
+            self.retain_no_start(
+                &grant,
+                RunnerInferenceStartEvidence::CancelledWithoutFence,
+                RunnerInferenceTransportStatus::Cancelled,
+            )
+            .await?;
+            return Ok(DispatchOutcome::NotStarted(
+                RunnerInferenceStartEvidence::CancelledWithoutFence,
+            ));
+        }
         if grant.start_before_unix_ms <= clock.latest_server_time() {
             self.retain_no_start(
                 &grant,
@@ -723,77 +906,85 @@ impl InferenceHost {
                 RunnerInferenceStartEvidence::ExpiredWithoutFence,
             ));
         }
-        // The OS-persisted fence is committed while the same lock excludes
-        // cancellation and binding material attachment changes.
-        let stored = grant.clone();
-        if !self
-            .with_journal(move |journal| journal.fence(&stored))
-            .await?
-        {
-            return Err(InferenceHostError::IdentityConflict);
-        }
-        // The durable fence now owns the exact revision/material snapshot.
-        // A concurrent CLI mutation may proceed only after this point.
-        drop(config_lease);
-        let cancellation = CancellationToken::new();
-        state.active.insert(
-            grant.attempt.attempt_id.as_str().to_owned(),
-            cancellation.clone(),
-        );
+        // The attempt lock orders cancel/no-start evidence against this fence;
+        // the read lease excludes attachment changes without blocking other
+        // dispatches or cancellation signalling.
         let host = self.clone();
-        let preview_tx = self.preview_tx.clone();
-        let preview_attempt = grant.attempt.clone();
         tokio::spawn(async move {
-            // A slow durable commit can cross the start cutoff. The fence is
-            // already conservative, but no HTTP request may begin afterwards.
-            let deadline = if grant.start_before_unix_ms <= clock.latest_server_time() {
-                Instant::now()
-            } else {
-                deadline
-            };
-            let payload = execute_and_retain(
-                &host.transport,
-                request,
-                mode,
-                deadline,
-                &cancellation,
-                &preview_tx,
-                preview_attempt,
-            )
-            .await;
+            // Once durable fencing is submitted, this task owns the entire
+            // handoff. Dropping a socket or dispatch caller cannot strand a fence
+            // whose blocking filesystem operation continued after cancellation.
+            let _attempt_guard = attempt_guard;
             let stored = grant.clone();
-            let result = match payload {
-                Ok(payload) => {
-                    host.with_journal(move |journal| journal.complete(&stored, payload))
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            host.state
-                .lock()
-                .await
-                .active
-                .remove(grant.attempt.attempt_id.as_str());
-            if result.is_err() {
-                tracing::error!(
-                    "local inference terminal persistence failed; attempt remains fenced"
-                );
+            #[cfg(test)]
+            let pause = host.fence_pause.lock().unwrap().take();
+            if !host
+                .with_journal(move |journal| {
+                    #[cfg(test)]
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        release.recv().map_err(|_| InferenceHostError::JournalIo)?;
+                    }
+                    journal.fence(&stored)
+                })
+                .await?
+            {
+                return Err(InferenceHostError::IdentityConflict);
             }
-            host.terminal_ready.notify_one();
-        });
-        Ok(DispatchOutcome::Started)
+            // The durable fence now owns the exact revision/material snapshot.
+            // A concurrent CLI mutation may proceed only after this point.
+            drop(config_lease);
+            drop(state);
+            let preview_tx = host.preview_tx.clone();
+            let preview_attempt = grant.attempt.clone();
+            tokio::spawn(async move {
+                // A slow durable commit can cross the start cutoff. The fence is
+                // already conservative, but no HTTP request may begin afterwards.
+                let deadline = if grant.start_before_unix_ms <= clock.latest_server_time() {
+                    Instant::now()
+                } else {
+                    deadline
+                };
+                let payload = execute_and_retain(
+                    &host.transport,
+                    request,
+                    mode,
+                    deadline,
+                    &cancellation,
+                    &preview_tx,
+                    preview_attempt,
+                )
+                .await;
+                let stored = grant.clone();
+                let result = match payload {
+                    Ok(payload) => {
+                        host.with_journal(move |journal| journal.complete(&stored, payload))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                drop(reservation);
+                if result.is_err() {
+                    tracing::error!(
+                        "local inference terminal persistence failed; attempt remains fenced"
+                    );
+                }
+                host.terminal_ready.notify_one();
+            });
+            Ok(DispatchOutcome::Started)
+        })
+        .await
+        .map_err(|_| InferenceHostError::JournalIo)?
     }
 
     pub async fn cancel(
         &self,
         grant: &RunnerInferenceDispatchGrant,
     ) -> Result<DispatchOutcome, InferenceHostError> {
-        self.validate_owner(grant)?;
-        let state = self.state.lock().await;
+        let signal = self.signal_cancel(grant)?;
+        let attempt_lock = signal.0;
+        let _attempt_guard = attempt_lock.gate.lock().await;
         if let Some(record) = self.lookup(grant).await? {
-            if let Some(token) = state.active.get(grant.attempt.attempt_id.as_str()) {
-                token.cancel();
-            }
             return Ok(outcome(record));
         }
         if grant.process_boot_nonce != self.process_boot_nonce {
@@ -808,6 +999,29 @@ impl InferenceHost {
         Ok(DispatchOutcome::NotStarted(
             RunnerInferenceStartEvidence::CancelledWithoutFence,
         ))
+    }
+
+    /// This only signals an exact locally known attempt. The returned guard
+    /// keeps cancellation intent alive until the ordered durable handler runs.
+    pub(crate) fn signal_cancel(
+        &self,
+        grant: &RunnerInferenceDispatchGrant,
+    ) -> Result<CancelSignal, InferenceHostError> {
+        self.validate_owner(grant)?;
+        // Signal first: unrelated journal/configuration I/O must not delay an
+        // active provider's cancellation. Exact identity is checked locally.
+        {
+            let active = self.active.lock().unwrap();
+            if let Some(active) = active.get(grant.attempt.attempt_id.as_str()) {
+                if active.grant != *grant {
+                    return Err(InferenceHostError::IdentityConflict);
+                }
+                active.cancellation.cancel();
+            }
+        }
+        let attempt_lock = self.attempt_lock(grant)?;
+        attempt_lock.cancellation.cancel();
+        Ok(CancelSignal(attempt_lock))
     }
 
     pub async fn reconcile(

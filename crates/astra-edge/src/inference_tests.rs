@@ -14,8 +14,280 @@ struct Fixture {
     clock: GrantClock,
 }
 
+#[tokio::test]
+async fn concurrent_preparation_does_not_block_cancel_and_aborted_capacity_is_released() {
+    let fixture = Fixture::new("http://127.0.0.1:1").await;
+    let first = fixture.grant("preparing-a", REQUEST).await;
+    let second = fixture.grant("preparing-b", REQUEST).await;
+    // Hold attachment mutation open to stop preparation before the fence.
+    let attachment = fixture.host.state.write().await;
+    let spawn = |grant: RunnerInferenceDispatchGrant| {
+        let host = fixture.host.clone();
+        let clock = fixture.clock;
+        tokio::spawn(async move { host.dispatch(grant, REQUEST.into(), clock).await })
+    };
+    let first_task = spawn(first.clone());
+    let second_task = spawn(second);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.host.active_count().await != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let host = fixture.host.clone();
+    let cancelled = first.clone();
+    let cancel_task = tokio::spawn(async move { host.cancel(&cancelled).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fixture
+                .host
+                .active
+                .lock()
+                .unwrap()
+                .get(first.attempt.attempt_id.as_str())
+                .unwrap()
+                .cancellation
+                .is_cancelled()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    second_task.abort();
+    assert!(second_task.await.unwrap_err().is_cancelled());
+    assert_eq!(fixture.host.active_count().await, 1);
+    drop(attachment);
+    assert!(matches!(
+        first_task.await.unwrap().unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::CancelledWithoutFence)
+    ));
+    assert!(matches!(
+        cancel_task.await.unwrap().unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::CancelledWithoutFence)
+    ));
+    assert_eq!(fixture.host.active_count().await, 0);
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(first, REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::CancelledWithoutFence)
+    ));
+}
+
+#[tokio::test]
+async fn forged_cancel_cannot_signal_preparing_attempt() {
+    let fixture = Fixture::new("http://127.0.0.1:1").await;
+    let grant = fixture.grant("preparing-owner", REQUEST).await;
+    let control = fixture.host.attempt_lock(&grant).unwrap();
+    let mut forged = grant.clone();
+    forged.grant_id = id("another-grant");
+    assert!(matches!(
+        fixture.host.cancel(&forged).await,
+        Err(InferenceHostError::IdentityConflict)
+    ));
+    assert!(!control.cancellation.is_cancelled());
+}
+
 fn id(value: &str) -> RunnerInferenceId {
     RunnerInferenceId::new(value).unwrap()
+}
+
+async fn worker_dispatch(
+    fixture: &Fixture,
+    grant: &RunnerInferenceDispatchGrant,
+) -> crate::inference_connection::InferenceConnectionWorker {
+    let mut worker =
+        crate::inference_connection::InferenceConnectionWorker::spawn(fixture.host.clone());
+    assert!(matches!(
+        worker.messages.recv().await,
+        Some(EdgeClientMessage::InferenceHello { .. })
+    ));
+    worker
+        .commands
+        .send(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1_000_000,
+            ),
+        })
+        .await
+        .unwrap();
+    worker
+        .commands
+        .send(EdgeServerMessage::InferenceDispatch {
+            grant: Box::new(grant.clone()),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            worker.messages.recv().await,
+            Some(EdgeClientMessage::InferenceRequestCredit { .. })
+        ) {}
+    })
+    .await
+    .unwrap();
+    worker
+        .commands
+        .send(EdgeServerMessage::InferenceRequestChunk {
+            attempt_id: grant.attempt.attempt_id.clone(),
+            delivery_generation: 7,
+            chunk: RunnerInferencePayloadChunk {
+                offset: 0,
+                data: RunnerInferenceChunkData::new(REQUEST.into()).unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+    worker
+}
+
+#[tokio::test]
+async fn worker_cancel_and_preview_progress_while_dispatch_preparation_is_paused() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let grant = fixture.grant("slow-preparation", REQUEST).await;
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *fixture.host.preparation_pause.lock().unwrap() = Some((entered, resume));
+    let mut worker = worker_dispatch(&fixture, &grant).await;
+    tokio::time::timeout(Duration::from_secs(2), entry)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .host
+        .preview_tx
+        .send(InferencePreview {
+            attempt: grant.attempt.clone(),
+            sequence: 0,
+            event: RunnerInferenceProviderEvent::Json(
+                serde_json::json!({"choices":[{"delta":{"content":"preview"}}]}),
+            ),
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            worker.messages.recv().await,
+            Some(EdgeClientMessage::InferenceProgress { .. })
+        ) {}
+    })
+    .await
+    .unwrap();
+    worker
+        .commands
+        .send(EdgeServerMessage::InferenceCancel {
+            grant: Box::new(grant.clone()),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture
+            .host
+            .active
+            .lock()
+            .unwrap()
+            .get(grant.attempt.attempt_id.as_str())
+            .unwrap()
+            .cancellation
+            .is_cancelled()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    let _terminal = fixture.terminal().await;
+    assert!(matches!(
+        fixture.host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::CancelledWithoutFence)
+    ));
+}
+
+#[tokio::test]
+async fn worker_ingress_signals_cancel_even_when_maintenance_waits_for_configuration() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let grant = fixture.grant("maintenance-cancel", REQUEST).await;
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *fixture.host.preparation_pause.lock().unwrap() = Some((entered, resume));
+    let worker = worker_dispatch(&fixture, &grant).await;
+    tokio::time::timeout(Duration::from_secs(2), entry)
+        .await
+        .unwrap()
+        .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.directory.path().join("models.json.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    release.send(()).unwrap();
+    // The periodic publication/configuration poll now also waits for this
+    // lease. Cancellation ingress must remain independent of that actor.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    worker
+        .commands
+        .send(EdgeServerMessage::InferenceCancel {
+            grant: Box::new(grant.clone()),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !fixture
+            .host
+            .active
+            .lock()
+            .unwrap()
+            .get(grant.attempt.attempt_id.as_str())
+            .unwrap()
+            .cancellation
+            .is_cancelled()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(lock);
+    let _terminal = fixture.terminal().await;
+    assert!(matches!(
+        fixture.host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::CancelledWithoutFence)
+    ));
+}
+
+#[tokio::test]
+async fn dropping_worker_during_blocking_fence_still_produces_terminal_custody() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let grant = fixture.grant("fence-disconnect", REQUEST).await;
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    *fixture.host.fence_pause.lock().unwrap() = Some((entered, resume));
+    let worker = worker_dispatch(&fixture, &grant).await;
+    tokio::time::timeout(Duration::from_secs(2), entry)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(worker);
+    tokio::task::yield_now().await;
+    release.send(()).unwrap();
+    let _terminal = fixture.terminal().await;
+    assert!(matches!(
+        fixture.host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::Terminal(_)
+    ));
+    assert_eq!(fixture.host.active_count().await, 0);
 }
 fn owner() -> InferenceOwner {
     InferenceOwner {
@@ -120,8 +392,8 @@ async fn missing_local_credential_is_typed_no_start_and_never_provider_io() {
     let server = MockServer::start().await;
     let fixture = Fixture::new_with_credential(
         &server.uri(),
-        LocalCredentialRef::Environment {
-            name: "ABSENT_FIXTURE_KEY".to_string(),
+        LocalCredentialRef::ProtectedFile {
+            secret_id: "absent_fixture_key".to_string(),
         },
     )
     .await;
@@ -526,6 +798,216 @@ async fn published_binding_keeps_friendly_and_provider_names_separate() {
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].display_name.as_str(), "local");
     assert_eq!(bindings[0].model_name.as_str(), "fixture");
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_enrollment_retries_but_permanent_refusal_does_not() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::Unavailable {
+                reason: RunnerInferenceRejection::StorageUnavailable,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(connection.poll().await.unwrap().is_empty());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(matches!(
+        connection.poll().await.unwrap().as_slice(),
+        [EdgeClientMessage::InferenceHello { .. }]
+    ));
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::Unavailable {
+                reason: RunnerInferenceRejection::ProtocolVersionUnsupported,
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(connection.poll().await.unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_publication_rejection_replays_exact_operation_after_delay() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    let sent = connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1_000_000,
+            ),
+        })
+        .await
+        .unwrap();
+    let publication = sent
+        .into_iter()
+        .find_map(|message| match message {
+            EdgeClientMessage::InferenceBindingPublish { publication } => Some(publication),
+            _ => None,
+        })
+        .unwrap();
+    connection
+        .handle(EdgeServerMessage::InferenceBindingRejected {
+            rejection: RunnerInferenceBindingRejection {
+                operation_id: publication.operation_id.clone(),
+                reason: RunnerInferenceRejection::StorageUnavailable,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(connection.poll().await.unwrap().is_empty());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let resent = connection.poll().await.unwrap();
+    assert!(
+        matches!(resent.as_slice(), [EdgeClientMessage::InferenceBindingPublish { publication: replay }] if **replay == *publication)
+    );
+    connection
+        .handle(EdgeServerMessage::InferenceBindingRejected {
+            rejection: RunnerInferenceBindingRejection {
+                operation_id: publication.operation_id.clone(),
+                reason: RunnerInferenceRejection::PublicationConflict,
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(connection.poll().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn connection_accepts_the_servers_full_transfer_window() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1_000_000,
+            ),
+        })
+        .await
+        .unwrap();
+    for index in 0..RUNNER_INFERENCE_MAX_TRANSFERS {
+        let grant = fixture.grant(&format!("window-{index}"), REQUEST).await;
+        let messages = connection
+            .handle(EdgeServerMessage::InferenceDispatch {
+                grant: Box::new(grant),
+                delivery_generation: 7,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [EdgeClientMessage::InferenceRequestCredit { .. }]
+        ));
+    }
+}
+
+#[tokio::test]
+async fn expired_queued_grant_reconciliation_seals_only_current_incarnation_no_start() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1_000_000,
+            ),
+        })
+        .await
+        .unwrap();
+    let mut grant = fixture.grant("expired-queued", REQUEST).await;
+    grant.start_before_unix_ms = 999_999;
+    let messages = connection
+        .handle(EdgeServerMessage::InferenceReconcile {
+            grant: Box::new(grant.clone()),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        messages.as_slice(),
+        [EdgeClientMessage::InferenceStartEvidence {
+            evidence: RunnerInferenceStartEvidence::ExpiredWithoutFence,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        fixture.host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::ExpiredWithoutFence)
+    ));
+    let mut replaced = fixture.grant("expired-old-boot", REQUEST).await;
+    replaced.start_before_unix_ms = 999_999;
+    replaced.process_boot_nonce = id("old-boot");
+    assert!(
+        connection
+            .handle(EdgeServerMessage::InferenceReconcile {
+                grant: Box::new(replaced.clone()),
+                delivery_generation: 7,
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture.host.reconcile(&replaced).await.unwrap(),
+        DispatchOutcome::Unknown
+    ));
+}
+
+#[tokio::test]
+async fn standalone_environment_snapshot_revokes_missing_credentials() {
+    let reference = LocalCredentialRef::Environment {
+        name: "TEST_KEY".into(),
+    };
+    let fixture = Fixture::new_with_credential("http://127.0.0.1:9", reference.clone()).await;
+    assert!(fixture.host.bindings().await.unwrap().is_empty());
+    let config = fixture.host.config().await.unwrap();
+    let key = ResolvedLocalCredential::from_environment(&reference, |_| Some("test-key".into()))
+        .unwrap()
+        .unwrap();
+    fixture
+        .host
+        .refresh_environment(config.revision, vec![("local".into(), 1, key)])
+        .await
+        .unwrap();
+    assert_eq!(fixture.host.bindings().await.unwrap().len(), 1);
+    assert!(
+        fixture
+            .host
+            .refresh_environment(config.revision + 1, Vec::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.host.bindings().await.unwrap().len(), 1);
+    let mut changed = config.clone();
+    changed.models.get_mut("local").unwrap().credential = LocalCredentialRef::Environment {
+        name: "NEW_KEY".into(),
+    };
+    let replaced = LocalModelConfigStore::with_path(fixture.directory.path().join("models.json"))
+        .replace(config.revision, changed)
+        .unwrap();
+    assert!(
+        fixture.host.bindings().await.unwrap().is_empty(),
+        "a changed credential must receive a new generation and cannot reuse an old slot"
+    );
+    fixture
+        .host
+        .refresh_environment(replaced.revision, Vec::new())
+        .await
+        .unwrap();
+    assert!(fixture.host.bindings().await.unwrap().is_empty());
 }
 
 #[tokio::test]

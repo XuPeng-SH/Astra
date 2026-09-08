@@ -13,6 +13,10 @@ use sha2::{Digest, Sha256};
 pub const RUNNER_INFERENCE_FRAME_BYTES: usize = 256 * 1024;
 pub const RUNNER_INFERENCE_CHUNK_BYTES: usize = 32 * 1024;
 pub const RUNNER_INFERENCE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Request transfer assemblies per connection, distinct from provider execution slots.
+pub const RUNNER_INFERENCE_MAX_TRANSFERS: usize = 8;
+/// Personal Runner execution ceiling, enforced by both Server delivery and Host.
+pub const RUNNER_INFERENCE_MAX_ACTIVE_ATTEMPTS: usize = 4;
 /// Maximum wire size of one provisional progress batch.  Progress is
 /// disposable and must never consume the larger terminal-transfer budget.
 pub const RUNNER_INFERENCE_PROGRESS_BATCH_BYTES: usize = RUNNER_INFERENCE_CHUNK_BYTES;

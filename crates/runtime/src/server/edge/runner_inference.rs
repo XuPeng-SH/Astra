@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 
 pub(super) const CONTROL_CAPACITY: usize = 32;
 const WINDOW_BYTES: usize = 8 * RUNNER_INFERENCE_CHUNK_BYTES;
-const MAX_CONNECTION_TRANSFERS: usize = 8;
+const MAX_CONNECTION_TRANSFERS: usize = RUNNER_INFERENCE_MAX_TRANSFERS;
 /// One authenticated identity check per attempt is enough for the disposable
 /// progress stream. Keep the connection-local cache bounded; terminal custody
 /// does not depend on this cache and remains recoverable after eviction.

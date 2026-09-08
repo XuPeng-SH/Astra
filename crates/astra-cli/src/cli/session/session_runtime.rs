@@ -440,6 +440,30 @@ pub(crate) async fn load_server_model_catalog_json(
     .map_err(|error| format!("failed to render complete model catalog: {error}"))
 }
 
+pub(crate) async fn headless_selection_uses_server(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: Option<&str>,
+) -> bool {
+    let resolve = async {
+        let projection = load_server_model_access(api, token).await?;
+        let selection = match model {
+            Some(model) => model_selection_for_name_from_catalog(&projection.offerings, model),
+            None => default_model_selection_from_access(&projection)?,
+        };
+        Ok::<_, String>(selection.is_some_and(|selected| {
+            projection.offerings.iter().any(|entry| {
+                entry.offering_id == selected.offering_id
+                    && entry.execution_placement
+                        == astra_services::models::ModelExecutionPlacement::Server
+            })
+        }))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), resolve)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+}
+
 async fn load_server_model_access(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -2002,6 +2026,28 @@ mod tests {
     };
     use tempfile::tempdir;
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+
+    #[tokio::test]
+    async fn headless_host_selection_uses_exact_placement_and_default() {
+        let server = wiremock::MockServer::start().await;
+        let mut edge = catalog_entry("offer-edge", "same-name", true, 1024);
+        edge.execution_placement = ModelExecutionPlacement::Edge;
+        let projection = access_projection(
+            vec![catalog_entry("offer-cloud", "same-name", true, 1024), edge],
+            Some("offer-cloud"),
+        );
+        wiremock::Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&projection))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        assert!(super::headless_selection_uses_server(&api, "token", Some("offer-cloud")).await);
+        assert!(super::headless_selection_uses_server(&api, "token", None).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("offer-edge")).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("same-name")).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("absent")).await);
+    }
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {

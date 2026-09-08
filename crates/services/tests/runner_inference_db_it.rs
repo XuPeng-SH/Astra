@@ -16,6 +16,187 @@ const REQUEST: &[u8] =
     br#"{ "model":"model", "messages":[{"role":"user","content":"private-request-canary"}] }"#;
 const RESPONSE: &[u8] = br#"{"content":"private-response-canary","complete":true}"#;
 
+#[tokio::test]
+#[ignore = "requires MatrixOne"]
+#[serial]
+async fn runner_delivery_waits_per_session_and_cancel_requires_no_start_before_releasing_slot() {
+    let f = Fixture::new().await;
+    let (_, first) = f.admit().await;
+    let mut next_input = f.input.clone();
+    if let InferenceInvocationScope::Run { operation_id, .. } = &mut next_input.scope {
+        *operation_id = "second".into();
+    }
+    let next_plan = plan_runner_inference_dispatch(
+        next_input,
+        &f.binding,
+        REQUEST,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .unwrap();
+    let next = admit_runner_inference_dispatch(&f.pool, &next_plan)
+        .await
+        .unwrap();
+    let other = admit_in_another_session(&f).await;
+    let batch = list_runner_reconciliation(&f.pool, &f.connection, 2)
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert!(batch.iter().any(|grant| grant.attempt == other.attempt));
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &first.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &next.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &other.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    request_runner_cancellation(&f.pool, &f.connection.user_id, &first.attempt)
+        .await
+        .unwrap();
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &next.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        claim_runner_delivery(&f.pool, &f.connection, &first.attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .action,
+        RunnerDeliveryAction::Cancel(_)
+    ));
+    record_runner_start_evidence(
+        &f.pool,
+        &f.connection,
+        &first,
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &next.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+async fn admit_in_another_session(f: &Fixture) -> RunnerInferenceDispatchGrant {
+    let session = format!("fair-session-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy,
+        created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+        .bind(&session).bind(&f.connection.user_id).execute(f.pool.get()).await.unwrap();
+    let mut input = f.input.clone();
+    input.scope = InferenceInvocationScope::Session {
+        session_id: session,
+        turn: 0,
+        round: 0,
+        operation_id: "primary".into(),
+        logical_attempt: 0,
+    };
+    input.run_authority = None;
+    let plan = plan_runner_inference_dispatch(
+        input,
+        &f.binding,
+        REQUEST,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .unwrap();
+    admit_runner_inference_dispatch(&f.pool, &plan)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne"]
+#[serial]
+async fn runner_delivery_preserves_host_capacity_across_claim_expiry() {
+    let f = Fixture::new().await;
+    let mut grants = Vec::new();
+    for _ in 0..5 {
+        grants.push(admit_in_another_session(&f).await);
+    }
+    for grant in &grants[..4] {
+        assert!(
+            claim_runner_delivery(&f.pool, &f.connection, &grant.attempt)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    sqlx::query("UPDATE inference_provider_attempts SET runner_dispatch_claim_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
+        WHERE user_id = ? AND runner_id = ?")
+        .bind(&f.connection.user_id).bind(f.connection.runner_id.as_str()).execute(f.pool.get()).await.unwrap();
+    // Expiring transport claims permit replay, never a fifth possible HTTP call.
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &grants[0].attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &grants[4].attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    request_runner_cancellation(&f.pool, &f.connection.user_id, &grants[0].attempt)
+        .await
+        .unwrap();
+    record_runner_start_evidence(
+        &f.pool,
+        &f.connection,
+        &grants[0],
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &grants[4].attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let sixth = admit_in_another_session(&f).await;
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &sixth.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let completed = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&completed, RESPONSE).unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &grants[1].attempt,
+        &completed,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &sixth.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 struct Fixture {
     pool: astra_core::SharedPool,
     connection: AuthenticatedRunnerConnection,
@@ -905,6 +1086,23 @@ async fn runner_recovery_loads_one_bounded_contiguous_attempt_chain() {
     assert_eq!(chain[1].receipt, suffix_claim.checkpoint_receipt());
     assert_eq!(chain[0].request.as_bytes(), REQUEST);
     assert_eq!(chain[1].response.as_bytes(), RESPONSE);
+    let consumed = first_claim.checkpoint_receipt();
+    verify_runner_checkpoint_consumption(&f.pool, &f.input, &consumed)
+        .await
+        .unwrap();
+    for prefix_pending in [true, false] {
+        sqlx::query("UPDATE inference_provider_attempts SET runner_continuation_pending = ? WHERE user_id = ? AND attempt_id = ?")
+            .bind(prefix_pending)
+            .bind(&f.input.user_id)
+            .bind(first_grant.attempt.attempt_id.as_str())
+            .execute(f.pool.get()).await.unwrap();
+        let suffix =
+            load_next_runner_continuation_chain(&f.pool, &f.input, std::slice::from_ref(&consumed))
+                .await
+                .unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].receipt, suffix_claim.checkpoint_receipt());
+    }
 }
 
 #[tokio::test]

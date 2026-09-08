@@ -8236,8 +8236,8 @@ pub(crate) async fn run_tui_session(
                                                     crate::cli::local_model_command::LocalModelCredentialInput::None
                                                 }
                                             };
-                                            let saved = tokio::task::spawn_blocking(move || {
-                                                crate::cli::local_model_command::add_from_tui(
+                                            let candidate = tokio::task::spawn_blocking(move || {
+                                                crate::cli::local_model_command::prepare_from_tui(
                                                     &save_scope,
                                                     draft.name,
                                                     draft.base_url,
@@ -8250,14 +8250,38 @@ pub(crate) async fn run_tui_session(
                                             .await
                                             .map_err(|_| "local model setup task stopped unexpectedly".to_string())
                                             .and_then(|result| result);
+                                            let candidate = match candidate {
+                                                Ok(candidate) => candidate,
+                                                Err(error) => {
+                                                    let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Not applied. {error}")) }).await;
+                                                    return;
+                                                }
+                                            };
                                             let scope_still_current = || {
                                                 astra_credentials::LocalModelScope::for_profile(&api.api_origin(), profile.as_deref())
                                                     .is_ok_and(|current| current.identity() == scope.identity())
                                             };
+                                            if !scope_still_current() {
+                                                let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err("Your account changed during setup. No provider test was run and the candidate was not applied.".into()) }).await;
+                                                return;
+                                            }
+                                            if action == bottom_pane::view::ModelSetupAction::TestAndUse {
+                                                if let Err(error) = candidate.check().await {
+                                                    let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Provider check failed. Your existing configuration and credentials are unchanged. {error}")) }).await;
+                                                    return;
+                                                }
+                                            }
+                                            if !scope_still_current() {
+                                                let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err("Your account changed during setup. The candidate was not applied. Open /model in the intended account to continue.".into()) }).await;
+                                                return;
+                                            }
+                                            let saved = tokio::task::spawn_blocking(move || candidate.apply()).await
+                                                .map_err(|_| "local model apply task stopped unexpectedly".to_string())
+                                                .and_then(|result| result);
                                             if saved.is_ok() && !scope_still_current() {
                                                 let _ = completion_tx.send(ModelSetupCompletion {
                                                     name: model_name, selection, runner: None,
-                                                    result: Err("Saved in the original account, but your selected account changed. No provider test was run. Open /model in the intended account to continue.".into()),
+                                                    result: Err("Saved in the original account, but your selected account changed. Open /model in the intended account to continue.".into()),
                                                 }).await;
                                                 return;
                                             }
@@ -8266,13 +8290,13 @@ pub(crate) async fn run_tui_session(
                                                 match crate::cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), scope.root()).await {
                                                     Ok(runner) => { runner.attach_context(&mut runner_context); new_runner = Some(runner); }
                                                     Err(error) => {
-                                                        let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Saved locally, but local model hosting is unavailable. No provider test was run. {error}")) }).await;
+                                                        let _ = completion_tx.send(ModelSetupCompletion { name: model_name, selection, runner: None, result: Err(format!("Saved locally, but local model hosting is unavailable. Reconnect to publish this configuration. {error}")) }).await;
                                                         return;
                                                     }
                                                 }
                                             }
                                             let result = match (saved, action) {
-                                                (Err(error), _) => Err(format!("Save could not be confirmed. No provider test was run; inspect the local configuration before retrying. {error}")),
+                                                (Err(error), _) => Err(format!("Save could not be confirmed; inspect the local configuration before retrying. {error}")),
                                                 (Ok(_), bottom_pane::view::ModelSetupAction::SaveWithoutTest) => {
                                                     Ok(ModelSetupReady {
                                                         offering_id: None,
@@ -8283,26 +8307,8 @@ pub(crate) async fn run_tui_session(
                                                     if !scope_still_current() {
                                                         let _ = completion_tx.send(ModelSetupCompletion {
                                                             name: model_name, selection, runner: new_runner,
-                                                            result: Err("Saved in the original account, but your selected account changed while connecting. No provider test was run. Open /model in the intended account to continue.".into()),
+                                                            result: Err("Saved in the original account, but your selected account changed while connecting. Open /model in the intended account to continue.".into()),
                                                         }).await;
-                                                        return;
-                                                    }
-                                                    if let Err(error) = crate::cli::local_model_command::check(
-                                                        &scope,
-                                                        crate::cli::cli_config::cli_args::ModelCheckArgs {
-                                                            name: model_name.clone(),
-                                                        },
-                                                    )
-                                                    .await
-                                                    {
-                                                        let _ = completion_tx
-                                                            .send(ModelSetupCompletion {
-                                                                name: model_name,
-                                                                selection,
-                                                                runner: new_runner,
-                                                                result: Err(format!("Saved locally, but the provider check failed. Current model unchanged. {error}")),
-                                                            })
-                                                            .await;
                                                         return;
                                                     }
                                                     let Some(runner_id) = runner_context.local_runner_id.clone() else {

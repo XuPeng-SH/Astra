@@ -55,6 +55,10 @@ pub enum InferenceHostError {
         "local model host uses different proxy or CA settings; close other local Astra sessions and reopen, or use an explicitly managed Runner"
     )]
     NetworkPolicyMismatch,
+    #[error(
+        "local model host protocol version differs; upgrade Astra and astra-edge together, close other local Astra sessions, let active work drain and the shared host exit, then reopen Astra"
+    )]
+    LocalProtocolMismatch,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -274,17 +274,17 @@ async fn local_inference_host(
                 .await
                 .map_err(|_| InferenceHostError::BindingUnavailable)?
                 .map_err(|_| InferenceHostError::BindingUnavailable)?;
+        let mut credentials = Vec::new();
         for (name, model) in &models.models {
             if let Ok(Some(credential)) =
                 ResolvedLocalCredential::from_environment(&model.credential, |name| {
                     std::env::var(name).ok()
                 })
             {
-                host.attach_environment(name.clone(), model.binding_revision, credential)
-                    .await?;
+                credentials.push((name.clone(), model.binding_revision, credential));
             }
         }
-        Ok(())
+        host.refresh_environment(models.revision, credentials).await
     }
     refresh_environment(&host, &models_path).await?;
     let attachment_host = host.clone();

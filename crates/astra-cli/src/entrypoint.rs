@@ -412,7 +412,26 @@ async fn run_async() -> i32 {
         // Authentication bootstrap has no provider configuration authority.
         Err(_) => false,
     };
-    let local_runner = if runner_surface && local_models_configured {
+    // A cloud single-shot does not need local discovery. Resume retains the
+    // existing attachment path because its durable Offering owns placement.
+    let known_server_selection =
+        if print_mode && !continue_last && resume.is_none() && local_models_configured {
+            if let Some(token) =
+                cli::session::session_runtime::current_access_token(profile.as_deref())
+            {
+                cli::session::session_runtime::headless_selection_uses_server(
+                    &api,
+                    &token,
+                    resolved_model.as_deref(),
+                )
+                .await
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+    let local_runner = if runner_surface && local_models_configured && !known_server_selection {
         let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         match cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), &workspace)
             .await
