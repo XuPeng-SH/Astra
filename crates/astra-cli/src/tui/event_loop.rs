@@ -1000,9 +1000,23 @@ fn apply_slash_background_read_effect(
                 chat_widget.commit_system(history_cell::system::SystemCell::response(message));
             }
             Err(error) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Local model '{name}' check failed: {error}. Fix it, then retry /model check {name}."
-                )));
+                let message = if error.contains("current local model configuration was not checked")
+                {
+                    format!(
+                        "Local model '{name}' was not checked because its configuration changed during the request. No readiness state was published. Retry /model check {name}."
+                    )
+                } else if error.contains("evidence could not be saved")
+                    || error.contains("persistence")
+                {
+                    format!(
+                        "Local model '{name}' was not marked ready because check evidence could not be saved. Retry /model check {name}; the provider response was not published as readiness."
+                    )
+                } else {
+                    format!(
+                        "Local model '{name}' check failed: {error}. Fix it, then retry /model check {name}."
+                    )
+                };
+                chat_widget.commit_system(history_cell::system::SystemCell::error(message));
             }
         },
         SlashBackgroundReadEffect::Failed { action, error } => {

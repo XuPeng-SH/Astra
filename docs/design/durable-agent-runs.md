@@ -54,14 +54,22 @@ Checkpoint must include enough information to resume safely:
 - Recovery must avoid double execution of non-idempotent actions.
 - Session execution slots prevent conflicting root runs when required by product semantics.
 - Local client session execution leases use one stable, never-rotated file
-  authority in the owner-local state directory. Linux adds a kernel-named
-  abstract Unix socket so path replacement cannot admit a second executor;
-  macOS uses one mode-0644 witness shared across users, an advisory flock,
-  and a kqueue vnode event history so cross-user contention and transient
-  rename/unlink/recreate operations cannot be hidden by restoring the final
-  inode. Both platforms re-check the complete lexical binding at settlement.
-  Unsupported platforms fail closed rather than running without an execution
-  owner.
+  witness in the owner-local state directory plus a kernel-owned authority.
+  Linux uses a kernel-named abstract Unix socket; macOS uses a byte-range lock
+  on the root-owned `/dev/dtracehelper` device. The device lock is derived from
+  the owner/session identity, so independent sessions remain concurrent while
+  a same-UID pathname replacement cannot admit a second executor. The file
+  witness and macOS kqueue vnode history retain replacement evidence, and both
+  platforms re-check the lease generation at canonical settlement. Platforms
+  without a rename-resistant authority fail closed rather than running without
+  an execution owner.
+- Workspace mutation leases (typed writers, Bash observation, and recursive
+  writers) use a separate cross-user coordination authority when the workspace
+  is shared. Linux uses the abstract socket plus an owner-only witness; macOS
+  uses the same root-owned device with a key-derived byte-range lock, a shared
+  mode-0644 witness, and kqueue history. The two lease classes must not be
+  conflated: a session lease serializes one session journal, while a workspace
+  lease serializes mutation attribution.
 
 ## Terminal outcomes
 

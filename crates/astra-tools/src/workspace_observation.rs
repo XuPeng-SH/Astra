@@ -36,6 +36,30 @@ const MAX_IGNORED_ENTRIES: usize = 2_048;
 const MAX_IGNORED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const FINGERPRINT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_LEASE_WAIT: Duration = Duration::from_secs(120);
+#[cfg(target_os = "macos")]
+static DARWIN_WORKSPACE_AUTHORITY_FILE: std::sync::LazyLock<Result<std::fs::File, String>> =
+    std::sync::LazyLock::new(|| {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+        const AUTHORITY_PATH: &str = "/dev/dtracehelper";
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(AUTHORITY_PATH)
+            .map_err(|source| {
+                format!("Darwin workspace coordination authority is unavailable: {source}")
+            })?;
+        let metadata = file.metadata().map_err(|source| {
+            format!("cannot inspect Darwin workspace coordination authority: {source}")
+        })?;
+        if !metadata.file_type().is_char_device() || metadata.uid() != 0 {
+            return Err(
+                "Darwin workspace coordination authority is not a root-owned device".to_string(),
+            );
+        }
+        Ok(file)
+    });
 #[cfg(target_os = "linux")]
 const MAX_ACTIVE_GENERATION_WATCH_PATHS: usize = 16_384;
 #[cfg(target_os = "linux")]
@@ -1331,9 +1355,9 @@ enum CrossProcessLockMode {
 }
 
 struct CrossProcessFileLock {
-    // Linux abstract-UDS names are kernel-owned and cannot be unlinked or
-    // renamed by a same-UID tool. The file remains a separate receipt-
-    // integrity witness; neither layer trusts peer-controlled contents.
+    // The kernel authority (Linux abstract UDS or Darwin device range) cannot
+    // be unlinked or renamed by a same-UID tool. The file remains a separate
+    // receipt-integrity witness; neither layer trusts peer-controlled contents.
     _kernel_namespace: CrossProcessKernelLock,
     file: std::fs::File,
     path: PathBuf,
@@ -1350,6 +1374,27 @@ struct CrossProcessFileLock {
 struct CrossProcessKernelLock {
     #[cfg(target_os = "linux")]
     _fd: std::os::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    offset: i64,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CrossProcessKernelLock {
+    fn drop(&mut self) {
+        let Ok(file) = &*DARWIN_WORKSPACE_AUTHORITY_FILE else {
+            return;
+        };
+        let mut range = libc::flock {
+            l_start: self.offset,
+            l_len: 1,
+            l_pid: 0,
+            l_type: libc::F_UNLCK,
+            l_whence: libc::SEEK_SET as libc::c_short,
+        };
+        // Keep the process-global authority descriptor open; unlocking only
+        // this range avoids releasing unrelated live workspace generations.
+        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut range) };
+    }
 }
 
 #[derive(Debug)]
@@ -1757,11 +1802,14 @@ fn locked_coordination_file(
     })
 }
 
-/// Reserve a process-private, kernel-owned global name for one deterministic
-/// coordination key. Abstract Unix sockets have no filesystem entry for a
-/// tool to unlink/rename, are unique across OS users, and disappear when the
-/// last owning descriptor closes (including process crash). An existing bind
-/// is only a contention fact; no bytes or peer identity are trusted.
+/// Reserve a kernel-owned global name for one deterministic coordination key.
+/// Linux uses an abstract Unix socket: it has no filesystem entry for a tool
+/// to unlink/rename, is unique across OS users, and disappears when the last
+/// owning descriptor closes (including process crash). Darwin uses a byte-range
+/// record lock on the root-owned `/dev/dtracehelper` device. The device inode
+/// cannot be replaced by the Astra user, while hashing the key into a range
+/// keeps independent workspaces concurrent. An existing bind/lock is only a
+/// contention fact; no bytes or peer identity are trusted.
 fn try_acquire_kernel_coordination_namespace(
     namespace_key: &str,
 ) -> std::io::Result<Option<CrossProcessKernelLock>> {
@@ -1815,13 +1863,41 @@ fn try_acquire_kernel_coordination_namespace(
     }
     #[cfg(target_os = "macos")]
     {
-        // Darwin has no Linux-style abstract Unix namespace. The shared
-        // mode-0644 witness inode is opened and flocked by every user, while
-        // kqueue event history and inode checks provide the integrity fence.
-        // Keep this marker so the common acquisition path retains one owned
-        // value per lock generation.
-        let _ = namespace_key;
-        Ok(Some(CrossProcessKernelLock {}))
+        let file = match &*DARWIN_WORKSPACE_AUTHORITY_FILE {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    error.clone(),
+                ));
+            }
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"astra-darwin-workspace-coordination-range-v1\0");
+        digest.update(namespace_key.as_bytes());
+        let digest = digest.finalize();
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let offset = i64::from_be_bytes(bytes) & i64::MAX;
+        let mut range = libc::flock {
+            l_start: offset,
+            l_len: 1,
+            l_pid: 0,
+            l_type: libc::F_WRLCK,
+            l_whence: libc::SEEK_SET as libc::c_short,
+        };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut range) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EAGAIN | libc::EDEADLK)
+            ) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Ok(Some(CrossProcessKernelLock { offset }))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -4545,6 +4621,15 @@ mod tests {
                     .expect("child acquires recursive writer barrier");
                 fs::write(marker, "owned by recursive writer").expect("child write");
             }
+            "probe-no-acquire" => {
+                let acquired = acquire_workspace_observation_lease_sync(
+                    Path::new(&root),
+                    Duration::from_millis(250),
+                )
+                .is_some();
+                fs::write(marker, if acquired { "acquired" } else { "blocked" })
+                    .expect("child write");
+            }
             #[cfg(target_os = "linux")]
             "kernel-namespace-holder" => {
                 let (specifications, _) = workspace_coordination_lock_specs(
@@ -5654,6 +5739,42 @@ mod tests {
 
         assert!(child.wait().unwrap().success());
         assert_eq!(fs::read_to_string(marker).unwrap(), "owned by mutation");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_same_uid_lock_replacement_cannot_admit_a_second_process_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("replacement-generation-probe");
+        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
+            .expect("first generation");
+        let lock_path = lease.locks[0].path.clone();
+        let detached = lock_path.with_extension("detached-by-integrity-test");
+        fs::rename(&lock_path, &detached).expect("detach original witness");
+        fs::write(&lock_path, b"replacement generation").expect("create replacement witness");
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, temp.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "probe-no-acquire")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "replacement probe did not report");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "blocked",
+            "Darwin's kernel range authority must block a second process even after witness replacement"
+        );
+        assert!(child.wait().unwrap().success());
+        assert!(!lease.integrity_valid());
+        drop(lease);
     }
 
     #[cfg(target_os = "linux")]

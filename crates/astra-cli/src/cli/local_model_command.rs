@@ -375,7 +375,17 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                 ),
                 Err(error) => (false, Some(error)),
             };
-            Ok(annotate_probe_result(&body, persisted, warning.as_deref()))
+            if let Some(warning) = warning {
+                // A provider response for an older binding is not evidence
+                // about the current model. Keep the result fail-closed so a
+                // direct CLI caller cannot mistake `probe_persisted: false`
+                // for a successful readiness check.
+                return Err(format!(
+                    "provider probe completed, but the current local model configuration was not checked: {warning}. Re-run `astra model local check {}`",
+                    args.name
+                ));
+            }
+            Ok(annotate_probe_result(&body, persisted, None))
         }
         Err(error) => {
             // A failed probe never changes the provider binding or credential.
@@ -1073,6 +1083,138 @@ mod tests {
             current.models["work"].probe,
             LocalModelProbeState::NotRun
         ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delayed_probe_cannot_publish_success_for_a_replaced_binding() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let check_scope = scope.clone();
+        let checking = tokio::spawn(async move {
+            super::check(
+                &check_scope,
+                ModelCheckArgs {
+                    name: "work".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delayed provider request must start");
+
+        add(ModelAddArgs {
+            provider_model: Some("replacement-model".into()),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+        let result = checking.await.unwrap();
+        let error = result.expect_err("a stale success must be a failed check");
+        assert!(
+            error.contains("current local model configuration was not checked"),
+            "{error}"
+        );
+        let current = scope.models().load().unwrap();
+        assert_eq!(current.models["work"].model, "replacement-model");
+        assert!(matches!(
+            current.models["work"].probe,
+            LocalModelProbeState::NotRun
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delayed_probe_cannot_publish_success_after_binding_removal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let check_scope = scope.clone();
+        let checking = tokio::spawn(async move {
+            super::check(
+                &check_scope,
+                ModelCheckArgs {
+                    name: "work".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if server.received_requests().await.unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("delayed provider request must start");
+
+        remove(ModelRemoveArgs {
+            name: "work".to_string(),
+        })
+        .unwrap();
+        let result = checking.await.unwrap();
+        let error = result.expect_err("a removed binding must not receive readiness evidence");
+        assert!(
+            error.contains("current local model configuration was not checked"),
+            "{error}"
+        );
+        assert!(scope.models().load().unwrap().models.is_empty());
     }
 
     #[test]
