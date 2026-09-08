@@ -2382,7 +2382,10 @@ impl SessionExecutionTamperWatch {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct LinuxExecutionKernelAuthority {
-    sockets: Vec<std::os::unix::net::UnixDatagram>,
+    // The sockets are intentionally held for the full lease lifetime. Their
+    // abstract names are the kernel-owned admission authority; dropping them
+    // releases the names.
+    _sockets: Vec<std::os::unix::net::UnixDatagram>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2424,7 +2427,7 @@ fn acquire_execution_kernel_authority(
         })?;
         sockets.push(socket);
     }
-    Ok(LinuxExecutionKernelAuthority { sockets })
+    Ok(LinuxExecutionKernelAuthority { _sockets: sockets })
 }
 
 /// Darwin does not expose Linux's abstract Unix socket namespace.  A regular
@@ -2443,12 +2446,17 @@ struct DarwinExecutionKernelAuthority {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn lexical_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
+fn absolute_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
     } else {
-        std::env::current_dir()?.join(path)
-    };
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lexical_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = absolute_path_for_identity(path)?;
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -2464,7 +2472,9 @@ fn lexical_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = lexical_path_for_identity(path)?;
+    // Keep `..` components for the filesystem's resolver. A lexical cleanup
+    // before canonicalization would change the meaning of `symlink/..`.
+    let absolute = absolute_path_for_identity(path)?;
 
     // The journal itself may not exist during first admission. Canonicalize
     // the deepest existing parent, then append the unresolved suffix. This
@@ -12610,6 +12620,47 @@ mod turn_event_buffer_tests {
         assert!(SessionExecutionLease::try_acquire(session_id).is_ok());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn session_execution_identity_preserves_symlink_parent_dir_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let lexical_root = temp.path().join("lexical-root");
+        let real_root = temp.path().join("real-root");
+        let real_target = real_root.join("target");
+        let real_state = real_root.join("state");
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::fs::create_dir_all(&real_state).unwrap();
+        std::fs::create_dir(&lexical_root).unwrap();
+        symlink(&real_target, lexical_root.join("link")).unwrap();
+
+        // The filesystem resolves link/.. relative to the symlink target,
+        // while the lexical key intentionally remains a spelling-based key.
+        let through_symlink = lexical_root
+            .join("link")
+            .join("..")
+            .join("state")
+            .join("session.jsonl");
+        let direct_target = real_state.join("session.jsonl");
+        let through_canonical = normalized_path_for_identity(&through_symlink).unwrap();
+        let direct_canonical = normalized_path_for_identity(&direct_target).unwrap();
+        assert_eq!(
+            through_canonical, direct_canonical,
+            "canonical identity must follow symlink/.. filesystem semantics"
+        );
+        assert_ne!(
+            lexical_path_for_identity(&through_symlink).unwrap(),
+            lexical_path_for_identity(&direct_target).unwrap(),
+            "the regression must exercise distinct lexical spellings"
+        );
+        assert!(
+            session_execution_identity_keys(&through_symlink)
+                .unwrap()
+                .contains(&direct_canonical)
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_session_execution_lease_is_available_and_fails_closed_on_conflict() {
@@ -12741,6 +12792,47 @@ mod turn_event_buffer_tests {
         assert!(
             output.status.success(),
             "canonical and alias state roots must share the authority key:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_symlink_parent_dir_cannot_admit_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let lexical_root = temp.path().join("lexical-root");
+        let real_root = temp.path().join("real-root");
+        let real_target = real_root.join("target");
+        let real_state = real_root.join("state");
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::fs::create_dir_all(&real_state).unwrap();
+        std::fs::create_dir(&lexical_root).unwrap();
+        symlink(&real_target, lexical_root.join("link")).unwrap();
+
+        let through_symlink = lexical_root.join("link").join("..").join("state");
+        let direct_target = real_state.clone();
+        let _guard = JournalDirGuard::new(&through_symlink);
+        let session_id = "sess-macos-symlink-dotdot";
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let detached_lock_path = first.lock_path.with_extension("detached-lock");
+        std::fs::rename(&first.lock_path, &detached_lock_path).unwrap();
+        std::fs::write(&first.lock_path, b"replacement generation").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(
+                "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+            )
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &direct_target)
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "symlink/.. and direct-target callers must share the authority:
+{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
