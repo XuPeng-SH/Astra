@@ -1,8 +1,9 @@
 use std::io::IsTerminal;
 
 use astra_credentials::{
-    LocalCredentialRef, LocalInferenceProtocol, LocalModelConfigStore, LocalModelDefinition,
-    LocalModelProbeState, LocalModelScope, LocalSecretStore, ResolvedLocalCredential,
+    LocalCredentialRef, LocalInferenceProtocol, LocalModelConfigError, LocalModelConfigStore,
+    LocalModelDefinition, LocalModelProbeState, LocalModelScope, LocalSecretStore,
+    ResolvedLocalCredential,
 };
 use astra_inference_adapter::openai::chat_completions_endpoint;
 use serde::Serialize;
@@ -357,7 +358,21 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                 },
             );
             let (persisted, warning) = match persisted {
-                Ok(persisted) => (persisted, None),
+                Ok(ProbePersistOutcome::Persisted) => (true, None),
+                Ok(ProbePersistOutcome::BindingChanged) => (
+                    false,
+                    Some(
+                        "the local model binding changed while the check was running; this result was discarded"
+                            .to_string(),
+                    ),
+                ),
+                Ok(ProbePersistOutcome::ModelMissing) => (
+                    false,
+                    Some(
+                        "the local model was removed while the check was running; this result was discarded"
+                            .to_string(),
+                    ),
+                ),
                 Err(error) => (false, Some(error)),
             };
             Ok(annotate_probe_result(&body, persisted, warning.as_deref()))
@@ -366,7 +381,7 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
             // A failed probe never changes the provider binding or credential.
             // Recording a secret-safe classification makes the next status
             // view useful without retaining provider URLs or response bodies.
-            let _ = persist_probe_state(
+            let persisted = persist_probe_state(
                 scope,
                 &args.name,
                 binding_revision,
@@ -375,7 +390,20 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
                     code: probe_failure_code(&error),
                 },
             );
-            Err(error)
+            match persisted {
+                Ok(ProbePersistOutcome::Persisted) => Err(error),
+                Ok(ProbePersistOutcome::BindingChanged) => Err(format!(
+                    "provider probe failed for an older local model configuration; the binding changed while the check was running, so the result was discarded ({error}). Re-run `astra model local check {}` for the current binding",
+                    args.name
+                )),
+                Ok(ProbePersistOutcome::ModelMissing) => Err(format!(
+                    "provider probe failed for an older local model configuration; model `{}` was removed while the check was running, so the result was discarded ({error}). Configure it again before retrying",
+                    args.name
+                )),
+                Err(persist_error) => Err(format!(
+                    "{error} (failure evidence could not be saved: {persist_error}); retry the check for the current status"
+                )),
+            }
         }
     }
 }
@@ -457,30 +485,42 @@ async fn check_definition(
     };
     let drain = async {
         let mut json_events = 0_u64;
-        let mut saw_choice = false;
+        let mut saw_semantic_event = false;
+        let mut saw_finish_reason = false;
         let mut saw_provider_error = false;
         let mut done = false;
         while let Some(event) = events_rx.recv().await {
             match event {
                 astra_inference_adapter::transport::ProviderEvent::Json(value) => {
                     json_events += 1;
-                    saw_choice |= value
-                        .get("choices")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|choices| !choices.is_empty());
+                    let payload = astra_inference_adapter::openai::OpenAiPayload::stream(&value);
+                    // Keep the local readiness probe aligned with the same
+                    // OpenAI projection used by the canonical Runner
+                    // collector. A non-empty `choices` array alone accepts
+                    // malformed chunks such as `choices:[{}]` and an EOF
+                    // after content without a terminal marker.
+                    saw_semantic_event |= payload.message_present;
+                    saw_finish_reason |= payload.finish_reason.is_some();
                     saw_provider_error |= value.get("error").is_some();
                 }
                 astra_inference_adapter::transport::ProviderEvent::Done => done = true,
                 astra_inference_adapter::transport::ProviderEvent::Eof => {}
             }
         }
-        (json_events, saw_choice, saw_provider_error, done)
+        (
+            json_events,
+            saw_semantic_event,
+            saw_finish_reason,
+            saw_provider_error,
+            done,
+        )
     };
-    let (terminal, (json_events, saw_choice, saw_provider_error, done)) =
+    let (terminal, (json_events, saw_semantic_event, saw_finish_reason, saw_provider_error, done)) =
         tokio::join!(execute, drain);
     if terminal.status != astra_inference_adapter::transport::ExecutionStatus::Complete
         || json_events == 0
-        || !saw_choice
+        || !saw_semantic_event
+        || (!done && !saw_finish_reason)
         || saw_provider_error
     {
         return Err(format!(
@@ -504,28 +544,43 @@ async fn check_definition(
     .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbePersistOutcome {
+    Persisted,
+    BindingChanged,
+    ModelMissing,
+}
+
 fn persist_probe_state(
     scope: &LocalModelScope,
     name: &str,
     binding_revision: u64,
     probe: LocalModelProbeState,
-) -> Result<bool, String> {
+) -> Result<ProbePersistOutcome, String> {
     let store = scope.models();
-    let mut config = store.load().map_err(|error| error.to_string())?;
-    let Some(definition) = config.models.get_mut(name) else {
-        return Ok(false);
-    };
-    // A check may finish after another terminal replaced the binding. Do not
-    // attach stale evidence to the newer provider configuration.
-    if definition.binding_revision != binding_revision {
-        return Ok(false);
+    // An unrelated model update may win the file CAS between load and
+    // replace. Retry once while the binding revision is still the one that
+    // was checked; this preserves evidence without ever attaching it to a
+    // replacement provider binding.
+    for attempt in 0..2 {
+        let mut config = store.load().map_err(|error| error.to_string())?;
+        let Some(definition) = config.models.get_mut(name) else {
+            return Ok(ProbePersistOutcome::ModelMissing);
+        };
+        // A check may finish after another terminal replaced the binding. Do
+        // not attach stale evidence to the newer provider configuration.
+        if definition.binding_revision != binding_revision {
+            return Ok(ProbePersistOutcome::BindingChanged);
+        }
+        definition.probe = probe.clone();
+        let expected_revision = config.revision;
+        match store.replace(expected_revision, config) {
+            Ok(_) => return Ok(ProbePersistOutcome::Persisted),
+            Err(LocalModelConfigError::RevisionConflict { .. }) if attempt == 0 => continue,
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    definition.probe = probe;
-    let expected_revision = config.revision;
-    store
-        .replace(expected_revision, config)
-        .map(|_| true)
-        .map_err(|error| error.to_string())
+    Err("probe persistence retry exhausted".to_string())
 }
 
 fn annotate_probe_result(body: &str, persisted: bool, warning: Option<&str>) -> String {
@@ -1000,8 +1055,8 @@ mod tests {
             ..no_auth_add("work")
         })
         .unwrap();
-        assert!(
-            !persist_probe_state(
+        assert_eq!(
+            persist_probe_state(
                 &scope(),
                 "work",
                 old_binding,
@@ -1009,7 +1064,8 @@ mod tests {
                     checked_at_unix_ms: 1,
                 },
             )
-            .unwrap()
+            .unwrap(),
+            ProbePersistOutcome::BindingChanged
         );
         let current = scope().models().load().unwrap();
         assert_eq!(current.models["work"].model, "new-model");
@@ -1324,6 +1380,84 @@ mod tests {
         assert_eq!(saved["provider_probe"], "stream_verified");
         assert_eq!(saved["status"], "ready");
         assert!(saved["probe_checked_at_unix_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn probe_rejects_eof_without_finish_reason_or_done_marker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let error = check(ModelCheckArgs {
+            name: "work".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("provider probe failed"), "{error}");
+        let saved: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["provider_probe"], "failed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn probe_rejects_malformed_choice_even_when_done_is_present() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        add(ModelAddArgs {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..no_auth_add("work")
+        })
+        .unwrap();
+
+        let error = check(ModelCheckArgs {
+            name: "work".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("provider probe failed"), "{error}");
+        let saved: serde_json::Value =
+            serde_json::from_str(&show("work").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["provider_probe"], "failed");
     }
 
     #[tokio::test]
