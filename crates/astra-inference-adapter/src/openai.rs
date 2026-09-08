@@ -1,8 +1,22 @@
-//! Borrowed native OpenAI response projection, shared by streaming and complete
-//! response consumers. Tool authorization, degraded markup recovery, usage
+//! Shared OpenAI wire primitives and borrowed response projection.
+//! Tool authorization, degraded markup recovery, usage
 //! accounting, and continuation remain in the canonical higher-level owner.
 
 use serde_json::{Map, Value};
+
+/// Local bindings accept a base URL or full endpoint. Preserve path and query.
+pub fn chat_completions_endpoint(base_url: &str) -> Result<String, &'static str> {
+    let mut base = reqwest::Url::parse(base_url).map_err(|_| "invalid local model base URL")?;
+    if !base
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+    {
+        let path = format!("{}/chat/completions", base.path().trim_end_matches('/'));
+        base.set_path(&path);
+    }
+    Ok(base.to_string())
+}
 
 pub struct OpenAiPayload<'a> {
     pub response_id: Option<&'a str>,

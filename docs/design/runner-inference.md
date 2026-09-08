@@ -1186,6 +1186,14 @@ adapter and a local diagnostic identity/fence. It creates no fake chat run or
 session. Retain its outcome and usage locally and publish only sanitized readiness
 evidence; a failed probe never becomes an automatic unbounded retry loop.
 
+Current local Chat Completions bindings share endpoint normalization between
+check and dispatch: a base URL gains `/chat/completions`; a full endpoint and its
+query are preserved. Probe and admitted request construction share the declared
+`max_completion_tokens` wire field. The probe caps it at four tokens (including
+reasoning), makes one request, and never retries or switches dialect after an
+error. Legacy-only `max_tokens` endpoints are not certified by this profile.
+A short stream check does not certify answer quality or tool support.
+
 ### Selection and TUI application flow
 
 Resolve an explicit `--model` first, then a resumed session's selection, then an

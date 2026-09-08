@@ -156,6 +156,31 @@ pub(crate) struct RunnerAuxiliaryCall<'a> {
 
 #[cfg(test)]
 #[test]
+fn runner_o_series_compilation_uses_declared_bounded_completion_limit() {
+    use super::client::{RunnerRequestOptions, prepare_runner_request};
+    let prepared = prepare_runner_request(
+        &[serde_json::json!({"role":"user", "content":"Reply with OK."})],
+        &[],
+        "o3",
+        RunnerRequestOptions {
+            max_output_tokens: Some(4),
+            temperature: None,
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            cache_capability: None,
+            no_tool_choice: false,
+        },
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&prepared.exact_body()).unwrap();
+    assert_eq!(body["model"], "o3");
+    assert_eq!(body["max_completion_tokens"], 4);
+    assert!(body.get("max_tokens").is_none());
+    assert!(body.get("temperature").is_none());
+    assert_eq!(prepared.wire_output_limit(), Some(4));
+}
+
+#[cfg(test)]
+#[test]
 fn runner_auxiliary_compilation_preserves_wire_model_budget_and_temperature() {
     use super::client::{RunnerRequestOptions, prepare_runner_request};
     let messages = [serde_json::json!({"role":"user", "content":"hello"})];

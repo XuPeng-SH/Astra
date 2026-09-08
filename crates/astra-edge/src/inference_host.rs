@@ -669,12 +669,9 @@ impl InferenceHost {
             };
             let headers = provider_headers(ProviderProtocol::OpenAiCompatible, key, [])
                 .map_err(|_| InferenceHostError::InvalidRequest)?;
-            let mut endpoint = reqwest::Url::parse(&model.base_url)
-                .map_err(|_| InferenceHostError::InvalidRequest)?;
-            endpoint.set_path(&format!(
-                "{}/chat/completions",
-                endpoint.path().trim_end_matches('/')
-            ));
+            let endpoint =
+                astra_inference_adapter::openai::chat_completions_endpoint(&model.base_url)
+                    .map_err(|_| InferenceHostError::InvalidRequest)?;
             let request = self
                 .transport
                 .prepare(endpoint.as_str(), headers, &artifact, None)

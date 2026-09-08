@@ -146,6 +146,15 @@ for an explicit provider test; this can incur provider charges. The current
 implementation does not persist probe status or show saved probe evidence in
 the picker.
 
+Local Chat Completions setup accepts a base URL (for example,
+`https://provider.example/v1`) or the full `/chat/completions` endpoint, including
+query parameters. Checking and execution use the same endpoint rules and the
+`max_completion_tokens` field. The explicit check makes one streaming request
+with at most four completion tokens, including reasoning, and no automatic retry.
+Endpoints requiring only the legacy `max_tokens` field are not supported by this
+local profile. Passing the check verifies a short stream, not tool support or
+answer quality.
+
 The setup form validates fields before saving and keeps invalid input available
 for correction. Tab or Up/Down moves between fields; Left/Right changes the
 credential source; Ctrl+U clears a field. Enter opens a review step, and Esc

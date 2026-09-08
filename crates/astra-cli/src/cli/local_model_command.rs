@@ -4,6 +4,7 @@ use astra_credentials::{
     LocalCredentialRef, LocalInferenceProtocol, LocalModelConfigStore, LocalModelDefinition,
     LocalModelScope, LocalSecretStore, ResolvedLocalCredential,
 };
+use astra_inference_adapter::openai::chat_completions_endpoint;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -257,13 +258,18 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
         .as_ref()
         .map(ResolvedLocalCredential::expose_to_local_transport)
         .unwrap_or("");
+    let mut body = serde_json::json!({
+        "model": definition.model,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "stream": true,
+    });
+    astra_core::model_wire::apply_chat_output_token_limit(
+        &mut body,
+        "openai-compatible",
+        definition.max_output_tokens.min(4) as usize,
+    );
     let request = astra_inference_adapter::ExactProviderRequest::compile(
-        &serde_json::json!({
-            "model": definition.model,
-            "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": definition.max_output_tokens.min(4),
-            "stream": true,
-        }),
+        &body,
         astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
         64 * 1024,
     )
@@ -353,20 +359,6 @@ pub(crate) async fn check(scope: &LocalModelScope, args: ModelCheckArgs) -> Resu
         config_path: store.path().display().to_string(),
     })
     .map_err(|error| error.to_string())
-}
-
-fn chat_completions_endpoint(base_url: &str) -> Result<String, String> {
-    let mut base = url::Url::parse(base_url).map_err(|_| "invalid local model base URL")?;
-    if base
-        .path()
-        .trim_end_matches('/')
-        .ends_with("/chat/completions")
-    {
-        return Ok(base.to_string());
-    }
-    let path = format!("{}/chat/completions", base.path().trim_end_matches('/'));
-    base.set_path(&path);
-    Ok(base.to_string())
 }
 
 pub(crate) fn show(scope: &LocalModelScope, name: &str) -> Result<Option<String>, String> {
@@ -574,6 +566,18 @@ mod tests {
 
     #[test]
     fn provider_endpoint_is_derived_without_rewriting_query_or_duplicating_path() {
+        for (input, expected) in [
+            ("/v1/", "/v1/chat/completions"),
+            ("/v1/chat/completions/", "/v1/chat/completions/"),
+            ("/tenant%2Fone/v1", "/tenant%2Fone/v1/chat/completions"),
+        ] {
+            assert_eq!(
+                chat_completions_endpoint(&format!("https://provider.example{input}?route=a%2Fb"))
+                    .unwrap(),
+                format!("https://provider.example{expected}?route=a%2Fb")
+            );
+        }
+        assert!(chat_completions_endpoint("not a URL").is_err());
         assert_eq!(
             chat_completions_endpoint("https://provider.example/v1?api-version=1").unwrap(),
             "https://provider.example/v1/chat/completions?api-version=1"
@@ -583,6 +587,191 @@ mod tests {
                 .unwrap(),
             "https://provider.example/v1/chat/completions?api-version=1"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn saved_endpoint_probe_and_granted_dispatch_share_strict_wire_contract() {
+        use astra_edge::inference_host::{
+            DispatchOutcome, GrantClock, InferenceHost, InferenceOwner,
+        };
+        use astra_inference_adapter::transport::ProviderTransport;
+        use astra_inference_adapter::{ExactProviderRequest, ProviderProtocol};
+        use astra_turn_types::runner_inference::*;
+        use std::num::NonZeroU64;
+        use std::time::Duration;
+        use tokio::time::Instant;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        fn id(value: &str) -> RunnerInferenceId {
+            RunnerInferenceId::new(value).unwrap()
+        }
+        // This fixture rejects the old probe dialect and wrong model/key/path.
+        // Both explicit check and real host dispatch must pass the same validator.
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &Request| {
+                if request.url.path() != "/gateway/v1/chat/completions"
+                    || request.url.query() != Some("api-version=1&route=a%2Fb")
+                {
+                    return ResponseTemplate::new(404);
+                }
+                if request.headers.get("authorization").and_then(|v| v.to_str().ok())
+                    != Some("Bearer fixture-key")
+                {
+                    return ResponseTemplate::new(401);
+                }
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body["model"] != "o3"
+                    || body.get("max_tokens").is_some()
+                    || !body["max_completion_tokens"].as_u64().is_some_and(|n| (1..=4).contains(&n))
+                    || body["stream"] != true
+                {
+                    return ResponseTemplate::new(400);
+                }
+                ResponseTemplate::new(200).set_body_raw(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    "text/event-stream",
+                )
+            })
+            .mount(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        for (index, suffix) in ["/gateway/v1", "/gateway/v1/chat/completions"]
+            .iter()
+            .enumerate()
+        {
+            let endpoint = format!("{}{suffix}?api-version=1&route=a%2Fb", server.uri());
+            add_from_tui(
+                &scope,
+                "work".into(),
+                endpoint,
+                "o3".into(),
+                1024,
+                4,
+                LocalModelCredentialInput::Stored("fixture-key".into()),
+            )
+            .unwrap();
+            assert!(
+                super::check(
+                    &scope,
+                    ModelCheckArgs {
+                        name: "work".into()
+                    }
+                )
+                .await
+                .unwrap()
+                .contains("stream_verified")
+            );
+            let host = InferenceHost::open(
+                root.path().join(format!("journal-{index}")),
+                InferenceOwner {
+                    deployment_identity: "fixture".into(),
+                    user_id: "fixture-user".into(),
+                    runner_id: id("fixture-runner"),
+                },
+                scope.models().path().to_path_buf(),
+                scope.root().join("model-secrets"),
+                ProviderTransport::build(reqwest::Client::builder().no_proxy()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut body = serde_json::json!({"model":"o3", "messages":[{"role":"user","content":"Hello"}], "stream":true});
+            astra_core::model_wire::apply_chat_output_token_limit(&mut body, "openai-compatible", 4);
+            let artifact =
+                ExactProviderRequest::compile(&body, ProviderProtocol::OpenAiCompatible, 65536)
+                    .unwrap();
+            let body = String::from_utf8(artifact.body().to_vec()).unwrap();
+            let grant = RunnerInferenceDispatchGrant {
+                attempt: RunnerInferenceAttemptIdentity {
+                    user_id: "fixture-user".into(),
+                    scope: astra_turn_types::InferenceInvocationScope::Session {
+                        session_id: "fixture-session".into(),
+                        turn: 0,
+                        round: 0,
+                        operation_id: "fixture-operation".into(),
+                        logical_attempt: 0,
+                    },
+                    invocation_id: id("fixture-invocation"),
+                    attempt_id: id("fixture-attempt"),
+                    binding: host.bindings().await.unwrap().remove(0).identity,
+                    request: RunnerInferenceArtifactReference {
+                        artifact_id: id("fixture-artifact"),
+                        sha256: RunnerInferenceDigest::new(artifact.identity().sha256.clone())
+                            .unwrap(),
+                        byte_len: NonZeroU64::new(body.len() as u64).unwrap(),
+                    },
+                },
+                grant_id: id("fixture-grant"),
+                process_boot_nonce: host.process_boot_nonce().clone(),
+                start_before_unix_ms: 1_060_000,
+                deadline_unix_ms: 1_120_000,
+            };
+            let now = Instant::now();
+            assert!(matches!(
+                host.dispatch(
+                    grant,
+                    body,
+                    GrantClock::observed(1_000_000, now, now).unwrap()
+                )
+                .await
+                .unwrap(),
+                DispatchOutcome::Started
+            ));
+            let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some((_, terminal)) = host.pending(1).await.unwrap().pop() {
+                        break terminal;
+                    }
+                    host.terminal_ready().await;
+                }
+            })
+            .await
+            .unwrap();
+            let response: RunnerInferenceResponse =
+                serde_json::from_str(&terminal.response_json).unwrap();
+            assert_eq!(
+                response.transport.status,
+                RunnerInferenceTransportStatus::Complete
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                (index + 1) * 2
+            );
+        }
+        for (model, key, status) in [
+            ("o3", "invalid-key", "HttpStatus(401)"),
+            ("invalid-model", "fixture-key", "HttpStatus(400)"),
+        ] {
+            add_from_tui(
+                &scope,
+                "work".into(),
+                format!(
+                    "{}/gateway/v1/chat/completions?api-version=1&route=a%2Fb",
+                    server.uri()
+                ),
+                model.into(),
+                1024,
+                4,
+                LocalModelCredentialInput::Stored(key.into()),
+            )
+            .unwrap();
+            let before = std::fs::read(scope.models().path()).unwrap();
+            let calls = server.received_requests().await.unwrap().len();
+            let error = super::check(
+                &scope,
+                ModelCheckArgs {
+                    name: "work".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains(status), "{error}");
+            assert_eq!(server.received_requests().await.unwrap().len(), calls + 1);
+            assert_eq!(std::fs::read(scope.models().path()).unwrap(), before);
+        }
     }
 
     #[tokio::test]
