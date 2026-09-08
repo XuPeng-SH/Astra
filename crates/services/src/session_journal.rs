@@ -2250,11 +2250,18 @@ impl SessionExecutionLease {
 
 impl Drop for SessionExecutionLease {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin record locks are process-scoped.  Release the
+            // unlink-resistant kernel range before reopening the process-local
+            // reservation; otherwise a same-process contender could acquire
+            // the range and then have this lease's deferred destructor undo
+            // its authority.
+            self._kernel_authority.release();
+        }
         // Do not rely solely on closing the descriptor to release the lock.
-        // Darwin runners can retain the advisory flock across the failed
-        // contender's descriptor lifetime, which makes a lease appear active
-        // after its owner has been dropped. Explicitly unlock before File's
-        // destructor closes the descriptor so the next turn can be admitted.
+        // Explicitly unlock before File's destructor closes the descriptor so
+        // the next turn can be admitted.
         let _ = <std::fs::File as fs2::FileExt>::unlock(&self._file);
         #[cfg(target_os = "macos")]
         ACTIVE_DARWIN_SESSION_EXECUTION_KEYS
@@ -2360,16 +2367,12 @@ fn acquire_execution_kernel_authority(
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram};
 
-    let absolute_journal_path = if journal_path.is_absolute() {
-        journal_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(journal_path))
-            .map_err(|source| SessionExecutionLeaseError::Io {
-                session_id: session_id.to_string(),
-                source,
-            })?
-    };
+    let absolute_journal_path = absolute_path_for_identity(journal_path).map_err(|source| {
+        SessionExecutionLeaseError::Io {
+            session_id: session_id.to_string(),
+            source,
+        }
+    })?;
     let mut identity = Sha256::new();
     identity.update(b"astra-session-execution-authority-v1\0");
     identity.update(owner_scope.id().as_bytes());
@@ -2403,13 +2406,23 @@ fn acquire_execution_kernel_authority(
 /// by another process with the same UID while the original process still owns
 /// the old inode.  `/dev/dtracehelper` is a root-owned device node whose inode
 /// cannot be replaced by the Astra user.  Darwin record locks are keyed by a
-/// byte range, so hashing the canonical owner/session identity gives each
-/// session an independent kernel-owned admission slot without serializing all
-/// sessions behind one global file lock.
+/// byte range, so hashing the normalized absolute owner/session identity gives
+/// each session an independent kernel-owned admission slot without serializing
+/// all sessions behind one global file lock.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct DarwinExecutionKernelAuthority {
     offset: i64,
+    released: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn absolute_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2427,17 +2440,17 @@ fn acquire_execution_kernel_authority(
             });
         }
     };
+    let absolute_journal_path = absolute_path_for_identity(journal_path).map_err(|source| {
+        SessionExecutionLeaseError::Io {
+            session_id: session_id.to_string(),
+            source,
+        }
+    })?;
     let mut identity = Sha256::new();
     identity.update(b"astra-darwin-session-execution-range-v1\0");
     identity.update(owner_scope.id().as_bytes());
     identity.update(b"\0");
-    identity.update(
-        journal_path
-            .canonicalize()
-            .unwrap_or_else(|_| journal_path.to_path_buf())
-            .as_os_str()
-            .as_encoded_bytes(),
-    );
+    identity.update(absolute_journal_path.as_os_str().as_encoded_bytes());
     identity.update(b"\0");
     identity.update(session_id.as_bytes());
     let digest = identity.finalize();
@@ -2474,12 +2487,19 @@ fn acquire_execution_kernel_authority(
             source,
         });
     }
-    Ok(DarwinExecutionKernelAuthority { offset })
+    Ok(DarwinExecutionKernelAuthority {
+        offset,
+        released: false,
+    })
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for DarwinExecutionKernelAuthority {
-    fn drop(&mut self) {
+impl DarwinExecutionKernelAuthority {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
         let Ok(file) = &*DARWIN_SESSION_AUTHORITY_FILE else {
             return;
         };
@@ -2500,6 +2520,13 @@ impl Drop for DarwinExecutionKernelAuthority {
                 &mut range,
             )
         };
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DarwinExecutionKernelAuthority {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -12513,6 +12540,85 @@ mod turn_event_buffer_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_session_execution_kernel_authority_handoff_is_idempotent() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-macos-handoff";
+        let owner_scope = OwnerScope::local_user();
+        let journal_path =
+            journal_file_path_for_owner(&owner_scope, session_id).expect("journal path");
+        let mut first = acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)
+            .expect("first kernel authority");
+        first.release();
+
+        let second = acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)
+            .expect("handoff kernel authority");
+        // The predecessor's deferred destructor must be a no-op after its
+        // explicit release; otherwise it would unlock the successor's
+        // process-scoped record lock.
+        drop(first);
+        let probe = |expected: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+                )
+                .arg("--exact")
+                .env("ASTRA_MACOS_LEASE_PROBE_DIR", tmp.path())
+                .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+                .env("ASTRA_MACOS_LEASE_PROBE_EXPECTED", expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "handoff probe failed ({expected}):\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe("blocked");
+        drop(second);
+        probe("acquired");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_authority_identity_is_stable_across_creation_and_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let target_root = temp.path().join("target-root");
+        let symlink_root = temp.path().join("linked-root");
+        std::fs::create_dir(&target_root).unwrap();
+        symlink(&target_root, &symlink_root).unwrap();
+        let _guard = JournalDirGuard::new(&symlink_root);
+        let session_id = "sess-macos-stable-identity";
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let owner_scope = OwnerScope::local_user();
+        let journal_path = journal_file_path_for_owner(&owner_scope, session_id).unwrap();
+        std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        std::fs::write(&journal_path, b"created after admission").unwrap();
+
+        let detached_lock_path = first.lock_path.with_extension("detached-lock");
+        std::fs::rename(&first.lock_path, &detached_lock_path).unwrap();
+        std::fs::write(&first.lock_path, b"replacement generation").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(
+                "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+            )
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &symlink_root)
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "replacement contender must remain blocked after journal creation:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_session_execution_lease_rejects_a_competing_process() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -12541,10 +12647,15 @@ mod turn_event_buffer_tests {
         };
         let session_id = std::env::var("ASTRA_MACOS_LEASE_PROBE_SESSION").unwrap();
         let _guard = JournalDirGuard::new(dir);
-        assert!(matches!(
-            SessionExecutionLease::try_acquire(&session_id),
-            Err(SessionExecutionLeaseError::Conflict { .. })
-        ));
+        let acquired = SessionExecutionLease::try_acquire(&session_id).is_ok();
+        match std::env::var("ASTRA_MACOS_LEASE_PROBE_EXPECTED")
+            .as_deref()
+            .unwrap_or("blocked")
+        {
+            "blocked" => assert!(!acquired),
+            "acquired" => assert!(acquired),
+            other => panic!("unknown lease probe expectation: {other}"),
+        }
     }
 
     #[cfg(target_os = "macos")]

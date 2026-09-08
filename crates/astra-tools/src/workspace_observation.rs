@@ -456,8 +456,30 @@ fn begin_workspace_writer_after_lease(
     Some(WorkspaceWriterGuard { state, lease })
 }
 
+struct ObservationGateReservation {
+    gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ObservationGateReservation {
+    fn new(gate: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { gate: Some(gate) }
+    }
+
+    fn release(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl Drop for ObservationGateReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct WorkspaceObservationLease {
-    gate: Arc<std::sync::atomic::AtomicBool>,
+    gate: ObservationGateReservation,
     locks: Vec<CrossProcessFileLock>,
     binding_identity: WorkspaceBindingIdentity,
     writer_state: Arc<WriterEpochState>,
@@ -1319,7 +1341,14 @@ fn generation_watch_registry() -> std::io::Result<Arc<GenerationWatchRegistry>> 
 
 impl Drop for WorkspaceObservationLease {
     fn drop(&mut self) {
-        self.gate.store(false, std::sync::atomic::Ordering::Release);
+        // The process-local gate is the last authority to release.  Every
+        // kernel/file lock must be gone before another same-process waiter is
+        // allowed to acquire the generation; Darwin record locks are
+        // process-scoped and an old destructor could otherwise unlock a newly
+        // handed-off byte range.
+        let locks = std::mem::take(&mut self.locks);
+        drop(locks);
+        self.gate.release();
     }
 }
 
@@ -1376,11 +1405,17 @@ struct CrossProcessKernelLock {
     _fd: std::os::fd::OwnedFd,
     #[cfg(target_os = "macos")]
     offset: i64,
+    #[cfg(target_os = "macos")]
+    released: bool,
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for CrossProcessKernelLock {
-    fn drop(&mut self) {
+impl CrossProcessKernelLock {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
         let Ok(file) = &*DARWIN_WORKSPACE_AUTHORITY_FILE else {
             return;
         };
@@ -1394,6 +1429,13 @@ impl Drop for CrossProcessKernelLock {
         // Keep the process-global authority descriptor open; unlocking only
         // this range avoids releasing unrelated live workspace generations.
         let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut range) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CrossProcessKernelLock {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -1507,6 +1549,8 @@ impl WorkspaceBindingIdentity {
 
 impl Drop for CrossProcessFileLock {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        self._kernel_namespace.release();
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -1897,7 +1941,10 @@ fn try_acquire_kernel_coordination_namespace(
             }
             return Err(error);
         }
-        Ok(Some(CrossProcessKernelLock { offset }))
+        Ok(Some(CrossProcessKernelLock {
+            offset,
+            released: false,
+        }))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2098,7 +2145,7 @@ async fn acquire_workspace_lease_async(
         workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)?;
     let trusted_coordination_root = stable_coordination_root()?;
     let gate = observation_gate(workspace_root)?;
-    loop {
+    let gate_reservation = loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled)
             || tokio::time::Instant::now() >= deadline
         {
@@ -2113,6 +2160,7 @@ async fn acquire_workspace_lease_async(
             )
             .is_ok()
         {
+            let reservation = ObservationGateReservation::new(gate.clone());
             // Cancellation/deadline may race the CAS.  Never hand out a
             // lease after the caller has stopped waiting; release it before
             // returning so the next caller is not stranded behind a ghost
@@ -2120,10 +2168,9 @@ async fn acquire_workspace_lease_async(
             if cancel_token.is_some_and(CancellationToken::is_cancelled)
                 || tokio::time::Instant::now() >= deadline
             {
-                gate.store(false, std::sync::atomic::Ordering::Release);
                 return None;
             }
-            break;
+            break reservation;
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -2140,7 +2187,7 @@ async fn acquire_workspace_lease_async(
         } else {
             delay.await;
         }
-    }
+    };
     let mut locks = Vec::with_capacity(lock_specifications.len());
     for specification in lock_specifications {
         let lock = acquire_cross_process_lock_async(
@@ -2150,10 +2197,7 @@ async fn acquire_workspace_lease_async(
             deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await;
-        let Some(lock) = lock else {
-            gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
-        };
+        let lock = lock?;
         locks.push(lock);
     }
     let watch_lock_paths = locks
@@ -2192,7 +2236,6 @@ async fn acquire_workspace_lease_async(
                 error = %error,
                 "workspace generation watcher refused receipt authority"
             );
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return None;
         }
         Err(error) => {
@@ -2201,7 +2244,6 @@ async fn acquire_workspace_lease_async(
                 error = %error,
                 "workspace generation watcher worker join failed; no receipt authority granted"
             );
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return None;
         }
     };
@@ -2213,11 +2255,10 @@ async fn acquire_workspace_lease_async(
         .quarantined
         .load(std::sync::atomic::Ordering::Acquire);
     if !binding_unchanged || !tamper_untampered || quarantined {
-        gate.store(false, std::sync::atomic::Ordering::Release);
         return None;
     }
     Some(WorkspaceObservationLease {
-        gate,
+        gate: gate_reservation,
         locks,
         binding_identity,
         writer_state,
@@ -2264,7 +2305,7 @@ fn acquire_workspace_lease_sync(
         workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)?;
     let trusted_coordination_root = stable_coordination_root()?;
     let gate = observation_gate(workspace_root)?;
-    loop {
+    let gate_reservation = loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline {
             return None;
         }
@@ -2277,30 +2318,27 @@ fn acquire_workspace_lease_sync(
             )
             .is_ok()
         {
+            let reservation = ObservationGateReservation::new(gate.clone());
             if cancel_token.is_some_and(CancellationToken::is_cancelled)
                 || Instant::now() >= deadline
             {
-                gate.store(false, std::sync::atomic::Ordering::Release);
                 return None;
             }
-            break;
+            break reservation;
         }
         if Instant::now() >= deadline {
             return None;
         }
         thread::sleep(Duration::from_millis(5));
-    }
+    };
     let mut locks = Vec::with_capacity(lock_specifications.len());
     for specification in lock_specifications {
-        let Some(lock) = acquire_cross_process_lock_sync(
+        let lock = acquire_cross_process_lock_sync(
             specification,
             CrossProcessLockMode::Exclusive,
             cancel_token,
             deadline.saturating_duration_since(Instant::now()),
-        ) else {
-            gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
-        };
+        )?;
         locks.push(lock);
     }
     let tamper_watch = GenerationTamperWatch::arm(
@@ -2320,7 +2358,6 @@ fn acquire_workspace_lease_sync(
                 error = %error,
                 "workspace generation watcher refused receipt authority"
             );
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return None;
         }
     };
@@ -2330,11 +2367,10 @@ fn acquire_workspace_lease_sync(
         .quarantined
         .load(std::sync::atomic::Ordering::Acquire);
     if !binding_unchanged || !tamper_untampered || quarantined {
-        gate.store(false, std::sync::atomic::Ordering::Release);
         return None;
     }
     Some(WorkspaceObservationLease {
-        gate,
+        gate: gate_reservation,
         locks,
         binding_identity,
         writer_state,
@@ -4630,7 +4666,7 @@ mod tests {
                 fs::write(marker, if acquired { "acquired" } else { "blocked" })
                     .expect("child write");
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             "kernel-namespace-holder" => {
                 let (specifications, _) = workspace_coordination_lock_specs(
                     Path::new(&root),
@@ -5621,6 +5657,63 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn aborting_async_lease_acquisition_releases_gate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("kernel-holder-ready");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, temp.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "kernel-namespace-holder")
+            .spawn()
+            .expect("spawn kernel authority holder");
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < marker_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "kernel authority holder did not start");
+
+        let gate = observation_gate(temp.path()).expect("observation gate");
+        let root = temp.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            acquire_workspace_observation_lease_with_options(&root, None, Duration::from_secs(30))
+                .await
+        });
+        let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !gate.load(std::sync::atomic::Ordering::Acquire)
+            && tokio::time::Instant::now() < gate_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            gate.load(std::sync::atomic::Ordering::Acquire),
+            "waiter must hold the gate before the cancellation race is exercised"
+        );
+        waiter.abort();
+        let _ = waiter.await;
+        child.kill().expect("stop kernel authority holder");
+        let _ = child.wait().expect("wait for kernel authority holder");
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                acquire_workspace_observation_lease_with_options(
+                    temp.path(),
+                    None,
+                    Duration::from_millis(250),
+                ),
+            )
+            .await
+            .expect("reacquisition timeout")
+            .is_some(),
+            "aborting an async waiter must not strand the in-process gate"
+        );
+    }
+
     #[test]
     fn blocking_lease_wait_honors_cancellation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5775,6 +5868,52 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert!(!lease.integrity_valid());
         drop(lease);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_workspace_kernel_authority_handoff_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (specifications, _) =
+            workspace_coordination_lock_specs(temp.path(), CoordinationLockKind::Observation)
+                .expect("workspace lock specification");
+        let mut first =
+            try_acquire_kernel_coordination_namespace(&specifications[0].kernel_namespace_key)
+                .expect("first kernel authority")
+                .expect("first namespace acquisition");
+        first.release();
+
+        let second =
+            try_acquire_kernel_coordination_namespace(&specifications[0].kernel_namespace_key)
+                .expect("handoff kernel authority")
+                .expect("handoff namespace acquisition");
+        // The predecessor must not unlock the successor's process-scoped
+        // byte range when its deferred destructor runs.
+        drop(first);
+        let probe = |expected: &str| {
+            let marker = temp.path().join(format!("kernel-handoff-{expected}"));
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "workspace_observation::tests::cross_process_workspace_observation_lease_helper",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CROSS_PROCESS_LEASE_HELPER_ENV, temp.path())
+                .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+                .env(CROSS_PROCESS_LEASE_MODE_ENV, "probe-no-acquire")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !marker.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "kernel handoff probe did not report");
+            assert_eq!(fs::read_to_string(&marker).unwrap(), expected);
+            assert!(child.wait().unwrap().success());
+        };
+        probe("blocked");
+        drop(second);
+        probe("acquired");
     }
 
     #[cfg(target_os = "linux")]
