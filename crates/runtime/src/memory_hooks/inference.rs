@@ -150,7 +150,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
             &self.encryptor,
             &self.user_id,
             &self.offering_id,
-            Some(self.shared_pool.get()),
+            Some(&self.shared_pool),
         )
         .await
         .map_err(|error| {

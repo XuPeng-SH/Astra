@@ -20106,7 +20106,7 @@ impl ServerSubRunExecutor {
             self.encryptor.as_ref(),
             &config.user_id,
             offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
+            self.shared_pool.as_ref(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -20135,7 +20135,7 @@ impl ServerSubRunExecutor {
             self.encryptor.as_ref(),
             &config.user_id,
             &selection.offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
+            self.shared_pool.as_ref(),
         )
         .await
         .map_err(|error| error.to_string())?;

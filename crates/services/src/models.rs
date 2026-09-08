@@ -867,6 +867,10 @@ pub enum ModelOfferingResolutionError {
         model_name: String,
     },
     Backend(String),
+    Runner {
+        kind: crate::service_error::ServiceErrorKind,
+        message: String,
+    },
 }
 
 impl ModelOfferingResolutionError {
@@ -878,6 +882,13 @@ impl ModelOfferingResolutionError {
 fn model_offering_resolution_error_response(
     error: ModelOfferingResolutionError,
 ) -> (StatusCode, Json<ErrorResponse>) {
+    if let ModelOfferingResolutionError::Runner { kind, message } = error {
+        return runner_model_error_response(crate::service_error::ServiceError {
+            kind,
+            message,
+            source: None,
+        });
+    }
     let (status, code) = match &error {
         ModelOfferingResolutionError::InvalidOfferingId => {
             (StatusCode::BAD_REQUEST, "model_selection_invalid")
@@ -891,6 +902,7 @@ fn model_offering_resolution_error_response(
         ModelOfferingResolutionError::Backend(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
         }
+        ModelOfferingResolutionError::Runner { .. } => unreachable!(),
     };
     error_response_coded(status, error.to_string(), code)
 }
@@ -934,6 +946,7 @@ impl std::fmt::Display for ModelOfferingResolutionError {
                 "Offering '{offering_id}' for model '{model_name}' is disabled"
             ),
             Self::Backend(error) => write!(f, "Offering resolution failed: {error}"),
+            Self::Runner { message, .. } => f.write_str(message),
         }
     }
 }
@@ -1670,16 +1683,31 @@ pub async fn revalidate_active_llm_offering(
 
 /// Revalidate execution material for an authenticated user's effective
 /// catalog. Personal Cloud BYOK Offerings are owner-scoped; deployment
-/// Offerings retain the existing global catalog behavior.
+/// Offerings retain the existing global catalog behavior. Runner Offerings use
+/// the same owner-scoped authority for foreground, delegated, and recovered runs.
 pub async fn revalidate_admitted_model_execution(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     user_id: &str,
     offering_id: &str,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+    pool: Option<&SharedPool>,
 ) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
     let offering_id = validate_model_offering_id(offering_id)?;
-    let pool = require_pool(pool, matrixone)
+    if offering_id.starts_with("runner-") {
+        let pool = pool.ok_or_else(|| {
+            ModelOfferingResolutionError::Backend(
+                "Runner model resolution requires durable storage".into(),
+            )
+        })?;
+        return crate::runner_model_bindings::resolve_runner_offering(pool, user_id, offering_id)
+            .await
+            .map(AdmittedModelExecution::from_runner_binding)
+            .map_err(|error| ModelOfferingResolutionError::Runner {
+                kind: error.kind,
+                message: error.message,
+            });
+    }
+    let pool = require_pool(pool.map(SharedPool::get), matrixone)
         .await
         .map_err(ModelOfferingResolutionError::Backend)?;
     let row = query(
@@ -3439,22 +3467,12 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         offering_id: String,
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
-        if offering_id.starts_with("runner-") {
-            let pool = self.pool.as_ref().ok_or_else(|| {
-                internal_error("Runner model resolution requires durable storage")
-            })?;
-            let binding =
-                crate::runner_model_bindings::resolve_runner_offering(pool, &user_id, &offering_id)
-                    .await
-                    .map_err(runner_model_error_response)?;
-            return Ok(AdmittedModelExecution::from_runner_binding(binding));
-        }
         revalidate_admitted_model_execution(
             &self.matrixone,
             self.encryptor.as_ref(),
             &user_id,
             &offering_id,
-            self.pool.as_ref().map(SharedPool::get),
+            self.pool.as_ref(),
         )
         .await
         .map_err(model_offering_resolution_error_response)
@@ -5554,6 +5572,35 @@ mod tests {
             let (status, body) = model_offering_resolution_error_response(error);
             assert_eq!(status, expected_status);
             assert_eq!(body.error_code.as_deref(), Some(expected_code));
+        }
+    }
+
+    #[test]
+    fn shared_runner_resolution_preserves_errors_without_stale_fallback() {
+        use crate::service_error::{ServiceError, ServiceErrorKind};
+        for kind in [
+            ServiceErrorKind::NotFound,
+            ServiceErrorKind::Conflict,
+            ServiceErrorKind::Invalid,
+            ServiceErrorKind::Verification,
+            ServiceErrorKind::ConflictTransient,
+            ServiceErrorKind::Persistence,
+            ServiceErrorKind::Network,
+            ServiceErrorKind::Internal,
+        ] {
+            let error = ModelOfferingResolutionError::Runner {
+                kind,
+                message: "Runner unavailable".into(),
+            };
+            assert!(!error.allows_stale_cache());
+            let actual = model_offering_resolution_error_response(error);
+            let expected = runner_model_error_response(ServiceError {
+                kind,
+                message: "Runner unavailable".into(),
+                source: None,
+            });
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.1.error_code, expected.1.error_code);
         }
     }
 

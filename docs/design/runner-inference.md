@@ -1035,6 +1035,10 @@ This file configures local execution. It is not the administrator's Server-side
 Agent rounds and required summaries use the same Runner coordinator and logical
 admission transaction. Runner admission supplies and revalidates an exact
 binding; it cannot enter the Server-only admission path. Non-streaming collection
+and explicit subagent model selection share the owner-scoped Offering resolver.
+Durable subagent recovery without an in-memory execution snapshot resolves the
+same Offering again; a foreign, disabled, or offline Runner fails closed without
+falling back to deployment credentials. Non-streaming collection
 preserves the wire model, token budget, and temperature. The durable attempt/
 custody owner remains responsible after caller cancellation or an ambiguous
 admission acknowledgement; a pre-dispatch failure can settle only while the

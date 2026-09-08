@@ -412,10 +412,41 @@ async fn effective_model_catalog_and_admission_are_authenticated_owner_scoped() 
         publication("other-identity", 0, 1).change.identity(),
     );
     let service = DatabaseModelService::new(
-        settings,
+        settings.clone(),
         Arc::new(FernetTokenEncryptor::new("runner-catalog-test-key").unwrap()),
     )
-    .with_pool(pool);
+    .with_pool(pool.clone());
+
+    // Delegated selection and durable recovery call the shared resolver
+    // directly, without a ModelService or inherited execution snapshot.
+    let encryptor = FernetTokenEncryptor::new("runner-catalog-test-key").unwrap();
+    for _ in 0..2 {
+        let restored = astra_services::revalidate_admitted_model_execution(
+            &settings,
+            &encryptor,
+            &user,
+            &offering_id,
+            Some(&pool),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.offering_id, offering_id);
+        assert!(matches!(
+            restored.execution_material,
+            ModelExecutionMaterial::Runner(_)
+        ));
+    }
+    assert!(
+        astra_services::revalidate_admitted_model_execution(
+            &settings,
+            &encryptor,
+            &other_user,
+            &offering_id,
+            Some(&pool),
+        )
+        .await
+        .is_err()
+    );
 
     let catalog = service.list_models(user.clone(), false).await.unwrap();
     assert!(catalog.iter().any(|item| item.offering_id == offering_id));
@@ -434,8 +465,55 @@ async fn effective_model_catalog_and_admission_are_authenticated_owner_scoped() 
         ModelExecutionMaterial::Runner(_)
     ));
     let error = service
-        .revalidate_model_execution(other_user, offering_id)
+        .revalidate_model_execution(other_user, offering_id.clone())
         .await
         .expect_err("another principal must not resolve this personal Offering");
     assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE edge_agent_registry SET last_heartbeat_at = DATE_SUB(NOW(6), INTERVAL 120 SECOND) WHERE user_id = ?")
+        .bind(&user).execute(pool.get()).await.unwrap();
+    assert!(
+        astra_services::revalidate_admitted_model_execution(
+            &settings,
+            &encryptor,
+            &user,
+            &offering_id,
+            Some(&pool),
+        )
+        .await
+        .is_err(),
+        "offline Runner cannot fall back to Server credentials"
+    );
+
+    sqlx::query("UPDATE edge_agent_registry SET last_heartbeat_at = NOW(6) WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    publish_runner_binding(
+        &pool,
+        &connection,
+        &RunnerInferenceBindingPublication {
+            protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+            operation_id: id("disable-catalog"),
+            expected_publication_revision: 1,
+            change: RunnerInferenceBindingChange::Disable {
+                identity: publication("identity", 0, 1).change.identity().clone(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        astra_services::revalidate_admitted_model_execution(
+            &settings,
+            &encryptor,
+            &user,
+            &offering_id,
+            Some(&pool),
+        )
+        .await
+        .is_err(),
+        "disabled Runner cannot reuse previously admitted material"
+    );
 }
