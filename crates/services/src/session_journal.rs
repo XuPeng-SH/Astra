@@ -2086,11 +2086,12 @@ pub enum SessionExecutionLeaseError {
 /// macOS has no abstract Unix socket namespace, so it pairs the owner-local
 /// lock file with a byte-range lock on the root-owned `/dev/dtracehelper`
 /// device. The device inode cannot be renamed by the local user and the range
-/// set is derived from both lexical and canonical session identities, so
-/// aliases and ancestor rebindings share admission while independent sessions
-/// remain concurrent. A kqueue vnode watch keeps rename, unlink, and
-/// replacement evidence sticky until settlement. Dropping the token releases
-/// every held authority.
+/// set is derived from lexical, canonical, and stable logical owner/session
+/// identities, so aliases and ancestor rebindings share admission while
+/// independent sessions remain concurrent. The logical key also prevents a
+/// retargeted alias from escaping into a different physical root. A kqueue
+/// vnode watch keeps rename, unlink, and replacement evidence sticky until
+/// settlement. Dropping the token releases every held authority.
 #[derive(Debug)]
 pub struct SessionExecutionLease {
     #[cfg(target_os = "linux")]
@@ -2101,6 +2102,12 @@ pub struct SessionExecutionLease {
     tamper_watch: SessionExecutionTamperWatch,
     #[cfg(target_os = "macos")]
     process_keys: Vec<PathBuf>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    identity_path: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    identity_keys: Vec<PathBuf>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    identity_owner_scope: OwnerScope,
     _file: std::fs::File,
     session_id: String,
     lock_path: PathBuf,
@@ -2168,12 +2175,13 @@ impl SessionExecutionLease {
             })?;
         let lock_path = execution_lease_path(&journal_path, session_id);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let identity_keys = session_execution_identity_keys(&journal_path).map_err(|source| {
-            SessionExecutionLeaseError::Io {
-                session_id: session_id.to_string(),
-                source,
-            }
-        })?;
+        let identity_keys =
+            session_execution_identity_keys(&journal_path, &owner_scope, session_id).map_err(
+                |source| SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source,
+                },
+            )?;
         #[cfg(test)]
         run_session_execution_identity_hook(&journal_path);
         #[cfg(target_os = "macos")]
@@ -2226,7 +2234,7 @@ impl SessionExecutionLease {
             }
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        match session_execution_identity_keys(&journal_path) {
+        match session_execution_identity_keys(&journal_path, &owner_scope, session_id) {
             Ok(current_keys) if current_keys == identity_keys => {}
             Ok(_) => {
                 return Err(SessionExecutionLeaseError::Io {
@@ -2270,6 +2278,12 @@ impl SessionExecutionLease {
                     tamper_watch,
                     #[cfg(target_os = "macos")]
                     process_keys,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    identity_path: journal_path,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    identity_keys,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    identity_owner_scope: owner_scope,
                     _file: file,
                     session_id: session_id.to_string(),
                     lock_path,
@@ -2299,11 +2313,27 @@ impl SessionExecutionLease {
     pub fn integrity_valid(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            open_journal_file_is_current(&self._file, &self.lock_path).unwrap_or(false)
+            let identity_valid = session_execution_identity_keys(
+                &self.identity_path,
+                &self.identity_owner_scope,
+                &self.session_id,
+            )
+            .map(|current| current == self.identity_keys)
+            .unwrap_or(false);
+            identity_valid
+                && open_journal_file_is_current(&self._file, &self.lock_path).unwrap_or(false)
         }
         #[cfg(target_os = "macos")]
         {
-            self.tamper_watch.is_untampered()
+            let identity_valid = session_execution_identity_keys(
+                &self.identity_path,
+                &self.identity_owner_scope,
+                &self.session_id,
+            )
+            .map(|current| current == self.identity_keys)
+            .unwrap_or(false);
+            identity_valid
+                && self.tamper_watch.is_untampered()
                 && open_journal_file_is_current(&self._file, &self.lock_path).unwrap_or(false)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2557,10 +2587,28 @@ fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn session_execution_identity_keys(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn logical_session_identity_key(owner_scope: &OwnerScope, session_id: &str) -> PathBuf {
+    let mut identity = Sha256::new();
+    identity.update(b"astra-session-execution-logical-v1\0");
+    identity.update(owner_scope.id().as_bytes());
+    identity.update(b"\0");
+    identity.update(session_id.as_bytes());
+    PathBuf::from(format!(
+        "/__astra-session-execution-logical-v1-{:x}",
+        identity.finalize()
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn session_execution_identity_keys(
+    path: &Path,
+    owner_scope: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Vec<PathBuf>> {
     let lexical = lexical_path_for_identity(path)?;
     let canonical = normalized_path_for_identity(path)?;
-    let mut keys = vec![lexical, canonical];
+    let logical = logical_session_identity_key(owner_scope, session_id);
+    let mut keys = vec![lexical, canonical, logical];
     keys.sort();
     keys.dedup();
     Ok(keys)
@@ -12693,6 +12741,8 @@ mod turn_event_buffer_tests {
         let direct_target = real_state.join("session.jsonl");
         let through_canonical = normalized_path_for_identity(&through_symlink).unwrap();
         let direct_canonical = normalized_path_for_identity(&direct_target).unwrap();
+        let owner_scope = OwnerScope::local_user();
+        let session_id = "sess-identity-path-semantics";
         assert_eq!(
             through_canonical, direct_canonical,
             "canonical identity must follow symlink/.. filesystem semantics"
@@ -12703,7 +12753,7 @@ mod turn_event_buffer_tests {
             "the regression must exercise distinct lexical spellings"
         );
         assert!(
-            session_execution_identity_keys(&through_symlink)
+            session_execution_identity_keys(&through_symlink, &owner_scope, session_id)
                 .unwrap()
                 .contains(&direct_canonical)
         );
@@ -12799,7 +12849,8 @@ mod turn_event_buffer_tests {
         let owner_scope = OwnerScope::local_user();
         let journal_path =
             journal_file_path_for_owner(&owner_scope, session_id).expect("journal path");
-        let identity_keys = session_execution_identity_keys(&journal_path).unwrap();
+        let identity_keys =
+            session_execution_identity_keys(&journal_path, &owner_scope, session_id).unwrap();
         let mut first =
             acquire_execution_kernel_authority(&owner_scope, &identity_keys, session_id)
                 .expect("first kernel authority");
@@ -12965,18 +13016,23 @@ mod turn_event_buffer_tests {
         std::fs::rename(&alias_root, temp.path().join("detached-alias-root")).unwrap();
         symlink(&second_root, &alias_root).unwrap();
 
+        assert!(
+            !first.integrity_valid(),
+            "retargeting the admitted root must revoke the predecessor lease"
+        );
+
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg(
                 "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
             )
             .arg("--exact")
-            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &alias_root)
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &second_root)
             .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "an ancestor retarget must not create a second session executor:\n{}",
+            "an ancestor retarget must not create a second session executor through the direct target:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         drop(first);

@@ -56,14 +56,14 @@ Checkpoint must include enough information to resume safely:
 - Local client session execution leases use one stable, never-rotated file
   witness in the owner-local state directory plus a kernel-owned authority.
   Linux uses kernel-named abstract Unix sockets; macOS uses byte-range locks
-  on the root-owned `/dev/dtracehelper` device. The kernel authority holds both
-  a deterministic lexical path key and the currently canonical path key: this
-  keeps aliases and ancestor rebindings in one admission domain while
-  independent sessions remain concurrent. The file witness and macOS kqueue
-  vnode history retain replacement evidence, and both platforms re-check the
-  lease generation at canonical settlement. Platforms without a
-  rename-resistant authority fail closed rather than running without an
-  execution owner.
+  on the root-owned `/dev/dtracehelper` device. The kernel authority holds a
+  stable owner/session key plus deterministic lexical and currently canonical
+  path keys: this keeps aliases and ancestor rebindings in one admission
+  domain, even if a root is retargeted, while independent sessions remain
+  concurrent. The file witness and macOS kqueue vnode history retain
+  replacement evidence, and both platforms re-check the lease generation at
+  canonical settlement. Platforms without a rename-resistant authority fail
+  closed rather than running without an execution owner.
 - Workspace mutation leases (typed writers, Bash observation, and recursive
   writers) use a separate cross-user coordination authority when the workspace
   is shared. Linux uses the abstract socket plus an owner-only witness; macOS
