@@ -2367,7 +2367,7 @@ fn acquire_execution_kernel_authority(
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram};
 
-    let absolute_journal_path = absolute_path_for_identity(journal_path).map_err(|source| {
+    let normalized_journal_path = normalized_path_for_identity(journal_path).map_err(|source| {
         SessionExecutionLeaseError::Io {
             session_id: session_id.to_string(),
             source,
@@ -2377,7 +2377,7 @@ fn acquire_execution_kernel_authority(
     identity.update(b"astra-session-execution-authority-v1\0");
     identity.update(owner_scope.id().as_bytes());
     identity.update(b"\0");
-    identity.update(absolute_journal_path.as_os_str().as_encoded_bytes());
+    identity.update(normalized_journal_path.as_os_str().as_encoded_bytes());
     identity.update(b"\0");
     identity.update(session_id.as_bytes());
     let name = format!("astra-exec-v1-{:x}", identity.finalize());
@@ -2417,11 +2417,42 @@ struct DarwinExecutionKernelAuthority {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn absolute_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+fn normalized_path_for_identity(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        std::env::current_dir().map(|cwd| cwd.join(path))
+        std::env::current_dir()?.join(path)
+    };
+
+    // The journal itself may not exist during first admission. Canonicalize
+    // the deepest existing parent, then append the unresolved suffix. This
+    // makes creation timing, relative spellings, and symlink aliases map to
+    // one authority key without requiring the caller to create state first.
+    let mut existing = absolute.clone();
+    let mut unresolved = Vec::new();
+    if let Some(file_name) = existing.file_name() {
+        unresolved.push(file_name.to_os_string());
+        existing.pop();
+    }
+    loop {
+        match existing.canonicalize() {
+            Ok(mut normalized) => {
+                for component in unresolved.iter().rev() {
+                    normalized.push(component);
+                }
+                return Ok(normalized);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = existing.file_name() else {
+                    return Err(error);
+                };
+                unresolved.push(component.to_os_string());
+                if !existing.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -2440,7 +2471,7 @@ fn acquire_execution_kernel_authority(
             });
         }
     };
-    let absolute_journal_path = absolute_path_for_identity(journal_path).map_err(|source| {
+    let normalized_journal_path = normalized_path_for_identity(journal_path).map_err(|source| {
         SessionExecutionLeaseError::Io {
             session_id: session_id.to_string(),
             source,
@@ -2450,7 +2481,7 @@ fn acquire_execution_kernel_authority(
     identity.update(b"astra-darwin-session-execution-range-v1\0");
     identity.update(owner_scope.id().as_bytes());
     identity.update(b"\0");
-    identity.update(absolute_journal_path.as_os_str().as_encoded_bytes());
+    identity.update(normalized_journal_path.as_os_str().as_encoded_bytes());
     identity.update(b"\0");
     identity.update(session_id.as_bytes());
     let digest = identity.finalize();
@@ -12613,6 +12644,40 @@ mod turn_event_buffer_tests {
         assert!(
             output.status.success(),
             "replacement contender must remain blocked after journal creation:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_authority_alias_cannot_admit_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let real_root = temp.path().join("real-root");
+        let alias_root = temp.path().join("alias-root");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, &alias_root).unwrap();
+
+        let _guard = JournalDirGuard::new(&real_root);
+        let session_id = "sess-macos-alias-identity";
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let detached_lock_path = first.lock_path.with_extension("detached-lock");
+        std::fs::rename(&first.lock_path, &detached_lock_path).unwrap();
+        std::fs::write(&first.lock_path, b"replacement generation").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(
+                "session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe",
+            )
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", &alias_root)
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "canonical and alias state roots must share the authority key:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
