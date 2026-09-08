@@ -7,7 +7,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LOCAL_MODELS_FILE_VERSION: u32 = 2;
+/// The first published local-model schema. There is no pre-existing on-disk
+/// format to migrate in this feature, so new installations start at version 1.
+pub const LOCAL_MODELS_FILE_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -855,7 +857,7 @@ mod tests {
         assert!(json.contains("WORK_LLM_API_KEY"));
         assert!(!json.contains("provider-secret-canary"));
         assert!(serde_json::from_str::<LocalModelConfig>(&json).is_ok());
-        let inline = r#"{"version":2,"revision":0,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","context_window":128000,"max_output_tokens":8192,"credential":{"kind":"environment","name":"WORK_LLM_API_KEY","value":"provider-secret-canary"}}}}"#;
+        let inline = r#"{"version":1,"revision":0,"models":{"work":{"protocol":"openai_compatible","base_url":"https://provider.example/v1","model":"coding-model","context_window":128000,"max_output_tokens":8192,"credential":{"kind":"environment","name":"WORK_LLM_API_KEY","value":"provider-secret-canary"}}}}"#;
         assert!(serde_json::from_str::<LocalModelConfig>(inline).is_err());
     }
 
@@ -976,7 +978,7 @@ mod tests {
 
     #[test]
     fn config_rejects_unknown_fields_and_unsafe_sources() {
-        let unknown = r#"{"version":2,"revision":0,"models":{},"secret":"leak"}"#;
+        let unknown = r#"{"version":1,"revision":0,"models":{},"secret":"leak"}"#;
         assert!(serde_json::from_str::<LocalModelConfig>(unknown).is_err());
         assert!(
             model(LocalCredentialRef::Environment {
@@ -1044,7 +1046,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                r#"{{"version":2,"revision":0,"models":{{"work":{{"protocol":"{canary}","base_url":"https://provider.example/v1","model":"m","context_window":128000,"max_output_tokens":8192,"credential":{{"kind":"none"}}}}}}}}"#
+                r#"{{"version":1,"revision":0,"models":{{"work":{{"protocol":"{canary}","base_url":"https://provider.example/v1","model":"m","context_window":128000,"max_output_tokens":8192,"credential":{{"kind":"none"}}}}}}}}"#
             ),
         )
         .unwrap();
@@ -1070,13 +1072,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_replace_never_follows_a_preplanted_legacy_temp_symlink() {
+    fn atomic_replace_never_follows_a_preexisting_temp_symlink() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("tempdir");
         let victim = root.path().join("victim");
         fs::write(&victim, "do-not-touch").expect("write victim");
-        symlink(&victim, root.path().join("models.json.tmp")).expect("plant legacy temp link");
+        symlink(&victim, root.path().join("models.json.tmp")).expect("plant preexisting temp link");
         let store = LocalModelConfigStore::with_path(root.path().join("models.json"));
         store
             .replace(0, LocalModelConfig::default())
@@ -1086,18 +1088,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn models_file_is_private_despite_a_permissive_legacy_temp_file() {
+    fn models_file_is_private_despite_a_permissive_preexisting_temp_file() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let root = tempfile::tempdir().expect("tempdir");
-        let legacy = root.path().join("models.json.tmp");
+        let preexisting = root.path().join("models.json.tmp");
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o666)
-            .open(&legacy)
-            .expect("create permissive legacy temp");
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o666)).unwrap();
+            .open(&preexisting)
+            .expect("create permissive preexisting temp");
+        fs::set_permissions(&preexisting, fs::Permissions::from_mode(0o666)).unwrap();
         let path = root.path().join("models.json");
         LocalModelConfigStore::with_path(path.clone())
             .replace(0, LocalModelConfig::default())
@@ -1107,7 +1109,7 @@ mod tests {
             0o600
         );
         assert_eq!(
-            fs::metadata(legacy).unwrap().permissions().mode() & 0o777,
+            fs::metadata(preexisting).unwrap().permissions().mode() & 0o777,
             0o666
         );
     }

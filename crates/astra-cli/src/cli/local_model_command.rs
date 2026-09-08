@@ -96,28 +96,6 @@ pub(crate) enum LocalModelCredentialInput {
     None,
 }
 
-#[cfg(test)]
-pub(crate) fn add_from_tui(
-    scope: &LocalModelScope,
-    name: String,
-    base_url: String,
-    provider_model: String,
-    context_window: u32,
-    max_output_tokens: u32,
-    credential_input: LocalModelCredentialInput,
-) -> Result<String, String> {
-    prepare_from_tui(
-        scope,
-        name,
-        base_url,
-        provider_model,
-        context_window,
-        max_output_tokens,
-        credential_input,
-    )?
-    .apply()
-}
-
 pub(crate) struct LocalModelCandidate {
     scope: LocalModelScope,
     name: String,
@@ -586,7 +564,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
         let scope = scope();
-        add_from_tui(
+        prepare_from_tui(
             &scope,
             "work".into(),
             "http://127.0.0.1:9".into(),
@@ -595,6 +573,8 @@ mod tests {
             64,
             LocalModelCredentialInput::Stored("original-key".into()),
         )
+        .unwrap()
+        .apply()
         .unwrap();
         let original = scope.models().load().unwrap();
         let candidate = prepare_from_tui(
@@ -706,7 +686,7 @@ mod tests {
             }
             let before = std::fs::read(scope.models().path()).unwrap();
             assert!(
-                add_from_tui(
+                prepare_from_tui(
                     &scope,
                     "work".into(),
                     "https://provider.example/v1".into(),
@@ -715,6 +695,7 @@ mod tests {
                     8192,
                     LocalModelCredentialInput::Stored("canary-key".into())
                 )
+                .and_then(|candidate| candidate.apply())
                 .is_err()
             );
             assert_eq!(std::fs::read(scope.models().path()).unwrap(), before);
@@ -808,7 +789,7 @@ mod tests {
             .enumerate()
         {
             let endpoint = format!("{}{suffix}?api-version=1&route=a%2Fb", server.uri());
-            add_from_tui(
+            prepare_from_tui(
                 &scope,
                 "work".into(),
                 endpoint,
@@ -817,6 +798,7 @@ mod tests {
                 4,
                 LocalModelCredentialInput::Stored("fixture-key".into()),
             )
+            .and_then(|candidate| candidate.apply())
             .unwrap();
             assert!(
                 super::check(
@@ -913,7 +895,7 @@ mod tests {
             ("o3", "invalid-key", "HttpStatus(401)"),
             ("invalid-model", "fixture-key", "HttpStatus(400)"),
         ] {
-            add_from_tui(
+            prepare_from_tui(
                 &scope,
                 "work".into(),
                 format!(
@@ -925,6 +907,7 @@ mod tests {
                 4,
                 LocalModelCredentialInput::Stored(key.into()),
             )
+            .and_then(|candidate| candidate.apply())
             .unwrap();
             let before = std::fs::read(scope.models().path()).unwrap();
             let calls = server.received_requests().await.unwrap().len();
@@ -1036,7 +1019,7 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
-        add_from_tui(
+        prepare_from_tui(
             &scope(),
             "work".to_string(),
             format!("{}/v1", provider.uri()),
@@ -1045,6 +1028,7 @@ mod tests {
             8_192,
             LocalModelCredentialInput::Stored("secret-canary".to_string()),
         )
+        .and_then(|candidate| candidate.apply())
         .unwrap();
         check(ModelCheckArgs {
             name: "work".to_string(),

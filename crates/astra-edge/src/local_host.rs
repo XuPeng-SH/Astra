@@ -21,9 +21,10 @@ use crate::inference_journal::{
     atomic_write, ensure_private_directory, open_private, read_private,
 };
 
-// v3 commits a revisioned, chunked credential snapshot atomically. A v2
-// peer must never reach the credential exchange with these semantics.
-const PROTOCOL: u32 = 3;
+// The private IPC protocol is introduced with the managed host itself. Keep a
+// single current version; pre-release protocol revisions are not a supported
+// migration boundary.
+const PROTOCOL: u32 = 1;
 const FRAME_BYTES: usize = 64 * 1024;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -490,16 +491,7 @@ impl ManagedClient {
             },
         )
         .await?;
-        let handshake = match read_frame(&mut stream).await {
-            Ok(handshake) => handshake,
-            Err(error) => {
-                drop(stream);
-                if legacy_host_is_running(installation).await {
-                    return Err(InferenceHostError::LocalProtocolMismatch);
-                }
-                return Err(error);
-            }
-        };
+        let handshake = read_frame(&mut stream).await?;
         let attachment = match handshake {
             Handshake::Ready { attachment } => attachment,
             Handshake::NetworkPolicyMismatch => {
@@ -574,34 +566,6 @@ impl Drop for ManagedClient {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-/// Diagnose an old shared host that closes an unsupported hello. This probe
-/// reads installation metadata only: no network settings or credentials follow,
-/// and it never attaches a lease or changes an existing client's snapshot.
-async fn legacy_host_is_running(installation: &Installation) -> bool {
-    tokio::time::timeout(Duration::from_millis(500), async {
-        let mut stream = UnixStream::connect(&installation.socket).await.ok()?;
-        installation.verify_peer(&stream).ok()?;
-        write_frame(
-            &mut stream,
-            &Hello {
-                version: 2,
-                scope: installation.scope.clone(),
-            },
-        )
-        .await
-        .ok()?;
-        let Handshake::Ready { attachment } = read_frame(&mut stream).await.ok()? else {
-            return None;
-        };
-        (attachment.version == 2
-            && attachment.scope == installation.scope
-            && attachment.runner_id == installation.runner_id)
-            .then_some(())
-    })
-    .await
-    .is_ok_and(|result| result.is_some())
 }
 
 async fn refresh(
@@ -783,115 +747,6 @@ mod tests {
             .unwrap();
         assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
         (stream, attachment)
-    }
-
-    #[tokio::test]
-    async fn old_client_is_rejected_before_touching_a_shared_hosts_snapshot() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let installation = installation(directory.path());
-        let control = ManagedHost::bind(installation.clone()).unwrap();
-        let host = host(directory.path(), &installation).await;
-        let store = astra_credentials::LocalModelConfigStore::with_path(
-            directory.path().join("models.json"),
-        );
-        let mut config = astra_credentials::LocalModelConfig::default();
-        config.models.insert(
-            "work".into(),
-            astra_credentials::LocalModelDefinition {
-                protocol: astra_credentials::LocalInferenceProtocol::OpenaiCompatible,
-                base_url: "http://127.0.0.1:9".into(),
-                model: "fixture".into(),
-                binding_revision: 1,
-                context_window: 1024,
-                max_output_tokens: 64,
-                credential: LocalCredentialRef::Environment {
-                    name: "TEST_KEY".into(),
-                },
-            },
-        );
-        store.replace(0, config).unwrap();
-        control.install(host.clone()).await.unwrap();
-        let (mut current, _) = attach(&installation).await;
-        write_frame(&mut current, &serde_json::json!({"credentials": [{"name":"work", "revision":1, "value":"existing-key"}], "revision":1, "more":false})).await.unwrap();
-        assert_eq!(read_frame::<u32>(&mut current).await.unwrap(), PROTOCOL);
-        let identity = host.bindings().await.unwrap().remove(0).identity;
-
-        let mut legacy = UnixStream::connect(&installation.socket).await.unwrap();
-        write_frame(
-            &mut legacy,
-            &Hello {
-                version: 2,
-                scope: installation.scope.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<Handshake>(&mut legacy).await.unwrap(),
-            Handshake::ProtocolMismatch
-        ));
-        assert!(read_frame::<u32>(&mut legacy).await.is_err());
-        assert_eq!(host.bindings().await.unwrap().remove(0).identity, identity);
-        write_frame(&mut current, &serde_json::json!({"credentials":null}))
-            .await
-            .unwrap();
-        assert_eq!(read_frame::<u32>(&mut current).await.unwrap(), PROTOCOL);
-        assert!(!control.shutdown.is_cancelled());
-        control.shutdown.cancel();
-    }
-
-    #[tokio::test]
-    async fn new_client_diagnoses_v2_host_without_sending_any_snapshot() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let scope = LocalModelScope::for_owner("https://fixture.invalid", "fixture-owner").unwrap();
-        let installation = Installation::open_at(
-            scope.identity(),
-            directory.path().join("identity"),
-            directory.path().join("runtime"),
-        )
-        .unwrap();
-        let listener = UnixListener::bind(&installation.socket).unwrap();
-        let expected = installation.clone();
-        let legacy = tokio::spawn(async move {
-            // Exact v2 behavior: close an unsupported hello before credentials.
-            let (mut current, _) = listener.accept().await.unwrap();
-            let hello: Hello = read_frame(&mut current).await.unwrap();
-            assert_eq!(hello.version, PROTOCOL);
-            assert_ne!(hello.version, 2);
-            drop(current);
-            // The diagnostic v2 handshake stops after public metadata. Existing
-            // v2 clients and credentials are never detached or replaced.
-            let (mut probe, _) = listener.accept().await.unwrap();
-            let hello: Hello = read_frame(&mut probe).await.unwrap();
-            assert_eq!(hello.version, 2);
-            write_frame(
-                &mut probe,
-                &Handshake::Ready {
-                    attachment: Attachment {
-                        runner_id: expected.runner_id,
-                        journal_id: "fixture-journal".into(),
-                        lease_id: uuid::Uuid::new_v4().to_string(),
-                        scope: expected.scope,
-                        version: 2,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-            let mut byte = [0];
-            assert_eq!(probe.read(&mut byte).await.unwrap(), 0);
-        });
-        let result =
-            ManagedClient::connect(&installation, scope, "https://fixture.invalid", None).await;
-        assert!(matches!(
-            result,
-            Err(InferenceHostError::LocalProtocolMismatch)
-        ));
-        tokio::time::timeout(Duration::from_secs(1), legacy)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(installation.socket.exists());
     }
 
     #[tokio::test]

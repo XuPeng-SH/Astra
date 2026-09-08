@@ -1,6 +1,7 @@
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test runner_inference_db_it -- --ignored --test-threads=1
 mod common;
 
+use astra_services::ModelRequestContextSeed;
 use astra_services::inference_execution::runner::*;
 use astra_services::inference_execution::*;
 use astra_services::models::{
@@ -10,11 +11,78 @@ use astra_services::runner_model_bindings::*;
 use astra_turn_types::runner_inference::*;
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 const REQUEST: &[u8] =
     br#"{ "model":"model", "messages":[{"role":"user","content":"private-request-canary"}] }"#;
 const RESPONSE: &[u8] = br#"{"content":"private-response-canary","complete":true}"#;
+
+fn plan_runner_attempt(
+    input: InferenceInvocationInput,
+    binding: &ResolvedRunnerModelBinding,
+    request: &[u8],
+    attempt_index: u32,
+    deadline_unix_ms: u64,
+) -> (InferenceInvocationPlan, RunnerProviderAttemptDispatchPlan) {
+    let invocation = plan_inference_invocation(input).unwrap();
+    let plan = plan_provider_attempt(
+        &invocation,
+        binding,
+        request,
+        attempt_index,
+        deadline_unix_ms,
+    );
+    (invocation, plan)
+}
+
+fn plan_provider_attempt(
+    invocation: &InferenceInvocationPlan,
+    binding: &ResolvedRunnerModelBinding,
+    request: &[u8],
+    attempt_index: u32,
+    deadline_unix_ms: u64,
+) -> RunnerProviderAttemptDispatchPlan {
+    let wire = InferenceProviderWireIdentity::new(
+        "openai_compatible",
+        format!("{:x}", Sha256::digest(request)),
+        request.len() as u64,
+    )
+    .unwrap();
+    let mut request_context = ModelRequestContextSeed::server_default();
+    request_context.topology = astra_services::ModelRequestTopology::EdgeServer;
+    request_context.execution_binding = "edge".into();
+    plan_runner_provider_attempt_dispatch(RunnerProviderAttemptDispatchInput {
+        invocation,
+        attempt_index,
+        wire,
+        request_context,
+        canonical_transitions: &[],
+        binding,
+        request,
+        deadline_unix_ms,
+    })
+    .unwrap()
+}
+
+async fn admit_runner_attempt(
+    pool: &astra_core::SharedPool,
+    input: InferenceInvocationInput,
+    binding: &ResolvedRunnerModelBinding,
+    request: &[u8],
+    attempt_index: u32,
+    deadline_unix_ms: u64,
+) -> (InferenceInvocationPlan, RunnerInferenceDispatchGrant) {
+    let (invocation, provider_plan) =
+        plan_runner_attempt(input, binding, request, attempt_index, deadline_unix_ms);
+    admit_runner_invocation(pool, &invocation, binding)
+        .await
+        .unwrap();
+    let grant = admit_runner_provider_attempt_dispatch(pool, &provider_plan)
+        .await
+        .unwrap();
+    (invocation, grant)
+}
 
 #[tokio::test]
 #[ignore = "requires MatrixOne"]
@@ -26,16 +94,15 @@ async fn runner_delivery_waits_per_session_and_cancel_requires_no_start_before_r
     if let InferenceInvocationScope::Run { operation_id, .. } = &mut next_input.scope {
         *operation_id = "second".into();
     }
-    let next_plan = plan_runner_inference_dispatch(
+    let (_, next) = admit_runner_attempt(
+        &f.pool,
         next_input,
         &f.binding,
         REQUEST,
+        0,
         (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
     )
-    .unwrap();
-    let next = admit_runner_inference_dispatch(&f.pool, &next_plan)
-        .await
-        .unwrap();
+    .await;
     let other = admit_in_another_session(&f).await;
     let batch = list_runner_reconciliation(&f.pool, &f.connection, 2)
         .await
@@ -107,16 +174,16 @@ async fn admit_in_another_session(f: &Fixture) -> RunnerInferenceDispatchGrant {
         logical_attempt: 0,
     };
     input.run_authority = None;
-    let plan = plan_runner_inference_dispatch(
+    let (_, grant) = admit_runner_attempt(
+        &f.pool,
         input,
         &f.binding,
         REQUEST,
+        0,
         (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
     )
-    .unwrap();
-    admit_runner_inference_dispatch(&f.pool, &plan)
-        .await
-        .unwrap()
+    .await;
+    grant
 }
 
 #[tokio::test]
@@ -280,19 +347,18 @@ impl Fixture {
         }
     }
 
-    fn plan(&self) -> RunnerInferenceDispatchPlan {
-        plan_runner_inference_dispatch(
-            self.input.clone(),
-            &self.binding,
-            REQUEST,
-            (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
-        )
-        .unwrap()
+    fn plan(&self) -> InferenceInvocationPlan {
+        plan_inference_invocation(self.input.clone()).unwrap()
     }
 
-    async fn admit(&self) -> (RunnerInferenceDispatchPlan, RunnerInferenceDispatchGrant) {
+    async fn admit(&self) -> (InferenceInvocationPlan, RunnerInferenceDispatchGrant) {
         let plan = self.plan();
-        let grant = admit_runner_inference_dispatch(&self.pool, &plan)
+        admit_runner_invocation(&self.pool, &plan, &self.binding)
+            .await
+            .unwrap();
+        let deadline = (chrono::Utc::now().timestamp_millis() + 120_000) as u64;
+        let provider_plan = plan_provider_attempt(&plan, &self.binding, REQUEST, 0, deadline);
+        let grant = admit_runner_provider_attempt_dispatch(&self.pool, &provider_plan)
             .await
             .unwrap();
         (plan, grant)
@@ -503,13 +569,13 @@ async fn runner_logical_admission_is_binding_scoped_and_only_undispatched_failur
     let f = Fixture::new().await;
     let (dispatched, _) = f.admit().await;
     assert!(
-        finish_undispatched_runner_invocation(&f.pool, dispatched.invocation(), &failure)
+        finish_undispatched_runner_invocation(&f.pool, &dispatched, &failure)
             .await
             .is_err(),
         "absence of a local terminal is not negative evidence after a grant"
     );
     assert!(
-        finish_undispatched_runner_invocation(&f.pool, dispatched.invocation(), &terminal())
+        finish_undispatched_runner_invocation(&f.pool, &dispatched, &terminal())
             .await
             .is_err()
     );
@@ -609,14 +675,16 @@ async fn runner_readiness_is_batched_cross_pod_and_does_not_acquire_session_lock
 async fn runner_grants_pin_exact_private_request_and_fence_owner_session_boot_and_start() {
     let f = Fixture::new().await;
     let (plan, grant) = f.admit().await;
-    assert!(!format!("{plan:?}").contains("private-request-canary"));
+    let provider_plan =
+        plan_provider_attempt(&plan, &f.binding, REQUEST, 0, grant.deadline_unix_ms);
+    assert!(!format!("{provider_plan:?}").contains("private-request-canary"));
     assert!(
         !serde_json::to_string(&grant)
             .unwrap()
             .contains("private-request-canary")
     );
     assert_eq!(
-        admit_runner_inference_dispatch(&f.pool, &plan)
+        admit_runner_provider_attempt_dispatch(&f.pool, &provider_plan)
             .await
             .unwrap(),
         grant
@@ -799,7 +867,7 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
     let claim = claim_runner_continuation(&f.pool, f.input.clone(), &grant.attempt, None)
         .await
         .unwrap();
-    assert!(claim.invocation().owner_generation() > plan.invocation().owner_generation());
+    assert!(claim.invocation().owner_generation() > plan.owner_generation());
     assert_eq!(
         load_runner_response_custody(&f.pool, &claim)
             .await
@@ -812,7 +880,7 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
             &f.pool,
             f.input.clone(),
             &grant.attempt,
-            Some(plan.invocation().owner_token())
+            Some(plan.owner_token())
         )
         .await
         .is_err()
@@ -918,16 +986,15 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
     )
     .await
     .unwrap();
-    let unsettled_plan = plan_runner_inference_dispatch(
+    let (_, unsettled_grant) = admit_runner_attempt(
+        &f.pool,
         unsettled_input,
         &current_binding,
         REQUEST,
+        0,
         (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
     )
-    .unwrap();
-    let unsettled_grant = admit_runner_inference_dispatch(&f.pool, &unsettled_plan)
-        .await
-        .unwrap();
+    .await;
     let unsettled_hash =
         astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
     take_runner_terminal_custody(
@@ -1024,7 +1091,7 @@ async fn runner_recovery_loads_one_bounded_contiguous_attempt_chain() {
         &f.pool,
         f.input.clone(),
         &first_grant.attempt,
-        Some(first_plan.invocation().owner_token()),
+        Some(first_plan.owner_token()),
     )
     .await
     .unwrap();
@@ -1036,16 +1103,15 @@ async fn runner_recovery_loads_one_bounded_contiguous_attempt_chain() {
 
     let mut suffix_input = f.input.clone();
     suffix_input.scope = suffix_input.scope.with_logical_attempt(1);
-    let suffix_plan = plan_runner_inference_dispatch(
+    let (suffix_plan, suffix_grant) = admit_runner_attempt(
+        &f.pool,
         suffix_input.clone(),
         &f.binding,
         REQUEST,
+        0,
         (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
     )
-    .unwrap();
-    let suffix_grant = admit_runner_inference_dispatch(&f.pool, &suffix_plan)
-        .await
-        .unwrap();
+    .await;
     let suffix_terminal = terminal();
     let suffix_hash =
         astra_turn_types::runner_inference::runner_terminal_digest(&suffix_terminal, RESPONSE)
@@ -1064,7 +1130,7 @@ async fn runner_recovery_loads_one_bounded_contiguous_attempt_chain() {
         &f.pool,
         suffix_input,
         &suffix_grant.attempt,
-        Some(suffix_plan.invocation().owner_token()),
+        Some(suffix_plan.owner_token()),
     )
     .await
     .unwrap();
@@ -1185,7 +1251,7 @@ async fn cancelled_discard_never_rewrites_an_existing_logical_failure() {
         &f.pool,
         f.input.clone(),
         &grant.attempt,
-        Some(plan.invocation().owner_token()),
+        Some(plan.owner_token()),
     )
     .await
     .unwrap();
@@ -1256,7 +1322,7 @@ async fn paused_or_waiting_run_cannot_discard_a_resumable_continuation() {
         &f.pool,
         f.input.clone(),
         &grant.attempt,
-        Some(plan.invocation().owner_token()),
+        Some(plan.owner_token()),
     )
     .await
     .unwrap();

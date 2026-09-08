@@ -76,19 +76,6 @@ impl BoundarySearch {
     }
 }
 
-/// Remove every **complete** UTF-8 event from `buf` (bytes before the first blank line, excluding the blank line).
-/// Leaves a trailing partial event in `buf` for the next chunk or final flush.
-pub fn drain_complete_sse_event_blocks(buf: &mut Vec<u8>) -> Result<Vec<String>, SseUtf8Error> {
-    let mut input = SseBlankLineUtf8Buf {
-        buf: std::mem::take(buf),
-        ..SseBlankLineUtf8Buf::default()
-    };
-    let result = input.push_bytes(&[]);
-    input.compact();
-    *buf = input.buf;
-    result
-}
-
 /// Incremental SSE byte buffer for HTTP streams.
 ///
 /// Decoding happens only after an event's blank-line boundary is complete. This
@@ -257,57 +244,6 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].contains("\"z\""));
         assert!(b.into_inner().unwrap().is_empty());
-    }
-
-    #[test]
-    fn drain_two_lf_blocks_in_one_buffer() {
-        let mut buf = b"data: {\"x\":1}\n\ndata: {\"y\":2}\n\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 2);
-        assert!(v[0].contains("\"x\""));
-        assert!(v[1].contains("\"y\""));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn drain_crlf_boundary() {
-        let mut buf = b"data: {}\r\n\r\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn partial_block_stays_until_separator_arrives() {
-        let mut buf = b"data: {\"a\":1}\n".to_vec();
-        assert!(
-            drain_complete_sse_event_blocks(&mut buf)
-                .unwrap()
-                .is_empty()
-        );
-        buf.push(b'\n');
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("\"a\""));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn empty_block_yields_empty_string() {
-        let mut buf = b"\n\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 1);
-        assert!(v[0].is_empty());
-    }
-
-    #[test]
-    fn lf_separator_splits_before_crlf_terminated_block() {
-        let mut buf = b"event: x\n\ndata: {}\r\n\r\n".to_vec();
-        let v = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0], "event: x");
-        assert_eq!(v[1], "data: {}");
-        assert!(buf.is_empty());
     }
 
     #[test]

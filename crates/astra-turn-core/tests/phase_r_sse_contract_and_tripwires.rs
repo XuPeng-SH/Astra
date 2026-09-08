@@ -17,9 +17,9 @@
 //! ## Is it a bug?
 //!
 //! In practice: **no, not today.** OpenAI and Anthropic both emit exactly
-//! one `data:` line per blank-line-terminated event, so
-//! [`drain_complete_sse_event_blocks`] returns blocks that happen to contain
-//! only a single data line. The permissive per-line policy never
+//! one `data:` line per blank-line-terminated event, so the blank-line framer
+//! returns blocks that happen to contain only a single data line. The permissive
+//! per-line policy never
 //! disagrees with spec compliance on real-provider bytes.
 //!
 //! It is a **latent risk** because:
@@ -36,8 +36,8 @@
 //! ## What these tests do
 //!
 //! 1. **Contract pins** — lock in today's permissive behaviour so nobody
-//!    tightens the parser without noticing the multi-data-in-one-block
-//!    tests in `sse_data_lines.rs` (line 175, 221, 239) that rely on it.
+//!    tightens the parser without noticing the multi-data-in-one-block tests
+//!    in `sse_data_lines.rs` that rely on it.
 //! 2. **Spec-deviation tripwires** (`#[ignore]`d) — if a maintainer ever
 //!    moves the parser to strict spec compliance, removing `#[ignore]` on
 //!    these turns them into the new contract. Ready-made target tests for

@@ -4606,23 +4606,6 @@ fn finish_hidden_reasoning_chunks(state: &mut HiddenReasoningStreamState) -> Vec
     vec![(pending, state.in_reasoning)]
 }
 
-/// Backwards-compatible helper for callers that only need the boolean state.
-/// The collector uses [`split_hidden_reasoning_chunks`] so split delimiters
-/// remain buffered across provider chunks.
-#[cfg(test)]
-pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
-    let mut state = HiddenReasoningStreamState {
-        in_reasoning: *in_think,
-        // The legacy boolean API can only represent the historical
-        // `<think>` variant.  The collector uses the richer state above.
-        expected_close: (*in_think).then_some("</think>"),
-        ..HiddenReasoningStreamState::default()
-    };
-    let out = split_hidden_reasoning_chunks(content, &mut state);
-    *in_think = state.in_reasoning;
-    out
-}
-
 /// Extract hidden reasoning blocks from text, returning `(reasoning,
 /// cleaned_text)`.  This is also used as a final safety net for non-streaming
 /// provider paths, while the streaming collector uses the stateful parser
@@ -15782,77 +15765,6 @@ mod tests {
         );
     }
 
-    // ── split_think_chunks (real MiniMax M2.7 streaming patterns) ────────────
-
-    #[test]
-    fn split_think_chunks_think_in_first_chunk() {
-        // MiniMax M2.7 real: first chunk starts with <think>
-        let mut in_think = false;
-        let chunks = split_think_chunks("<think>\nThe user says \"hi\".", &mut in_think);
-        assert!(in_think, "should be inside think block");
-        assert_eq!(chunks, vec![("\nThe user says \"hi\".".to_string(), true)]);
-    }
-
-    #[test]
-    fn split_think_chunks_think_closes_mid_chunk() {
-        // MiniMax M2.7 real: last chunk closes </think> and has reply
-        let mut in_think = true;
-        let chunks = split_think_chunks(
-            " Use friendly tone.\n</think>\n\nHello! How can I help you today?",
-            &mut in_think,
-        );
-        assert!(!in_think, "should be outside think block after close");
-        assert_eq!(
-            chunks,
-            vec![
-                (" Use friendly tone.\n".to_string(), true),
-                ("\n\nHello! How can I help you today?".to_string(), false),
-            ]
-        );
-    }
-
-    #[test]
-    fn split_think_chunks_no_think_tags() {
-        // Normal model response without thinking
-        let mut in_think = false;
-        let chunks = split_think_chunks("Hello! How can I help?", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(chunks, vec![("Hello! How can I help?".to_string(), false)]);
-    }
-
-    #[test]
-    fn split_think_chunks_full_think_in_one_chunk() {
-        // Entire think block in a single chunk (non-streaming scenario)
-        let mut in_think = false;
-        let chunks = split_think_chunks("<think>reasoning here</think>\n\nAnswer.", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(
-            chunks,
-            vec![
-                ("reasoning here".to_string(), true),
-                ("\n\nAnswer.".to_string(), false),
-            ]
-        );
-    }
-
-    #[test]
-    fn split_think_chunks_state_persists_across_calls() {
-        // Simulate MiniMax M2.7 multi-chunk stream
-        let mut in_think = false;
-        // chunk 1: opens think
-        let c1 = split_think_chunks("<think>\nThe user says \"hi\".", &mut in_think);
-        assert!(in_think);
-        assert!(c1[0].1);
-        // chunk 2: still inside think
-        let c2 = split_think_chunks(" Should be concise.", &mut in_think);
-        assert!(in_think);
-        assert_eq!(c2, vec![(" Should be concise.".to_string(), true)]);
-        // chunk 3: closes think and has reply
-        let c3 = split_think_chunks("</think>\n\nHello!", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(c3, vec![("\n\nHello!".to_string(), false),]);
-    }
-
     #[test]
     fn hidden_reasoning_parser_buffers_split_open_and_close_tags() {
         let mut state = HiddenReasoningStreamState::default();
@@ -15928,46 +15840,6 @@ mod tests {
         assert_eq!(
             chunks,
             vec![("<analysis>user-visible XML</analysis>".to_string(), false)]
-        );
-    }
-
-    #[test]
-    fn split_think_chunks_multi_phase_reasoning() {
-        // Some models emit multiple <think> phases in one stream.
-        // Verify in_think correctly toggles false→true→false→true→false.
-        let mut in_think = false;
-        // Phase 1
-        let c1 = split_think_chunks("<think>phase one</think>text one", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(
-            c1,
-            vec![
-                ("phase one".to_string(), true),
-                ("text one".to_string(), false),
-            ]
-        );
-        // Phase 2 — in_think was false, starts a new think block
-        let c2 = split_think_chunks("<think>phase two</think>text two", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(
-            c2,
-            vec![
-                ("phase two".to_string(), true),
-                ("text two".to_string(), false),
-            ]
-        );
-        // Phase 3 — split across chunks
-        let c3a = split_think_chunks("<think>phase three start", &mut in_think);
-        assert!(in_think);
-        assert_eq!(c3a, vec![("phase three start".to_string(), true)]);
-        let c3b = split_think_chunks(" phase three end</think>final", &mut in_think);
-        assert!(!in_think);
-        assert_eq!(
-            c3b,
-            vec![
-                (" phase three end".to_string(), true),
-                ("final".to_string(), false),
-            ]
         );
     }
 

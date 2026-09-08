@@ -172,8 +172,8 @@ repair error instead of silently using the first terminal's private proxy.
 The current bounds are 32 clients, 256 active model bindings, 64 KiB IPC frames,
 one-second configuration/heartbeat refresh and a 30-second missed-heartbeat
 expiry. Unchanged configuration sends no provider key in heartbeat frames.
-Private IPC version 3 stages up to 256 credential entries in bounded frames and
-applies the complete snapshot atomically; interruption never exposes a partial
+The private IPC stages up to 256 credential entries in bounded frames and applies
+the complete snapshot atomically; interruption never exposes a partial
 replacement. Every chunk names the same configuration revision; activation
 compares that revision while holding the local configuration lease. A concurrent
 edit rejects the snapshot and requests a fresh one without detaching the terminal.
@@ -230,12 +230,11 @@ its own bounded diagnostic sink; it must not inherit and keep a print-mode
 caller's stdout pipe open. Management progress uses IPC and cannot pollute
 machine-readable command output.
 
-The private local IPC uses version 3 for atomic, revisioned credential chunks.
-Version 2 peers are rejected before the network-policy or credential exchange.
-A new client may issue a metadata-only version 2 hello to diagnose an older
-shared host; it never sends a version 2 credential snapshot. A version mismatch
-requires matching Astra/Runner binaries and normal host drain/restart, preserving
-other clients, the installation lock, and all journal custody.
+The private local IPC has one current protocol version for atomic, revisioned
+credential chunks. A version mismatch is a repair condition: the CLI reports
+that the installed Astra and Runner binaries must match and never attempts a
+fallback snapshot or host takeover. The installation lock and journal remain
+untouched.
 
 Client leases are operational attachment state, not inference authorization.
 IPC liveness plus heartbeats detects dead clients; current heartbeat/expiry are
@@ -1121,7 +1120,7 @@ An example desired definition contains no literal credential:
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "revision": 3,
   "models": {
     "work": {

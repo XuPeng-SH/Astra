@@ -675,15 +675,6 @@ fn persistence(error: sqlx::Error) -> ServiceError {
     )
 }
 
-/// Holds private request content only until admission. Debug deliberately does
-/// not traverse canonical request data or the provider body.
-pub struct RunnerInferenceDispatchPlan {
-    invocation: InferenceInvocationPlan,
-    attempt: InferenceProviderAttemptPlan,
-    grant: RunnerInferenceDispatchGrant,
-    request: String,
-}
-
 /// Exact Runner provider attempt beneath an already admitted logical
 /// invocation. This is the canonical agent-loop path: logical lifecycle is
 /// shared with Server execution, while request custody, physical attempt and
@@ -712,36 +703,6 @@ impl RunnerProviderAttemptDispatchPlan {
 
     pub fn grant(&self) -> &RunnerInferenceDispatchGrant {
         &self.grant
-    }
-}
-
-impl std::fmt::Debug for RunnerInferenceDispatchPlan {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RunnerInferenceDispatchPlan")
-            .field("grant", &self.grant)
-            .field("request", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl RunnerInferenceDispatchPlan {
-    pub fn invocation(&self) -> &InferenceInvocationPlan {
-        &self.invocation
-    }
-    pub fn attempt(&self) -> &InferenceProviderAttemptPlan {
-        &self.attempt
-    }
-    pub fn grant(&self) -> &RunnerInferenceDispatchGrant {
-        &self.grant
-    }
-
-    pub fn with_canonical_transitions(
-        mut self,
-        transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
-    ) -> ServiceResult<Self> {
-        self.attempt = self.attempt.with_canonical_transitions(transitions)?;
-        Ok(self)
     }
 }
 
@@ -774,70 +735,6 @@ fn validate_json_body(bytes: &[u8]) -> ServiceResult<String> {
     serde_json::from_str::<serde_json::Value>(text)
         .map_err(|_| ServiceError::invalid("Runner payload is not valid JSON"))?;
     Ok(text.to_owned())
-}
-
-/// A stable logical route pins binding/profile revisions, while its Offering
-/// identity stays stable across local credential/profile rotation.
-pub fn plan_runner_inference_dispatch(
-    input: InferenceInvocationInput,
-    binding: &ResolvedRunnerModelBinding,
-    request: &[u8],
-    deadline_unix_ms: u64,
-) -> ServiceResult<RunnerInferenceDispatchPlan> {
-    validate_runner_invocation(&input, binding)?;
-    if deadline_unix_ms == 0 || deadline_unix_ms > i64::MAX as u64 {
-        return Err(ServiceError::invalid(
-            "Runner inference deadline is out of range",
-        ));
-    }
-    let request_text = validate_json_body(request)?;
-    let request_value: serde_json::Value = serde_json::from_str(&request_text)
-        .map_err(|_| ServiceError::invalid("Runner request is not valid JSON"))?;
-    if request_value
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        != Some(binding.definition.model_name.as_str())
-    {
-        return Err(ServiceError::invalid(
-            "Runner exact request model does not match its binding",
-        ));
-    }
-    let mut invocation = plan_inference_invocation(input)?;
-    let binding_json = serde_json::to_string(&binding.definition.identity)
-        .map_err(|_| ServiceError::invalid("Runner binding encoding failed"))?;
-    invocation.invocation_id = hash_identity("inv", &[&invocation.invocation_id, &binding_json]);
-    invocation.route_id = hash_identity("route", &[&invocation.invocation_id]);
-    let wire = InferenceProviderWireIdentity::new(
-        "openai_compatible",
-        digest(request).as_str(),
-        request.len() as u64,
-    )?;
-    let attempt = plan_inference_provider_attempt(&invocation, 0, wire);
-    let reference = artifact_reference(hash_identity("rreq", &[&attempt.attempt_id]), request)?;
-    let grant = RunnerInferenceDispatchGrant {
-        attempt: RunnerInferenceAttemptIdentity {
-            user_id: invocation.input.user_id.clone(),
-            scope: invocation.input.scope.clone(),
-            invocation_id: RunnerInferenceId::new(invocation.invocation_id.clone())
-                .map_err(ServiceError::invalid)?,
-            attempt_id: RunnerInferenceId::new(attempt.attempt_id.clone())
-                .map_err(ServiceError::invalid)?,
-            binding: binding.definition.identity.clone(),
-            request: reference,
-        },
-        grant_id: RunnerInferenceId::new(new_admission_token()).map_err(ServiceError::invalid)?,
-        process_boot_nonce: binding.process_boot_nonce.clone(),
-        // Admission replaces this provisional value from the database clock
-        // before the grant becomes durable or leaves the Server.
-        start_before_unix_ms: deadline_unix_ms,
-        deadline_unix_ms,
-    };
-    Ok(RunnerInferenceDispatchPlan {
-        invocation,
-        attempt,
-        grant,
-        request: request_text,
-    })
 }
 
 /// Exact immutable inputs for a single Runner provider-attempt dispatch.
@@ -951,129 +848,6 @@ fn decode_grant(row: &sqlx::mysql::MySqlRow) -> ServiceResult<RunnerInferenceDis
     let encoded: String = row.try_get("runner_grant_json").map_err(persistence)?;
     serde_json::from_str(&encoded)
         .map_err(|_| ServiceError::invalid("invalid durable Runner grant"))
-}
-
-/// Atomic exact request custody, route/attempt admission, and start grant. A
-/// failed/unknown commit must be retried with this same plan, never a new grant.
-pub async fn admit_runner_inference_dispatch(
-    pool: &SharedPool,
-    plan: &RunnerInferenceDispatchPlan,
-) -> ServiceResult<RunnerInferenceDispatchGrant> {
-    let identity = &plan.grant.attempt;
-    let mut tx = pool.get().begin().await.map_err(persistence)?;
-    if !matches!(
-        lock_invocation_scope_authority(&mut tx, &plan.invocation.input).await?,
-        InvocationScopeAuthority::Live
-    ) {
-        return Err(ServiceError::conflict(
-            "Runner inference scope authority unavailable",
-        ));
-    }
-    if let Some(row) = sqlx::query(
-        "SELECT runner_grant_json FROM inference_provider_attempts
-        WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
-    )
-    .bind(&identity.user_id)
-    .bind(identity.attempt_id.as_str())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(persistence)?
-    {
-        let persisted = decode_grant(&row)?;
-        if persisted.attempt != plan.grant.attempt
-            || persisted.process_boot_nonce != plan.grant.process_boot_nonce
-            || persisted.deadline_unix_ms != plan.grant.deadline_unix_ms
-        {
-            return Err(ServiceError::conflict(
-                "Runner grant already exists with another exact identity",
-            ));
-        }
-        return Ok(persisted);
-    }
-    let resolved = lock_resolved_binding(&mut tx, &identity.user_id, &identity.binding).await?;
-    check_runner_queue_capacity(&mut tx, identity).await?;
-    if resolved.process_boot_nonce != plan.grant.process_boot_nonce {
-        return Err(ServiceError::conflict(
-            "Runner process boot changed before admission",
-        ));
-    }
-    // Use the database epoch as the admission clock. Comparing a Rust UTC
-    // `NaiveDateTime` with `NOW()` makes correctness depend on the database
-    // session timezone and caused valid grants to fail eight hours early on a
-    // default local MatrixOne installation.
-    let database_now_ms: i64 = sqlx::query(
-        "SELECT CAST(ROUND(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) * 1000) AS SIGNED) AS now_ms",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(persistence)?
-    .try_get("now_ms")
-    .map_err(persistence)?;
-    let deadline_ms = i64::try_from(plan.grant.deadline_unix_ms)
-        .map_err(|_| ServiceError::invalid("Runner deadline out of range"))?;
-    if deadline_ms <= database_now_ms {
-        return Err(ServiceError::conflict("Runner inference deadline expired"));
-    }
-    let start_ms = database_now_ms
-        .checked_add(MAX_START_WINDOW_MS as i64)
-        .ok_or_else(|| ServiceError::internal("Runner admission clock overflow"))?
-        .min(deadline_ms);
-    let mut grant = plan.grant.clone();
-    grant.start_before_unix_ms = start_ms as u64;
-    insert_inference_invocation_admission(&mut tx, &plan.invocation).await?;
-    insert_inference_provider_attempt_admission(
-        &mut tx,
-        &plan.attempt,
-        checked_i64(plan.attempt.wire.provider_wire_bytes, "provider_wire_bytes")?,
-    )
-    .await?;
-    let record = artifact_record(
-        identity,
-        &identity.request,
-        "runner_inference_request",
-        plan.request.clone(),
-    )?;
-    persist_referenced_json_artifact_tx(&mut tx, &record)
-        .await
-        .map_err(|_| {
-            ServiceError::new(
-                ServiceErrorKind::Persistence,
-                "persist Runner request custody",
-            )
-        })?;
-    sqlx::query(
-        "UPDATE inference_routes SET runner_binding_json = ? WHERE user_id = ? AND route_id = ?",
-    )
-    .bind(
-        serde_json::to_string(&identity.binding)
-            .map_err(|_| ServiceError::invalid("Runner binding encoding failed"))?,
-    )
-    .bind(&identity.user_id)
-    .bind(&plan.invocation.route_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(persistence)?;
-    sqlx::query(
-        "UPDATE inference_provider_attempts SET runner_id = ?, runner_journal_id = ?,
-        runner_grant_json = ?, runner_grant_expires_at = FROM_UNIXTIME(? / 1000.0),
-        runner_deadline_at = FROM_UNIXTIME(? / 1000.0)
-        WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(identity.binding.runner_id.as_str())
-    .bind(identity.binding.journal_id.as_str())
-    .bind(
-        serde_json::to_string(&grant)
-            .map_err(|_| ServiceError::invalid("Runner grant encoding failed"))?,
-    )
-    .bind(start_ms)
-    .bind(deadline_ms)
-    .bind(&identity.user_id)
-    .bind(identity.attempt_id.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(persistence)?;
-    tx.commit().await.map_err(persistence)?;
-    Ok(grant)
 }
 
 pub async fn admit_runner_provider_attempt_dispatch(

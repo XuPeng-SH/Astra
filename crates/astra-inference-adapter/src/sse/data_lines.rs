@@ -1,7 +1,7 @@
 //! Incremental parsing of SSE `data: …` lines into JSON values (OpenAI-style stream).
 //!
 //! Consumers drain **blank-line** SSE events via
-//! [`super::blocks::drain_complete_sse_event_blocks`], then parse each block with
+//! [`super::blocks::SseBlankLineUtf8Buf`], then parse each block with
 //! [`json_events_from_sse_event_block`]. Any trailing bytes fall back to line-oriented
 //! [`drain_sse_data_lines`] / [`finish_sse_data_buffer`] (single-`\n` providers, partial tail).
 //! Contract tests use [`parse_sse_data_json_events`] and friends.
@@ -203,7 +203,7 @@ pub fn validated_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::blocks::drain_complete_sse_event_blocks;
+    use crate::sse::blocks::SseBlankLineUtf8Buf;
     use serde_json::json;
 
     #[test]
@@ -216,9 +216,9 @@ mod tests {
 
     #[test]
     fn json_events_from_block_matches_openai_framing() {
-        let mut buf = b"data: {\"a\":1}\n\n".to_vec();
-        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert!(buf.is_empty());
+        let mut input = SseBlankLineUtf8Buf::new();
+        let blocks = input.push_bytes(b"data: {\"a\":1}\n\n").unwrap();
+        assert!(input.into_inner().unwrap().is_empty());
         assert_eq!(blocks.len(), 1);
         let d = json_events_from_sse_event_block(&blocks[0]);
         assert_eq!(d.events, vec![json!({"a": 1})]);
@@ -227,8 +227,8 @@ mod tests {
 
     #[test]
     fn json_events_from_block_crlf_inside_block() {
-        let mut buf = b"data: {\"x\":2}\r\n\r\n".to_vec();
-        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
+        let mut input = SseBlankLineUtf8Buf::new();
+        let blocks = input.push_bytes(b"data: {\"x\":2}\r\n\r\n").unwrap();
         let d = json_events_from_sse_event_block(&blocks[0]);
         assert_eq!(d.events, vec![json!({"x": 2})]);
     }
