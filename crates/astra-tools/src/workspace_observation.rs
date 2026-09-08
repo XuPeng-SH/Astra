@@ -1232,6 +1232,12 @@ struct WorkspacePathIdentity {
 #[allow(clippy::unnecessary_cast)]
 const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
 
+#[cfg(target_os = "linux")]
+const STICKY_BIT: u32 = libc::S_ISVTX;
+
+#[cfg(target_os = "macos")]
+const STICKY_BIT: u32 = libc::S_ISVTX as u32;
+
 impl WorkspacePathIdentity {
     fn capture(path: PathBuf) -> Option<Self> {
         let metadata = fs::symlink_metadata(&path).ok()?;
@@ -1371,9 +1377,8 @@ fn stable_coordination_root() -> Option<PathBuf> {
                 continue;
             };
             let mode = metadata.mode() & 0o777;
-            let global_safe = metadata.uid() == 0
-                && metadata.mode() & (libc::S_ISVTX as u32) != 0
-                && mode & 0o002 != 0;
+            let global_safe =
+                metadata.uid() == 0 && metadata.mode() & STICKY_BIT != 0 && mode & 0o002 != 0;
             let owner_safe = metadata.uid() == effective_uid && mode & 0o022 == 0;
             if metadata.is_dir() && (global_safe || owner_safe) {
                 return Some(root);
