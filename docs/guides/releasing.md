@@ -50,16 +50,24 @@ Publication is deliberately ordered:
 7. update stable rolling Docker tags.
 
 The protected publication job uses the built-in `GITHUB_TOKEN`. Immediately
-before creating a new tag, it requires the selected source to still be the
-current `main` head. If `main` advanced during builds or approval, publication
-stops before creating a tag or versioned Docker manifest. Start a new normal
-release run from current `main`; rerunning the old candidates cannot fix this.
+before creating a new tag, it fetches the default branch and requires the
+selected source to remain reachable from `main`. Normal merges during builds
+or approval do not invalidate the candidates: the tag still points to the
+exact source selected at preflight, and publication reuses its verified
+artifacts. If the source is no longer reachable or branch history cannot be
+fetched, publication stops before creating a tag or versioned Docker manifest.
 
-This check is not an atomic lock on `main`: a concurrent update can still cause
-GitHub to reject tag creation. Existing-tag recovery remains available, but
-does not promise to overcome GitHub workflow-permission restrictions on a
-historical source. If recovery encounters that restriction, stop and inspect
-the partial publication; never move the immutable tag or overwrite its assets.
+Reachability only proves that the selected source belongs to `main` history;
+it does not prove that it still represents the branch's current intent. A
+reverted commit remains an ancestor. Before approving publication or rerunning
+older candidates, maintainers must confirm that the selected source has not
+been reverted or superseded by a decision to abandon that release.
+
+This check is not an atomic lock on `main`. GitHub token permissions and tag
+rulesets still apply, including workflow-permission restrictions on a
+historical source. If GitHub rejects tag creation or existing-tag recovery,
+inspect the error and any partial publication; never move the immutable tag
+or overwrite its assets.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its

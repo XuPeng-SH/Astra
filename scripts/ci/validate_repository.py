@@ -198,7 +198,9 @@ def main() -> None:
         encoding="utf-8"
     )
     for required in (
-        "is no longer the current ${default_branch} head",
+        'git fetch --no-tags origin "refs/heads/${default_branch}"',
+        'git merge-base --is-ancestor "${source_sha}" FETCH_HEAD',
+        "is no longer reachable from ${default_branch}",
         "No tag was created",
         "Release-Run:",
         'gh api --method POST "repos/${repository}/git/tags"',
@@ -207,7 +209,7 @@ def main() -> None:
     ):
         if required not in release_tag_reconciler:
             errors.append(
-                "scripts/reconcile-release-tag.sh: missing current-head or immutable "
+                "scripts/reconcile-release-tag.sh: missing source-ancestry or immutable "
                 f"ownership contract ({required})"
             )
 

@@ -39,17 +39,28 @@ if [ -z "${remote_tag_object}" ]; then
         exit 1
     fi
 
-    current_default_sha="$(
-        git ls-remote origin "refs/heads/${default_branch}" |
-            awk 'NR == 1 { print $1 }'
-    )"
-    if [ -z "${current_default_sha}" ]; then
-        echo "Could not resolve the current ${default_branch} head before creating ${source_tag}." >&2
+    # Refresh ancestry without changing the source selected and verified by this run.
+    if ! git fetch --no-tags origin "refs/heads/${default_branch}"; then
+        echo "Could not fetch the current ${default_branch} history before creating ${source_tag}." >&2
         exit 1
     fi
-    if [ "${current_default_sha}" != "${source_sha}" ]; then
-        echo "Release source ${source_sha} is no longer the current ${default_branch} head (${current_default_sha})." >&2
-        echo "No tag was created. Start a new normal release run from the current default branch; do not rerun these stale candidates." >&2
+    if ! git cat-file -e "${source_sha}^{commit}" 2>/dev/null; then
+        echo "Release source ${source_sha} is not present as a commit in this checkout." >&2
+        exit 1
+    fi
+    if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+        echo "Release ancestry verification requires a complete checkout (fetch-depth: 0)." >&2
+        exit 1
+    fi
+    ancestry_status=0
+    git merge-base --is-ancestor "${source_sha}" FETCH_HEAD || ancestry_status=$?
+    if [ "${ancestry_status}" -gt 1 ]; then
+        echo "Could not verify release source ancestry (git exit ${ancestry_status})." >&2
+        exit 1
+    fi
+    if [ "${ancestry_status}" -eq 1 ]; then
+        echo "Release source ${source_sha} is no longer reachable from ${default_branch}." >&2
+        echo "No tag was created. Inspect the branch history before starting a new release run." >&2
         exit 1
     fi
 
@@ -63,7 +74,7 @@ if [ -z "${remote_tag_object}" ]; then
             --jq .sha
     )"; then
         echo "GitHub refused to create ${source_tag}." >&2
-        echo "Check the publication token permissions and tag ruleset. If the default branch advanced, start a new normal release run." >&2
+        echo "Check the publication token permissions and tag ruleset, including workflow-permission restrictions for this source." >&2
         exit 1
     fi
     if ! gh api --method POST "repos/${repository}/git/refs" \
