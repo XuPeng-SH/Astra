@@ -141,6 +141,12 @@ as secrets in the `idc-publication` Environment; its deployment branch policy
 normally admits only `main`. Do not keep copies as repository or organization
 secrets.
 
+The reusable IDC candidate workflow declares both credential names, and its
+caller explicitly maps them. Keep that mapping even though the values are
+stored only in `idc-publication`: without it, the reusable jobs receive empty
+credentials. The secrets are optional at the call boundary because the caller
+does not enter the Environment; the build job checks them before use.
+
 The workflow copies the established release topology: native GitHub-hosted
 runners build each selected platform by digest and run the existing all-in-one
 smoke test. Candidates and build caches stay in the IDC-only

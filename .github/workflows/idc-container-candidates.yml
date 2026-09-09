@@ -30,6 +30,13 @@ on:
         description: JSON platform build matrix
         required: true
         type: string
+    # Values come from idc-publication after each job enters the Environment.
+    # They may be empty in the caller; the runtime credential guard is required.
+    secrets:
+      IDC_REGISTRY_USERNAME:
+        required: false
+      IDC_REGISTRY_PASSWORD:
+        required: false
 
 env:
   IMAGE_NAME: ${{ inputs.candidate_image }}

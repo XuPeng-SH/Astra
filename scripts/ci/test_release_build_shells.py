@@ -385,24 +385,46 @@ esac
         self.assertIn("source_ref=" + revisions["base"], result.stdout)
 
     def test_idc_registry_credentials_are_required_before_build(self):
-        script = workflow_run_script(
-            ".github/workflows/build_push_to_idc.yml",
-            "Require IDC registry credentials",
-        )
-        for missing in ("IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
-            with self.subTest(missing=missing):
-                env = {
-                    **os.environ,
-                    "IDC_REGISTRY_USERNAME": "release-user",
-                    "IDC_REGISTRY_PASSWORD": "release-password",
-                    missing: "",
-                }
-                result = subprocess.run(
-                    ["bash", "-c", script], env=env, capture_output=True, text=True
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Missing required IDC credential: " + missing, result.stdout)
-                self.assertNotIn("release-password", result.stdout + result.stderr)
+        for workflow in ("build_push_to_idc.yml", "idc-container-candidates.yml"):
+            script = workflow_run_script(
+                f".github/workflows/{workflow}", "Require IDC registry credentials"
+            )
+            for missing in (None, "IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
+                with self.subTest(workflow=workflow, missing=missing):
+                    env = {
+                        **os.environ,
+                        "IDC_REGISTRY_USERNAME": "release-user",
+                        "IDC_REGISTRY_PASSWORD": "release-password",
+                    }
+                    if missing:
+                        env[missing] = ""
+                    result = subprocess.run(
+                        ["bash", "-c", script], env=env, capture_output=True, text=True
+                    )
+                    if missing:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("Missing required IDC credential: " + missing, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("release-password", result.stdout + result.stderr)
+
+    def test_idc_environment_secrets_are_mapped_across_workflow_call(self):
+        caller = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
+        reusable = (ROOT / ".github/workflows/idc-container-candidates.yml").read_text()
+        call = caller.split("\n  candidates:\n", 1)[1].split("\n  stage:\n", 1)[0]
+        declaration = reusable.split("\nenv:\n", 1)[0]
+        names = {"IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"}
+        mapped = set(re.findall(r"^      (IDC_REGISTRY_\w+):", call, re.MULTILINE))
+        self.assertEqual(mapped, names)
+        self.assertNotIn("secrets: inherit", call)
+        for name in names:
+            # A name must be mapped as well as declared for GitHub to inject an
+            # Environment-only secret. A declaration alone still resolves empty.
+            self.assertIn(f"{name}: ${{{{ secrets.{name} }}}}", call)
+            self.assertIn(f"      {name}:\n        required: false", declaration)
+        for job in ("build", "smoke"):
+            block = reusable.split(f"\n  {job}:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+            self.assertIn("    environment: idc-publication\n", block)
 
     def test_idc_rejects_non_main_controller(self):
         result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")

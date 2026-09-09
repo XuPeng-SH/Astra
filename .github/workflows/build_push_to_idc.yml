@@ -143,6 +143,11 @@ jobs:
       matrix_json: ${{ needs.settings.outputs.matrix }}
       source_ref: ${{ needs.settings.outputs.source_ref }}
       source_sha: ${{ needs.settings.outputs.source_sha }}
+    # Enumerate the names so the reusable jobs can resolve their Environment
+    # secrets. The caller has no Environment; do not add repository copies.
+    secrets:
+      IDC_REGISTRY_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+      IDC_REGISTRY_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
 
   stage:
     name: Assemble verified IDC manifest
