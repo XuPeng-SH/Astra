@@ -1055,7 +1055,13 @@ a potentially billable probe. **Save without test** records
 <name>` or `astra model local check <name>` for an explicit provider test. A
 later endpoint, model, limit, or credential change invalidates prior evidence
 (the stored observation remains historical). The full picker projection of
-this state and public repair actions remain deployment gates.
+this state and public repair actions remain deployment gates. There is one
+canonical probe observation per binding, not a durable failure ledger for every
+terminal: a failed check from a different credential does not erase a known
+observation, and that terminal remains `stale`/`ready_for_check` after its
+immediate error is shown. This keeps owner-scoped configuration compact and
+avoids retaining a growing set of terminal-specific credential identities while
+still failing closed for every unverified terminal.
 
 The command surface extends existing `astra model list/show` with local `list`,
 `add`, `check`, `rotate`, `disable`, and `remove`. Each is an adapter over the same local

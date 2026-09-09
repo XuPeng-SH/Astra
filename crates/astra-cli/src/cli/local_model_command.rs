@@ -1914,6 +1914,124 @@ mod tests {
         assert_eq!(listed["models"][0]["probe_failure_code"], "http_401");
     }
 
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn two_process_probe_worker() {
+        let Some(role) = std::env::var("ASTRA_TWO_PROCESS_PROBE_ROLE").ok() else {
+            // This test is launched explicitly by the parent process below.
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(super::check(
+            &scope(),
+            ModelCheckArgs {
+                name: "work".to_string(),
+            },
+        ));
+        match role.as_str() {
+            "valid" => assert!(result.is_ok(), "{result:?}"),
+            "invalid" => {
+                let error = result.expect_err("the invalid child credential must fail");
+                assert!(error.contains("HttpStatus(401)"), "{error}");
+                let listed: serde_json::Value =
+                    serde_json::from_str(&super::list(&scope()).unwrap()).unwrap();
+                assert_eq!(listed["models"][0]["provider_probe"], "stale");
+                assert_eq!(listed["models"][0]["status"], "ready_for_check");
+            }
+            other => panic!("unexpected probe worker role {other}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn environment_probe_evidence_isolated_across_processes() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer process-valid"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer process-invalid"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let _credentials_dir = TestEnvironmentVariable::set(
+            "ASTRA_CLI_CREDENTIALS_DIR",
+            root.path().to_str().unwrap(),
+        );
+        let scope = scope();
+        let variable = "ASTRA_TEST_TERMINAL_PROVIDER_KEY";
+        add(ModelAddArgs {
+            name: Some("work".into()),
+            base_url: Some(format!("{}/v1", server.uri())),
+            provider_model: Some("coding-model".into()),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            credential_env: Some(variable.into()),
+            no_auth: false,
+            store_secret: false,
+        })
+        .unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let run_worker = |role: &str, credential: &str| {
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "cli::local_model_command::tests::two_process_probe_worker",
+                    "--nocapture",
+                ])
+                .env("ASTRA_CLI_CREDENTIALS_DIR", root.path())
+                .env("ASTRA_TWO_PROCESS_PROBE_ROLE", role)
+                .env(variable, credential)
+                .output()
+                .unwrap()
+        };
+        let valid = run_worker("valid", "process-valid");
+        assert!(
+            valid.status.success(),
+            "valid child failed: {}\n{}",
+            valid.status,
+            String::from_utf8_lossy(&valid.stderr)
+        );
+        let stored = scope.models().load().unwrap();
+        assert!(matches!(
+            stored.models["work"].probe,
+            LocalModelProbeState::Passed { .. }
+        ));
+
+        let invalid = run_worker("invalid", "process-invalid");
+        assert!(
+            invalid.status.success(),
+            "invalid child failed: {}\n{}",
+            invalid.status,
+            String::from_utf8_lossy(&invalid.stderr)
+        );
+        let stored = scope.models().load().unwrap();
+        assert!(matches!(
+            stored.models["work"].probe,
+            LocalModelProbeState::Passed { .. }
+        ));
+    }
+
     #[tokio::test]
     #[serial]
     #[cfg(unix)]
