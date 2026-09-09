@@ -1943,7 +1943,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     #[cfg(unix)]
     async fn environment_probe_evidence_isolated_across_processes() {
