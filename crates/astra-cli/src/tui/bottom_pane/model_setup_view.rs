@@ -177,33 +177,25 @@ impl ModelSetupView {
         };
         // Validate against the canonical local configuration contract before
         // closing the form; validation performs no disk or provider I/O.
-        use astra_credentials::{
-            LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig, LocalModelDefinition,
-            LocalModelProbeState,
+        let credential_ref = match &credential {
+            ModelSetupCredentialDraft::Environment { name } => {
+                astra_credentials::LocalCredentialRef::Environment { name: name.clone() }
+            }
+            ModelSetupCredentialDraft::Stored { .. } => {
+                astra_credentials::LocalCredentialRef::ProtectedFile {
+                    secret_id: "pending".into(),
+                }
+            }
+            ModelSetupCredentialDraft::None => astra_credentials::LocalCredentialRef::None,
         };
-        let definition = LocalModelDefinition {
-            protocol: LocalInferenceProtocol::OpenaiCompatible,
-            base_url: self.values[1].trim().to_string(),
-            model: self.values[2].trim().to_string(),
-            binding_revision: 1,
+        if let Err(error) = crate::cli::local_model_command::validated_local_model_definition(
+            self.values[0].trim(),
+            self.values[1].trim(),
+            self.values[2].trim(),
             context_window,
             max_output_tokens,
-            credential: match &credential {
-                ModelSetupCredentialDraft::Environment { name } => {
-                    LocalCredentialRef::Environment { name: name.clone() }
-                }
-                ModelSetupCredentialDraft::Stored { .. } => LocalCredentialRef::ProtectedFile {
-                    secret_id: "pending".into(),
-                },
-                ModelSetupCredentialDraft::None => LocalCredentialRef::None,
-            },
-            probe: LocalModelProbeState::default(),
-        };
-        let config = LocalModelConfig {
-            models: [(self.values[0].trim().to_string(), definition)].into(),
-            ..Default::default()
-        };
-        if let Err(error) = config.validate() {
+            &credential_ref,
+        ) {
             let error = match &error {
                 astra_credentials::LocalModelConfigError::Model { source, .. } => source.as_ref(),
                 _ => &error,

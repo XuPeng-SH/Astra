@@ -140,6 +140,34 @@ pub(crate) enum LocalModelCredentialInput {
     None,
 }
 
+/// Build and validate the user-facing local model fields through the same
+/// durable configuration contract used by both the CLI and the TUI. The TUI
+/// passes a placeholder protected-file reference for a secret that has not
+/// been stored yet; this function performs no I/O and only checks shape and
+/// bounds.
+pub(crate) fn validated_local_model_definition(
+    name: &str,
+    base_url: &str,
+    provider_model: &str,
+    context_window: u32,
+    max_output_tokens: u32,
+    credential: &LocalCredentialRef,
+) -> Result<LocalModelDefinition, LocalModelConfigError> {
+    let definition = LocalModelDefinition {
+        protocol: LocalInferenceProtocol::OpenaiCompatible,
+        base_url: base_url.to_owned(),
+        model: provider_model.to_owned(),
+        binding_revision: 1,
+        context_window,
+        max_output_tokens,
+        credential: credential.clone(),
+        probe: LocalModelProbeState::default(),
+    };
+    let mut config = astra_credentials::LocalModelConfig::default();
+    config.models.insert(name.to_owned(), definition.clone());
+    config.validate().map(|()| definition)
+}
+
 pub(crate) struct LocalModelCandidate {
     scope: LocalModelScope,
     name: String,
@@ -207,8 +235,7 @@ pub(crate) fn prepare_from_tui(
     credential_input: LocalModelCredentialInput,
 ) -> Result<LocalModelCandidate, String> {
     let store = scope.models();
-    let mut prospective = store.load().map_err(|error| error.to_string())?;
-    let expected_revision = prospective.revision;
+    let expected_revision = store.load().map_err(|error| error.to_string())?.revision;
     let secrets = scope.secrets();
     let (credential, created_secret) = match credential_input {
         LocalModelCredentialInput::Environment(name) => {
@@ -228,26 +255,22 @@ pub(crate) fn prepare_from_tui(
         }
         LocalModelCredentialInput::None => (LocalCredentialRef::None, None),
     };
+    let definition = validated_local_model_definition(
+        &name,
+        &base_url,
+        &provider_model,
+        context_window,
+        max_output_tokens,
+        &credential,
+    )
+    .map_err(|error| error.to_string())?;
     let candidate = LocalModelCandidate {
         scope: scope.clone(),
         expected_revision,
         name,
-        definition: LocalModelDefinition {
-            protocol: LocalInferenceProtocol::OpenaiCompatible,
-            base_url,
-            model: provider_model,
-            binding_revision: 1,
-            context_window,
-            max_output_tokens,
-            credential,
-            probe: LocalModelProbeState::default(),
-        },
+        definition,
         created_secret,
     };
-    prospective
-        .models
-        .insert(candidate.name.clone(), candidate.definition.clone());
-    prospective.validate().map_err(|error| error.to_string())?;
     Ok(candidate)
 }
 
