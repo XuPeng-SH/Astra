@@ -202,6 +202,48 @@ jobs:
           --features e2e-hooks --profile ci
           -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
 
+  macos-workspace-coordination:
+    name: "Test: macOS workspace coordination"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-test-macos-workspace-coordination
+      - name: Lint macOS workspace coordination
+        run: >-
+          cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
+          --all-targets -- -D warnings
+      - name: Initialize system Git for bounded observation probes
+        timeout-minutes: 1
+        # Checkout uses Homebrew Git, but the hardened observer selects
+        # /usr/bin/git with a cleared environment. Initialize that executable
+        # before its first use under the production two-second probe deadline.
+        # Keep the timing visible so runner startup failures are diagnosable.
+        run: |
+          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
+            -c core.untrackedCache=false rev-parse --show-toplevel
+      - name: Test macOS workspace coordination invariants
+        # Several invariants launch re-exec lock contenders while fingerprint
+        # probes deliberately have a short wall-clock deadline. Keep the module
+        # serial on shared CI hosts; the contender test supplies explicit
+        # cross-process concurrency without starving unrelated probes.
+        run: >-
+          cargo test --locked --manifest-path Cargo.toml -p astra-tools
+          workspace_observation::tests:: -- --test-threads=1
+      - name: Test macOS CLI Bash execution
+        run: >-
+          cargo test --locked --manifest-path Cargo.toml -p astra-cli
+          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
+
   # Online tests run beside the offline shards instead of waiting for an
   # unrelated compile-only job. CI keeps each live-DB lane serial; the
   # Makefile assigns services to core and runtime/plan to integration so the

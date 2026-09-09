@@ -462,12 +462,195 @@ impl WorkspaceObservationLease {
 struct GenerationTamperWatch {
     #[cfg(target_os = "linux")]
     subscription: GenerationWatchSubscription,
+    #[cfg(target_os = "macos")]
+    watcher: MacOsGenerationTamperWatch,
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsGenerationTamperWatch {
+    kqueue: std::os::fd::OwnedFd,
+    _watched_paths: Vec<std::fs::File>,
+    tampered: std::sync::atomic::AtomicBool,
+    poll_gate: std::sync::Mutex<()>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsGenerationTamperWatch {
+    fn arm(
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> std::io::Result<Self> {
+        Self::arm_before_register(locks, binding_paths, cancel_token, || {})
+    }
+
+    fn arm_before_register(
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
+        cancel_token: Option<&CancellationToken>,
+        before_register: impl FnOnce(),
+    ) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let lock_mask = libc::NOTE_ATTRIB
+            | libc::NOTE_DELETE
+            | libc::NOTE_EXTEND
+            | libc::NOTE_LINK
+            | libc::NOTE_RENAME
+            | libc::NOTE_REVOKE
+            | libc::NOTE_WRITE;
+        let binding_mask = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+        // Duplicate the admitted witness descriptions instead of resolving
+        // their replaceable pathnames again.
+        let mut specifications = locks
+            .iter()
+            .map(|lock| Ok((lock.file.try_clone()?, lock_mask)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for identity in binding_paths {
+            let file = Self::open_binding_descriptor(&identity, || {})?;
+            specifications.push((file, binding_mask));
+        }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "workspace generation watch registration was cancelled",
+            ));
+        }
+
+        let raw_kqueue = unsafe { libc::kqueue() };
+        if raw_kqueue < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let kqueue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_kqueue) };
+        if unsafe { libc::fcntl(raw_kqueue, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        before_register();
+        let mut watched_paths = Vec::with_capacity(specifications.len());
+        for (file, mask) in specifications {
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "workspace generation watch registration was cancelled",
+                ));
+            }
+            let change = libc::kevent {
+                ident: file.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: mask,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe {
+                libc::kevent(
+                    kqueue.as_raw_fd(),
+                    &raw const change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            } < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            watched_paths.push(file);
+        }
+
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "workspace generation watch registration was cancelled",
+            ));
+        }
+        Ok(Self {
+            kqueue,
+            _watched_paths: watched_paths,
+            tampered: std::sync::atomic::AtomicBool::new(false),
+            poll_gate: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn open_binding_descriptor(
+        identity: &WorkspacePathIdentity,
+        before_validate: impl FnOnce(),
+    ) -> std::io::Result<fs::File> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut options = fs::OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_EVTONLY
+                | libc::O_CLOEXEC
+                | if identity.file_type == libc::S_IFLNK as u32 {
+                    libc::O_SYMLINK
+                } else {
+                    libc::O_NOFOLLOW
+                },
+        );
+        let file = options.open(&identity.path)?;
+        before_validate();
+        let metadata = file.metadata()?;
+        if metadata.dev() != identity.device
+            || metadata.ino() != identity.inode
+            || metadata.mode() & FILE_TYPE_MASK != identity.file_type
+        {
+            return Err(std::io::Error::other(
+                "workspace watch descriptor identity changed",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn is_untampered(&self) -> bool {
+        self.is_untampered_before_poll(|| {})
+    }
+
+    fn is_untampered_before_poll(&self, before_poll: impl FnOnce()) -> bool {
+        use std::os::fd::AsRawFd;
+
+        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        before_poll();
+        let Ok(_poll_guard) = self.poll_gate.lock() else {
+            self.tampered
+                .store(true, std::sync::atomic::Ordering::Release);
+            return false;
+        };
+        // Another validator may have consumed the event while we waited.
+        // EV_CLEAR's empty queue must never undo permanent revocation.
+        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let event_count = unsafe {
+            libc::kevent(
+                self.kqueue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &raw mut event,
+                1,
+                &raw const timeout,
+            )
+        };
+        if event_count != 0 {
+            self.tampered
+                .store(true, std::sync::atomic::Ordering::Release);
+            return false;
+        }
+        true
+    }
 }
 
 impl GenerationTamperWatch {
     fn arm(
-        lock_paths: impl IntoIterator<Item = PathBuf>,
-        binding_paths: impl IntoIterator<Item = PathBuf>,
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
         cancel_token: Option<&CancellationToken>,
     ) -> std::io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -479,13 +662,13 @@ impl GenerationTamperWatch {
                 | libc::IN_UNMOUNT;
             let binding_mask = libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_UNMOUNT;
             let mut specifications = HashMap::<PathBuf, u32>::new();
-            for path in lock_paths {
+            for path in locks.iter().map(|lock| lock.path.clone()) {
                 specifications
                     .entry(path)
                     .and_modify(|mask| *mask |= lock_mask)
                     .or_insert(lock_mask);
             }
-            for path in binding_paths {
+            for path in binding_paths.into_iter().map(|identity| identity.path) {
                 // Only self-removal/rebinding is generation tamper. Ordinary
                 // writes below a watched workspace directory legitimately
                 // change that directory's metadata and must remain receiptable.
@@ -503,9 +686,15 @@ impl GenerationTamperWatch {
             )?;
             Ok(Self { subscription })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            let _ = (lock_paths, binding_paths, cancel_token);
+            Ok(Self {
+                watcher: MacOsGenerationTamperWatch::arm(locks, binding_paths, cancel_token)?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (locks, binding_paths, cancel_token);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "workspace generation tamper watch is unavailable",
@@ -518,7 +707,11 @@ impl GenerationTamperWatch {
         {
             self.subscription.is_untampered()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.watcher.is_untampered()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             false
         }
@@ -1177,7 +1370,7 @@ enum CrossProcessLockMode {
 }
 
 struct CrossProcessFileLock {
-    // Linux abstract-UDS names are kernel-owned and cannot be unlinked or
+    // The platform namespace is kernel-owned and cannot be unlinked or
     // renamed by a same-UID tool. The file remains a separate receipt-
     // integrity witness; neither layer trusts peer-controlled contents.
     _kernel_namespace: CrossProcessKernelLock,
@@ -1196,9 +1389,11 @@ struct CrossProcessFileLock {
 struct CrossProcessKernelLock {
     #[cfg(target_os = "linux")]
     _fd: std::os::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    _coordination_root: std::fs::File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkspacePathIdentity {
     path: PathBuf,
     #[cfg(unix)]
@@ -1334,23 +1529,34 @@ impl CrossProcessFileLock {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trusted_sticky_coordination_root(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    #[allow(clippy::unnecessary_cast)]
+    let sticky_bit = libc::S_ISVTX as u32;
+    metadata.is_dir()
+        && metadata.uid() == 0
+        && metadata.mode() & sticky_bit != 0
+        && metadata.mode() & 0o002 != 0
+}
+
 fn stable_coordination_root() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use std::os::unix::fs::MetadataExt;
+        #[cfg(target_os = "linux")]
         let root = PathBuf::from("/tmp");
+        // `/tmp` is a symlink on macOS. Use its root-owned sticky target so
+        // path validation and the OFD namespace both bind a stable inode.
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
         let metadata = fs::symlink_metadata(&root).ok()?;
         // A root-owned sticky directory is the only unprivileged namespace in
         // which a different OS user cannot unlink this user's lock file. If a
         // host does not provide that contract, mutation execution is rejected
         // rather than silently falling back to a workspace-local generation.
-        (metadata.is_dir()
-            && metadata.uid() == 0
-            && metadata.mode() & libc::S_ISVTX != 0
-            && metadata.mode() & 0o002 != 0)
-            .then_some(root)
+        trusted_sticky_coordination_root(&metadata).then_some(root)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // No cross-user stable namespace has been established for this
         // platform. Callers fail closed and do not claim receipt authority.
@@ -1556,6 +1762,25 @@ fn locked_coordination_file(
 /// tool to unlink/rename, are unique across OS users, and disappear when the
 /// last owning descriptor closes (including process crash). An existing bind
 /// is only a contention fact; no bytes or peer identity are trusted.
+#[cfg(target_os = "macos")]
+fn macos_coordination_offset(namespace_key: &str) -> libc::off_t {
+    let digest = Sha256::digest(namespace_key.as_bytes());
+    let mut offset_bytes = [0_u8; 8];
+    offset_bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(offset_bytes) & i64::MAX as u64).max(1) as libc::off_t
+}
+
+#[cfg(target_os = "macos")]
+fn macos_coordination_record_lock(offset: libc::off_t, lock_type: libc::c_short) -> libc::flock {
+    libc::flock {
+        l_start: offset,
+        l_len: 1,
+        l_pid: 0,
+        l_type: lock_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    }
+}
+
 fn try_acquire_kernel_coordination_namespace(
     namespace_key: &str,
 ) -> std::io::Result<Option<CrossProcessKernelLock>> {
@@ -1607,13 +1832,88 @@ fn try_acquire_kernel_coordination_namespace(
         }
         Err(error)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        // Darwin has no abstract Unix-domain socket namespace. Instead, use
+        // one byte in the stable root directory's vnode as a deterministic
+        // kernel namespace. Admission first reserves the byte with a retained
+        // OFD read lock, then probes for a hypothetical write lock. F_OFD_GETLK
+        // ignores the calling open file description, but observes a competing
+        // description's read lock. Therefore concurrent contenders may both
+        // retreat, but cannot both be admitted; the outer acquisition loop uses
+        // process-diverse jitter to restore liveness. OFD locks are descriptor-
+        // scoped and disappear on close or process crash.
+        let root = stable_coordination_root().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trusted macOS workspace coordination root is unavailable",
+            )
+        })?;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY);
+        let file = options.open(&root)?;
+        let metadata = file.metadata()?;
+        if !trusted_sticky_coordination_root(&metadata) || metadata.nlink() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trusted macOS workspace coordination root changed during admission",
+            ));
+        }
+
+        let offset = macos_coordination_offset(namespace_key);
+        let mut reservation =
+            macos_coordination_record_lock(offset, libc::F_RDLCK as libc::c_short);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut reservation) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+
+        let mut probe = macos_coordination_record_lock(offset, libc::F_WRLCK as libc::c_short);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &raw mut probe) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if probe.l_type != libc::F_UNLCK as libc::c_short {
+            return Ok(None);
+        }
+        Ok(Some(CrossProcessKernelLock {
+            _coordination_root: file,
+        }))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = namespace_key;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "kernel workspace coordination namespace is unavailable",
         ))
+    }
+}
+
+fn kernel_coordination_retry_delay() -> Duration {
+    #[cfg(target_os = "macos")]
+    {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // This only breaks lock-step contender retries; no authority or
+        // cryptographic decision depends on the mixed value being unpredictable.
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut mixed =
+            sequence ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        Duration::from_micros(1_000 + mixed % 9_000)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Duration::from_millis(5)
     }
 }
 
@@ -1650,7 +1950,7 @@ async fn acquire_cross_process_lock_async(
             Err(_) => return None,
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let delay = tokio::time::sleep(remaining.min(Duration::from_millis(5)));
+        let delay = tokio::time::sleep(remaining.min(kernel_coordination_retry_delay()));
         tokio::pin!(delay);
         if let Some(cancel_token) = cancel_token {
             tokio::select! {
@@ -1717,7 +2017,7 @@ fn acquire_cross_process_lock_sync(
             Ok(None) => {}
             Err(_) => return None,
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(kernel_coordination_retry_delay());
     };
     let file = open_coordination_lock(&specification.witness_path)?;
     loop {
@@ -1864,10 +2164,6 @@ async fn acquire_workspace_lease_async(
         };
         locks.push(lock);
     }
-    let watch_lock_paths = locks
-        .iter()
-        .map(|lock| lock.path.clone())
-        .collect::<Vec<_>>();
     let watch_binding_paths = binding_identity
         .path_components
         .iter()
@@ -1875,25 +2171,22 @@ async fn acquire_workspace_lease_async(
         // Watching `/tmp` itself would let unrelated users' traffic revoke
         // every active lease.
         .filter(|identity| !trusted_coordination_root.starts_with(&identity.path))
-        .map(|identity| identity.path.clone())
+        .cloned()
         .collect::<Vec<_>>();
     let watcher_cancel = cancel_token.cloned();
     let tamper_watch = tokio::task::spawn_blocking(move || {
-        let tamper_watch = GenerationTamperWatch::arm(
-            watch_lock_paths,
-            watch_binding_paths,
-            watcher_cancel.as_ref(),
-        )?;
+        let tamper_watch =
+            GenerationTamperWatch::arm(&locks, watch_binding_paths, watcher_cancel.as_ref())?;
         if !tamper_watch.is_untampered() {
             return Err(std::io::Error::other(
                 "workspace generation watcher was revoked before admission completed",
             ));
         }
-        Ok(tamper_watch)
+        Ok((tamper_watch, locks))
     })
     .await;
-    let tamper_watch = match tamper_watch {
-        Ok(Ok(tamper_watch)) => tamper_watch,
+    let (tamper_watch, locks) = match tamper_watch {
+        Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
@@ -2012,12 +2305,12 @@ fn acquire_workspace_lease_sync(
         locks.push(lock);
     }
     let tamper_watch = GenerationTamperWatch::arm(
-        locks.iter().map(|lock| lock.path.clone()),
+        &locks,
         binding_identity
             .path_components
             .iter()
             .filter(|identity| !trusted_coordination_root.starts_with(&identity.path))
-            .map(|identity| identity.path.clone()),
+            .cloned(),
         cancel_token,
     );
     let tamper_watch = match tamper_watch {
@@ -4329,7 +4622,7 @@ mod tests {
                     .expect("child acquires recursive writer barrier");
                 fs::write(marker, "owned by recursive writer").expect("child write");
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             "kernel-namespace-holder" => {
                 let (specifications, _) = workspace_coordination_lock_specs(
                     Path::new(&root),
@@ -4348,6 +4641,83 @@ mod tests {
                     .collect::<Vec<_>>();
                 fs::write(marker, "kernel namespace held").expect("child marker");
                 std::thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-parent-flock-holder" => {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let gate = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+                    .open("/private")
+                    .expect("open parent directory flock target");
+                fs2::FileExt::try_lock_exclusive(&gate)
+                    .expect("hold external parent directory flock");
+                fs::write(marker, "parent flock held").expect("child marker");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-raw-record-lock-holder" => {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let (specifications, _) = workspace_coordination_lock_specs(
+                    Path::new(&root),
+                    CoordinationLockKind::Observation,
+                )
+                .expect("coordination specifications");
+                let coordination_root =
+                    stable_coordination_root().expect("trusted coordination root");
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+                    .open(coordination_root)
+                    .expect("open coordination root");
+                for specification in specifications {
+                    let mut lock = macos_coordination_record_lock(
+                        macos_coordination_offset(&specification.kernel_namespace_key),
+                        libc::F_RDLCK as libc::c_short,
+                    );
+                    assert_eq!(
+                        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock,) },
+                        0,
+                        "raw external record lock"
+                    );
+                }
+                fs::write(marker, "raw record locks held").expect("child marker");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-simultaneous-contender" => {
+                let marker = PathBuf::from(marker);
+                let control = marker.parent().expect("contender control directory");
+                let start = control.join("start");
+                let active = control.join("active");
+                let overlap = control.join("overlap");
+                fs::write(&marker, "ready").expect("contender ready marker");
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !start.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(start.exists(), "contender start signal timed out");
+
+                let lease = acquire_workspace_observation_lease_sync(
+                    Path::new(&root),
+                    Duration::from_secs(5),
+                )
+                .expect("simultaneous contender eventually acquires lease");
+                let owns_sentinel = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&active)
+                    .is_ok();
+                if !owns_sentinel {
+                    fs::write(&overlap, "overlap observed").expect("overlap marker");
+                }
+                assert!(owns_sentinel, "two workspace generations overlapped");
+                std::thread::sleep(Duration::from_millis(100));
+                fs::remove_file(active).expect("release active-generation sentinel");
+                drop(lease);
             }
             other => panic!("unknown helper mode: {other}"),
         }
@@ -5397,7 +5767,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn same_uid_lock_replacement_cannot_admit_a_second_process_generation() {
         use std::os::unix::fs::PermissionsExt;
@@ -5440,7 +5810,7 @@ mod tests {
         assert_eq!(fs::read_to_string(marker).unwrap(), "owned by mutation");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn untrusted_kernel_prebind_wait_is_cancelable_and_never_authoritative() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5466,7 +5836,7 @@ mod tests {
             )
             .await
             .is_none(),
-            "an existing abstract name is only contention and never trusted authority"
+            "an existing kernel name is only contention and never trusted authority"
         );
         drop(blocker);
         assert!(
@@ -5481,7 +5851,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn kernel_namespace_is_released_by_holder_crash_and_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5509,7 +5879,7 @@ mod tests {
         let _ = child.wait().unwrap();
         assert!(
             acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1)).is_some(),
-            "kernel-owned abstract names must disappear when a holder crashes"
+            "kernel-owned names must disappear when a holder crashes"
         );
     }
 
@@ -5568,8 +5938,12 @@ mod tests {
 
         assert!(!temp.path().join(".astra").exists());
         assert!(!lease.locks.is_empty());
+        let coordination_root = stable_coordination_root().expect("stable coordination root");
         assert!(
-            lease.locks.iter().all(|lock| lock.path.starts_with("/tmp")),
+            lease
+                .locks
+                .iter()
+                .all(|lock| lock.path.starts_with(&coordination_root)),
             "coordination files must be outside the tool-writable workspace"
         );
         assert!(lease.integrity_valid());
@@ -5583,7 +5957,7 @@ mod tests {
         assert!(stable_coordination_root().is_some());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unrelated_sticky_root_activity_does_not_revoke_generation() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -5591,7 +5965,9 @@ mod tests {
             acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1))
                 .expect("lease");
 
-        let unrelated = tempfile::tempdir_in("/tmp").expect("unrelated tempdir");
+        let unrelated =
+            tempfile::tempdir_in(stable_coordination_root().expect("stable coordination root"))
+                .expect("unrelated tempdir");
         fs::write(unrelated.path().join("traffic"), "unrelated").unwrap();
         drop(unrelated);
 
@@ -5601,7 +5977,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn ordinary_workspace_write_preserves_generation_integrity() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -5928,7 +6304,7 @@ mod tests {
         drop(replacement);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn transient_lock_generation_split_is_sticky_even_after_inode_restore() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6042,7 +6418,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn transient_parent_replacement_is_detected_after_original_is_restored() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6115,7 +6491,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sequential_cross_uid_generations_share_global_mutex_not_integrity_witness() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -6175,7 +6551,7 @@ mod tests {
                 Duration::from_millis(25),
             )
             .is_none(),
-            "a different UID witness must not bypass the global abstract-UDS mutex"
+            "a different UID witness must not bypass the global kernel mutex"
         );
         drop(first);
         let second = acquire_cross_process_lock_sync(
@@ -6198,7 +6574,237 @@ mod tests {
         assert!(!missing.join(".astra").exists());
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_coordination_supports_independent_workspace_generations() {
+        let root = stable_coordination_root().expect("trusted macOS coordination root");
+        assert_eq!(root, Path::new("/private/tmp"));
+
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+        let first = acquire_workspace_observation_lease_sync(
+            first_workspace.path(),
+            Duration::from_secs(1),
+        )
+        .expect("first workspace generation");
+        let second = acquire_workspace_observation_lease_sync(
+            second_workspace.path(),
+            Duration::from_secs(1),
+        )
+        .expect("independent workspace generation");
+        assert!(first.integrity_valid());
+        assert!(second.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_witness_watch_retains_admitted_inode_across_path_substitution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
+                .unwrap();
+        let witness = &lease.locks[0].path;
+        let aside = witness.with_extension("review-original");
+        let substitute = witness.with_extension("review-substitute");
+        fs::rename(witness, &aside).unwrap();
+        fs::write(witness, "").unwrap();
+        let watch =
+            MacOsGenerationTamperWatch::arm_before_register(&lease.locks, Vec::new(), None, || {
+                fs::rename(witness, &substitute).unwrap();
+                fs::rename(&aside, witness).unwrap();
+            })
+            .unwrap();
+        assert!(watch.is_untampered(), "restoration preceded registration");
+        fs::write(witness, "tamper").unwrap();
+        fs::write(witness, "").unwrap();
+        assert!(!watch.is_untampered(), "must observe A, not substituted B");
+        assert!(!watch.is_untampered());
+        fs::remove_file(substitute).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_binding_descriptor_rejects_substitution_after_path_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("binding");
+        let aside = temp.path().join("original");
+        let substitute = temp.path().join("substitute");
+        fs::create_dir(&path).unwrap();
+        let identity = WorkspacePathIdentity::capture(path.clone()).unwrap();
+        fs::rename(&path, &aside).unwrap();
+        fs::create_dir(&path).unwrap();
+        let result = MacOsGenerationTamperWatch::open_binding_descriptor(&identity, || {
+            fs::rename(&path, &substitute).unwrap();
+            fs::rename(&aside, &path).unwrap();
+        });
+        assert!(identity.is_unchanged());
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_concurrent_validators_keep_event_revocation_sticky() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
+                .unwrap();
+        let watch = &lease.tamper_watch.watcher;
+        let witness = &lease.locks[0].path;
+        fs::write(witness, "tamper").unwrap();
+        fs::write(witness, "").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let barrier = &barrier;
+        let (drained, wait_drained) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let result = watch.is_untampered_before_poll(|| {
+                    barrier.wait();
+                });
+                drained.send(()).unwrap();
+                result
+            });
+            let second = scope.spawn(move || {
+                watch.is_untampered_before_poll(|| {
+                    barrier.wait();
+                    wait_drained.recv().unwrap();
+                })
+            });
+            assert!(!first.join().unwrap());
+            assert!(!second.join().unwrap());
+        });
+        assert!(!lease.integrity_valid());
+        assert!(!lease.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_parent_directory_flock_does_not_block_workspace_admission() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let marker = workspace.path().join("parent-flock-ready");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, workspace.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "macos-parent-flock-holder")
+            .spawn()
+            .expect("spawn external parent-flock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "parent-flock holder did not become ready");
+
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1));
+        child.kill().expect("stop parent-flock holder");
+        let _ = child.wait().expect("reap parent-flock holder");
+        assert!(
+            lease.is_some(),
+            "an unrelated flock on /private must not block every workspace namespace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_raw_record_lock_is_workspace_scoped_and_released_on_crash() {
+        let workspace = tempfile::tempdir().expect("contended workspace");
+        let independent = tempfile::tempdir().expect("independent workspace");
+        let marker = workspace.path().join("raw-record-lock-ready");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, workspace.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "macos-raw-record-lock-holder")
+            .spawn()
+            .expect("spawn raw record-lock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            marker.exists(),
+            "raw record-lock holder did not become ready"
+        );
+
+        assert!(
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_millis(50),)
+                .is_none(),
+            "an externally held namespace byte must reject a second generation"
+        );
+        let independent_lease =
+            acquire_workspace_observation_lease_sync(independent.path(), Duration::from_secs(1));
+        child.kill().expect("crash raw record-lock holder");
+        let _ = child.wait().expect("reap raw record-lock holder");
+        assert!(
+            independent_lease.is_some(),
+            "a record lock must contend only its derived workspace byte"
+        );
+        assert!(
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1),)
+                .is_some(),
+            "the raw record lock must disappear when its holder crashes"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_simultaneous_contenders_never_overlap_and_make_progress() {
+        let temp = tempfile::tempdir().expect("test root");
+        let workspace = temp.path().join("workspace");
+        let control = temp.path().join("control");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&control).expect("control directory");
+        let first_marker = control.join("first-ready");
+        let second_marker = control.join("second-ready");
+        let spawn_contender = |marker: &Path| {
+            Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(
+                    "workspace_observation::tests::cross_process_workspace_observation_lease_helper",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CROSS_PROCESS_LEASE_HELPER_ENV, &workspace)
+                .env(CROSS_PROCESS_LEASE_MARKER_ENV, marker)
+                .env(
+                    CROSS_PROCESS_LEASE_MODE_ENV,
+                    "macos-simultaneous-contender",
+                )
+                .spawn()
+                .expect("spawn simultaneous contender")
+        };
+        let mut first = spawn_contender(&first_marker);
+        let mut second = spawn_contender(&second_marker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (!first_marker.exists() || !second_marker.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            first_marker.exists() && second_marker.exists(),
+            "both contenders must reach the start barrier"
+        );
+        fs::write(control.join("start"), "go").expect("release contenders");
+
+        let first_status = first.wait().expect("wait for first contender");
+        let second_status = second.wait().expect("wait for second contender");
+        assert!(
+            first_status.success(),
+            "first contender failed: {first_status}"
+        );
+        assert!(
+            second_status.success(),
+            "second contender failed: {second_status}"
+        );
+        assert!(
+            !control.join("overlap").exists(),
+            "two workspace generations obtained authority simultaneously"
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn platform_without_stable_tamper_watch_refuses_receipt_authority() {
         let temp = tempfile::tempdir().expect("tempdir");
