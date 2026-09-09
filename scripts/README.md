@@ -40,6 +40,12 @@ The repository validator covers local documentation links, JSON and shell
 syntax, pinned GitHub Actions, mirrored agent instructions, accidental tracked
 artifacts, executable script modes, and monitoring metric references.
 
+Rust CI installs mold using only the runner's Ubuntu sources (`ubuntu.sources`,
+or `sources.list` on older images). Third-party repository outages therefore do
+not block linker setup. These APT options apply only to the install step, retain
+signature and package integrity verification, and keep Ubuntu download failures
+fatal; they do not modify the runner's source configuration.
+
 Rust CI uses `scripts/ci/configure-sccache.sh` to probe the optional compiler
 cache before enabling it. Backend startup failures fall back to direct `rustc`,
 and sccache's native I/O fallback covers interruptions after startup. The

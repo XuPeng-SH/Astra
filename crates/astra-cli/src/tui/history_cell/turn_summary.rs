@@ -70,7 +70,7 @@ impl HistoryCell for TurnSummaryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let theme = crate::tui::theme::current();
         let label = Style::default().fg(theme.dim);
-        let value = Style::default().fg(theme.selected_fg);
+        let value = Style::default().fg(theme.fg);
         let sections = self.sections(label, value);
         if sections.is_empty() {
             return Vec::new();

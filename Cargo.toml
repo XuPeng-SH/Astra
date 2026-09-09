@@ -27,6 +27,7 @@ members = [
     "crates/astra-mcp",
     "crates/astra-memoria",
 ]
+exclude = ["vendor/crossterm"]
 resolver = "2"
 
 [workspace.package]
@@ -136,3 +137,7 @@ opt-level = 1
 
 [profile.release]
 strip = "symbols"
+
+# Local startup-query prototype; see vendor/crossterm/ASTRA-PATCH.md.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

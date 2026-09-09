@@ -62,8 +62,22 @@ pub(crate) async fn finalize_session_exit(
 
     if let Some((label, command)) = resume_hint {
         eprintln!();
-        eprintln!("{}", format!("  {label}").dim());
-        eprintln!("{}", format!("    {command}").cyan());
+        if std::env::var_os("NO_COLOR").is_some()
+            || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+        {
+            eprintln!("  {label}");
+            eprintln!("    {command}");
+        } else {
+            let palette = crate::tui::current_stderr_theme();
+            eprintln!(
+                "{}",
+                format!("  {label}").with(crate::tui::to_crossterm_color(palette.dim))
+            );
+            eprintln!(
+                "{}",
+                format!("    {command}").with(crate::tui::to_crossterm_color(palette.accent))
+            );
+        }
     }
 
     if should_clear_last_session_id(reason)

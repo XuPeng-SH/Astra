@@ -4915,6 +4915,8 @@ pub(crate) async fn run_tui_session(
     // Previous astra crashes may leave terminal in raw mode, causing
     // startup eprintln output to lose carriage returns.
     let _ = crossterm::terminal::disable_raw_mode();
+    let mut startup_terminal = super::terminal_startup::StartupTerminal::begin()
+        .map_err(|error| format!("Terminal startup failed: {error}"))?;
 
     // ── Initialize the gradient gutter time origin (PR #335) ─────────
     // Without this, the first cell to finalize before any
@@ -4931,16 +4933,23 @@ pub(crate) async fn run_tui_session(
     tracer.phase("cached_auth");
     let mut state = initialize_session_state(profile, initial_model, cli_context);
     tracer.phase("state_init");
-    let startup = complete_session_startup(
-        &mut state,
-        &mut tracer,
-        api,
-        profile,
-        resume_session_id,
-        no_instructions,
-        cli_context,
-    )
-    .await?;
+    let startup = tokio::select! {
+        biased;
+        _ = startup_terminal.interrupted() => {
+            // Restore immediately, before session cleanup or error output.
+            drop(startup_terminal);
+            return Err("Session startup interrupted (Ctrl-C)".to_string());
+        }
+        result = complete_session_startup(
+            &mut state,
+            &mut tracer,
+            api,
+            profile,
+            resume_session_id,
+            no_instructions,
+            cli_context,
+        ) => result?,
+    };
     let SessionStartupArtifacts {
         pipeline_modules,
         mut edge_heartbeat_task,
@@ -4952,7 +4961,10 @@ pub(crate) async fn run_tui_session(
     // Take terminal ownership before spawning any TUI-owned worker. If the
     // terminal vanished during startup, retire the startup-owned runtime now
     // instead of detaching heartbeat/agent work from a TUI that never ran.
-    let mut guard = match TerminalGuard::init() {
+    let mut guard = match startup_terminal
+        .prepare_tui()
+        .and_then(|()| TerminalGuard::init())
+    {
         Ok(guard) => guard,
         Err(error) => {
             if let Some(spawner) = state.agent_spawner.take() {
@@ -4979,10 +4991,14 @@ pub(crate) async fn run_tui_session(
             return Err(format!("TUI init failed: {error}"));
         }
     };
+    startup_terminal.handoff();
     let session_shutdown_token = tokio_util::sync::CancellationToken::new();
     let shutdown_monitor_token = session_shutdown_token.clone();
     let mut shutdown_monitor = tokio::spawn(async move {
-        let signal = await_shutdown_signal(shutdown_signal_rx).await;
+        let signal = tokio::select! {
+            signal = await_shutdown_signal(shutdown_signal_rx) => signal,
+            _ = startup_terminal.interrupted() => crate::cli::session::session_guard::ShutdownSignal::Sigint,
+        };
         shutdown_monitor_token.cancel();
         signal
     });

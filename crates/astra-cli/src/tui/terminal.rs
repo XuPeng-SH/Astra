@@ -121,13 +121,8 @@ impl TerminalGuard {
         // the event loop to blit on a paused screen instead of writing bytes the
         // render loop would paint over. Cleared in Drop.
         astra_tools::display_sixel::set_tui_active(true);
-        // Probe sixel support once, now — raw mode is on and the event-loop input
-        // reader hasn't started, so it's safe to read the DA1 reply directly.
-        // Cached so display_sixel skips the image (with a message) on terminals
-        // that would only show a blank box.
-        astra_tools::display_sixel::set_sixel_supported(
-            astra_tools::display_sixel::probe_sixel_support(),
-        );
+        // Startup queried DA1 together with terminal colors through crossterm.
+        // Do not open another reader here: it could consume keys or late OSC replies.
         std::mem::forget(early_guard);
         Ok(guard)
     }

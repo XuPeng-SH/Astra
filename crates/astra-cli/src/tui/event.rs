@@ -44,7 +44,14 @@ impl TuiEventStream {
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         loop {
-            match Pin::new(&mut self.crossterm_stream).poll_next(cx) {
+            let event = Pin::new(&mut self.crossterm_stream).poll_next(cx);
+            #[cfg(unix)]
+            if let Some(params) = crossterm::event::cached_primary_device_attributes() {
+                astra_tools::display_sixel::set_sixel_supported(
+                    params.iter().skip(1).any(|&param| param == 4),
+                );
+            }
+            match event {
                 Poll::Ready(Some(Ok(event))) => {
                     if let Some(mapped) = map_crossterm_event(event) {
                         return Poll::Ready(Some(mapped));

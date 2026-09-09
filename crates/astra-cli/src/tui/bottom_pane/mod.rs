@@ -2133,7 +2133,7 @@ impl BottomPane {
             .fg(theme.accent)
             .bg(bg)
             .add_modifier(Modifier::BOLD);
-        let tail_style = Style::default().fg(theme.fg).bg(bg);
+        let tail_style = panel;
         let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
 
         let preview_rows = (area.height as usize).saturating_sub(1);
@@ -2205,7 +2205,7 @@ impl BottomPane {
             .fg(theme.accent)
             .bg(bg)
             .add_modifier(Modifier::BOLD);
-        let tail_style = Style::default().fg(theme.fg).bg(bg);
+        let tail_style = panel;
         let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
         let preview_rows = (area.height as usize).saturating_sub(1);
         for (idx, text) in self
