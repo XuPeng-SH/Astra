@@ -255,15 +255,25 @@ pub(crate) fn prepare_from_tui(
         }
         LocalModelCredentialInput::None => (LocalCredentialRef::None, None),
     };
-    let definition = validated_local_model_definition(
+    let definition = match validated_local_model_definition(
         &name,
         &base_url,
         &provider_model,
         context_window,
         max_output_tokens,
         &credential,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(definition) => definition,
+        Err(error) => {
+            // The protected secret is created before the pure validation so
+            // the candidate can own it during its lifetime. If validation
+            // fails before that candidate exists, clean it up explicitly.
+            if let Some(secret_id) = created_secret.as_deref() {
+                let _ = secrets.remove(secret_id);
+            }
+            return Err(error.to_string());
+        }
+    };
     let candidate = LocalModelCandidate {
         scope: scope.clone(),
         expected_revision,
@@ -1524,6 +1534,35 @@ mod tests {
                 "failed validation/load must not orphan newly created secrets"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn invalid_tui_candidate_removes_secret_created_before_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let _override = astra_credentials::set_test_credentials_dir(root.path().to_path_buf());
+        let scope = scope();
+        let error = match prepare_from_tui(
+            &scope,
+            "work".into(),
+            "not-a-provider-url".into(),
+            "coding-model".into(),
+            128_000,
+            8_192,
+            LocalModelCredentialInput::Stored("canary-key".into()),
+        ) {
+            Ok(_) => panic!("invalid candidate must not be prepared"),
+            Err(error) => error,
+        };
+        assert!(error.contains("base URL"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(scope.root().join("model-secrets"))
+                .unwrap()
+                .count(),
+            0,
+            "validation failure must not orphan a newly created secret"
+        );
     }
 
     #[test]
