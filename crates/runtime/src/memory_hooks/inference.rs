@@ -70,6 +70,8 @@ where
 /// Server-only direct-provider implementation of [`MemoryInferencePort`].
 #[derive(Clone)]
 pub(crate) struct DirectMemoryInferenceClient {
+    pub(crate) fixed_temperature: Option<f64>,
+    pub(crate) thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) model_name: String,
@@ -84,6 +86,8 @@ pub(crate) struct DirectMemoryInferenceClient {
 impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            fixed_temperature: self.fixed_temperature,
+            thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
             api_key: &self.api_key,
@@ -159,6 +163,8 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
             )
         })?;
         let direct = DirectMemoryInferenceClient {
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
             base_url: execution.base_url.clone(),
             api_key: execution.api_key.clone(),
             model_name: execution.model_name.clone(),
@@ -255,6 +261,8 @@ mod tests {
 
     fn direct_client() -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-test".into(),
             model_name: "qwen-flash".into(),

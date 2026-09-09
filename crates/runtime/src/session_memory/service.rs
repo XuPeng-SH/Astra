@@ -2213,6 +2213,8 @@ mod tests {
         )
         .await;
         let selector = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "semantic-selector".to_string(),
@@ -3109,6 +3111,8 @@ mod tests {
         // empty. We degrade to the deterministic rule-fallback path and
         // persist a session-memory snapshot instead of skipping the whole run.
         let selector_params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector".to_string(),
@@ -3189,6 +3193,8 @@ mod tests {
         )
         .await;
         let first = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "selector-first".to_string(),
@@ -3200,6 +3206,8 @@ mod tests {
             request_timeout: None,
         };
         let second = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{failing_url}/v1"),
             model_name: "selector-second".to_string(),
             ..first.clone()
@@ -3456,6 +3464,8 @@ mod tests {
         // the test).
         let memoria = Arc::new(CapturingMemoria::default());
         let selector_params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector-leak".to_string(),

@@ -862,6 +862,8 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub model_name: &'a str,
     pub wire_model_name: Option<&'a str>,
     pub api_key: &'a str,
@@ -880,6 +882,8 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
             api_key: &execution.api_key,
@@ -909,6 +913,9 @@ pub(crate) struct OwnedLlmExecutionRoute {
     /// Capability established at model admission. Auxiliary callers may use
     /// it to select a compatible bounded-reasoning request, never a heuristic.
     pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
+    /// Mode-independent fixed temperature admitted with the Offering.
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub header_overrides: HashMap<String, String>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub completions_url_override: Option<String>,
@@ -919,6 +926,8 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            fixed_temperature: self.fixed_temperature,
+            thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
             api_key: &self.api_key,
@@ -3485,6 +3494,26 @@ fn apply_request_body_overrides(
     merge_json_object(body, overrides);
 }
 
+fn apply_admitted_openai_protocol(
+    body: &mut Value,
+    protocol: astra_core::model_wire::thinking::ThinkingProtocol,
+    thinking: &ThinkingConfig,
+    temperature: Option<f64>,
+    overrides: Option<&Map<String, Value>>,
+) {
+    // The legacy OpenAI effort serializer removes temperature for Adaptive.
+    // A binary toggle is not that contract: restore explicit sampling only,
+    // never manufacture a default or infer a mode-specific allowed value.
+    if protocol.can_disable()
+        && let Some(value) = temperature
+            .map(|value| json!(value))
+            .or_else(|| overrides.and_then(|o| o.get("temperature")).cloned())
+    {
+        body["temperature"] = value;
+    }
+    thinking.apply_openai_protocol(body, protocol);
+}
+
 fn validate_request_body_overrides(
     request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<(), astra_core::ClassifiedError> {
@@ -4589,12 +4618,20 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_stream_callback_and_tool_choice(
+    // Reuse the provider-attempt deadline owner. Do not put a second timeout
+    // around the durable invocation, which would lose terminal settlement.
+    let total_budget = bounded_auxiliary_budget(
+        call.purpose,
+        llm_total_budget(),
+        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
+    );
+    call_llm_and_collect_with_total_budget(
         call,
         cancel,
         stream_callback,
         attempt_observer,
         RuntimeToolChoice::None,
+        total_budget,
     )
     .await
 }
@@ -4604,6 +4641,18 @@ pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
         llm_provider_protocol(provider),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
     )
+}
+
+fn bounded_auxiliary_budget(
+    purpose: astra_turn_types::InferencePurpose,
+    global: std::time::Duration,
+    introspection: std::time::Duration,
+) -> std::time::Duration {
+    if purpose == astra_turn_types::InferencePurpose::Introspection {
+        global.min(introspection)
+    } else {
+        global
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4652,7 +4701,21 @@ async fn call_llm_and_collect_with_total_budget(
         has_fallback,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
+    let temperature = if route.fixed_temperature.is_some() {
+        configured_temperature
+    } else {
+        temperature
+    };
     let LlmExecutionRoute {
+        fixed_temperature: _,
+        thinking_protocol,
         model_name,
         wire_model_name,
         api_key,
@@ -4710,7 +4773,22 @@ async fn call_llm_and_collect_with_total_budget(
     // endpoints still need their typed suppression field to honor it. Apply
     // this after user/catalog overrides so an admitted Off policy cannot be
     // accidentally re-enabled by stale model metadata.
-    thinking.apply_openai_suppression(&mut body, provider, base_url);
+    if !matches!(provider, "anthropic" | "bedrock") {
+        let protocol = thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                provider,
+                base_url,
+                upstream_name,
+            )
+        });
+        apply_admitted_openai_protocol(
+            &mut body,
+            protocol,
+            thinking,
+            temperature,
+            request_body_overrides,
+        );
+    }
     let wire_output_limit = provider_request_output_limit(&body);
     match tool_choice {
         RuntimeToolChoice::Auto => {}
@@ -6933,7 +7011,21 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         has_fallback: _,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
+    let temperature = if route.fixed_temperature.is_some() {
+        configured_temperature
+    } else {
+        temperature
+    };
     let LlmExecutionRoute {
+        fixed_temperature: _,
+        thinking_protocol,
         model_name,
         wire_model_name,
         api_key,
@@ -6975,7 +7067,22 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         request_body_overrides,
         cache_capability,
     );
-    thinking.apply_openai_suppression(&mut body, provider, base_url);
+    if !matches!(provider, "anthropic" | "bedrock") {
+        let protocol = thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                provider,
+                base_url,
+                upstream_name,
+            )
+        });
+        apply_admitted_openai_protocol(
+            &mut body,
+            protocol,
+            thinking,
+            temperature,
+            request_body_overrides,
+        );
+    }
     if matches!(tool_choice, RuntimeToolChoice::None) {
         apply_no_tool_choice(&mut body, provider, tools)?;
     }
@@ -7585,6 +7692,281 @@ pub(crate) fn parse_openai_sse_json_stream(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn primary_streaming_and_nonstreaming_preserve_admitted_protocol_and_sampling() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use axum::{Json, response::IntoResponse};
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let capture = captured.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |Json(body): Json<Value>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push(body.clone());
+                if body["stream"] == true {
+                    ([ ("content-type", "text/event-stream") ],
+                     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
+                } else {
+                    Json(json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for streaming in [false, true] {
+            for (protocol, thinking, fixed) in [
+                (ThinkingProtocol::Moonshot, ThinkingConfig::Off, Some(0.7)),
+                (
+                    ThinkingProtocol::Moonshot,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::Unknown,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    None,
+                ),
+                (ThinkingProtocol::Unknown, ThinkingConfig::Off, Some(0.7)),
+                (
+                    ThinkingProtocol::EnableThinking,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ThinkingObject,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ReasoningEffort,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+            ] {
+                let mut overrides = json!({"top_p":0.9,"presence_penalty":0.1});
+                if protocol == ThinkingProtocol::Unknown && thinking.is_enabled() {
+                    overrides["reasoning_effort"] = json!("medium");
+                }
+                let route = OwnedLlmExecutionRoute {
+                    model_name: "local-alias".into(),
+                    wire_model_name: Some("upstream-fixture".into()),
+                    api_key: "fixture".into(),
+                    base_url: base.clone(),
+                    provider: "openai".into(),
+                    thinking_capability: None,
+                    fixed_temperature: fixed,
+                    thinking_protocol: Some(protocol),
+                    header_overrides: HashMap::new(),
+                    request_body_overrides: overrides.as_object().cloned(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &[json!({"role":"user","content":"hello"})],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route.borrowed(),
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &thinking,
+                };
+                if streaming {
+                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                        call,
+                        LlmCancel::None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    call_llm_nonstream(
+                        global_llm_client(),
+                        call,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let body = captured.lock().unwrap().last().unwrap().clone();
+                assert_eq!(body["model"], "upstream-fixture");
+                if protocol == ThinkingProtocol::Moonshot {
+                    assert_eq!(
+                        body["thinking"]["type"],
+                        if thinking.is_enabled() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    assert_eq!(body["top_p"], 0.9);
+                    assert_eq!(body["presence_penalty"], 0.1);
+                }
+                if thinking.is_enabled() && protocol == ThinkingProtocol::Unknown {
+                    assert_eq!(body["reasoning_effort"], "medium");
+                } else if protocol == ThinkingProtocol::ReasoningEffort {
+                    assert!(
+                        body.get("temperature").is_none(),
+                        "native effort restrictions remain authoritative"
+                    );
+                } else {
+                    assert_eq!(body["temperature"], 0.7);
+                }
+                if protocol == ThinkingProtocol::EnableThinking {
+                    assert_eq!(body["enable_thinking"], true);
+                    assert!(body.get("reasoning_effort").is_none());
+                }
+            }
+        }
+        assert_eq!(captured.lock().unwrap().len(), 14);
+        // Validate generic overrides even without fixed_temperature, in both
+        // public transports, before any request can reach the provider.
+        for streaming in [false, true] {
+            for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
+                let route = OwnedLlmExecutionRoute {
+                    model_name: "fixture".into(),
+                    wire_model_name: None,
+                    api_key: "fixture".into(),
+                    base_url: base.clone(),
+                    provider: "openai".into(),
+                    thinking_capability: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    header_overrides: HashMap::new(),
+                    request_body_overrides: json!({"temperature":invalid}).as_object().cloned(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &[],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route.borrowed(),
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let result = if streaming {
+                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                        call,
+                        LlmCancel::None,
+                        None,
+                        None,
+                    )
+                    .await
+                } else {
+                    call_llm_nonstream(
+                        global_llm_client(),
+                        call,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                };
+                assert!(result.unwrap_err().message.contains("finite non-negative"));
+            }
+        }
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            14,
+            "invalid overrides must not reach provider I/O"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn introspection_budget_does_not_shorten_primary_or_extend_global_limit() {
+        use astra_turn_types::InferencePurpose;
+        let global = std::time::Duration::from_secs(60);
+        let cap = std::time::Duration::from_secs(8);
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::Introspection, global, cap),
+            cap
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::Introspection, cap, global),
+            cap
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::PrimaryAgent, global, cap),
+            global
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::RequiredCompaction, global, cap),
+            global
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_introspection_slow_provider_exits_without_protocol_retry() {
+        use axum::{Router, routing::post};
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                captured.fetch_add(1, Ordering::SeqCst);
+                async { std::future::pending::<axum::response::Response>().await }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let call = LlmCall {
+            purpose: astra_turn_types::InferencePurpose::Introspection,
+            messages: &[json!({"role":"user","content":"hello"})],
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                fixed_temperature: None,
+                thinking_protocol: Some(
+                    astra_core::model_wire::thinking::ThinkingProtocol::Moonshot,
+                ),
+                model_name: "slow-fixture",
+                wire_model_name: None,
+                api_key: "fixture",
+                base_url: &base,
+                provider: "openai",
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: Some(1024),
+            temperature: None,
+            has_fallback: false,
+            thinking: &ThinkingConfig::Off,
+        };
+        let result = call_llm_and_collect_with_total_budget(
+            call,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::None,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        assert!(matches!(
+            result.unwrap_err().kind,
+            astra_core::ErrorKind::BudgetExhausted | astra_core::ErrorKind::ProviderDeadline
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn cloud_byok_compatible_reuses_openai_message_and_tool_wire_format() {
         let messages = vec![json!({"role":"user","content":"Use the calculator"})];
@@ -7629,6 +8011,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "test-model",
                     wire_model_name: None,
                     api_key: "sk-private-secret",
@@ -7802,6 +8186,8 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            fixed_temperature: None,
+            thinking_protocol: None,
             model_name: "model-a",
             wire_model_name: Some("wire-model-a"),
             api_key: "api-key-secret",
@@ -7878,6 +8264,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -7922,6 +8310,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -7987,6 +8377,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8045,6 +8437,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8102,6 +8496,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8178,6 +8574,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8245,6 +8643,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8309,6 +8709,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8380,6 +8782,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8443,6 +8847,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8485,6 +8891,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8531,6 +8939,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8596,6 +9006,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8686,6 +9098,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
                     api_key: "",
@@ -8757,6 +9171,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
                     api_key: "k",
@@ -10701,6 +11117,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -10757,6 +11175,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -11352,6 +11772,8 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
                         api_key: "k",
@@ -12982,6 +13404,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13042,6 +13466,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13088,6 +13514,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
                         api_key: "k",
@@ -13131,6 +13559,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13171,6 +13601,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13214,6 +13646,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
                         api_key: "k",
@@ -13287,6 +13721,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13317,6 +13753,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13368,6 +13806,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13433,6 +13873,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13480,6 +13922,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13531,6 +13975,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13576,6 +14022,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -13620,6 +14068,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",

@@ -9,6 +9,8 @@ publish = false
 default = ["harness"]
 # Enables deterministic provider and edge-callback controls for full-stack tests.
 e2e-hooks = ["astra-services/e2e-hooks"]
+# Paid checks are not part of the generic ignored/MatrixOne CI lane.
+live-provider-tests = []
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
 otel = ["astra-logging/otel"]
 # Observation + verification harness (zero cost when disabled).

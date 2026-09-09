@@ -4599,6 +4599,8 @@ mod tests {
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
@@ -4649,6 +4651,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: crate::turn::llm::client::LlmExecutionRoute {
+                fixed_temperature: None,
+                thinking_protocol: None,
                 model_name: "model-test",
                 wire_model_name: None,
                 api_key: "test-key",

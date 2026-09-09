@@ -31315,6 +31315,8 @@ mod tests {
                 provider: "openai".to_string(),
                 cache_capability: None,
                 thinking_capability: None,
+                fixed_temperature: None,
+                thinking_protocol: None,
                 request_body_overrides: None,
                 context_window: Some(128_000),
                 max_completion_tokens: Some(16_384),

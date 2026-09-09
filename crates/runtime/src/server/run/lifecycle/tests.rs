@@ -1412,6 +1412,8 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
             fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: Some(128_000),

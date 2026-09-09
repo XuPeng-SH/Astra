@@ -67,6 +67,20 @@ fn default_effort() -> ThinkingEffort {
 }
 
 impl ThinkingConfig {
+    /// Final OpenAI-chat emission shared with the model probe's wire contract.
+    /// This is deliberately independent of model names and endpoint heuristics.
+    pub fn apply_openai_protocol(
+        &self,
+        body: &mut Value,
+        protocol: astra_core::model_wire::thinking::ThinkingProtocol,
+    ) {
+        let effort = match self {
+            Self::Adaptive { effort } => Some(effort_str(*effort)),
+            _ => None,
+        };
+        protocol.apply(body, self.is_enabled(), effort);
+    }
+
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
@@ -589,55 +603,26 @@ fn provider_uses_budget_thinking(provider: Option<&str>) -> bool {
 
 /// Returns `true` if the provider string alone identifies a DashScope endpoint.
 pub fn provider_may_think_natively(provider: &str) -> bool {
-    let p = provider.to_ascii_lowercase();
-    p.contains("dashscope") || p.contains("aliyun") || p.contains("alibaba")
+    astra_core::model_wire::thinking::is_dashscope_provider(provider)
 }
 
 /// Returns `true` if the endpoint needs `enable_thinking` flag.
 /// Checks both provider string and base_url since many configs use
 /// `provider: "openai"` with a DashScope base_url.
 pub fn needs_dashscope_thinking_flag(provider: &str, base_url: &str) -> bool {
-    if provider_may_think_natively(provider) {
-        return true;
-    }
-    let u = base_url.to_ascii_lowercase();
-    u.contains("dashscope") || u.contains("aliyun")
+    astra_core::model_wire::thinking::canonical_thinking_protocol(provider, base_url, "")
+        == astra_core::model_wire::thinking::ThinkingProtocol::EnableThinking
 }
 
-/// Return the native thinking control for an admitted OpenAI-compatible route.
-///
-/// Matching is deliberately limited to provider protocol identifiers and the
-/// parsed endpoint authority.  Model names and user text are never consulted.
+/// Compatibility projection for callers without a concrete upstream model.
+/// The shared adapter registry is the only endpoint-protocol owner.
 pub fn openai_thinking_control(provider: &str, base_url: &str) -> OpenAiThinkingControl {
-    if needs_dashscope_thinking_flag(provider, base_url) {
-        return OpenAiThinkingControl::EnableThinkingFlag;
+    use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+    match canonical_thinking_protocol(provider, base_url, "") {
+        ThinkingProtocol::EnableThinking => OpenAiThinkingControl::EnableThinkingFlag,
+        ThinkingProtocol::ThinkingObject => OpenAiThinkingControl::ThinkingObject,
+        _ => OpenAiThinkingControl::None,
     }
-    if is_deepseek_endpoint(provider, base_url) {
-        return OpenAiThinkingControl::ThinkingObject;
-    }
-    OpenAiThinkingControl::None
-}
-
-fn is_deepseek_endpoint(provider: &str, base_url: &str) -> bool {
-    let provider = provider.trim().to_ascii_lowercase();
-    if provider == "deepseek" || provider.starts_with("deepseek-") {
-        return true;
-    }
-    let authority = base_url
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| base_url.trim().strip_prefix("http://"))
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or_default()
-        .split('@')
-        .next_back()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    authority == "api.deepseek.com" || authority.ends_with(".deepseek.com")
 }
 
 /// Strip `<think>...</think>` XML tags from model output, returning only

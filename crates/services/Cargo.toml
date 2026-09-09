@@ -10,6 +10,8 @@ openssl-vendored = ["dep:openssl", "openssl/vendored"]
 e2e-hooks = []
 # External services are not provisioned by the ordinary MatrixOne CI lanes.
 external-contract-tests = []
+# Requires explicit feature + --ignored + private provider configuration.
+live-provider-tests = []
 
 [[test]]
 name = "memoria_live_contract_it"

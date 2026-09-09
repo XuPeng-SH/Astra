@@ -1,7 +1,40 @@
 # Model access and inference
 
 > Status: target design contract.
-> Last updated: 2026-09-06.
+> Last updated: 2026-09-10.
+
+## Implemented scope: generation-policy stages 1 and 2
+
+The full route/admission design below is a target, not a claim that every type
+and invariant is implemented by these stages.
+
+- Implemented: conservative Server summary temperature resolution, endpoint-bound
+  canonical defaults, propagation of fixed temperature and thinking protocol to
+  main/auxiliary execution, configuration-bound persisted thinking observations,
+  and a bounded introspection budget. Unknown/custom endpoints (regardless of
+  their provider label), custom completion URLs and Bedrock gateways use the
+  provider default unless an explicit temperature is configured.
+- Implemented: numeric override validation at summary resolution and the main
+  streaming/nonstreaming entrypoints. The main call's explicit temperature still
+  takes precedence over a route override unless fixed_temperature is declared.
+- Not implemented: removing temperature from the generic override map at model
+  admission, making it runtime-owned in all routes, or replacing all request
+  types with the target ResolvedGenerationPolicy below. Overrides are still
+  merged and reconciled by the existing payload builder. Admission-time rejection
+  and one universal generation-policy owner remain target work.
+- Stage 2 adds typed maintained endpoint/model thinking contracts and administrator
+  declarations. Stage-1-only statements about adding no new provider matchers do
+  not describe the complete stage-2 adapter set. User Runner purpose authorization
+  is unchanged; these changes do not enable Runner Work admission.
+
+Thinking checks use a 30-second total budget, including client setup and both
+legs, with at most 15 seconds per HTTP request and a 1 MiB response limit.
+The separate connectivity check can add its own time; 30 seconds is not an
+end-to-end model-check API deadline. EnableThinking probes use streamed SSE in
+both legs to cover streaming-only deployments. Missing finish metadata is
+accepted with valid output; truncation cannot prove absence of reasoning.
+Connection/DNS/TLS, timeout, body and HTTP failures remain distinguishable
+without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
@@ -34,6 +67,9 @@ It does not own:
 - Web, CLI, Server Only, and Edge + Server expose the same model and run semantics.
 - Every inference has an immutable execution placement, credential owner, billing owner, policy decision, and durable identity.
 - Account, entitlement, credential, endpoint, and billing failures are visible and recoverable without corrupting run state.
+- Protocol compatibility and optional generation-parameter capability remain
+  separate facts; an OpenAI-compatible route is never assumed to accept every
+  OpenAI request field.
 - The design supports multi-tenant SaaS operation, hundreds of concurrent clients, and horizontal Server scaling.
 
 ## Non-goals
@@ -45,6 +81,7 @@ It does not own:
 - Silent fallback across billing or data boundaries.
 - Treating cached balance, health, or entitlement data as authoritative without freshness.
 - Preserving obsolete request shapes such as client-selected gateways or request-scoped inference URLs.
+- Hostname- or model-name-specific request shaping in runtime hot paths.
 
 ## Product contract
 
@@ -585,6 +622,7 @@ struct ResolvedInferenceRoute {
     billing_owner: BillingOwner,
     data_boundary: DataBoundary,
     purpose: InferencePurpose,
+    generation_policy: ResolvedGenerationPolicy,
     policy_version: PolicyVersion,
     fallback_policy: ResolvedFallbackPolicy,
 }
@@ -695,7 +733,6 @@ struct InferenceRequest {
     messages: Vec<CanonicalMessage>,
     tools: Vec<CanonicalToolSchema>,
     response_contract: ResponseContract,
-    thinking: ThinkingConfig,
     output_limit: u32,
     cache: CacheIntent,
     deadline: Timestamp,
@@ -713,6 +750,419 @@ enum InferenceStreamEvent {
 ```
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
+
+## Provider request capability contract
+
+### Problem and invariant
+
+An inference protocol describes the transport envelope. It does not prove that
+every optional field, value, or interaction accepted by one provider is
+accepted by another provider implementing the same envelope. In particular,
+`openai-compatible` does not by itself prove support for:
+
+- an explicit `temperature`, including `0.0`;
+- one provider's thinking-control field;
+- `stream_options` or usage-in-stream behavior;
+- a particular tool-choice representation;
+- one completion-token-limit field;
+- structured-output or system-role extensions.
+
+The invariant is:
+
+> Astra emits an optional provider field only when the resolved route proves
+> that the field/value is supported, or when the user or administrator has
+> supplied an explicit typed Offering capability. Unknown capability means
+> omission, not OpenAI-default behavior.
+
+This rule applies to primary, delegated, compaction, memory, reflection,
+verification, and introspection calls. Auxiliary paths must not create their
+own provider heuristics.
+
+### Resolved generation policy
+
+Model admission resolves the call-level generation behavior before provider
+payload construction:
+
+```rust
+struct ResolvedGenerationPolicy {
+    thinking: ResolvedThinkingPolicy,
+    temperature: TemperatureEmission,
+    provenance: GenerationPolicyProvenance,
+}
+
+enum ThinkingConfig {
+    Off,
+    Enabled { budget_tokens: u32 },
+    Adaptive { effort: ThinkingEffort },
+}
+
+struct ResolvedThinkingPolicy {
+    requested: ThinkingConfig,
+    emission: ThinkingEmission,
+    provenance: GenerationPolicyProvenance,
+}
+
+enum ThinkingEmission {
+    // Emit no control field and allow the endpoint to select its default.
+    ProviderDefault,
+    // Emit the adapter's typed disable control.
+    Disabled,
+    // Emit the adapter's typed enable/effort/budget control.
+    Enabled {
+        effort: Option<ThinkingEffort>,
+        budget_tokens: Option<u32>,
+    },
+}
+
+enum TemperatureEmission {
+    // The final payload must not contain temperature; use endpoint default.
+    ProviderDefault,
+    // The final payload must not contain temperature because the selected
+    // thinking/provider protocol rejects it.
+    Forbidden,
+    Explicit(f64),
+}
+
+enum GenerationPolicyProvenance {
+    OfferingCapability,
+    CanonicalProviderContract,
+    ConservativeProtocolDefault,
+}
+```
+
+`ThinkingConfig` is the requested product behavior. `ResolvedThinkingPolicy`
+is the admitted wire behavior. `ProviderDefault` is not equivalent to
+`ThinkingConfig::Off`: it makes no claim that provider-side reasoning is
+disabled. `Disabled` is legal only when a typed adapter capability can encode
+the disable control; otherwise the resolver must choose `ProviderDefault` or
+reject a request that strictly requires disabled reasoning.
+
+`TemperatureEmission` is deliberately a final wire decision, not a guessed
+model attribute. Both `ProviderDefault` and `Forbidden` assert that the field
+is absent after all overrides; they differ so trace and replay can distinguish
+endpoint-default behavior from a protocol prohibition. Its non-secret value
+and provenance are persisted with the resolved route and provider attempt.
+
+`ResolvedInferenceRoute.generation_policy` is the single owner. An
+`InferenceRequest` carries the route and does not duplicate the policy.
+Provider payload builders read only `request.route.generation_policy`.
+
+Resolution uses the following precedence:
+
+1. Resolve requested `ThinkingConfig` against the admitted thinking
+   capability. An unclassified OpenAI-compatible route uses
+   `ThinkingEmission::ProviderDefault`; it must not pretend that thinking is
+   disabled.
+2. A selected thinking protocol that forbids temperature resolves to
+   `TemperatureEmission::Forbidden`.
+3. A validated per-Offering temperature capability for the selected thinking
+   mode resolves to `Explicit(value)`, `ProviderDefault`, or `Forbidden`.
+4. A canonical provider/model contract may resolve bounded low-variance
+   introspection to `Explicit(0.0)` only when that exact contract is maintained
+   and tested by Astra.
+5. An unclassified OpenAI-compatible route resolves to `ProviderDefault`.
+6. All non-introspection purposes retain their existing product policy; they
+   do not inherit the auxiliary classifier's low-variance preference.
+
+Contradictory capabilities fail model admission before provider I/O. Provider
+payload assembly consumes this resolved value after applying provider-specific
+thinking rules.
+
+Before resolution, a numeric legacy `request_body_overrides.temperature` is
+validated, normalized into an Offering-scoped `Explicit(value)` capability,
+and removed from the generic override map. An invalid value fails admission.
+After that extraction, `temperature` is runtime-owned: generic overrides cannot
+reintroduce it, and the final payload must exactly match
+`TemperatureEmission`. This preserves the administrator's existing explicit
+temperature control while removing the current behavior where an
+introspection-level `0.0` silently overwrites it.
+
+Mode-dependent models require a mode-dependent capability shape:
+
+```rust
+struct TemperatureCapabilities {
+    provider_default: TemperatureConstraint,
+    thinking_disabled: Option<TemperatureConstraint>,
+    thinking_enabled: Option<TemperatureConstraint>,
+}
+
+enum TemperatureConstraint {
+    ProviderDefault,
+    Forbidden,
+    Fixed(f64),
+    ExplicitZeroSupported,
+}
+```
+
+The existing scalar `QuirksData.fixed_temperature` is a backward-compatible
+declaration for a temperature that is fixed across every admitted mode of that
+Offering. It cannot describe a model whose fixed value changes with thinking
+mode. Such a model uses `ProviderDefault` in the first implementation stage;
+a later typed `TemperatureCapabilities` declaration may select the exact value
+per mode without a new runtime heuristic.
+
+### Persisted thinking protocol (stage 2)
+
+OpenAI-chat probes and Server inference share `astra_core::model_wire::thinking`.
+`QuirksData.thinking_protocol` is an optional administrator declaration with
+`unknown`, `enable_thinking`, `thinking_object`, `reasoning_effort`, or
+`moonshot` values. Absence selects the maintained canonical adapter; explicit
+`unknown` opts out of the new adapter, retaining established request assembly
+and explicit overrides. Endpoint authority and upstream model, not a local alias or
+an arbitrary URL substring, select the Moonshot adapter. It covers the official
+`/v1` endpoints and the maintained `kimi-k2.5`, `kimi-k2.6`, and
+`kimi-k3` IDs. K2.5/K2.6 follow the
+[official toggle documentation](https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart);
+K3 is covered by the optional real-provider toggle contract. Other model IDs or
+gateways remain unknown unless explicitly configured. This is a maintained
+adapter registry, not a Work-admission-specific model matcher.
+
+The protocol reaches admitted execution, normal streaming/nonstreaming calls,
+memory inference, and bounded summaries. Final OpenAI-chat emission removes
+controls belonging to other protocols after generic body overrides when a
+protocol is known. Unknown adds and removes nothing: existing thinking-off
+sanitization and provider behavior remain authoritative. Anthropic Messages and Bedrock retain
+their existing native envelope adapters; this stage does not redefine those
+providers' probing semantics or authorize Runner introspection.
+
+Moonshot introspection defaults sampling to the provider rather than injecting
+the classifier's zero temperature. The toggle adapter does not impose sampling
+limits or remove explicit temperature, top_p or penalty settings. A verified
+toggle is not evidence of a fixed-temperature contract for every model version.
+The mode-independent Offering `fixed_temperature` uses the same configuration
+resolver in main and auxiliary requests; conflicting explicit overrides are
+reported. Existing native adapter restrictions remain authoritative. Generic
+OpenAI-compatible routes retain their pre-existing effort and override behavior;
+Cloud BYOK does not require a protocol configuration UI to keep working.
+
+Explicit model checks perform the probe; model creation and normal inference do
+not. A supported binary protocol is tested in both enabled and disabled modes
+with a bounded 1024-token request. Both responses must have completed visible
+content; the enabled response must expose reasoning and the disabled response
+must not. This establishes observed toggle behavior, not proof of zero internal
+reasoning tokens. Truncated/malformed output, ignored controls, transport errors,
+or unknown protocols cannot become a successful `both` observation. Unknown
+protocols use a baseline request without guessed controls and can establish only
+observed native reasoning (`native_only`), not suppression support. Declared
+effort protocols send low effort and require observable reasoning (including
+reported reasoning token usage) before reporting `effort_only`. This confirms
+reasoning under the declared protocol, not a measurement of effort effectiveness.
+BYOK probing retains the
+same pinned public-endpoint transport and owner authorization as inference.
+
+Both `infra_llm_models` and `user_llm_models` have nullable
+`thinking_probe_json` observations containing adapter revision, configuration
+fingerprint, protocol, capability/error, and observation time. The fingerprint
+binds provider, endpoint, upstream model, encrypted credential generation and
+administrator configuration. It contains no plaintext credential. Results are
+published using configuration- and previous-observation-matching conditional updates, so a concurrent
+rotation cannot publish a result for the replacement configuration. Resolution
+reuses only matching observations, without network probing; explicit checks
+refresh them. Credential/configuration changes invalidate observations. Old
+rows remain usable, and schema migration never makes provider requests. Legacy
+administrator capability values are imported as explicitly marked legacy hints
+when the first new check is inconclusive, not evidence of a verified wire protocol.
+A failed/inconclusive check retains a prior capability only for the same bound
+configuration and protocol while recording the latest error separately. Stale
+or malformed snapshots never fall back to an unbound legacy capability column.
+
+User model responses optionally include `thinking_probe`; a missing or stale
+observation is absent, while an inconclusive check has an error. A thinking
+probe failure does not disable a model whose connectivity check succeeded.
+
+`ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
+LLM budget, for no-tool introspection provider execution. It uses the existing
+provider-attempt deadline/settlement owner, not an outer cancelling timeout.
+Primary and other purposes retain their budgets. This is **not** an eight-second
+end-to-end TTFT guarantee: pre-provider durable admission and post-provider
+logical settlement have their own lifecycle costs. Existing auxiliary failure
+handling remains responsible for degraded Work admission.
+The default is a latency policy, not a provider-success guarantee: K3 samples
+have exceeded the approximately 7.2-second provider work allowance. Rollout must
+measure Work-admission success/degradation rate and end-to-end TTFT together;
+compatibility tests with a larger budget do not establish the default-budget SLO.
+
+### Immediate compatibility decision
+
+The first implementation stage applies to Server-executed Cloud BYOK and
+changes only bounded introspection request construction:
+
+| Route | Introspection temperature behavior |
+| --- | --- |
+| Exact canonical provider/model Offering with a tested zero-temperature contract | Send `0.0` only when the resolved thinking policy permits it. |
+| Offering with a validated mode-independent `fixed_temperature` | Send the configured value. |
+| Offering with an explicit numeric legacy `request_body_overrides.temperature` | Normalize it to `Explicit(value)` and preserve that value unless thinking forbids temperature. |
+| Generic `openai-compatible` route without an explicit capability | Use provider default: remove `temperature` from the final payload. |
+| Route whose enabled thinking protocol forbids temperature | Use `Forbidden`: remove `temperature` from the final payload. |
+| Primary agent and other inference purposes | Preserve their existing policy. |
+
+The immediate Cloud BYOK fix requires no new user setting, public API field, or
+database migration. Existing `openai-compatible` rows acquire the conservative
+behavior on Server upgrade. The CLI continues to ask only for provider, base
+URL, upstream model ID, alias, context window, default selection, and key.
+
+For an unclassified OpenAI-compatible route, stage 1 also resolves thinking to
+`ThinkingEmission::ProviderDefault`. It guarantees that Astra does not send the
+known-invalid zero-temperature combination; it does **not** guarantee that
+provider-side thinking is disabled or that latency decreases. A provider may
+still return malformed or empty classifier output, which remains a separate
+semantic failure class. The originating issue is complete only after a strict
+Kimi-like contract test and a hosted Kimi end-to-end check both produce a
+parsed Work-admission decision, or after Astra rejects that auxiliary purpose
+before provider I/O with an explicit typed policy.
+
+The target implementation uses one shared resolver for every execution
+placement that authorizes the purpose. It must not introduce a matcher for
+`api.moonshot.cn`, `kimi-*`, or any other new hostname/model string. Existing
+Offering metadata such as `fixed_temperature` may feed the typed resolver, but
+it must be carried through the canonical admitted route rather than read
+directly inside a provider adapter.
+
+The initial implementation follows the existing execution-material path:
+
+```text
+Offering/provider capability
+  -> ResolvedActiveLlmModel
+  -> AdmittedModelExecution
+  -> ResolvedTurnLlmConfig
+  -> OwnedLlmExecutionRoute
+  -> RuntimeSummaryClient
+  -> provider payload reconciliation
+```
+
+The stage-1 policy resolver is a pure function at the Server summary-call
+boundary. `RuntimeSummaryClient` supplies the inference purpose and desired
+thinking mode; the route supplies admitted capabilities. Its result shape is
+kept independent of Server state so it can move to the shared model-call
+boundary before another execution placement authorizes `Introspection`. The
+provider payload builder remains the final enforcement point and removes
+temperature whenever the resolved thinking protocol forbids it.
+
+The current `openai_thinking_control(provider, base_url)` helper is a
+grandfathered transition mechanism, not a second product-policy owner. During
+stage 1 the Server summary resolver may consult it to select the bounded
+thinking policy, while final payload assembly invokes the same helper only to
+serialize an admitted `Off` policy into the maintained DeepSeek or DashScope
+wire control. Contract tests must keep those two uses consistent. No Kimi,
+Moonshot, new hostname, or model-name branch is added. In the target state,
+the helper's facts belong to the admitted Offering/connection and payload
+assembly consumes the resolved typed control without inspecting endpoint text.
+The non-goal on hostname/model matching applies to this target state and
+prohibits adding new runtime matchers during the transition.
+
+User Runner authorization is a separate gate. PR #712 currently allows only
+`PrimaryAgent`, `SubAgent`, and `RequiredCompaction`; it rejects
+`Introspection` before provider I/O even though its proposed summary client
+uses no temperature. Stage 1 therefore fixes Server Cloud BYOK only. It must
+not add a vacuous Server/Runner parity test. If Runner later authorizes
+`Introspection`, that authorization change requires its own design and tests
+and must consume this same resolver before Work admission is enabled.
+
+### Rejected alternatives
+
+- **Match Kimi, Moonshot, or a hostname.** The same model may be exposed by a
+  gateway or proxy, and another model can have the same constraint.
+- **Treat every OpenAI-compatible endpoint as OpenAI.** This is the faulty
+  assumption the contract removes.
+- **Ask every Cloud BYOK user for temperature/thinking internals.** Safe default
+  behavior must not require provider expertise; advanced capability declaration
+  can remain an administrator or future probe concern.
+- **Retry a 400 after deleting optional fields.** A generic 400 does not identify
+  the incompatible field, and retry can add latency and bill twice.
+- **Omit temperature for all providers and purposes.** That is safe at the wire
+  level but unnecessarily changes maintained canonical-provider behavior and
+  established low-variance classifier behavior where an exact contract is
+  known.
+- **Implement a separate Work-admission HTTP client.** It would duplicate route,
+  credential, usage, error, and policy semantics instead of fixing the shared
+  inference boundary.
+
+### Auxiliary inference and latency
+
+Work admission is a bounded introspection call. It starts concurrently with the
+primary model request and settles before a plain-text completion or provider
+tool batch crosses its execution boundary. Therefore its latency is not added
+unconditionally to primary latency; the pre-output critical path is:
+
+```text
+request preparation
+  + max(primary provider path, Work-admission provider path)
+  + required reconciliation and client delivery
+```
+
+If Work admission finishes first, the primary path determines the remaining
+time. If the primary response finishes first, the remaining Work-admission
+deadline can delay the first executable completion boundary. Provider cache
+hits, endpoint load, network variance, and scheduler delay can change the
+winner between otherwise identical turns.
+
+The compatibility fix must not add a second provider attempt after a generic
+HTTP 400. Retrying after stripping fields would increase latency and may double
+billing without proving which field was rejected. Astra instead sends the
+conservative payload on the first attempt. An unavailable optional judge keeps
+the existing typed Primary degradation; a required primary inference does not
+silently switch Offering, credential owner, billing owner, or data boundary.
+
+Latency optimization after correctness requires phase telemetry, not inference
+from end-to-end TTFT. Every primary and auxiliary attempt records:
+
+- queue/admission, provider-request-start, provider-first-byte, and completion
+  timestamps;
+- resolved temperature emission and provenance, without request-body or secret
+  values;
+- cache read/write token facts when the provider reports them;
+- Work-admission reconciliation wait after the primary result;
+- first durable output and first client-delivery timestamps;
+- typed failure class and whether semantic Primary degradation occurred.
+
+### Compatibility and rollout
+
+- Historical administrator `quirks.fixed_temperature` values were previously
+  persisted without affecting inference. They now become active for primary and
+  auxiliary requests, take precedence over a call-level temperature, and reject
+  conflicting route overrides. This can change sampling or cause a local
+  configuration error after upgrade; it is not a behavior-neutral migration.
+  Before rollout, audit configured values without printing credentials:
+
+  ```sql
+  SELECT model_id, model_name, JSON_EXTRACT(quirks, '$.fixed_temperature') AS fixed_temperature
+  FROM infra_llm_models
+  WHERE JSON_EXTRACT(quirks, '$.fixed_temperature') IS NOT NULL;
+  ```
+
+  Review non-null values and their compatibility with every enabled thinking
+  mode. Change unintended values through the existing administrator model API;
+  schema migration must not silently delete or rewrite them.
+- Existing Cloud BYOK rows remain readable and require no backfill.
+- Existing canonical provider behavior remains unchanged unless its adapter no
+  longer has a tested zero-temperature contract.
+- All routes without a maintained endpoint-bound zero-temperature contract or
+  explicit temperature become less prescriptive, not just routes literally
+  labelled `openai-compatible` (e.g. DashScope, OpenRouter and custom gateways);
+  omission lets the endpoint apply its own valid default.
+- A numeric `request_body_overrides.temperature` is an intentional typed
+  declaration after admission. Today bounded introspection silently replaces
+  that value with `0.0`; after this change the declared value remains
+  authoritative unless the selected thinking protocol forbids temperature.
+  This is a deliberate user-visible correction, not a no-op refactor.
+- The scalar `fixed_temperature` field keeps its persisted shape and requires
+  no backfill, but stage 1 treats it as mode-independent. A model whose fixed
+  temperature varies with thinking mode stays on `ProviderDefault` until a
+  richer typed capability is admitted.
+- No provider response body is exposed merely to diagnose compatibility; raw
+  non-authentication 4xx bodies remain protected by the existing secret
+  reflection boundary.
+- The change is rolled back by restoring the previous Server binary; no stored
+  state must be reverted.
+- A later richer capability probe or user-visible advanced setting is a
+  separate contract change. It must not be required to make default Cloud BYOK
+  safe.
+
+Rollout observes per-purpose provider 400 rates, Work-admission availability,
+TTFT, provider-first-byte latency, and reconciliation wait. A rise in malformed
+judge responses is evaluated separately from transport compatibility: omitting
+temperature may change sampling, but it must not be treated as a transport
+failure.
 
 ## Client and SDK contract
 
@@ -906,6 +1356,8 @@ not satisfy these gates.
 | Entitlement revoked | Reject new inference and return eligible alternatives. |
 | Credential receives 401 | Refresh or request reauthorization for that binding; do not disable the global model identity. |
 | Provider returns 429/overload | Use bounded exponential backoff with jitter within deadline and budget. |
+| Optional field capability is unknown | Resolve it to the typed provider-default policy and enforce absence from the final payload; do not infer support from protocol compatibility. |
+| Auxiliary provider request is rejected as incompatible | Record typed degradation and preserve the Primary path; do not retry by stripping guessed fields. |
 | Provider delivery is uncertain | Enter `DeliveryUnknown`; reconcile when possible; do not blind retry. |
 | Edge offline before start | Mark Offering offline and offer wait, choose model, or cancel. |
 | Edge disconnects during stream | Preserve durable partial state and query by invocation ID after reconnect. |
@@ -966,6 +1418,8 @@ Inference spans and durable facts include non-secret identifiers for:
 - execution placement and billing owner;
 - policy and relevant revisions;
 - admitted, queued, first-token, and complete latency;
+- resolved generation-parameter emission/provenance and post-primary
+  reconciliation wait;
 - token usage, cache status, retry count, and typed outcome.
 
 Metrics include resolution latency/errors, active/queued inference, provider 401/429/5xx, TaaS link/billing/credential health, Edge disconnect/recovery, per-purpose usage, fallback, and optional-inference degradation.
@@ -1011,6 +1465,30 @@ Tests validate behavior, persisted facts, wire payloads, streams, and product pr
 ### Provider and Edge end-to-end
 
 - Canonical message/tool/thinking payload and stream translation.
+- Generic OpenAI-compatible introspection omits unproven optional sampling
+  fields on its first and only attempt.
+- Strict mock endpoints that reject `temperature: 0.0` accept the conservative
+  Work-admission payload and return a parsed structured decision.
+- A Kimi-like default-thinking mock rejects `temperature: 0.0`, accepts the
+  provider-default request, returns separate reasoning plus structured final
+  content within the classifier token cap, and produces a parsed Work decision.
+- A numeric legacy `request_body_overrides.temperature` is normalized to a
+  typed `Explicit(value)` capability and is not silently replaced with `0.0`;
+  invalid values fail admission, while `ProviderDefault` and `Forbidden`
+  remove the field from the final payload.
+- Canonical OpenAI, Anthropic, and DeepSeek adapter fixtures preserve their
+  tested request behavior; primary, compaction, memory, and reflection calls do
+  not inherit the introspection-only temperature rule.
+- Server Cloud BYOK resolves generation policy from the admitted route without
+  adding a Kimi, Moonshot, hostname, or model-name matcher.
+- Until User Runner authorizes `Introspection`, it returns a typed error before
+  provider I/O. If that purpose is authorized later, its contract test must
+  prove that it consumes the shared resolver rather than a Runner-local policy.
+- An opt-in hosted Kimi check, kept outside required CI because it needs a real
+  credential, produces a parsed Work-admission decision. Failure keeps the
+  originating compatibility issue open even if the strict mock passes.
+- Incompatible auxiliary inference records typed Primary degradation without
+  leaking provider response bodies or creating a second billed attempt.
 - Cancellation, deadline, context overflow, and typed provider error.
 - Edge secret never reaches Server storage or logs.
 - Offline-before-start, mid-stream disconnect, completion-ack loss, and reconnect.
@@ -1045,6 +1523,8 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
   device; Cloud BYOK credentials are explicitly uploaded and encrypted on
   Astra Server.
 - All inference purposes use one resolver and invocation contract.
+- OpenAI-compatible protocol selection alone never authorizes an optional
+  provider request field or value.
 - Every upstream request is attributable to a durable provider attempt.
 - No client can select an endpoint, credential, or placement directly.
 - Refresh, reconnect, process crash, credential rotation, and Server failover preserve truthful run state.

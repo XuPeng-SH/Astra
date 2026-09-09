@@ -33,7 +33,7 @@ These documents describe target contracts. They should not be read as proof that
 | Runtime tool boundary | [edge-runtime-tool-boundary.md](edge-runtime-tool-boundary.md) | Runtime authority domains, workspace isolation, side effects, and result containment. |
 | Cloud-edge sync | [../architecture/edge-cloud-sync-architecture.md](../architecture/edge-cloud-sync-architecture.md) | Durable outbox, sync facts, repair, retention. |
 | Orchestration | [orchestration.md](orchestration.md) | Multi-agent delegation, model selection per agent, coordination. |
-| Model access and inference | [model-access-and-inference.md](model-access-and-inference.md) | Cloud/Workspace/Device model access, TaaS bindings, Offerings, connections, inference placement, invocation, usage, and billing boundaries. |
+| Model access and inference | [model-access-and-inference.md](model-access-and-inference.md) | Cloud/Workspace/Device model access, TaaS bindings, Offerings, connections, provider request capabilities, parameter emission, inference placement, invocation, usage, and billing boundaries. |
 | Model routing | [model-routing.md](model-routing.md) | Model/provider selection, escalation, fallback chains, and traceability. |
 | Multi-agent runtime | [multi-agent-runtime.md](multi-agent-runtime.md) | Durable child runs, fanout/fanin, delegation lineage, and bounded parallelism. |
 | Memory | [memory.md](memory.md) | Cross-session and in-session memory semantics. |

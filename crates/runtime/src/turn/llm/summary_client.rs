@@ -89,6 +89,65 @@ enum SummaryExecution {
     Direct,
 }
 
+/// Final temperature decision for one auxiliary inference call.
+///
+/// This is deliberately distinct from `Option<f64>`: both an inherited route
+/// default and an asserted provider default are represented by `None` at the
+/// lower-level client boundary, but only the former may contain a configured
+/// body override. Resolution below validates that distinction before provider
+/// I/O.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SummaryTemperatureEmission {
+    InheritRouteDefault,
+    ProviderDefault,
+    Forbidden,
+    Explicit(f64),
+}
+
+impl SummaryTemperatureEmission {
+    fn call_temperature(self) -> Option<f64> {
+        match self {
+            Self::Explicit(value) => Some(value),
+            Self::InheritRouteDefault | Self::ProviderDefault | Self::Forbidden => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InheritRouteDefault => "inherit_route_default",
+            Self::ProviderDefault => "provider_default",
+            Self::Forbidden => "forbidden",
+            Self::Explicit(_) => "explicit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryGenerationPolicyProvenance {
+    ExistingPurposePolicy,
+    OfferingCapability,
+    CanonicalProviderContract,
+    ConservativeProtocolDefault,
+}
+
+impl SummaryGenerationPolicyProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExistingPurposePolicy => "existing_purpose_policy",
+            Self::OfferingCapability => "offering_capability",
+            Self::CanonicalProviderContract => "canonical_provider_contract",
+            Self::ConservativeProtocolDefault => "conservative_protocol_default",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedSummaryGenerationPolicy {
+    thinking: ThinkingConfig,
+    temperature: SummaryTemperatureEmission,
+    temperature_provenance: SummaryGenerationPolicyProvenance,
+}
+
 /// Runtime-owned adapter from the provider execution contract to summary work.
 /// Provider-specific request construction, authentication, timeouts, and
 /// response parsing remain centralized in the canonical LLM client.
@@ -154,9 +213,19 @@ impl RuntimeSummaryClient {
 
     /// Auxiliary semantic decisions need a short, predictable response. Some
     /// models cannot turn reasoning off but do offer an explicit low-effort
-    /// control. Use only the probe-derived capability contract; generic
-    /// OpenAI-compatible endpoints keep the established `Off` shape.
+    /// control. Use only admitted capability facts or Astra's maintained
+    /// canonical-provider transition contract; never infer from a model name.
     fn thinking_for(purpose: InferencePurpose, route: &OwnedLlmExecutionRoute) -> ThinkingConfig {
+        let protocol = route.thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &route.provider,
+                &route.base_url,
+                route
+                    .wire_model_name
+                    .as_deref()
+                    .unwrap_or(&route.model_name),
+            )
+        });
         match (purpose, route.thinking_capability) {
             // A persisted EffortOnly value may predate the provider's typed
             // suppression capability. The admitted endpoint protocol is the
@@ -166,29 +235,91 @@ impl RuntimeSummaryClient {
             (
                 InferencePurpose::Introspection,
                 Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) if astra_turn_core::thinking_config::openai_thinking_control(
-                &route.provider,
-                &route.base_url,
-            ) != astra_turn_core::thinking_config::OpenAiThinkingControl::None =>
-            {
-                ThinkingConfig::Off
-            }
+            ) if protocol.can_disable() => ThinkingConfig::Off,
             (
                 InferencePurpose::Introspection,
                 Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) => ThinkingConfig::Adaptive {
-                effort: ThinkingEffort::Low,
-            },
+            ) if protocol
+                == astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort =>
+            {
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Low,
+                }
+            }
             _ => ThinkingConfig::Off,
         }
     }
 
-    /// Closed-schema runtime decisions must be reproducible for the same
-    /// admitted context. Main-agent generation and compaction keep their own
-    /// sampling policy; only the bounded introspection classifiers use zero
-    /// temperature.
-    fn temperature_for(purpose: InferencePurpose, thinking: &ThinkingConfig) -> Option<f64> {
-        (matches!(purpose, InferencePurpose::Introspection) && thinking.is_off()).then_some(0.0)
+    fn configured_temperature(route: &OwnedLlmExecutionRoute) -> Result<Option<f64>, String> {
+        astra_core::model_wire::thinking::configured_temperature(
+            route.request_body_overrides.as_ref(),
+            route.fixed_temperature,
+        )
+    }
+
+    /// Resolve the complete bounded-summary generation policy once from the
+    /// admitted route. Generic OpenAI-compatible transport is not proof that
+    /// zero temperature is supported, so an unclassified route uses the
+    /// endpoint default. Exact built-in providers retain their established
+    /// deterministic classifier behavior.
+    fn resolve_generation_policy(
+        purpose: InferencePurpose,
+        route: &OwnedLlmExecutionRoute,
+    ) -> Result<ResolvedSummaryGenerationPolicy, String> {
+        let thinking = Self::thinking_for(purpose, route);
+        let configured_temperature = Self::configured_temperature(route)?;
+        let protocol = route.thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &route.provider,
+                &route.base_url,
+                route
+                    .wire_model_name
+                    .as_deref()
+                    .unwrap_or(&route.model_name),
+            )
+        });
+        let (temperature, temperature_provenance) =
+            if !matches!(purpose, InferencePurpose::Introspection) {
+                (
+                    SummaryTemperatureEmission::InheritRouteDefault,
+                    SummaryGenerationPolicyProvenance::ExistingPurposePolicy,
+                )
+            } else if !thinking.is_off() {
+                (
+                    SummaryTemperatureEmission::Forbidden,
+                    SummaryGenerationPolicyProvenance::OfferingCapability,
+                )
+            } else if let Some(value) = configured_temperature {
+                (
+                    SummaryTemperatureEmission::Explicit(value),
+                    SummaryGenerationPolicyProvenance::OfferingCapability,
+                )
+            } else if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot {
+                (
+                    SummaryTemperatureEmission::ProviderDefault,
+                    SummaryGenerationPolicyProvenance::CanonicalProviderContract,
+                )
+            } else if route.completions_url_override.is_none()
+                && astra_core::model_wire::thinking::canonical_zero_temperature(
+                    &route.provider,
+                    &route.base_url,
+                )
+            {
+                (
+                    SummaryTemperatureEmission::Explicit(0.0),
+                    SummaryGenerationPolicyProvenance::CanonicalProviderContract,
+                )
+            } else {
+                (
+                    SummaryTemperatureEmission::ProviderDefault,
+                    SummaryGenerationPolicyProvenance::ConservativeProtocolDefault,
+                )
+            };
+        Ok(ResolvedSummaryGenerationPolicy {
+            thinking,
+            temperature,
+            temperature_provenance,
+        })
     }
 
     /// Low-level provider-adapter constructor for unit tests. Production
@@ -214,7 +345,17 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         purpose: InferencePurpose,
         messages: &[Value],
     ) -> Result<SummaryResponse, String> {
-        let thinking = Self::thinking_for(purpose, &self.route);
+        let policy = Self::resolve_generation_policy(purpose, &self.route)?;
+        let thinking = &policy.thinking;
+        let temperature = policy.temperature.call_temperature();
+        tracing::debug!(
+            target: "astra::inference_policy",
+            purpose = purpose.as_str(),
+            temperature_emission = policy.temperature.as_str(),
+            temperature_value = ?temperature,
+            temperature_provenance = policy.temperature_provenance.as_str(),
+            "resolved auxiliary generation policy"
+        );
         let result = match &self.execution {
             SummaryExecution::Durable(execution) => {
                 let DurableSummaryExecution {
@@ -253,9 +394,9 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                                 cache_capability: self.cache_capability,
                                 route: self.route.borrowed(),
                                 max_output_tokens: Some(self.max_output_tokens),
-                                temperature: Self::temperature_for(purpose, &thinking),
+                                temperature,
                                 has_fallback: false,
-                                thinking: &thinking,
+                                thinking,
                             },
                         )
                         .await;
@@ -283,9 +424,9 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         cache_capability: self.cache_capability,
                         route: self.route.borrowed(),
                         max_output_tokens: Some(self.max_output_tokens),
-                        temperature: Self::temperature_for(purpose, &thinking),
+                        temperature,
                         has_fallback: false,
-                        thinking: &thinking,
+                        thinking,
                     },
                     llm_nonstream_timeout(),
                 )
@@ -520,6 +661,8 @@ mod tests {
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
@@ -537,6 +680,8 @@ mod tests {
             base_url: execution.base_url.clone(),
             provider: execution.provider.clone(),
             thinking_capability: None,
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -576,6 +721,8 @@ mod tests {
             base_url: "https://example.invalid/v1".to_string(),
             provider: "openai".to_string(),
             thinking_capability,
+            fixed_temperature: None,
+            thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -592,13 +739,29 @@ mod tests {
 
     #[test]
     fn bounded_introspection_uses_low_effort_only_when_model_admission_proves_support() {
-        let effort_only =
+        let mut effort_only =
             route_with_capability(Some(astra_services::models::ThinkingCapability::EffortOnly));
+        assert_eq!(
+            RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &effort_only),
+            ThinkingConfig::Off,
+            "legacy capability alone cannot prove an effort wire protocol"
+        );
+        effort_only.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort);
         assert_eq!(
             RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &effort_only),
             ThinkingConfig::Adaptive {
                 effort: ThinkingEffort::Low,
             }
+        );
+        effort_only.thinking_protocol = None;
+        effort_only.base_url = "https://api.openai.com/v1".into();
+        assert_eq!(
+            RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &effort_only),
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            },
+            "canonical fallback must be shared by both EffortOnly branches"
         );
 
         for capability in [
@@ -634,34 +797,182 @@ mod tests {
     }
 
     #[test]
-    fn closed_introspection_decisions_are_deterministic_without_changing_other_inference() {
-        assert_eq!(
-            RuntimeSummaryClient::temperature_for(
+    fn bounded_introspection_resolves_temperature_from_admitted_capabilities() {
+        let canonical = route_with_capability(None);
+        for (provider, base_url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("anthropic", "https://api.anthropic.com/v1"),
+            ("deepseek", "https://api.deepseek.com"),
+        ] {
+            let mut route = canonical.clone();
+            route.provider = provider.to_string();
+            route.base_url = base_url.into();
+            let policy = RuntimeSummaryClient::resolve_generation_policy(
                 InferencePurpose::Introspection,
-                &ThinkingConfig::Off,
-            ),
-            Some(0.0)
+                &route,
+            )
+            .expect("canonical policy");
+            assert_eq!(
+                policy.temperature,
+                SummaryTemperatureEmission::Explicit(0.0),
+                "provider={provider}"
+            );
+            assert_eq!(
+                policy.temperature_provenance,
+                SummaryGenerationPolicyProvenance::CanonicalProviderContract,
+                "provider={provider}"
+            );
+        }
+
+        let mut compatible = route_with_capability(None);
+        compatible.provider = astra_services::byok_endpoint::COMPATIBLE_PROVIDER.to_string();
+        let compatible_policy = RuntimeSummaryClient::resolve_generation_policy(
+            InferencePurpose::Introspection,
+            &compatible,
+        )
+        .expect("compatible policy");
+        assert_eq!(
+            compatible_policy.temperature,
+            SummaryTemperatureEmission::ProviderDefault,
+            "transport compatibility alone must not imply zero-temperature support"
         );
         assert_eq!(
-            RuntimeSummaryClient::temperature_for(
+            compatible_policy.temperature_provenance,
+            SummaryGenerationPolicyProvenance::ConservativeProtocolDefault
+        );
+
+        compatible.fixed_temperature = Some(0.6);
+        assert_eq!(
+            RuntimeSummaryClient::resolve_generation_policy(
                 InferencePurpose::Introspection,
-                &ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::Low,
-                },
-            ),
-            None,
+                &compatible,
+            )
+            .expect("fixed-temperature policy")
+            .temperature,
+            SummaryTemperatureEmission::Explicit(0.6)
+        );
+
+        compatible.fixed_temperature = None;
+        compatible.request_body_overrides = Some(serde_json::Map::from_iter([(
+            "temperature".to_string(),
+            serde_json::json!(0.7),
+        )]));
+        assert_eq!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &compatible,
+            )
+            .expect("configured-temperature policy")
+            .temperature,
+            SummaryTemperatureEmission::Explicit(0.7),
+            "the admitted override must not be silently replaced with zero"
+        );
+
+        let mut effort_only =
+            route_with_capability(Some(astra_services::models::ThinkingCapability::EffortOnly));
+        effort_only.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort);
+        assert_eq!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &effort_only,
+            )
+            .expect("effort-only policy")
+            .temperature,
+            SummaryTemperatureEmission::Forbidden,
             "thinking protocols own sampling and must not receive temperature"
         );
+
         for purpose in [
             InferencePurpose::PrimaryAgent,
             InferencePurpose::RequiredCompaction,
             InferencePurpose::MemoryExtraction,
         ] {
             assert_eq!(
-                RuntimeSummaryClient::temperature_for(purpose, &ThinkingConfig::Off),
-                None
+                RuntimeSummaryClient::resolve_generation_policy(purpose, &canonical)
+                    .expect("non-introspection policy")
+                    .temperature,
+                SummaryTemperatureEmission::InheritRouteDefault
             );
         }
+    }
+
+    #[test]
+    fn provider_labels_and_completion_overrides_do_not_prove_zero_temperature() {
+        for provider in [
+            "openai",
+            "anthropic",
+            "deepseek",
+            "bedrock",
+            "dashscope",
+            "moonshot",
+            "openrouter",
+        ] {
+            for url in [
+                "https://api.moonshot.cn/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://gateway.example/v1",
+            ] {
+                let mut route = route_with_capability(None);
+                route.provider = provider.into();
+                route.base_url = url.into();
+                assert_eq!(
+                    RuntimeSummaryClient::resolve_generation_policy(
+                        InferencePurpose::Introspection,
+                        &route
+                    )
+                    .unwrap()
+                    .temperature,
+                    SummaryTemperatureEmission::ProviderDefault,
+                    "{provider} {url}"
+                );
+            }
+        }
+        let mut route = route_with_capability(None);
+        route.base_url = "https://api.openai.com/v1".into();
+        route.completions_url_override = Some("https://gateway.example/chat/completions".into());
+        assert_eq!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &route
+            )
+            .unwrap()
+            .temperature,
+            SummaryTemperatureEmission::ProviderDefault
+        );
+    }
+
+    #[test]
+    fn contradictory_or_invalid_temperature_capabilities_fail_before_provider_io() {
+        let mut route = route_with_capability(None);
+        route.provider = astra_services::byok_endpoint::COMPATIBLE_PROVIDER.to_string();
+        route.fixed_temperature = Some(0.6);
+        route.request_body_overrides = Some(serde_json::Map::from_iter([(
+            "temperature".to_string(),
+            serde_json::json!(1.0),
+        )]));
+        assert!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &route,
+            )
+            .expect_err("conflicting capabilities")
+            .contains("conflicts with fixed_temperature")
+        );
+
+        route.fixed_temperature = None;
+        route.request_body_overrides = Some(serde_json::Map::from_iter([(
+            "temperature".to_string(),
+            serde_json::json!("cold"),
+        )]));
+        assert!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &route,
+            )
+            .expect_err("invalid capability")
+            .contains("finite non-negative number")
+        );
     }
 
     #[tokio::test]
@@ -732,6 +1043,199 @@ mod tests {
         assert_eq!(body.get("tool_choice"), Some(&Value::String("none".into())));
     }
 
+    #[tokio::test]
+    async fn generic_openai_compatible_work_admission_uses_provider_defaults_once() {
+        let provider_requests = Arc::new(AtomicU32::new(0));
+        let captured_body = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let provider_requests_for_handler = provider_requests.clone();
+        let captured_body_for_handler = captured_body.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let provider_requests = provider_requests_for_handler.clone();
+                let captured_body = captured_body_for_handler.clone();
+                async move {
+                    provider_requests.fetch_add(1, Ordering::SeqCst);
+                    *captured_body
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.clone());
+                    if body.get("temperature").is_some() {
+                        return Response::builder()
+                            .status(400)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                r#"{"error":{"message":"thinking mode fixes temperature"}}"#,
+                            ))
+                            .expect("strict provider rejection");
+                    }
+                    let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#;
+                    if body["stream"] == true {
+                        let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":decision},"finish_reason":null}]});
+                        return Response::builder().status(200).header("content-type", "text/event-stream")
+                            .body(Body::from(format!("data: {event}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"))).unwrap();
+                    }
+                    let response = serde_json::json!({
+                        "id": "kimi-like-summary",
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "The prompt requests one direct answer.",
+                                "content": decision
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response.to_string()))
+                        .expect("strict provider response")
+                }
+            }),
+        );
+        let mut execution = summary_execution(spawn_summary_test_server(app).await);
+        // Use an unclassified OpenAI-compatible protocol identifier while
+        // keeping the test server on loopback. The production
+        // `openai-compatible` identifier intentionally activates public-HTTPS
+        // SSRF enforcement and cannot target this local fixture.
+        for provider in ["mock-openai-compatible", "openai"] {
+            execution.provider = provider.to_string();
+            for streaming in [false, true] {
+                let client = if streaming {
+                    let ledger = DurableInferenceLedger::required_with_persistence(
+                        None,
+                        Some(&execution),
+                        "summary-user",
+                        Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
+                    )
+                    .unwrap()
+                    .with_run_authority(summary_authority());
+                    RuntimeSummaryClient::new_with_attempt_allocator(
+                        summary_route(&execution),
+                        1_024,
+                        ledger,
+                        summary_scope(),
+                        DurableSummaryAttemptAllocator::default(),
+                    )
+                } else {
+                    RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 1_024)
+                };
+                let messages = vec![serde_json::json!({
+                    "role": "user",
+                    "content": "Decide whether this turn needs durable Work"
+                })];
+
+                let summary = client
+                    .summarize(InferencePurpose::Introspection, &messages)
+                    .await
+                    .expect("provider-default request must succeed");
+                astra_services::parse_work_admission_response(&summary.text)
+                    .expect("the separate final content must remain a valid Work decision");
+
+                let body = captured_body
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .expect("captured strict-provider request");
+                assert!(
+                    body.get("temperature").is_none(),
+                    "generic compatibility must not invent a sampling capability"
+                );
+                assert!(
+                    body.get("thinking").is_none(),
+                    "stage 1 leaves an unclassified endpoint's thinking mode at its provider default"
+                );
+            }
+        }
+        assert_eq!(
+            provider_requests.load(Ordering::SeqCst),
+            4,
+            "one request per provider and transport, no retry/fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_moonshot_protocol_suppresses_reasoning_without_guessing_model_name() {
+        let app = Router::new().route("/chat/completions", post(|axum::Json(body): axum::Json<Value>| async move {
+            assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+            assert!(body.get("enable_thinking").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("temperature").is_none());
+            assert_eq!(body["max_completion_tokens"], 1024);
+            axum::Json(serde_json::json!({"choices":[{"message":{"content":"decision"},"finish_reason":"stop"}]}))
+        }));
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let mut route = summary_route(&execution);
+        route.model_name = "arbitrary-local-alias".into();
+        route.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::Moonshot);
+        let client = RuntimeSummaryClient::new_direct_for_test(route, 1024);
+        assert_eq!(
+            client
+                .summarize(
+                    InferencePurpose::Introspection,
+                    &[serde_json::json!({"role":"user","content":"hello"})]
+                )
+                .await
+                .unwrap()
+                .text,
+            "decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_temperature_override_remains_authoritative_on_the_wire() {
+        let captured_body = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let captured_body_for_handler = captured_body.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let captured_body = captured_body_for_handler.clone();
+                async move {
+                    *captured_body
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
+                    let response = serde_json::json!({
+                        "id": "configured-summary",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "configured"},
+                            "finish_reason": "stop"
+                        }]
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response.to_string()))
+                        .expect("configured provider response")
+                }
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let mut route = summary_route(&execution);
+        route.provider = "mock-openai-compatible".to_string();
+        route.request_body_overrides = Some(serde_json::Map::from_iter([(
+            "temperature".to_string(),
+            serde_json::json!(0.7),
+        )]));
+        let client = RuntimeSummaryClient::new_direct_for_test(route, 128);
+
+        client
+            .summarize(
+                InferencePurpose::Introspection,
+                &[serde_json::json!({"role": "user", "content": "classify"})],
+            )
+            .await
+            .expect("configured request");
+
+        let body = captured_body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("captured configured request");
+        assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.7)));
+    }
+
     #[test]
     fn summary_attempt_allocator_is_shared_only_within_the_exact_scope() {
         let allocator = DurableSummaryAttemptAllocator::default();
@@ -797,6 +1301,8 @@ mod tests {
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
@@ -831,6 +1337,8 @@ mod tests {
                 base_url,
                 provider: execution.provider.clone(),
                 thinking_capability: None,
+                fixed_temperature: None,
+                thinking_protocol: None,
                 header_overrides: HashMap::new(),
                 request_body_overrides: None,
                 completions_url_override: None,
@@ -870,6 +1378,108 @@ mod tests {
             vec![0, 1, 2],
             "repair must advance after the authoritative recovered N+1 identity"
         );
+    }
+
+    /// Explicit paid-provider check. The file contains URL, key and model as
+    /// its last three nonempty lines; none of its contents are logged.
+    #[tokio::test]
+    #[cfg(feature = "live-provider-tests")]
+    #[ignore = "requires ASTRA_TEST_SUMMARY_CONFIG_FILE and a real provider credential"]
+    async fn live_work_admission_provider_contract() {
+        let path = std::env::var("ASTRA_TEST_SUMMARY_CONFIG_FILE")
+            .expect("set ASTRA_TEST_SUMMARY_CONFIG_FILE");
+        let config = std::fs::read_to_string(path).expect("read provider configuration");
+        let lines: Vec<_> = config
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(lines.len() >= 3, "expected URL, key and model");
+        let fields = &lines[lines.len() - 3..];
+        let mut execution = summary_execution(fields[0].to_string());
+        execution.api_key = fields[1].to_string();
+        execution.model_name =
+            std::env::var("ASTRA_TEST_SUMMARY_MODEL").unwrap_or_else(|_| fields[2].to_string());
+        execution.provider = astra_services::byok_endpoint::COMPATIBLE_PROVIDER.to_string();
+        execution.access_kind = astra_services::ModelAccessKind::CloudByok;
+        execution.thinking_protocol = Some(match std::env::var("ASTRA_TEST_THINKING_PROTOCOL") {
+            Ok(value) => serde_json::from_value(serde_json::Value::String(value))
+                .expect("known thinking protocol"),
+            Err(_) => astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &execution.provider,
+                &execution.base_url,
+                &execution.model_name,
+            ),
+        });
+        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
+        let ledger = DurableInferenceLedger::required_with_persistence(
+            None,
+            Some(&execution),
+            "summary-user",
+            Some(persistence),
+        )
+        .expect("test ledger")
+        .with_run_authority(summary_authority());
+        let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            summary_route(&execution),
+            1_024,
+            ledger,
+            summary_scope(),
+            DurableSummaryAttemptAllocator::default(),
+        );
+        let messages = astra_services::work_admission_judge_messages(
+            &astra_services::TurnIntentJudgeContext {
+                message: "今天星期几".to_string(),
+                turn_count: 1,
+                ..Default::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.summarize(InferencePurpose::Introspection, &messages),
+        )
+        .await;
+        eprintln!(
+            "live_work_admission elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let response = result
+            .expect("provider deadline exceeded")
+            .unwrap_or_else(|error| {
+                for marker in [
+                    "DNS",
+                    "resolve",
+                    "non-public",
+                    "timeout",
+                    "budget",
+                    "deadline",
+                    "Budget",
+                    "Deadline",
+                    "exhausted",
+                    "400",
+                    "401",
+                    "403",
+                    "404",
+                    "429",
+                    "ledger",
+                    "admission",
+                    "empty text",
+                    "tool call",
+                ] {
+                    if error.contains(marker) {
+                        eprintln!("live_failure_marker={marker}");
+                    }
+                }
+                panic!("live summary request failed; credential and response suppressed")
+            });
+        let parsed = astra_services::parse_work_admission_response(&response.text);
+        eprintln!(
+            "live_work_admission structured_decision_valid={} response_bytes={}",
+            parsed.is_ok(),
+            response.text.len()
+        );
+        assert!(parsed.is_ok(), "provider returned no valid Work decision");
     }
 
     #[tokio::test]

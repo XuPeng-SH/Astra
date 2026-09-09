@@ -57,7 +57,7 @@ use crate::turn::agentic_loop::host::{
     complete_turn_phase, interaction_scoped_tool_restrictions,
 };
 use crate::turn::llm::client::{
-    LlmCall, LlmCallResult, LlmCancel, LlmExecutionRoute, LlmStreamUpdate, OwnedLlmExecutionRoute,
+    LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute,
     call_llm_and_collect_with_stream_callback,
     call_llm_and_collect_with_stream_callback_and_budget,
     call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice,
@@ -1697,6 +1697,9 @@ struct ResolvedTurnLlmConfig {
     /// Probe-derived fact used by bounded auxiliary calls. This is carried
     /// from model admission rather than inferred from a provider/model name.
     thinking_capability: Option<astra_services::models::ThinkingCapability>,
+    /// Mode-independent fixed temperature resolved at model admission.
+    fixed_temperature: Option<f64>,
+    thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
@@ -1719,6 +1722,8 @@ impl ResolvedTurnLlmConfig {
             base_url: self.base_url.clone(),
             provider: self.provider.clone(),
             thinking_capability: self.thinking_capability,
+            fixed_temperature: self.fixed_temperature,
+            thinking_protocol: self.thinking_protocol,
             header_overrides: self.header_overrides.clone(),
             request_body_overrides: self.request_body_overrides.clone(),
             completions_url_override: self.completions_url_override.clone(),
@@ -1953,6 +1958,8 @@ async fn resolve_llm_model_for_turn(
                 execution.cache_capability,
             ),
             thinking_capability: execution.thinking_capability,
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
             fallback_chain: Vec::new(),
             header_overrides: execution.header_overrides.clone(),
             request_body_overrides: execution.request_body_overrides.clone(),
@@ -1975,6 +1982,8 @@ async fn resolve_llm_model_for_turn(
             resolved.prompt_cache_capability,
         ),
         thinking_capability: resolved.thinking_capability,
+        fixed_temperature: resolved.fixed_temperature,
+        thinking_protocol: resolved.thinking_protocol,
         fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
         request_body_overrides: resolved.request_body_overrides,
@@ -7524,6 +7533,8 @@ impl ServerAgenticLoopHost {
             fallback_chain: Vec::new(),
             cache_capability: self.mock_cache_capability,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -13112,23 +13123,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
+                    let execution_route = llm_cfg.execution_route();
                     let call = LlmCall {
                         purpose: state.inference_purpose,
                         messages: attempt_llm_messages,
                         tools: &final_tools,
                         cache_capability: Some(cache_cap),
-                        route: LlmExecutionRoute {
-                            model_name: &llm_cfg.model_name,
-                            wire_model_name: llm_cfg.wire_model_name.as_deref(),
-                            api_key: &llm_cfg.api_key,
-                            base_url: &llm_cfg.base_url,
-                            provider: &llm_cfg.provider,
-                            header_overrides: (!llm_cfg.header_overrides.is_empty())
-                                .then_some(&llm_cfg.header_overrides),
-                            request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
-                            completions_url_override: llm_cfg.completions_url_override.as_deref(),
-                            request_timeout: llm_cfg.request_timeout,
-                        },
+                        route: execution_route.borrowed(),
                         max_output_tokens: Some(effective_max_output),
                         temperature: None,
                         has_fallback,
@@ -16565,6 +16566,8 @@ mod tests {
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             fallback_chain: Vec::new(),
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -22911,6 +22914,8 @@ mod tests {
             fallback_chain: Vec::new(),
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -29440,6 +29445,8 @@ mod tests {
                 fallback_chain: vec!["legacy-model-name".to_string()],
                 tags: Vec::new(),
                 request_body_overrides: None,
+                fixed_temperature: None,
+                thinking_protocol: None,
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(64_000),
@@ -30875,6 +30882,8 @@ mod tests {
                 base_url: "https://api.openai.com/v1".to_string(),
                 provider: "openai".to_string(),
                 thinking_capability: None,
+                fixed_temperature: None,
+                thinking_protocol: None,
                 header_overrides: forwarded,
                 request_body_overrides: None,
                 completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),

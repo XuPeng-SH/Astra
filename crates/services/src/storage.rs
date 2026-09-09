@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-04-v70";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-09-v71";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -6776,6 +6776,7 @@ async fn ensure_core_schema_while_leased(
             quirks JSON NOT NULL,
             thinking_capability VARCHAR(20) NULL,
             thinking_probe_error TEXT NULL,
+            thinking_probe_json JSON NULL,
             created_by VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -6798,6 +6799,7 @@ async fn ensure_core_schema_while_leased(
             api_key_encrypted TEXT NOT NULL,
             base_url VARCHAR(500) NOT NULL,
             context_window INT NOT NULL,
+            thinking_probe_json JSON NULL,
             is_default SMALLINT NOT NULL DEFAULT 0,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -6811,6 +6813,18 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
+    // Additive observations; old models stay usable. Never probe in migrations.
+    for table in ["infra_llm_models", "user_llm_models"] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            table,
+            "thinking_probe_json",
+            &format!("ALTER TABLE {table} ADD COLUMN thinking_probe_json JSON NULL"),
+        )
+        .await?;
+    }
 
     // Canonical inference execution ledger. Admission writes the immutable route
     // and logical invocation together; each physical attempt is then committed

@@ -75,7 +75,7 @@ port for the fixture:
 
 ```bash
 ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX= \
-ASTRA_DATABASE=astra_probe_test ASTRA_TEST_DATABASE=astra_probe_test \
+ASTRA_DATABASE=astra_test_probe_local ASTRA_TEST_DATABASE=astra_test_probe_local \
 ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
 ASTRA_BYOK_DEEPSEEK_BASE_URL=http://127.0.0.1:18994 \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
@@ -85,6 +85,13 @@ CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
 This covers create, credential rotation, explicit probe and failed-write
 preservation. Official OpenAI/Anthropic probe and rotation tests seed only their
 fixture rows with loopback endpoints; production official endpoints remain fixed.
+The same fixture also removes the new thinking observation columns in its
+designated disposable database, reruns schema bootstrap twice, and verifies
+that the old model row survives and credential rotation invalidates observations.
+Never designate a database containing non-test data for this fixture.
+Destructive schema rehearsals require an effective database name beginning with
+`astra_test_probe_` and a nonempty suffix, checked before bootstrap or writes.
+This prefix is a guardrail, not permission to reuse a database containing data.
 `memoria_reauthentication_http` separately covers same-key reconnect, pending
 proof invalidation and an in-flight verification crossing disconnect/reconnect.
 
@@ -108,6 +115,44 @@ Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
+
+### Optional thinking-protocol compatibility checks
+
+Offline checks require no credentials:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p astra-core --lib model_wire::
+CARGO_INCREMENTAL=0 cargo test -p astra-services --lib models::
+CARGO_INCREMENTAL=0 cargo test -p astra-runtime --lib turn::llm::
+```
+
+Explicit real-provider checks accept a private configuration file whose last
+three nonempty lines are endpoint URL, API key, and upstream model ID. Do not
+commit that file or print its contents. Each check makes paid provider calls:
+
+```bash
+ASTRA_TEST_SUMMARY_CONFIG_FILE=/absolute/path/to/private-config \
+ASTRA_TEST_SUMMARY_MODEL=kimi-k2.6 \
+CARGO_INCREMENTAL=0 cargo test -p astra-services --features live-provider-tests --lib \
+  live_thinking_protocol_probe -- --ignored --nocapture
+
+ASTRA_TEST_SUMMARY_CONFIG_FILE=/absolute/path/to/private-config \
+ASTRA_TEST_SUMMARY_MODEL=kimi-k2.6 \
+CARGO_INCREMENTAL=0 cargo test -p astra-runtime --features live-provider-tests --lib \
+  live_work_admission_provider_contract -- --ignored --nocapture
+```
+
+Both paid checks require `live-provider-tests` and `--ignored`; default
+MatrixOne CI can run ignored tests without a paid key. Do not enable this
+feature in the generic online lane.
+
+Repeat for `kimi-k3`. The first check verifies observable enabled/disabled
+behavior; the second uses the actual streaming summary transport and Work
+decision parser with a test persistence implementation, without starting an
+Astra Server. Its elapsed time is invocation duration, not user-visible TTFT.
+Neither replaces the MatrixOne-backed persistence fixture above. Configure
+`ASTRA_BYOK_DNS_SERVERS` only when required by the local network; do not disable
+the BYOK public-endpoint policy to run these checks.
 
 ```bash
 # 1. Smallest relevant target while iterating

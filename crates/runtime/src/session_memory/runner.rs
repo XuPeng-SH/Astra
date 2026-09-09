@@ -2345,6 +2345,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2398,6 +2400,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2464,6 +2468,8 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2538,6 +2544,8 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2613,6 +2621,8 @@ mod tests {
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2668,6 +2678,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: server_url,
             api_key: "anthropic-key".to_string(),
             model_name: "deepseek-v4-flash-anthropic".to_string(),
@@ -2721,6 +2733,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: server_url,
             api_key: "bedrock-key".to_string(),
             model_name: "anthropic.claude".to_string(),
@@ -2771,6 +2785,8 @@ mod tests {
 
         let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2834,6 +2850,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2904,6 +2922,8 @@ mod tests {
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let first = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{failing_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-1".to_string(),
@@ -2915,6 +2935,8 @@ mod tests {
             request_timeout: None,
         };
         let second = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: format!("{success_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-2".to_string(),

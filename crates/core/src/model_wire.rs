@@ -2,6 +2,8 @@
 //! Keep this below services/runtime so probes cannot invent a second contract.
 use serde_json::{Value, json};
 
+pub mod thinking;
+
 /// Apply a caller-bounded output budget to Anthropic Messages or OpenAI-style
 /// chat completions. Bedrock Converse has a separate inferenceConfig shape.
 /// Thinking-budget policy belongs to the caller, not this serialization helper.

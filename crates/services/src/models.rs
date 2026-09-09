@@ -13,9 +13,14 @@ use std::{
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
+use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+mod thinking_probe;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
     classify_model_resolution_error_message, error_response, error_response_coded, internal_error,
+};
+use thinking_probe::{
+    ThinkingProbeSnapshot, cached_capability, probe_chat_protocol, probe_identity,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -96,6 +101,9 @@ fn validate_pricing_data(pricing: &PricingData) -> Result<(), String> {
 pub struct QuirksData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed_temperature: Option<f64>,
+    /// Explicit OpenAI-chat control protocol; None uses the maintained adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     #[serde(default)]
     pub preserve_reasoning_content: bool,
     #[serde(default)]
@@ -488,7 +496,7 @@ impl ThinkingCapability {
 /// Result of the two-phase thinking behavior probe.
 ///
 /// Ephemeral — returned during `check_model`, but the capability is persisted to DB.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingProbeResult {
     pub capability: ThinkingCapability,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,6 +607,12 @@ pub struct ResolvedActiveLlmModel {
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
+    /// Mode-independent fixed temperature declared by the admitted Offering.
+    ///
+    /// `None` means the endpoint owns its default. Models whose required
+    /// temperature varies with thinking mode cannot use this scalar contract.
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
@@ -692,6 +706,9 @@ pub struct AdmittedModelExecution {
     /// capability fact rather than model-name heuristics when selecting a
     /// bounded auxiliary reasoning policy.
     pub thinking_capability: Option<ThinkingCapability>,
+    /// Mode-independent fixed temperature carried from Offering admission.
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
     pub max_completion_tokens: Option<u32>,
@@ -714,6 +731,8 @@ impl AdmittedModelExecution {
             provider: offering.model.provider,
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
+            fixed_temperature: offering.model.fixed_temperature,
+            thinking_protocol: offering.model.thinking_protocol,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
             max_completion_tokens: offering.model.max_completion_tokens,
@@ -743,6 +762,8 @@ impl AdmittedModelExecution {
             provider,
             cache_capability: None,
             thinking_capability: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(context_window),
             max_completion_tokens: None,
@@ -764,6 +785,7 @@ impl std::fmt::Debug for AdmittedModelExecution {
             .field("model_name", &self.model_name)
             .field("wire_model_name", &self.wire_model_name)
             .field("provider", &self.provider)
+            .field("fixed_temperature", &self.fixed_temperature)
             .field("credential_present", &!self.api_key.is_empty())
             .field("header_names", &header_names)
             .field(
@@ -850,6 +872,7 @@ impl std::fmt::Debug for ResolvedActiveLlmModel {
             .field("fallback_chain", &self.fallback_chain)
             .field("tags", &self.tags)
             .field("request_body_overrides", &self.request_body_overrides)
+            .field("fixed_temperature", &self.fixed_temperature)
             .field("prompt_cache_capability", &self.prompt_cache_capability)
             .field("thinking_capability", &self.thinking_capability)
             .field("context_window", &self.context_window)
@@ -1122,10 +1145,33 @@ fn build_resolved_active_llm_from_row(
         .map_err(|e| format!("invalid infra_llm_models.thinking_capability: {e}"))?;
     let thinking_capability = ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())?;
 
+    let thinking_protocol = quirks.thinking_protocol.unwrap_or_else(|| {
+        canonical_thinking_protocol(
+            &provider,
+            &base_url,
+            quirks.wire_model_name.as_deref().unwrap_or(&model_name),
+        )
+    });
+    let snapshot: Option<String> = row
+        .try_get("thinking_probe_json")
+        .map_err(|e| e.to_string())?;
+    let identity = probe_identity(
+        &provider,
+        &base_url,
+        quirks.wire_model_name.as_deref().unwrap_or(&model_name),
+        &encrypted,
+        &quirks_json,
+    );
+    let thinking_capability = if snapshot.is_some() {
+        cached_capability(snapshot.as_deref(), &identity, thinking_protocol)
+    } else {
+        thinking_capability
+    };
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
+    let fixed_temperature = quirks.fixed_temperature;
     let request_headers = quirks.request_headers;
 
     let context_window: i32 = row
@@ -1165,6 +1211,8 @@ fn build_resolved_active_llm_from_row(
         fallback_chain,
         tags,
         request_body_overrides,
+        fixed_temperature,
+        thinking_protocol: Some(thinking_protocol),
         prompt_cache_capability,
         thinking_capability,
         context_window: Some(context_window),
@@ -1381,7 +1429,7 @@ const RESOLVE_COLS: &str = "\
     CAST(quirks AS CHAR) AS quirks_json, \
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
-    thinking_capability, context_window, max_completion_tokens";
+    thinking_capability, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, context_window, max_completion_tokens";
 const REQUIRED_MODEL_SELECTION_ERROR: &str =
     astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE;
 
@@ -1587,7 +1635,7 @@ pub async fn revalidate_admitted_model_execution(
         .map_err(ModelOfferingResolutionError::Backend)?;
     let row = query(
         "SELECT model_alias, model_name, provider, api_key_encrypted, base_url, \
-         context_window, is_active FROM user_llm_models \
+         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json FROM user_llm_models \
          WHERE user_id = ? AND model_id = ? LIMIT 1",
     )
     .bind(user_id)
@@ -1642,6 +1690,15 @@ pub async fn revalidate_admitted_model_execution(
                 .await
                 .map_err(ModelOfferingResolutionError::Backend)?;
         }
+        let upstream: String = row
+            .try_get("model_name")
+            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+        let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+        let snapshot: Option<String> = row
+            .try_get("thinking_probe_json")
+            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+        let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
+        let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
         return Ok(AdmittedModelExecution {
             offering_id: offering_id.to_string(),
             access_kind: ModelAccessKind::CloudByok,
@@ -1664,7 +1721,9 @@ pub async fn revalidate_admitted_model_execution(
                 ))
             })?,
             cache_capability: None,
-            thinking_capability: None,
+            thinking_capability,
+            fixed_temperature: None,
+            thinking_protocol: Some(protocol),
             request_body_overrides: None,
             context_window: Some(context_window),
             max_completion_tokens: None,
@@ -2218,6 +2277,8 @@ fn model_list_page_from_items(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModelRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_probe: Option<ThinkingProbeResult>,
     pub model_id: String,
     pub name: String,
     pub provider: String,
@@ -2612,7 +2673,19 @@ impl DatabaseModelService {
             .map_err(internal_error)?;
         let is_default: i16 = row.try_get("is_default").map_err(internal_error)?;
         let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
+        let provider: String = row.try_get("provider").map_err(internal_error)?;
+        let base: String = row.try_get("base_url").map_err(internal_error)?;
+        let model: String = row.try_get("model_name").map_err(internal_error)?;
+        let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
+        let identity = probe_identity(&provider, &base, &model, &encrypted, "");
+        let protocol = canonical_thinking_protocol(&provider, &base, &model);
+        let thinking_probe = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ThinkingProbeSnapshot>(s).ok())
+            .and_then(|s| s.result(&identity, protocol));
         Ok(UserModelRecord {
+            thinking_probe,
             model_id: row.try_get("model_id").map_err(internal_error)?,
             name: row.try_get("model_alias").map_err(internal_error)?,
             provider: row.try_get("provider").map_err(internal_error)?,
@@ -2663,6 +2736,7 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
 const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, base_url, \
+    api_key_encrypted, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
 
@@ -2885,7 +2959,7 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?;
         }
         if let Some(encrypted_key) = encrypted_key {
-            query("UPDATE user_llm_models SET api_key_encrypted = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+            query("UPDATE user_llm_models SET api_key_encrypted = ?, thinking_probe_json = NULL, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
                 .bind(encrypted_key)
                 .bind(&user_id)
                 .bind(&model_id)
@@ -2951,7 +3025,7 @@ impl ModelService for DatabaseModelService {
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let row = query(
-            "SELECT model_name, provider, api_key_encrypted, base_url \
+            "SELECT model_name, provider, api_key_encrypted, base_url, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
              FROM user_llm_models WHERE user_id = ? AND model_id = ?",
         )
         .bind(&user_id)
@@ -2976,6 +3050,39 @@ impl ModelService for DatabaseModelService {
             return Err(error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("Model credential or endpoint check failed: {reason}"),
+            ));
+        }
+        let protocol = canonical_thinking_protocol(&provider, &base_url, &model);
+        let result = probe_thinking_behavior_with_protocol(
+            &provider,
+            &model,
+            &api_key,
+            Some(&base_url),
+            Some(protocol),
+        )
+        .await;
+        let snapshot = ThinkingProbeSnapshot::new(
+            probe_identity(&provider, &base_url, &model, &encrypted, ""),
+            protocol,
+            &result,
+        )
+        .with_previous(
+            row.try_get::<Option<String>, _>("thinking_probe_json")
+                .map_err(internal_error)?
+                .as_deref(),
+            None,
+        );
+        let json = serde_json::to_string(&snapshot).map_err(internal_error)?;
+        // A check must never publish an observation for a concurrently rotated
+        // credential or changed endpoint. No network I/O is held in a DB txn.
+        let updated = query("UPDATE user_llm_models SET thinking_probe_json = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND provider = ? AND base_url = ? AND model_name = ? AND api_key_encrypted = ? AND CAST(thinking_probe_json AS CHAR) <=> ?")
+            .bind(json).bind(&user_id).bind(&model_id).bind(&provider).bind(&base_url).bind(&model).bind(&encrypted)
+            .bind(row.try_get::<Option<String>, _>("thinking_probe_json").map_err(internal_error)?)
+            .execute(&pool).await.map_err(internal_error)?;
+        if updated.rows_affected() == 0 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Model changed during probe; check again",
             ));
         }
         self.get_user_model(user_id, model_id).await
@@ -3194,17 +3301,23 @@ impl ModelService for DatabaseModelService {
             });
         }
         if !is_admin && !user_id.is_empty() {
-            let user_rows = query(
-                "SELECT model_id, model_alias, provider, context_window, is_active \
+            let user_rows = query(&format!(
+                "SELECT {USER_MODEL_SELECT_COLS} \
                  FROM user_llm_models WHERE user_id = ? AND is_active = 1 \
                  ORDER BY provider, model_alias, model_id",
-            )
+            ))
             .bind(&user_id)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
             for row in user_rows {
                 let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
+                let thinking_capability = Self::user_model_record_from_row(&row)?
+                    .thinking_probe
+                    .filter(|result| {
+                        result.error.is_none() || result.capability != ThinkingCapability::None
+                    })
+                    .map(|result| result.capability);
                 models.push(ModelListItem {
                     offering_id: row.try_get("model_id").map_err(internal_error)?,
                     access_id: "cloud-byok".to_string(),
@@ -3218,7 +3331,7 @@ impl ModelService for DatabaseModelService {
                     context_window: row.try_get("context_window").map_err(internal_error)?,
                     max_completion_tokens: None,
                     architecture: None,
-                    thinking_capability: None,
+                    thinking_capability,
                 });
             }
         }
@@ -3523,6 +3636,15 @@ impl ModelService for DatabaseModelService {
         update_field!(tags, "tags", json);
         update_field!(quirks, "quirks", json);
 
+        if request.api_key.is_some()
+            || request.base_url.is_some()
+            || request.provider.is_some()
+            || request.quirks.is_some()
+        {
+            query("UPDATE infra_llm_models SET thinking_capability = NULL, thinking_probe_error = NULL, thinking_probe_json = NULL WHERE model_name = ?")
+                .bind(&model_name).execute(&pool).await.map_err(internal_error)?;
+        }
+
         if let Some(active) = request.is_active {
             let val: i16 = if active { 1 } else { 0 };
             query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?")
@@ -3585,7 +3707,7 @@ impl ModelService for DatabaseModelService {
         invalidate_active_llm_model_resolution_cache();
         let row = query(
             "SELECT api_key_encrypted, provider, base_url, \
-                    CAST(quirks AS CHAR) AS quirks_json \
+                    CAST(quirks AS CHAR) AS quirks_json, thinking_capability, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
              FROM infra_llm_models WHERE model_name = ?",
         )
         .bind(&model_name)
@@ -3640,36 +3762,78 @@ impl ModelService for DatabaseModelService {
 
         // Phase 2: two-phase thinking behavior probe (only when connected)
         let thinking_probe = if check.is_none() {
-            let result =
-                probe_thinking_behavior(&provider, &probe_name, &api_key, base_url.as_deref())
-                    .await;
+            let protocol = quirks.thinking_protocol.unwrap_or_else(|| {
+                canonical_thinking_protocol(
+                    &provider,
+                    base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
+                    &probe_name,
+                )
+            });
+            let result = probe_thinking_behavior_with_protocol(
+                &provider,
+                &probe_name,
+                &api_key,
+                base_url.as_deref(),
+                Some(protocol),
+            )
+            .await;
+            let snapshot = ThinkingProbeSnapshot::new(
+                probe_identity(
+                    &provider,
+                    base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
+                    &probe_name,
+                    &encrypted,
+                    &quirks_json,
+                ),
+                protocol,
+                &result,
+            )
+            .with_previous(
+                row.try_get::<Option<String>, _>("thinking_probe_json")
+                    .map_err(internal_error)?
+                    .as_deref(),
+                ThinkingCapability::try_from_db_column(
+                    row.try_get::<Option<String>, _>("thinking_capability")
+                        .map_err(internal_error)?
+                        .as_deref(),
+                )
+                .map_err(internal_error)?,
+            );
+            let snapshot_json = serde_json::to_string(&snapshot).map_err(internal_error)?;
             // Persist probe result to DB.
-            // Only write capability when the probe succeeded (no error).
-            // A failed probe should leave capability=NULL (re-probable)
-            // rather than permanently marking the model as non-thinking.
-            let cap_str: Option<&str> = if result.error.is_none() {
-                Some(result.capability.as_db_str())
-            } else {
-                None
-            };
+            // Latest error is independent of still-valid prior capability.
+            let cap_str = snapshot.persisted_capability().map(|cap| cap.as_db_str());
             let err_str = result.error.as_deref();
-            if let Err(e) = query(
+            let updated = query(
                 "UPDATE infra_llm_models SET thinking_capability = ?, \
-                 thinking_probe_error = ?, updated_at = NOW(6) WHERE model_name = ?",
+                 thinking_probe_error = ?, thinking_probe_json = ?, updated_at = NOW(6) WHERE model_name = ? \
+                 AND provider = ? AND COALESCE(base_url, '') = ? AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ? AND CAST(thinking_probe_json AS CHAR) <=> ?",
             )
             .bind(cap_str)
             .bind(err_str)
+            .bind(snapshot_json)
             .bind(&model_name)
+            .bind(&provider)
+            .bind(base_url.as_deref().unwrap_or(""))
+            .bind(&encrypted)
+            .bind(&quirks_json)
+            .bind(row.try_get::<Option<String>, _>("thinking_probe_json").map_err(internal_error)?)
             .execute(&pool)
-            .await
-            {
-                tracing::warn!(
-                    model = %model_name,
-                    err = %e,
-                    "failed to persist thinking_capability to DB"
-                );
+            .await.map_err(internal_error)?;
+            if updated.rows_affected() == 0 {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Model changed during probe; check again",
+                ));
             }
-            Some(result)
+            invalidate_active_llm_model_resolution_cache();
+            self.invalidate_catalog_revision_cache();
+            Some(ThinkingProbeResult {
+                capability: snapshot
+                    .persisted_capability()
+                    .unwrap_or(ThinkingCapability::None),
+                error: result.error,
+            })
         } else {
             None
         };
@@ -4005,52 +4169,52 @@ pub async fn validate_connectivity(
     }
 }
 
-/// Select the DeepSeek probe only from the admitted provider identity or the
-/// endpoint authority. Model names and arbitrary hostname substrings are not
-/// protocol evidence; a gateway such as `deepseek-proxy.example.com` must not
-/// receive a DeepSeek-only extension field by accident.
+#[cfg(test)]
 fn is_deepseek_probe_route(provider: &str, base_url: &str) -> bool {
-    let provider = provider.trim().to_ascii_lowercase();
-    if provider == "deepseek" || provider.starts_with("deepseek-") {
-        return true;
-    }
-    let authority = base_url
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| base_url.trim().strip_prefix("http://"))
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or_default()
-        .split('@')
-        .next_back()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    authority == "api.deepseek.com" || authority.ends_with(".deepseek.com")
+    canonical_thinking_protocol(provider, base_url, "") == ThinkingProtocol::ThinkingObject
 }
 
-/// Provider-aware two-phase probe of a model's thinking behavior.
-///
-/// **Bedrock/Anthropic** (default = no thinking):
-///   Phase 1: Send WITH thinking enabled → can model think at all?
-///   If yes → Both (user can toggle). If error/no → None.
-///
-/// **DashScope/native thinkers** (default = thinking):
-///   Phase 1: Send default request → confirms it thinks.
-///   Phase 2: Send with `enable_thinking: false` → can it stop?
-///   Both phases think → NativeOnly. Phase 2 stops → Both.
-///
-/// **Generic OpenAI-compatible**:
-///   Phase 1: Send default request → does it think by default?
-///   If no → try with `reasoning_effort: "low"` → if it returns thinking → Both.
-///   If still no → None.
+/// Explicit protocol-aware check; unknown OpenAI-compatible routes are never
+/// probed with guessed extension fields. Probe failure leaves capability unknown.
 pub async fn probe_thinking_behavior(
     provider: &str,
     model_name: &str,
     api_key: &str,
     base_url: Option<&str>,
+) -> ThinkingProbeResult {
+    probe_thinking_behavior_with_protocol(provider, model_name, api_key, base_url, None).await
+}
+
+async fn probe_thinking_behavior_with_protocol(
+    provider: &str,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    protocol_override: Option<ThinkingProtocol>,
+) -> ThinkingProbeResult {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        probe_thinking_behavior_with_protocol_inner(
+            provider,
+            model_name,
+            api_key,
+            base_url,
+            protocol_override,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| ThinkingProbeResult {
+        capability: ThinkingCapability::None,
+        error: Some("Thinking probe total budget exhausted".into()),
+    })
+}
+
+async fn probe_thinking_behavior_with_protocol_inner(
+    provider: &str,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    protocol_override: Option<ThinkingProtocol>,
 ) -> ThinkingProbeResult {
     if provider == "mock" {
         return ThinkingProbeResult {
@@ -4062,7 +4226,15 @@ pub async fn probe_thinking_behavior(
     let probe_builder = astra_core::net::apply_env_proxy(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
     );
-    let client = match probe_builder.build() {
+    let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+    } else {
+        probe_builder
+            .build()
+            .map(crate::byok_endpoint::EndpointClient::from)
+            .map_err(|e| e.to_string())
+    };
+    let client = match client_result {
         Ok(c) => c,
         Err(e) => {
             return ThinkingProbeResult {
@@ -4079,179 +4251,30 @@ pub async fn probe_thinking_behavior(
         return probe_anthropic(&client, model_name, api_key, base_url).await;
     }
 
-    // OpenAI-compatible — provider-aware probe based on base_url.
-    let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
-    let url = match base_trim {
-        Some(b) => b.trim_end_matches('/').to_string(),
-        None if provider == "openai" => "https://api.openai.com/v1".to_string(),
-        None => {
-            return ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(format!("No base_url for provider '{provider}'")),
-            };
-        }
-    };
-    let probe_url = format!("{url}/chat/completions");
-    let url_lower = url.to_ascii_lowercase();
-    let base_body = serde_json::json!({
-        "model": model_name,
-        "max_tokens": 50,
-        "temperature": 0,
-        "messages": [{"role": "user", "content": "Say hello"}]
-    });
-
-    // ── DeepSeek: V4 exposes a typed thinking toggle on the OpenAI endpoint ──
-    if is_deepseek_probe_route(provider, &url) {
-        let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return ThinkingProbeResult {
-                    capability: ThinkingCapability::None,
-                    error: Some(e),
-                };
-            }
-        };
-        if !default_thinks {
-            return ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: None,
-            };
-        }
-
-        // DeepSeek V4 uses `thinking: {type: "disabled"}`. A rejection of
-        // this extension means the endpoint is an older/native-only route;
-        // keep the conservative effort-only contract rather than guessing
-        // that suppression succeeded.
-        let mut body_disable = base_body;
-        body_disable["thinking"] = serde_json::json!({"type": "disabled"});
-        return match send_openai_probe(&client, &probe_url, api_key, &body_disable).await {
-            Ok(false) => ThinkingProbeResult {
-                capability: ThinkingCapability::Both,
-                error: None,
-            },
-            Ok(true) => ThinkingProbeResult {
-                capability: ThinkingCapability::NativeOnly,
-                error: None,
-            },
-            Err(_) => ThinkingProbeResult {
-                capability: ThinkingCapability::EffortOnly,
-                error: None,
-            },
-        };
-    }
-
-    // ── MiniMax: always thinks via <think> tags, can't disable ──
-    if url_lower.contains("minimax") {
-        return match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
-            Ok(true) => ThinkingProbeResult {
-                capability: ThinkingCapability::NativeOnly,
-                error: None,
-            },
-            Ok(false) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: None,
-            },
-            Err(e) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(e),
-            },
-        };
-    }
-
-    // ── DashScope (Qwen, GLM-5.1): default=no thinking, enable_thinking toggles ──
-    if url_lower.contains("dashscope") || url_lower.contains("aliyun") {
-        // First check if it thinks by default (GLM-5.1 does)
-        let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return ThinkingProbeResult {
-                    capability: ThinkingCapability::None,
-                    error: Some(e),
-                };
-            }
-        };
-        if default_thinks {
-            // Thinks by default — test suppression
-            let mut body_disable = base_body;
-            body_disable["enable_thinking"] = serde_json::json!(false);
-            let (still_thinks, suppress_err) =
-                match send_openai_probe(&client, &probe_url, api_key, &body_disable).await {
-                    Ok(v) => (v, None),
-                    Err(e) => (true, Some(e)), // conservative: assume can't suppress on error
-                };
-            return ThinkingProbeResult {
-                capability: if still_thinks {
-                    ThinkingCapability::NativeOnly
-                } else {
-                    ThinkingCapability::Both
-                },
-                error: suppress_err,
-            };
-        }
-        // Doesn't think by default — try enabling
-        let mut body_enable = base_body;
-        body_enable["enable_thinking"] = serde_json::json!(true);
-        return match send_openai_probe(&client, &probe_url, api_key, &body_enable).await {
-            Ok(true) => ThinkingProbeResult {
-                capability: ThinkingCapability::Both,
-                error: None,
-            },
-            Ok(false) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: None,
-            },
-            Err(e) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(e),
-            },
-        };
-    }
-
-    // ── Generic OpenAI-compatible: probe default, then try enable_thinking ──
-    let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
-        Ok(v) => v,
-        Err(e) => {
-            return ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(e),
-            };
-        }
-    };
-    if default_thinks {
-        let mut body_suppress = base_body;
-        body_suppress["enable_thinking"] = serde_json::json!(false);
-        let (still_thinks, suppress_err) =
-            match send_openai_probe(&client, &probe_url, api_key, &body_suppress).await {
-                Ok(v) => (v, None),
-                Err(e) => (true, Some(e)), // conservative: assume can't suppress on error
-            };
+    let url = base_url
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(if provider == "openai" {
+            "https://api.openai.com/v1"
+        } else {
+            ""
+        });
+    if url.is_empty() {
         return ThinkingProbeResult {
-            capability: if still_thinks {
-                ThinkingCapability::NativeOnly
-            } else {
-                ThinkingCapability::Both
-            },
-            error: suppress_err,
+            capability: ThinkingCapability::None,
+            error: Some("No base_url configured".into()),
         };
     }
-    let mut body_enable = base_body;
-    body_enable["enable_thinking"] = serde_json::json!(true);
-    match send_openai_probe(&client, &probe_url, api_key, &body_enable).await {
-        Ok(true) => ThinkingProbeResult {
-            capability: ThinkingCapability::Both,
-            error: None,
-        },
-        Ok(false) => ThinkingProbeResult {
-            capability: ThinkingCapability::None,
-            error: None,
-        },
-        Err(e) => ThinkingProbeResult {
-            capability: ThinkingCapability::None,
-            error: Some(e),
-        },
-    }
+    let protocol =
+        protocol_override.unwrap_or_else(|| canonical_thinking_protocol(provider, url, model_name));
+    probe_chat_protocol(
+        &client,
+        provider,
+        model_name,
+        &format!("{}/chat/completions", url.trim_end_matches('/')),
+        api_key,
+        protocol,
+    )
+    .await
 }
 
 async fn probe_bedrock(
@@ -4390,28 +4413,56 @@ async fn send_openai_probe(
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
+    observe_usage_reasoning: bool,
 ) -> Result<bool, String> {
-    let resp = client
+    send_openai_probe_with_timeout(
+        client,
+        url,
+        api_key,
+        body,
+        observe_usage_reasoning,
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+async fn send_openai_probe_with_timeout(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    observe_usage_reasoning: bool,
+    request_timeout: Duration,
+) -> Result<bool, String> {
+    let mut resp = client
         .post(url)
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
+        .timeout(request_timeout)
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("Probe request failed: {e}"))?;
+        .map_err(thinking_probe::transport_error)?;
 
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Probe HTTP {status}: {}",
-            &text[..text.len().min(200)]
-        ));
+        return Err(format!("Thinking probe HTTP {status}"));
     }
 
-    let text = resp.text().await.unwrap_or_default();
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Probe parse error: {e}"))?;
+    // Bound both buffered JSON and SSE responses, including malicious gateways.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(thinking_probe::transport_error)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("Thinking probe response exceeded size limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let json = thinking_probe::parse_response(&bytes, body["stream"] == true)?;
+    thinking_probe::validate_output(&json)?;
 
     let content = json
         .get("choices")
@@ -4421,7 +4472,10 @@ async fn send_openai_probe(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
 
-    let has_think_tags = content.contains("<think>");
+    let has_think_tags = content
+        .split_once("<think>")
+        .and_then(|(_, rest)| rest.split_once("</think>"))
+        .is_some_and(|(reasoning, _)| !reasoning.trim().is_empty());
     let has_reasoning_content = json
         .get("choices")
         .and_then(|c| c.get(0))
@@ -4430,7 +4484,21 @@ async fn send_openai_probe(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.is_empty());
 
-    Ok(has_think_tags || has_reasoning_content)
+    let usage_reasoning = observe_usage_reasoning
+        && json
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0);
+    let observed = has_think_tags || has_reasoning_content || usage_reasoning;
+    if !observed
+        && json
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("length")
+    {
+        return Err("Truncated thinking probe cannot establish absence of reasoning".into());
+    }
+    Ok(observed)
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -5641,12 +5709,27 @@ mod tests {
             fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: Some(200_000),
             max_completion_tokens: Some(16_384),
             request_headers: None,
         }
+    }
+
+    #[test]
+    fn admitted_execution_carries_mode_independent_fixed_temperature() {
+        let mut model = sample_resolved_active_model("fixed-temperature-model");
+        model.fixed_temperature = Some(0.6);
+        let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "fixed-temperature-offering".to_string(),
+            model,
+        })
+        .expect("admitted execution");
+
+        assert_eq!(execution.fixed_temperature, Some(0.6));
     }
 
     #[test]
@@ -6095,6 +6178,8 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
@@ -6117,6 +6202,8 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: None,
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
@@ -6258,6 +6345,7 @@ mod tests {
     fn quirks_data_serialization_roundtrip() {
         let q = QuirksData {
             fixed_temperature: Some(0.7),
+            thinking_protocol: None,
             preserve_reasoning_content: true,
             no_parallel_tool_calls: true,
             tool_choice_required: false,
@@ -7606,6 +7694,10 @@ mod tests {
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            assert_eq!(
+                body["stream"], true,
+                "DashScope thinking probes must support streaming-only deployments"
+            );
             let has_reasoning = match (supports_thinking, enable) {
                 (false, _) => false,
                 (true, Some(false)) => false,
@@ -7616,7 +7708,12 @@ mod tests {
             if has_reasoning {
                 msg["reasoning_content"] = serde_json::json!("thinking...");
             }
-            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+            let event =
+                serde_json::json!({"choices": [{"index":0,"delta": msg, "finish_reason": "stop"}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
         };
         let app = Router::new().route("/chat/completions", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -7636,6 +7733,7 @@ mod tests {
 
         let handler = |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            assert_eq!(body["stream"], true);
             let has_reasoning = match enable {
                 Some(false) => false, // Suppression works
                 _ => true,            // Default or explicit true → thinks
@@ -7644,7 +7742,12 @@ mod tests {
             if has_reasoning {
                 msg["reasoning_content"] = serde_json::json!("thinking...");
             }
-            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+            let event =
+                serde_json::json!({"choices": [{"index":0,"delta": msg, "finish_reason": "stop"}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
         };
         let app = Router::new().route("/chat/completions", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -7673,7 +7776,7 @@ mod tests {
             if !disabled {
                 msg["reasoning_content"] = serde_json::json!("thinking...");
             }
-            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+            axum::Json(serde_json::json!({"choices": [{"message": msg, "finish_reason": "stop"}]}))
         };
         let app = Router::new().route("/chat/completions", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -7691,7 +7794,7 @@ mod tests {
     #[tokio::test]
     async fn probe_dashscope_qwen_plus_both() {
         let base = spawn_dashscope_mock(true).await;
-        let result = probe_thinking_behavior("openai", "qwen-plus", "k", Some(&base)).await;
+        let result = probe_thinking_behavior("dashscope", "qwen-plus", "k", Some(&base)).await;
         assert_eq!(result.capability, ThinkingCapability::Both, "{:?}", result);
     }
 
@@ -7699,15 +7802,19 @@ mod tests {
     #[tokio::test]
     async fn probe_dashscope_qwen25_3b_none() {
         let base = spawn_dashscope_mock(false).await;
-        let result = probe_thinking_behavior("openai", "qwen2.5-3b", "k", Some(&base)).await;
+        let result = probe_thinking_behavior("dashscope", "qwen2.5-3b", "k", Some(&base)).await;
         assert_eq!(result.capability, ThinkingCapability::None, "{:?}", result);
+        assert!(
+            result.error.is_some(),
+            "No visible reasoning is inconclusive, not proof of no capability"
+        );
     }
 
     // ── DashScope glm-5.1: thinks by default, enable_thinking:false suppresses → Both ──
     #[tokio::test]
     async fn probe_dashscope_glm51_native_both() {
         let base = spawn_dashscope_native_thinker_mock().await;
-        let result = probe_thinking_behavior("openai", "glm-5.1", "k", Some(&base)).await;
+        let result = probe_thinking_behavior("dashscope", "glm-5.1", "k", Some(&base)).await;
         assert_eq!(result.capability, ThinkingCapability::Both, "{:?}", result);
     }
 
@@ -7729,18 +7836,21 @@ mod tests {
             serde_json::json!({
                 "choices": [{"message": {
                     "content": "<think>reasoning</think>\n\nHello!"
-                }}]
+                }, "finish_reason":"stop"}]
             }),
         )
         .await;
         let result = probe_thinking_behavior("openai", "MiniMax-M2.5", "k", Some(&base)).await;
-        // Generic path: detects <think> → tries suppression with same mock → still thinks → NativeOnly
-        assert!(
-            result.capability == ThinkingCapability::NativeOnly
-                || result.capability == ThinkingCapability::Both,
-            "MiniMax with <think> tags: {:?}",
-            result
-        );
+        assert!(result.error.is_none());
+        assert_eq!(result.capability, ThinkingCapability::NativeOnly);
+        let captured = captured.lock().unwrap();
+        let body = captured.as_ref().unwrap();
+        for field in ["thinking", "enable_thinking", "reasoning_effort"] {
+            assert!(
+                body.get(field).is_none(),
+                "Unknown protocol must not guess a control"
+            );
+        }
     }
 
     // ── Error paths ──

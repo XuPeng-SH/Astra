@@ -77,6 +77,7 @@ impl ModelService for TestModelService {
         }
         let model_id = format!("model-{}-{}", user_id, rows.len() + 1);
         let record = UserModelRecord {
+            thinking_probe: None,
             model_id: model_id.clone(),
             name: request.name,
             provider: request.provider,
