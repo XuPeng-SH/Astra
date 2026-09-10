@@ -2,9 +2,9 @@
 
 # Astra
 
-### The self-hosted runtime for agents that must act inside private systems
+### An agent runtime with EXPLAIN ANALYZE for context
 
-**Durable work on fewer tokens. Agent changes you can trace and roll back. Work that moves with you.**
+**Inspect context and state. Adjust and recover with evidence. Run in your environment.**
 
 [![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
@@ -21,30 +21,46 @@
 
 ---
 
-Astra is not another coding agent or a library for wrapping one model call. It
-is the open-source, self-hosted runtime behind CLI, Web, and application agents
-that must keep long-running Work alive without replaying an ever-growing
-context, make captured changes inspectable and reversible, and reconnect Work
-to authorized execution wherever the relevant tools and private systems live.
+Astra is a self-hosted runtime for long-running agent Work. Every model
+request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
+leaves evidence you can inspect, diff, and roll back, and execution runs
+through a Runner inside your own environment.
 
-| Durable work on fewer tokens | Agent changes you can trace and roll back | Work that moves with you |
+| What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
-| ContextPipe budgets and compresses context while checkpoints keep long-running Work resumable. | Trace links captured file, session, and database changes to evidence and scoped rollback. | The Server keeps the Work; a user-bound Runner reconnects it to private repositories, tools, credentials, and networks. |
+| `EXPLAIN ANALYZE` shows every context source, its budget, its actual cost, and what was dropped and why. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
+| **Understand what happened.** | **Know what changed and what still needs verification.** | **Keep code and credentials where they are.** |
 
-Astra includes the Server, CLI/TUI, Web dashboard, APIs, and TypeScript SDK. You
-bring the LLM and embedding endpoints, then connect tools and data through a
-Runner or MCP.
+```bash
+astra chat --explain verbose -m "Run the shell command: ls *.sh | wc -l and answer with just the number."
+```
 
-**Codex starts with the agent experience. DeepSeek Harness starts with the
-plugin graph. Astra starts with durable enterprise Work: context is budgeted,
-captured changes carry rollback evidence, and execution reconnects to the
-identity and environment allowed to perform it.**
+```text
+Explain Analyze DAG — turn-1
+  tokens fresh_in=928 cache_read=82688 cache_write=0 out=44
+├─ context_assembly ms=187ms budget=41783/102400 (40.8%)
+│  ├─ prompt system=6294 history=0 memory=0 tool_schemas=11269 user=18
+│  ├─ tool_surface selected=28/28 [agent, agent_fanout, bash, git, glob, grep, +22]
+│  └─ memory query="Run the shell command: ls *.sh | wc -l …" considered=0 selected=0 tokens=0 ms=0ms
+├─ preflight semantic admission outcome=unavailable ms=2ms
+├─ round[1] request preparation outcome=succeeded ms=564ms
+├─ round[1] model inference outcome=succeeded ms=1.2s
+├─ round[1] tool execution outcome=succeeded ms=1.4s
+├─ preflight semantic admission outcome=decided ms=1.8s
+├─ round[2] request preparation outcome=succeeded ms=478ms
+├─ round[2] model inference outcome=succeeded ms=1.7s
+└─ assistant out_tokens=44 chars=1
+   └─ preview 2
+```
+
+<sub>Abbreviated output of a real one-shot turn against a hosted Astra Server with `deepseek-v4-flash`. Every line answers a question a database engineer already knows how to ask: what was the budget, what did each source cost, what was dropped, and did the cache hit.</sub>
+
+Astra ships as one binary (CLI, TUI, and Server), plus a Web dashboard and a
+TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 
 <div align="center">
-  <img alt="Illustrative 20-second Astra flow: ContextPipe keeps durable Work within a smaller token budget, a user-bound Runner makes a captured change inside a private environment, and Astra traces and rolls the change back before the Work continues." src="docs/assets/astra-cli-demo.gif" width="900">
+  <img alt="Recorded terminal session: astra chat --explain verbose answers a question, then prints the Explain Analyze DAG for the turn — token counts, context assembly budget, prompt breakdown by source, tool surface, memory retrieval, and per-round timing." src="docs/assets/astra-cli-demo.gif" width="900">
 </div>
-
-<p align="center"><sub>Less context to carry. Changes you can recover from. The same Work wherever you continue.</sub></p>
 
 ### Pick the layer you need
 
@@ -182,22 +198,82 @@ ties Pi, finishes one task behind Hermes, and one ahead of DSH.
 
 ## Quick start
 
-Two supported paths, both ending at a working agent response. Start with
-**Docker** to evaluate Astra without a Rust or Node toolchain; **build from
-source** when you want the Web dashboard, CLI-local Runner capacity, or to
-change Astra itself. For production topologies, use the
-[getting-started guide](docs/quickstart/README.md).
+The fastest path is the hosted Astra Server: the Server and Memoria are already running;
+you install the CLI, log in, and add one model API key. Nothing else to deploy.
 
-| Path | What you get | Additional prerequisites |
-| --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose, OpenSSL, and Python 3.9+ |
-| [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
+### 1. Install the CLI
 
-Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
-memory needs an embedding API; deterministic mock embeddings are also available
-for local evaluation and tests.
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+```
 
-### Docker
+The script verifies the checksum and installs `astra` (and `astra-edge`) into
+`/usr/local/bin`, or `~/.local/bin` when that is not writable; pass
+`--dir PATH` to choose. Linux (`amd64`, `arm64`) and macOS (Apple Silicon,
+Intel) are supported. Linux binaries are static and need nothing else. On
+macOS the binary links against Homebrew's OpenSSL 3, so run
+`brew install openssl@3` first.
+
+### 2. Point the CLI at the hosted Server and log in
+
+```bash
+astra config set api_url https://astra.thememoria.ai
+astra login
+```
+
+`astra login` prints a `https://thememoria.ai/connect/astra?...` link and
+waits; open it in a browser, approve, and the CLI stores the credentials in
+`~/.astra/credentials.json`. On a machine without a browser, use
+`astra login --manual` and paste a connection key from thememoria.ai.
+`astra whoami` confirms the account.
+
+### 3. Add your model
+
+Astra is BYOK: the key is stored on the Server for your account and never in
+the local config. The wizard asks for provider, model id, and key (hidden
+input) and marks the model as your default:
+
+```bash
+astra model add
+```
+
+Or non-interactively, for example with DeepSeek:
+
+```bash
+printf '%s' "$DEEPSEEK_API_KEY" | astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 128000 --api-key-stdin --default
+```
+
+Providers: `openai`, `anthropic`, `deepseek`, and `openai-compatible` with
+`--base-url` for GLM, Qwen, Kimi, or a gateway. `--model` is the provider's
+exact model id; the first argument is the alias you use later. Then verify
+the credential and endpoint from the Server side:
+
+```bash
+astra model probe deepseek
+```
+
+### 4. Run
+
+```bash
+astra                                   # interactive TUI; type / for commands
+astra chat -m "Map this repository and explain its architecture"
+astra chat -y --explain verbose -m "Count the .sh files here with a shell command"
+```
+
+File, shell, and Git tools run on this machine inside the current directory;
+the Server only sees tool results. One-shot `chat` cannot ask for approval,
+so pass `-y` (or `--permission-mode auto`) when the task needs tools; the
+TUI prompts instead. `--explain verbose` prints the Explain Analyze DAG for
+the turn.
+
+If a command returns `401`, the access token has expired: run
+`astra refresh`. `astra doctor` checks the install, Server, and login in
+one go. Sessions and journals live under `~/.astra`.
+
+To run the Server yourself instead, use one of the two self-hosted paths
+below. Both end at the same CLI commands as the hosted path.
+
+### Self-host with Docker
 
 No Rust or Node toolchain. These steps run all the way to a real agent
 response, not just a healthy port.
@@ -338,7 +414,7 @@ available without ambient access to the machine. Operate the stack with
 profile; the [Docker quick start](docs/quickstart/docker.md) covers ports and
 troubleshooting.
 
-### Build from source
+### Self-host from source
 
 This path builds the `astra` binary and starts the Server-only profile with the
 Web dashboard.
