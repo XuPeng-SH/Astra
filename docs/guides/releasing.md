@@ -26,6 +26,37 @@ versioned Docker manifest and GitHub Release are both available. A prerelease
 such as `0.2.0-rc.1` publishes only its exact version and is marked as a GitHub
 prerelease.
 
+Stable promotion is monotonic within the unified workflow: publication reads
+all published GitHub releases immediately before promotion, independently
+checking the global `latest` and the `X.Y` release line. Recovering `0.2.3`
+after `0.2.4` does not change either alias; publishing `0.2.9` after `0.3.0`
+may advance `0.2` but never `latest`. GitHub's latest-release designation uses
+the same global check. An unreadable or malformed release inventory fails
+closed. A well-formed inventory containing an unrecognized published stable tag
+(including a prerelease tag incorrectly marked stable) instead produces a
+warning and disables both rolling Docker aliases and GitHub latest promotion;
+verified fixed-version publication may still finish. Same-version retries
+remain idempotent. Manual tag/registry changes
+outside this serialized workflow are not protected by this check.
+
+PR CI builds the Docker `dependency-inputs` stage, which is also the real
+builder's base stage. It restores the cargo-chef skeleton and performs full
+locked Cargo dependency resolution, including excluded and newly added path
+patches. This uses the real COPY/.dockerignore inputs rather than relying on
+the planner's no-deps metadata or a crossterm-specific filename assertion.
+Docker validation and lint run in parallel; the existing `check` name is a
+small aggregate that requires both applicable gates to succeed.
+Full multi-platform image compilation and
+runtime smoke tests remain release/IDC gates. Linux client builds refresh only
+Ubuntu package sources for musl, retaining package verification and fatal
+errors for Ubuntu source or installation failures.
+
+Vendored terminal unit tests use a committed standalone lockfile. A separate
+Linux/macOS PTY lane executes Astra's `tui::terminal_startup` tests under both
+the default reader and `crossterm/use-dev-tty`, using separate Cargo calls so
+features cannot be unified across the two runs. Vendor changes explicitly
+select downstream Rust scopes without relying on the unknown-path fallback.
+
 ## Why publication starts from a workflow, not a tag push
 
 Tag-triggered workflows execute release logic stored with the tagged commit.
@@ -250,8 +281,8 @@ Verify all of the following before announcing it:
 - the all-in-one source checkout at `vX.Y.Z` uses the same Astra version plus
   the tested MatrixOne and Memoria digests;
 - `make stack-setup` reaches the first successful CLI turn;
-- stable `X.Y` and `latest` tags resolve to the version manifest, while a
-  prerelease leaves them unchanged.
+- eligible stable `X.Y` and `latest` tags resolve to the version manifest;
+  prereleases and recovery of superseded versions leave newer aliases unchanged.
 
 ## Recover or correct a release
 

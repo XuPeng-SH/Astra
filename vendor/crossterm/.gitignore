@@ -1,2 +1,2 @@
-/Cargo.lock
+# Commit Cargo.lock for the standalone, locked CI unit-test lane.
 /target/

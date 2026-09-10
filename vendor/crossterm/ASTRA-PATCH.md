@@ -68,7 +68,11 @@ Changed upstream files:
 Added files: src/event/startup_query.rs, src/event/source/unix/parser.rs.
 Astra's PTY integration tests exercise the real query, theme, terminal guard and
 EventStream without credentials or network requests. The patch's own tests run
-with cargo test --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream.
+with cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream.
+The committed standalone Cargo.lock pins this unit-test lane independently of
+the application's root lockfile. Updating test dependencies requires an
+explicit lockfile update; these unit tests do not replace the real-reader PTY
+tests below. CI runs those PTY tests on both Linux and macOS.
 
 Shipping this prototype requires maintaining this fork until a released upstream
 API provides the required query and input-preservation behavior. Do not silently
@@ -77,8 +81,8 @@ replace it with a library that reads /dev/tty independently of crossterm.
 ## Astra regression commands
 
 ```sh
-cargo test -p astra-cli --lib tui::terminal_startup -- --test-threads=2
-cargo test -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
+cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
 ```
 
 These PTY tests use fake terminal replies and no network or credentials. Run both

@@ -50,9 +50,16 @@ fn dockerfile_builds_from_workspace_root() {
     let (_, planner_and_later) = dockerfile
         .split_once("FROM chef AS planner")
         .expect("Dockerfile must define the cargo-chef planner stage");
-    let (planner, builder) = planner_and_later
-        .split_once("FROM chef AS builder")
-        .expect("Dockerfile must define the cargo-chef builder stage");
+    let (planner, dependencies_and_later) = planner_and_later
+        .split_once("FROM chef AS dependency-inputs")
+        .expect("Dockerfile must define the shared dependency-inputs stage");
+    let (dependencies, builder_and_later) = dependencies_and_later
+        .split_once("FROM dependency-inputs AS builder")
+        .expect("builder must inherit the dependency inputs validated by CI");
+    let builder = builder_and_later
+        .split_once("\nFROM ")
+        .expect("Dockerfile must define a separate runtime stage")
+        .0;
 
     for (name, stage) in [("planner", planner), ("builder", builder)] {
         assert!(
@@ -63,14 +70,20 @@ fn dockerfile_builds_from_workspace_root() {
             stage.contains("COPY crates ./crates"),
             "{name} stage must copy the root workspace crates"
         );
+        assert!(
+            stage.contains("COPY vendor ./vendor"),
+            "{name} stage must copy the patched dependency sources"
+        );
     }
     assert!(
         !dockerfile.contains("COPY . ./"),
         "Dockerfile must use scoped workspace copies so unrelated files do not invalidate Rust layers"
     );
     assert!(
-        dockerfile.contains("COPY --from=planner /app/recipe.json recipe.json"),
-        "builder stage must read cargo-chef recipe from the root workspace"
+        dependencies.contains("WORKDIR /app")
+            && dependencies.contains("COPY --from=planner /app/recipe.json recipe.json")
+            && dependencies.contains("COPY vendor ./vendor"),
+        "shared dependency stage must use the root recipe and patched sources"
     );
 }
 

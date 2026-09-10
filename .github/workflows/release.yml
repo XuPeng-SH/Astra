@@ -35,7 +35,6 @@ jobs:
       tag_object: ${{ steps.resolve.outputs.tag_object }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
       rolling_version: ${{ steps.resolve.outputs.rolling_version }}
-      publish_latest: ${{ steps.resolve.outputs.publish_latest }}
       matrix: ${{ steps.resolve.outputs.matrix }}
       owner_run_id: ${{ steps.resolve.outputs.owner_run_id }}
 
@@ -163,11 +162,9 @@ jobs:
           scripts/validate-release-version.sh "${version}" --root "${source_dir}"
 
           prerelease=false
-          publish_latest=true
           rolling_version="${version%.*}"
           if [[ "${version}" == *-* ]]; then
             prerelease=true
-            publish_latest=false
             rolling_version=""
           fi
           matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
@@ -179,7 +176,6 @@ jobs:
             echo "tag_object=${tag_object}"
             echo "prerelease=${prerelease}"
             echo "rolling_version=${rolling_version}"
-            echo "publish_latest=${publish_latest}"
             echo "matrix=${matrix}"
             echo "owner_run_id=${marker_run_id}"
           } >> "${GITHUB_OUTPUT}"
@@ -642,6 +638,18 @@ jobs:
             "${{ steps.publish_release.outputs.release_id }}" \
             dist
 
+      - name: Resolve monotonic stable release promotion
+        id: promotion
+        if: ${{ needs.preflight.outputs.prerelease == 'false' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/resolve_release_promotion.py \
+            "${GITHUB_REPOSITORY}" "${RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
+
       - name: Publish GitHub Release
         if: ${{ steps.existing_release.outputs.state != 'published' }}
         shell: bash
@@ -649,7 +657,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.publish_release.outputs.release_id }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
-          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
+          PUBLISH_LATEST: ${{ steps.promotion.outputs.publish_latest || 'false' }}
         run: |
           set -euo pipefail
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
@@ -658,21 +666,34 @@ jobs:
             -f make_latest="${PUBLISH_LATEST}" >/dev/null
 
       - name: Promote stable rolling Docker tags
-        if: ${{ needs.preflight.outputs.publish_latest == 'true' }}
+        if: ${{ steps.promotion.outputs.publish_latest == 'true' || steps.promotion.outputs.publish_minor == 'true' }}
         shell: bash
         env:
           IMAGE_NAME: matrixorigin/astra
           IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
           ROLLING_VERSION: ${{ needs.preflight.outputs.rolling_version }}
+          PUBLISH_LATEST: ${{ steps.promotion.outputs.publish_latest }}
+          PUBLISH_MINOR: ${{ steps.promotion.outputs.publish_minor }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            --tag "${IMAGE_NAME}:${ROLLING_VERSION}" \
-            --tag "${IMAGE_NAME}:latest" \
-            "${IMAGE_NAME}:${IMAGE_VERSION}"
+          targets=()
+          if [ "${PUBLISH_MINOR}" = "true" ]; then
+            targets+=("${ROLLING_VERSION}")
+          fi
+          if [ "${PUBLISH_LATEST}" = "true" ]; then
+            targets+=(latest)
+          fi
+          if [ "${#targets[@]}" -eq 0 ]; then
+            exit 0
+          fi
+          tag_args=()
+          for target in "${targets[@]}"; do
+            tag_args+=(--tag "${IMAGE_NAME}:${target}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${IMAGE_NAME}:${IMAGE_VERSION}"
 
           expected="$(docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}" --raw | sha256sum | awk '{ print $1 }')"
-          for target in "${ROLLING_VERSION}" latest; do
+          for target in "${targets[@]}"; do
             actual="$(docker buildx imagetools inspect "${IMAGE_NAME}:${target}" --raw | sha256sum | awk '{ print $1 }')"
             if [ "${actual}" != "${expected}" ]; then
               echo "Promoted tag ${target} does not match ${IMAGE_VERSION}." >&2
@@ -690,9 +711,7 @@ jobs:
             echo "- Source: \`${{ needs.preflight.outputs.source_sha }}\`"
             echo "- Clients: Linux/macOS, AMD64/ARM64"
             echo "- Server: \`matrixorigin/astra:${{ needs.preflight.outputs.version }}\`"
-            if [ "${{ needs.preflight.outputs.publish_latest }}" = "true" ]; then
-              echo "- Promoted: \`${{ needs.preflight.outputs.rolling_version }}\`, \`latest\`"
-            else
-              echo "- Prerelease: rolling Docker tags were not changed"
-            fi
+            echo "- Promote latest: ${{ steps.promotion.outputs.publish_latest || 'false' }}"
+            echo "- Promote minor: ${{ steps.promotion.outputs.publish_minor || 'false' }}"
+            echo "- Prereleases and superseded release aliases are not promoted"
           } >> "${GITHUB_STEP_SUMMARY}"

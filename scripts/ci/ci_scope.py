@@ -40,7 +40,6 @@ RUST_SCOPES = (
 )
 SERVICE_CRATES = {"services", "astra-turn-core", "astra-plan", "astra-prompts"}
 LIGHTWEIGHT_ROOT_FILES = {
-    ".dockerignore",
     ".editorconfig",
     ".gitattributes",
     ".gitignore",
@@ -160,6 +159,11 @@ def classify(paths: list[str]) -> dict[str, bool]:
         if path == ".nvmrc":
             _enable(result, "sdk", "web")
             continue
+        if path.startswith("vendor/"):
+            # Vendored Rust code is a compiler input, not an unknown-area
+            # fallback. Keep downstream Rust lanes without unrelated Node tests.
+            _enable(result, *RUST_SCOPES)
+            continue
         if path.startswith("packages/sdk/"):
             # The web workspace consumes the local SDK package.
             _enable(result, "sdk", "web")
@@ -183,9 +187,10 @@ def classify(paths: list[str]) -> dict[str, bool]:
                 "online_integration",
             )
             continue
-        if path == "Dockerfile":
-            # make lint verifies its Rust version remains aligned with the toolchain.
-            _enable(result, "rust")
+        if path in {"Dockerfile", ".dockerignore"}:
+            # Lint checks the pinned toolchain; core's repo_layout_contract
+            # checks Docker stages and workspace inputs as well.
+            _enable(result, "rust", "test_core")
             continue
         if path.startswith("crates/"):
             _rust_scope_for(path, result)

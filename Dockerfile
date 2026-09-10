@@ -48,15 +48,27 @@ FROM chef AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
+FROM chef AS dependency-inputs
+
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+# Keep patched path dependencies available while cooking the workspace skeleton.
+# Their source also participates in the dependency cache key.
+COPY vendor ./vendor
+# CI and the real builder share this filesystem. Full dependency resolution
+# validates every path dependency, including patches outside workspace members;
+# cargo-chef prepare's --no-deps metadata alone cannot do that.
+RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json --no-build && \
+    cargo metadata --locked --format-version 1 > /dev/null
+
+FROM dependency-inputs AS builder
 
 ARG IMAGE_REVISION
 ARG IMAGE_SOURCE_DIRTY
 
-WORKDIR /app
-COPY --from=planner /app/recipe.json recipe.json
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
 RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json \
@@ -65,6 +77,7 @@ RUN cargo chef cook --release --locked --no-default-features --recipe-path recip
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN ASTRA_BUILD_SOURCE_GIT_SHA="${IMAGE_REVISION}" \
     ASTRA_BUILD_SOURCE_GIT_DIRTY="${IMAGE_SOURCE_DIRTY}" \
     cargo build --release --locked --no-default-features \

@@ -103,6 +103,24 @@ class CiScopeTests(unittest.TestCase):
         self.assertFalse(scopes["sdk"])
         self.assertFalse(scopes["web"])
 
+    def test_vendor_explicitly_selects_rust_without_unknown_path_fallback(self) -> None:
+        for path in ("vendor/crossterm/src/event.rs", "vendor/crossterm/Cargo.lock", "vendor/new-crate/src/lib.rs"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                for name in ("rust", "test_cli", "test_core", "test_services", "test_runtime", "online_core", "online_integration"):
+                    self.assertTrue(scopes[name], name)
+                for name in ("sdk", "web", "harness", "script_contracts"):
+                    self.assertFalse(scopes[name], name)
+
+    def test_docker_inputs_select_existing_rust_layout_contracts(self) -> None:
+        for path in ("Dockerfile", ".dockerignore"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["rust"])
+                self.assertTrue(scopes["test_core"])
+                self.assertFalse(scopes["sdk"])
+                self.assertFalse(scopes["web"])
+
     def test_ci_classifier_change_falls_back_to_every_scope(self) -> None:
         self.assertTrue(all(classify(["scripts/ci/ci_scope.py"]).values()))
 

@@ -195,12 +195,63 @@ jobs:
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
           -p astra-config -p astra-edge
+          -p astra-credentials -p astra-mcp -p astra-memoria
+          -p astra-harness -p astra-test-harness
+          -p astra-logging -p astra-sync-protocol
           --profile ci
       - name: Test server e2e-hooks (selective)
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
           --features e2e-hooks --profile ci
           -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
+
+  vendored-terminal:
+    name: "Test: vendored terminal (${{ matrix.os }})"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+      # The patched crate is deliberately outside the application workspace.
+      # These are parser/unit tests, not the real-reader PTY regression suite.
+      - name: Test vendored terminal units
+        run: |
+          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream
+          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream,use-dev-tty
+
+  terminal-pty:
+    name: "Test: terminal PTY (${{ matrix.os }})"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-terminal-pty
+          install-nextest: false
+      # Separate Cargo invocations prevent feature unification from silently
+      # selecting dev-tty for the nominal default-reader test run.
+      - name: Test real terminal readers through PTYs
+        run: |
+          cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+          cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"

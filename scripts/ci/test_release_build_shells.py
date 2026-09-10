@@ -30,6 +30,66 @@ def workflow_run_script(path, step_name):
 
 
 class ReleaseShellTests(unittest.TestCase):
+    def test_musl_install_isolates_sources_and_preserves_failures(self):
+        script = workflow_run_script(
+            ".github/workflows/release-binaries.yml", "Install musl build dependencies"
+        )
+        scenarios = (
+            ("deb822", "modern", "", 0, 2),
+            ("legacy", "legacy", "", 0, 2),
+            ("empty-deb822-fallback", "empty-modern", "", 0, 2),
+            ("missing-sources", "missing", "", 1, 0),
+            ("ubuntu-update-failure", "modern", "update", 100, 1),
+            ("package-install-failure", "modern", "install", 100, 2),
+        )
+        for name, source_layout, failed_operation, exit_code, calls in scenarios:
+            with self.subTest(scenario=name), tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory)
+                apt = fixture / "apt"
+                (apt / "sources.list.d").mkdir(parents=True)
+                modern = apt / "sources.list.d/ubuntu.sources"
+                legacy = apt / "sources.list"
+                if source_layout == "modern":
+                    modern.write_text("Ubuntu source fixture\n")
+                elif source_layout in ("legacy", "empty-modern"):
+                    legacy.write_text("Ubuntu source fixture\n")
+                    if source_layout == "empty-modern":
+                        modern.touch()
+                selected = modern if source_layout == "modern" else legacy
+                log = fixture / "apt.log"
+                # Execute the actual workflow shell, substituting only the fixture
+                # filesystem. An unrestricted refresh models a broken Chrome index.
+                stub = r'''
+sudo() {
+    printf '%s\n' "$*" >> "$APT_TEST_LOG"
+    case " $* " in
+        *" -o Dir::Etc::sourceparts=- "*) ;;
+        *) echo 'Chrome index: Hash Sum mismatch' >&2; return 100 ;;
+    esac
+    if [[ -n "$APT_TEST_FAIL" && " $* " == *" $APT_TEST_FAIL "* ]]; then
+        echo 'Ubuntu update or package verification failed' >&2
+        return 100
+    fi
+}
+'''
+                result = subprocess.run(
+                    ["bash", "-c", stub + script.replace("/etc/apt", str(apt))],
+                    env={**os.environ, "APT_TEST_LOG": str(log),
+                         "APT_TEST_FAIL": failed_operation},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                recorded = log.read_text().splitlines() if log.exists() else []
+                prefix = (
+                    f"apt-get -o Dir::Etc::sourcelist={selected} "
+                    "-o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 "
+                    "-o APT::Update::Error-Mode=any "
+                )
+                self.assertEqual(recorded, [
+                    prefix + "update",
+                    prefix + "install -y --no-install-recommends musl-tools",
+                ][:calls])
+
     def test_draft_reads_use_publication_credentials(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("contents: write", workflow.split("\n  publish:\n", 1)[1])
