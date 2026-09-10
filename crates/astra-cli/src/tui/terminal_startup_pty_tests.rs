@@ -13,6 +13,34 @@ use crate::tui::terminal_startup::StartupTerminal;
 const CHILD: &str = "tui::terminal_startup::pty_tests::probe_child";
 const RESULT: &str = "ASTRA_PROBE_RESULT=";
 const INPUT: &str = "a你\x1b[200~pasted\n你好\x1b]11;rgb:ff/ff/ff\x07\x1b[201~";
+// Long enough to prove that receiving colors does not finish the query before
+// DA1, while leaving ample headroom inside the real 300 ms product budget on
+// loaded hosted runners. This wall-clock PTY fixture does not claim to verify
+// behavior at the exact timeout boundary.
+const DELAYED_DA1_WAIT: Duration = Duration::from_millis(80);
+
+// Split after the opening ESC, inside the ST terminator, and inside the RGB
+// payload. Do not sleep once per byte: scheduler delays can accumulate beyond
+// the real 300 ms startup budget. Exhaustive byte boundaries are also covered
+// directly by the vendored parser tests, without OS scheduling or PTY coalescing.
+const LIGHT_RESPONSE_PARTS: [&[u8]; 4] = [
+    b"\x1b",
+    b"]10;rgb:0000/0000/0000\x1b",
+    b"\\\x1b]11;rgb:ffff/",
+    b"ffff/ffff\x07",
+];
+
+#[derive(Debug, Default, serde::Serialize)]
+struct PtyTiming {
+    // All parent timestamps are milliseconds since spawn completed; child
+    // elapsed_ms measures StartupTerminal::begin independently.
+    query_budget_ms: u128,
+    query_seen_ms: Option<u128>,
+    response_write_end_ms: Vec<u128>,
+    da1_written_ms: Option<u128>,
+    startup_ready_seen_ms: Option<u128>,
+    input_ready_seen_ms: Option<u128>,
+}
 
 fn terminal_modes_restored(
     before: &nix::sys::termios::Termios,
@@ -286,7 +314,12 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     }
     let mut child = command.spawn().unwrap();
     drop(command);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let parent_started = Instant::now();
+    let deadline = parent_started + Duration::from_secs(10);
+    let mut timing = PtyTiming {
+        query_budget_ms: super::QUERY_TIMEOUT.as_millis(),
+        ..PtyTiming::default()
+    };
     let mut output = Vec::new();
     let mut replied = false;
     let mut sent_input = false;
@@ -296,7 +329,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             child.kill().ok();
             child.wait().ok();
             panic!(
-                "PTY case {case} timed out: {}",
+                "PTY case {case} timed out; timing={timing:?}: {}",
                 String::from_utf8_lossy(&output)
             );
         }
@@ -313,8 +346,19 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 Ok(count) => output.extend_from_slice(&chunk[..count]),
             }
         }
+        if timing.startup_ready_seen_ms.is_none()
+            && output.windows(13).any(|bytes| bytes == b"STARTUP_READY")
+        {
+            timing.startup_ready_seen_ms = Some(parent_started.elapsed().as_millis());
+        }
+        if timing.input_ready_seen_ms.is_none()
+            && output.windows(11).any(|bytes| bytes == b"INPUT_READY")
+        {
+            timing.input_ready_seen_ms = Some(parent_started.elapsed().as_millis());
+        }
         if !replied && output.windows(3).any(|bytes| bytes == b"\x1b[c") {
             replied = true;
+            timing.query_seen_ms = Some(parent_started.elapsed().as_millis());
             if !matches!(case, "late" | "unsupported") && !special_input(case) {
                 master.write_all(INPUT.as_bytes()).unwrap();
                 sent_input = true;
@@ -337,19 +381,36 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 _ => "",
             };
             if case == "fragmented" {
-                for byte in response.as_bytes() {
-                    master.write_all(&[*byte]).unwrap();
-                    std::thread::sleep(Duration::from_millis(1));
+                assert_eq!(LIGHT_RESPONSE_PARTS.concat(), response.as_bytes());
+                let send_started = Instant::now();
+                for (index, part) in LIGHT_RESPONSE_PARTS.iter().enumerate() {
+                    // Absolute deadlines avoid accumulating timer overshoot.
+                    let due = send_started + Duration::from_millis(2 * index as u64);
+                    let remaining = due.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(remaining);
+                    }
+                    master.write_all(part).unwrap();
+                    timing
+                        .response_write_end_ms
+                        .push(parent_started.elapsed().as_millis());
                 }
             } else {
                 master.write_all(response.as_bytes()).unwrap();
+                timing
+                    .response_write_end_ms
+                    .push(parent_started.elapsed().as_millis());
             }
             if !matches!(
                 case,
                 "unsupported" | "query_escape" | "sigint_query" | "late_da1"
             ) {
                 if case == "delayed_da1" {
-                    std::thread::sleep(Duration::from_millis(220));
+                    let due = Instant::now() + DELAYED_DA1_WAIT;
+                    let remaining = due.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(remaining);
+                    }
                 }
                 let da1 = if case == "no_sixel" {
                     b"\x1b[?1;2c".as_slice()
@@ -357,6 +418,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                     b"\x1b[?62;4;6c"
                 };
                 master.write_all(da1).unwrap();
+                timing.da1_written_ms = Some(parent_started.elapsed().as_millis());
             }
         }
         if !sent_input
@@ -416,7 +478,10 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     }
     let status = child.wait().unwrap();
     let text = String::from_utf8_lossy(&output);
-    assert!(status.success(), "PTY case {case} failed: {text}");
+    assert!(
+        status.success(),
+        "PTY case {case} failed; timing={timing:?}: {text}"
+    );
     assert!(
         text.contains("STARTUP_READY\r\n"),
         "startup newline handling: {text}"
@@ -424,9 +489,10 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     let result = text
         .lines()
         .find_map(|line| line.split_once(RESULT).map(|(_, value)| value))
-        .unwrap_or_else(|| panic!("no result for {case}: {text}"));
-    let value: Value = serde_json::from_str(result).unwrap();
-    assert_eq!(value["restored"], true, "{case}");
+        .unwrap_or_else(|| panic!("no result for {case}; timing={timing:?}: {text}"));
+    let mut value: Value = serde_json::from_str(result).unwrap();
+    value["pty_timing"] = serde_json::to_value(timing).unwrap();
+    assert_eq!(value["restored"], true, "{case}: {value}");
     if matches!(
         case,
         "abort"
@@ -442,7 +508,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     assert_eq!(
         value["events"],
         serde_json::json!(expected_events(case)),
-        "{case}"
+        "{case}: {value}"
     );
     (value, output)
 }
@@ -451,8 +517,18 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
 fn pty_detects_light_dark_and_fragmented_responses() {
     for case in ["light", "fragmented", "background_only", "dark"] {
         let (value, _) = run_case(case);
-        assert_eq!(value["light"], case != "dark", "{case}");
-        assert_eq!(value["plain"], false, "{case}");
+        assert_eq!(value["light"], case != "dark", "{case}: {value}");
+        assert_eq!(value["plain"], false, "{case}: {value}");
+        if case == "fragmented" {
+            assert_eq!(
+                value["pty_timing"]["response_write_end_ms"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                LIGHT_RESPONSE_PARTS.len(),
+                "{case}: {value}"
+            );
+        }
     }
 }
 
@@ -565,10 +641,15 @@ fn pty_early_palette_or_theme_access_is_detected_and_restores_terminal() {
 }
 
 #[test]
-fn pty_sixel_preserves_slow_response_budget_and_negative_evidence() {
+fn pty_sixel_waits_for_da1_and_records_negative_evidence() {
     let (value, _) = run_case("delayed_da1");
-    assert_eq!(value["sixel_before"], true);
-    assert!(value["elapsed_ms"].as_u64().unwrap() >= 200);
+    assert_eq!(value["sixel_before"], true, "delayed_da1: {value}");
+    let query_seen = value["pty_timing"]["query_seen_ms"].as_u64().unwrap();
+    let da1_written = value["pty_timing"]["da1_written_ms"].as_u64().unwrap();
+    assert!(
+        da1_written.saturating_sub(query_seen) >= DELAYED_DA1_WAIT.as_millis() as u64,
+        "DA1 was not observably delayed: {value}"
+    );
     let (value, _) = run_case("no_sixel");
-    assert_eq!(value["sixel_before"], false);
+    assert_eq!(value["sixel_before"], false, "no_sixel: {value}");
 }

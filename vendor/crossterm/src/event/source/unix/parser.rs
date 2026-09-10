@@ -213,6 +213,34 @@ mod tests {
     }
 
     #[test]
+    fn bytewise_color_responses_preserve_order_and_keys() {
+        let responses = [
+            b"\x1b]10;rgb:0000/0000/0000\x1b\\".as_slice(),
+            b"\x1b]11;rgb:ffff/ffff/ffff\x07".as_slice(),
+        ];
+        let mut parser = Parser::default();
+        parser.set_startup_query(true);
+        parser.advance(b"a", false);
+        for response in responses {
+            for byte in response {
+                // Each advance is a separate reader chunk. No sleeps needed
+                // to force fragmentation, unlike a PTY (which may coalesce).
+                parser.advance(std::slice::from_ref(byte), false);
+            }
+        }
+        parser.advance("你".as_bytes(), false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![
+                key('a'),
+                InternalEvent::OscResponse(String::from_utf8(responses[0].to_vec()).unwrap()),
+                InternalEvent::OscResponse(String::from_utf8(responses[1].to_vec()).unwrap()),
+                key('你'),
+            ]
+        );
+    }
+
+    #[test]
     fn bracketed_paste_is_not_interpreted_as_a_color_response() {
         let mut parser = Parser::default();
         parser.advance(b"\x1b[200~\x1b]11;rgb:ff/ff/ff\x07hello\x1b[201~", false);

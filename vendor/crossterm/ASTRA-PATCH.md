@@ -87,3 +87,21 @@ cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::ter
 
 These PTY tests use fake terminal replies and no network or credentials. Run both
 backends when changing reader readiness, framing, deadlines, or query handoff.
+
+The fragmented-color PTY fixture sends four chunks at absolute offsets, rather
+than sleeping once per byte and accumulating scheduler delays. It still splits
+the opening ESC, ST terminator, and RGB payload. The parser unit tests cover
+every two-part split and byte-at-a-time replies directly, since PTY writes may
+be coalesced by the OS. Product query and parser deadlines remain unchanged.
+Failures include the decoded probe result and parent query/write/ready
+timestamps (`pty_timing`, milliseconds since child spawn completed), alongside
+the child's independent startup `elapsed_ms`, to distinguish missing/late
+replies from incorrect parsing or theme selection. These are test diagnostics,
+not application telemetry or user terminal content.
+
+The Sixel/DA1 PTY case uses an 80 ms delayed reply: enough to prove that the
+query continues after both colors arrive, while retaining substantial headroom
+inside the real 300 ms product budget on a loaded hosted runner. The assertion
+uses the recorded parent timestamps to prove that the delay actually occurred.
+It intentionally does not use wall-clock scheduling to test behavior close to
+the timeout boundary.
