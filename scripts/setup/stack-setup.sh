@@ -19,6 +19,7 @@ fi
 stack_dir="$repo_root/deployment/all-in-one"
 . "$repo_root/scripts/setup/stack_status.sh"
 . "$repo_root/scripts/setup/stack_env_write.sh"
+. "$repo_root/scripts/setup/stack_memory.sh"
 
 die() {
     echo "❌ $*" >&2
@@ -72,7 +73,8 @@ for key in \
     MEMORIA_EMBEDDING_MODEL MEMORIA_EMBEDDING_DIM MEMORIA_EMBEDDING_API_KEY \
     MEMORIA_EMBEDDING_ENDPOINTS ASTRA_STACK_NAME MATRIXONE_DATA_VOLUME \
     MATRIXONE_LOG_DIR MEMORIA_LOG_DIR ASTRA_BIND_ADDRESS ASTRA_API_URL \
-    ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
+    ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT \
+    MEMORIA_IMAGE MEMORIA_SELF_HOSTED_MASTER_ACCESS MEMORIA_WEB_URL; do
     if printenv "$key" >/dev/null 2>&1; then
         setup_overrides="${setup_overrides}${setup_overrides:+, }$key"
     fi
@@ -610,7 +612,7 @@ show_setup_state() {
     admin_model_state
     echo
     echo "Current installation status"
-    echo "  Infrastructure: ready (API $ASTRA_API_URL; dependencies and memory verified)"
+    echo "  Infrastructure: ready (API $ASTRA_API_URL; dependency memory round trip verified)"
     if [[ "$admin_state" == ready ]]; then
         if [[ -n "$admin_identity" ]]; then
             echo "  Administrator:  ready ($admin_identity)"
@@ -743,6 +745,8 @@ ok "Docker, Compose, Python, CLI, and local secrets are ready"
 choose_existing_stack_action
 
 step "2/5" "Configuring and testing semantic memory"
+memory_changed=false
+configure_local_memory_access
 refresh_embedding_state
 embedding_changed=false
 show_embedding_state
@@ -762,8 +766,8 @@ fi
 refresh_embedding_state
 probe_embedding
 unset embedding_key
-if [[ "$embedding_changed" == true && "$reuse_stack" == true ]]; then
-    warn "embedding settings changed, so the existing containers must be recreated"
+if [[ ( "$embedding_changed" == true || "$memory_changed" == true ) && "$reuse_stack" == true ]]; then
+    warn "memory settings changed, so the existing containers must be recreated"
     reuse_stack=false
     startup_mode=repair
 fi
@@ -780,9 +784,9 @@ else
     ok "MatrixOne, Memoria, and astra-server are running"
 fi
 
-step "4/5" "Verifying the complete runtime"
+step "4/5" "Verifying dependencies and optional user memory access"
 verify_stack
-ok "readiness, dependencies, and embedding memory round trip passed"
+ok "readiness and dependency memory round trip passed (see verification output for user-access coverage)"
 
 step "5/5" "Reviewing optional administrator and model setup"
 api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"

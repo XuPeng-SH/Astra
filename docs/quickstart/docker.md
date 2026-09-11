@@ -60,7 +60,50 @@ MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when the endpoint
 requires it, `MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`.
 `stack-start` initializes configuration, starts Compose, waits for health, and
-verifies an exact memory round trip.
+verifies an exact dependency memory round trip. The new self-hosted example pins
+Memoria 0.5.2 and explicitly enables owner-scoped memory for local password
+accounts. Existing env files are preserved; upgrade both `MEMORIA_IMAGE` and
+`MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` after backing up the database, or use the
+guided setup to review these changes. Hosted/browser-login deployments must
+leave that flag disabled.
+
+### Verify ordinary-user memory
+
+Dependency health alone does not prove that an Astra account can use `/memory`.
+By default, `stack-verify` checks Memoria directly with administrator credentials
+and explicitly reports that user access was **not verified**.
+
+To test the user boundary, prepare two different ordinary, non-admin local test
+accounts. The operator must ensure they are non-admin: `/auth/me` does not
+return roles, so this script cannot verify that property and reports that
+limitation explicitly. Supply their credentials through environment variables (prefer a
+secret manager; do not put passwords into shell command arguments/history):
+
+```bash
+read -r ASTRA_SMOKE_USERNAME
+read -r -s ASTRA_SMOKE_PASSWORD
+read -r ASTRA_SMOKE_OTHER_USERNAME
+read -r -s ASTRA_SMOKE_OTHER_PASSWORD
+export ASTRA_SMOKE_USERNAME ASTRA_SMOKE_PASSWORD
+export ASTRA_SMOKE_OTHER_USERNAME ASTRA_SMOKE_OTHER_PASSWORD
+make stack-verify
+unset ASTRA_SMOKE_USERNAME ASTRA_SMOKE_PASSWORD
+unset ASTRA_SMOKE_OTHER_USERNAME ASTRA_SMOKE_OTHER_PASSWORD
+```
+
+The check logs in through Astra, stores one uniquely marked memory, verifies
+its exact ID/content in the owner's search, and checks that the other account's
+search cannot see it. It also verifies that the owner can expand the exact record
+by ID, while the other account receives JSON `null` (Memoria's missing/foreign
+record response) or 403/404. Other responses or errors do not prove isolation.
+It purges only that test memory afterward, including after a failed assertion,
+and checks Astra's normalized deletion receipt. It never creates users or changes
+their permissions.
+A failed or partially configured user check exits nonzero. Missing credentials
+are reported as unverified, never as a successful user-memory check. This is a
+basic search/read-by-ID isolation smoke test, not an exhaustive authorization
+audit; cross-user mutation permissions are not tested.
+
 The released clients and full guided path support Linux, macOS, and Windows
 through WSL. Native Windows and Git Bash are not release targets yet.
 Loopback embedding endpoints are tested directly; other endpoints honor the

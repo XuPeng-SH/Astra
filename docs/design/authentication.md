@@ -14,9 +14,20 @@ The auth service captures validated Memoria settings during application composit
 
 Every user operation resolves that user's persisted scoped credential first. An existing binding remains authoritative for its Memoria owner and `none` / `read_only` / `read_write` consent, including on self-hosted deployments. Lookup failures fail closed and never change authority.
 
-Trusted self-hosted deployments may explicitly set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` together with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. Only an active local account with password authentication, no scoped binding and no retained Memoria identity may use this fallback. Disconnect, account deactivation/deletion and lookup failure deny access; they never manufacture a deployment-master grant for an existing runtime. Astra binds an eligible local user to the master-key transport by the canonical Astra `user_id`. Data requests use Memoria's `Memoria-Owner` authorization scheme. Memoria validates the deployment secret but exposes a non-master principal, so ID-based reads and mutations retain atomic owner enforcement. This fallback is disabled by default and must not be activated for hosted/browser-login deployments. Memoria v0.5.1 and the digest currently pinned by the all-in-one example do not support this scheme; use a release containing `matrixorigin/Memoria#250` before enabling it.
+Trusted self-hosted deployments may explicitly set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` together with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. Only an active local account with password authentication, no scoped binding and no retained Memoria identity may use this fallback. Disconnect, account deactivation/deletion and lookup failure deny access; they never manufacture a deployment-master grant for an existing runtime. Astra binds an eligible local user to the master-key transport by the canonical Astra `user_id`. Data requests use Memoria's `Memoria-Owner` authorization scheme. Memoria validates the deployment secret but exposes a non-master principal, so ID-based reads and mutations retain atomic owner enforcement. The Server defaults to disabled and this fallback must not be activated for hosted/browser-login deployments. The self-hosted all-in-one example explicitly enables it and pins compatible Memoria 0.5.2. Existing env files are preserved; operators upgrading from the older pin must install a compatible Memoria image and explicitly enable access. Memoria v0.5.1 does not support this scheme.
 
 The provider verifies the scoped-key API contract through `/auth/whoami`: active non-master personal key, exact owner, nonempty key ID, API version 1, scopes capability and memory-filter capability. HTTP redirects are not followed. Identity, model-provider and Memoria secrets must not be logged.
+
+Memory proxy denials include additive `error_code` values without changing
+authorization policy: `memory_consent_denied` for a scoped permission denial,
+`memory_self_hosted_access_disabled` for an eligible unbound local account in a
+deployment without a login website whose fallback is disabled, and
+`memory_access_disabled` for other disabled authority. Only the self-hosted code
+produces deployment-switch advice in CLI diagnostics. Revoked/inactive authority
+must not be presented as a reason to enable fallback. Authentication middleware
+can reject invalid or revoked sessions earlier with 401. Older servers without
+these codes retain generic CLI permission hints; detail text is not parsed to
+infer an authorization category.
 
 ## Atomic binding and sessions
 

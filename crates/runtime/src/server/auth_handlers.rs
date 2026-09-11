@@ -398,7 +398,9 @@ impl MemoriaUserAuthority {
 
 #[derive(Debug)]
 enum MemoriaForwardError {
-    Forbidden(String),
+    ConsentDenied(String),
+    SelfHostedAccessDisabled,
+    AccessDisabled,
     Unconfigured,
     Backend(String),
 }
@@ -406,7 +408,10 @@ enum MemoriaForwardError {
 impl std::fmt::Display for MemoriaForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Forbidden(message) | Self::Backend(message) => f.write_str(message),
+            Self::ConsentDenied(message) | Self::Backend(message) => f.write_str(message),
+            Self::SelfHostedAccessDisabled | Self::AccessDisabled => {
+                f.write_str("memory access is not enabled for this Astra account")
+            }
             Self::Unconfigured => f.write_str("Memoria credential resolver is not configured"),
         }
     }
@@ -417,8 +422,26 @@ fn require_memoria_consent(
     requires_write: bool,
 ) -> Result<(), MemoriaForwardError> {
     match access.denial_message(requires_write) {
-        Some(message) => Err(MemoriaForwardError::Forbidden(message.into())),
+        Some(message) => Err(MemoriaForwardError::ConsentDenied(message.into())),
         None => Ok(()),
+    }
+}
+
+// This classifies an already-denied request for presentation only. Never use
+// this classification to grant fallback authority or bypass scoped consent.
+fn disabled_memoria_authority_error<T>(
+    resolution: &astra_services::auth::memoria::MemoriaCredentialResolution<T>,
+    has_login_website: bool,
+) -> MemoriaForwardError {
+    if !has_login_website
+        && matches!(
+            resolution,
+            astra_services::auth::memoria::MemoriaCredentialResolution::UnboundLocal
+        )
+    {
+        MemoriaForwardError::SelfHostedAccessDisabled
+    } else {
+        MemoriaForwardError::AccessDisabled
     }
 }
 
@@ -436,11 +459,14 @@ async fn resolve_memoria_user_authority(
         .auth_service
         .memoria_credentials()
         .ok_or(MemoriaForwardError::Unconfigured)?;
+    let resolution = resolver
+        .resolve_runtime(user_id)
+        .await
+        .map_err(MemoriaForwardError::Backend)?;
+    let disabled_error =
+        disabled_memoria_authority_error(&resolution, resolver.provider.web_url.is_some());
     match crate::turn::cloud::memoria_compact::select_memoria_authority(
-        resolver
-            .resolve_runtime(user_id)
-            .await
-            .map_err(MemoriaForwardError::Backend)?,
+        resolution,
         state.memoria_self_hosted_fallback_enabled,
     ) {
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Scoped(credential) => {
@@ -457,9 +483,7 @@ async fn resolve_memoria_user_authority(
             })
         }
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Disabled => {
-            Err(MemoriaForwardError::Forbidden(
-                "memory access is not enabled for this Astra account".into(),
-            ))
+            Err(disabled_error)
         }
     }
 }
@@ -541,8 +565,20 @@ async fn forward_memoria_for_user(
 
 fn map_memoria_forward_error(error: MemoriaForwardError) -> (StatusCode, Json<ErrorResponse>) {
     let error = match error {
-        MemoriaForwardError::Forbidden(message) => {
-            return error_response(StatusCode::FORBIDDEN, message);
+        MemoriaForwardError::ConsentDenied(_)
+        | MemoriaForwardError::SelfHostedAccessDisabled
+        | MemoriaForwardError::AccessDisabled => {
+            let code = match &error {
+                MemoriaForwardError::ConsentDenied(_) => "memory_consent_denied",
+                MemoriaForwardError::SelfHostedAccessDisabled => {
+                    "memory_self_hosted_access_disabled"
+                }
+                _ => "memory_access_disabled",
+            };
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(error.to_string()).with_error_code(code)),
+            );
         }
         MemoriaForwardError::Unconfigured => {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
@@ -1161,14 +1197,52 @@ mod tests {
             let (status, body) = map_memoria_forward_error(error);
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(body.detail, access.denial_message(write).unwrap());
+            assert_eq!(body.error_code.as_deref(), Some("memory_consent_denied"));
         }
-        let (status, body) = map_memoria_forward_error(MemoriaForwardError::Forbidden(
+        let (status, body) = map_memoria_forward_error(MemoriaForwardError::ConsentDenied(
             "A completely different localized message".into(),
         ));
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.detail, "A completely different localized message");
+        assert_eq!(body.error_code.as_deref(), Some("memory_consent_denied"));
         assert!(require_memoria_consent(MemoryAccess::ReadOnly, false).is_ok());
         assert!(require_memoria_consent(MemoryAccess::ReadWrite, true).is_ok());
+    }
+
+    #[test]
+    fn memoria_disabled_codes_preserve_local_hosted_and_revoked_distinctions() {
+        use astra_services::auth::memoria::MemoriaCredentialResolution;
+        for (resolution, has_website, code) in [
+            (
+                MemoriaCredentialResolution::<()>::UnboundLocal,
+                false,
+                "memory_self_hosted_access_disabled",
+            ),
+            (
+                MemoriaCredentialResolution::UnboundLocal,
+                true,
+                "memory_access_disabled",
+            ),
+            (
+                MemoriaCredentialResolution::Denied,
+                false,
+                "memory_access_disabled",
+            ),
+            (
+                MemoriaCredentialResolution::Denied,
+                true,
+                "memory_access_disabled",
+            ),
+        ] {
+            let error = super::disabled_memoria_authority_error(&resolution, has_website);
+            let (status, body) = map_memoria_forward_error(error);
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body.error_code.as_deref(), Some(code));
+            assert_eq!(
+                body.detail,
+                "memory access is not enabled for this Astra account"
+            );
+        }
     }
 
     #[test]

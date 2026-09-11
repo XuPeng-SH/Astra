@@ -12,6 +12,7 @@ embedding_probe="$repo_root/scripts/setup/check_embedding.py"
 identity_helpers="$repo_root/scripts/setup/stack_identity.sh"
 status_helpers="$repo_root/scripts/setup/stack_status.sh"
 env_write_helpers="$repo_root/scripts/setup/stack_env_write.sh"
+memory_helpers="$repo_root/scripts/setup/stack_memory.sh"
 
 grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
@@ -134,6 +135,49 @@ fi
 printf '%s\n' 'MEMORIA_EMBEDDING_PROVIDER=mock' > "$fixture"
 python3 "$embedding_probe" "$fixture" >/dev/null
 python3 "$repo_root/scripts/ci/test_embedding_preflight.py"
+python3 "$repo_root/scripts/ci/test_user_memory_verification.py"
+
+# Exercise self-hosted setup decisions without Docker or prompting.
+(
+    . "$env_write_helpers"
+    . "$memory_helpers"
+    stack_env="$fixture_dir/memory.env"
+    supported_image="$(env_file_read "$repo_root/deployment/all-in-one/.env.example" MEMORIA_IMAGE)"
+    [[ "$(env_file_read "$generated_env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 1 ]]
+    [[ "$(env_file_read "$generated_env" MEMORIA_IMAGE)" == "$supported_image" ]]
+    confirm() { [[ "$memory_answer" == yes ]]; }
+    warn() { :; }
+    ok() { :; }
+    die() { exit 42; }
+    printf 'MEMORIA_IMAGE=old-image\nMEMORIA_SELF_HOSTED_MASTER_ACCESS=0\n' > "$stack_env"
+    memory_answer=no
+    memory_changed=false
+    configure_local_memory_access
+    [[ "$memory_changed" == false ]]
+    [[ "$(env_file_read "$stack_env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 0 ]]
+    [[ "$(env_file_read "$stack_env" MEMORIA_IMAGE)" == old-image ]]
+    memory_answer=yes
+    configure_local_memory_access
+    [[ "$memory_changed" == true ]]
+    [[ "$(env_file_read "$stack_env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 1 ]]
+    [[ "$(env_file_read "$stack_env" MEMORIA_IMAGE)" == "$supported_image" ]]
+    memory_changed=false
+    configure_local_memory_access
+    [[ "$memory_changed" == false ]]
+    set_env_value MEMORIA_IMAGE custom-image
+    memory_answer=no
+    if (configure_local_memory_access); then
+        echo 'memory setup accepted an unverified custom image' >&2; exit 1
+    else
+        [[ "$?" == 42 ]]
+    fi
+    set_env_value MEMORIA_WEB_URL https://example.invalid
+    set_env_value MEMORIA_SELF_HOSTED_MASTER_ACCESS 0
+    memory_answer=yes
+    configure_local_memory_access
+    [[ "$(env_file_read "$stack_env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 0 ]]
+    [[ "$(env_file_read "$stack_env" MEMORIA_IMAGE)" == custom-image ]]
+)
 
 if grep -Eq 'set -x|echo .*embedding_key|echo .*api_key' "$script"; then
     echo "interactive setup contract failed: secret may be traced or printed" >&2

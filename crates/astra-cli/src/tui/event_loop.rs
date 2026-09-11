@@ -391,7 +391,11 @@ async fn load_memory_search(
         .map_err(|error| format!("Memory unreachable: {error}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("Memory search failed (HTTP {status})"));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Memory search failed: {}",
+            crate::cli::cli_config::cli_utils::read_api_error(status.as_u16(), &body)
+        ));
     }
     let body = response
         .text()

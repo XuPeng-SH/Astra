@@ -90,7 +90,7 @@ make stack-start
 Process-level credentials are passed to Compose but are not written to `.env`.
 Put embedding settings in that file only when persistence is intentional;
 otherwise export them again on subsequent `make stack-up` invocations.
-`make stack-verify` repeats the runtime proof.
+`make stack-verify` repeats dependency verification. It reports separately whether Astra account memory access was tested. Operators must select two non-admin accounts; `/auth/me` does not expose roles, so the script cannot certify that they are non-admin. See [user memory verification](../../docs/quickstart/docker.md#verify-ordinary-user-memory).
 
 If a service does not become healthy, startup prints container status and
 recent logs while leaving the partial stack available for inspection. Fix the
@@ -132,7 +132,9 @@ astra login
 ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 ```
 
-With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. End-user master access is disabled by default: the Memoria digest currently pinned in `.env.example` predates the required `Memoria-Owner` scheme. After upgrading `MEMORIA_IMAGE` to a release containing `matrixorigin/Memoria#250`, set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra will then use the configured `MEMORIA_MASTER_KEY` only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. A hosted/browser-login deployment must leave this flag disabled.
+With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.2 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
+
+Existing `.env` files are not overwritten by `stack-env`. If upgrading from the older Memoria pin, back up the database, update `MEMORIA_IMAGE` to the compatible digest in `.env.example`, set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, and run `make stack-up` to recreate affected containers. `make stack-setup` offers this change with confirmation and preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401).
 
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the

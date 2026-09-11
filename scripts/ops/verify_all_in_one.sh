@@ -185,4 +185,12 @@ if not isinstance(purged, int) or purged < 1:
 '
 memory_id=""
 echo "✅ Memory cleanup: removed smoke record"
-echo "✅ All-in-one runtime verification passed"
+echo "Dependency phase complete (administrator-to-Memoria path); checking user-memory verification coverage."
+if [[ -n "${ASTRA_SMOKE_USERNAME:-}${ASTRA_SMOKE_PASSWORD:-}${ASTRA_SMOKE_OTHER_USERNAME:-}${ASTRA_SMOKE_OTHER_PASSWORD:-}" ]]; then
+    python3 "$repo_root/scripts/ops/verify_user_memory.py" "$api_url"
+else
+    echo "⚠️  Astra user memory access was NOT verified. Dependency health does not prove /memory works."
+    echo "   To verify it, supply two existing ordinary test accounts via ASTRA_SMOKE_USERNAME/PASSWORD"
+    echo "   and ASTRA_SMOKE_OTHER_USERNAME/PASSWORD (environment variables, not command-line arguments)."
+fi
+echo "✅ Requested verification checks passed; see above for any unverified coverage."

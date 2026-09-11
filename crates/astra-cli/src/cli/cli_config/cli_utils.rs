@@ -590,6 +590,26 @@ pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
 /// Error-code-aware hint. Human-readable detail is presentation and must not
 /// be parsed to recover a failure category.
 pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    if status == 403 {
+        match error_code {
+            Some("memory_self_hosted_access_disabled") => {
+                return Some(
+                    "Ask the administrator to check MEMORIA_SELF_HOSTED_MASTER_ACCESS=1, the Memoria master key, and support for Memoria-Owner authentication.",
+                );
+            }
+            Some("memory_consent_denied") => {
+                return Some(
+                    "Your memory-sharing permissions do not allow this operation. Review your sharing settings; deployment configuration does not override consent.",
+                );
+            }
+            Some("memory_access_disabled") => {
+                return Some(
+                    "Memory access is unavailable for this account. Check your account connection and memory-sharing permissions.",
+                );
+            }
+            _ => {}
+        }
+    }
     if (status == 500 || status == 503)
         && matches!(
             error_code,
@@ -1323,6 +1343,60 @@ mod tests {
     }
 
     // ── read_api_error ────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_api_error_preserves_denial_and_conditional_deployment_guidance() {
+        let body = serde_json::json!({
+            "detail": "memory access is not enabled for this Astra account",
+            "request_id": "memory-request-123",
+            "error_code": "memory_self_hosted_access_disabled",
+        })
+        .to_string();
+        let error = read_api_error(403, &body);
+        assert!(error.contains("memory access is not enabled"));
+        assert!(error.contains("memory-request-123"));
+        assert!(error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS=1"));
+        assert!(!error.contains("Cloud:"));
+    }
+
+    #[test]
+    fn memory_api_error_retains_backend_incompatibility_without_403_advice() {
+        let body =
+            r#"{"detail":"Memoria-Owner authentication requires a compatible Memoria release"}"#;
+        let error = read_api_error(401, body);
+        assert!(error.contains("Memoria-Owner"));
+        assert!(!error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS=1"));
+    }
+
+    #[test]
+    fn memory_api_error_only_gives_deployment_advice_for_the_typed_local_denial() {
+        for code in [
+            Some("memory_consent_denied"),
+            Some("memory_access_disabled"),
+            None,
+            Some("unknown"),
+        ] {
+            let error = read_api_error(
+                403,
+                &serde_json::json!({
+                    // Even matching prose from an old server cannot select a deployment hint.
+                    "detail": "memory access is not enabled for this Astra account",
+                    "error_code": code,
+                })
+                .to_string(),
+            );
+            assert!(
+                !error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS"),
+                "{error}"
+            );
+        }
+        let error = read_api_error(
+            403,
+            r#"{"detail":"translated message","error_code":"memory_consent_denied"}"#,
+        );
+        assert!(error.contains("Review your sharing settings"));
+        assert!(error.contains("translated message"));
+    }
 
     #[test]
     fn read_api_error_includes_status() {

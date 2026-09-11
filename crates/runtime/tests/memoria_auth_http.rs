@@ -215,17 +215,20 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     assert_eq!(login["memory_access"], "none");
     assert!(!login.to_string().contains("identity-key"));
     let token = login["access_token"].as_str().unwrap();
-    assert_eq!(
-        request(
-            app.clone(),
-            "GET",
-            "/memory/profile",
-            Some(token),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
+    let (status, denied) = request(
+        app.clone(),
+        "GET",
+        "/memory/profile",
+        Some(token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["error_code"], "memory_consent_denied");
+    assert!(
+        denied["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let (status, relink) = request(
@@ -264,18 +267,16 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     assert_eq!(status, StatusCode::OK, "{profile}");
     assert_eq!(profile["profile"], "from-provider-a");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        request(
-            app.clone(),
-            "POST",
-            "/memory/store",
-            Some(token),
-            json!({"content":"blocked","memory_type":"semantic"})
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
-    );
+    let (status, denied) = request(
+        app.clone(),
+        "POST",
+        "/memory/store",
+        Some(token),
+        json!({"content":"blocked","memory_type":"semantic"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["error_code"], "memory_consent_denied");
     assert_eq!(
         request(app.clone(), "DELETE", "/auth/memoria", None, json!({}))
             .await
