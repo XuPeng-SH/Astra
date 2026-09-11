@@ -7,6 +7,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod browser_code;
+
 /// Session authentication failure that can be repaired by `/login`.
 ///
 /// Excludes upstream model-provider credential failures. Those belong to the
@@ -183,8 +185,18 @@ pub(crate) async fn do_memoria_browser_login(
     profile: Option<&str>,
     website_base: &str,
 ) -> Result<String, String> {
+    do_memoria_browser_login_with_opener(api, profile, website_base, open_login_url).await
+}
+
+async fn do_memoria_browser_login_with_opener(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    website_base: &str,
+    open: impl FnOnce(&str),
+) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    let website = validate_login_website(website_base)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| format!("failed to start local login callback: {error}"))?;
@@ -196,15 +208,16 @@ pub(crate) async fn do_memoria_browser_login(
     state_bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     state_bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     let expected_state = URL_SAFE_NO_PAD.encode(state_bytes);
-    let website = validate_login_website(website_base)?;
     let allowed_origin = website.origin().ascii_serialization();
+    let verifier = browser_code::verifier();
     let connect_url = format!(
         "{}/connect/astra?port={port}&state={expected_state}&cli_version={}",
         website_base.trim_end_matches('/'),
         env!("CARGO_PKG_VERSION")
     );
+    let connect_url = browser_code::append_capability(&connect_url, &verifier)?;
     eprintln!("Open this page to connect Astra:\n{connect_url}");
-    open_login_url(&connect_url);
+    open(&connect_url);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut rejected = 0_u8;
@@ -228,6 +241,25 @@ pub(crate) async fn do_memoria_browser_login(
             }
             continue;
         };
+        if request.method == "GET" {
+            let code = match browser_code::callback_code(&request.path, &expected_state) {
+                Ok(code) if request.body.is_empty() => code,
+                _ => {
+                    browser_code::write_result(&mut stream, false).await;
+                    continue;
+                }
+            };
+            let result = tokio::time::timeout_at(deadline, async {
+                let key =
+                    browser_code::redeem(website_base, &code, &verifier, port, &expected_state)
+                        .await?;
+                do_memoria_login_with_key(api, profile, &key).await
+            })
+            .await
+            .map_err(|_| "Browser login timed out; run astra login again".to_string())?;
+            browser_code::write_result(&mut stream, result.is_ok()).await;
+            return result;
+        }
         if request.method == "OPTIONS" {
             let origin = (request.origin.as_deref() == Some(allowed_origin.as_str()))
                 .then_some(allowed_origin.as_str());
@@ -687,6 +719,116 @@ pub(crate) async fn do_register_for_session(
 
 #[cfg(test)]
 mod tests {
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn browser_login_entrypoint_supports_local_codes_and_legacy_without_remote_polling() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest, Sha256};
+        let _creds_guard = crate::tests::isolate_credentials();
+        for legacy in [false, true] {
+            let website = MockServer::start().await;
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/auth/memoria"))
+                .and(body_json(json!({"connection_key":"test-connection-key"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"browser-user","access_token":"test-access","refresh_token":"test-refresh"})))
+                .expect(1).mount(&server).await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let website_url = website.uri();
+            let login =
+                super::do_memoria_browser_login_with_opener(&api, None, &website_url, |url| {
+                    sender.send(url.to_string()).unwrap();
+                });
+            let browser = async {
+                let url = url::Url::parse(&receiver.await.unwrap()).unwrap();
+                let fields: std::collections::HashMap<_, _> = url
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                assert_eq!(fields["callback_transport"], "authorization_code_v1");
+                assert_eq!(fields["code_challenge_method"], "S256");
+                assert!(!fields.contains_key("code_verifier"));
+                let callback = format!("http://127.0.0.1:{}/callback", fields["port"]);
+                let code = super::browser_code::verifier();
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                // Unrelated/wrong-state requests must not cause credential exchange
+                // or prevent the valid local browser from finishing afterwards.
+                let invalid = client
+                    .get(&callback)
+                    .query(&[("code", &code), ("state", &"wrong".to_string())])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(invalid.status(), 400);
+                assert!(website.received_requests().await.unwrap().is_empty());
+                assert!(server.received_requests().await.unwrap().is_empty());
+                let response = if legacy {
+                    client.post(&callback).header("Origin",website.uri())
+                        .json(&json!({"state":fields["state"],"memoria_connection_key":"test-connection-key"}))
+                        .send().await.unwrap()
+                } else {
+                    let challenge = fields["code_challenge"].clone();
+                    let state = fields["state"].clone();
+                    let expected_callback = callback.clone();
+                    let expected_code = code.clone();
+                    Mock::given(method("POST"))
+                        .and(path("/api/auth/astra/browser-login/redeem"))
+                        .respond_with(move |req: &wiremock::Request| {
+                            let body: serde_json::Value = req.body_json().unwrap();
+                            assert_eq!(body["authorization_code"], expected_code);
+                            assert_eq!(body["state"], state);
+                            assert_eq!(body["redirect_uri"], expected_callback);
+                            let verifier = body["code_verifier"].as_str().unwrap();
+                            assert_eq!(
+                                URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+                                challenge
+                            );
+                            ResponseTemplate::new(200)
+                                .set_body_json(json!({"connection_key":"test-connection-key"}))
+                        })
+                        .expect(1)
+                        .mount(&website)
+                        .await;
+                    client
+                        .get(&callback)
+                        .query(&[("code", &code), ("state", &fields["state"])])
+                        .send()
+                        .await
+                        .unwrap()
+                };
+                assert!(response.status().is_success());
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                if !legacy {
+                    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+                    assert!(response.text().await.unwrap().contains("signed in"));
+                }
+                assert_eq!(
+                    website.received_requests().await.unwrap().len(),
+                    usize::from(!legacy)
+                );
+            };
+            let (result, ()) = tokio::join!(login, browser);
+            assert_eq!(result.unwrap(), "test-access");
+            let profile = load_credentials().profiles.remove("default").unwrap();
+            assert_eq!(profile.account_id.as_deref(), Some("browser-user"));
+            assert_eq!(profile.access_token.as_deref(), Some("test-access"));
+            assert_eq!(profile.refresh_token.as_deref(), Some("test-refresh"));
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_login_rejects_invalid_website_before_opening_browser() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let result = super::do_memoria_browser_login_with_opener(
+            &api,
+            None,
+            "http://remote.invalid",
+            |_| panic!("must not open browser"),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn loopback_callback_rejects_ambiguous_and_oversized_headers() {

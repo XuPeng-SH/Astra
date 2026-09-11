@@ -90,7 +90,67 @@ shared signing secret.
 
 `GET /auth/methods` advertises the Server's website and issuer. An unset website retains interactive password login, including all-in-one deployments. The CLI falls back to the older password journey only on discovery 404, not on outages or malformed configuration. Explicit username/password and manual scoped-key login remain available.
 
-Browser login URLs require HTTPS except for explicit loopback development addresses. The callback remains bound to 127.0.0.1 with exact Origin, nonce, method, content-type and bounded request validation. Windows passes the URL as child-process environment data, not shell source.
+Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
+
+### Browser-delivered local authorization codes
+
+The CLI binds its existing listener to `127.0.0.1:0`, generates a fresh state
+and private verifier, and opens the discovered website's `/connect/astra` with
+`port`, `state`, `cli_version`, `callback_transport=authorization_code_v1`,
+`code_challenge_method=S256`, and SHA-256 `code_challenge`. The verifier never
+enters the browser URL, logs, or profile storage. No anonymous start endpoint
+or remote approval polling exists.
+
+The signed-in browser shows the account and the existing single confirmation
+button. There is no code to enter or compare and no additional checkbox.
+Confirmation calls the website's authenticated
+`POST /api/integrations/astra/browser-login/authorize`. It reuses the canonical
+integration-key/consent owner and returns only a random, one-time authorization
+code with a 60-second lifetime, never a connection key or Astra session token.
+
+The browser performs a **top-level GET navigation** to
+`http://127.0.0.1:<port>/callback?code=...&state=...`. This is a native-app
+loopback redirect, not cross-origin fetch, an iframe, a popup, or an insecure
+form POST. The destination is constructed from a validated integer port; no
+caller-provided hostname or arbitrary redirect URL is accepted.
+
+The local listener checks the state and bounded, unambiguous request, then
+redeems the code once through
+`POST /api/auth/astra/browser-login/redeem` on the discovered website. The
+request carries the code, private verifier, exact redirect URI and state.
+The website checks S256, expiry, active account, and the exact active
+integration-key generation under the canonical account lock. A conditional
+consume admits one winner. Rotation, revocation, inactivity and replay fail
+closed. Only code hashes and binding metadata are stored in the additive
+`srv_astra_login_codes` table.
+
+Security boundary: transferring the initial website URL to another computer
+does not deliver its browser's code to the remote initiator. A public challenge,
+state, port, or even the initiator's private verifier alone cannot retrieve
+a code or credential. The remote initiator has no polling endpoint. A local
+process that intercepts the callback still lacks the private verifier. This
+does not defend against a compromised local host or a user deliberately
+forwarding the final secret authorization code.
+
+After redemption, the CLI uses the existing `/auth/memoria` exchange and saves
+the existing Astra profile tokens. Only then does the local page report
+successful login. The response has no external resources, uses `no-store`
+and `no-referrer`, and contains no credentials. No Astra Server schema, identity
+mapping or session-lifecycle change is needed.
+
+Website HTTPS is required except explicit loopback development URLs. Code
+exchange does not follow redirects, bounds response size and duration, and is
+not automatically replayed after failure: consumption may already have
+succeeded. Invalid/mismatched GET callbacks do not trigger token exchange.
+The five-minute local listener deadline remains in effect.
+
+Compatibility is explicit in the CLI link. An old website can ignore the
+capability fields and use the unchanged JSON POST callback, which still checks
+exact website Origin, state, method and content type. There is no speculative
+start call and no 404/405/HTML-based fallback decision. A CLI-only update does
+not fix Safari against an old website; upgrade website backend and frontend
+before distributing the new CLI. Old CLI links remain supported. Explicit
+password and manual-key login remain unchanged.
 
 ## Verification
 
