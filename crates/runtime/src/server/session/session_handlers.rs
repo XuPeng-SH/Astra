@@ -1921,8 +1921,14 @@ fn schedule_session_end_governance(state: &AppState, owner_id: String, session_i
         );
         return;
     };
-    let memoria_client =
+    let mut memoria_client =
         crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(resolver, owner_id.clone());
+    if state.memoria_self_hosted_fallback_enabled
+        && let Some(master_key) = state.memoria_master_key.clone()
+    {
+        memoria_client =
+            memoria_client.with_self_hosted_fallback(state.memoria_base_url.clone(), master_key);
+    }
 
     tokio::spawn(async move {
         let debouncer = crate::turn::session_end_debounce::global();

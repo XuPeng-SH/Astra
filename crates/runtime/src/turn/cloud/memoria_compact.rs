@@ -153,8 +153,8 @@ pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
 }
 
 pub use astra_memoria::{
-    MemoriaMemory, MemoriaPort, MemoryScope, ReflectCandidate, ReflectSummary,
-    parse_reflect_candidates, validate_strict_memories,
+    MemoriaMemory, MemoriaPort, MemoriaToolTransport, MemoryScope, ReflectCandidate,
+    ReflectSummary, parse_reflect_candidates, validate_strict_memories,
 };
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
@@ -226,6 +226,7 @@ pub struct HttpMemoriaPort {
     http: reqwest::Client,
     owner_user_id: Option<String>,
     owner_binding_required: bool,
+    owner_scoped_master: bool,
 }
 
 impl HttpMemoriaPort {
@@ -242,12 +243,14 @@ impl HttpMemoriaPort {
             ),
             owner_user_id: None,
             owner_binding_required: false,
+            owner_scoped_master: false,
         }
     }
 
     fn new_master(base_url: String, master_key: String) -> Self {
         Self {
             owner_binding_required: true,
+            owner_scoped_master: true,
             ..Self::new(base_url, master_key)
         }
     }
@@ -263,6 +266,12 @@ impl HttpMemoriaPort {
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();
         Some(Self::new_master(mem.base_url, mem.master_key?))
+    }
+
+    /// Build an owner-neutral self-hosted transport from explicit deployment
+    /// settings. The returned port still requires `bind_owner` before use.
+    pub fn self_hosted(base_url: String, master_key: String) -> Self {
+        Self::new_master(base_url, master_key)
     }
 
     fn request(
@@ -293,15 +302,32 @@ impl HttpMemoriaPort {
                 "Memoria master-key data request requires an authenticated owner binding".into(),
             );
         }
+        let authorization_scheme = if self.owner_scoped_master {
+            "Memoria-Owner"
+        } else {
+            "Bearer"
+        };
         let request = self
             .http
             .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                "Authorization",
+                format!("{authorization_scheme} {}", self.api_key),
+            )
             .header("X-Memoria-Tool", "astra");
         Ok(match owner {
             Some(owner) => request.header("X-User-Id", owner),
             None => request,
         })
+    }
+
+    fn status_error(&self, operation: &str, status: reqwest::StatusCode) -> String {
+        if self.owner_scoped_master && status == reqwest::StatusCode::UNAUTHORIZED {
+            return format!(
+                "Memoria {operation} HTTP {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme"
+            );
+        }
+        format!("Memoria {operation} HTTP {status}")
     }
 
     pub async fn health_check(&self) -> Result<(), String> {
@@ -333,11 +359,44 @@ impl HttpMemoriaPort {
 /// This makes revocation and access-mode changes effective without restarting
 /// an Astra runtime and prevents the server master key from becoming an
 /// implicit end-user consent path.
+pub(crate) enum MemoriaAuthoritySelection<T> {
+    Scoped(T),
+    SelfHosted,
+    Disabled,
+}
+
+/// The user's persisted binding is authoritative whenever it exists. The
+/// deployment master requires an explicitly eligible active local account;
+/// revoked or inactive authority cannot become fallback authority.
+pub(crate) fn select_memoria_authority<T>(
+    resolution: astra_services::auth::memoria::MemoriaCredentialResolution<T>,
+    self_hosted_fallback_enabled: bool,
+) -> MemoriaAuthoritySelection<T> {
+    use astra_services::auth::memoria::MemoriaCredentialResolution;
+    match resolution {
+        MemoriaCredentialResolution::Scoped(scoped) => MemoriaAuthoritySelection::Scoped(scoped),
+        MemoriaCredentialResolution::UnboundLocal if self_hosted_fallback_enabled => {
+            MemoriaAuthoritySelection::SelfHosted
+        }
+        MemoriaCredentialResolution::UnboundLocal | MemoriaCredentialResolution::Denied => {
+            MemoriaAuthoritySelection::Disabled
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UserScopedMemoriaPort {
     resolver: astra_services::auth::memoria::MemoriaCredentialResolver,
     owner_user_id: Option<String>,
+    self_hosted_fallback: Option<SelfHostedMemoriaFallback>,
 }
+
+#[derive(Clone)]
+struct SelfHostedMemoriaFallback {
+    base_url: String,
+    master_key: String,
+}
+
 impl UserScopedMemoriaPort {
     pub fn new(
         resolver: astra_services::auth::memoria::MemoriaCredentialResolver,
@@ -346,55 +405,96 @@ impl UserScopedMemoriaPort {
         Self {
             resolver,
             owner_user_id: Some(owner_user_id),
+            self_hosted_fallback: None,
         }
     }
     pub fn template(resolver: astra_services::auth::memoria::MemoriaCredentialResolver) -> Self {
         Self {
             resolver,
             owner_user_id: None,
+            self_hosted_fallback: None,
         }
     }
+
+    /// Allow owner-scoped master access only when authentication explicitly
+    /// reports an eligible active local account with no binding.
+    pub fn with_self_hosted_fallback(mut self, base_url: String, master_key: String) -> Self {
+        self.self_hosted_fallback = Some(SelfHostedMemoriaFallback {
+            base_url,
+            master_key,
+        });
+        self
+    }
+
     fn owner_user_id(&self) -> Result<&str, String> {
         self.owner_user_id
             .as_deref()
             .ok_or_else(|| "Memoria requires an authenticated owner".into())
     }
     async fn client(&self, write: bool) -> Result<(HttpMemoriaPort, String), String> {
-        let credential = self
-            .resolver
-            .resolve(self.owner_user_id()?)
-            .await?
-            .ok_or("memory access is not enabled")?;
-        enforce_memory_access(credential.access.as_str(), write)?;
-        Ok((
-            HttpMemoriaPort::new(self.resolver.provider.base_url.clone(), credential.key)
-                .with_owner_user_id(credential.owner.clone()),
-            credential.owner,
-        ))
+        let owner_user_id = self.owner_user_id()?;
+        match select_memoria_authority(
+            self.resolver.resolve_runtime(owner_user_id).await?,
+            self.self_hosted_fallback.is_some(),
+        ) {
+            MemoriaAuthoritySelection::Scoped(credential) => {
+                enforce_memory_access(credential.access.as_str(), write)?;
+                Ok((
+                    HttpMemoriaPort::new(self.resolver.provider.base_url.clone(), credential.key)
+                        .with_owner_user_id(credential.owner.clone()),
+                    credential.owner,
+                ))
+            }
+            MemoriaAuthoritySelection::SelfHosted => {
+                let fallback = self
+                    .self_hosted_fallback
+                    .as_ref()
+                    .expect("selection requires a configured fallback");
+                Ok((
+                    HttpMemoriaPort::self_hosted(
+                        fallback.base_url.clone(),
+                        fallback.master_key.clone(),
+                    )
+                    .with_owner_user_id(owner_user_id),
+                    owner_user_id.to_string(),
+                ))
+            }
+            MemoriaAuthoritySelection::Disabled => Err("memory access is not enabled".into()),
+        }
     }
 }
 
 fn enforce_memory_access(access: &str, write: bool) -> Result<(), String> {
-    if access == "none" {
-        return Err("memory access is disabled by the user".to_string());
+    use astra_services::auth::memoria::MemoryAccess;
+    let access =
+        match access {
+            "none" => MemoryAccess::None,
+            "read_only" => MemoryAccess::ReadOnly,
+            "read_write" => MemoryAccess::ReadWrite,
+            _ => return Err(
+                "Memory service configuration is invalid. Please contact the server administrator."
+                    .into(),
+            ),
+        };
+    match access.denial_message(write) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
     }
-    if write && access != "read_write" {
-        return Err("memory write access is disabled by the user".to_string());
-    }
-    if access != "read_only" && access != "read_write" {
-        return Err("Memoria credential has an invalid access mode".to_string());
-    }
-    Ok(())
 }
 
 #[async_trait::async_trait]
 impl MemoriaPort for UserScopedMemoriaPort {
     async fn admits_operation(&self, write: bool) -> Result<bool, String> {
-        Ok(self
-            .resolver
-            .resolve(self.owner_user_id()?)
-            .await?
-            .is_some_and(|credential| credential.access.allows(write)))
+        Ok(
+            match select_memoria_authority(
+                self.resolver.resolve_runtime(self.owner_user_id()?).await?,
+                self.self_hosted_fallback.is_some(),
+            ) {
+                MemoriaAuthoritySelection::Scoped(credential) => credential.access.allows(write),
+                MemoriaAuthoritySelection::SelfHosted => true,
+                MemoriaAuthoritySelection::Disabled => false,
+            },
+        )
     }
     fn bind_owner(&self, user_id: &str) -> Result<std::sync::Arc<dyn MemoriaPort>, String> {
         if self
@@ -407,6 +507,19 @@ impl MemoriaPort for UserScopedMemoriaPort {
         let mut bound = self.clone();
         bound.owner_user_id = Some(user_id.to_string());
         Ok(std::sync::Arc::new(bound))
+    }
+
+    async fn resolve_tool_transport(
+        &self,
+        write: bool,
+    ) -> Result<Option<MemoriaToolTransport>, String> {
+        let (client, owner_user_id) = self.client(write).await?;
+        Ok(Some(MemoriaToolTransport {
+            base_url: client.base_url,
+            credential: client.api_key,
+            owner_user_id,
+            owner_scoped_master: client.owner_scoped_master,
+        }))
     }
 
     async fn retrieve_for_prompt(
@@ -603,6 +716,23 @@ impl MemoriaPort for HttpMemoriaPort {
         ))
     }
 
+    async fn resolve_tool_transport(
+        &self,
+        _write: bool,
+    ) -> Result<Option<MemoriaToolTransport>, String> {
+        let owner_user_id = self
+            .owner_user_id
+            .as_deref()
+            .ok_or("Memoria tool transport requires an authenticated owner binding")?;
+        let scope = astra_memoria::MemoryScope::new(owner_user_id, "tool-transport")?;
+        Ok(Some(MemoriaToolTransport {
+            base_url: self.base_url.clone(),
+            credential: self.api_key.clone(),
+            owner_user_id: scope.user_id,
+            owner_scoped_master: self.owner_scoped_master,
+        }))
+    }
+
     async fn retrieve_for_prompt(
         &self,
         query: &str,
@@ -630,7 +760,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .map_err(|e| format!("Memoria prompt retrieve failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Memoria prompt retrieve HTTP {}", resp.status()));
+            return Err(self.status_error("prompt retrieve", resp.status()));
         }
 
         let data: Value = resp
@@ -682,7 +812,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .map_err(|e| format!("Memoria retrieve failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Memoria retrieve HTTP {}", resp.status()));
+            return Err(self.status_error("retrieve", resp.status()));
         }
 
         let data: Value = resp
@@ -731,7 +861,7 @@ impl MemoriaPort for HttpMemoriaPort {
                 .await
                 .map_err(|e| format!("Memoria typed list failed: {e}"))?;
             if !resp.status().is_success() {
-                return Err(format!("Memoria typed list HTTP {}", resp.status()));
+                return Err(self.status_error("typed list", resp.status()));
             }
             let data: Value = resp
                 .json()
@@ -788,7 +918,11 @@ impl MemoriaPort for HttpMemoriaPort {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<body unreadable>".to_string());
-            return Err(format!("Memoria store HTTP {status}: {}", body.trim()));
+            return Err(format!(
+                "{}: {}",
+                self.status_error("store", status),
+                body.trim()
+            ));
         }
 
         let data: Value = resp
@@ -844,7 +978,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .map_err(|e| format!("Memoria purge failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Memoria purge HTTP {}", resp.status()));
+            return Err(self.status_error("purge", resp.status()));
         }
 
         let data: Value = resp
@@ -877,7 +1011,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Memoria delete HTTP {}", resp.status()));
+            return Err(self.status_error("delete", resp.status()));
         }
         Ok(())
     }
@@ -913,7 +1047,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria store_episode failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Memoria store_episode HTTP {}", resp.status()));
+            return Err(self.status_error("store_episode", resp.status()));
         }
         let data: Value = resp
             .json()
@@ -960,7 +1094,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria store_scene failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Memoria store_scene HTTP {}", resp.status()));
+            return Err(self.status_error("store_scene", resp.status()));
         }
         let data: Value = resp
             .json()
@@ -1003,7 +1137,8 @@ impl MemoriaPort for HttpMemoriaPort {
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(format!(
-                "Memoria reflect HTTP {status}: {}",
+                "{}: {}",
+                self.status_error("reflect", status),
                 text.chars().take(120).collect::<String>()
             ));
         }
@@ -1055,7 +1190,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria feedback failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Memoria feedback HTTP {}", resp.status()));
+            return Err(self.status_error("feedback", resp.status()));
         }
         Ok(())
     }
@@ -1485,6 +1620,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn self_hosted_tool_transport_requires_and_preserves_owner_binding() {
+        let template =
+            HttpMemoriaPort::self_hosted("http://memoria.local".into(), "master-key".into());
+        assert!(template.resolve_tool_transport(false).await.is_err());
+
+        let bound = template.bind_owner("astra-owner").unwrap();
+        let transport = bound.resolve_tool_transport(true).await.unwrap().unwrap();
+        assert_eq!(transport.base_url, "http://memoria.local");
+        assert_eq!(transport.owner_user_id, "astra-owner");
+        assert_eq!(transport.credential, "master-key");
+        assert!(transport.owner_scoped_master);
+        assert_eq!(transport.authorization_header(), "Memoria-Owner master-key");
+    }
+
     #[test]
     fn user_memory_access_is_enforced_before_transport_resolution() {
         assert!(enforce_memory_access("none", false).is_err());
@@ -1494,6 +1644,42 @@ mod tests {
         assert!(enforce_memory_access("read_write", false).is_ok());
         assert!(enforce_memory_access("read_write", true).is_ok());
         assert!(enforce_memory_access("unexpected", false).is_err());
+    }
+
+    #[test]
+    fn scoped_binding_always_wins_over_self_hosted_fallback() {
+        use astra_services::auth::memoria::MemoriaCredentialResolution;
+        assert!(matches!(
+            select_memoria_authority(MemoriaCredentialResolution::Scoped("scoped-owner"), true),
+            MemoriaAuthoritySelection::Scoped("scoped-owner")
+        ));
+        assert!(matches!(
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::UnboundLocal, true),
+            MemoriaAuthoritySelection::SelfHosted
+        ));
+        assert!(matches!(
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::UnboundLocal, false),
+            MemoriaAuthoritySelection::Disabled
+        ));
+        assert!(matches!(
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::Denied, true),
+            MemoriaAuthoritySelection::Disabled
+        ));
+    }
+
+    #[test]
+    fn owner_scoped_unauthorized_error_explains_backend_compatibility() {
+        let self_hosted =
+            HttpMemoriaPort::self_hosted("http://memoria.local".into(), "master-key".into());
+        let error = self_hosted.status_error("retrieve", reqwest::StatusCode::UNAUTHORIZED);
+        assert!(error.contains("verify MEMORIA_MASTER_KEY"));
+        assert!(error.contains("supports the Memoria-Owner authorization scheme"));
+
+        let scoped = HttpMemoriaPort::new("http://memoria.local".into(), "scoped-key".into());
+        assert_eq!(
+            scoped.status_error("retrieve", reqwest::StatusCode::UNAUTHORIZED),
+            "Memoria retrieve HTTP 401 Unauthorized"
+        );
     }
 
     async fn capture_one_http_request(

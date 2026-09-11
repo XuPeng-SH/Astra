@@ -1133,6 +1133,8 @@ impl AppSettings {
             memoria: MemoriaSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: lookup("MEMORIA_MASTER_KEY"),
+                self_hosted_master_access: lookup("MEMORIA_SELF_HOSTED_MASTER_ACCESS")
+                    .is_some_and(|value| value == "1"),
                 issuer: lookup("MEMORIA_ISSUER"),
                 web_url: lookup("MEMORIA_WEB_URL"),
                 legacy_issuer: lookup("MEMORIA_LEGACY_ISSUER"),
@@ -1501,6 +1503,7 @@ impl fmt::Debug for ApiSettings {
 pub struct MemoriaSettings {
     pub base_url: String,
     pub master_key: Option<String>,
+    pub self_hosted_master_access: bool,
     pub issuer: Option<String>,
     pub web_url: Option<String>,
     pub legacy_issuer: Option<String>,
@@ -1513,6 +1516,8 @@ impl MemoriaSettings {
             base_url: env::var("MEMORIA_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_MEMORIA_URL.to_string()),
             master_key: env::var("MEMORIA_MASTER_KEY").ok(),
+            self_hosted_master_access: env::var("MEMORIA_SELF_HOSTED_MASTER_ACCESS")
+                .is_ok_and(|value| value == "1"),
             issuer: env::var("MEMORIA_ISSUER").ok(),
             web_url: env::var("MEMORIA_WEB_URL").ok(),
             legacy_issuer: env::var("MEMORIA_LEGACY_ISSUER").ok(),
@@ -1522,6 +1527,14 @@ impl MemoriaSettings {
     /// Returns `true` when a master key is configured (Memoria is usable).
     pub fn is_configured(&self) -> bool {
         self.master_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Allow a trusted self-hosted master credential only as a per-user
+    /// fallback when no scoped credential exists. A configured website means
+    /// end-user scoped credentials own consent even if an operator also
+    /// configured a master key for administrative duties.
+    pub fn allows_self_hosted_master_fallback(&self) -> bool {
+        self.self_hosted_master_access && self.web_url.is_none() && self.is_configured()
     }
 
     /// `Authorization: Bearer <key>` header value, or `None` if unconfigured.
@@ -1665,6 +1678,56 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn memoria_user_authority_distinguishes_self_hosted_from_scoped_login() {
+        let mut settings = MemoriaSettings {
+            base_url: "http://memoria.local".into(),
+            master_key: Some("configured".into()),
+            self_hosted_master_access: false,
+            issuer: None,
+            web_url: None,
+            legacy_issuer: None,
+        };
+        assert!(!settings.allows_self_hosted_master_fallback());
+
+        settings.self_hosted_master_access = true;
+        assert!(settings.allows_self_hosted_master_fallback());
+
+        settings.web_url = Some("https://accounts.example.test".into());
+        assert!(!settings.allows_self_hosted_master_fallback());
+
+        settings.web_url = None;
+        settings.master_key = None;
+        assert!(!settings.allows_self_hosted_master_fallback());
+    }
+
+    #[test]
+    fn self_hosted_master_access_requires_exact_explicit_env_opt_in() {
+        let mut values = HashMap::from([
+            ("ASTRA_ALLOW_INSECURE_DEFAULTS".to_string(), "1".to_string()),
+            (
+                "MEMORIA_MASTER_KEY".to_string(),
+                "configured-key".to_string(),
+            ),
+        ]);
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(!settings.memoria.allows_self_hosted_master_fallback());
+
+        values.insert(
+            "MEMORIA_SELF_HOSTED_MASTER_ACCESS".to_string(),
+            "true".to_string(),
+        );
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(!settings.memoria.allows_self_hosted_master_fallback());
+
+        values.insert(
+            "MEMORIA_SELF_HOSTED_MASTER_ACCESS".to_string(),
+            "1".to_string(),
+        );
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(settings.memoria.allows_self_hosted_master_fallback());
+    }
 
     #[test]
     fn explicit_env_config_source_is_exact_and_fail_closed() {

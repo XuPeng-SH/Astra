@@ -13160,7 +13160,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // explicit workspace/executor binding and cannot silently fall back.
         let mut root_runtime_context_guard = None;
         if let Some(workspace) = server_tool_executor_workspace {
-            // Memory access is provided by the composition-owned, scoped port.
+            // Memory access is provided by the composition-selected port.
             let memoria_base = None;
             let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.clone(),
@@ -13177,6 +13177,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             );
+            if let Some(memoria_port) = self
+                .memory_extraction_service
+                .as_ref()
+                .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
+            {
+                executor = executor.with_memoria_port(memoria_port);
+            }
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(loop_state.cancellation.token.clone());
             executor =
@@ -15518,6 +15525,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "runtime executor authorization was validated before streaming run start",
                 ),
             );
+            if let Some(memoria_port) = self
+                .memory_extraction_service
+                .as_ref()
+                .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
+            {
+                executor = executor.with_memoria_port(memoria_port);
+            }
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(state.cancellation.token.clone());
             executor =
@@ -21378,6 +21392,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 memoria_base,
                 None,
             );
+            if let Some(memoria_port) = self
+                .memory_extraction_service
+                .as_ref()
+                .and_then(|service| service.memoria_client_for_owner(&config.user_id).ok())
+            {
+                executor = executor.with_memoria_port(memoria_port);
+            }
             executor.set_work_item_attempt_bound(config.work_item.is_some());
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_capabilities(crate::capabilities::delegated_subrun_capabilities(

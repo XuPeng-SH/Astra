@@ -138,6 +138,7 @@ async fn memoria_step_up_authorizes_real_device_and_takeover_routes_without_pass
         web_url: Some(base.clone()),
         issuer: Some("https://stepup-issuer.test".into()),
         master_key: None,
+        self_hosted_master_access: false,
         legacy_issuer: None,
     };
     let state = build_server_state(settings).await.unwrap();

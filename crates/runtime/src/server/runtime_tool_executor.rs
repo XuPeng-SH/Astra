@@ -749,7 +749,8 @@ impl RuntimeToolExecutor {
         sandbox_policy.max_output_bytes = 200_000;
 
         let memoria_client =
-            astra_tools::memoria::MemoriaToolGateway::new(cloud_base.clone(), cloud_token.clone());
+            astra_tools::memoria::MemoriaToolGateway::new(cloud_base.clone(), cloud_token.clone())
+                .require_composition_port();
         let default_executor = DefaultToolExecutor::for_server_workspace(
             &workspace_root,
             user_id.clone(),
@@ -819,6 +820,13 @@ impl RuntimeToolExecutor {
             runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
         }
+    }
+
+    /// Bind explicit memory tools to the same composition-owned authority as
+    /// prompt recall and background extraction.
+    pub fn with_memoria_port(mut self, memoria_port: Arc<dyn astra_memoria::MemoriaPort>) -> Self {
+        self.memoria_client = self.memoria_client.with_memoria_port(memoria_port);
+        self
     }
 
     /// Return the exact ledger scope used by server-local memory calls.
@@ -4380,6 +4388,42 @@ mod tests {
     use crate::server::tool_workspace_path_guard::{
         server_sandbox_local_path_mismatch, server_sandbox_tool_path_mismatch,
     };
+
+    struct UnavailableMemoryPort;
+
+    #[async_trait]
+    impl astra_memoria::MemoriaPort for UnavailableMemoryPort {
+        async fn resolve_tool_transport(
+            &self,
+            _write: bool,
+        ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
+            Err("memory access is not enabled".into())
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+            unreachable!()
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            unreachable!()
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            unreachable!()
+        }
+    }
 
     #[test]
     fn guidance_dispatch_error_maps_to_typed_supersession() {
@@ -12071,19 +12115,32 @@ esac
     // ── Memory tool user isolation ─────────────────────────────────────
 
     #[tokio::test]
-    async fn memory_tool_injects_user_id() {
+    async fn memory_tool_preserves_structured_gateway_errors() {
         let (exec, _dir) = test_executor();
+        let exec = exec.with_memoria_port(Arc::new(UnavailableMemoryPort));
         assert!(
             exec.tool_engine.contains("memory"),
             "memory should be registered in ToolEngine as a context-aware service handler"
         );
-        // We can't actually call Memoria, but we can verify the execute path
-        // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
+        // A structured gateway error must remain an error at the tool-result
+        // boundary; otherwise the TUI misleadingly renders `Ran Memory`.
         let result = exec
-            .execute("memory", &json!({"action": "remember", "content": "test"}))
+            .execute_with_metadata("memory", &json!({"action": "remember", "content": "test"}))
             .await;
-        // Should attempt the call (may fail due to no server, but shouldn't crash)
-        assert!(!result.is_empty());
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("memory access is not enabled"));
+    }
+
+    #[tokio::test]
+    async fn memory_tool_requires_the_server_composition_port() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("memory", &json!({"action": "recall", "query": "test"}))
+            .await;
+
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("memory_service_misconfigured"));
     }
 
     #[tokio::test]

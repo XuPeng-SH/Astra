@@ -209,6 +209,7 @@ services:
       ASTRA_BRIDGE_SECRET: ${ASTRA_RUNTIME_ROOT_SECRET:?Set ASTRA_RUNTIME_ROOT_SECRET in deployment/all-in-one/.env}
       MEMORIA_BASE_URL: http://memoria:8100
       MEMORIA_MASTER_KEY: ${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in deployment/all-in-one/.env}
+      MEMORIA_SELF_HOSTED_MASTER_ACCESS: ${MEMORIA_SELF_HOSTED_MASTER_ACCESS:-0}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     depends_on:
       matrixone:

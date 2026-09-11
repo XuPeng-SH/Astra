@@ -34,18 +34,19 @@ pub(super) async fn build_runtime_wiring(
         )),
         delegation_tracker.clone(),
     ));
+    let memoria_port = state.auth_service.memoria_credentials().map(|resolver| {
+        let mut port =
+            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
+        if settings.memoria.allows_self_hosted_master_fallback()
+            && let Some(master_key) = settings.memoria.master_key.clone()
+        {
+            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
+        }
+        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
+    });
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(shared_pool.clone(), "default")
-            .with_encryptor(
-                Arc::clone(run_encryptor),
-                state.auth_service.memoria_credentials().map(|resolver| {
-                    Arc::new(
-                        crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(
-                            resolver,
-                        ),
-                    ) as Arc<dyn astra_memoria::MemoriaPort>
-                }),
-            ),
+            .with_encryptor(Arc::clone(run_encryptor), memoria_port),
     );
     let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
     let workspace_record_store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(

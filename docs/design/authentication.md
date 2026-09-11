@@ -10,7 +10,11 @@ External principals are identified by issuer/provider and subject, never subject
 
 ## One composition boundary
 
-The auth service captures validated Memoria settings during application composition and supplies one credential resolver to login, refresh, proxy routes and memory runtime consumers. A pool setter never selects a memory transport. Explicit fixture/admin transport overrides cannot redirect the user-scoped credential.
+The auth service captures validated Memoria settings during application composition and supplies one credential resolver to login, refresh, proxy routes and memory runtime consumers. A pool setter never selects a memory transport, and explicit fixture/admin transport overrides cannot redirect the user-scoped credential.
+
+Every user operation resolves that user's persisted scoped credential first. An existing binding remains authoritative for its Memoria owner and `none` / `read_only` / `read_write` consent, including on self-hosted deployments. Lookup failures fail closed and never change authority.
+
+Trusted self-hosted deployments may explicitly set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` together with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. Only an active local account with password authentication, no scoped binding and no retained Memoria identity may use this fallback. Disconnect, account deactivation/deletion and lookup failure deny access; they never manufacture a deployment-master grant for an existing runtime. Astra binds an eligible local user to the master-key transport by the canonical Astra `user_id`. Data requests use Memoria's `Memoria-Owner` authorization scheme. Memoria validates the deployment secret but exposes a non-master principal, so ID-based reads and mutations retain atomic owner enforcement. This fallback is disabled by default and must not be activated for hosted/browser-login deployments. Memoria v0.5.1 and the digest currently pinned by the all-in-one example do not support this scheme; use a release containing `matrixorigin/Memoria#250` before enabling it.
 
 The provider verifies the scoped-key API contract through `/auth/whoami`: active non-master personal key, exact owner, nonempty key ID, API version 1, scopes capability and memory-filter capability. HTTP redirects are not followed. Identity, model-provider and Memoria secrets must not be logged.
 

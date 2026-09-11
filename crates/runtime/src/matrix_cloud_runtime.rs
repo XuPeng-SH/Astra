@@ -157,9 +157,9 @@ impl MatrixCloudRuntime {
     /// Also spins up the [`crate::session_memory::MemoryExtractionService`]
     /// here, because it needs all three of: encryptor (for selector
     /// resolve), ingestion sender (for events), and a [`MemoriaPort`]
-    /// (the sole persistence target for L1 session memory). The port resolves
-    /// each owner's consented credential at operation time; users without
-    /// write access never cause a Memoria request.
+    /// (the sole persistence target for L1 session memory). Scoped ports
+    /// resolve consent on every operation; trusted self-hosted ports bind the
+    /// deployment credential to the authenticated owner.
     pub fn with_encryptor(
         mut self,
         enc: Arc<astra_services::FernetTokenEncryptor>,

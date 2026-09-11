@@ -178,10 +178,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     }
     let session_id = session_id.to_string();
     let context = format!("server-tool:{name}");
-    let client = astra_tools::memoria::MemoriaToolGateway::new(
-        memoria_client.cloud_base.clone(),
-        memoria_client.cloud_token.clone(),
-    );
+    let client = memoria_client.fork_transport();
     tokio::spawn(
         async move {
             let report = client

@@ -212,7 +212,13 @@ impl std::fmt::Debug for MemoryExtractionService {
 impl MemoryExtractionService {
     /// Share the composition-owned memory provider with the run and its children.
     pub fn memoria_client_for_owner(&self, user: &str) -> Result<Arc<dyn MemoriaPort>, String> {
-        self.memoria_client.bind_owner(user)
+        self.memoria_client.bind_owner(user).inspect_err(|error| {
+            tracing::warn!(
+                user_id = user,
+                error = %error,
+                "failed to bind the composition-owned Memoria provider"
+            );
+        })
     }
     /// Build a service. `memoria_client` is required — callers that
     /// can't produce one (offline CLI, no Memoria configured) should

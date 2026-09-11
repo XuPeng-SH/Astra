@@ -15,6 +15,18 @@ pub enum MemoryAccess {
     ReadWrite,
 }
 impl MemoryAccess {
+    /// User-facing remediation shared by explicit tools and HTTP memory routes.
+    pub fn denial_message(self, write: bool) -> Option<&'static str> {
+        match (self, write) {
+            (Self::None, _) => Some(
+                "Memory sharing with Astra is disabled. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings and choose read-only or read/write access. Signing in to Astra does not enable memory sharing automatically.",
+            ),
+            (Self::ReadOnly, true) => Some(
+                "Memory sharing is read-only. Reading memories is allowed, but saving or modifying them requires read/write access. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings to change access.",
+            ),
+            _ => None,
+        }
+    }
     pub fn allows(self, write: bool) -> bool {
         self == Self::ReadWrite || (!write && self == Self::ReadOnly)
     }
@@ -170,6 +182,19 @@ pub struct MemoriaCredential {
     connection_generation: Option<String>,
 }
 
+/// Current runtime authority for one Astra account.
+///
+/// `UnboundLocal` is deliberately narrower than an absent credential: only an
+/// active password account with no retained Memoria identity may receive the
+/// explicitly enabled self-hosted fallback. Disconnect and account lifecycle
+/// changes therefore cannot turn a previously scoped runtime into a new
+/// deployment-master grant.
+pub enum MemoriaCredentialResolution<T> {
+    Scoped(T),
+    UnboundLocal,
+    Denied,
+}
+
 #[derive(PartialEq, Eq)]
 pub(super) struct ReauthenticationBinding {
     provider_id: String,
@@ -220,6 +245,28 @@ impl MemoriaCredentialResolver {
             self.provider.provider_id
         ))
     }
+    fn decode_credential(
+        &self,
+        ciphertext: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<MemoriaCredential, String> {
+        let identity: VerifiedMemoriaIdentity = serde_json::from_str(metadata.unwrap_or(""))
+            .map_err(|_| "Invalid Memoria binding metadata".to_string())?;
+        if identity.issuer != self.provider.issuer {
+            return Err("Memoria binding issuer mismatch".into());
+        }
+        let key = self
+            .encryptor
+            .decrypt(ciphertext.ok_or("Missing Memoria credential")?)
+            .map_err(|_| "Memoria credential decryption failed".to_string())?;
+        Ok(MemoriaCredential {
+            key,
+            owner: identity.memoria_user_id,
+            generation: identity.key_id,
+            access: identity.memory_access,
+            connection_generation: identity.connection_generation,
+        })
+    }
     pub async fn resolve(&self, user: &str) -> Result<Option<MemoriaCredential>, String> {
         let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens WHERE token_id = ? AND type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ? AND is_active = 1 AND EXISTS (SELECT 1 FROM auth_users WHERE user_id = auth_tokens.scope_user_id AND is_active = 1)")
@@ -228,23 +275,37 @@ impl MemoriaCredentialResolver {
         let Some((ciphertext, metadata)) = row else {
             return Ok(None);
         };
-        let identity: VerifiedMemoriaIdentity =
-            serde_json::from_str(metadata.as_deref().unwrap_or(""))
-                .map_err(|_| "Invalid Memoria binding metadata".to_string())?;
-        if identity.issuer != self.provider.issuer {
-            return Err("Memoria binding issuer mismatch".into());
+        self.decode_credential(ciphertext.as_deref(), metadata.as_deref())
+            .map(Some)
+    }
+
+    /// Resolve both the current credential and whether an absent credential
+    /// represents an active, genuinely local account that is eligible for the
+    /// opt-in self-hosted fallback.
+    pub async fn resolve_runtime(
+        &self,
+        user: &str,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        if let Some(credential) = self.resolve(user).await? {
+            return Ok(MemoriaCredentialResolution::Scoped(credential));
         }
-        let key = self
-            .encryptor
-            .decrypt(ciphertext.as_deref().ok_or("Missing Memoria credential")?)
-            .map_err(|_| "Memoria credential decryption failed".to_string())?;
-        Ok(Some(MemoriaCredential {
-            key,
-            owner: identity.memoria_user_id,
-            generation: identity.key_id,
-            access: identity.memory_access,
-            connection_generation: identity.connection_generation,
-        }))
+        let eligible: Option<String> = sqlx::query_scalar(
+            "SELECT u.user_id FROM auth_users u \
+             WHERE u.user_id = ? AND u.is_active = 1 AND u.password_hash <> '' \
+             AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
+             AND NOT EXISTS (SELECT 1 FROM auth_external_identities e WHERE e.astra_user_id = u.user_id AND e.provider_id LIKE 'memoria:%') \
+             AND NOT EXISTS (SELECT 1 FROM auth_memoria_identities l WHERE l.astra_user_id = u.user_id) \
+             LIMIT 1",
+        )
+        .bind(user)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|_| "Memoria runtime fallback eligibility lookup failed".to_string())?;
+        Ok(if eligible.is_some() {
+            MemoriaCredentialResolution::UnboundLocal
+        } else {
+            MemoriaCredentialResolution::Denied
+        })
     }
 }
 impl DatabaseAuthService {
@@ -349,6 +410,7 @@ impl DatabaseAuthService {
         self.with_memoria_settings(&MemoriaSettings {
             base_url,
             master_key: None,
+            self_hosted_master_access: false,
             issuer: None,
             web_url: None,
             legacy_issuer: None,
@@ -585,6 +647,7 @@ async fn verify_connection(
     let provider = MemoriaProvider::new(&MemoriaSettings {
         base_url: base_url.into(),
         master_key: None,
+        self_hosted_master_access: false,
         issuer: None,
         web_url: None,
         legacy_issuer: None,
@@ -599,6 +662,21 @@ async fn verify_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consent_remediation_preserves_sign_in_and_memory_sharing_separation() {
+        for write in [false, true] {
+            let message = MemoryAccess::None.denial_message(write).unwrap();
+            assert!(message.contains("Memory sharing with Astra is disabled"));
+            assert!(message.contains("Memory sharing settings"));
+            assert!(!message.contains("/login"));
+            assert!(!message.contains("MEMORIA_MASTER_KEY"));
+            assert!(MemoryAccess::ReadWrite.denial_message(write).is_none());
+        }
+        assert!(MemoryAccess::ReadOnly.denial_message(false).is_none());
+        let message = MemoryAccess::ReadOnly.denial_message(true).unwrap();
+        assert!(message.contains("read-only"));
+        assert!(message.contains("requires read/write access"));
+    }
     #[test]
     fn step_up_proof_hash_binds_issuer_subject_and_generation_without_ambiguous_fields() {
         let binding = ReauthenticationBinding {
@@ -731,6 +809,7 @@ mod provider_contract_tests {
         MemoriaSettings {
             base_url: base.into(),
             master_key: None,
+            self_hosted_master_access: false,
             issuer: None,
             web_url: web.map(str::to_string),
             legacy_issuer: None,

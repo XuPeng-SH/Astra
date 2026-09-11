@@ -1,12 +1,14 @@
 use astra_core::{JwtSettings, MatrixOneSettings, MemoriaSettings, SharedPool};
-use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
-use astra_services::{AuthService, DatabaseAuthService, FernetTokenEncryptor};
+use astra_runtime::{AppState, HealthChecker, MemoriaPort, ServiceInfo, build_app};
+use astra_services::{
+    AuthService, DatabaseAuthService, FernetTokenEncryptor, auth::AuthRegisterRequestData,
+};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
-    routing::get,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use std::sync::{
@@ -69,6 +71,7 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     let calls = Arc::new(AtomicUsize::new(0));
     let owner = format!("http-{}", uuid::Uuid::new_v4());
     let read_calls = calls.clone();
+    let store_calls = calls.clone();
     let app = Router::new()
         .route("/auth/whoami", get(move |headers: axum::http::HeaderMap| {
             let owner = owner.clone();
@@ -83,19 +86,34 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
                     "capabilities":["api_key_scopes","memory_filters_v1"], "granted_scopes":scopes})))
             }
         }))
-        .route("/v1/profiles/me", get(move |headers: axum::http::HeaderMap| {
-            read_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(headers["authorization"], "Bearer readonly-key");
-            async { Json(json!({"profile":"from-provider-a"})) }
-        }));
+        .route(
+            "/v1/profiles/me",
+            get(move |headers: axum::http::HeaderMap| {
+                read_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(headers["authorization"], "Bearer readonly-key");
+                async { Json(json!({"profile":"from-provider-a"})) }
+            }),
+        )
+        .route(
+            "/v1/memories",
+            post(move |headers: axum::http::HeaderMap| {
+                store_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    headers["authorization"],
+                    "Memoria-Owner self-hosted-fallback-key"
+                );
+                async { Json(json!({"memory_id":"local-memory"})) }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     let provider = MemoriaSettings {
-        base_url: base,
+        base_url: base.clone(),
         master_key: None,
+        self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
         legacy_issuer: None,
@@ -115,12 +133,46 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .with_memoria_settings(&provider)
         .unwrap(),
     );
-    // An independent override must never reroute the scoped credential.
+    let local = auth
+        .register(AuthRegisterRequestData {
+            username: format!("local-{}", uuid::Uuid::new_v4()),
+            email: format!("local-{}@example.invalid", uuid::Uuid::new_v4()),
+            password: "Local-password-1".into(),
+            display_name: None,
+        })
+        .await
+        .unwrap();
+    let local_port = astra_runtime::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+        auth.memoria_credentials().unwrap(),
+        local.user_id.clone(),
+    )
+    .with_self_hosted_fallback(base.clone(), "self-hosted-fallback-key".into());
+    assert!(local_port.admits_operation(true).await.unwrap());
+    let local_transport = local_port
+        .resolve_tool_transport(true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(local_transport.owner_user_id, local.user_id);
+    assert!(local_transport.owner_scoped_master);
+    assert_eq!(
+        local_port
+            .store("local", "semantic", None, None)
+            .await
+            .unwrap(),
+        "local-memory"
+    );
+    // Even with self-hosted fallback enabled, the persisted scoped binding
+    // remains authoritative for its owner and consent mode.
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(Healthy))
-            .with_shared_pool(pool)
+            .with_shared_pool(pool.clone())
             .with_auth_service(auth.clone())
-            .with_memoria_config("http://127.0.0.1:1", None),
+            .with_memoria_config(
+                "http://127.0.0.1:1",
+                Some("self-hosted-fallback-key".into()),
+            )
+            .with_self_hosted_memoria_fallback(true),
     );
 
     let (status, methods) = request(app.clone(), "GET", "/auth/methods", None, json!({})).await;
@@ -175,7 +227,7 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .0,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     let (status, relink) = request(
         app.clone(),
         "POST",
@@ -186,6 +238,21 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(relink["user_id"], login["user_id"]);
+    let retained_scoped_port =
+        astra_runtime::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+            auth.memoria_credentials().unwrap(),
+            login["user_id"].as_str().unwrap().to_string(),
+        )
+        .with_self_hosted_fallback(base, "self-hosted-fallback-key".into());
+    assert!(retained_scoped_port.admits_operation(false).await.unwrap());
+    assert!(!retained_scoped_port.admits_operation(true).await.unwrap());
+    let scoped_transport = retained_scoped_port
+        .resolve_tool_transport(false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!scoped_transport.owner_scoped_master);
+    assert_ne!(scoped_transport.owner_user_id, login["user_id"]);
     let (status, profile) = request(
         app.clone(),
         "GET",
@@ -196,7 +263,7 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     .await;
     assert_eq!(status, StatusCode::OK, "{profile}");
     assert_eq!(profile["profile"], "from-provider-a");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         request(
             app.clone(),
@@ -253,5 +320,49 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
             .unwrap()
             .is_none()
     );
+    let calls_after_disconnect = calls.load(Ordering::SeqCst);
+    assert!(!retained_scoped_port.admits_operation(false).await.unwrap());
+    assert!(
+        retained_scoped_port
+            .resolve_tool_transport(false)
+            .await
+            .is_err()
+    );
+    assert!(
+        retained_scoped_port
+            .store("revoked", "semantic", None, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), calls_after_disconnect);
+
+    sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
+        .bind(&local.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(!local_port.admits_operation(true).await.unwrap());
+    assert!(local_port.resolve_tool_transport(true).await.is_err());
+    assert!(
+        local_port
+            .store("inactive", "semantic", None, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), calls_after_disconnect);
+    sqlx::query("DELETE FROM auth_users WHERE user_id = ?")
+        .bind(&local.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(!local_port.admits_operation(false).await.unwrap());
+    assert!(local_port.resolve_tool_transport(false).await.is_err());
+    assert!(
+        local_port
+            .store("deleted", "semantic", None, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), calls_after_disconnect);
     server.abort();
 }

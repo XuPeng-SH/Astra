@@ -530,6 +530,13 @@ impl ServerSkillSubRunExecutor {
         .with_runtime_process_authorization(self.runtime_process_authorization.clone())
         .with_runtime_edge_dispatch_authorization(self.runtime_edge_dispatch_authorization.clone())
         .with_tool_execution_service(builder.build());
+        if let Some(memoria_port) = self
+            .memory_extraction_service
+            .as_ref()
+            .and_then(|service| service.memoria_client_for_owner(&self.user_id).ok())
+        {
+            executor = executor.with_memoria_port(memoria_port);
+        }
         self.apply_execution_binding_snapshot(&mut executor);
         executor.set_invocation_ledger(invocation_ledger);
         if let Some(pool) = &self.shared_pool {

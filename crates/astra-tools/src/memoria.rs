@@ -6,6 +6,7 @@
 //! This module is shared between CLI and server — both use HTTP proxy
 //! calls to the Memoria service.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -466,6 +467,8 @@ impl Default for MemoryCircuitBreaker {
 pub struct MemoriaToolGateway {
     pub cloud_base: Option<String>,
     pub cloud_token: Option<String>,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
+    composition_port_required: bool,
     circuit: MemoryCircuitBreaker,
 }
 
@@ -526,14 +529,14 @@ impl Drop for RecallInvocationGuard {
     }
 }
 
-fn memoria_output_is_error(output: &str) -> bool {
+pub fn memoria_output_is_error(output: &str) -> bool {
     if output.starts_with("Error") {
         return true;
     }
     serde_json::from_str::<Value>(output)
         .ok()
         .and_then(|value| value.get("error").cloned())
-        .is_some()
+        .is_some_and(|error| !error.is_null())
 }
 
 fn exact_memory_ids_from_args(args: &Value) -> Vec<String> {
@@ -596,6 +599,13 @@ fn memory_status_counts_toward_circuit(status: reqwest::StatusCode) -> bool {
             status,
             reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
         )
+}
+
+fn memory_operation_requires_write(operation: &str) -> bool {
+    matches!(
+        operation,
+        "remember" | "forget" | "update" | "reflect" | "feedback"
+    )
 }
 
 /// Whether a prompt-facing memory response represents service availability,
@@ -748,8 +758,35 @@ impl MemoriaToolGateway {
         Self {
             cloud_base,
             cloud_token,
+            memoria_port: None,
+            composition_port_required: false,
             circuit: MemoryCircuitBreaker::default(),
         }
+    }
+
+    /// Require the server composition to supply the selected memory authority.
+    /// This disables the legacy environment-variable transport fallback used by
+    /// standalone CLI callers.
+    pub fn require_composition_port(mut self) -> Self {
+        self.composition_port_required = true;
+        self
+    }
+
+    /// Use the composition-owned, owner-bound Memoria port for every tool
+    /// operation. The port resolves current consent and credentials at call
+    /// time; no credential is cached in this gateway.
+    pub fn with_memoria_port(mut self, memoria_port: Arc<dyn astra_memoria::MemoriaPort>) -> Self {
+        self.memoria_port = Some(memoria_port);
+        self
+    }
+
+    /// Create an independent circuit breaker while preserving the selected
+    /// transport authority for background feedback work.
+    pub fn fork_transport(&self) -> Self {
+        let mut gateway = Self::new(self.cloud_base.clone(), self.cloud_token.clone());
+        gateway.memoria_port = self.memoria_port.clone();
+        gateway.composition_port_required = self.composition_port_required;
+        gateway
     }
 
     /// Project caller arguments into the runtime-owned Memoria execution
@@ -1237,19 +1274,63 @@ impl MemoriaToolGateway {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
+        let tool_transport = if let Some(port) = self.memoria_port.as_ref() {
+            match port
+                .resolve_tool_transport(memory_operation_requires_write(op))
+                .await
+            {
+                Ok(Some(transport)) => Some(transport),
+                Ok(None) => {
+                    return json!({
+                        "error": "Memory unavailable: the selected provider does not support explicit memory tools"
+                    })
+                    .to_string();
+                }
+                Err(error) => return json!({"error": error}).to_string(),
+            }
+        } else if self.composition_port_required {
+            return json!({
+                "error": "Memory service configuration is incomplete. Please contact the server administrator.",
+                "code": "memory_service_misconfigured"
+            })
+            .to_string();
+        } else {
+            None
+        };
+        let mut transport_args = args.clone();
+        if let Some(transport) = tool_transport.as_ref()
+            && let Some(object) = transport_args.as_object_mut()
+        {
+            object.insert(
+                "user_id".into(),
+                Value::String(transport.owner_user_id.clone()),
+            );
+        }
+        let args = &transport_args;
+
         // The v2→v1 translation — including business-category expansion
         // into (content-prefix + trust_tier + tag) — now happens inside
         // `build_direct_request` for the `remember` branch. No
         // pre-normalization needed here.
 
-        let (endpoint, mut payload, auth_header, method) = match Self::build_request_transport(
-            self.cloud_base.as_deref(),
-            self.cloud_token.as_deref(),
-            op,
-            args,
-        ) {
-            Ok(request) => request,
-            Err(response) => return response,
+        let (endpoint, mut payload, auth_header, method) = if let Some(transport) = &tool_transport
+        {
+            let (endpoint, payload, method) =
+                Self::build_direct_request(&transport.base_url, op, args);
+            if endpoint.is_empty() {
+                return payload.to_string();
+            }
+            (endpoint, payload, transport.authorization_header(), method)
+        } else {
+            match Self::build_request_transport(
+                self.cloud_base.as_deref(),
+                self.cloud_token.as_deref(),
+                op,
+                args,
+            ) {
+                Ok(request) => request,
+                Err(response) => return response,
+            }
         };
 
         // `build_request_transport` preserves the old `if ep.is_empty()`
@@ -1270,7 +1351,10 @@ impl MemoriaToolGateway {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let name = pre_op_snapshot_name(op, ts);
-            if let Err(e) = self.proxy_snapshot_create(&name).await {
+            if let Err(e) = self
+                .proxy_snapshot_create(&name, tool_transport.as_ref())
+                .await
+            {
                 tracing::warn!(
                     target: "astra::memory::auto_snapshot",
                     op = %op,
@@ -1291,12 +1375,20 @@ impl MemoriaToolGateway {
                     HttpMethod::Post => client.post(&endpoint),
                 };
                 let req = req.header("Authorization", &auth_header);
-                let req = match project_direct_memoria_scope(
-                    self.cloud_base.as_deref(),
-                    self.cloud_token.as_deref(),
-                    args,
-                    &mut payload,
-                ) {
+                let direct_owner = if let Some(transport) = tool_transport.as_ref() {
+                    if let Some(payload) = payload.as_object_mut() {
+                        payload.remove("user_id");
+                    }
+                    Some(transport.owner_user_id.clone())
+                } else {
+                    project_direct_memoria_scope(
+                        self.cloud_base.as_deref(),
+                        self.cloud_token.as_deref(),
+                        args,
+                        &mut payload,
+                    )
+                };
+                let req = match direct_owner {
                     Some(user_id) => req.header("X-User-Id", user_id),
                     None => req,
                 };
@@ -1346,9 +1438,12 @@ impl MemoriaToolGateway {
         // server-owned execution without introducing a local memory overlay.
         if op == "recall"
             && args.get("scope").and_then(Value::as_str) == Some("session")
-            && self.cloud_token.is_none()
+            && (tool_transport.is_some() || self.cloud_token.is_none())
         {
-            match self.direct_session_working_list(args, timeout).await {
+            match self
+                .direct_session_working_list(args, timeout, tool_transport.as_ref())
+                .await
+            {
                 Some(working) => {
                     tracing::debug!(
                         target: "astra::memory::reconciliation",
@@ -1432,26 +1527,42 @@ impl MemoriaToolGateway {
         raw_text
     }
 
-    async fn direct_session_working_list(&self, args: &Value, timeout: Duration) -> Option<String> {
+    async fn direct_session_working_list(
+        &self,
+        args: &Value,
+        timeout: Duration,
+        tool_transport: Option<&astra_memoria::MemoriaToolTransport>,
+    ) -> Option<String> {
         let session_id = args.get("session_id").and_then(Value::as_str)?;
-        let user_id = args.get("user_id").and_then(Value::as_str)?;
-        let mem = astra_core::MemoriaSettings::from_env();
-        let key = mem.master_key?;
+        let (base_url, authorization, user_id) = if let Some(transport) = tool_transport {
+            (
+                transport.base_url.clone(),
+                transport.authorization_header(),
+                transport.owner_user_id.clone(),
+            )
+        } else {
+            let mem = astra_core::MemoriaSettings::from_env();
+            (
+                mem.base_url,
+                format!("Bearer {}", mem.master_key?),
+                args.get("user_id").and_then(Value::as_str)?.to_string(),
+            )
+        };
         let limit = args
             .get("top_k")
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .clamp(1, 50);
         let limit_text = limit.to_string();
-        let url = format!("{}/v1/memories", mem.base_url.trim_end_matches('/'));
+        let url = format!("{}/v1/memories", base_url.trim_end_matches('/'));
         let client = astra_core::net::client_builder_for_target(&url)
             .timeout(timeout)
             .build()
             .ok()?;
         let response = client
             .get(url)
-            .header("Authorization", format!("Bearer {key}"))
-            .header("X-User-Id", user_id)
+            .header("Authorization", authorization)
+            .header("X-User-Id", &user_id)
             .query(&[
                 ("session_id", session_id),
                 ("memory_type", "working"),
@@ -1493,8 +1604,9 @@ impl MemoriaToolGateway {
             None => {
                 return Err(
                     json!({
-                        "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
-                        "hint": "Login with /login to enable cloud-backed memory with user isolation"
+                        "error": "Memory is not configured for this local execution path: MEMORIA_MASTER_KEY is not set.",
+                        "code": "local_memory_not_configured",
+                        "hint": "For a local Memoria deployment, configure its endpoint and MEMORIA_MASTER_KEY. To use cloud memory, connect this client to your Astra server; memory sharing is configured separately in Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings."
                     })
                     .to_string(),
                 );
@@ -1547,7 +1659,34 @@ impl MemoriaToolGateway {
         Some((endpoint, payload, method))
     }
 
-    async fn proxy_snapshot_create(&self, name: &str) -> Result<(), String> {
+    async fn proxy_snapshot_create(
+        &self,
+        name: &str,
+        tool_transport: Option<&astra_memoria::MemoriaToolTransport>,
+    ) -> Result<(), String> {
+        if let Some(transport) = tool_transport {
+            let url = format!("{}/v1/snapshots", transport.base_url.trim_end_matches('/'));
+            let client = astra_core::net::client_builder_for_target(&url)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|e| format!("build client: {e}"))?;
+            let response = client
+                .post(url)
+                .header("Authorization", transport.authorization_header())
+                .header("X-User-Id", &transport.owner_user_id)
+                .json(&json!({"name": name}))
+                .send()
+                .await
+                .map_err(|e| format!("memoria snapshot request failed: {e}"))?;
+            if response.status().is_success() {
+                return Ok(());
+            }
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "memoria snapshot request failed: status={status}, body={body}"
+            ));
+        }
         let Some(cloud_base) = self.cloud_base.as_deref() else {
             return memoria_snapshot_create(name).await.map(|_| ());
         };
@@ -2426,6 +2565,169 @@ pub async fn memoria_health() -> Result<String, String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct ToolTransportPort {
+        transport: astra_memoria::MemoriaToolTransport,
+        admission: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[test]
+    fn explicit_memory_operations_request_the_correct_access_level() {
+        for operation in ["recall", "expand", "profile"] {
+            assert!(!memory_operation_requires_write(operation), "{operation}");
+        }
+        for operation in ["remember", "forget", "update", "reflect", "feedback"] {
+            assert!(memory_operation_requires_write(operation), "{operation}");
+        }
+    }
+
+    #[test]
+    fn memory_error_marker_ignores_json_null() {
+        assert!(!memoria_output_is_error(r#"{"error":null,"status":"ok"}"#));
+        assert!(memoria_output_is_error(r#"{"error":"denied"}"#));
+    }
+
+    #[async_trait::async_trait]
+    impl astra_memoria::MemoriaPort for ToolTransportPort {
+        async fn resolve_tool_transport(
+            &self,
+            write: bool,
+        ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
+            self.admission.lock().unwrap().push(write);
+            Ok(Some(self.transport.clone()))
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+            unreachable!("the prompt-facing gateway resolves raw tool transport")
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            unreachable!("the prompt-facing gateway resolves raw tool transport")
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            unreachable!("the prompt-facing gateway resolves raw tool transport")
+        }
+    }
+
+    #[tokio::test]
+    async fn composition_owned_port_supplies_scoped_tool_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/memories/retrieve"))
+            .and(header("authorization", "Bearer scoped-key"))
+            .and(header("x-user-id", "memoria-owner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let admission = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = Arc::new(ToolTransportPort {
+            transport: astra_memoria::MemoriaToolTransport {
+                base_url: server.uri(),
+                credential: "scoped-key".into(),
+                owner_user_id: "memoria-owner".into(),
+                owner_scoped_master: false,
+            },
+            admission: Arc::clone(&admission),
+        });
+        let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
+
+        let output = gateway
+            .call(
+                "recall",
+                &json!({
+                    "query": "preferences",
+                    "top_k": 3,
+                    "session_id": "session-1",
+                    "user_id": "astra-owner"
+                }),
+            )
+            .await;
+
+        assert!(!memoria_output_is_error(&output), "{output}");
+        assert_eq!(*admission.lock().unwrap(), vec![false]);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn composition_owned_master_transport_uses_owner_only_authentication() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/memories/retrieve"))
+            .and(header("authorization", "Memoria-Owner master-key"))
+            .and(header("x-user-id", "astra-owner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let port = Arc::new(ToolTransportPort {
+            transport: astra_memoria::MemoriaToolTransport {
+                base_url: server.uri(),
+                credential: "master-key".into(),
+                owner_user_id: "astra-owner".into(),
+                owner_scoped_master: true,
+            },
+            admission: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
+
+        let output = gateway
+            .call(
+                "recall",
+                &json!({
+                    "query": "preferences",
+                    "top_k": 3,
+                    "session_id": "session-1",
+                    "user_id": "attacker-selected-owner"
+                }),
+            )
+            .await;
+
+        assert!(!memoria_output_is_error(&output), "{output}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn required_composition_port_never_falls_back_to_master_key_environment() {
+        let server = MockServer::start().await;
+        let _env = MemoriaEnvGuard::set(&server.uri(), "must-not-be-used");
+        let gateway = MemoriaToolGateway::new(None, None).require_composition_port();
+
+        let output = gateway
+            .call(
+                "recall",
+                &json!({
+                    "query": "preferences",
+                    "session_id": "session-1",
+                    "user_id": "astra-owner"
+                }),
+            )
+            .await;
+
+        assert!(memoria_output_is_error(&output), "{output}");
+        assert!(output.contains("memory_service_misconfigured"), "{output}");
+        assert!(output.contains("server administrator"));
+        assert!(!output.contains("/login"));
+        assert!(!output.contains("MEMORIA_MASTER_KEY"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     struct MemoriaEnvGuard {
         base_url: Option<String>,

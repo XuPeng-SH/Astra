@@ -337,7 +337,7 @@ impl MemoryToolHandler {
             .memoria_client
             .call(action.as_str(), &isolated_args)
             .await;
-        if output.starts_with("Error") {
+        if astra_tools::memoria::memoria_output_is_error(&output) {
             astra_tools::ToolResult::error(output)
         } else {
             astra_tools::ToolResult::text(output)
