@@ -16,6 +16,7 @@ use sqlx::{Row, query};
 use crate::model_request_context::{ModelRequestContextRecord, ModelRequestEventStage};
 
 mod observation;
+mod projection;
 mod request;
 use observation::{build_observation_envelope, graph_decision_ref, graph_event_ref};
 pub use request::ReflectRequest;
@@ -1505,7 +1506,8 @@ impl ReflectService for DatabaseReflectService {
             failure_clusters,
             graph_slice,
             budget_result,
-        })
+        }
+        .project_lightweight())
     }
 }
 
@@ -2899,7 +2901,7 @@ mod tests {
             budget_result: ObservationBudgetResult::default(),
         };
 
-        let (_, _, evidence, _, _) = build_observation_envelope(
+        let (_, observations, evidence, _, _) = build_observation_envelope(
             "sess-graph",
             &request,
             &overview,
@@ -2919,7 +2921,16 @@ mod tests {
                 .iter()
                 .any(|item| item.ref_id == "urn:astra:decision:cloud:dec-1")
         );
-        assert_refs_are_valid(&[], &evidence, &[], &[]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].kind, "session_health");
+        assert_eq!(
+            observations[0].evidence_refs,
+            evidence
+                .iter()
+                .map(|item| item.ref_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_refs_are_valid(&observations, &evidence, &[], &[]);
     }
 
     #[test]

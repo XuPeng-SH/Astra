@@ -3128,7 +3128,7 @@ impl DurableInferenceLedger {
                             %e,
                             "LLM call succeeded and its provider attempt terminal was recorded, but logical invocation settlement failed"
                         );
-                        return Err(e);
+                        return Err(super::client::attach_llm_result_details(e, &result));
                     }
                     Ok(result)
                 }
@@ -3234,7 +3234,8 @@ impl DurableInferenceLedger {
                         .settle(NonstreamSettlementCommand::Terminal(terminal_from_result(
                             &result,
                         )))
-                        .await?;
+                        .await
+                        .map_err(|error| super::client::attach_llm_result_details(error, &result))?;
                     Ok(result)
                 }
                 Err(error) => {
@@ -3301,7 +3302,8 @@ impl DurableInferenceLedger {
                     .settle(NonstreamSettlementCommand::Terminal(terminal_from_result(
                         &result,
                     )))
-                    .await?;
+                    .await
+                    .map_err(|error| super::client::attach_llm_result_details(error, &result))?;
                 Ok(result)
             }
             Err(error) => {

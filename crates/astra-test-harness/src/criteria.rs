@@ -271,6 +271,12 @@ pub enum Criterion {
         consumer_document: JournalToolDocument,
         consumer_paths: Vec<String>,
         consumer_filters: Vec<JournalJsonPredicate>,
+        /// Optional visible-turn separation required between the producer
+        /// and consumer. When set, both calls must carry a typed turn field;
+        /// missing turn evidence fails closed instead of guessing from event
+        /// order or model prose.
+        #[serde(default)]
+        min_turns_after_producer: Option<u32>,
     },
 
     /// Passes when at least one `[fork-cache]` JSON event in stderr
@@ -457,14 +463,20 @@ pub enum Criterion {
         warmup_rounds: u32,
     },
 
-    /// Passes when provider cache reuse is healthy within stable Context
-    /// Pipeline prefix epochs. The first request for each typed prefix
-    /// identity is a cold boundary and is not scored; each later request with
-    /// the same identity must read at least `min` of the preceding request's
-    /// total input from the provider cache.
-    ProviderPromptCacheStablePrefixReuseRatio {
+    /// Checks primary-request cache-read count nonregression within typed
+    /// system/tool prefix identity epochs, using
+    /// `current cache_read / previous cache_read` from pipeline feedback.
+    /// The observed ratio can exceed 1.0. Both counts can include conversation
+    /// history; this does not measure stable-prefix or absolute input coverage.
+    /// Auxiliary requests are outside this feedback's scope. Use
+    /// `ProviderPromptCacheReadRatio` for absolute cache-read share from
+    /// aggregate turn/round usage, which can include auxiliary requests.
+    /// Identity transitions are bounded per run and do not form scored pairs.
+    /// Within each epoch, only the first pair with a zero previous read is
+    /// exempt as a cold boundary; later zeros remain scored failures.
+    ProviderPromptCacheReadNonregressionRatio {
         min: f64,
-        #[serde(default = "default_stable_prefix_min_pairs")]
+        #[serde(default = "default_cache_read_min_pairs")]
         min_pairs: u32,
         max_identity_transitions_per_run: u32,
     },
@@ -521,7 +533,7 @@ fn default_prompt_cache_warmup_turns() -> u32 {
     1
 }
 
-fn default_stable_prefix_min_pairs() -> u32 {
+fn default_cache_read_min_pairs() -> u32 {
     1
 }
 
@@ -639,7 +651,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::CacheRateAbove { .. }
         | Criterion::PromptCacheTokens { .. }
         | Criterion::ProviderPromptCacheReadRatio { .. }
-        | Criterion::ProviderPromptCacheStablePrefixReuseRatio { .. }
+        | Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
         | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
 
         Criterion::Judger { .. }
@@ -721,7 +733,7 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. }
         | Criterion::ProviderPromptCacheReadRatio { .. }
-        | Criterion::ProviderPromptCacheStablePrefixReuseRatio { .. }
+        | Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
         | Criterion::PromptCacheReuseScope { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_session_capture(criteria)
@@ -1926,7 +1938,13 @@ fn evaluate_one(
             let mut checked_executions = 0usize;
             let mut owned_items = std::collections::HashSet::new();
             let mut pending_assignment: Option<(String, u64)> = None;
-            let mut first_failure = session.first_work_assignment_surface_gap();
+            // This fold is the durable Work lifecycle oracle.  Do not infer
+            // capability reachability from a provider's physical tool list:
+            // ordinary execution tools and deferred settlement discovery are
+            // separate contracts.  A missing settlement is caught below by
+            // the exact assignment identity; deferred discovery is asserted
+            // independently by the case when it is part of the contract.
+            let mut first_failure = None;
             for call in session.journal_tool_calls() {
                 if call.name == "start_work"
                     && call.ok != Some(false)
@@ -2258,6 +2276,74 @@ fn evaluate_one(
                         == Some("started")
                 {
                     work_established = true;
+                    // Admission may durably apply user-declared mutations in
+                    // the same transaction that establishes Work. Compare the
+                    // typed declared base with the accepted snapshot instead
+                    // of requiring a later `propose_work_plan` call.
+                    if let Some(result) = call.result.as_ref() {
+                        let declared: std::collections::HashMap<&str, u64> = result
+                            .get("declared_tasks")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|task| {
+                                Some((
+                                    task.get("item_id")?.as_str()?,
+                                    task.get("item_revision")?.as_u64()?,
+                                ))
+                            })
+                            .collect();
+                        let tasks = result
+                            .pointer("/task_board_update/tasks")
+                            .and_then(serde_json::Value::as_array);
+                        let additions = tasks.is_some_and(|tasks| {
+                            tasks.iter().any(|task| {
+                                task.get("item_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|item_id| {
+                                        item_id != "root" && !declared.contains_key(item_id)
+                                    })
+                            })
+                        });
+                        let revised_state = |state: &str| {
+                            tasks.is_some_and(|tasks| {
+                                tasks.iter().any(|task| {
+                                    let Some(item_id) =
+                                        task.get("item_id").and_then(serde_json::Value::as_str)
+                                    else {
+                                        return false;
+                                    };
+                                    let Some(base_revision) = declared.get(item_id) else {
+                                        return false;
+                                    };
+                                    task.get("item_revision")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .is_some_and(|revision| revision > *base_revision)
+                                        && task
+                                            .get("declaration_state")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(state)
+                                })
+                            })
+                        };
+                        let active_revision = revised_state("active");
+                        let cancelled_revision = revised_state("cancelled");
+                        let superseded_revision = revised_state("superseded");
+                        let retired_revision = cancelled_revision || superseded_revision;
+                        if additions || active_revision || retired_revision {
+                            accepted_patches += 1;
+                            accepted_addition |= additions;
+                            accepted_active_revision |= active_revision;
+                            accepted_retired_revision |= retired_revision;
+                            accepted_cancelled_revision |= cancelled_revision;
+                            accepted_superseded_revision |= superseded_revision;
+                            let required_atomic_retirement = retired_revision
+                                && (!*require_cancelled_revision || cancelled_revision)
+                                && (!*require_superseded_revision || superseded_revision);
+                            accepted_atomic_retire_and_add |=
+                                additions && required_atomic_retirement;
+                        }
+                    }
                     continue;
                 }
                 if call.name != "propose_work_plan" {
@@ -2418,10 +2504,17 @@ fn evaluate_one(
                     matched = Some(artifact.to_string());
                     break;
                 }
-                if call.name == *producer
-                    && let Some(result) = call.result.as_ref()
-                {
-                    collect_session_artifact_handles(result, &mut advertised);
+                if call.name == *producer {
+                    if let Some(descriptor) = call.result_artifact.as_ref() {
+                        advertised.insert(
+                            astra_turn_core::tool_result_storage::session_tool_result_artifact_uri_for_descriptor(
+                                descriptor,
+                            ),
+                        );
+                    }
+                    if let Some(result) = call.result.as_ref() {
+                        collect_session_artifact_handles(result, &mut advertised);
+                    }
                 }
             }
             let passed = matched.is_some();
@@ -2522,11 +2615,12 @@ fn evaluate_one(
             consumer_document,
             consumer_paths,
             consumer_filters,
+            min_turns_after_producer,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_value_flow_bound");
             };
-            let mut produced = Vec::<serde_json::Value>::new();
+            let mut produced = Vec::<(serde_json::Value, Option<u32>)>::new();
             let mut matched = None;
             for call in session.journal_tool_calls() {
                 if call.ok != Some(true) {
@@ -2538,15 +2632,23 @@ fn evaluate_one(
                         JournalToolDocument::Result => call.result.as_ref(),
                     };
                     let matched_value = consumer_document.and_then(|document| {
-                        produced.iter().find(|value| {
-                            consumer_paths.iter().any(|path| {
-                                flow_destinations_at_path(document, path)
-                                    .into_iter()
-                                    .any(|destination| value_flows_into(value, destination))
-                            })
+                        produced.iter().find(|(value, producer_turn)| {
+                            let turn_separation_ok = min_turns_after_producer.is_none_or(|min| {
+                                producer_turn.zip(call.turn).is_some_and(
+                                    |(producer_turn, consumer_turn)| {
+                                        consumer_turn >= producer_turn.saturating_add(min)
+                                    },
+                                )
+                            });
+                            turn_separation_ok
+                                && consumer_paths.iter().any(|path| {
+                                    flow_destinations_at_path(document, path)
+                                        .into_iter()
+                                        .any(|destination| value_flows_into(value, destination))
+                                })
                         })
                     });
-                    if let Some(value) = matched_value {
+                    if let Some((value, _)) = matched_value {
                         matched = Some(value.clone());
                         break;
                     }
@@ -2558,21 +2660,24 @@ fn evaluate_one(
                     }
                     .and_then(|document| document.pointer(producer_path));
                     if let Some(value) = producer_value.filter(|value| is_flow_scalar(value)) {
-                        produced.push(value.clone());
+                        produced.push((value.clone(), call.turn));
                     }
                 }
             }
             let passed = matched.is_some();
+            let turn_detail = min_turns_after_producer
+                .map(|min| format!(" after at least {min} later visible turn(s)"))
+                .unwrap_or_default();
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: matched.map_or_else(
                     || format!(
-                        "bounded journal consumer {consumer} {consumer_document:?} paths {consumer_paths:?} did not use a scalar emitted by prior producer {producer}"
+                        "bounded journal consumer {consumer} {consumer_document:?} paths {consumer_paths:?} did not use a scalar emitted by prior producer {producer}{turn_detail}"
                     ),
                     |value| format!(
-                        "bounded journal consumer {consumer} used prior producer {producer} value {value}"
+                        "bounded journal consumer {consumer} used prior producer {producer} value {value}{turn_detail}"
                     ),
                 ),
                 full_detail: None,
@@ -2850,13 +2955,13 @@ fn evaluate_one(
                 }
             }
         },
-        Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        Criterion::ProviderPromptCacheReadNonregressionRatio {
             min,
             min_pairs,
             max_identity_transitions_per_run,
         } => match session {
-            None => missing_required_session(c, "stable-prefix provider cache reuse"),
-            Some(capture) => match assess_stable_prefix_cache_reuse(capture) {
+            None => missing_required_session(c, "provider cache-read nonregression"),
+            Some(capture) => match assess_cache_read_nonregression(capture) {
                 Err(detail) => CriterionResult {
                     criterion: c.clone(),
                     severity: criterion_severity(c),
@@ -2880,7 +2985,7 @@ fn evaluate_one(
                         severity: criterion_severity(c),
                         passed: enough_pairs && transitions_ok && ratio_ok,
                         detail: format!(
-                            "stable_prefix_cache_reuse worst={:.2}%, pairs={}, min_pairs_per_run={}, max_transitions_per_run={}, expected >= {:.2}%, pairs/run>={}, transitions/run<={}",
+                            "cache_read_nonregression worst={:.2}%, pairs={}, min_pairs_per_run={}, max_transitions_per_run={}, expected >= {:.2}%, pairs/run>={}, transitions/run<={}",
                             assessment.worst_ratio.unwrap_or_default() * 100.0,
                             assessment.scored_pairs,
                             assessment
@@ -3067,16 +3172,16 @@ struct ProviderPromptCacheUsage {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StablePrefixCacheAssessment {
+struct CacheReadNonregressionAssessment {
     scored_pairs: u32,
     minimum_pairs_per_multi_observation_run: Option<u32>,
     max_identity_transitions_per_run: u32,
     worst_ratio: Option<f64>,
 }
 
-fn assess_stable_prefix_cache_reuse(
+fn assess_cache_read_nonregression(
     capture: &SessionCapture,
-) -> Result<StablePrefixCacheAssessment, String> {
+) -> Result<CacheReadNonregressionAssessment, String> {
     use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 
     type ObservationKey = (String, String, u32, u32);
@@ -3092,14 +3197,15 @@ fn assess_stable_prefix_cache_reuse(
         .filter(|event| event.event_type == "pipeline_feedback")
     {
         feedback_events = feedback_events.saturating_add(1);
-        let metadata = event
-            .raw
-            .get("metadata")
-            .ok_or_else(|| "stable-prefix cache evidence missing typed metadata".to_string())?;
-        let feedback: PipelineJournalEvent = serde_json::from_value(metadata.clone())
-            .map_err(|_| "stable-prefix cache evidence has invalid typed metadata".to_string())?;
+        let metadata = event.raw.get("metadata").ok_or_else(|| {
+            "cache-read nonregression evidence missing typed metadata".to_string()
+        })?;
+        let feedback: PipelineJournalEvent =
+            serde_json::from_value(metadata.clone()).map_err(|_| {
+                "cache-read nonregression evidence has invalid typed metadata".to_string()
+            })?;
         let frame = feedback.runtime_feedback.ok_or_else(|| {
-            "stable-prefix cache evidence missing canonical runtime feedback".to_string()
+            "cache-read nonregression evidence missing canonical runtime feedback".to_string()
         })?;
         let outer_turn = event.raw.get("turn").and_then(serde_json::Value::as_u64);
         if feedback.kind != PipelineEventKind::Feedback
@@ -3107,11 +3213,13 @@ fn assess_stable_prefix_cache_reuse(
             || outer_turn != Some(u64::from(frame.progress.session_turn))
             || !frame.is_valid()
         {
-            return Err("stable-prefix cache evidence failed typed identity validation".into());
+            return Err(
+                "cache-read nonregression evidence failed typed identity validation".into(),
+            );
         }
         if frame.context.prompt_cache_identity.is_none() || frame.request_usage.is_none() {
             return Err(
-                "stable-prefix cache evidence requires prompt_cache_identity and request_usage"
+                "cache-read nonregression evidence requires prompt_cache_identity and request_usage"
                     .into(),
             );
         }
@@ -3124,7 +3232,7 @@ fn assess_stable_prefix_cache_reuse(
         if let Some(existing) = observations.get(&key) {
             if existing != &frame {
                 return Err(
-                    "stable-prefix cache evidence contains conflicting mirrored observations"
+                    "cache-read nonregression evidence contains conflicting mirrored observations"
                         .into(),
                 );
             }
@@ -3134,7 +3242,7 @@ fn assess_stable_prefix_cache_reuse(
     }
 
     if feedback_events == 0 {
-        return Err("no canonical pipeline feedback for stable-prefix cache reuse".into());
+        return Err("no canonical pipeline feedback for provider cache-read nonregression".into());
     }
 
     let mut runs = std::collections::BTreeMap::<
@@ -3170,28 +3278,29 @@ fn assess_stable_prefix_cache_reuse(
                 skipped_cold_boundary = false;
                 continue;
             }
-            let previous_cached_prefix = previous
+            let previous_cache_read = previous
                 .request_usage
                 .expect("validated request usage")
                 .cache_read;
-            // The first observation after a cold boundary establishes the
-            // provider's cached-prefix anchor but is not itself a reuse pair.
-            // Dynamic prompt/tool-result tails are intentionally excluded from
-            // this ratio; they are not part of the typed stable identity.
+            // The first observation after a cold boundary establishes a
+            // cache-read count anchor but is not itself a scored pair.
+            // Reads can include conversation history beyond the system/tool
+            // prefixes tracked by the identity. This compares read counts,
+            // not stable-prefix coverage or absolute input hit share.
             // Only that one boundary is exempt: a later zero must remain a
             // scored 0% observation and cannot be erased by later recovery.
-            if previous_cached_prefix == 0 && !skipped_cold_boundary {
+            if previous_cache_read == 0 && !skipped_cold_boundary {
                 skipped_cold_boundary = true;
                 continue;
             }
-            let current_cached_prefix = current
+            let current_cache_read = current
                 .request_usage
                 .expect("validated request usage")
                 .cache_read;
-            let ratio = if previous_cached_prefix == 0 {
+            let ratio = if previous_cache_read == 0 {
                 0.0
             } else {
-                current_cached_prefix as f64 / previous_cached_prefix as f64
+                current_cache_read as f64 / previous_cache_read as f64
             };
             scored_pairs = scored_pairs.saturating_add(1);
             run_pairs = run_pairs.saturating_add(1);
@@ -3207,7 +3316,7 @@ fn assess_stable_prefix_cache_reuse(
             max_identity_transitions_per_run.max(run_identity_transitions);
     }
 
-    Ok(StablePrefixCacheAssessment {
+    Ok(CacheReadNonregressionAssessment {
         scored_pairs,
         minimum_pairs_per_multi_observation_run,
         max_identity_transitions_per_run,
@@ -3628,15 +3737,15 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
-        Criterion::ProviderPromptCacheStablePrefixReuseRatio { min, min_pairs, .. } => {
+        Criterion::ProviderPromptCacheReadNonregressionRatio { min, min_pairs, .. } => {
             if !min.is_finite() || *min < 0.0 || *min > 1.0 {
                 return Err(format!(
-                    "ProviderPromptCacheStablePrefixReuseRatio.min must be finite in [0.0, 1.0]; got {min}"
+                    "ProviderPromptCacheReadNonregressionRatio.min must be finite in [0.0, 1.0]; got {min}"
                 ));
             }
             if *min_pairs == 0 {
                 return Err(
-                    "ProviderPromptCacheStablePrefixReuseRatio.min_pairs must be >= 1".into(),
+                    "ProviderPromptCacheReadNonregressionRatio.min_pairs must be >= 1".into(),
                 );
             }
             Ok(())
@@ -5534,6 +5643,7 @@ mod tests {
                     equals: serde_json::json!("session"),
                 },
             ],
+            min_turns_after_producer: None,
         };
         let splice_session = mk_session(&[(
             "turn",
@@ -5597,6 +5707,102 @@ mod tests {
         assert!(
             bounded_result[0].passed,
             "bound filters should accept one valid flow"
+        );
+    }
+
+    #[test]
+    fn bounded_value_flow_can_require_a_later_visible_turn() {
+        let call = |id: &str, action: &str, result: serde_json::Value| {
+            let mut args = serde_json::json!({"action": action});
+            if action == "remember" {
+                args["memory_type"] = serde_json::json!("working");
+            } else if action == "recall" {
+                args["scope"] = serde_json::json!("session");
+            }
+            serde_json::json!({
+                "tool_call_id": id,
+                "name": "memory",
+                "ok": true,
+                "args_full": args.to_string(),
+                "result_full": result.to_string(),
+            })
+        };
+        let criterion = Criterion::JournalToolValueFlowBound {
+            producer: "memory".into(),
+            producer_document: JournalToolDocument::Result,
+            producer_path: "/memory_id".into(),
+            producer_filters: vec![
+                JournalJsonPredicate {
+                    document: JournalToolDocument::Arguments,
+                    path: "/action".into(),
+                    equals: serde_json::json!("remember"),
+                },
+                JournalJsonPredicate {
+                    document: JournalToolDocument::Arguments,
+                    path: "/memory_type".into(),
+                    equals: serde_json::json!("working"),
+                },
+            ],
+            consumer: "memory".into(),
+            consumer_document: JournalToolDocument::Result,
+            consumer_paths: vec!["/*/memory_id".into()],
+            consumer_filters: vec![
+                JournalJsonPredicate {
+                    document: JournalToolDocument::Arguments,
+                    path: "/action".into(),
+                    equals: serde_json::json!("recall"),
+                },
+                JournalJsonPredicate {
+                    document: JournalToolDocument::Arguments,
+                    path: "/scope".into(),
+                    equals: serde_json::json!("session"),
+                },
+            ],
+            min_turns_after_producer: Some(1),
+        };
+        let producer = call(
+            "remember-1",
+            "remember",
+            serde_json::json!({"memory_id": "memory-123"}),
+        );
+        let consumer = call(
+            "recall-1",
+            "recall",
+            serde_json::json!([{"memory_id": "memory-123"}]),
+        );
+
+        let same_turn = mk_session(&[(
+            "turn",
+            serde_json::json!({"turn": 1, "tool_calls": [producer.clone(), consumer.clone()]}),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&same_turn),
+        );
+        assert!(
+            !result[0].passed,
+            "same-turn evidence must not satisfy a cross-turn gate"
+        );
+
+        let cross_turn = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({"turn": 1, "tool_calls": [producer]}),
+            ),
+            (
+                "turn",
+                serde_json::json!({"turn": 2, "tool_calls": [consumer]}),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&cross_turn),
+        );
+        assert!(
+            result[0].passed,
+            "later-turn evidence should satisfy the gate: {result:?}"
         );
     }
 
@@ -5721,7 +5927,93 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_scores_each_typed_epoch_after_its_cold_boundary() {
+    fn cache_read_nonregression_uses_only_its_unambiguous_discriminator() {
+        let value = serde_json::json!({
+            "type": "provider_prompt_cache_read_nonregression_ratio",
+            "min": 0.95,
+            "min_pairs": 1,
+            "max_identity_transitions_per_run": 0
+        });
+        let criterion: Criterion =
+            serde_yaml_ng::from_str(&value.to_string()).expect("new criterion must parse");
+        assert!(matches!(
+            criterion,
+            Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
+        ));
+        assert_eq!(serde_json::to_value(criterion).unwrap(), value);
+
+        let mut obsolete = value;
+        obsolete["type"] = "provider_prompt_cache_stable_prefix_reuse_ratio".into();
+        let error = serde_yaml_ng::from_str::<Criterion>(&obsolete.to_string())
+            .expect_err("misleading discriminator must not remain an alias");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn cache_read_nonregression_and_absolute_read_share_are_independent() {
+        // Each tuple is (fresh input, cached input) in a primary-only run.
+        // With no auxiliary calls, feedback and aggregate round usage agree.
+        for (name, usages, expected) in [
+            (
+                "constant low coverage",
+                [(9_000, 1_000), (9_000, 1_000)],
+                [true, false],
+            ),
+            (
+                "healthy increasing reads",
+                [(100, 9_900), (100, 10_900)],
+                [true, true],
+            ),
+            (
+                "high coverage with falling reads",
+                [(100, 9_900), (100, 8_900)],
+                [false, true],
+            ),
+        ] {
+            let mut events = Vec::new();
+            for (index, (fresh, read)) in usages.into_iter().enumerate() {
+                let round = index as u32 + 1;
+                events.push((
+                    "pipeline_feedback",
+                    pipeline_feedback_event(round, "prefix-a", fresh, read),
+                ));
+                events.push((
+                    "llm_round",
+                    serde_json::json!({
+                        "turn": 1,
+                        "round": round,
+                        "tokens_in": fresh,
+                        "cache_read_tokens": read,
+                        "cache_creation_tokens": 0
+                    }),
+                ));
+            }
+            let result = evaluate_deterministic_with_session(
+                &[
+                    Criterion::ProviderPromptCacheReadNonregressionRatio {
+                        min: 0.95,
+                        min_pairs: 1,
+                        max_identity_transitions_per_run: 0,
+                    },
+                    Criterion::ProviderPromptCacheReadRatio {
+                        min: 0.95,
+                        warmup_turns: 0,
+                        warmup_rounds: 0,
+                    },
+                ],
+                &outcome_with_tools(&[]),
+                Some(&mk_session(&events)),
+            );
+            assert_eq!(
+                [result[0].passed, result[1].passed],
+                expected,
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_read_nonregression_scores_each_typed_epoch_after_its_cold_boundary() {
         let sess = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5748,7 +6040,7 @@ mod tests {
                 pipeline_feedback_event(6, "prefix-b", 100, 29_900),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 2,
             max_identity_transitions_per_run: 1,
@@ -5765,7 +6057,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_ignores_dynamic_prompt_tail() {
+    fn cache_read_nonregression_compares_reads_independently_of_fresh_input() {
         let sess = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5776,7 +6068,7 @@ mod tests {
                 pipeline_feedback_event(2, "prefix-a", 3_000, 36_224),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             max_identity_transitions_per_run: 0,
@@ -5790,7 +6082,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_rejects_repeated_cold_observation_after_recovery() {
+    fn cache_read_nonregression_rejects_repeated_cold_observation_after_recovery() {
         let sess = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5809,7 +6101,7 @@ mod tests {
                 pipeline_feedback_event(4, "prefix-a", 100, 36_000),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             max_identity_transitions_per_run: 0,
@@ -5829,7 +6121,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_rejects_cached_prefix_regression() {
+    fn cache_read_nonregression_rejects_read_count_regression() {
         let sess = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5840,7 +6132,7 @@ mod tests {
                 pipeline_feedback_event(2, "prefix-a", 100, 32_000),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             max_identity_transitions_per_run: 0,
@@ -5854,7 +6146,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_fails_closed_without_identity_or_pair() {
+    fn cache_read_nonregression_fails_closed_without_identity_or_pair() {
         let mut missing_identity = pipeline_feedback_event(1, "prefix-a", 30_000, 0);
         missing_identity
             .pointer_mut("/metadata/runtime_feedback/context")
@@ -5882,7 +6174,7 @@ mod tests {
                 pipeline_feedback_event(2, "prefix-a", 10_000, 20_000),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             max_identity_transitions_per_run: 10,
@@ -5899,7 +6191,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_rejects_conflicting_mirrors_and_excess_churn() {
+    fn cache_read_nonregression_rejects_conflicting_mirrors_and_excess_churn() {
         let conflicting = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5936,7 +6228,7 @@ mod tests {
                 pipeline_feedback_event(6, "prefix-c", 100, 29_900),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             max_identity_transitions_per_run: 1,
@@ -5953,7 +6245,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_cache_reuse_requires_evidence_from_every_multi_round_run() {
+    fn cache_read_nonregression_requires_evidence_from_every_multi_round_run() {
         let sess = mk_session(&[
             (
                 "pipeline_feedback",
@@ -5976,7 +6268,7 @@ mod tests {
                 pipeline_feedback_event_for_run("child", 2, "child-x", 100, 29_900),
             ),
         ]);
-        let criterion = Criterion::ProviderPromptCacheStablePrefixReuseRatio {
+        let criterion = Criterion::ProviderPromptCacheReadNonregressionRatio {
             min: 0.95,
             min_pairs: 1,
             // Keep the transition ceiling out of this counterexample: the
@@ -7402,7 +7694,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_work_item_execution_reports_post_start_wire_surface_gap() {
+    fn journal_work_item_execution_reports_unsettled_assignment() {
         let capture = mk_session(&[
             (
                 "llm_round",
@@ -7451,10 +7743,242 @@ mod tests {
 
         assert!(!result[0].passed, "{result:?}");
         assert!(
-            result[0]
-                .detail
-                .contains("wire surface omitted settle_work_item"),
-            "the harness must report the first broken provider boundary, not only the later abandoned assignment: {result:?}"
+            result[0].detail.contains("assigned but never settled"),
+            "the lifecycle oracle must report the durable unfinished assignment: {result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_work_item_execution_accepts_typed_deferred_settlement_discovery() {
+        let capture = mk_session(&[
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 0,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["start_work", "web_fetch"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "start",
+                        "name": "start_work",
+                        "ok": true,
+                        "result": {
+                            "status": "started",
+                            "declared_tasks": [{"item_id": "task-1", "item_revision": 1}],
+                            "runnable_items": [{"item_id": "task-1", "item_revision": 1}],
+                            "initial_task": {"status": "assigned", "item_id": "task-1", "item_revision": 1}
+                        }
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 1,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "discover-settle",
+                        "name": "tool_search",
+                        "ok": true,
+                        "result": {
+                            "matches": [{"name": "settle_work_item"}],
+                            "missing": []
+                        }
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 2,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "settle",
+                        "name": "settle_work_item",
+                        "ok": true,
+                        "result": {
+                            "status": "recorded",
+                            "item_id": "task-1",
+                            "item_revision": 1,
+                            "outcome": "delivered"
+                        }
+                    }]
+                }),
+            ),
+        ]);
+        let outcome = outcome_with_tools(&[]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::JournalWorkItemExecutionFromStart {
+                min_distinct_items: 1,
+            }],
+            &outcome,
+            Some(&capture),
+        );
+        assert!(
+            result[0].passed,
+            "deferred settlement discovery is typed evidence: {result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_work_item_execution_retains_typed_discovery_across_empty_round() {
+        let capture = mk_session(&[
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 0,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["start_work", "web_fetch"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "start",
+                        "name": "start_work",
+                        "ok": true,
+                        "result": {
+                            "status": "started",
+                            "declared_tasks": [{"item_id": "task-1", "item_revision": 1}],
+                            "runnable_items": [{"item_id": "task-1", "item_revision": 1}],
+                            "initial_task": {"status": "assigned", "item_id": "task-1", "item_revision": 1}
+                        }
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 1,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "discover-settle",
+                        "name": "tool_search",
+                        "ok": true,
+                        "result": {"matches": [{"name": "settle_work_item"}], "missing": []}
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 2,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": []
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 3,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "settle",
+                        "name": "settle_work_item",
+                        "ok": true,
+                        "result": {
+                            "status": "recorded",
+                            "item_id": "task-1",
+                            "item_revision": 1,
+                            "outcome": "delivered"
+                        }
+                    }]
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::JournalWorkItemExecutionFromStart {
+                min_distinct_items: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&capture),
+        );
+        assert!(
+            result[0].passed,
+            "typed availability must survive an empty continuation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn journal_work_item_execution_does_not_treat_unrelated_call_as_settlement_surface() {
+        let capture = mk_session(&[
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 0,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["start_work", "web_fetch"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "start",
+                        "name": "start_work",
+                        "ok": true,
+                        "result": {
+                            "status": "started",
+                            "declared_tasks": [{"item_id": "task-1", "item_revision": 1}],
+                            "runnable_items": [{"item_id": "task-1", "item_revision": 1}],
+                            "initial_task": {"status": "assigned", "item_id": "task-1", "item_revision": 1}
+                        }
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 1,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": [{
+                        "tool_call_id": "fetch",
+                        "name": "web_fetch",
+                        "ok": true,
+                        "result": {"status": "ok"}
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "round": 2,
+                    "metadata": {
+                        "purpose": "primary_agent",
+                        "visible_tools": ["web_fetch", "tool_search"]
+                    },
+                    "tool_calls": []
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::JournalWorkItemExecutionFromStart {
+                min_distinct_items: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&capture),
+        );
+        assert!(
+            !result[0].passed,
+            "unrelated execution must not prove settlement: {result:?}"
+        );
+        assert!(
+            result[0].detail.contains("assigned but never settled"),
+            "must report the missing durable settlement, not infer it from an unrelated tool: {result:?}"
         );
     }
 
@@ -7536,6 +8060,52 @@ mod tests {
         );
         assert!(!rejected[0].passed, "{}", rejected[0].detail);
         assert!(rejected[0].detail.contains("before canonical Work"));
+    }
+
+    #[test]
+    fn journal_work_graph_patch_accepts_atomic_admission_mutation() {
+        let capture = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "start",
+                    "name": "start_work",
+                    "ok": true,
+                    "result": {
+                        "status": "started",
+                        "declared_tasks": [
+                            {"item_id": "task-1", "item_revision": 1},
+                            {"item_id": "task-2", "item_revision": 1}
+                        ],
+                        "task_board_update": {
+                            "kind": "snapshot",
+                            "graph_revision": 3,
+                            "tasks": [
+                                {"item_id": "root", "item_revision": 1, "declaration_state": "active"},
+                                {"item_id": "task-1", "item_revision": 1, "declaration_state": "active"},
+                                {"item_id": "task-2", "item_revision": 2, "declaration_state": "cancelled"},
+                                {"item_id": "replacement-1", "item_revision": 1, "declaration_state": "active"}
+                            ]
+                        }
+                    }
+                }]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::JournalWorkGraphPatch {
+                require_addition: true,
+                require_active_revision: false,
+                require_retired_revision: true,
+                require_cancelled_revision: true,
+                require_superseded_revision: false,
+                require_dependency_change: false,
+                require_atomic_retire_and_add: true,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&capture),
+        );
+
+        assert!(result[0].passed, "{}", result[0].detail);
     }
 
     #[test]

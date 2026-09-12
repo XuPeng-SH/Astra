@@ -135,12 +135,11 @@ mod enabled {
             || state.hooks.completion_settlement.work_settlement_only
         {
             state
-                .max_turns
-                .saturating_sub(state.agentic_turn_budget.hard_turn_limit)
-                .min(2)
-                .min(u32::MAX as usize) as u32
+                .agentic_turn_budget
+                .hard_turn_limit
+                .map(|limit| state.max_turns.saturating_sub(limit.get()).min(2) as u32)
         } else {
-            0
+            Some(0)
         };
 
         let tokens_used_session = state.total_prompt
@@ -165,11 +164,11 @@ mod enabled {
             state.telemetry.all_tools_used.iter().cloned().collect();
         unique_tools.sort();
 
-        let last_tool_called = state
-            .turn_guard
-            .tool_sigs
-            .last()
-            .and_then(|sigs| sigs.iter().last().cloned());
+        let last_tool_called = state.turn_guard.tool_sigs.last().and_then(|sigs| {
+            sigs.iter()
+                .last()
+                .map(|signature| signature.tool_name().to_owned())
+        });
 
         let consecutive_same_tool = compute_consecutive_same_tool(&state.turn_guard.tool_sigs);
         let has_final_text = !state.final_text.trim().is_empty();
@@ -252,7 +251,7 @@ mod enabled {
     }
 
     pub(crate) fn compute_consecutive_same_tool(
-        sigs: &[std::collections::BTreeSet<String>],
+        sigs: &[std::collections::BTreeSet<astra_turn_core::stall::StallSignature>],
     ) -> u32 {
         if sigs.len() < 2 {
             return 0;
@@ -370,7 +369,7 @@ mod enabled {
 
             assert_eq!(compute_consecutive_same_tool(&[]), 0);
 
-            let a: BTreeSet<String> = ["bash".to_string()].into();
+            let a = BTreeSet::from([astra_turn_core::stall::StallSignature::new("bash", b"")]);
             assert_eq!(compute_consecutive_same_tool(std::slice::from_ref(&a)), 0);
             assert_eq!(compute_consecutive_same_tool(&[a.clone(), a.clone()]), 2);
             assert_eq!(
@@ -378,7 +377,10 @@ mod enabled {
                 3
             );
 
-            let b: BTreeSet<String> = ["read_file".to_string()].into();
+            let b = BTreeSet::from([astra_turn_core::stall::StallSignature::new(
+                "read_file",
+                b"",
+            )]);
             assert_eq!(
                 compute_consecutive_same_tool(&[a.clone(), a.clone(), b.clone(), a.clone()]),
                 0
@@ -425,30 +427,44 @@ mod enabled {
             assert_eq!(snap.turns_limit, Some(25));
             assert_eq!(snap.turns_used, 7); // current_round_index + 1
             assert_eq!(snap.session_turn, 3); // outer session turn
-            assert_eq!(snap.settlement_rounds_reserved, 0);
+            assert_eq!(snap.settlement_rounds_reserved, Some(0));
+        }
+
+        #[test]
+        fn uncapped_settlement_does_not_fabricate_reserved_round_count() {
+            let mut state = make_state();
+            state.agentic_turn_budget.hard_turn_limit = None;
+            state.max_turns = 51;
+            state.hooks.completion_settlement.text_only = true;
+            assert_eq!(capture_snapshot(&state, 0).settlement_rounds_reserved, None);
+            state.hooks.completion_settlement.text_only = false;
+            assert_eq!(
+                capture_snapshot(&state, 0).settlement_rounds_reserved,
+                Some(0)
+            );
         }
 
         #[test]
         fn capture_snapshot_reports_runtime_settlement_boundary() {
             let mut state = make_state();
-            state.agentic_turn_budget.hard_turn_limit = 10;
+            state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(10);
             state.max_turns = 11;
             state.hooks.completion_settlement.text_only = true;
 
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.settlement_rounds_reserved, 1);
+            assert_eq!(snap.settlement_rounds_reserved, Some(1));
 
             state.max_turns = 12;
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.settlement_rounds_reserved, 2);
+            assert_eq!(snap.settlement_rounds_reserved, Some(2));
 
             state.max_turns = 13;
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.settlement_rounds_reserved, 2);
+            assert_eq!(snap.settlement_rounds_reserved, Some(2));
 
             state.hooks.completion_settlement.text_only = false;
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.settlement_rounds_reserved, 0);
+            assert_eq!(snap.settlement_rounds_reserved, Some(0));
         }
 
         #[test]

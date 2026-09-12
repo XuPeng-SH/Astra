@@ -55,7 +55,7 @@ cargo test -p astra-harness capability_matrix
 cargo test -p astra-turn-core artifact_windows
 cargo test -p astra-turn-core cloud::tool_delivery
 cargo test -p astra-services session_audit
-cargo test -p astra-cli first_class_browser_surface
+cargo test -p astra-cli tool_search_select_web_fetch_returns_schema_on_cli_path
 ```
 
 The capability inventory is intentionally cheap enough for every change. It

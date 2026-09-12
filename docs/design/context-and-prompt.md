@@ -20,6 +20,13 @@ Prompt cache stability comes from stable structure, not from hiding runtime trut
 
 ## Context layers
 
+Auxiliary Work admission emits only fields consumed by the runtime. Ordinary
+(`not_required`) admission classifies lifecycle, explicit execution topology,
+mutation scope, domain, and required capabilities; it does not generate a second
+list of user deliverables. The primary conversation retains those requirements.
+Missing topology remains invalid and may receive only the existing bounded
+repair. Required Work still supplies its initial graph and lifecycle mutations.
+
 | Layer | Purpose |
 | --- | --- |
 | System contract | Stable rules, tool protocol, provider contract, safety boundaries. |
@@ -74,6 +81,15 @@ expected results, retry counts, mutations and deadlines stay in user context.
 Output-limit continuation is a producer-owned textual instruction. The same
 projection applies to a fresh retry, a volatile replay and re-homed authority;
 append-only frames retain their existing lifetime protocol.
+
+This consolidation means `TailSuffix` cannot promise an unchanged provider
+prefix when a new runtime instruction appears: entering settlement can change
+the leading system message even when the assembly's stable-section hash is
+unchanged. Diagnose this boundary using the provider-final request fingerprints.
+Deployments that support preserving appended message boundaries can explicitly
+select `AppendOnlyUserTail` to retain the stable authority policy and append
+runtime instructions with their existing lifetime and supersession semantics.
+Do not silently reinterpret an explicitly selected `TailSuffix` capability.
 
 The bounded live-evidence recovery also separates its introspect instruction
 from its reason/schema facts. Typed control decoding accepts both direct JSON

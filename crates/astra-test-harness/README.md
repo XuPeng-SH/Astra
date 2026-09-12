@@ -5,6 +5,15 @@ cases against one or more models, captures session state (journal +
 step_events + stderr), evaluates success criteria (deterministic
 matchers + optional LLM judger), and emits a scored report.
 
+Harbor checks core execution readiness inside the actual task container before
+chat: a connected database, supported interaction API and matching server build
+are required. Optional-component degradation remains visible and does not block
+unrelated tasks; memory-dependent tests still require memory readiness. The
+strict monitoring semantics of `astra health` are unchanged. A pre-execution
+failure or cancellation remains the primary error, with any collected artifacts
+diagnostic only. Accepted runs, including scoreable interruptions, still require
+a valid machine-event stream before metrics can be projected.
+
 ## Why a dedicated harness
 
 Unit and integration tests prove code correctness; this harness
@@ -42,6 +51,12 @@ models. Do not use a passing remote run as evidence that uncommitted Server
 code is correct. Branch acceptance requires the deterministic HTTP system
 matrix against the current binary/DB wiring; a deployment smoke additionally
 needs the target Server revision recorded by the release workflow.
+
+Invalid machine-event evidence fails the run even when terminal JSON reports
+success. The report retains available terminal text and token diagnostics, but
+clears session/run identities so it cannot certify an unbound journal. Such a
+failure is a `BehaviorContractViolation`, not evidence of model incapability;
+unclassified process/collection failures remain `Unknown`.
 
 Per-case `cli_env` values are applied only to the spawned `astra` CLI process.
 They cannot configure the Server selected by the profile or `ASTRA_API_URL`.
@@ -152,7 +167,7 @@ focus without duplicating the whole scripted journey.
 | `cache_rate_above { threshold }`                    | tool cache hit rate ≥ threshold (0.0–1.0)                    | step_events |
 | `prompt_cache_tokens { min_read, min_creation }`    | provider prompt-cache read/write token buckets meet minimums | envelope    |
 | `provider_prompt_cache_read_ratio { min, warmup_turns, warmup_rounds }` | token-weighted cache-read ratio after explicit turn- or provider-round warm-up ≥ `min` | journal |
-| `provider_prompt_cache_stable_prefix_reuse_ratio { min, min_pairs, max_identity_transitions_per_run }` | every multi-observation run proves enough stable-prefix pairs at `min` reuse; cold identity boundaries are unscored but explicitly bounded per run | canonical pipeline feedback |
+| `provider_prompt_cache_read_nonregression_ratio { min, min_pairs, max_identity_transitions_per_run }` | within typed system/tool identity epochs, primary-request `current cache_read / previous cache_read` ≥ `min`, with enough pairs in every multi-observation run and bounded identity transitions; only the first pair with a zero previous read per epoch is exempt. Ratios may exceed 1.0; reads include history. Auxiliary requests are outside this metric; `provider_prompt_cache_read_ratio` measures absolute share from aggregate turn/round usage, which can include them | canonical pipeline feedback |
 | `stderr_matches { pattern }`                        | multi-line regex on stderr                                   | stderr      |
 | `text_contains { needle }`                          | substring in final text                                      | envelope    |
 | `text_not_contains { needle }`                      | substring is absent from final text                          | envelope    |
@@ -173,7 +188,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
-| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters }` | same-call conjunctive typed filters bind scope/type to the successful producer/consumer value flow | journal |
+| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | an accepted post-Work graph patch contains the requested typed mutation dimensions; retirement is cancellation or supersession, never prose | journal |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |

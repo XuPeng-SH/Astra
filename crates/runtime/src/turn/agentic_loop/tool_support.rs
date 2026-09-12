@@ -9,6 +9,17 @@ pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
         .map(|is_error| if is_error { 1 } else { 0 })
 }
 
+/// Process exit semantics cannot erase a failure of the enclosing tool
+/// contract (for example a missing executor verification receipt).
+pub(crate) fn has_typed_executor_failure(fields: &Map<String, Value>) -> bool {
+    fields
+        .get("error_kind")
+        .is_some_and(|value| serde_json::from_value::<astra_core::ErrorKind>(value.clone()).is_ok())
+        || fields.get("recovery_evidence").is_some_and(|value| {
+            serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).is_ok()
+        })
+}
+
 fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32> {
     let fields = fields?;
     if let Some(semantics) = fields
@@ -39,6 +50,14 @@ fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32>
 }
 
 fn edge_tool_observability_exit_code(edge_result: &EdgeToolExecResult) -> Option<i32> {
+    if edge_tool_status_exit_code(&edge_result.status) == Some(1)
+        && edge_result
+            .tool_result_fields
+            .as_ref()
+            .is_some_and(has_typed_executor_failure)
+    {
+        return Some(1);
+    }
     structured_edge_exit_code(edge_result.tool_result_fields.as_ref())
         .or_else(|| edge_tool_status_exit_code(&edge_result.status))
 }
@@ -219,6 +238,24 @@ mod tests {
             duration_ms: 10,
         };
 
+        assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
+    }
+
+    #[test]
+    fn executor_failure_remains_visible_after_successful_process_exit() {
+        let result = EdgeToolExecResult {
+            request_id: "verify-unavailable".into(),
+            tool: "bash".into(),
+            args: json!({"command": "true", "mode": "verify"}),
+            output: String::new(),
+            tool_result_fields: Some(Map::from_iter([
+                ("exit_semantics".into(), json!("success")),
+                ("exit_code".into(), json!(0)),
+                ("error_kind".into(), json!("tool_unavailable")),
+            ])),
+            status: "failed".into(),
+            duration_ms: 1,
+        };
         assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
     }
 

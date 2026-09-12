@@ -69,6 +69,18 @@ impl fmt::Display for FailureClass {
 
 /// Classify a failure based on outcome signals and criteria results.
 pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> FailureClass {
+    if outcome
+        .stderr
+        .starts_with(crate::runner::PROTOCOL_ERROR_MARKER)
+    {
+        return FailureClass::BehaviorContractViolation;
+    }
+    // Negative codes are harness-owned spawn/collection failures or a child
+    // without a normal exit status, not evidence of model task quality.
+    // Classify them before failed criteria derived from missing observations.
+    if outcome.exit_code < 0 {
+        return FailureClass::Unknown;
+    }
     // Exit 124 only proves that the outer deadline fired. If typed execution
     // evidence already proves model/tool progress, calling it an infrastructure
     // outage hides the product's pacing failure and tells reviewers to paper it
@@ -637,6 +649,30 @@ mod tests {
         assert_eq!(
             classify(&outcome, &results),
             FailureClass::ModelInstructionFollowing
+        );
+    }
+
+    #[test]
+    fn missing_process_evidence_is_not_model_incapability() {
+        let results = vec![
+            cr(Criterion::ExitCode { code: 0 }, false),
+            cr(
+                Criterion::TextContains {
+                    needle: "expected".into(),
+                },
+                false,
+            ),
+        ];
+        for stderr in ["", "arbitrary diagnostic"] {
+            let outcome = make_outcome().with_exit_code(-1).with_stderr(stderr);
+            assert_eq!(classify(&outcome, &results), FailureClass::Unknown);
+        }
+        let invalid = make_outcome()
+            .with_exit_code(-1)
+            .with_stderr(crate::runner::PROTOCOL_ERROR_MARKER);
+        assert_eq!(
+            classify(&invalid, &results),
+            FailureClass::BehaviorContractViolation
         );
     }
 

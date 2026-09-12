@@ -15,11 +15,13 @@ description: |
   the active attempt loses its admitted capability, delivery is fabricated, or settlement is absent.
 prompt: |
   Use canonical Work with activation=start and exactly one foreground task to fetch
-  https://example.com/ and report its document title. Cite the HTTP status, content type,
-  and retrieved title returned by your available retrieval capability as source evidence.
-  Keep the task visible and execute it without asking me to choose routine task-management
-  details. Do not edit files, delegate, or call run_next_work_item after start_work returns
-  its initial task assignment.
+  https://example.com/ and report its document title. The network retrieval capability is
+  deferred: call tool_search exactly once with query select:web_fetch, then invoke the
+  selected contract through invoke_tool. Cite the HTTP status, content type, and retrieved
+  title returned by that capability as source evidence. Keep the task visible and execute
+  it without asking me to choose routine task-management details. Do not call web_fetch
+  directly or use bash for network access; do not edit files, delegate, or call
+  run_next_work_item after start_work returns its initial task assignment.
 models:
   - deepseek-v4-flash
 capability: "custom:work_item_inherits_admitted_capability_journey"
@@ -32,6 +34,19 @@ criteria:
     code: 0
   - type: journal_tool_call_count
     name: start_work
+    min: 1
+    max: 2
+  # A provider may first attempt a direct deferred call and then repair via
+  # tool_search.  That is an unhappy-path retry, not a duplicate Work start;
+  # the durable contract is exactly one successful admission.
+  - type: journal_tool_outcome_count
+    name: start_work
+    ok: false
+    min: 0
+    max: 1
+  - type: journal_tool_outcome_count
+    name: start_work
+    ok: true
     min: 1
     max: 1
   - type: journal_tool_json
@@ -50,11 +65,37 @@ criteria:
     max: 0
   - type: journal_work_item_execution_from_start
   # An assignment receipt alone is not evidence that the selected task
-  # could use its admitted capability. Require the external retrieval itself:
-  # this catches an executor accidentally being given only coordinator tools,
-  # where it can churn on dispatch and eventually fabricate settlement.
-  - type: journal_tool_called
+  # could use its admitted capability. Require the canonical deferred path:
+  # discovery selects the typed network contract and invoke_tool carries the
+  # resulting call without promoting the full schema into tools[].
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 1
+    max: 1
+    document: arguments
+    path: /query
+    equals: select:web_fetch
+  - type: journal_tool_json
+    name: tool_search
+    document: result
+    path: /matches/0/name
+    equals: web_fetch
+  # The selected capability is carried by the stable invoke_tool protocol;
+  # its full schema must not be promoted into the canonical coordinator
+  # surface, otherwise every later turn pays for a new tools[] identity.
+  - type: journal_turn_tool_hidden
     name: web_fetch
+  - type: journal_tool_call_count
+    name: web_fetch
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: web_fetch
+    ok: true
+    min: 1
+    max: 1
+  # Settlement is a hot resident lifecycle transition. It must be callable
+  # directly without a dedicated discovery round.
   - type: journal_tool_call_count
     name: settle_work_item
     min: 1
@@ -79,11 +120,17 @@ criteria:
         rule: prompt_cache_break
         max: 1
       - type: provider_prompt_cache_read_ratio
-        min: 0.95
-        # This case is one user turn with several model rounds. A one-turn
-        # warmup would discard the entire observation set and make the cache
-        # contract impossible to evaluate.
+        min: 0.90
+        # The first Work activation can legitimately append a bounded typed
+        # receipt and one or more selected schemas. Keep the user-facing raw
+        # floor at 90%. The criterion below separately bounds system/tool
+        # identity churn and checks cache-read count nonregression; its read
+        # counts can include conversation history and do not prove coverage.
         warmup_turns: 0
+      - type: provider_prompt_cache_read_nonregression_ratio
+        min: 0.95
+        min_pairs: 1
+        max_identity_transitions_per_run: 1
   - type: journal_tool_call_count
     name: ask_user
     min: 0

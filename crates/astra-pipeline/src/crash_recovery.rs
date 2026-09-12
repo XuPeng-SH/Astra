@@ -227,9 +227,11 @@ fn build_restored_from_scan(
         messages: heavy.messages.clone(),
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
+        run_execution_budget: heavy.run_execution_budget.clone(),
+        run_execution_control: heavy.run_execution_control.clone(),
         blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
+        deferred_tool_activations: heavy.deferred_tool_activations.clone(),
         resume_turn: extract_turn_from_step_id(&heavy.light.step_id),
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -1636,6 +1638,24 @@ mod tests {
             gap_detected: None,
         };
         let mut heavy = make_test_heavy_checkpoint();
+        heavy.run_execution_budget = Some(crate::step_protocol::RunExecutionBudget::V1 {
+            run_id: "run".into(),
+            producer_owner_generation: 3,
+            charged_iterations: 2,
+            granted_iteration_boundary: 50,
+            remaining_iterations: 48,
+            effective_hard_turn_limit: None,
+        });
+        heavy.run_execution_control = Some(crate::step_protocol::RunExecutionControl::V2 {
+            hook_obligations: astra_turn_types::StopHookObligations::default(),
+            completion_settlement: astra_turn_types::CompletionSettlementState {
+                text_only: true,
+                outcome_reconciliation_retries: 1,
+                ..Default::default()
+            },
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        });
         heavy.messages = vec![
             serde_json::json!({"role": "user", "content": "recover this turn"}),
             serde_json::json!({
@@ -1651,6 +1671,8 @@ mod tests {
         ];
 
         let restored = build_restored_from_scan(&scan, &heavy).expect("restore succeeds");
+        assert_eq!(restored.run_execution_budget, heavy.run_execution_budget);
+        assert_eq!(restored.run_execution_control, heavy.run_execution_control);
         heavy.messages[0]["content"] = serde_json::json!("mutated checkpoint");
         heavy
             .messages

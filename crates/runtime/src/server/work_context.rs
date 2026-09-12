@@ -136,6 +136,7 @@ pub(crate) fn install_canonical_work_context(
         delivery_class: VolatileDeliveryClass::RequiredContext,
         payload,
         round_index: 0,
+        authority_lifetime: Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
     };
     items.push(serde_json::to_value(injection).expect("canonical Work context must serialize"));
 }
@@ -167,6 +168,10 @@ mod tests {
             .find(|entry| entry.kind == CANONICAL_WORK_CONTEXT_KIND)
             .expect("canonical Work injection");
         assert_eq!(work.delivery_class, VolatileDeliveryClass::RequiredContext);
+        assert_eq!(
+            work.authority_lifetime,
+            Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn)
+        );
         assert_eq!(work.payload["graph_revision"], 2);
         assert!(
             injections

@@ -262,15 +262,21 @@ pub async fn run_orphan_cancel_claim_race_http() {
         .await
         .expect("production recovery claim before DELETE");
     assert!(
-        claimed.iter().all(|run| run.run_id != cancel_run_id),
+        claimed
+            .iter()
+            .all(|claim| claim.run.run_id != cancel_run_id),
         "the cancel-win terminal generation must not be claimable"
     );
     let claimed = claimed
         .iter()
-        .find(|run| run.run_id == claim_run_id)
+        .find(|claim| claim.run.run_id == claim_run_id)
         .expect("the oldest orphan fixture must be claimed");
-    assert_eq!(claimed.run_generation, 1);
-    assert_eq!(claimed.owner_pod_id.as_deref(), Some(store.owner_pod_id()));
+    assert_eq!(claimed.run.run_generation, 1);
+    assert_eq!(claimed.claimed_from_generation, 0);
+    assert_eq!(
+        claimed.run.owner_pod_id.as_deref(),
+        Some(store.owner_pod_id())
+    );
 
     let (claim_status, claim_body) =
         delete_json(&ctx.app, &format!("/chat/runs/{claim_run_id}"), Some(auth)).await;

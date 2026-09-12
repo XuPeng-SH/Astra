@@ -2984,6 +2984,13 @@ fn session_handoff_http_error(
     error: astra_services::SessionHandoffError,
 ) -> (StatusCode, Json<ErrorResponse>) {
     match error {
+        astra_services::SessionHandoffError::StorageUnavailable(detail) => {
+            tracing::warn!(error = %detail, "handoff execution state verification failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to verify the saved execution state. The handoff was not advanced. Please retry.",
+            )
+        }
         astra_services::SessionHandoffError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, message)
         }
@@ -3879,6 +3886,21 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[test]
+    fn handoff_storage_failure_is_not_reported_as_invalid_user_input() {
+        let (status, Json(body)) = session_handoff_http_error(
+            astra_services::SessionHandoffError::StorageUnavailable("read unavailable".into()),
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(rendered.contains("The handoff was not advanced"));
+        assert!(!rendered.contains("read unavailable"));
+        let (status, _) = session_handoff_http_error(astra_services::SessionHandoffError::Invalid(
+            "checkpoint reference changed".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 
     fn transcript_item(run_id: &str, item_seq: i64, content: &str) -> TranscriptItemResponse {
         TranscriptItemResponse {

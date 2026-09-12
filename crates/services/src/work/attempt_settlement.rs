@@ -321,10 +321,10 @@ impl DatabaseWorkAttemptSettlementService {
     ) -> Result<bool, WorkAttemptSettlementError> {
         let mut tx = self.pool.get().begin().await.map_err(persistence)?;
         let attempt = sqlx::query(
-            "SELECT work_id, branch_id, executor_run_id, status
+            "SELECT work_id, branch_id
              FROM work_item_attempts
              WHERE owner_id = ? AND attempt_id = ?
-               AND execution_mode = 'primary' AND outcome IS NULL FOR UPDATE",
+               AND execution_mode = 'primary' AND outcome IS NULL",
         )
         .bind(owner_id)
         .bind(attempt_id)
@@ -335,32 +335,47 @@ impl DatabaseWorkAttemptSettlementService {
             tx.commit().await.map_err(persistence)?;
             return Ok(false);
         };
-        let status: String = attempt.try_get("status").map_err(persistence)?;
-        if status != "paused" {
-            tx.commit().await.map_err(persistence)?;
-            return Ok(false);
-        }
-        let old_run_id: String = attempt.try_get("executor_run_id").map_err(persistence)?;
+        // Discover the immutable branch without locking the attempt. All
+        // carrier coordination acquires the branch before its attempts.
+        let work_id: String = attempt.try_get("work_id").map_err(persistence)?;
+        let branch_id: String = attempt.try_get("branch_id").map_err(persistence)?;
         let session_id: String = sqlx::query_scalar(
             "SELECT session_id FROM work_branches
              WHERE owner_id = ? AND work_id = ? AND branch_id = ?
                AND archived_at IS NULL AND deletion_operation_id IS NULL FOR UPDATE",
         )
         .bind(owner_id)
-        .bind(
-            attempt
-                .try_get::<String, _>("work_id")
-                .map_err(persistence)?,
-        )
-        .bind(
-            attempt
-                .try_get::<String, _>("branch_id")
-                .map_err(persistence)?,
-        )
+        .bind(&work_id)
+        .bind(&branch_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(persistence)?
         .ok_or(WorkAttemptSettlementError::StaleAssignment)?;
+        let attempt = sqlx::query(
+            "SELECT executor_run_id, status FROM work_item_attempts
+             WHERE owner_id = ? AND attempt_id = ? AND work_id = ? AND branch_id = ?
+               AND execution_mode = 'primary' AND outcome IS NULL FOR UPDATE",
+        )
+        .bind(owner_id)
+        .bind(attempt_id)
+        .bind(&work_id)
+        .bind(&branch_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(persistence)?;
+        let Some(attempt) = attempt else {
+            tx.commit().await.map_err(persistence)?;
+            return Ok(false);
+        };
+        if attempt
+            .try_get::<String, _>("status")
+            .map_err(persistence)?
+            != "paused"
+        {
+            tx.commit().await.map_err(persistence)?;
+            return Ok(false);
+        }
+        let old_run_id: String = attempt.try_get("executor_run_id").map_err(persistence)?;
         let new_run = sqlx::query(
             "SELECT session_id, status, run_generation, last_event_idx
              FROM agent_runs WHERE user_id = ? AND run_id = ? FOR UPDATE",
@@ -422,10 +437,10 @@ impl DatabaseWorkAttemptSettlementService {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Reconcile primary attempts whose execution carrier already reached a
-    /// terminal durable state without settlement. This prevents one crashed
-    /// or cancelled root loop from pinning the branch as in-flight forever.
-    pub async fn reconcile_terminal_primary_attempts(
+    /// Reconcile unsettled primary attempts with their durable execution carrier.
+    /// A recovered pause releases execution for session continuation; a live
+    /// blocking pause does not. Terminal carriers cannot remain in-flight.
+    pub async fn reconcile_primary_attempt_carriers(
         &self,
         owner_id: &str,
         work_id: &str,
@@ -447,13 +462,16 @@ impl DatabaseWorkAttemptSettlementService {
             return Err(WorkAttemptSettlementError::StaleAssignment);
         }
         let rows = sqlx::query(
-            "SELECT a.attempt_id, r.status AS executor_status
+            "SELECT a.attempt_id, a.status AS attempt_status,
+                    r.status AS executor_status, r.waiting_for
              FROM work_item_attempts a
              JOIN agent_runs r
                ON r.user_id = a.owner_id AND r.run_id = a.executor_run_id
              WHERE a.owner_id = ? AND a.work_id = ? AND a.branch_id = ?
                AND a.execution_mode = 'primary'
-               AND a.status IN ('running', 'waiting', 'paused')",
+               AND a.status IN ('running', 'waiting', 'paused')
+               AND a.outcome IS NULL
+             FOR UPDATE",
         )
         .bind(owner_id)
         .bind(work_id)
@@ -464,13 +482,22 @@ impl DatabaseWorkAttemptSettlementService {
         let mut reconciled = 0_u64;
         for row in rows {
             let executor_status: String = row.try_get("executor_status").map_err(persistence)?;
+            let waiting_for: Option<String> = row.try_get("waiting_for").map_err(persistence)?;
             let status = match durable_run_status_kind(&executor_status) {
+                DurableRunStatusKind::Paused if waiting_for.is_none() => "paused",
                 DurableRunStatusKind::Cancelled => "cancelled",
                 DurableRunStatusKind::Completed
                 | DurableRunStatusKind::Delegated
                 | DurableRunStatusKind::Failed => "failed",
                 _ => continue,
             };
+            if row
+                .try_get::<String, _>("attempt_status")
+                .map_err(persistence)?
+                == status
+            {
+                continue;
+            }
             let result = sqlx::query(
                 "UPDATE work_item_attempts SET status = ?, updated_at = CURRENT_TIMESTAMP(6)
                  WHERE owner_id = ? AND attempt_id = ? AND outcome IS NULL

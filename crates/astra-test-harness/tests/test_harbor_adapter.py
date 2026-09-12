@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import json
 import os
 import shlex
@@ -19,6 +20,7 @@ from harbor_adapter_env import (
     astra_chat_command,
     astra_inner_timeout,
     astra_runtime_env,
+    validate_cli_readiness,
 )
 from harbor_adapter import (
     Astra,
@@ -45,7 +47,26 @@ def embedded_build_info() -> str:
     )
 
 
+def ready_probe():
+    return ExecResult(stdout=json.dumps({
+        "status": "degraded", "database": "connected", "memoria": "unavailable",
+        "interaction_api_major": "3", "build_git_sha": "a" * 40,
+    }), stderr=None, return_code=3)
+
+
 class AstraRuntimeEnvTests(unittest.TestCase):
+    def test_shared_server_readiness_contract(self):
+        fixtures = json.loads((Path(__file__).parent / "fixtures/server_readiness.json").read_text())
+        for case in fixtures:
+            with self.subTest(name=case["name"]):
+                if case["ready"]:
+                    validate_cli_readiness(json.dumps(case["body"]), case["exit_code"], "a" * 40)
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_cli_readiness(json.dumps(case["body"]), case["exit_code"], "a" * 40)
+        with self.assertRaises(ValueError):
+            validate_cli_readiness(" " * 65537, 0, None)
+
     def test_machine_events_are_strict_jsonl_with_closed_tool_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
@@ -69,6 +90,57 @@ class AstraRuntimeEnvTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
                 validate_stream_event_jsonl(path)
+
+    def test_preflight_rejection_terminal_does_not_require_executor_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "tool_completed",
+                        "name": "run_next_work_item",
+                        "description": "run next work item",
+                        "status": "rejected",
+                        "duration_ms": 0,
+                        "output": json.dumps(
+                            {
+                                "status": "rejected",
+                                "error_kind": "text_only_settlement_tool_call",
+                                "retryable": False,
+                            }
+                        ),
+                        "tool_use_id": "system-work-dispatch-1-13",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_stream_event_jsonl(path), 1)
+
+    def test_unpaired_non_rejection_terminal_remains_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            for status, output in (
+                ("completed", '{"status":"completed"}'),
+                ("failed", '{"status":"failed"}'),
+                ("rejected", "not-json"),
+                ("rejected", '{"status":"failed"}'),
+            ):
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "tool_completed",
+                            "status": status,
+                            "output": output,
+                            "tool_use_id": "call-unpaired",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(status=status, output=output):
+                    with self.assertRaisesRegex(RuntimeError, "unknown tool"):
+                        validate_stream_event_jsonl(path)
 
     def test_uploaded_build_info_is_exact_and_closed(self):
         value = validate_embedded_build_info(embedded_build_info(), "a" * 40)
@@ -371,7 +443,7 @@ class AstraRuntimeEnvTests(unittest.TestCase):
         self.assertIn("Astra access-token file is missing", command)
         self.assertIn('ASTRA_ACCESS_TOKEN="$(cat "$ASTRA_ACCESS_TOKEN_FILE")"', command)
         self.assertNotIn("secret-token", command)
-        self.assertIn("astra health >/dev/null", command)
+        self.assertNotIn("astra health", command)
         self.assertIn(
             "timeout --signal=TERM --kill-after=20s 840s astra chat",
             command,
@@ -681,9 +753,9 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
         environment = SimpleNamespace(
             default_user=1000,
             exec=AsyncMock(
-                return_value=ExecResult(
+                side_effect=[ready_probe(), ExecResult(
                     stdout=json.dumps(outcome), stderr=None, return_code=5
-                )
+                )]
             ),
         )
 
@@ -701,7 +773,7 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
         environment = SimpleNamespace(
             default_user=1000,
             exec=AsyncMock(
-                return_value=ExecResult(
+                side_effect=[ready_probe(), ExecResult(
                     stdout=json.dumps(
                         {
                             "exit_code": 0,
@@ -712,7 +784,7 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     stderr=None,
                     return_code=0,
-                )
+                )]
             ),
         )
 
@@ -739,9 +811,9 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
         environment = SimpleNamespace(
             default_user=None,
             exec=AsyncMock(
-                return_value=ExecResult(
+                side_effect=[ready_probe(), ExecResult(
                     stdout="not-json", stderr="crashed", return_code=5
-                )
+                ), ExecResult(stdout="not-json", stderr=None, return_code=0)]
             ),
         )
 
@@ -750,6 +822,85 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
             self._write_trial_lock(directory)
             with self.assertRaises(NonZeroAgentExitCodeError):
                 await agent.run("task", environment, AgentContext())
+
+    async def test_run_reads_strict_partial_envelope_when_stdout_is_noisy(self):
+        outcome = {
+            "exit_code": 5,
+            "final_state": "interrupted",
+            "completion_disposition": "interrupted",
+            "interruption_kind": "execution_incomplete",
+            "success": False,
+            "error_kind": "partial",
+        }
+        environment = SimpleNamespace(
+            default_user=1000,
+            exec=AsyncMock(
+                side_effect=[
+                    ready_probe(),
+                    ExecResult(
+                        stdout="safety warning\n" + json.dumps(outcome),
+                        stderr=None,
+                        return_code=5,
+                    ),
+                    ExecResult(
+                        stdout=json.dumps(outcome),
+                        stderr=None,
+                        return_code=0,
+                    ),
+                ]
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Astra(Path(directory) / "agent", model_name="deepseek-v4-flash")
+            self._write_trial_lock(directory)
+            await agent.run("task", environment, AgentContext())
+
+        self.assertEqual(environment.exec.await_count, 3)
+        envelope_call = environment.exec.await_args_list[2].kwargs
+        self.assertEqual(
+            envelope_call["command"], "cat /logs/agent/astra-output.json"
+        )
+        self.assertEqual(envelope_call["user"], 1000)
+
+    async def test_readiness_failures_never_start_chat_or_mask_primary_error(self):
+        good = json.loads(ready_probe().stdout)
+        probes = [ExecResult(stdout=ready_probe().stdout, stderr=None, return_code=code)
+                  for code in (1, 78)]
+        for field, value in (("database", "disconnected"), ("interaction_api_major", "2"),
+                             ("build_git_sha", "b" * 40), ("status", "unhealthy")):
+            probes.append(ExecResult(stdout=json.dumps(good | {field: value}), stderr=None, return_code=3))
+        probes.extend(ExecResult(stdout=value, stderr=None, return_code=3)
+                      for value in ("not-json", "[]", ready_probe().stdout + " extra"))
+        for probe in probes:
+            with self.subTest(probe=probe), tempfile.TemporaryDirectory() as directory:
+                agent = Astra(Path(directory) / "agent", model_name="test-model",
+                              extra_env={"ASTRA_EXPECTED_BUILD_GIT_SHA": "a" * 40})
+                self._write_trial_lock(directory)
+                environment = SimpleNamespace(default_user=None, exec=AsyncMock(return_value=probe))
+                with self.assertRaises(ValueError):
+                    await agent.run("task", environment, AgentContext())
+                self.assertEqual(environment.exec.await_count, 1)
+                context = AgentContext()
+                agent.populate_context_post_run(context)
+                self.assertTrue(context.is_empty())
+
+    async def test_failed_run_does_not_weaken_next_success_artifact_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Astra(Path(directory) / "agent", model_name="test-model")
+            self._write_trial_lock(directory)
+            environment = SimpleNamespace(default_user=None, exec=AsyncMock(side_effect=asyncio.CancelledError()))
+            with self.assertRaises(asyncio.CancelledError):
+                await agent.run("task", environment, AgentContext())
+            agent.populate_context_post_run(AgentContext())
+            environment.exec = AsyncMock(side_effect=[ready_probe(), ExecResult(stdout="{}", stderr=None, return_code=0)])
+            await agent.run("task", environment, AgentContext())
+            with self.assertRaisesRegex(RuntimeError, "artifact is unavailable"):
+                agent.populate_context_post_run(AgentContext())
+            agent.logs_dir.mkdir(parents=True, exist_ok=True)
+            (agent.logs_dir / "astra-output.json.events").write_text("not-json\n")
+            with self.assertRaises(RuntimeError):
+                agent.populate_context_post_run(AgentContext())
 
 
 if __name__ == "__main__":

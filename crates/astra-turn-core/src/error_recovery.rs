@@ -439,6 +439,20 @@ pub fn build_escalation_message(level: EscalationLevel, avoid_tools: &[String]) 
 
 // ── Session Error Summary ────────────────────────────────────────────────────
 
+const RECENT_ERROR_WINDOW: usize = 16;
+
+/// Durable decision facts. Recent counters are derived from the bounded window
+/// on restore, not persisted as a second potentially inconsistent projection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionErrorContinuation {
+    total_errors: usize,
+    errors_by_category: HashMap<ErrorCategory, usize>,
+    retries_performed: usize,
+    retries_succeeded: usize,
+    recent_errors: VecDeque<ErrorCategory>,
+}
+
 /// Lightweight session-level error tracking for escalation decisions.
 #[derive(Debug, Clone, Default)]
 pub struct SessionErrorSummary {
@@ -453,14 +467,71 @@ pub struct SessionErrorSummary {
     recent_errors: VecDeque<ErrorCategory>,
 }
 
+impl serde::Serialize for SessionErrorSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.checkpoint(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SessionErrorSummary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let snapshot = <SessionErrorContinuation as serde::Deserialize>::deserialize(deserializer)?;
+        Self::restore(snapshot).map_err(serde::de::Error::custom)
+    }
+}
+
 impl SessionErrorSummary {
+    pub fn checkpoint(&self) -> SessionErrorContinuation {
+        SessionErrorContinuation {
+            total_errors: self.total_errors,
+            errors_by_category: self.errors_by_category.clone(),
+            retries_performed: self.retries_performed,
+            retries_succeeded: self.retries_succeeded,
+            recent_errors: self.recent_errors.clone(),
+        }
+    }
+
+    pub fn restore(snapshot: SessionErrorContinuation) -> Result<Self, &'static str> {
+        if snapshot.recent_errors.len() > RECENT_ERROR_WINDOW
+            || snapshot.retries_succeeded > snapshot.retries_performed
+            || snapshot
+                .errors_by_category
+                .values()
+                .try_fold(0usize, |sum, count| sum.checked_add(*count))
+                != Some(snapshot.total_errors)
+        {
+            return Err("inconsistent session error continuation");
+        }
+        let mut recent_errors_by_category = HashMap::new();
+        for category in &snapshot.recent_errors {
+            *recent_errors_by_category.entry(*category).or_insert(0usize) += 1;
+        }
+        if recent_errors_by_category.iter().any(|(category, count)| {
+            *count
+                > snapshot
+                    .errors_by_category
+                    .get(category)
+                    .copied()
+                    .unwrap_or(0)
+        }) {
+            return Err("recent error window exceeds lifetime facts");
+        }
+        Ok(Self {
+            total_errors: snapshot.total_errors,
+            errors_by_category: snapshot.errors_by_category,
+            retries_performed: snapshot.retries_performed,
+            retries_succeeded: snapshot.retries_succeeded,
+            recent_total_errors: snapshot.recent_errors.len(),
+            recent_errors_by_category,
+            recent_errors: snapshot.recent_errors,
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn record_error(&mut self, category: ErrorCategory) {
-        const RECENT_ERROR_WINDOW: usize = 16;
-
         self.total_errors += 1;
         *self.errors_by_category.entry(category).or_default() += 1;
         self.recent_total_errors += 1;
@@ -534,6 +605,86 @@ impl SessionErrorSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_error_continuation_matches_uninterrupted_execution() {
+        let mut continuous = SessionErrorSummary::new();
+        for step in 0..80 {
+            let wire = serde_json::to_value(continuous.checkpoint()).unwrap();
+            assert!(wire.get("recent_total_errors").is_none());
+            assert!(wire.get("recent_errors_by_category").is_none());
+            let mut restored =
+                SessionErrorSummary::restore(serde_json::from_value(wire).unwrap()).unwrap();
+            for state in [&mut continuous, &mut restored] {
+                state.record_error(if step % 3 == 0 {
+                    ErrorCategory::Auth
+                } else {
+                    ErrorCategory::Network
+                });
+                if step % 7 == 0 {
+                    state.record_retry(true);
+                }
+                if step % 19 == 0 {
+                    state.clear_recent_pressure();
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(continuous.checkpoint()).unwrap(),
+                serde_json::to_value(restored.checkpoint()).unwrap()
+            );
+            assert_eq!(
+                continuous.recent_error_pressure(),
+                restored.recent_error_pressure()
+            );
+            assert_eq!(
+                continuous.recent_errors_by_category,
+                restored.recent_errors_by_category
+            );
+        }
+        let valid = continuous.checkpoint();
+        let mut corrupt = valid.clone();
+        corrupt.total_errors += 1;
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+        let mut corrupt = valid.clone();
+        corrupt.recent_errors = std::iter::repeat_n(ErrorCategory::Network, 17).collect();
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+        let mut corrupt = valid;
+        corrupt.retries_succeeded = corrupt.retries_performed + 1;
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+    }
+
+    #[test]
+    fn session_error_continuation_rejects_missing_or_inconsistent_facts() {
+        let mut summary = SessionErrorSummary::new();
+        summary.record_error(ErrorCategory::Network);
+        let valid = summary.checkpoint();
+        let wire = serde_json::to_value(&valid).unwrap();
+        for field in wire.as_object().unwrap().keys() {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<SessionErrorContinuation>(missing).is_err());
+        }
+        let mut unknown = wire;
+        unknown["recent_total_errors"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<SessionErrorContinuation>(unknown).is_err());
+
+        let mut wrong_category = valid.clone();
+        wrong_category.recent_errors = VecDeque::from([ErrorCategory::Auth]);
+        assert!(
+            serde_json::from_value::<SessionErrorSummary>(
+                serde_json::to_value(&wrong_category).unwrap()
+            )
+            .is_err()
+        );
+        assert!(SessionErrorSummary::restore(wrong_category).is_err());
+
+        let mut overflow = valid;
+        overflow
+            .errors_by_category
+            .insert(ErrorCategory::Network, usize::MAX);
+        overflow.errors_by_category.insert(ErrorCategory::Auth, 1);
+        assert!(SessionErrorSummary::restore(overflow).is_err());
+    }
 
     // ── Classification: data-driven ──
 

@@ -405,7 +405,7 @@ fn pure_user_intent_for_runtime_decision(message: &str) -> String {
 async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
     if state.llm_rounds_completed > 0
         || !state.tool_results.is_empty()
-        || !state.skills.invoked.is_empty()
+        || !state.skills.execution.invoked.is_empty()
     {
         return;
     }
@@ -436,8 +436,10 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         return;
     }
 
-    let visible =
-        crate::turn::skill_tool::visible_skills_for_host_turn(&full, &state.skills.invoked);
+    let visible = crate::turn::skill_tool::visible_skills_for_host_turn(
+        &full,
+        &state.skills.execution.invoked,
+    );
     let Some(decision) = host
         .judge_skill_auto_route(
             state,
@@ -457,7 +459,12 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
     };
     let skill_name = decision.skill_name.trim().to_string();
     let attempt_key = skill_auto_route_attempt_key(&query, &skill_name);
-    if state.skills.auto_route_attempts.contains(&attempt_key) {
+    if state
+        .skills
+        .execution
+        .auto_route_attempts
+        .contains(&attempt_key)
+    {
         tracing::debug!(
             skill_name,
             "skill auto-route skipped repeated decision for same user intent"
@@ -465,7 +472,11 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         return;
     }
     if skill_name.is_empty() || !visible.iter().any(|skill| skill.name == skill_name) {
-        state.skills.auto_route_attempts.insert(attempt_key);
+        state
+            .skills
+            .execution
+            .auto_route_attempts
+            .insert(attempt_key);
         tracing::warn!(
             skill_name,
             "skill auto-route judge returned a skill outside the visible catalog"
@@ -490,7 +501,11 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         .map(|outcome| outcome.all_required_passed)
         .unwrap_or(true);
     if !result.success || !verified {
-        state.skills.auto_route_attempts.insert(attempt_key);
+        state
+            .skills
+            .execution
+            .auto_route_attempts
+            .insert(attempt_key);
         return;
     }
 
@@ -535,10 +550,14 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
     state.push_prompt_history_message(tool_msg);
     state.tool_results.push(tool_result);
     state.telemetry.all_selected_skills.push(skill_name.clone());
-    state.skills.auto_route_attempts.insert(attempt_key);
+    state
+        .skills
+        .execution
+        .auto_route_attempts
+        .insert(attempt_key);
     let execution_topology =
         crate::turn::skill_tool::declared_execution_topology(resolver.as_ref(), &skill_name);
-    state.skills.invoked.insert(
+    state.skills.execution.invoked.insert(
         skill_name.clone(),
         crate::turn::skill_tool::InvokedSkill {
             name: skill_name,
@@ -574,7 +593,12 @@ fn default_budget_exhaustion_completion_text(state: &AgenticLoopState) -> String
 #[derive(Default)]
 struct ParallelAgentSummary {
     label: Option<String>,
+    /// Terminality is ownership state, not outcome quality.  A failed or
+    /// cancelled child is no longer live and must not block parent synthesis.
+    terminal: bool,
+    successful: bool,
     completed_result: Option<String>,
+    partial_result: Option<String>,
     incomplete_reason: Option<String>,
     control_errors: Vec<String>,
 }
@@ -591,9 +615,56 @@ struct UnfinishedParallelAgent {
     control_errors: Vec<String>,
 }
 
+struct TerminalParallelAgentIssue {
+    agent_id: String,
+    label: String,
+    partial_result: Option<String>,
+    incomplete_reason: Option<String>,
+    control_errors: Vec<String>,
+}
+
 struct ParallelAgentBudgetRollup {
     completed: Vec<CompletedParallelAgent>,
+    terminal_issues: Vec<TerminalParallelAgentIssue>,
     unfinished: Vec<UnfinishedParallelAgent>,
+}
+
+/// Apply one typed observation to the owner's per-agent lifecycle state.
+///
+/// `agent.spawn` is allowed to return a terminal child result directly.  It
+/// must therefore use the same reducer as `agent.get_result`; otherwise a
+/// foreground spawn-only completion is recorded as launched forever.  Once a
+/// terminal result is observed it is sticky: a later stale running/launched
+/// observation must not reopen the child or make the owner look incomplete.
+fn apply_parallel_agent_budget_projection(
+    entry: &mut ParallelAgentSummary,
+    projection: &crate::orchestration::AgentToolBudgetRecordProjection,
+) {
+    if entry.label.is_none() {
+        entry.label = projection.display_name_hint.clone();
+    }
+    if let Some(summarized) = projection.control_error_summary.clone()
+        && !entry
+            .control_errors
+            .iter()
+            .any(|existing| existing == &summarized)
+    {
+        entry.control_errors.push(summarized);
+    }
+    // Once a terminal observation releases the child owner, later stale
+    // running/terminal callbacks must not reopen or rewrite that outcome.
+    if entry.terminal {
+        return;
+    }
+    if projection.terminal {
+        entry.terminal = true;
+        entry.successful = projection.successful;
+        entry.completed_result = projection.completed_result.clone();
+        entry.partial_result = projection.partial_result.clone();
+        entry.incomplete_reason = projection.incomplete_reason.clone();
+    } else {
+        entry.incomplete_reason = projection.incomplete_reason.clone();
+    }
 }
 
 fn collect_parallel_agent_budget_rollup(
@@ -609,7 +680,7 @@ fn collect_parallel_agent_budget_rollup(
         let projection = project_agent_tool_budget_record(record);
 
         match projection.action {
-            AgentToolRecordActionKind::Spawn => {
+            AgentToolRecordActionKind::Spawn | AgentToolRecordActionKind::GetResult => {
                 let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
@@ -617,32 +688,7 @@ fn collect_parallel_agent_budget_rollup(
                     order.push(agent_id.clone());
                 }
                 let entry = summaries.entry(agent_id).or_default();
-                if entry.label.is_none() {
-                    entry.label = projection.display_name_hint.clone();
-                }
-            }
-            AgentToolRecordActionKind::GetResult => {
-                let Some(agent_id) = projection.agent_id.clone() else {
-                    continue;
-                };
-                if !order.iter().any(|id| id == &agent_id) {
-                    order.push(agent_id.clone());
-                }
-                let entry = summaries.entry(agent_id).or_default();
-                if let Some(summarized) = projection.control_error_summary.clone() {
-                    if !entry
-                        .control_errors
-                        .iter()
-                        .any(|existing| existing == &summarized)
-                    {
-                        entry.control_errors.push(summarized);
-                    }
-                }
-                if let Some(result) = projection.completed_result.clone() {
-                    entry.completed_result = Some(result);
-                } else if entry.completed_result.is_none() {
-                    entry.incomplete_reason = projection.incomplete_reason.clone();
-                }
+                apply_parallel_agent_budget_projection(entry, &projection);
             }
             AgentToolRecordActionKind::Other => {}
         }
@@ -652,9 +698,9 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                entry
-                    .completed_result
-                    .as_ref()
+                (entry.successful)
+                    .then_some(entry.completed_result.as_ref())
+                    .flatten()
                     .map(|result| CompletedParallelAgent {
                         label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
                         result: result.clone(),
@@ -662,11 +708,28 @@ fn collect_parallel_agent_budget_rollup(
             })
         })
         .collect();
+    let terminal_issues: Vec<_> = order
+        .iter()
+        .filter_map(|agent_id| {
+            summaries.get(agent_id).and_then(|entry| {
+                if !entry.terminal || entry.successful {
+                    return None;
+                }
+                Some(TerminalParallelAgentIssue {
+                    agent_id: agent_id.clone(),
+                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                    partial_result: entry.partial_result.clone(),
+                    incomplete_reason: entry.incomplete_reason.clone(),
+                    control_errors: entry.control_errors.clone(),
+                })
+            })
+        })
+        .collect();
     let unfinished: Vec<_> = order
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                if entry.completed_result.is_some() {
+                if entry.terminal {
                     return None;
                 }
                 Some(UnfinishedParallelAgent {
@@ -679,12 +742,13 @@ fn collect_parallel_agent_budget_rollup(
         })
         .collect();
 
-    if completed.is_empty() && unfinished.is_empty() {
+    if completed.is_empty() && terminal_issues.is_empty() && unfinished.is_empty() {
         return None;
     }
 
     Some(ParallelAgentBudgetRollup {
         completed,
+        terminal_issues,
         unfinished,
     })
 }
@@ -694,7 +758,10 @@ fn parallel_agent_budget_exhaustion_summary(
     cancelled_agents: &HashSet<String>,
 ) -> Option<String> {
     let rollup = collect_parallel_agent_budget_rollup(state)?;
-    if rollup.completed.is_empty() || rollup.unfinished.is_empty() {
+    if rollup.completed.is_empty()
+        && rollup.terminal_issues.is_empty()
+        && rollup.unfinished.is_empty()
+    {
         return None;
     }
 
@@ -703,34 +770,53 @@ fn parallel_agent_budget_exhaustion_summary(
     } else {
         " You can continue in the next message."
     };
-    let mut lines = vec![
-        format!(
-            "[The owner turn reached its execution boundary after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} did not finish before the turn ended.{}]",
-            current_agentic_step(state),
-            rollup.completed.len(),
-            rollup.unfinished.len(),
-            checkpoint_note
-        ),
-        String::new(),
-        "Completed sub-agent results:".to_string(),
-    ];
-    for (idx, entry) in rollup.completed.iter().enumerate() {
-        lines.push(format!(
-            "{}. {} — {}",
-            idx + 1,
-            entry.label,
-            summarize_agent_tool_budget_result(&entry.result)
-        ));
+    let mut lines = vec![format!(
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} terminated without a successful result; {} remain live.{}]",
+        current_agentic_step(state),
+        rollup.completed.len(),
+        rollup.terminal_issues.len(),
+        rollup.unfinished.len(),
+        checkpoint_note
+    )];
+    if !rollup.completed.is_empty() {
+        lines.push(String::new());
+        lines.push("Completed sub-agent results:".to_string());
+        for (idx, entry) in rollup.completed.iter().enumerate() {
+            lines.push(format!(
+                "{}. {} — {}",
+                idx + 1,
+                entry.label,
+                summarize_agent_tool_budget_result(&entry.result)
+            ));
+        }
     }
-    lines.push(String::new());
-    lines.push("Unfinished sub-agent results:".to_string());
-    for (idx, entry) in rollup.unfinished.iter().enumerate() {
-        let detail = render_agent_tool_budget_unfinished_detail(
-            entry.incomplete_reason.as_deref(),
-            &entry.control_errors,
-            cancelled_agents.contains(&entry.agent_id),
-        );
-        lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+    if !rollup.terminal_issues.is_empty() {
+        lines.push(String::new());
+        lines.push("Terminal sub-agent issues:".to_string());
+        for (idx, entry) in rollup.terminal_issues.iter().enumerate() {
+            let mut detail = render_agent_tool_budget_unfinished_detail(
+                entry.incomplete_reason.as_deref(),
+                &entry.control_errors,
+                cancelled_agents.contains(&entry.agent_id),
+            );
+            if let Some(partial_result) = entry.partial_result.as_deref() {
+                detail.push_str("; partial result: ");
+                detail.push_str(&summarize_agent_tool_budget_result(partial_result));
+            }
+            lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+        }
+    }
+    if !rollup.unfinished.is_empty() {
+        lines.push(String::new());
+        lines.push("Live sub-agent results:".to_string());
+        for (idx, entry) in rollup.unfinished.iter().enumerate() {
+            let detail = render_agent_tool_budget_unfinished_detail(
+                entry.incomplete_reason.as_deref(),
+                &entry.control_errors,
+                cancelled_agents.contains(&entry.agent_id),
+            );
+            lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+        }
     }
     Some(lines.join("\n"))
 }
@@ -895,18 +981,6 @@ async fn finish_cancellation<H: AgenticLoopHost>(
     PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
 }
 
-fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
-    let budget = state.agentic_turn_budget;
-    if budget.extension_turns == 0 || state.max_turns <= budget.initial_turns {
-        return 0;
-    }
-    state
-        .max_turns
-        .saturating_sub(budget.initial_turns)
-        .div_ceil(budget.extension_turns)
-        .min(u32::MAX as usize) as u32
-}
-
 pub(crate) fn extract_tool_args(args: Option<&str>) -> Option<Value> {
     let args = args?;
     serde_json::from_str::<Value>(args).ok()
@@ -1039,14 +1113,6 @@ fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
         .is_some_and(|previous| previous == last)
 }
 
-fn record_failure_or_rejection(record: &astra_services::session_journal::ToolCallRecord) -> bool {
-    record.was_executed() && !record.ok
-        || matches!(
-            record.disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
-        )
-}
-
 pub(crate) fn record_explicit_path(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> Option<String> {
@@ -1173,87 +1239,6 @@ fn scoped_command_path_tokens(words: &[String]) -> Vec<(usize, &str)> {
         }
     }
     indices
-}
-
-/// Prove that a shell validator/read observes the bound workspace rather
-/// than an unrelated checkout. This is evidence classification only: shell
-/// execution and permission policy remain independent. Unknown syntax or
-/// dynamic scope is intentionally not a receipt when a workspace binding is
-/// available.
-pub(crate) fn bash_command_is_workspace_scoped(
-    command: &str,
-    workspace_root: Option<&str>,
-) -> bool {
-    let Some(root) = workspace_root.and_then(normalize_absolute_path) else {
-        // Without a binding there is no safe scope to compare against; keep
-        // legacy receipt behavior and let the executor/permission layer own
-        // isolation.
-        return true;
-    };
-    let Some(segments) = astra_turn_core::evaluation::split_shell_control_segments(command) else {
-        return false;
-    };
-    let mut cwd = root.clone();
-    for segment in segments
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let Some(pipeline_segments) =
-            astra_turn_core::evaluation::split_shell_pipeline_segments(segment)
-        else {
-            return false;
-        };
-        for pipeline_segment in pipeline_segments {
-            let pipeline_segment = pipeline_segment.trim();
-            if pipeline_segment.is_empty() {
-                continue;
-            }
-            let pipeline_segment = pipeline_segment
-                .strip_suffix("2>&1")
-                .or_else(|| pipeline_segment.strip_suffix("1>&2"))
-                .map(str::trim)
-                .unwrap_or(pipeline_segment);
-            let Some(words) = shell_file_test_words(pipeline_segment) else {
-                // Dynamic cwd, manifest, or path expressions cannot be
-                // correlated to this workspace. Do not retain an older cwd
-                // and accidentally turn an unrelated validation into proof.
-                return false;
-            };
-            let Some(head) = words.first() else { continue };
-            let head_lower = head.to_ascii_lowercase();
-            // A control wrapper is only neutral when it has no state-changing
-            // shell syntax. Check redirects before handling `cd`/`pushd`/`set`;
-            // a redirected control segment can write concurrently with a
-            // later validator in the same pipeline. Ordinary writer redirects
-            // remain in scope here; the receipt classifier handles their
-            // ordering separately.
-            if matches!(head_lower.as_str(), "cd" | "pushd" | "set")
-                && shell_segment_has_non_benign_redirect(pipeline_segment)
-            {
-                return false;
-            }
-            if matches!(head_lower.as_str(), "cd" | "pushd") {
-                let Some(target) = words.iter().skip(1).find(|word| !word.starts_with('-')) else {
-                    return false;
-                };
-                let Some(next_cwd) = normalize_scoped_path(target, &cwd, &root) else {
-                    return false;
-                };
-                cwd = next_cwd;
-                continue;
-            }
-            if head_lower == "popd" {
-                return false;
-            }
-            for (_, token) in scoped_command_path_tokens(&words) {
-                if normalize_scoped_path(token, &cwd, &root).is_none() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
 }
 
 /// A read-only shell command is not automatically a workspace observation:
@@ -2027,11 +2012,10 @@ fn shell_option_takes_value(option: &str) -> bool {
 /// record predicate rather than duplicating a weaker may-observe check in the
 /// completion-action window.
 pub(crate) fn tool_call_can_observe_bound_workspace(
-    state: &AgenticLoopState,
+    root: Option<&str>,
     name: &str,
     args: Option<&Value>,
 ) -> bool {
-    let root = state.hooks.workspace_root_hint.as_deref();
     if name == "bash" {
         // This only permits the bounded recovery action to run.  Settlement
         // still requires the executor-produced v2 receipt in the completed
@@ -2065,7 +2049,7 @@ pub(crate) fn tool_call_can_observe_bound_workspace(
 /// Scope an executed observation to the bound workspace. Direct read tools
 /// use their typed path; Bash uses the shared shell scope classifier.
 pub(crate) fn record_can_observe_bound_workspace(
-    state: &AgenticLoopState,
+    root: Option<&str>,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     // The observer ran on the owner side of the bound workspace.  This typed
@@ -2074,7 +2058,6 @@ pub(crate) fn record_can_observe_bound_workspace(
     if record_has_typed_workspace_observation_receipt(record) {
         return true;
     }
-    let root = state.hooks.workspace_root_hint.as_deref();
     let args = extract_tool_args(record.authoritative_args_full());
     if record.name == "bash" {
         // Verify mode is an explicit receipt contract.  Do not silently
@@ -2089,7 +2072,7 @@ pub(crate) fn record_can_observe_bound_workspace(
         }) {
             return false;
         }
-        return tool_call_can_observe_bound_workspace(state, &record.name, args.as_ref());
+        return tool_call_can_observe_bound_workspace(root, &record.name, args.as_ref());
     }
     if !crate::turn::tool_side_effects::tool_call_may_observe_workspace(&record.name, args.as_ref())
     {
@@ -2202,8 +2185,8 @@ fn simple_bash_mutation_targets(command: &str) -> Option<Vec<String>> {
             }
             // The first positional is a mode/owner, not a file.  Until the
             // executor provides typed target operands, retain only the final
-            // literal path; counting the mode as a second workspace target
-            // would let a one-file change buy the multi-file probation slice.
+            // literal path; the mode must never be treated as a filesystem
+            // operand when proving a mutation is confined to scratch space.
             positional
                 .into_iter()
                 .last()
@@ -2540,581 +2523,46 @@ fn record_is_stable_workspace_mutation(
     false
 }
 
-fn stable_workspace_targets(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Vec<PathBuf> {
-    if !record_is_stable_workspace_mutation(state, record) {
-        return Vec::new();
-    }
-    let root = state.hooks.workspace_root_hint.as_deref();
-    if let Some(path) =
-        record_explicit_path(record).and_then(|path| normalize_workspace_path(&path, root))
-    {
-        return vec![path];
-    }
-    if record.name != "bash" {
-        return Vec::new();
-    }
-    let Some(command) = extract_tool_args(record.authoritative_args_full()).and_then(|args| {
-        astra_turn_core::tool_argument_hints::command_hint_from_args(&args).map(str::to_string)
-    }) else {
-        return Vec::new();
-    };
-    let Some(segments) = astra_turn_core::evaluation::split_shell_control_segments(&command) else {
-        return Vec::new();
-    };
-    segments
-        .into_iter()
-        .filter_map(|segment| simple_bash_mutation_targets(segment.trim()))
-        .flatten()
-        .filter_map(|target| normalize_workspace_path(&target, root))
-        .collect()
-}
-
-fn record_is_successful_workspace_validation(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-    latest_mutation_path: Option<&str>,
-) -> bool {
-    if !record.was_executed()
-        || !record.ok
-        || matches!(
-            record.result_class.as_deref(),
-            Some(
-                "test_failure"
-                    | "env_failure"
-                    | "execution_error"
-                    | "inconclusive"
-                    | "agent_incomplete"
-                    | "fanout_incomplete"
-            )
-        )
-    {
-        return false;
-    }
-    if record.name != "bash" {
-        return false;
-    }
-    let Some(args) = extract_tool_args(record.authoritative_args_full()) else {
-        return false;
-    };
-    let Some(command) = astra_turn_core::tool_argument_hints::command_hint_from_args(&args) else {
-        return false;
-    };
-    if !bash_command_is_workspace_scoped(command, state.hooks.workspace_root_hint.as_deref()) {
-        return false;
-    }
-    // A mutating compound command is a receipt only when a positive
-    // validation occurs after its final mutation.  Do not let a successful
-    // `cargo test && sed -i ...` masquerade as validation of the modified
-    // state merely because its prefix matches a known validator.
-    // This ordering check applies to every bash validation record.  The
-    // side-effect classifier is intentionally conservative and can miss an
-    // unknown writer (for example an inline Python mutation); a recognized
-    // validation prefix must not bypass the post-mutation barrier in that
-    // case.
-    if !bash_command_has_proportionate_validation(command) {
-        return false;
-    }
-    if astra_turn_core::evaluation::bash_command_post_mutation_validation_prefix(command).is_some()
-    {
-        return true;
-    }
-    // Artifact-local checks are only completion evidence when they name the
-    // latest mutation target.  Without a typed target, keep the result as
-    // ordinary observation rather than granting another scheduler slice.
-    let Some(path) = latest_mutation_path else {
-        return false;
-    };
-    let Some(receipt_operands) = local_validation_receipt_operands(command) else {
-        return false;
-    };
-    let target = normalize_absolute_path(path);
-    receipt_operands.iter().any(|token| {
-        token == path
-            || target.as_ref().is_some_and(|target| {
-                normalize_absolute_path(token).is_some_and(|candidate| candidate == *target)
-            })
-    })
-}
-
-fn bash_command_has_proportionate_validation(command: &str) -> bool {
-    if astra_turn_core::evaluation::bash_command_post_mutation_validation_prefix(command).is_some()
-    {
-        return true;
-    }
-    local_validation_receipt_operands(command).is_some()
-}
-
-/// Return the operands of the final artifact-local receipt in a command.
-/// Keeping the operands attached to the receipt segment is important: a
-/// mutation segment necessarily contains its own target, but that does not
-/// mean a later `cmp`/checksum actually validated it.  Control operators are
-/// interpreted conservatively so `;`/`||` cannot preserve a receipt after an
-/// alternate status path.
-fn local_validation_receipt_operands(command: &str) -> Option<Vec<String>> {
-    let segments = astra_turn_core::evaluation::split_shell_control_segments_with_ops(command)?;
-    let mut receipt_operands = None;
-    for (segment_index, (raw_segment, op_after)) in segments.iter().enumerate() {
-        let segment = raw_segment.trim();
-        if !segment.is_empty() {
-            if let Some(operands) = local_validation_segment_operands(segment) {
-                receipt_operands = Some(operands);
-            } else if !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(segment)
-                && !local_status_neutral_segment(segment)
-            {
-                receipt_operands = None;
-            }
-        }
-        let sequence_has_rhs = segments[segment_index + 1..].iter().any(|(segment, _)| {
-            let segment = segment.trim();
-            !segment.is_empty() && !segment.starts_with('#')
-        });
-        if matches!(op_after, astra_turn_core::evaluation::ShellControlOp::Or)
-            || (matches!(
-                op_after,
-                astra_turn_core::evaluation::ShellControlOp::Sequence
-            ) && sequence_has_rhs)
-        {
-            receipt_operands = None;
-        }
-    }
-    receipt_operands
-}
-
-fn local_status_neutral_segment(segment: &str) -> bool {
-    matches!(segment.trim().to_ascii_lowercase().as_str(), "true" | ":")
-}
-
-fn local_validation_segment_operands(segment: &str) -> Option<Vec<String>> {
-    if segment.contains('|') {
-        return None;
-    }
-    let words = astra_turn_core::evaluation::split_static_shell_words(segment)?;
-    let command = words.first().map(|word| word.to_ascii_lowercase())?;
-    let operands = words.iter().skip(1);
-    match command.as_str() {
-        // `file` and a raw checksum are observations, not proof that the
-        // artifact satisfies a requested contract.  `-c` makes a checksum
-        // command compare against an expected manifest.
-        "sha256sum" | "sha512sum" if operands.clone().any(|word| word == "-c") => Some(
-            operands
-                .filter(|word| !word.starts_with('-'))
-                .cloned()
-                .collect(),
-        ),
-        // Comparing an artifact with itself is another observation; require
-        // two distinct operands before it can be scoped to the latest target.
-        "cmp" | "diff" => {
-            let operands = operands
-                .filter(|word| !word.starts_with('-'))
-                .collect::<Vec<_>>();
-            (operands.len() >= 2 && operands.windows(2).any(|pair| pair[0] != pair[1]))
-                .then(|| operands.into_iter().cloned().collect())
-        }
-        // A bare `test -e/-s` is an observation of existence/metadata, not a
-        // correctness receipt without an expected value or typed contract.
-        "[" => None,
-        _ => None,
-    }
-}
-
-fn recent_window_has_stable_mutation(state: &AgenticLoopState, recent_start: usize) -> bool {
-    state.stall.tool_call_records[recent_start..]
-        .iter()
-        .any(|record| record_is_stable_workspace_mutation(state, record))
-}
-
-fn recent_window_has_validated_stable_mutation(
-    state: &AgenticLoopState,
-    recent_start: usize,
-) -> bool {
-    let mut saw_stable_mutation = false;
-    let mut latest_mutation_is_validated = false;
-    let mut latest_mutation_path: Option<String> = None;
-    for record in state.stall.tool_call_records[recent_start..]
-        .iter()
-        .filter(|record| record.was_executed())
-    {
-        let args = extract_tool_args(record.authoritative_args_full());
-        let stable_mutation = record_is_stable_workspace_mutation(state, record);
-        if stable_mutation && record.ok {
-            saw_stable_mutation = true;
-            latest_mutation_is_validated = false;
-            latest_mutation_path = stable_workspace_targets(state, record)
-                .into_iter()
-                .last()
-                .and_then(|path| path.to_str().map(ToString::to_string));
-        }
-        let successful_validation = record_is_successful_workspace_validation(
-            state,
-            record,
-            latest_mutation_path.as_deref(),
-        );
-        if !stable_mutation
-            && crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                &record.name,
-                args.as_ref(),
-            )
-            && !successful_validation
-        {
-            // An unscoped or volatile mutation invalidates the previous
-            // validation epoch just as surely as a stable mutation does.  This
-            // includes a command that wrote bytes before returning a failure;
-            // an exit status is not a rollback receipt.
-            latest_mutation_is_validated = false;
-            latest_mutation_path = None;
-        }
-        if saw_stable_mutation && successful_validation {
-            latest_mutation_is_validated = true;
-        }
-    }
-    saw_stable_mutation && latest_mutation_is_validated
-}
-
-/// Permit one bounded probationary slice for a normal multi-file write plan.
-///
-/// A task often has to create several deliverables before any meaningful
-/// project-wide check can run.  Requiring validation after the very first
-/// write would make the scheduler settle before the plan is even materialized.
-/// This escape hatch is intentionally one-shot and narrow: it only accepts a
-/// wholly successful window of distinct, explicitly scoped workspace writes.
-/// Subsequent slices still require validation, acceptance, or typed recovery.
-fn recent_window_supports_probationary_extension(
-    state: &AgenticLoopState,
-    recent_start: usize,
-) -> bool {
-    if used_budget_extensions(state) != 0 {
-        return false;
-    }
-    let recent = &state.stall.tool_call_records[recent_start..];
-    if recent.len() < 2
-        || recent.iter().any(|record| {
-            !record.was_executed() || !record.ok || record_failure_or_rejection(record)
-        })
-    {
-        return false;
-    }
-    let mut targets = HashSet::new();
-    let mut saw_validation_attempt = false;
-    for record in recent {
-        if record_is_stable_workspace_mutation(state, record) {
-            for path in stable_workspace_targets(state, record) {
-                targets.insert(path);
-            }
-            continue;
-        }
-        // Unknown or volatile mutations are a hard barrier.  Successful
-        // read-only observations are allowed in the probationary window, but
-        // arbitrary opaque calls are not evidence of a deliverable.
-        if tool_record_is_workspace_mutation(record)
-            || !crate::turn::tool_side_effects::tool_call_may_observe_workspace(
-                &record.name,
-                extract_tool_args(record.authoritative_args_full()).as_ref(),
-            )
-        {
-            return false;
-        }
-        if record.name == "bash"
-            && extract_tool_args(record.authoritative_args_full())
-                .and_then(|args| {
-                    astra_turn_core::tool_argument_hints::command_hint_from_args(&args)
-                        .map(bash_command_has_proportionate_validation)
-                })
-                .unwrap_or(false)
-        {
-            saw_validation_attempt = true;
-        }
-    }
-    if saw_validation_attempt {
-        // Once a validation-shaped command appears in the window, a later
-        // mutation must close the epoch; do not let the one-shot probation
-        // path bypass the ordering check.
-        return false;
-    }
-    if targets.len() < 2 {
-        return false;
-    }
-    let mut signatures = recent
-        .iter()
-        .filter_map(|record| record.round.map(|_| record.name.as_str()))
-        .collect::<HashSet<_>>();
-    // Round signatures are checked by the generic repetition guard.  Keep a
-    // second, cheap distinctness check here for synthetic records that do not
-    // carry round ids, without comparing task- or provider-specific text.
-    signatures.len() >= 2 || {
-        signatures.clear();
-        recent
-            .iter()
-            .filter_map(|record| record.authoritative_args_full())
-            .for_each(|args| {
-                signatures.insert(args);
-            });
-        signatures.len() >= 2
-    }
-}
-
-fn recent_window_completed_explicit_acceptance(
-    state: &AgenticLoopState,
-    recent_start: usize,
-) -> bool {
-    if !recent_window_has_stable_mutation(state, recent_start)
-        || !super::execution_phase::missing_explicit_verification_hooks(state)
-            .is_some_and(|missing| missing.is_empty())
-    {
-        return false;
-    }
-    let mut acceptance_seen = false;
-    for record in &state.stall.tool_call_records[recent_start..] {
-        if acceptance_seen {
-            let args = extract_tool_args(record.authoritative_args_full());
-            if crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                &record.name,
-                args.as_ref(),
-            ) {
-                return false;
-            }
-        }
-        if record.was_executed()
-            && record.ok
-            && state.hooks.stop_hooks.iter().any(|hook| {
-                hook.authoritative
-                    && super::execution_phase::record_verifies_explicit_hook(record, hook)
-            })
-        {
-            acceptance_seen = true;
-        }
-    }
-    acceptance_seen
-}
-
-/// Return whether the recent execution window contains a typed evidence
-/// delta, rather than merely a different command/range spelling.  Budget
-/// renewal is advisory capacity management, so a healthy long investigation
-/// can continue when it produces new receipts, but a sequence of equivalent
-/// reads must settle instead of buying more slices forever.
-fn recent_window_has_typed_evidence_delta(
-    state: &AgenticLoopState,
-    recent_start: usize,
-    allow_workspace_observation_delta: bool,
-) -> bool {
-    let records = &state.stall.tool_call_records;
-    if recent_start >= records.len() {
-        return false;
-    }
-    let prior = &records[..recent_start];
-    let recent = &records[recent_start..];
-    let consumed_extension_count = used_budget_extensions(state);
-    let current_slice_floor = if consumed_extension_count > 0 {
-        state
-            .max_turns
-            .saturating_sub(state.agentic_turn_budget.extension_turns)
-    } else {
-        0
-    };
-
-    let mut seen_locations: HashSet<String> =
-        prior.iter().filter_map(record_explicit_path).collect();
-    // Search/diff/git observations often carry their scope in a structured
-    // argument rather than the direct `path` field.  Keep the same canonical
-    // operation identity used by terminal evaluation so a new query is
-    // evidence without treating a repeated query as progress.  Requiring a
-    // prior observation (or two distinct observations in this window) mirrors
-    // the path rule below and prevents one isolated read from minting a slice.
-    let mut seen_observation_operations = HashSet::new();
-    for record in prior.iter().filter(|record| {
-        record.was_executed()
-            && (current_slice_floor == 0
-                || record
-                    .round
-                    .is_some_and(|round| (round as usize) >= current_slice_floor))
-    }) {
-        if record_can_observe_bound_workspace(state, record)
-            && !tool_record_is_workspace_mutation(record)
-            && let Some(key) = astra_turn_core::evaluation::tool_outcome_operation_key(record)
-        {
-            seen_observation_operations.insert(key);
-        }
-    }
-    // A successful retry of the exact operation that previously failed or
-    // was rejected is a typed recovery delta.  Do not infer equivalence from
-    // tool names alone; the core evaluator owns the canonical operation key.
-    // Reconstruct the unresolved ledger at the boundary, rather than keeping
-    // every historical failure forever.  A recovery is a state transition
-    // (unresolved -> resolved), not a property of the operation name that can
-    // be replayed by identical successes in later slices.
-    let mut unresolved_operations = HashSet::new();
-    for record in prior.iter().filter(|record| record.was_executed()) {
-        if let Some(key) = astra_turn_core::evaluation::tool_outcome_operation_key(record) {
-            if record_failure_or_rejection(record) {
-                unresolved_operations.insert(key);
-            } else if record.ok {
-                unresolved_operations.remove(&key);
-            }
-        }
-    }
-
-    // Compare each new record with the evidence already observed, including
-    // earlier records in this same recent window. This keeps a two-call
-    // boundary useful when it is the first window, while still rejecting one
-    // isolated read as sufficient progress.
-    for record in recent.iter().filter(|record| record.was_executed()) {
-        let observation_is_successful = record.ok
-            && record_can_observe_bound_workspace(state, record)
-            && !tool_record_is_workspace_mutation(record);
-        if allow_workspace_observation_delta
-            && observation_is_successful
-            && let Some(key) = astra_turn_core::evaluation::tool_outcome_operation_key(record)
-            && !seen_observation_operations.is_empty()
-            && seen_observation_operations.insert(key)
-        {
-            return true;
-        }
-        let args = extract_tool_args(record.authoritative_args_full());
-        if allow_workspace_observation_delta
-            && record.ok
-            && !tool_record_is_workspace_mutation(record)
-            && crate::turn::tool_side_effects::tool_call_may_observe_workspace(
-                &record.name,
-                args.as_ref(),
-            )
-            && record_explicit_path(record)
-                .is_some_and(|path| !seen_locations.is_empty() && !seen_locations.contains(&path))
-        {
-            return true;
-        }
-        if let Some(path) = record_explicit_path(record) {
-            seen_locations.insert(path);
-        }
-
-        if record_failure_or_rejection(record) {
-            if let Some(key) = astra_turn_core::evaluation::tool_outcome_operation_key(record) {
-                unresolved_operations.insert(key);
-            }
-        } else if record.ok
-            && astra_turn_core::evaluation::tool_outcome_operation_key(record)
-                .is_some_and(|key| unresolved_operations.remove(&key))
-            && (!tool_record_is_workspace_mutation(record)
-                || record_is_stable_workspace_mutation(state, record))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Unknown/opaque writers only close the evidence window in which they ran.
-/// A later read-only window can return to the ordinary observation policy if
-/// no concrete mutation shape was ever recorded. This keeps admission safety
-/// fail-closed without reclassifying a whole read-only task forever.
-fn recent_window_has_executed_mutation_risk(state: &AgenticLoopState, recent_start: usize) -> bool {
-    state.stall.tool_call_records[recent_start..]
-        .iter()
-        .filter(|record| record.was_executed())
-        .any(|record| {
-            let args = extract_tool_args(record.authoritative_args_full());
-            crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                &record.name,
-                args.as_ref(),
-            ) && !record_is_successful_workspace_validation(state, record, None)
-        })
-}
-
-/// Decide whether the next bounded slice has a fresh, task-facing reason to
-/// exist. Read-only work may advance through distinct workspace observations;
-/// mutating work must instead close a stable mutation epoch with a successful
-/// validator or an explicit acceptance contract. Exact typed recovery remains
-/// valid for both. Tool volume, a new result-class label, and scratch writes are
-/// deliberately not progress proofs.
 fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
-    if super::execution_phase::workspace_observation_is_quarantined(state) {
-        // A quarantined workspace has no trustworthy evidence watermark. Do
-        // not renew a slice from ledger-shaped reads or validation records;
-        // the turn must end as unverified until a new bound is established.
-        return false;
-    }
-    const RECENT_ACTIVITY_WINDOW: usize = 8;
-    let consumed_extension_count = used_budget_extensions(state);
-    let current_slice_floor = if consumed_extension_count > 0 {
-        state
-            .max_turns
-            .saturating_sub(state.agentic_turn_budget.extension_turns)
-    } else {
-        0
-    };
-
-    let recent_indices: Vec<usize> = state
-        .stall
-        .tool_call_records
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, record)| {
-            record.was_executed()
-                && (current_slice_floor == 0
-                    || record
-                        .round
-                        .is_some_and(|round| (round as usize) >= current_slice_floor))
-        })
-        .take(RECENT_ACTIVITY_WINDOW)
-        .map(|(index, _)| index)
-        .collect();
-    let Some(recent_start) = recent_indices.last().copied() else {
-        return false;
-    };
-    if recent_turns_are_repetitive(state) {
-        return false;
-    }
-
-    let effective_mutating_evidence_mode = state.task_profile.mutates_workspace
-        || super::execution_phase::has_executed_positive_workspace_mutation(state)
-        || recent_window_has_executed_mutation_risk(state, recent_start);
-
-    recent_window_has_typed_evidence_delta(state, recent_start, !effective_mutating_evidence_mode)
-        || recent_window_has_validated_stable_mutation(state, recent_start)
-        || recent_window_completed_explicit_acceptance(state, recent_start)
-        || recent_window_supports_probationary_extension(state, recent_start)
+    // Missing progress receipts are not evidence of a stalled run. Receipt
+    // coverage differs across capabilities; renewal grants capacity, not a
+    // completion verdict. Keep only authoritative continuation vetoes here.
+    !super::execution_phase::workspace_observation_is_quarantined(state)
+        && !recent_turns_are_repetitive(state)
 }
 
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<()> {
     // Runtime-policy entries are alerts, not a second scheduler.  A
     // convergence-stage advisory can still accompany a productive, bounded
     // slice (for example, a complex investigation with changing evidence).
-    // Concrete progress, explicit verdicts, repeated signatures, and the
-    // administrator-owned hard limit remain the execution controls.
+    // Current repetition/ownership facts and the resolved resource limit
+    // remain execution controls; historical verdicts are audit, not authority.
     let budget = state.agentic_turn_budget;
-    let at_review_limit = state.max_turns >= budget.hard_turn_limit;
     if state.hooks.completion_settlement.text_only
         || state.hooks.completion_settlement.work_settlement_only
         || budget.extension_turns == 0
-        || budget.max_extensions == 0
-        || (at_review_limit && !budget.renewable_past_review_limit)
-        || (!at_review_limit && used_budget_extensions(state) >= budget.max_extensions)
-        || crate::server::run::lifecycle::has_turn_verdict_critical(&state.stall.verdict_events)
         || !recent_activity_supports_budget_extension(state)
     {
         return None;
     }
 
-    // Profile limits are adaptive review checkpoints, not semantic task
-    // boundaries. A renewable profile keeps receiving bounded slices while
-    // concrete progress continues. Explicit caller/child limits retain a
-    // non-renewable hard boundary after any configured headroom is consumed.
-    let available = if at_review_limit {
-        usize::MAX.saturating_sub(state.max_turns)
-    } else {
-        budget.hard_turn_limit.saturating_sub(state.max_turns)
-    };
-    let additional_turns = budget.extension_turns.min(available);
+    let additional_turns = budget
+        .hard_turn_limit
+        .map_or(budget.extension_turns, |limit| {
+            budget
+                .extension_turns
+                .min(limit.get().saturating_sub(state.max_turns))
+        });
     if additional_turns == 0 {
         return None;
     }
 
     let previous_max_turns = state.max_turns;
     let previous_remaining_turns = state.remaining_turns;
-    state.max_turns += additional_turns;
-    state.remaining_turns += additional_turns;
+    let max_turns = state.max_turns.checked_add(additional_turns)?;
+    let remaining_turns = state.remaining_turns.checked_add(additional_turns)?;
+    state.max_turns = max_turns;
+    state.remaining_turns = remaining_turns;
     tracing::info!(
         target: "astra::budget",
         previous_max_turns,
@@ -3122,7 +2570,7 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<()> {
         max_turns = state.max_turns,
         remaining_turns = state.remaining_turns,
         additional_turns,
-        profile_review_limit = budget.hard_turn_limit,
+        hard_turn_limit = ?budget.hard_turn_limit,
         "runtime renewed adaptive agentic execution slice"
     );
     Some(())
@@ -3147,10 +2595,13 @@ fn promote_untouched_fallback_initial_slice(state: &mut AgenticLoopState) -> boo
             false,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
         );
-    let promoted_initial = implementation
+    let requested_initial = implementation.agentic_turn_budget.initial_turns;
+    let promoted_initial = state
         .agentic_turn_budget
-        .initial_turns
-        .min(state.agentic_turn_budget.hard_turn_limit);
+        .hard_turn_limit
+        .map_or(requested_initial, |limit| {
+            requested_initial.min(limit.get())
+        });
     let additional_turns = promoted_initial.saturating_sub(state.max_turns);
     // The runtime ceiling and renewal contract were already resolved at the
     // request boundary. Preserve them exactly; only restore the missing
@@ -3162,7 +2613,7 @@ fn promote_untouched_fallback_initial_slice(state: &mut AgenticLoopState) -> boo
         target: "astra::budget",
         additional_turns,
         initial_turns = state.max_turns,
-        hard_turn_limit = state.agentic_turn_budget.hard_turn_limit,
+        hard_turn_limit = ?state.agentic_turn_budget.hard_turn_limit,
         "promoted fallback analysis slice after trusted workspace mutation"
     );
     true
@@ -3212,13 +2663,9 @@ fn promote_fallback_budget_after_observed_mutation(state: &mut AgenticLoopState)
 pub(crate) fn adaptive_budget_is_renewable(state: &AgenticLoopState) -> bool {
     let budget = state.agentic_turn_budget;
     budget.extension_turns > 0
-        && budget.max_extensions > 0
-        && !crate::server::run::lifecycle::has_turn_verdict_critical(&state.stall.verdict_events)
-        && if state.max_turns >= budget.hard_turn_limit {
-            budget.renewable_past_review_limit
-        } else {
-            used_budget_extensions(state) < budget.max_extensions
-        }
+        && budget
+            .hard_turn_limit
+            .is_none_or(|limit| state.max_turns < limit.get())
 }
 
 fn begin_budget_settlement(state: &mut AgenticLoopState) -> bool {
@@ -3232,6 +2679,16 @@ fn begin_budget_settlement_for_work_state(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
 ) -> bool {
+    let pending = match super::execution_phase::pending_terminal_completion_action_for_work_state(
+        state,
+        active_work_attempt,
+    ) {
+        Ok(action) => action,
+        Err(error) => {
+            super::execution_phase::finish_unavailable_verification(state, error);
+            return false;
+        }
+    };
     if state.hooks.completion_settlement.text_only
         || state.hooks.completion_settlement.work_settlement_only
         || state
@@ -3246,10 +2703,8 @@ fn begin_budget_settlement_for_work_state(
         return false;
     }
 
-    if let Some(action) = super::execution_phase::pending_terminal_completion_action_for_work_state(
-        state,
-        active_work_attempt,
-    ) && !super::execution_phase::completion_action_window_is_batchable(state, &action)
+    if let Some(action) = pending.as_ref()
+        && !super::execution_phase::completion_action_window_is_batchable(state, action)
     {
         // Do not advertise a one-call window for a dependency chain that
         // cannot be completed atomically. The terminal branch records a
@@ -3259,10 +2714,8 @@ fn begin_budget_settlement_for_work_state(
     state.hooks.completion_settlement.work_settlement_only = active_work_attempt;
     state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
 
-    if let Some(action) = super::execution_phase::pending_terminal_completion_action_for_work_state(
-        state,
-        active_work_attempt,
-    ) && super::execution_phase::completion_action_window_is_batchable(state, &action)
+    if let Some(action) = pending
+        && super::execution_phase::completion_action_window_is_batchable(state, &action)
         && !matches!(action, super::host::CompletionAction::CompletionTaskAction)
     {
         // Reserve exactly one matching completion action and one closing
@@ -3290,7 +2743,9 @@ fn begin_budget_settlement_for_work_state(
                 "mode": if active_work_attempt { "completion_then_work_settlement" } else { "one_completion_action" },
                 "allowed_action": action,
                 "attempts_remaining": 1,
-                "action_hint": super::execution_phase::completion_action_hint(&action),
+                "action_hint": super::execution_phase::completion_action_hint_for_state(
+                    state, &action,
+                ),
                 "declarations_may_remain_visible_for_cache": true,
                 "execution_authority": "one_matching_action",
                 "instruction": if active_work_attempt {
@@ -3443,10 +2898,7 @@ pub(crate) fn mark_work_settlement_incomplete(state: &mut AgenticLoopState) {
     ));
 }
 
-pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &mut AgenticLoopState,
-) {
+pub(crate) async fn run_loop_preamble(state: &mut AgenticLoopState) {
     // This flag is a turn outcome consumed by the canonical commit after the
     // agentic loop returns. Reset it when a new turn actually starts, not
     // during finalization, so prefix rewrites remain observable to commit.
@@ -3477,9 +2929,14 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         }
         for (key, value) in hook_output.env_vars {
             astra_core::session_env_overlay::set(&key, &value);
+            state.skills.session_event_hooks.note_environment_applied();
         }
     }
+}
 
+/// Host-local schema installation is needed for a new executor even when its
+/// logical turn has already completed the side-effecting preamble.
+pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &AgenticLoopState) {
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
         // takes no skill list and advertises `skill_name` as an open
@@ -3510,6 +2967,7 @@ fn apply_structured_user_reanchor(
     }
 
     state.turn_guard.begin_fresh_user_turn();
+    state.stall.begin_fresh_user_turn();
     // Hard capability/permission restrictions are owned by their boundary and
     // must survive a semantic re-anchor. Behavioral state can reset here, but
     // user intent must not broaden the executable capability surface.
@@ -3559,15 +3017,57 @@ fn apply_structured_user_feedback(state: &mut AgenticLoopState, intent: &TurnInt
 /// ratio against `max_turn_input_tokens`. When no limit is configured
 /// (`max_turn_input_tokens == 0`) returns `(0.0, 0)`.
 #[inline]
+#[cfg(test)]
 pub(crate) fn estimate_context_pressure(
     messages: &[serde_json::Value],
     pinned_tool_schema_tokens: usize,
     max_turn_input_tokens: u64,
 ) -> (f64, u64) {
+    estimate_context_pressure_with_system_prompt_tokens(
+        messages,
+        pinned_tool_schema_tokens,
+        max_turn_input_tokens,
+        None,
+    )
+}
+
+/// Estimate pressure using the last prompt assembly measured by the shared
+/// provider-context manifest when one is available.
+///
+/// The canonical history does not contain the assembled system prompt, so a
+/// pressure estimate needs that prompt overhead exactly once.  Before the
+/// first provider request the generic estimator's conservative fallback is
+/// unavoidable; after a request, reusing the typed manifest avoids charging
+/// the old fixed-size approximation on every later round.  This affects only
+/// the local compaction decision — the final provider wire estimate remains
+/// authoritative.
+#[inline]
+pub(crate) fn estimate_context_pressure_for_state(state: &AgenticLoopState) -> (f64, u64) {
+    estimate_context_pressure_with_system_prompt_tokens(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        state.max_turn_input_tokens,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        ),
+    )
+}
+
+#[inline]
+pub(crate) fn estimate_context_pressure_with_system_prompt_tokens(
+    messages: &[serde_json::Value],
+    pinned_tool_schema_tokens: usize,
+    max_turn_input_tokens: u64,
+    system_prompt_tokens: Option<usize>,
+) -> (f64, u64) {
     if max_turn_input_tokens == 0 {
         return (0.0, 0);
     }
-    let tokens = crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    let tokens = crate::prompts::estimate_tokens(
+        messages,
+        pinned_tool_schema_tokens,
+        system_prompt_tokens.unwrap_or(0),
+    ) as u64;
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
@@ -3747,6 +3247,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         break;
     }
 
+    if let Err(error) = super::execution_phase::checked_completion_evidence(state) {
+        super::execution_phase::finish_unavailable_verification(state, error);
+        try_write_heavy_checkpoint(state);
+        return Ok(PreparedTurnIteration::Finished(
+            AgenticLoopOutcome::Completed,
+        ));
+    }
+
     // Reconcile before considering settlement so a task that demonstrably
     // entered implementation does not lose the implementation portion of its
     // initial slice merely because semantic admission was intentionally
@@ -3804,7 +3312,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             .await;
             state.final_text.clear();
             state.interruption = None;
-        } else if let Some(action) = super::execution_phase::pending_completion_action(state)
+        } else if let Ok(Some(action)) = super::execution_phase::pending_completion_action(state)
             && !super::execution_phase::completion_action_window_is_batchable(state, &action)
         {
             state.final_text =
@@ -3839,20 +3347,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             state.remaining_turns = state.remaining_turns.saturating_add(1);
             state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
             state.budget_wrapup_injected = true;
-            state.push_volatile_payload(
-                super::host::VolatileKind::FinalAnswerSettlement,
-                serde_json::json!({
-                    "schema": "completion_settlement.v2",
-                    "signal": "typed_completion_action_settled",
-                    "mode": "text_only",
-                    "allowed_action": serde_json::Value::Null,
-                    "attempts_remaining": 0,
-                    "declarations_may_remain_visible_for_cache": true,
-                    "execution_authority": "none",
-                    "instruction": "The bounded completion action has been attempted. Produce the final answer from the resulting evidence; do not request another tool.",
-                    "authority": "typed_completion_action_window",
-                }),
-            );
+            super::execution_phase::project_completion_action_text_settlement(state);
         } else if should_complete_budget_exhaustion_gracefully(state) {
             try_write_heavy_checkpoint(state);
             state.interruption = Some(InterruptionRecord::new(
@@ -3964,6 +3459,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
     }
 
+    state.charged_iterations = state
+        .charged_iterations
+        .checked_add(1)
+        .ok_or_else(|| "execution iteration accounting overflow".to_string())?;
     state.remaining_turns = state.remaining_turns.saturating_sub(1);
     state
         .step_recorder
@@ -4368,11 +3867,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
-        let (mut pressure, mut pressure_estimate_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (mut pressure, mut pressure_estimate_tokens) =
+            estimate_context_pressure_for_state(state);
 
         // Pre-turn LLM compact: if pressure exceeds the model-adaptive
         // trigger, let the host run an optional cache-friendly inline-summary
@@ -4402,11 +3898,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     sess.stats.record_compaction(event.tokens_freed);
                 }
                 host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) = estimate_context_pressure(
-                    &state.messages,
-                    state.pinned_tool_schema_tokens as usize,
-                    state.max_turn_input_tokens,
-                );
+                (pressure, pressure_estimate_tokens) = estimate_context_pressure_for_state(state);
             }
         }
 
@@ -4506,11 +3998,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure_for_state(state);
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
@@ -4532,11 +4020,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // proactively compress before the first LLM call.  This prevents an
     // immediate 413 when resuming from a CompactAndRetry interruption.
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let (estimated_pressure, estimated_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (estimated_pressure, estimated_tokens) = estimate_context_pressure_for_state(state);
         if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
             run_proactive_compaction(
                 estimated_pressure,
@@ -4574,6 +4058,156 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn restored_workspace_observation_unavailable_stops_before_provider_with_remaining_budget()
+     {
+        let mut state = make_state();
+        state.stall.verification_frontier =
+            super::super::verification_frontier::tests::restored_prefix_with_missing_history(
+                &state.stall.tool_call_records,
+            );
+        state.max_turns = 50;
+        state.remaining_turns = 40;
+        state.charged_iterations = 10;
+        let mut host = MockHost::new(Vec::new());
+        assert!(matches!(
+            prepare_turn_iteration(&mut host, &mut state, 10)
+                .await
+                .unwrap(),
+            PreparedTurnIteration::Finished(_)
+        ));
+        assert_eq!(
+            (
+                state.max_turns,
+                state.remaining_turns,
+                state.charged_iterations
+            ),
+            (50, 40, 10)
+        );
+        assert_eq!(state.llm_rounds_completed, 0);
+        assert_eq!(
+            state.interruption.as_ref().map(|value| value.kind),
+            Some(InterruptionKind::ExecutionIncomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_verification_error_stops_before_budget_or_provider_admission() {
+        for active_work in [false, true] {
+            let mut state = make_state();
+            state.stall.verification_frontier =
+                super::super::verification_frontier::tests::restored_read_only_prefix();
+            state.hooks.stop_hooks.push(astra_turn_types::StopHook {
+                label: "new contract".into(),
+                command: "./new-check".into(),
+                working_dir: None,
+                depends_on: Vec::new(),
+                timeout_secs: None,
+                cache_key: None,
+                authoritative: true,
+            });
+            state.max_turns = 50;
+            state.remaining_turns = 0;
+            state.charged_iterations = 50;
+            assert!(!begin_budget_settlement_for_work_state(
+                &mut state,
+                active_work
+            ));
+            let mut host = MockHost::new(Vec::new());
+            assert!(matches!(
+                prepare_turn_iteration(&mut host, &mut state, 50)
+                    .await
+                    .unwrap(),
+                PreparedTurnIteration::Finished(_)
+            ));
+            assert_eq!(
+                (
+                    state.max_turns,
+                    state.remaining_turns,
+                    state.charged_iterations
+                ),
+                (50, 0, 50)
+            );
+            assert_eq!(
+                state.interruption.as_ref().map(|record| record.kind),
+                Some(InterruptionKind::ExecutionIncomplete)
+            );
+            assert!(
+                state
+                    .hooks
+                    .completion_settlement
+                    .completion_action_window
+                    .is_none()
+            );
+            assert_eq!(state.llm_rounds_completed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn heavy_checkpoint_records_actual_charged_iterations_for_same_run() {
+        let sessions = tempfile::tempdir().expect("isolated journal");
+        let _journal = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some(uuid::Uuid::new_v4().to_string());
+        state.context_manifest_user_id = Some("budget-checkpoint-test".into());
+        state.current_run_id = Some("same-budget-run".into());
+        state.current_run_owner_generation = Some(3);
+        state.max_turns = 50;
+        state.remaining_turns = 50;
+        for iteration in 0..2 {
+            let prepared = prepare_turn_iteration(&mut host, &mut state, iteration)
+                .await
+                .expect("iteration preparation");
+            assert!(!matches!(prepared, PreparedTurnIteration::Finished(_)));
+        }
+        state.hooks.completion_settlement.text_only = true;
+        state.hooks.completion_settlement.textless_response_retries = 1;
+        state.budget_wrapup_injected = true;
+        state.budget_wrapup_ignored_rounds = 1;
+        let hook = astra_turn_types::StopHook {
+            label: "required validation".into(),
+            command: "make check".into(),
+            working_dir: Some("/workspace".into()),
+            depends_on: Vec::new(),
+            timeout_secs: Some(30),
+            cache_key: None,
+            authoritative: true,
+        };
+        state.hooks.stop_hooks = vec![hook.clone()];
+        state.hooks.stop_hook_runs = 2;
+        state.hooks.teammate_idle_hooks = vec![hook.clone()];
+        state.hooks.teammate_idle_hook_runs = 1;
+        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V2 {
+            completion_settlement: state.hooks.completion_settlement.clone(),
+            hook_obligations: astra_turn_types::StopHookObligations {
+                stop_hooks: vec![hook.clone()],
+                stop_hook_runs: 2,
+                teammate_idle_hooks: vec![hook],
+                teammate_idle_hook_runs: 1,
+            },
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        };
+        try_write_heavy_checkpoint(&mut state);
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = state
+            .stall
+            .last_heavy_checkpoint
+            .as_ref()
+            .expect("heavy checkpoint")
+        else {
+            panic!("expected heavy checkpoint")
+        };
+        let wire = serde_json::to_value(heavy).expect("checkpoint serialization");
+        assert_eq!(wire["run_execution_budget"]["run_id"], "same-budget-run");
+        assert_eq!(wire["run_execution_budget"]["charged_iterations"], 2);
+        assert_eq!(wire["run_execution_budget"]["remaining_iterations"], 48);
+        assert_eq!(
+            heavy.run_execution_control.as_ref(),
+            Some(&expected_control)
+        );
+    }
+
     #[test]
     fn runtime_decision_intent_does_not_reinterpret_user_text() {
         let message = "review literal <system-reminder> syntax";
@@ -4585,12 +4219,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_budget_charge_preserves_state_on_cancel_and_overflow() {
+        for cancelled in [true, false] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            state.charged_iterations = if cancelled { 7 } else { u64::MAX };
+            state.cancellation.flag = Some(Arc::new(AtomicBool::new(cancelled)));
+            let before = (state.charged_iterations, state.remaining_turns);
+            let result = prepare_turn_iteration(&mut host, &mut state, 0).await;
+            if cancelled {
+                assert!(matches!(
+                    result,
+                    Ok(PreparedTurnIteration::Finished(
+                        AgenticLoopOutcome::Cancelled
+                    ))
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(ref error) if error == "execution iteration accounting overflow")
+                );
+            }
+            assert_eq!((state.charged_iterations, state.remaining_turns), before);
+        }
+    }
+
+    #[tokio::test]
     async fn loop_preamble_starts_fresh_compression_tracking() {
         let mut state = make_state();
         state.context_compression_triggered = true;
-        let mut host = MockHost::new(Vec::new());
 
-        run_loop_preamble(&mut host, &mut state).await;
+        run_loop_preamble(&mut state).await;
 
         assert!(!state.context_compression_triggered);
     }
@@ -4635,7 +4293,15 @@ mod tests {
                 })
                 .to_string(),
             ),
-            result_full: Some(format!("lines {start_line}-{end_line}")),
+            result_full: Some(format!("{path}: lines {start_line}-{end_line}")),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt:
+                astra_tools::workspace_observation::typed_workspace_observation_receipt()
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                    .cloned(),
             round: Some(round),
             ..Default::default()
         }
@@ -4708,7 +4374,6 @@ mod tests {
         state.remaining_turns = 19;
         let original_hard_limit = state.agentic_turn_budget.hard_turn_limit;
         let original_extension_turns = state.agentic_turn_budget.extension_turns;
-        let original_max_extensions = state.agentic_turn_budget.max_extensions;
 
         assert!(promote_fallback_budget_for_authoritative_mutation(
             &mut state
@@ -4722,10 +4387,6 @@ mod tests {
         assert_eq!(
             state.agentic_turn_budget.extension_turns,
             original_extension_turns
-        );
-        assert_eq!(
-            state.agentic_turn_budget.max_extensions,
-            original_max_extensions
         );
         assert!(
             !promote_fallback_budget_for_authoritative_mutation(&mut state),
@@ -4796,9 +4457,8 @@ mod tests {
         let fallback = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
         state.task_profile = fallback;
         state.agentic_turn_budget = fallback.agentic_turn_budget;
-        state.agentic_turn_budget.hard_turn_limit = 28;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(28);
         state.agentic_turn_budget.extension_turns = 4;
-        state.agentic_turn_budget.max_extensions = 1;
         state.max_turns = 24;
         state.remaining_turns = 0;
         state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -4807,9 +4467,11 @@ mod tests {
         assert!(promote_fallback_budget_after_observed_mutation(&mut state));
         assert_eq!(state.max_turns, 28);
         assert_eq!(state.remaining_turns, 4);
-        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 28);
+        assert_eq!(
+            state.agentic_turn_budget.hard_turn_limit,
+            std::num::NonZeroUsize::new(28)
+        );
         assert_eq!(state.agentic_turn_budget.extension_turns, 4);
-        assert_eq!(state.agentic_turn_budget.max_extensions, 1);
     }
 
     #[tokio::test]
@@ -4972,25 +4634,80 @@ mod tests {
         }
     }
 
-    fn turn_sig(signature: &str) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from([signature.to_string()])
+    fn turn_sig(
+        signature: &str,
+    ) -> std::collections::BTreeSet<astra_turn_core::stall::StallSignature> {
+        let (name, args) = signature.split_once(':').unwrap_or((signature, ""));
+        std::collections::BTreeSet::from([astra_turn_core::stall::StallSignature::new(
+            name,
+            args.as_bytes(),
+        )])
     }
 
     #[test]
-    fn budget_extension_accepts_successful_read_only_analysis_with_distinct_turns() {
+    fn uncapped_execution_renews_beyond_legacy_round_and_extension_limits() {
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("分析session");
-        state.stall.tool_call_records = vec![
-            read_record_at_path(0, "/workspace/first.rs", 1, 80),
-            read_record_at_path(1, "/workspace/second.rs", 81, 160),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("read_file:first"), turn_sig("read_file:second")];
-
-        assert!(
-            recent_activity_supports_budget_extension(&state),
-            "successful non-repetitive read-only analysis should be eligible for continuation"
+        state.charged_iterations = 17;
+        state.agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                state.task_profile,
+                None,
+                None,
+            );
+        state.max_turns = state.agentic_turn_budget.initial_turns;
+        for _ in 0..40 {
+            state.remaining_turns = 0;
+            let before = state.max_turns;
+            assert!(maybe_extend_turn_budget(&mut state).is_some());
+            assert_eq!(
+                state.max_turns,
+                before + state.agentic_turn_budget.extension_turns
+            );
+            assert_eq!(
+                state.remaining_turns,
+                state.agentic_turn_budget.extension_turns
+            );
+        }
+        assert!(state.max_turns > 300);
+        assert_eq!(
+            state.charged_iterations, 17,
+            "renewal cannot reset prior charges"
         );
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, None);
+    }
+
+    #[test]
+    fn budget_extension_unknown_progress_is_not_a_stop_signal() {
+        let mut state = make_state();
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: std::num::NonZeroUsize::new(6),
+            extension_turns: 2,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 0;
+        // Successful computation has no workspace-observation receipt. Its
+        // absence cannot establish either task completion or lack of progress.
+        state.stall.tool_call_records = vec![bash_record(1, "printf 391", true)];
+        state.stall.turn_sigs = vec![turn_sig("compute:first")];
+        assert!(maybe_extend_turn_budget(&mut state).is_some());
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 2);
+
+        // The same request shape repeated without a transition remains a stop
+        // signal; accepting unknown progress must not disable this control.
+        state.stall.turn_sigs.push(turn_sig("compute:first"));
+        state.remaining_turns = 0;
+        assert!(maybe_extend_turn_budget(&mut state).is_none());
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 0);
+
+        state.stall.turn_sigs.push(turn_sig("compute:next"));
+        state.max_turns = 6;
+        // Keep count headroom to isolate the hard-ceiling veto.
+        assert!(maybe_extend_turn_budget(&mut state).is_none());
+        assert_eq!(state.max_turns, 6);
+        assert_eq!(state.remaining_turns, 0);
     }
 
     #[test]
@@ -5011,119 +4728,6 @@ mod tests {
     }
 
     #[test]
-    fn budget_extension_does_not_use_read_observations_after_unstructured_write() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/out.txt"),
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("write:out"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_allows_unstructured_write_after_canonical_validation() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/out.txt"),
-            bash_record(1, "cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:out"), turn_sig("test:workspace")];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_keeps_rejected_writer_in_read_only_mode() {
-        let mut state = make_state();
-        let mut rejected = write_record(0, "/workspace/out.txt", false);
-        rejected.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
-        state.stall.tool_call_records = vec![
-            rejected,
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("rejected:write"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_does_not_use_reads_after_an_unknown_executed_writer() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            bash_record(
-                0,
-                "python3 -c \"open('/workspace/out.txt','w').write('x')\"",
-                true,
-            ),
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("unknown-write"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_does_not_use_reads_after_a_failed_direct_writer() {
-        let mut state = make_state();
-        let mut failed = write_record(0, "/workspace/out.txt", false);
-        failed.disposition = Some(astra_services::session_journal::ToolCallDisposition::Executed);
-        state.stall.tool_call_records = vec![
-            failed,
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("failed:write"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_allows_reads_after_a_successful_canonical_validator() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            bash_record(0, "cargo test", true),
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("test:workspace"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
     fn workspace_validation_must_stay_inside_the_bound_root() {
         let mut state = make_state();
         state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -5141,12 +4745,9 @@ mod tests {
                 bash_record(1, command, true),
             ];
             state.stall.turn_sigs = vec![turn_sig("write"), turn_sig(command)];
-            assert!(
-                !recent_activity_supports_budget_extension(&state),
-                "external validator must not renew the workspace task: {command}"
-            );
+            assert!(recent_activity_supports_budget_extension(&state));
             assert_eq!(
-                super::super::execution_phase::pending_completion_action(&state),
+                super::super::execution_phase::pending_completion_action(&state).unwrap(),
                 Some(super::super::host::CompletionAction::PostMutationObservation),
                 "external validator must not close the workspace evidence epoch: {command}"
             );
@@ -5154,7 +4755,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_validator_does_not_extend_a_mutation_epoch() {
+    fn metadata_only_validator_does_not_complete_a_mutation_epoch() {
         let mut state = make_state();
         state.hooks.workspace_root_hint = Some("/workspace".into());
         for command in [
@@ -5169,9 +4770,9 @@ mod tests {
                 bash_record(1, command, true),
             ];
             state.stall.turn_sigs = vec![turn_sig("write"), turn_sig(command)];
-            assert!(
-                !recent_activity_supports_budget_extension(&state),
-                "metadata-only command must not renew a mutation epoch: {command}"
+            assert_eq!(
+                super::super::execution_phase::pending_completion_action(&state).unwrap(),
+                Some(super::super::host::CompletionAction::PostMutationObservation),
             );
         }
     }
@@ -5191,109 +4792,13 @@ mod tests {
                 bash_record(1, command, true),
             ];
             state.stall.turn_sigs = vec![turn_sig("write"), turn_sig(command)];
-            assert!(
-                !recent_activity_supports_budget_extension(&state),
-                "an opaque timed pipeline must not manufacture post-mutation evidence: {command}"
-            );
+            assert!(recent_activity_supports_budget_extension(&state));
             assert_eq!(
-                super::super::execution_phase::pending_completion_action(&state),
+                super::super::execution_phase::pending_completion_action(&state).unwrap(),
                 Some(super::super::host::CompletionAction::PostMutationObservation),
                 "the mutation epoch remains open after an unproven timed pipeline: {command}"
             );
         }
-    }
-
-    #[test]
-    fn workspace_validation_accepts_bound_cwd_and_nested_tmp_workspace() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/out.txt"),
-            bash_record(
-                1,
-                "cargo test --manifest-path=/workspace/subdir/Cargo.toml",
-                true,
-            ),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write"), turn_sig("bound-equals-validator")];
-        assert!(recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/out.txt"),
-            bash_record(1, "cd /workspace/subdir && cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write"), turn_sig("bound-cwd-validator")];
-        assert!(recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/out.txt"),
-            bash_record(
-                1,
-                "python setup.py build_ext --inplace 2>&1 | tail -20",
-                true,
-            ),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write"), turn_sig("bound-pipeline-validator")];
-        assert!(recent_activity_supports_budget_extension(&state));
-
-        state.hooks.workspace_root_hint = Some("/tmp/workspace".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/tmp/workspace/out.txt"),
-            bash_record(1, "cd /tmp/workspace/subdir && cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write"), turn_sig("nested-bound-validator")];
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_keeps_failed_canonical_validator_as_a_risk_barrier() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            bash_record(0, "cargo test", false),
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("test:workspace"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn external_scratch_write_only_blocks_its_current_budget_window() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            write_record(0, "/tmp/scratch.txt", true),
-            read_record_at_path(1, "/workspace/first.rs", 1, 20),
-            read_record_at_path(2, "/workspace/second.rs", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("scratch:write"),
-            turn_sig("read:first"),
-            turn_sig("read:second"),
-        ];
-        assert!(!recent_activity_supports_budget_extension(&state));
-
-        // Once the scratch call is outside the current eight-record evidence
-        // window, a normal read-only task may resume distinct observations.
-        for round in 3..=10 {
-            state.stall.tool_call_records.push(read_record_at_path(
-                round,
-                &format!("/workspace/read-{round}.rs"),
-                1,
-                20,
-            ));
-            state
-                .stall
-                .turn_sigs
-                .push(turn_sig(&format!("read:{round}")));
-        }
-        assert!(recent_activity_supports_budget_extension(&state));
     }
 
     #[test]
@@ -5392,97 +4897,31 @@ mod tests {
     }
 
     #[test]
-    fn budget_extension_rejects_different_signatures_with_same_observation() {
-        let mut state = make_state();
-        for round in 0..8 {
-            let mut record = read_record(round, round * 10, round * 10 + 9);
-            record.result_full = Some("unchanged evidence".into());
-            state.stall.tool_call_records.push(record);
-            state
-                .stall
-                .turn_sigs
-                .push(turn_sig(&format!("read_file:range-{round}")));
-        }
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "argument/range spelling alone must not renew a slice when the observed receipt is unchanged"
-        );
-    }
-
-    #[test]
-    fn mutating_turn_does_not_renew_from_distinct_workspace_observations() {
+    fn committed_edit_at_slice_boundary_can_continue_before_validation() {
         let mut state = make_state();
         state.task_profile.mutates_workspace = true;
         state.hooks.workspace_root_hint = Some("/workspace".into());
+        // A completed edit is progress, not completion. The next edit must
+        // not require a successful project validator between the two writes.
         state.stall.tool_call_records = vec![
-            read_record_at_path(0, "/workspace/first.rs", 1, 20),
-            read_record_at_path(1, "/workspace/second.rs", 1, 20),
+            read_record_at_path(21, "/workspace/src/lib.rs", 1, 80),
+            committed_write_record(23, "/workspace/src/lib.rs"),
         ];
-        state.stall.turn_sigs = vec![turn_sig("read:first"), turn_sig("read:second")];
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "a MustMutate turn needs typed task-facing progress, not new reads"
-        );
-
-        state.task_profile.mutates_workspace = false;
-        assert!(
-            recent_activity_supports_budget_extension(&state),
-            "read-only investigation retains distinct-evidence renewal"
-        );
-    }
-
-    #[test]
-    fn budget_extension_accepts_a_successful_recovery_of_an_exact_failed_operation() {
-        let mut state = make_state();
-        let mut failed = read_record(0, 1, 20);
-        failed.ok = false;
-        failed.error = Some("transient read failure".into());
-        let recovered = read_record(1, 1, 20);
-        state.stall.tool_call_records = vec![failed, recovered];
-        state.stall.turn_sigs = vec![turn_sig("read_file:failed"), turn_sig("read_file:retry")];
+        state.stall.turn_sigs = vec![turn_sig("read:lib"), turn_sig("write:lib")];
 
         assert!(
             recent_activity_supports_budget_extension(&state),
-            "a same-operation success resolving a prior typed failure is evidence delta"
+            "an executor-confirmed change can earn continuation without claiming validation"
+        );
+        assert_eq!(
+            super::super::execution_phase::pending_completion_action(&state).unwrap(),
+            Some(super::super::host::CompletionAction::PostMutationObservation),
+            "renewal must not discharge the final observation obligation",
         );
     }
 
     #[test]
-    fn budget_extension_rejects_all_failed_activity() {
-        let mut state = make_state();
-        let mut failed = read_record(0, 1, 80);
-        failed.ok = false;
-        failed.error = Some("file not found".into());
-        state.stall.tool_call_records = vec![failed];
-        state.stall.turn_sigs = vec![turn_sig("read_file:missing")];
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "failed-only activity should not extend the turn"
-        );
-    }
-
-    #[test]
-    fn budget_extension_rejects_arbitrary_success_after_unvalidated_mutation() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/src/lib.rs"),
-            bash_record(1, "ls -la /workspace", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:lib"), turn_sig("list:workspace")];
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "an unrelated successful observation must not buy a new mutating slice"
-        );
-    }
-
-    #[test]
-    fn budget_extension_requires_validation_after_latest_mutation() {
+    fn new_mutation_renews_but_invalidates_old_validation() {
         let mut state = make_state();
         state.task_profile.mutates_workspace = true;
         state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -5498,177 +4937,17 @@ mod tests {
         ];
 
         assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "a successful check becomes stale when a later deliverable mutation opens a new validation epoch"
+            recent_activity_supports_budget_extension(&state),
+            "a fresh mutation earns continuation independently of stale validation"
+        );
+        assert_eq!(
+            super::super::execution_phase::pending_completion_action(&state).unwrap(),
+            Some(super::super::host::CompletionAction::PostMutationObservation),
         );
     }
 
     #[test]
-    fn budget_extension_rejects_volatile_scratch_churn() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/app".into());
-        for round in 0..8 {
-            let record = if round % 2 == 0 {
-                write_record(round, &format!("/tmp/encoder-{round}.c"), true)
-            } else {
-                bash_record(round, &format!("cc /tmp/encoder-{}.c", round - 1), false)
-            };
-            state.stall.tool_call_records.push(record);
-            state
-                .stall
-                .turn_sigs
-                .push(turn_sig(&format!("scratch:{round}")));
-        }
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "distinct /tmp candidates plus distinct failed checks are activity, not stable task progress"
-        );
-    }
-
-    #[test]
-    fn budget_extension_rejects_scratch_mutation_even_after_unrelated_test() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/app".into());
-        state.stall.tool_call_records = vec![
-            write_record(0, "/tmp/encoder.c", true),
-            bash_record(1, "cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("scratch:write"), turn_sig("test:generic")];
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "a validator cannot turn an external scratch artifact into a task deliverable"
-        );
-    }
-
-    #[test]
-    fn budget_extension_rejects_bash_scratch_mutation_even_after_test() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/app".into());
-        state.stall.tool_call_records = vec![
-            bash_record(0, "printf source > /tmp/encoder.c", true),
-            bash_record(1, "cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("scratch:bash"), turn_sig("test:generic")];
-
-        assert!(
-            !recent_activity_supports_budget_extension(&state),
-            "a shell redirect into external scratch must not masquerade as a deliverable mutation"
-        );
-    }
-
-    #[test]
-    fn budget_extension_requires_validation_after_same_bash_mutation() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![bash_record(
-            0,
-            "cargo test && sed -i 's/a/b/' /workspace/src/lib.rs",
-            true,
-        )];
-        state.stall.turn_sigs = vec![turn_sig("test-then-write")];
-        assert!(!recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = authoritative_bash_mutation_record(
-            0,
-            "sed -i 's/a/b/' /workspace/src/lib.rs && cargo test",
-        );
-        state.stall.turn_sigs[0] = turn_sig("write-then-test");
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_requires_validator_after_the_final_mutation_barrier() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        let command =
-            "cargo test && sed -i 's/a/b/' /workspace/src/lib.rs && test -e /workspace/src/lib.rs";
-        state.stall.tool_call_records = vec![bash_record(0, command, true)];
-        state.stall.turn_sigs = vec![turn_sig("stale-validator")];
-        assert!(!recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = authoritative_bash_mutation_record(
-            0,
-            "sed -i 's/a/b/' /workspace/src/lib.rs && cargo test",
-        );
-        state.stall.turn_sigs[0] = turn_sig("post-validator");
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_accepts_local_validation_in_the_same_bash_record() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![authoritative_bash_mutation_record(
-            0,
-            "printf x > '/workspace/out file' && cmp /workspace/expected '/workspace/out file'",
-        )];
-        state.stall.turn_sigs = vec![turn_sig("local-post-validation")];
-        assert!(recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = bash_record(
-            0,
-            "cmp /workspace/expected '/workspace/out file' && printf x > '/workspace/out file'",
-            true,
-        );
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_scopes_local_receipt_to_its_final_operands() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-
-        state.stall.tool_call_records = vec![authoritative_bash_mutation_record(
-            0,
-            "printf bad > /workspace/out && cmp /workspace/foo /workspace/bar",
-        )];
-        state.stall.turn_sigs = vec![turn_sig("unrelated-local-cmp")];
-        assert!(!recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = authoritative_bash_mutation_record(
-            0,
-            "printf good > /workspace/out && cmp /workspace/expected /workspace/out",
-        );
-        assert!(recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = authoritative_bash_mutation_record(
-            0,
-            "printf good > /workspace/out && cmp /workspace/expected /workspace/out || true",
-        );
-        assert!(!recent_activity_supports_budget_extension(&state));
-
-        state.stall.tool_call_records[0] = authoritative_bash_mutation_record(
-            0,
-            "printf good > /workspace/out && cmp /workspace/expected /workspace/out;",
-        );
-        assert!(recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_rejects_validation_before_an_unknown_writer() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![bash_record(
-            0,
-            "cargo test && python3 -c \"open('/workspace/src/lib.rs','w').write('bad')\"",
-            true,
-        )];
-        state.stall.turn_sigs = vec![turn_sig("test-then-unknown-write")];
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_closes_validation_epoch_after_failed_partial_mutation() {
+    fn partial_mutation_preserves_completion_debt_without_erasing_progress() {
         let mut state = make_state();
         state.task_profile.mutates_workspace = true;
         state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -5682,23 +4961,11 @@ mod tests {
             turn_sig("test:lib"),
             turn_sig("partial-write:lib"),
         ];
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_rejects_preview_only_or_unscoped_mutations() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![ToolCallRecord {
-            name: "write_file".into(),
-            ok: true,
-            args_preview: Some(r#"{"path":"/workspace/src/lib.rs"}"#.into()),
-            round: Some(0),
-            ..Default::default()
-        }];
-        state.stall.turn_sigs = vec![turn_sig("preview-only")];
-        assert!(!recent_activity_supports_budget_extension(&state));
+        assert!(recent_activity_supports_budget_extension(&state));
+        assert_eq!(
+            super::super::execution_phase::pending_completion_action(&state).unwrap(),
+            Some(super::super::host::CompletionAction::PostMutationObservation),
+        );
     }
 
     #[test]
@@ -5956,152 +5223,6 @@ mod tests {
     }
 
     #[test]
-    fn budget_extension_keeps_workspace_nested_under_tmp_stable() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/tmp/project".into());
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/tmp/project/src/lib.rs"),
-            bash_record(1, "cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:tmp-workspace"), turn_sig("test:project")];
-
-        assert!(
-            recent_activity_supports_budget_extension(&state),
-            "a bound workspace may itself live under /tmp; only paths outside that root are volatile scratch"
-        );
-    }
-
-    #[test]
-    fn budget_extension_accepts_completed_explicit_acceptance_contract() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state
-            .hooks
-            .stop_hooks
-            .push(explicit_verification_hook("quality", "./quality-gate"));
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/src/lib.rs"),
-            bash_record(1, "./quality-gate", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:lib"), turn_sig("hook:quality")];
-
-        assert!(
-            recent_activity_supports_budget_extension(&state),
-            "caller-authored acceptance coverage is typed progress even when its command family is project-specific"
-        );
-    }
-
-    #[test]
-    fn budget_extension_rejects_mutation_after_explicit_acceptance() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state
-            .hooks
-            .stop_hooks
-            .push(explicit_verification_hook("quality", "./quality-gate"));
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/src/lib.rs"),
-            bash_record(1, "./quality-gate", true),
-            bash_record(2, "printf bad > /workspace/src/lib.rs && false", false),
-        ];
-        state.stall.turn_sigs = vec![
-            turn_sig("write:lib"),
-            turn_sig("hook:quality"),
-            turn_sig("partial-write:lib"),
-        ];
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_allows_one_probationary_multi_file_slice() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: 6,
-            extension_turns: 2,
-            max_extensions: 2,
-            renewable_past_review_limit: true,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/src/lib.rs"),
-            committed_write_record(1, "/workspace/src/main.rs"),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:lib"), turn_sig("write:main")];
-        assert!(recent_activity_supports_budget_extension(&state));
-        assert!(maybe_extend_turn_budget(&mut state).is_some());
-
-        state.max_turns = 4;
-        state.remaining_turns = 0;
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_does_not_count_chmod_mode_as_a_second_target() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            bash_record(0, "chmod 644 /workspace/out.txt", true),
-            read_record_at_path(1, "/workspace/out.txt", 1, 20),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("chmod:out"), turn_sig("read:out")];
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_does_not_reuse_receipt_from_a_previous_slice() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: 8,
-            extension_turns: 2,
-            max_extensions: 3,
-            renewable_past_review_limit: true,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        state.stall.tool_call_records = vec![
-            committed_write_record(0, "/workspace/src/lib.rs"),
-            bash_record(1, "cargo test", true),
-        ];
-        state.stall.turn_sigs = vec![turn_sig("write:lib"), turn_sig("test:lib")];
-        assert!(maybe_extend_turn_budget(&mut state).is_some());
-
-        // The old receipt remains in the journal, but no fresh mutation or
-        // validation occurred in the newly granted slice.
-        state
-            .stall
-            .tool_call_records
-            .push(read_record_at_path(2, "/workspace/other.rs", 1, 20));
-        state.stall.turn_sigs.push(turn_sig("read:other"));
-        assert!(!recent_activity_supports_budget_extension(&state));
-    }
-
-    #[test]
-    fn budget_extension_rejects_observation_only_file_and_self_comparison() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        for command in [
-            "printf x > /workspace/out.txt && file /workspace/out.txt",
-            "printf x > /workspace/out.txt && cmp /workspace/out.txt /workspace/out.txt",
-        ] {
-            state.stall.tool_call_records = vec![bash_record(0, command, true)];
-            state.stall.turn_sigs = vec![turn_sig(command)];
-            assert!(!recent_activity_supports_budget_extension(&state));
-        }
-    }
-
-    #[test]
     fn budget_extension_does_not_treat_policy_convergence_as_a_hard_stop() {
         use astra_turn_core::context_feedback::{
             RuntimePolicyFeedbackEntry, RuntimePolicyFeedbackSet, RuntimePolicyRecommendation,
@@ -6131,10 +5252,8 @@ mod tests {
         assert!(recent_activity_supports_budget_extension(&state));
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: false,
         };
         state.max_turns = 2;
         state.remaining_turns = 0;
@@ -6150,10 +5269,8 @@ mod tests {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: false,
         };
         state.max_turns = 2;
         state.remaining_turns = 0;
@@ -6188,14 +5305,12 @@ mod tests {
     }
 
     #[test]
-    fn critical_verdict_revokes_adaptive_checkpoint_guidance() {
+    fn historical_critical_verdict_does_not_revoke_execution_capacity() {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: false,
         };
         state.max_turns = 2;
         state.remaining_turns = 0;
@@ -6220,15 +5335,24 @@ mod tests {
             },
         );
 
-        assert!(!adaptive_budget_is_renewable(&state));
+        assert!(adaptive_budget_is_renewable(&state));
         assert!(
-            crate::prompts::execution_slice_guidance(
+            !crate::prompts::execution_slice_guidance(
                 state.remaining_turns,
                 state.max_turns,
                 adaptive_budget_is_renewable(&state),
             )
             .contains("Do not call any tool"),
-            "a critical verdict must keep the terminal guidance aligned with the scheduler"
+            "historical advice must not become terminal execution authority"
+        );
+        state.stall.turn_sigs = vec![turn_sig("recovered:first"), turn_sig("recovered:next")];
+        assert!(maybe_extend_turn_budget(&mut state).is_some());
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 2);
+        assert_eq!(
+            state.stall.verdict_events.len(),
+            1,
+            "retain the audit history"
         );
     }
 
@@ -6259,10 +5383,8 @@ mod tests {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 0;
@@ -6301,10 +5423,8 @@ mod tests {
         state.hooks.workspace_root_hint = Some("/workspace".into());
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 9,
-            hard_turn_limit: 13,
+            hard_turn_limit: std::num::NonZeroUsize::new(13),
             extension_turns: 4,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 9;
         state.remaining_turns = 0;
@@ -6349,10 +5469,8 @@ mod tests {
             Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 2,
+            hard_turn_limit: std::num::NonZeroUsize::new(2),
             extension_turns: 0,
-            max_extensions: 0,
-            renewable_past_review_limit: false,
         };
         state.max_turns = 2;
         state.remaining_turns = 1;
@@ -6558,7 +5676,8 @@ mod tests {
         }];
 
         assert_ne!(
-            super::super::execution_phase::pending_completion_action_for_work_state(&state, true),
+            super::super::execution_phase::pending_completion_action_for_work_state(&state, true)
+                .unwrap(),
             Some(super::super::host::CompletionAction::CanonicalWorkValidation)
         );
     }
@@ -6584,6 +5703,7 @@ mod tests {
         state.remaining_turns = 0;
 
         let action = super::super::execution_phase::pending_completion_action(&state)
+            .unwrap()
             .expect("both dependent verification hooks remain pending");
         assert!(matches!(
             action,
@@ -6611,10 +5731,8 @@ mod tests {
         state.hooks.workspace_root_hint = Some("/workspace".into());
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 6,
+            hard_turn_limit: std::num::NonZeroUsize::new(6),
             extension_turns: 2,
-            max_extensions: 2,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 0;
@@ -6677,10 +5795,8 @@ mod tests {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 1;
@@ -6960,6 +6076,85 @@ mod tests {
     }
 
     #[test]
+    fn parallel_budget_rollup_accepts_terminal_spawn_and_keeps_it_sticky() {
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({
+                    "agent_id": "agent-a",
+                    "description": "Direct review"
+                }),
+                Some(json!({
+                    "status": "completed",
+                    "agent_id": "agent-a",
+                    "result": "Direct review finished."
+                })),
+                None,
+            ),
+            // A stale callback must not reopen a child after its terminal
+            // result was already observed from the foreground spawn.
+            agent_record(
+                "get_result",
+                json!({"agent_id": "agent-a"}),
+                Some(json!({
+                    "status": "launched",
+                    "agent_id": "agent-a"
+                })),
+                None,
+            ),
+        ];
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert_eq!(rollup.unfinished.len(), 0);
+        assert_eq!(rollup.completed.len(), 1);
+        assert_eq!(rollup.completed[0].label, "Direct review");
+        assert_eq!(rollup.completed[0].result, "Direct review finished.");
+        assert!(unfinished_parallel_agent_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn parallel_budget_rollup_releases_non_success_terminal_child() {
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"agent_id": "agent-failed", "description": "Failed review"}),
+                Some(json!({
+                    "status": "failed",
+                    "agent_id": "agent-failed",
+                    "error": "child exploded"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"agent_id": "agent-cancelled", "description": "Cancelled review"}),
+                Some(json!({
+                    "status": "cancelled",
+                    "agent_id": "agent-cancelled",
+                    "reason": "parent cancelled this sub-agent"
+                })),
+                None,
+            ),
+        ];
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert!(rollup.completed.is_empty());
+        assert!(
+            unfinished_parallel_agent_ids(&state).is_empty(),
+            "terminal failure/cancellation must not be treated as live ownership"
+        );
+        let details = rollup
+            .terminal_issues
+            .iter()
+            .map(|entry| entry.incomplete_reason.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(details.contains(&"parent cancelled this sub-agent"));
+        assert!(details.contains(&"child exploded"));
+    }
+
+    #[test]
     fn budget_exhaustion_summary_uses_shared_child_result_projection() {
         let mut state = make_state();
         state.max_turns = 9;
@@ -7141,6 +6336,8 @@ mod tests {
     async fn execution_settlement_cancels_unfinished_parallel_agents_before_synthesis() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
+        // Exercise actual resource exhaustion, not missing progress receipts.
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(13);
         state.max_turns = 13;
         state.remaining_turns = 0;
         state.llm_rounds_completed = 13;
@@ -7295,7 +6492,13 @@ mod tests {
             "pre-routing still consumes the current turn budget"
         );
         assert_eq!(state.tool_results.len(), 1);
-        assert!(state.skills.invoked.contains_key("review-changes"));
+        assert!(
+            state
+                .skills
+                .execution
+                .invoked
+                .contains_key("review-changes")
+        );
         assert_eq!(
             state.messages.iter().find_map(|msg| {
                 msg.get("tool_calls")?
@@ -7369,7 +6572,7 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert!(host.skill_auto_route_queries.is_empty());
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
         assert!(state.tool_results.is_empty());
     }
 
@@ -7388,7 +6591,13 @@ mod tests {
             .expect("turn should prepare");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        assert!(state.skills.invoked.contains_key("review-changes"));
+        assert!(
+            state
+                .skills
+                .execution
+                .invoked
+                .contains_key("review-changes")
+        );
         assert_eq!(
             host.skill_auto_route_queries,
             vec!["review changes on current branch".to_string()]
@@ -7698,7 +6907,7 @@ mod tests {
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert!(host.skill_auto_route_queries.is_empty());
         assert!(state.tool_results.is_empty());
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
     }
 
     #[tokio::test]
@@ -7721,7 +6930,7 @@ mod tests {
             vec!["review changes on current branch".to_string()]
         );
         assert!(state.tool_results.is_empty());
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
     }
 
     #[tokio::test]
@@ -7739,9 +6948,9 @@ mod tests {
             .expect("first turn should prepare despite failed auto-route");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        assert_eq!(state.skills.auto_route_attempts.len(), 1);
+        assert_eq!(state.skills.execution.auto_route_attempts.len(), 1);
         assert!(state.tool_results.is_empty());
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
 
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
@@ -7749,12 +6958,12 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert_eq!(
-            state.skills.auto_route_attempts.len(),
+            state.skills.execution.auto_route_attempts.len(),
             1,
             "same intent+skill failure should not create repeated auto-route attempts"
         );
         assert!(state.tool_results.is_empty());
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
         assert_eq!(
             host.skill_auto_route_queries,
             vec![
@@ -8443,6 +7652,47 @@ mod tests {
         assert!(p100 > p50, "100 msgs > 50 msgs pressure");
         assert!(p50 > p10, "50 msgs > 10 msgs pressure");
         assert!(p100 > p10, "100 msgs > 10 msgs pressure");
+    }
+
+    #[test]
+    fn estimate_context_pressure_for_state_reuses_last_assembly_measurement() {
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.messages = vec![json!({
+            "role": "user",
+            "content": "a short retained message",
+        })];
+        state.pinned_tool_schema_tokens = 2_000;
+
+        let fallback_tokens = estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        )
+        .1;
+        state.last_llm_context_manifest_trace = Some(json!({
+            "system_prompt_tokens": 4_000,
+            "volatile_preamble_tokens": 100,
+            "wire": {
+                "budget": {
+                    "estimated_system_tokens": 3_900,
+                },
+            },
+        }));
+
+        let (pressure, measured_tokens) = estimate_context_pressure_for_state(&state);
+        assert!(
+            measured_tokens < fallback_tokens,
+            "a measured prompt must replace the stale fallback estimate"
+        );
+        assert_eq!(
+            measured_tokens,
+            crate::prompts::estimate_tokens(&state.messages, 2_000, 3_900) as u64
+        );
+        assert_eq!(
+            pressure,
+            measured_tokens as f64 / state.max_turn_input_tokens as f64
+        );
     }
 
     #[test]

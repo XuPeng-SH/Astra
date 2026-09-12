@@ -59,8 +59,8 @@ pub(crate) const DEFAULT_DB_POOL_MAX_LIFETIME_SECS: u64 = 1800;
 
 use crate::runtime_limits::{
     DEFAULT_GLOBAL_OUTPUT_LIMIT, DEFAULT_MAX_RETRIEVED, DEFAULT_MAX_TOOL_RETRIES,
-    DEFAULT_MAX_TURN_INPUT_TOKENS, DEFAULT_MAX_TURNS, DEFAULT_PLAN_SUBTASK_MAX_TURNS,
-    DEFAULT_RETRY_BASE_MS, DEFAULT_TOOL_OUTPUT_LIMIT, DEFAULT_TURN_TIMEOUT_S,
+    DEFAULT_MAX_TURN_INPUT_TOKENS, DEFAULT_RETRY_BASE_MS, DEFAULT_TOOL_OUTPUT_LIMIT,
+    DEFAULT_TURN_TIMEOUT_S,
 };
 
 /// Read an env var and apply it to an `Option<T>` field if the value parses.
@@ -717,13 +717,6 @@ pub struct ServerRuntimeConfig {
 }
 
 impl ServerRuntimeConfig {
-    pub(crate) fn max_turns(&self) -> usize {
-        self.max_turns.unwrap_or(DEFAULT_MAX_TURNS)
-    }
-    pub(crate) fn plan_subtask_max_turns(&self) -> usize {
-        self.plan_subtask_max_turns
-            .unwrap_or(DEFAULT_PLAN_SUBTASK_MAX_TURNS)
-    }
     pub(crate) fn turn_timeout_s(&self) -> u64 {
         self.turn_timeout_s.unwrap_or(DEFAULT_TURN_TIMEOUT_S)
     }
@@ -768,11 +761,10 @@ impl ServerRuntimeConfig {
         if self.retry_base_ms == Some(0) {
             return Err("runtime.retry_base_ms must be > 0 (or omit for default)".into());
         }
-        // Use resolved values so the check fires even when one field
-        // relies on its default (max_turns=None + plan=100 → 100 > 50).
-        let max_turns = self.max_turns();
-        let plan_turns = self.plan_subtask_max_turns();
-        if plan_turns > max_turns {
+        // Omission is not a hidden cap. Compare only explicit constraints.
+        if let (Some(max_turns), Some(plan_turns)) = (self.max_turns, self.plan_subtask_max_turns)
+            && plan_turns > max_turns
+        {
             return Err(format!(
                 "runtime.plan_subtask_max_turns ({plan_turns}) exceeds max_turns ({max_turns})"
             ));
@@ -1987,17 +1979,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_validate_plan_turns_exceeds_max_turns_with_defaults() {
+    fn runtime_config_allows_explicit_plan_limit_without_implicit_global_cap() {
         let config = ServerRuntimeConfig {
             max_turns: None,
             plan_subtask_max_turns: Some(400),
             ..Default::default()
         };
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.contains("plan_subtask_max_turns (400) exceeds max_turns (300)"),
-            "should reject when default max_turns=300 is exceeded: {err}"
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

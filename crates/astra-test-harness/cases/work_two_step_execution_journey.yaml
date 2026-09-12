@@ -1,8 +1,8 @@
 name: work_two_step_execution_journey
 description: |
-  **What**: Ask Astra for two independent, source-backed repository checks in ordinary
-  product language.
-  **Tests**: Natural Work establishment, live execution of both items, durable settlement,
+  **What**: Explicitly request durable tracking and delivery of two independent,
+  source-backed repository checks in ordinary product language.
+  **Tests**: Requested Work establishment, live execution of both items, durable settlement,
   and bounded model/tool churn without relying on task names or response prose.
   **Why**: A task list that is only created or only visible after completion is not a usable
   product. This is deliberately distinct from the planning-only journey: it fails unless
@@ -14,6 +14,8 @@ description: |
   **Fail means**: Astra returns a prose checklist, leaves a created item unfinished, creates
   duplicate Work, or spins through excessive model/tool rounds.
 prompt: |
+  Create a durable Work board to track these two tasks separately, execute both now,
+  and record their delivery so I can inspect or continue this Work in a later session.
   Before a release handoff, independently verify two things in this repository:
   first, identify the CI command that runs the test suite; second, identify the local
   developer command intended to run the corresponding check. Cite the source paths and
@@ -103,10 +105,12 @@ criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
-      - type: provider_prompt_cache_stable_prefix_reuse_ratio
+      - type: provider_prompt_cache_read_nonregression_ratio
         min: 0.95
         min_pairs: 1
         max_identity_transitions_per_run: 1
-        # Each identity's first request is a typed cold boundary; only later
-        # requests within that same prefix epoch are scored. Legitimate
-        # runtime tool-surface changes are not assigned a fixed round number.
+        # Compare cache-read counts within each system/tool identity epoch,
+        # exempting only its first pair with a zero previous read. Reads can
+        # include history; this does not assert absolute cache-read coverage.
+        # Legitimate tool-surface changes are bounded by identity transitions,
+        # not assigned a fixed round number.

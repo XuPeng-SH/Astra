@@ -13,7 +13,7 @@
 //!   tests can inject mock responses without a real API.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     cloud::compact_prompt::{
@@ -145,6 +145,12 @@ pub struct SummaryResponse {
     pub text: String,
     /// Whether the request exceeded the context window (PTL error).
     pub is_ptl_error: bool,
+    /// Provider terminal reason, preserved so structured auxiliary callers can
+    /// distinguish an output-cap boundary from a schema-invalid completion.
+    pub finish_reason: Option<String>,
+    /// Provider-reported usage for this inference. Auxiliary inference is part
+    /// of the durable turn budget and must not disappear at this abstraction.
+    pub usage: Map<String, Value>,
 }
 
 /// Abstraction over the LLM API for summary generation.
@@ -157,7 +163,7 @@ pub trait SummaryLlmClient: Send + Sync {
         &self,
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
-    ) -> Result<SummaryResponse, String>;
+    ) -> Result<SummaryResponse, astra_core::ClassifiedError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +398,7 @@ pub mod test_support {
     /// Mock LLM client for testing.
     pub struct MockSummaryClient {
         /// Responses to return in order. If fewer than calls, last is repeated.
-        pub responses: Vec<Result<SummaryResponse, String>>,
+        pub responses: Vec<Result<SummaryResponse, astra_core::ClassifiedError>>,
         pub call_count: Arc<AtomicUsize>,
         purposes: Arc<Mutex<Vec<astra_turn_types::InferencePurpose>>>,
         requests: Arc<Mutex<Vec<Vec<Value>>>>,
@@ -404,6 +410,8 @@ pub mod test_support {
                 responses: vec![Ok(SummaryResponse {
                     text: text.to_string(),
                     is_ptl_error: false,
+                    finish_reason: Some("stop".to_string()),
+                    usage: Map::new(),
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
@@ -417,10 +425,14 @@ pub mod test_support {
                     Ok(SummaryResponse {
                         text: String::new(),
                         is_ptl_error: true,
+                        finish_reason: None,
+                        usage: Map::new(),
                     }),
                     Ok(SummaryResponse {
                         text: success_text.to_string(),
                         is_ptl_error: false,
+                        finish_reason: Some("stop".to_string()),
+                        usage: Map::new(),
                     }),
                 ],
                 call_count: Arc::new(AtomicUsize::new(0)),
@@ -434,6 +446,8 @@ pub mod test_support {
                 responses: vec![Ok(SummaryResponse {
                     text: String::new(),
                     is_ptl_error: true,
+                    finish_reason: None,
+                    usage: Map::new(),
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
@@ -443,7 +457,10 @@ pub mod test_support {
 
         pub fn error(msg: &str) -> Self {
             Self {
-                responses: vec![Err(msg.to_string())],
+                responses: vec![Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Network,
+                    msg,
+                ))],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
                 requests: Arc::new(Mutex::new(Vec::new())),
@@ -471,7 +488,7 @@ pub mod test_support {
             &self,
             purpose: astra_turn_types::InferencePurpose,
             messages: &[Value],
-        ) -> Result<SummaryResponse, String> {
+        ) -> Result<SummaryResponse, astra_core::ClassifiedError> {
             self.purposes
                 .lock()
                 .expect("mock summary purpose lock")

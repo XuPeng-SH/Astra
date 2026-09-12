@@ -103,77 +103,202 @@ fn emit_tool_display_feedback(
 /// Persist the complete sanitized result whenever the inline presentation is
 /// lossy. This is the durable-record boundary and must not be optimized for
 /// the next model prompt.
-fn persist_tool_result_for_record(
+#[derive(Debug)]
+struct PersistedRecordResult {
+    content: String,
+    artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
+}
+
+fn persist_tool_result_for_record_with_authority(
     current_user_id: Option<&str>,
     current_session_id: Option<&String>,
+    current_run_id: Option<&str>,
     id: &str,
     name: &str,
     full_model_result_str: &str,
     inline_model_result_str: String,
-) -> String {
-    // An artifact handle in the record is the lossless fallback for every
-    // tool-specific presentation bound, including read_file/introspect.
-    // Keeping this separate from the model boundary prevents an optimization
-    // for the next prompt from silently deleting audit/recovery evidence.
-    if let Some(sid) = current_session_id {
-        let session_dir = model_tool_result_session_dir(current_user_id, sid)
-            .expect("validated session_id must resolve tool-result session dir");
-        let replacement = if full_model_result_str != inline_model_result_str {
-            // A tool-specific model bound has already omitted evidence. Keep
-            // that evidence recoverable even when the full result is below
-            // the general large-result threshold.
-            astra_turn_core::tool_result_storage::persist_tool_result_with_replacement(
-                &session_dir,
-                id,
-                name,
-                full_model_result_str,
-            )
-        } else {
-            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
-                &session_dir,
-                id,
-                name,
-                full_model_result_str,
-            )
-        };
-        match replacement {
-            Some(replacement) => replacement,
-            None => inline_model_result_str,
+) -> Result<PersistedRecordResult, astra_turn_core::tool_result_storage::ToolResultPersistenceError>
+{
+    persist_tool_document_for_record_with_authority(
+        current_user_id,
+        current_session_id,
+        current_run_id,
+        id,
+        ToolDocumentPresentation {
+            name,
+            full: full_model_result_str,
+            inline: inline_model_result_str,
+            kind: astra_services::session_journal::ToolResultDocumentKind::Result,
+        },
+    )
+}
+
+struct ToolDocumentPresentation<'a> {
+    name: &'a str,
+    full: &'a str,
+    inline: String,
+    kind: astra_services::session_journal::ToolResultDocumentKind,
+}
+
+fn persist_tool_document_for_record_with_authority(
+    current_user_id: Option<&str>,
+    current_session_id: Option<&String>,
+    current_run_id: Option<&str>,
+    id: &str,
+    document: ToolDocumentPresentation<'_>,
+) -> Result<PersistedRecordResult, astra_turn_core::tool_result_storage::ToolResultPersistenceError>
+{
+    let ToolDocumentPresentation {
+        name,
+        full: full_model_result_str,
+        inline: inline_model_result_str,
+        kind,
+    } = document;
+    let Some(sid) = current_session_id else {
+        return Ok(PersistedRecordResult {
+            content: if kind.is_result() {
+                inline_model_result_str
+            } else {
+                full_model_result_str.to_string()
+            },
+            artifact: None,
+        });
+    };
+    let Some(run_id) = current_run_id else {
+        return Ok(PersistedRecordResult {
+            // Without a run identity there is no immutable artifact identity.
+            // Preserve the complete sanitized evidence inline instead of
+            // emitting a handle that introspect cannot safely resolve.
+            content: full_model_result_str.to_string(),
+            artifact: None,
+        });
+    };
+    let session_dir = model_tool_result_session_dir(current_user_id, sid)
+        .expect("validated session_id must resolve tool-result session dir");
+    let persisted = if full_model_result_str != inline_model_result_str
+        || full_model_result_str.chars().count()
+            > astra_turn_core::tool_result_storage::PERSIST_THRESHOLD_CHARS
+    {
+        astra_turn_core::tool_result_storage::persist_tool_document_with_descriptor(
+            &session_dir,
+            run_id,
+            id,
+            name,
+            full_model_result_str,
+            kind,
+        )
+        .map(Some)
+    } else {
+        Ok(None)
+    };
+    let persisted = match persisted {
+        Ok(persisted) => persisted,
+        Err(astra_turn_core::tool_result_storage::ToolResultPersistenceError::Io(error)) => {
+            tracing::warn!(
+                target: "astra_runtime::headless_tool_pipeline",
+                run_id,
+                tool_call_id = id,
+                document_kind = ?kind,
+                error = %error,
+                "tool-result artifact unavailable; retaining full sanitized journal result"
+            );
+            return Ok(PersistedRecordResult {
+                content: full_model_result_str.to_string(),
+                artifact: None,
+            });
         }
+        Err(conflict) => return Err(conflict),
+    };
+    Ok(match persisted {
+        Some(persisted) => PersistedRecordResult {
+            content: persisted.replacement,
+            artifact: Some(persisted.descriptor),
+        },
+        None => PersistedRecordResult {
+            content: inline_model_result_str,
+            artifact: None,
+        },
+    })
+}
+
+fn artifact_persistence_failure(
+    error: &astra_turn_core::tool_result_storage::ToolResultPersistenceError,
+    provider_result_was_error: bool,
+) -> (String, serde_json::Map<String, Value>) {
+    debug_assert!(matches!(
+        error,
+        astra_turn_core::tool_result_storage::ToolResultPersistenceError::IdentityConflict { .. }
+    ));
+    let failure_kind = "identity_conflict";
+    let content = serde_json::json!({
+        "status": "failed",
+        "error": "tool execution completed but its durable result evidence could not be persisted",
+        "reason": failure_kind,
+        "error_kind": "durable_result_persistence",
+        "retryable": false,
+        "provider_outcome_acknowledged": true,
+        "provider_result_was_error": provider_result_was_error,
+        "durable_result_complete": false,
+    })
+    .to_string();
+    let metadata = serde_json::Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(
+                astra_core::ErrorKind::ContractViolation
+                    .as_str()
+                    .to_string(),
+            ),
+        ),
+        (
+            "artifact_persistence_error_kind".to_string(),
+            Value::String(failure_kind.to_string()),
+        ),
+        ("retryable".to_string(), Value::Bool(false)),
+        ("execution_started".to_string(), Value::Bool(true)),
+        (
+            "provider_outcome_acknowledged".to_string(),
+            Value::Bool(true),
+        ),
+        (
+            "provider_result_was_error".to_string(),
+            Value::Bool(provider_result_was_error),
+        ),
+        ("durable_result_complete".to_string(), Value::Bool(false)),
+    ]);
+    (content, metadata)
+}
+
+/// Select the representation appended to the next model boundary.
+///
+/// A producer-authored bounded projection stays inline instead of becoming an
+/// opaque artifact prompt that introduces a second pagination protocol. The
+/// full result has already gone through [`persist_tool_result_for_record`] and
+/// remains available to the journal/artifact resolver.
+fn model_tool_result_for_followup(
+    presentation: astra_tools::ModelResultPresentation,
+    inline_model_result_str: String,
+    journal_result: &PersistedRecordResult,
+) -> String {
+    if presentation == astra_tools::ModelResultPresentation::Generic
+        && journal_result.artifact.is_some()
+    {
+        journal_result.content.clone()
     } else {
         inline_model_result_str
     }
 }
 
-/// Select the representation appended to the next model boundary.
-///
-/// `read_file` and `introspect` have typed, deterministic recovery APIs. A
-/// bounded source/snapshot result therefore stays inline instead of becoming
-/// an opaque artifact prompt that encourages recursive pagination. The full
-/// result has already gone through [`persist_tool_result_for_record`] and is
-/// still available to the journal/artifact resolver.
-fn model_tool_result_for_followup(
-    current_user_id: Option<&str>,
-    current_session_id: Option<&String>,
-    id: &str,
-    name: &str,
-    full_model_result_str: &str,
-    inline_model_result_str: String,
+fn model_projection_before_artifact_replacement(
+    tool_name: &str,
+    full_model_result: &str,
+    presentation: astra_tools::ModelResultPresentation,
 ) -> String {
-    if matches!(name, "read_file" | "introspect")
-        && full_model_result_str != inline_model_result_str
-    {
-        return inline_model_result_str;
+    if presentation == astra_tools::ModelResultPresentation::SourceBounded {
+        full_model_result.to_string()
+    } else {
+        truncate_tool_result_for_model(tool_name, full_model_result)
     }
-
-    persist_tool_result_for_record(
-        current_user_id,
-        current_session_id,
-        id,
-        name,
-        full_model_result_str,
-        inline_model_result_str,
-    )
 }
 
 /// Extract and validate the lossless Work-board update before the model
@@ -203,6 +328,9 @@ fn tool_result_fields_for_model_roundtrip(
     existing_fields: Option<&serde_json::Map<String, Value>>,
 ) -> Option<serde_json::Map<String, Value>> {
     let mut fields = existing_fields.cloned().unwrap_or_default();
+    // Presentation authority is consumed by this runtime boundary. It is not
+    // provider context and must not become another model-visible instruction.
+    fields.remove(astra_tools::MODEL_RESULT_PRESENTATION_FIELD);
     if let Some(update) = canonical_work_task_board_update_for_record(tool_name, full_model_result)
     {
         fields.insert(CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD.to_string(), update);
@@ -403,6 +531,7 @@ fn truncate_tool_error(result_str: &str) -> String {
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
+        self.observe_execution_terminal_owner(&executed.execution);
         let ExecutedExecution {
             mut execution,
             idem_key,
@@ -425,6 +554,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             execution.tool_result_fields = Some(sanitized.metadata);
         }
+        // Host presentation is not executor metadata. In particular a large
+        // hook context must not cross the invocation-ledger payload limit
+        // before its independent artifact projection has been prepared.
+        let mut runtime_advisories = astra_turn_core::tool::result::advisory::take_advisories(
+            execution.tool_result_fields.as_mut(),
+        );
         // Reusable observations exclude invocation-specific PostTool
         // presentation, but they are never allowed to retain raw credentials
         // or prompt-injection payloads.
@@ -432,9 +567,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if let Some(context) = pre_tool_context {
             let context =
                 astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&context).content;
-            execution
-                .result_str
-                .push_str(&format!("\n\n[Hook context]: {context}"));
+            runtime_advisories.push(format!("[Hook context]: {context}"));
         }
         let mut post_tool_modified = false;
         if !self.ctx.tool_event_hooks.is_empty() && !is_err {
@@ -479,8 +612,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .finish_governed_tool_result(governed, Some(pending))
                 .await
         } else {
-            governed.into_inner()
+            crate::server::tool_invocation_runtime::FinishedToolInvocation {
+                result: governed.into_inner(),
+                record: execution.confirmed_invocation.take(),
+            }
         };
+        let invocation_completion = finalized.record.as_ref().and_then(|record| {
+            match astra_turn_types::ToolInvocationCompletionRef::from_record(record) {
+                Ok(reference) => Some(reference),
+                Err(error) => {
+                    tracing::error!(%error, "confirmed invocation record cannot bind recovery evidence");
+                    None
+                }
+            }
+        });
+        let finalized = finalized.result;
         is_err = finalized.is_error;
         execution.result_str =
             astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&finalized.output)
@@ -489,7 +635,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(metadata)
                 .metadata
         });
-        let error_kind =
+        let mut error_kind =
             execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref())
                 .or(source_error_kind);
 
@@ -497,14 +643,71 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
         let journal_result_inline =
             truncate_tool_result_for_model(&execution.name, &journal_result_source);
-        let journal_result = persist_tool_result_for_record(
-            self.ctx.current_user_id,
-            self.ctx.current_session_id,
-            &execution.id,
-            &execution.name,
-            &journal_result_source,
-            journal_result_inline,
-        );
+        let full_guidance = runtime_advisories.join("\n");
+        let inline_guidance = truncate_tool_result_for_model(&execution.name, &full_guidance);
+        let (journal_result, guidance_artifact) =
+            match persist_tool_result_for_record_with_authority(
+                self.ctx.current_user_id,
+                self.ctx.current_session_id,
+                self.ctx.current_run_id,
+                &execution.id,
+                &execution.name,
+                &journal_result_source,
+                journal_result_inline,
+            )
+            .and_then(|result| {
+                if full_guidance == inline_guidance {
+                    return Ok((result, None));
+                }
+                persist_tool_document_for_record_with_authority(
+                self.ctx.current_user_id, self.ctx.current_session_id,
+                self.ctx.current_run_id, &execution.id,
+                ToolDocumentPresentation {
+                    name: &execution.name, full: &full_guidance, inline: inline_guidance,
+                    kind: astra_services::session_journal::ToolResultDocumentKind::RuntimeGuidance,
+                },
+            ).map(|guidance| (result, Some(guidance)))
+            }) {
+                Ok((persisted, guidance)) => {
+                    let artifact = guidance.and_then(|guidance| {
+                        runtime_advisories = vec![guidance.content];
+                        guidance.artifact
+                    });
+                    (persisted, artifact)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "astra_runtime::headless_tool_pipeline",
+                        run_id = ?self.ctx.current_run_id,
+                        tool_call_id = %execution.id,
+                        error = %error,
+                        "durable tool-result artifact persistence failed closed"
+                    );
+                    let provider_result_was_error = is_err;
+                    let (failure, failure_metadata) =
+                        artifact_persistence_failure(&error, provider_result_was_error);
+                    execution.result_str = failure.clone();
+                    execution.tool_result_fields = Some(failure_metadata);
+                    is_err = true;
+                    error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    (
+                        PersistedRecordResult {
+                            content: failure,
+                            artifact: None,
+                        },
+                        None,
+                    )
+                }
+            };
+
+        if !runtime_advisories.is_empty() || execution.tool_result_fields.is_some() {
+            astra_turn_core::tool::result::advisory::set_advisories(
+                execution
+                    .tool_result_fields
+                    .get_or_insert_with(Default::default),
+                &runtime_advisories,
+            );
+        }
 
         let raw_args_full = serde_json::to_string(&execution.args).ok();
         let args_size = raw_args_full
@@ -520,16 +723,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 is_err,
                 executed_ms,
                 args_size,
-                journal_result.as_str(),
+                journal_result.content.as_str(),
                 args_preview.clone(),
                 file_path,
                 args_full,
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            rec.invocation_completion = invocation_completion;
             rec.runtime_args_full = raw_args_full;
             rec.tool_call_id = Some(execution.id.clone());
+            rec.result_artifact = journal_result.artifact.clone();
             rec.error_kind = error_kind;
+            rec.runtime_advisory_artifact = guidance_artifact;
+            rec.runtime_advisories = astra_turn_core::tool::result::advisory::advisories(
+                execution.tool_result_fields.as_ref(),
+            );
             if let Some(fields) = execution.tool_result_fields.as_ref() {
                 rec.disposition = Some(tool_call_disposition_from_result_fields(
                     fields,
@@ -674,6 +883,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+            let mut advisories = astra_turn_core::tool::result::advisory::advisories(
+                execution.tool_result_fields.as_ref(),
+            );
             // Cache and compare the provider observation, not presentation
             // transforms from the current Pre/PostTool hook set. Reuse applies
             // the then-current hooks again after authorization.
@@ -683,7 +895,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &idem_key,
                 HeadlessCacheableRecordCtx {
                     observation: &cache_observation,
-                    result_str: &mut execution.result_str,
+                    advisories: &mut advisories,
                     call_id: Some(&execution.id),
                     turn_index: self.ctx.turn_index,
                     semantic_context_generation: self.ctx.turn_guard.workspace_epoch(),
@@ -693,6 +905,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 },
                 is_err,
             );
+            if !advisories.is_empty() {
+                astra_turn_core::tool::result::advisory::set_advisories(
+                    execution
+                        .tool_result_fields
+                        .get_or_insert_with(Default::default),
+                    &advisories,
+                );
+                if let Some(record) = self.ctx.tool_call_records.last_mut() {
+                    record.runtime_advisories = advisories;
+                }
+            }
         }
 
         emit_tool_display_feedback(
@@ -710,8 +933,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
         let structural_model_projection =
             work_receipt_for_model(&execution.name, &full_model_result_str);
+        let result_presentation =
+            astra_tools::model_result_presentation(execution.tool_result_fields.as_ref());
         let model_result_str = structural_model_projection.clone().unwrap_or_else(|| {
-            truncate_tool_result_for_model(&execution.name, &full_model_result_str)
+            model_projection_before_artifact_replacement(
+                &execution.name,
+                &full_model_result_str,
+                result_presentation,
+            )
         });
         // Work receipts are already durably retained in the canonical journal
         // above.  Keep the compact typed projection inline so the model can
@@ -726,14 +955,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let model_result_str = if structural_model_projection.is_some() {
             model_result_str
         } else {
-            model_tool_result_for_followup(
-                self.ctx.current_user_id,
-                self.ctx.current_session_id,
-                &execution.id,
-                &execution.name,
-                &full_model_result_str,
-                model_result_str,
-            )
+            model_tool_result_for_followup(result_presentation, model_result_str, &journal_result)
         };
 
         let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
@@ -755,6 +977,37 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 "_tool_name".to_string(),
                 serde_json::Value::String(execution.name.clone()),
             );
+            if let Err(error) = astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+                &mut tool_msg,
+                self.ctx.current_run_id,
+            ) {
+                // A fresh round-trip message cannot normally carry an owner;
+                // if a future caller does, retain the original evidence and
+                // fail closed rather than replacing its run identity.
+                tracing::error!(
+                    run_id = ?self.ctx.current_run_id,
+                    tool_call_id = %execution.id,
+                    error = %error,
+                    "tool-result run identity was not attached"
+                );
+            }
+            if let Err(error) =
+                astra_turn_core::tool_result_storage::mark_tool_result_artifact_descriptor(
+                    &mut tool_msg,
+                    journal_result.artifact.as_ref(),
+                )
+            {
+                // The descriptor is immutable evidence metadata.  A
+                // conflicting pre-existing value must never be overwritten;
+                // the model body remains available, while later compaction
+                // will fail closed rather than manufacture ownership.
+                tracing::error!(
+                    run_id = ?self.ctx.current_run_id,
+                    tool_call_id = %execution.id,
+                    error = %error,
+                    "tool-result artifact descriptor was not attached"
+                );
+            }
         }
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
@@ -767,6 +1020,33 @@ mod tests {
     use astra_services::session_journal::JournalDirGuard;
     use astra_services::session_journal::ToolCallDisposition;
     use serde_json::json;
+
+    #[test]
+    fn guidance_persistence_failure_keeps_evidence_without_fabricating_a_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let sid = "guidance-io-failure".to_string();
+        let session_dir = model_tool_result_session_dir(Some("user-a"), &sid).unwrap();
+        std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+        std::fs::write(&session_dir, "not a directory").unwrap();
+        let full = "complete configured guidance\n".repeat(2_000);
+        let persisted = persist_tool_document_for_record_with_authority(
+            Some("user-a"),
+            Some(&sid),
+            Some("run-a"),
+            "call-a",
+            ToolDocumentPresentation {
+                name: "probe",
+                full: &full,
+                inline: "bounded candidate".into(),
+                kind: astra_services::session_journal::ToolResultDocumentKind::RuntimeGuidance,
+            },
+        )
+        .unwrap();
+        assert_eq!(persisted.content, full);
+        assert!(persisted.artifact.is_none());
+        assert!(!persisted.content.contains("artifact://"));
+    }
 
     #[test]
     fn model_tool_result_directory_uses_authenticated_owner_scope() {
@@ -796,27 +1076,177 @@ mod tests {
         let content = "review evidence 😀\n".repeat(4_000);
         let inline = "inline preview should be replaced".to_string();
 
-        let model_result = persist_tool_result_for_record(
+        let persisted = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
             Some(&session_id),
+            Some("run-evidence-1"),
             "call-evidence-1",
             "git",
             &content,
             inline,
-        );
+        )
+        .unwrap();
 
-        assert!(model_result.contains(
-            &astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
-                "call-evidence-1"
-            )
-        ));
-        assert!(model_result.contains("introspect(artifact="));
+        assert!(
+            persisted
+                .content
+                .contains("artifact://session/tool-result/")
+        );
+        assert!(
+            persisted
+                .content
+                .contains("Reading retained output requires an authorized artifact reader")
+        );
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
         assert_eq!(
-            astra_turn_core::tool_result_storage::read_persisted_result(&dir, "call-evidence-1"),
-            Some(content),
-            "the model handle and durable evidence must share the same owner/session/call identity"
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                &dir,
+                &persisted.artifact.unwrap(),
+                128 * 1024,
+            )
+            .unwrap(),
+            content,
+            "the model handle and durable evidence must share one immutable identity"
         );
+    }
+
+    #[test]
+    fn missing_run_identity_preserves_full_evidence_without_dead_handle() {
+        let session_id = "session-without-run".to_string();
+        let content = "complete sanitized evidence".repeat(2_000);
+        let persisted = persist_tool_result_for_record_with_authority(
+            Some("reviewer-a"),
+            Some(&session_id),
+            None,
+            "call-without-run",
+            "bash",
+            &content,
+            "bounded preview".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.content, content);
+        assert!(persisted.artifact.is_none());
+        assert!(!persisted.content.contains("artifact://"));
+    }
+
+    #[test]
+    fn durable_record_persistence_emits_run_bound_internal_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("persisted-authority-{}", uuid::Uuid::new_v4());
+        let content = "complete governed evidence\n".repeat(2_000);
+
+        let persisted = persist_tool_result_for_record_with_authority(
+            Some("reviewer-a"),
+            Some(&session_id),
+            Some("run-authority"),
+            "call-authority",
+            "agent",
+            &content,
+            "bounded preview".to_string(),
+        )
+        .unwrap();
+        let descriptor = persisted.artifact.expect("typed artifact authority");
+        assert_eq!(descriptor.call_id, "call-authority");
+        assert_eq!(descriptor.run_id, "run-authority");
+        assert!(
+            persisted
+                .content
+                .contains("artifact://session/tool-result/")
+        );
+        assert!(
+            !persisted.content.contains(&descriptor.content_sha256),
+            "journal authority must not perturb provider-facing display text"
+        );
+        let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
+        assert_eq!(
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                &dir,
+                &descriptor,
+                128 * 1024,
+            )
+            .unwrap(),
+            content
+        );
+    }
+
+    #[test]
+    fn durable_record_identity_conflict_never_inlines_new_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("persisted-conflict-{}", uuid::Uuid::new_v4());
+        let first_bytes = "first acknowledged result";
+        let conflicting_bytes = "second conflicting result must never enter the journal";
+
+        let first = persist_tool_result_for_record_with_authority(
+            Some("reviewer-a"),
+            Some(&session_id),
+            Some("run-conflict"),
+            "call-conflict",
+            "agent",
+            first_bytes,
+            "first preview".to_string(),
+        )
+        .unwrap();
+        let error = persist_tool_result_for_record_with_authority(
+            Some("reviewer-a"),
+            Some(&session_id),
+            Some("run-conflict"),
+            "call-conflict",
+            "agent",
+            conflicting_bytes,
+            "second preview".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            astra_turn_core::tool_result_storage::ToolResultPersistenceError::IdentityConflict { .. }
+        ));
+        let (failure, metadata) = artifact_persistence_failure(&error, false);
+        assert!(!failure.contains(conflicting_bytes));
+        assert_eq!(
+            metadata["artifact_persistence_error_kind"],
+            "identity_conflict"
+        );
+        assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["provider_outcome_acknowledged"], true);
+        let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
+        assert_eq!(
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                &dir,
+                &first.artifact.unwrap(),
+                1024,
+            )
+            .unwrap(),
+            first_bytes
+        );
+    }
+
+    #[test]
+    fn durable_record_io_failure_retains_sanitized_inline_result_without_descriptor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("persisted-io-{}", uuid::Uuid::new_v4());
+        let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool-results"), "not a directory").unwrap();
+        let sanitized = "complete sanitized result retained for degraded audit";
+
+        let persisted = persist_tool_result_for_record_with_authority(
+            Some("reviewer-a"),
+            Some(&session_id),
+            Some("run-io"),
+            "call-io",
+            "agent",
+            sanitized,
+            "bounded preview".to_string(),
+        )
+        .expect("ordinary IO degradation must preserve the original tool outcome");
+
+        assert_eq!(persisted.content, sanitized);
+        assert!(persisted.artifact.is_none());
     }
 
     #[test]
@@ -1061,21 +1491,36 @@ mod tests {
             "test must exercise the lossy presentation boundary, not the size threshold"
         );
 
-        let model_result = persist_tool_result_for_record(
+        let persisted = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
             Some(&session_id),
+            Some("run-bounded-1"),
             "call-bounded-1",
             "bash",
             &content,
             "bounded preview".to_string(),
-        );
+        )
+        .unwrap();
 
-        assert!(model_result.contains("artifact://session/tool-result/"));
-        assert!(model_result.contains("introspect(artifact="));
+        assert!(
+            persisted
+                .content
+                .contains("artifact://session/tool-result/")
+        );
+        assert!(
+            persisted
+                .content
+                .contains("Reading retained output requires an authorized artifact reader")
+        );
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
         assert_eq!(
-            astra_turn_core::tool_result_storage::read_persisted_result(&dir, "call-bounded-1"),
-            Some(content)
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                &dir,
+                &persisted.artifact.unwrap(),
+                128 * 1024,
+            )
+            .unwrap(),
+            content
         );
     }
 
@@ -1094,13 +1539,20 @@ mod tests {
             "fixture must cross the read_file model cap"
         );
 
-        let model_result = model_tool_result_for_followup(
+        let record_result = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
             Some(&session_id),
+            Some("run-read-file-1"),
             "call-read-file-1",
             "read_file",
             &content,
             inline.clone(),
+        )
+        .unwrap();
+        let model_result = model_tool_result_for_followup(
+            astra_tools::ModelResultPresentation::NativeRecovery,
+            inline.clone(),
+            &record_result,
         );
 
         assert_eq!(model_result, inline);
@@ -1109,68 +1561,128 @@ mod tests {
             "read_file should advertise its native start_line/end_line recovery"
         );
 
-        let record_result = persist_tool_result_for_record(
-            Some("reviewer-a"),
-            Some(&session_id),
-            "call-read-file-record-1",
-            "read_file",
-            &content,
-            inline,
+        assert!(
+            record_result
+                .content
+                .contains("artifact://session/tool-result/")
         );
-        assert!(record_result.contains("artifact://session/tool-result/"));
+        let descriptor = record_result.artifact.unwrap();
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
         assert_eq!(
-            astra_turn_core::tool_result_storage::read_persisted_result(
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
                 &dir,
-                "call-read-file-record-1"
-            ),
-            Some(content)
+                &descriptor,
+                128 * 1024,
+            )
+            .unwrap(),
+            content
         );
     }
 
     #[test]
-    fn bounded_introspect_stays_inline_and_uses_facets_for_recovery() {
+    fn bounded_introspect_keeps_structured_projection_inline_and_full_source_durable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = format!("inline-introspect-{}", uuid::Uuid::new_v4());
-        let content = "snapshot\n".repeat(1_200);
-        let inline = astra_turn_core::tool_result_sanitize::truncate_tool_result_for_model(
+        let mut report = astra_turn_core::introspect::build_introspect_report(
+            &astra_turn_core::introspect::IntrospectSnapshot::default(),
+            &astra_turn_core::introspect::IntrospectRequest::default(),
+        );
+        let observation = report.observations[0].clone();
+        report.observations = (0..60)
+            .map(|index| {
+                let mut item = observation.clone();
+                item.ref_id = format!("urn:observation:{index}");
+                item.summary = "bounded source fact ".repeat(20);
+                item
+            })
+            .collect();
+        let content = serde_json::to_string(&report).unwrap();
+        let inline = model_projection_before_artifact_replacement(
             "introspect",
             &content,
+            astra_tools::ModelResultPresentation::NativeRecovery,
         );
         assert_ne!(content, inline, "fixture must cross the generic model cap");
 
-        let model_result = model_tool_result_for_followup(
+        let record_result = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
             Some(&session_id),
+            Some("run-introspect-1"),
             "call-introspect-1",
             "introspect",
             &content,
             inline.clone(),
+        )
+        .unwrap();
+        let model_result = model_tool_result_for_followup(
+            astra_tools::ModelResultPresentation::NativeRecovery,
+            inline.clone(),
+            &record_result,
         );
 
         assert_eq!(model_result, inline);
+        let projected: serde_json::Value = serde_json::from_str(&model_result).unwrap();
+        assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
+        assert_eq!(projected["summary"], report.summary);
         assert!(
             !model_result.contains("introspect(artifact="),
             "introspect should use typed facet requests rather than recursively paging its own snapshot"
         );
 
-        let record_result = persist_tool_result_for_record(
-            Some("reviewer-a"),
-            Some(&session_id),
-            "call-introspect-record-1",
-            "introspect",
-            &content,
-            inline,
+        assert!(
+            record_result
+                .content
+                .contains("artifact://session/tool-result/")
         );
-        assert!(record_result.contains("artifact://session/tool-result/"));
+        let descriptor = record_result.artifact.unwrap();
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
+        let restored = astra_turn_core::tool_result_storage::read_verified_persisted_result(
+            &dir,
+            &descriptor,
+            128 * 1024,
+        )
+        .unwrap();
         assert_eq!(
-            astra_turn_core::tool_result_storage::read_persisted_result(
-                &dir,
-                "call-introspect-record-1"
-            ),
-            Some(content)
+            serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&content).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_bounded_artifact_window_keeps_body_and_cursor_together() {
+        let body = (0..8_192)
+            .map(|index| char::from(b'a' + (index % 26) as u8))
+            .collect::<String>();
+        let window = serde_json::json!({
+            "status": "partial",
+            "content": body,
+            "start_offset": 0,
+            "next_offset": 8192,
+            "total_bytes": 12000,
+        })
+        .to_string();
+
+        let source_bounded = model_projection_before_artifact_replacement(
+            "arbitrary_window_owner",
+            &window,
+            astra_tools::ModelResultPresentation::SourceBounded,
+        );
+        assert_eq!(source_bounded, window);
+        assert_eq!(
+            serde_json::from_str::<Value>(&source_bounded).unwrap()["next_offset"],
+            8192
+        );
+
+        let native_recovery = model_projection_before_artifact_replacement(
+            "arbitrary_native_recovery_owner",
+            &window,
+            astra_tools::ModelResultPresentation::NativeRecovery,
+        );
+        assert_ne!(native_recovery, window);
+        assert!(
+            native_recovery.len() < window.len(),
+            "native recovery must retain the generic model boundary"
         );
     }
 

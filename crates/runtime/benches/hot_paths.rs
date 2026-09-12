@@ -80,7 +80,6 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
-
     let mut group = c.benchmark_group("inject_required_tool_names");
     group.bench_function("5_required_into_2_visible", |b| {
         b.iter(|| {
@@ -135,7 +134,6 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
-
     let mut group = c.benchmark_group("retain_invoked_tool_schemas");
     group.bench_function("5_results_1_visible", |b| {
         b.iter(|| {

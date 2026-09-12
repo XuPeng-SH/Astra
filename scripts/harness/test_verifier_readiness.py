@@ -1961,6 +1961,13 @@ pytest /tests/official-score.py
                 len({record["session"] for record in payload["records"]}), 7
             )
 
+    def test_default_readiness_concurrency_is_serial(self):
+        self.assertEqual(
+            readiness.DEFAULT_MAX_CONCURRENCY,
+            1,
+            "Docker lifecycle readiness must not overlap task environments by default",
+        )
+
     def test_task_probe_error_flattening_is_closed_and_secret_free(self):
         cleanup = readiness.ReadinessStageError(
             "cleanup compose_down", "exception", "runtime"

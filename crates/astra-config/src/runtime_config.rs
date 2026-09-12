@@ -178,42 +178,47 @@ impl Default for AgentBindingRegistryConfig {
 /// Per-turn agentic-loop budget knobs editable via `/config`.
 ///
 /// Defaults of 0 mean "fall through to [`astra_core::RuntimeLimits`]"
-/// (which itself defaults to 150/0). Setting a positive value here
+/// (which leaves total rounds uncapped unless explicitly configured). A positive value here
 /// overrides the env-driven default for the CLI without requiring a
 /// process restart with new `ASTRA_*` exports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeLimitsConfig {
-    /// Max tool calls per user message (regular chat turn).
-    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
+    /// Maximum execution rounds per user message (regular chat turn).
+    /// 0 = inherit the optional `RuntimeLimits::max_turns` constraint.
     #[serde(default)]
     pub max_turns: u32,
 
-    /// Max tool calls per plan subtask. 0 = fall back to `max_turns`.
+    /// Maximum execution rounds per plan subtask. 0 = fall back to `max_turns`.
     #[serde(default)]
     pub plan_subtask_max_turns: u32,
 }
 
 impl RuntimeLimitsConfig {
-    /// Resolve the effective per-turn tool-call ceiling.
+    /// Resolve an optional explicit per-turn execution-round ceiling.
     ///
     /// Config values > 0 override the env-driven [`astra_core::RuntimeLimits`]
     /// singleton. A plan subtask first consults `plan_subtask_max_turns`,
     /// then falls back to `max_turns`, then finally to the env/built-in
     /// `effective_plan_subtask_turns()` behavior.
-    pub fn resolve_turn_ceiling(&self, is_plan_subtask: bool) -> usize {
+    pub fn resolve_turn_ceiling(
+        &self,
+        is_plan_subtask: bool,
+    ) -> Result<Option<std::num::NonZeroUsize>, String> {
         let env_limits = astra_core::RuntimeLimits::global();
         if is_plan_subtask {
             if self.plan_subtask_max_turns > 0 {
-                self.plan_subtask_max_turns as usize
+                Ok(std::num::NonZeroUsize::new(
+                    self.plan_subtask_max_turns as usize,
+                ))
             } else if self.max_turns > 0 {
-                self.max_turns as usize
+                Ok(std::num::NonZeroUsize::new(self.max_turns as usize))
             } else {
                 env_limits.effective_plan_subtask_turns()
             }
         } else if self.max_turns > 0 {
-            self.max_turns as usize
+            Ok(std::num::NonZeroUsize::new(self.max_turns as usize))
         } else {
-            env_limits.max_turns
+            env_limits.max_rounds()
         }
     }
 }
@@ -350,13 +355,19 @@ impl Default for RuntimeConfig {
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.
 ///
+/// This is a local prompt-cost policy: a CLI/Edge process and a Server process
+/// may each resolve their own configuration. It never grants execution
+/// authority. The active deployment boundary's capability binding, allowlist,
+/// and runtime readiness still filter the resulting candidate surface.
+///
 /// # `pinned_tools` semantics
 ///
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
 /// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
 /// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
 /// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
-///   the pinned set (it lands in deferred instead).
+///   the pinned set (it lands in deferred instead). `tool_search` is the
+///   activation protocol floor and cannot be removed.
 /// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
 ///   ignored (see `ToolSurface::build`).
 ///
@@ -3101,12 +3112,15 @@ mod tests {
             max_turns: 8,
             plan_subtask_max_turns: 0,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(false), 8);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(false),
+            Ok(std::num::NonZeroUsize::new(8))
+        );
     }
 
     #[test]
     fn runtime_turn_ceiling_falls_back_to_env_when_zero() {
-        let env_max = astra_core::RuntimeLimits::global().max_turns;
+        let env_max = astra_core::RuntimeLimits::global().max_rounds();
         let cfg = RuntimeLimitsConfig {
             max_turns: 0,
             plan_subtask_max_turns: 0,
@@ -3120,7 +3134,10 @@ mod tests {
             max_turns: 100,
             plan_subtask_max_turns: 20,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(true), 20);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(true),
+            Ok(std::num::NonZeroUsize::new(20))
+        );
     }
 
     #[test]
@@ -3129,7 +3146,10 @@ mod tests {
             max_turns: 30,
             plan_subtask_max_turns: 0,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(true), 30);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(true),
+            Ok(std::num::NonZeroUsize::new(30))
+        );
     }
 
     #[test]

@@ -410,7 +410,7 @@ impl SelfModel {
                 .into_iter()
                 .map(|hint| OutcomeMemoryHint {
                     tool_name: hint.tool_name,
-                    signature: hint.signature,
+                    signature: hint.identity.display_hint(),
                     success: hint.success,
                     failure_category: hint
                         .failure_category
@@ -1464,7 +1464,7 @@ mod tests {
         let config = RuntimeConfig::default();
         let mut health = ToolHealthTracker::new();
         health.record_outcome(
-            r#"bash:{"command":"pwd"}"#,
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), br#"{"command":"pwd"}"#),
             astra_turn_core::tool_health::ToolOutcome {
                 success: true,
                 latency_ms: 9,
@@ -1474,7 +1474,7 @@ mod tests {
             },
         );
         health.record_outcome(
-            r#"grep:{"pattern":"TODO"}"#,
+            &astra_pipeline::ToolHealthIdentity::new("grep".into(), br#"{"pattern":"TODO"}"#),
             astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 12,
@@ -1513,17 +1513,25 @@ mod tests {
             "got: {section}"
         );
         assert!(
-            section.contains(r#"grep:{"pattern":"TODO"}"#),
+            section.contains(
+                &astra_pipeline::ToolHealthIdentity::new("grep".into(), br#"{"pattern":"TODO"}"#)
+                    .display_hint()
+            ),
             "got: {section}"
         );
         assert!(
-            section.contains(r#"bash:{"command":"pwd"}"#),
+            section.contains(
+                &astra_pipeline::ToolHealthIdentity::new("bash".into(), br#"{"command":"pwd"}"#)
+                    .display_hint()
+            ),
             "got: {section}"
         );
         assert!(
             section.contains("fail[timeout]"),
             "failure category tag should be rendered alongside signature, got: {section}"
         );
+        assert!(!section.contains("TODO"));
+        assert!(!section.contains("pwd"));
     }
 
     #[test]

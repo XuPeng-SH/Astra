@@ -63,7 +63,17 @@ impl StartupTerminal {
                 raw_output_flags: None,
                 raw_local_flags: None,
             };
-            execute!(io::stdout(), EnableBracketedPaste)?;
+            match crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                execute!(stdout, EnableBracketedPaste)
+            })? {
+                crate::cli::stream::output_sink::OutputWriteStatus::Written => {}
+                crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "stdout closed during terminal startup",
+                    ));
+                }
+            }
 
             // Startup uses normal line-oriented output. Preserve its newline
             // processing while retaining raw, non-echoing input.
@@ -149,7 +159,9 @@ impl Drop for StartupTerminal {
         #[cfg(unix)]
         if self.owns_raw_mode {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                execute!(stdout, DisableBracketedPaste)
+            });
         }
     }
 }

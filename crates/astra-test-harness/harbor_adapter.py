@@ -25,6 +25,7 @@ from harbor_adapter_env import (
     astra_chat_command,
     astra_inner_timeout,
     astra_runtime_env,
+    validate_cli_readiness,
 )
 
 
@@ -169,6 +170,29 @@ def validate_embedded_build_info(raw: str, expected_git_sha: str) -> dict[str, o
     return value
 
 
+def _is_unpaired_rejection_terminal(event: dict[str, object]) -> bool:
+    """Recognize a server-side preflight rejection without weakening closure.
+
+    The stream is an observation of model/tool protocol, not the executor's
+    callback lifecycle.  Admission can reject a requested call before an
+    executor-owned ``tool_started`` event exists, while still publishing the
+    typed terminal result to the model/UI.  Such a terminal is valid only when
+    both the event and its structured result explicitly carry ``rejected``;
+    ordinary completed/failed events still require a matching start.
+    """
+
+    if event.get("status") != "rejected":
+        return False
+    output = event.get("output")
+    if not isinstance(output, str) or not output:
+        return False
+    try:
+        payload = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "rejected"
+
+
 def validate_stream_event_jsonl(path: Path) -> int:
     """Validate the isolated machine-event artifact and exact tool closure."""
     active_tools: set[str] = set()
@@ -204,9 +228,10 @@ def validate_stream_event_jsonl(path: Path) -> int:
                             )
                         active_tools.add(tool_id)
                     elif tool_id not in active_tools:
-                        raise RuntimeError(
-                            f"Astra machine event {line_number} completes an unknown tool"
-                        )
+                        if not _is_unpaired_rejection_terminal(event):
+                            raise RuntimeError(
+                                f"Astra machine event {line_number} completes an unknown tool"
+                            )
                     else:
                         active_tools.remove(tool_id)
                 event_count += 1
@@ -225,6 +250,7 @@ class Astra(BaseInstalledAgent):
     _REMOTE_BINARY = PurePosixPath("/usr/local/bin/astra")
     _REMOTE_ACCESS_TOKEN_FILE = PurePosixPath("/run/astra-access-token")
     _OUTPUT_FILE = "astra-output.json"
+    _run_failed = False
 
     @staticmethod
     @override
@@ -352,6 +378,15 @@ class Astra(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        # Harbor calls output recovery even when run raises or is cancelled.
+        # Preserve that primary failure; only accepted runs owe scoreable artifacts.
+        self._run_failed = True
+        await self._run_checked(instruction, environment, context)
+        self._run_failed = False
+
+    async def _run_checked(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
         if not self.model_name:
             raise ValueError("Astra Harbor runs require a model name")
 
@@ -372,6 +407,15 @@ class Astra(BaseInstalledAgent):
         runtime_env["ASTRA_ACCESS_TOKEN_FILE"] = (
             self._REMOTE_ACCESS_TOKEN_FILE.as_posix()
         )
+        probe = await environment.exec(
+            command="timeout --signal=TERM --kill-after=2s 10s astra health",
+            user=environment.default_user,
+            env=runtime_env,
+        )
+        validate_cli_readiness(
+            probe.stdout or "", probe.return_code,
+            self._get_env("ASTRA_EXPECTED_BUILD_GIT_SHA"),
+        )
         result = await environment.exec(
             # Match BaseInstalledAgent._exec: the command ends in `tee`, so
             # pipefail is required to preserve Astra's typed non-zero status.
@@ -381,7 +425,25 @@ class Astra(BaseInstalledAgent):
         )
         if result.return_code == 0:
             return
-        if scoreable_interrupted_outcome(result.stdout, result.return_code) is not None:
+        typed_outcome = scoreable_interrupted_outcome(
+            result.stdout, result.return_code
+        )
+        if typed_outcome is None and result.return_code == _ASTRA_PARTIAL_EXIT_CODE:
+            # The CLI's stdout is human-facing and may contain safety or
+            # transport diagnostics before `tee` writes the machine result.
+            # Read the adapter-owned envelope directly instead of extracting
+            # JSON from noisy text.  The same strict schema validation still
+            # applies, so crashes, stale files, and malformed output remain
+            # Harbor exceptions.
+            envelope = await environment.exec(
+                command=f"cat {shlex.quote(output_path.as_posix())}",
+                user=environment.default_user,
+            )
+            if envelope.return_code == 0:
+                typed_outcome = scoreable_interrupted_outcome(
+                    envelope.stdout, result.return_code
+                )
+        if typed_outcome is not None:
             self.logger.info(
                 "Astra returned a typed interrupted outcome; preserving the "
                 "trial for task verification",
@@ -399,6 +461,9 @@ class Astra(BaseInstalledAgent):
         at the adapter boundary makes benchmark cost/efficiency comparisons
         auditable without changing task prompts or provider behavior.
         """
+        if self._run_failed:
+            self.logger.warning("Astra run failed; artifacts remain diagnostic only")
+            return
         output_path = self.logs_dir / self._OUTPUT_FILE
         # Diagnostics remain on stderr and are never parsed as lifecycle
         # evidence. A malformed or polluted dedicated event file invalidates

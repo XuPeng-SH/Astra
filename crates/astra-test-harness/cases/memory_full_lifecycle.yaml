@@ -31,13 +31,15 @@ steps:
       similarly named record from another session. Include the word "retrieved" and
       the marker in your reply.
     criteria:
+      - type: tool_called
+        name: memory
   - prompt: |
       The temporary test fact is no longer needed. Purge it with memory(action=forget), using
       the exact memory_id returned by the successful remember call, and provide an audit reason.
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
+  - type: journal_tool_called
     name: memory
   - type: journal_tool_call_count
     name: memory
@@ -59,7 +61,7 @@ criteria:
         equals: working
     consumer: memory
     consumer_document: result
-    consumer_paths: ["/*/memory_id"]
+    consumer_paths: ["/*/memory_id", "/memories/*/memory_id", "/items/*/memory_id"]
     consumer_filters:
       - document: arguments
         path: /action
@@ -67,6 +69,7 @@ criteria:
       - document: arguments
         path: /scope
         equals: session
+    min_turns_after_producer: 1
   - type: journal_tool_value_flow_bound
     producer: memory
     producer_document: result

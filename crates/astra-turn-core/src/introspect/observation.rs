@@ -375,12 +375,7 @@ fn apply_report_budget(
     evidence: &mut Vec<ObservationEvidence>,
     action_hints: &mut Vec<ObservationActionHint>,
 ) -> ObservationBudgetResult {
-    let (max_observations, max_evidence, max_hints) = match request.depth.as_str() {
-        "hint" => (3, 1, 2),
-        "summary" => (8, 4, 4),
-        "diagnostic" => (32, 16, 8),
-        _ => (100, 50, 8),
-    };
+    let (max_observations, max_evidence, max_hints) = request.depth.report_limits();
 
     // Sort by priority before truncation so high-value observations survive.
     observations.sort_by_key(|o| std::cmp::Reverse(observation_priority_key(o)));
@@ -416,7 +411,7 @@ fn apply_report_budget(
 
 /// Priority key for sorting observations before budget truncation.
 /// Higher = more important. warning > info; higher confidence > lower; system > detail.
-fn observation_priority_key(o: &ObservationRecord) -> i64 {
+pub(super) fn observation_priority_key(o: &ObservationRecord) -> i64 {
     let severity_score = match o.severity.as_str() {
         "critical" => 1000,
         "error" => 800,

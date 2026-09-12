@@ -797,6 +797,7 @@ criteria:
                         consumer_document: actual_consumer_document,
                         consumer_paths: actual_consumer_paths,
                         consumer_filters,
+                        ..
                     } if producer == "memory"
                         && consumer == "memory"
                         && producer_path == "/memory_id"
@@ -829,7 +830,11 @@ criteria:
         assert!(
             has_memory_flow(
                 crate::criteria::JournalToolDocument::Result,
-                vec!["/*/memory_id".to_string()],
+                vec![
+                    "/*/memory_id".to_string(),
+                    "/memories/*/memory_id".to_string(),
+                    "/items/*/memory_id".to_string(),
+                ],
                 "recall",
             ),
             "memory lifecycle must prove remember->recall ID provenance"

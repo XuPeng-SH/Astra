@@ -31,7 +31,7 @@ use crate::explain_dag::{ExplainTurnMeta, render_explain_dag};
 
 use super::app_event::TuiAppEvent;
 use super::bottom_pane::view::BottomPaneViewAction;
-use super::bottom_pane::{BottomPane, BottomPaneAction};
+use super::bottom_pane::{BottomPane, BottomPaneAction, UserIntentRejectReason};
 use super::chat_widget::UserEvent;
 use super::draw::{active_viewport, do_draw};
 use super::event::{TuiEvent, TuiEventStream};
@@ -6645,16 +6645,22 @@ pub(crate) async fn run_tui_session(
                                                                             "intent_{}",
                                                                             uuid::Uuid::now_v7().simple()
                                                                         );
-                                                                        if !bottom_pane.accept_user_intent(
+                                                                        if let Err(reason) = bottom_pane.try_accept_user_intent(
                                                                             intent_id.clone(),
                                                                             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
                                                                             astra_turn_types::UserIntentStatus::AcceptedLocal,
                                                                             queued_text.clone(),
                                                                         ) {
+                                                                            // Empty input is not a guidance intent. It can be
+                                                                            // produced by an internal wake-up submission and must
+                                                                            // remain a quiet no-op, never an ownership error.
+                                                                            if reason == UserIntentRejectReason::EmptyText {
+                                                                                continue;
+                                                                            }
                                                                             bottom_pane.restore_into_composer(&queued_text);
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::error(
-                                                                                    "Could not establish local ownership for this guidance.",
+                                                                                    reason.message(),
                                                                                 ),
                                                                             );
                                                                             continue;

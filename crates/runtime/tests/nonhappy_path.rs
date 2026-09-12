@@ -45,13 +45,13 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_turn_core::stall::{SERVER_STALL_WINDOW, StallSignature, detect_server_stall};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
     #[test]
     fn detects_repetitive_tool_calls() {
-        let sig = BTreeSet::from(["bash".to_string(), "echo hello".to_string()]);
+        let sig = BTreeSet::from([StallSignature::new("bash", b"echo hello")]);
         let tool_sigs = vec![sig.clone(), sig.clone(), sig.clone()];
 
         assert!(
@@ -64,9 +64,9 @@ mod stall_detection {
     /// Proves stall detector allows varied tool calls
     #[test]
     fn allows_varied_tool_calls() {
-        let sig1 = BTreeSet::from(["bash".to_string(), "ls".to_string()]);
-        let sig2 = BTreeSet::from(["bash".to_string(), "pwd".to_string()]);
-        let sig3 = BTreeSet::from(["grep".to_string(), "pattern".to_string()]);
+        let sig1 = BTreeSet::from([StallSignature::new("bash", b"ls")]);
+        let sig2 = BTreeSet::from([StallSignature::new("bash", b"pwd")]);
+        let sig3 = BTreeSet::from([StallSignature::new("grep", b"pattern")]);
         let tool_sigs = vec![sig1, sig2, sig3];
 
         assert!(
@@ -627,6 +627,7 @@ mod error_recovery_integration {
 // and confirms behavioral evidence does not mutate hard restrictions or budget.
 
 mod chat_stream_turnguard_e2e {
+    use astra_pipeline::ToolHealthIdentity;
     use astra_runtime::turn::result_quality::ResultQuality;
     use astra_turn_core::guardrails::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use astra_turn_core::tool_health::ToolHealthTracker;
@@ -897,9 +898,18 @@ mod chat_stream_turnguard_e2e {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
-        guard.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
-        guard.record_cache_hit_for_signature("read_file", "read_file:path=b.txt");
-        guard.record_cache_hit_for_signature("read_file", "read_file:path=c.txt");
+        guard.record_cache_hit_for_signature(&ToolHealthIdentity::new(
+            "read_file".into(),
+            br#"{"path":"a.txt"}"#,
+        ));
+        guard.record_cache_hit_for_signature(&ToolHealthIdentity::new(
+            "read_file".into(),
+            br#"{"path":"b.txt"}"#,
+        ));
+        guard.record_cache_hit_for_signature(&ToolHealthIdentity::new(
+            "read_file".into(),
+            br#"{"path":"c.txt"}"#,
+        ));
 
         let v = guard.evaluate();
         assert!(
@@ -920,7 +930,10 @@ mod chat_stream_turnguard_e2e {
         let mut restricted = HashSet::new();
 
         for _ in 0..3 {
-            guard.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+            guard.record_cache_hit_for_signature(&ToolHealthIdentity::new(
+                "read_file".into(),
+                br#"{"path":"a.txt"}"#,
+            ));
         }
 
         let v = guard.evaluate();

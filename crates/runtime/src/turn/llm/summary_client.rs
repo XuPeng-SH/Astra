@@ -344,8 +344,12 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         &self,
         purpose: InferencePurpose,
         messages: &[Value],
-    ) -> Result<SummaryResponse, String> {
-        let policy = Self::resolve_generation_policy(purpose, &self.route)?;
+    ) -> Result<SummaryResponse, astra_core::ClassifiedError> {
+        let contract_error = |message: String| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+        };
+        let policy =
+            Self::resolve_generation_policy(purpose, &self.route).map_err(contract_error)?;
         let thinking = &policy.thinking;
         let temperature = policy.temperature.call_temperature();
         tracing::debug!(
@@ -364,7 +368,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     attempt_allocator,
                 } = execution.as_ref();
                 let allocator_scope_key =
-                    Self::attempt_allocator_scope_key(base_scope, purpose, &self.route)?;
+                    Self::attempt_allocator_scope_key(base_scope, purpose, &self.route)
+                        .map_err(contract_error)?;
                 let mut collisions = 0;
                 loop {
                     let durable_pair_base = ledger
@@ -378,12 +383,12 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                                 .unwrap_or(&self.route.model_name),
                             &self.route.provider,
                         )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        .await?;
                     // Reserve both identities in one short, non-async critical
                     // section. No allocator lock may span provider or database I/O.
                     let requested_logical_attempt = attempt_allocator
-                        .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)?;
+                        .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)
+                        .map_err(contract_error)?;
                     let outcome = ledger
                         .execute_stream_no_tool_choice(
                             base_scope.with_logical_attempt(requested_logical_attempt),
@@ -434,24 +439,34 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }
         };
         match result {
-            Ok(result) if !result.tool_calls.is_empty() => Err(format!(
-                "summary inference returned {} tool call(s) instead of structured text",
-                result.tool_calls.len()
-            )),
-            Ok(result) if result.full_text.trim().is_empty() => {
-                Err("summary inference returned empty text".to_string())
+            // A no-tool provider response that nevertheless contains a native
+            // or degraded call is a completed transport with invalid
+            // structured output, not a network failure. Return an empty typed
+            // payload so schema-owning callers can take their one bounded
+            // repair path. No call from this private adapter is executable.
+            Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
+                Ok(SummaryResponse {
+                    text: String::new(),
+                    is_ptl_error: false,
+                    finish_reason: result.effective_finish_reason.or(result.finish_reason),
+                    usage: result.usage,
+                })
             }
             Ok(result) => Ok(SummaryResponse {
                 text: result.full_text,
                 is_ptl_error: false,
+                finish_reason: result.effective_finish_reason.or(result.finish_reason),
+                usage: result.usage,
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
                     text: String::new(),
                     is_ptl_error: true,
+                    finish_reason: None,
+                    usage: serde_json::Map::new(),
                 })
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error),
         }
     }
 }
@@ -474,6 +489,7 @@ mod tests {
         admission_conflicts: AtomicU32,
         cursor_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
         cursor_barrier_reads_remaining: AtomicU32,
+        successful_commit_ack_delay: Option<std::time::Duration>,
     }
 
     #[async_trait]
@@ -604,7 +620,11 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner
                 .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
-                .await
+                .await?;
+            if let Some(delay) = self.successful_commit_ack_delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(())
         }
     }
 
@@ -1032,6 +1052,14 @@ mod tests {
             .await
             .expect("the no-tool transport must return summary text");
         assert_eq!(summary.text, "structured summary");
+        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            summary
+                .usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(10)
+        );
 
         let body = captured_body
             .lock()
@@ -1041,6 +1069,112 @@ mod tests {
         assert_eq!(body.get("messages"), Some(&Value::Array(messages)));
         assert_eq!(body.get("tools"), Some(&Value::Array(tools)));
         assert_eq!(body.get("tool_choice"), Some(&Value::String("none".into())));
+    }
+
+    async fn summary_with_commit_ack_delay(
+        delay: std::time::Duration,
+    ) -> (
+        Result<SummaryResponse, astra_core::ClassifiedError>,
+        u32,
+        Vec<u32>,
+    ) {
+        let requests = Arc::new(AtomicU32::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let event = serde_json::json!({
+                        "id": "slow-commit-summary",
+                        "choices": [{"index":0,"delta":{"content":
+                            "{\"work_lifecycle\":\"not_required\",\"execution_topology\":\"primary\"}"},
+                            "finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":100,"completion_tokens":12,
+                            "prompt_tokens_details":{"cached_tokens":64}}
+                    });
+                    Response::builder().status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
+                        .unwrap()
+                }
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let persistence = Arc::new(RecoverFirstAdmissionPersistence {
+            successful_commit_ack_delay: Some(delay),
+            ..Default::default()
+        });
+        let ledger = DurableInferenceLedger::required_with_persistence(
+            None,
+            Some(&execution),
+            "summary-user",
+            Some(persistence.clone()),
+        )
+        .unwrap()
+        .with_run_authority(summary_authority());
+        let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            summary_route(&execution),
+            1_024,
+            ledger,
+            summary_scope(),
+            DurableSummaryAttemptAllocator::default(),
+        );
+        let summary = client
+            .summarize(
+                InferencePurpose::Introspection,
+                &[serde_json::json!({"role":"user","content":"Classify this direct answer request"})],
+            )
+            .await;
+        let attempts = persistence
+            .admitted_logical_attempts
+            .lock()
+            .unwrap()
+            .clone();
+        (summary, requests.load(Ordering::SeqCst), attempts)
+    }
+
+    #[tokio::test]
+    async fn durable_summary_receives_success_and_usage_after_slow_commit_ack() {
+        let (summary, requests, attempts) =
+            summary_with_commit_ack_delay(std::time::Duration::from_secs(1)).await;
+        let summary =
+            summary.expect("unused provider time remains available for commit acknowledgement");
+        astra_services::parse_work_admission_response(&summary.text).unwrap();
+        let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&summary.usage);
+        assert_eq!(usage.input_tokens, 36);
+        assert_eq!(usage.cached_input_tokens, 64);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(requests, 1);
+        assert_eq!(attempts, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn durable_summary_timeout_preserves_error_kind_and_provider_usage() {
+        let (summary, requests, attempts) =
+            summary_with_commit_ack_delay(std::time::Duration::from_secs(9)).await;
+        let error =
+            summary.expect_err("a late durable success cannot authorize foreground delivery");
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            details["deadline"]["phase"],
+            "provider_attempt_terminalization"
+        );
+        let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(
+            details["usage"].as_object().unwrap(),
+        );
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.output_tokens
+            ),
+            (36, 64, 12)
+        );
+        assert_eq!(requests, 1);
+        assert_eq!(attempts, vec![0]);
     }
 
     #[tokio::test]
@@ -1068,7 +1202,7 @@ mod tests {
                             ))
                             .expect("strict provider rejection");
                     }
-                    let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#;
+                    let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary"}"#;
                     if body["stream"] == true {
                         let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":decision},"finish_reason":null}]});
                         return Response::builder().status(200).header("content-type", "text/event-stream")
@@ -1234,6 +1368,52 @@ mod tests {
             .clone()
             .expect("captured configured request");
         assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.7)));
+    }
+
+    #[tokio::test]
+    async fn provider_tool_call_on_no_tool_summary_is_repairable_invalid_output() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let response = serde_json::json!({
+                    "id": "invalid-summary-response",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"work_lifecycle\":\"not_required\"}",
+                            "tool_calls": [{
+                                "id": "forbidden-call",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": "{\"command\":\"true\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+                });
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(response.to_string()))
+                    .expect("summary provider response")
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64);
+        let summary = client
+            .summarize(
+                InferencePurpose::Introspection,
+                &[serde_json::json!({"role": "user", "content": "classify"})],
+            )
+            .await
+            .expect("completed transport must reach the structured repair owner");
+
+        assert!(summary.text.is_empty());
+        assert_eq!(summary.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            summary.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
     }
 
     #[test]
@@ -1447,30 +1627,7 @@ mod tests {
         let response = result
             .expect("provider deadline exceeded")
             .unwrap_or_else(|error| {
-                for marker in [
-                    "DNS",
-                    "resolve",
-                    "non-public",
-                    "timeout",
-                    "budget",
-                    "deadline",
-                    "Budget",
-                    "Deadline",
-                    "exhausted",
-                    "400",
-                    "401",
-                    "403",
-                    "404",
-                    "429",
-                    "ledger",
-                    "admission",
-                    "empty text",
-                    "tool call",
-                ] {
-                    if error.contains(marker) {
-                        eprintln!("live_failure_marker={marker}");
-                    }
-                }
+                eprintln!("live_failure_kind={}", error.kind.as_str());
                 panic!("live summary request failed; credential and response suppressed")
             });
         let parsed = astra_services::parse_work_admission_response(&response.text);
@@ -1591,7 +1748,8 @@ mod tests {
             .summarize(InferencePurpose::Introspection, &messages)
             .await
             .expect_err("N without an available N+1 recovery identity must fail closed");
-        assert!(error.contains("logical attempt space is exhausted"));
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(error.message.contains("logical attempt space is exhausted"));
         assert!(
             persistence
                 .admitted_logical_attempts

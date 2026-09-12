@@ -323,36 +323,121 @@ impl RuntimePolicy {
 
 const POLICY_RECORD_WINDOW: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimePolicyContinuationError {
+    #[error("policy evidence history is unavailable")]
+    HistoryUnavailable,
+    #[error("policy revision space is exhausted")]
+    RevisionExhausted,
+}
+
 /// Incremental state for the canonical behavioral-feedback evaluator.
 /// The bounded record window supports structured overlap/family detectors;
 /// cumulative counters remain scalar and no request scans journal history.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimePolicyEvaluationState {
     revision: u32,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     subject: Option<RuntimePolicySubject>,
+    // The restored journal contains only new local records. This cursor must
+    // never skip them using an offset from the departed process.
+    #[serde(skip)]
     records_cursor: usize,
     /// Run-wide bounded evidence. Failures and rejected requests are retained
     /// because they are precisely the facts the feedback loop must diagnose.
-    record_window: VecDeque<ToolCallRecord>,
+    record_window: VecDeque<astra_turn_core::evaluation::ToolEvaluationFact>,
     /// Evidence local to the active Work item. This resets when ownership
     /// moves to another item so healthy decomposition does not look like one
     /// endlessly wandering investigation.
-    subject_record_window: VecDeque<ToolCallRecord>,
+    subject_record_window: VecDeque<astra_turn_core::evaluation::ToolEvaluationFact>,
     /// Operation-scoped causes that made low-yield evidence strong enough to
     /// affect scheduling. Window aging never clears these; only a successful
     /// execution of the same normalized operation identity does. Keeping the
     /// identity below the tool-name level prevents an unrelated `bash` (or
     /// other multiplexed tool) success from masquerading as recovery.
-    low_yield_problem_operations: BTreeSet<String>,
-    prior_active_failure_operations: BTreeSet<String>,
-    prior_active_rejected_operations: BTreeSet<String>,
+    low_yield_problem_operations: BTreeSet<astra_turn_core::evaluation::EvaluationOutcomeKey>,
+    prior_active_failure_operations: BTreeSet<astra_turn_core::evaluation::EvaluationOutcomeKey>,
+    prior_active_rejected_operations: BTreeSet<astra_turn_core::evaluation::EvaluationOutcomeKey>,
     /// Number of inspection-only authoritative boundaries observed after a
     /// SearchFanout Converge advisory. `None` means no active advisory watch.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     search_converged_followup_inspections: Option<u8>,
     latest: RuntimePolicyFeedbackSet,
 }
 
 impl RuntimePolicyEvaluationState {
+    pub fn preflight_history(
+        &self,
+        records_len: usize,
+    ) -> Result<(), RuntimePolicyContinuationError> {
+        if records_len < self.records_cursor {
+            return Err(RuntimePolicyContinuationError::HistoryUnavailable);
+        }
+        Ok(())
+    }
+    fn validate_continuation(&self) -> Result<(), &'static str> {
+        if self.record_window.len() > POLICY_RECORD_WINDOW
+            || self.subject_record_window.len() > POLICY_RECORD_WINDOW
+        {
+            return Err("policy evidence window exceeds capacity");
+        }
+        for fact in self.record_window.iter().chain(&self.subject_record_window) {
+            fact.validate()?;
+            if !matches!(
+                fact.disposition,
+                ToolCallDisposition::Executed | ToolCallDisposition::Rejected
+            ) {
+                return Err("non-authoritative policy window evidence");
+            }
+        }
+        if self.subject.is_none()
+            && (!self.subject_record_window.is_empty()
+                || !self.low_yield_problem_operations.is_empty()
+                || !self.prior_active_failure_operations.is_empty()
+                || !self.prior_active_rejected_operations.is_empty()
+                || self.search_converged_followup_inspections.is_some()
+                || self.revision != 0
+                || !matches!(self.latest, RuntimePolicyFeedbackSet::NotEvaluated))
+        {
+            return Err("subject-scoped evidence without a policy subject");
+        }
+        if !self.latest.is_valid(u32::MAX) {
+            return Err("invalid policy feedback");
+        }
+        match &self.latest {
+            RuntimePolicyFeedbackSet::NotEvaluated if self.revision != 0 => {
+                return Err("policy revision without evaluation");
+            }
+            RuntimePolicyFeedbackSet::Evaluated {
+                revision, subject, ..
+            } if *revision != self.revision || self.subject.as_ref() != Some(subject) => {
+                return Err("policy feedback identity mismatch");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn serialize_continuation<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        self.validate_continuation()
+            .map_err(serde::ser::Error::custom)?;
+        serde::Serialize::serialize(self, serializer)
+    }
+
+    pub(crate) fn deserialize_continuation<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let state = <Self as serde::Deserialize>::deserialize(deserializer)?;
+        state
+            .validate_continuation()
+            .map_err(serde::de::Error::custom)?;
+        Ok(state)
+    }
+
     #[must_use]
     pub fn latest(&self) -> &RuntimePolicyFeedbackSet {
         &self.latest
@@ -367,7 +452,7 @@ pub fn evaluate_tool_boundary(
     subject: RuntimePolicySubject,
     records: &[ToolCallRecord],
     completed_rounds: u32,
-) -> Option<RuntimePolicyFeedbackSet> {
+) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
     evaluate_tool_boundary_with_thresholds(
         state,
         subject,
@@ -387,11 +472,32 @@ pub fn evaluate_tool_boundary_with_thresholds(
     records: &[ToolCallRecord],
     completed_rounds: u32,
     thresholds: astra_turn_core::evaluation::EvaluationThresholds,
-) -> Option<RuntimePolicyFeedbackSet> {
-    if records.len() < state.records_cursor {
-        *state = RuntimePolicyEvaluationState::default();
+) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
+    state.preflight_history(records.len())?;
+    if state.revision == u32::MAX {
+        // Only the exhausted counter needs a transactional candidate. The
+        // ordinary tool boundary keeps its in-place, bounded update cost.
+        let mut candidate = state.clone();
+        let update = evaluate_policy_boundary(
+            &mut candidate,
+            subject,
+            records,
+            completed_rounds,
+            thresholds,
+        )?;
+        *state = candidate;
+        return Ok(update);
     }
+    evaluate_policy_boundary(state, subject, records, completed_rounds, thresholds)
+}
 
+fn evaluate_policy_boundary(
+    state: &mut RuntimePolicyEvaluationState,
+    subject: RuntimePolicySubject,
+    records: &[ToolCallRecord],
+    completed_rounds: u32,
+    thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
     let subject_changed = state
         .subject
         .as_ref()
@@ -409,6 +515,15 @@ pub fn evaluate_tool_boundary_with_thresholds(
     }
 
     let new_records = &records[state.records_cursor..];
+    let boundary_facts = new_records
+        .iter()
+        .map(|record| {
+            (
+                record,
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(record),
+            )
+        })
+        .collect::<Vec<_>>();
     state.records_cursor = records.len();
     let lifecycle_transition = new_records.iter().any(|record| {
         is_work_lifecycle_tool(&record.name)
@@ -416,7 +531,7 @@ pub fn evaluate_tool_boundary_with_thresholds(
             && record.ok
     });
     let mut authoritative_observation = false;
-    for record in new_records {
+    for (record, fact) in &boundary_facts {
         if is_work_lifecycle_tool(&record.name) {
             continue;
         }
@@ -427,8 +542,8 @@ pub fn evaluate_tool_boundary_with_thresholds(
             continue;
         }
         authoritative_observation = true;
-        state.record_window.push_back(record.clone());
-        state.subject_record_window.push_back(record.clone());
+        state.record_window.push_back(fact.clone());
+        state.subject_record_window.push_back(fact.clone());
         while state.record_window.len() > POLICY_RECORD_WINDOW {
             state.record_window.pop_front();
         }
@@ -440,7 +555,7 @@ pub fn evaluate_tool_boundary_with_thresholds(
         state.search_converged_followup_inspections = None;
     }
     if !authoritative_observation && !subject_changed && !lifecycle_transition {
-        return None;
+        return Ok(None);
     }
 
     let run_window = state.record_window.iter().cloned().collect::<Vec<_>>();
@@ -460,54 +575,52 @@ pub fn evaluate_tool_boundary_with_thresholds(
     // behavioral guidance so a failed attempt cannot steer the next request.
     let successful_subject_window = subject_window
         .iter()
-        .filter(|record| {
-            record.effective_disposition() == ToolCallDisposition::Executed && record.ok
-        })
+        .filter(|record| record.was_executed() && record.ok)
         .cloned()
         .collect::<Vec<_>>();
-    let redundant_reads = astra_turn_core::evaluation::count_active_redundant_overlapping_reads(
-        &successful_subject_window,
-    );
+    let redundant_reads =
+        astra_turn_core::evaluation::count_active_redundant_overlapping_read_facts(
+            &successful_subject_window,
+        );
     let exploration_streak =
-        astra_turn_core::evaluation::exploration_family_round_streak(&successful_subject_window)
+        astra_turn_core::evaluation::exploration_family_fact_streak(&successful_subject_window)
             .map(|(_, streak)| streak)
             .unwrap_or(0);
     let sequential_single_call_streak = trailing_single_tool_round_streak(&subject_window);
     let unresolved_outcomes =
-        astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(&run_window);
+        astra_turn_core::evaluation::count_unresolved_tool_outcome_fact_failures(&run_window);
     let active_failure_operations =
-        astra_turn_core::evaluation::active_execution_failure_operation_keys(&run_window);
+        astra_turn_core::evaluation::active_execution_failure_fact_keys(&run_window)
+            .into_iter()
+            .map(astra_turn_core::evaluation::EvaluationOutcomeKey::Stable)
+            .collect::<BTreeSet<_>>();
     let active_rejected_operations =
-        astra_turn_core::evaluation::active_rejected_operation_keys(&run_window);
+        astra_turn_core::evaluation::active_rejected_fact_keys(&run_window);
     let rejected_requests = active_rejected_operations.len();
     // Resolve sticky scheduler pressure only with tool-scoped authoritative
     // recovery. Invocation shape (batching, a mutation, or changed arguments)
     // is not outcome evidence and cannot clear a prior convergence decision.
-    for record in new_records {
-        if record.effective_disposition() == ToolCallDisposition::Executed && record.ok {
-            for key in astra_turn_core::evaluation::tool_outcome_recovery_keys(record) {
-                state.low_yield_problem_operations.remove(&key);
-            }
-            if let Some(key) = astra_turn_core::evaluation::rejected_operation_key(record) {
+    for (_, fact) in &boundary_facts {
+        if fact.was_executed() && fact.ok {
+            if let Some(key) = policy_operation_key(fact) {
                 state.low_yield_problem_operations.remove(&key);
             }
         }
     }
-    let validation_retries =
-        astra_turn_core::evaluation::max_redundant_validation_retries(&successful_subject_window);
+    let validation_retries = astra_turn_core::evaluation::max_redundant_validation_retries_facts(
+        &successful_subject_window,
+    );
     let search_fanout =
-        astra_turn_core::evaluation::count_search_fanout(&successful_subject_window);
-    let successful_new_records = new_records
+        astra_turn_core::evaluation::count_search_fanout_facts(&successful_subject_window);
+    let successful_new_records = boundary_facts
         .iter()
-        .filter(|record| {
-            !is_work_lifecycle_tool(&record.name)
-                && record.effective_disposition() == ToolCallDisposition::Executed
-                && record.ok
+        .filter(|(record, fact)| {
+            !is_work_lifecycle_tool(&record.name) && fact.was_executed() && fact.ok
         })
-        .cloned()
+        .map(|(_, fact)| fact.clone())
         .collect::<Vec<_>>();
     let new_successful_searches =
-        astra_turn_core::evaluation::count_search_fanout(&successful_new_records);
+        astra_turn_core::evaluation::count_search_fanout_facts(&successful_new_records);
     let authoritative_boundary_records = new_records
         .iter()
         .filter(|record| {
@@ -538,32 +651,23 @@ pub fn evaluate_tool_boundary_with_thresholds(
         } if prior_subject == &subject => entries.as_slice(),
         _ => &[],
     };
-    let reobserved_failure_operations = new_records
+    let reobserved_failure_operations = boundary_facts
         .iter()
-        .filter(|record| {
-            record.effective_disposition() == ToolCallDisposition::Executed
-                && !record.ok
-                && astra_turn_core::evaluation::tool_outcome_operation_key(record)
-                    .is_some_and(|key| active_failure_operations.contains(&key))
-                && state.prior_active_failure_operations.contains(
-                    &astra_turn_core::evaluation::tool_outcome_operation_key(record)
-                        .unwrap_or_default(),
-                )
+        .filter(|(_, fact)| fact.was_executed() && !fact.ok)
+        .filter_map(|(_, fact)| policy_operation_key(fact))
+        .filter(|key| {
+            active_failure_operations.contains(key)
+                && state.prior_active_failure_operations.contains(key)
         })
-        .filter_map(astra_turn_core::evaluation::tool_outcome_operation_key)
         .collect::<BTreeSet<_>>();
-    let reobserved_rejected_operations = new_records
+    let reobserved_rejected_operations = boundary_facts
         .iter()
-        .filter(|record| {
-            record.effective_disposition() == ToolCallDisposition::Rejected
-                && astra_turn_core::evaluation::rejected_operation_key(record)
-                    .is_some_and(|key| active_rejected_operations.contains(&key))
-                && state.prior_active_rejected_operations.contains(
-                    &astra_turn_core::evaluation::rejected_operation_key(record)
-                        .unwrap_or_default(),
-                )
+        .filter(|(_, fact)| fact.disposition == ToolCallDisposition::Rejected)
+        .filter_map(|(_, fact)| policy_operation_key(fact))
+        .filter(|key| {
+            active_rejected_operations.contains(key)
+                && state.prior_active_rejected_operations.contains(key)
         })
-        .filter_map(astra_turn_core::evaluation::rejected_operation_key)
         .collect::<BTreeSet<_>>();
     let signal_reobserved = |signal| match signal {
         RuntimePolicySignal::UnresolvedToolOutcomes => !reobserved_failure_operations.is_empty(),
@@ -810,7 +914,16 @@ pub fn evaluate_tool_boundary_with_thresholds(
 /// or scratch mutation is still one model/tool round and therefore cannot
 /// masquerade as a cadence recovery. A batched round, non-executed request, or
 /// missing round identity breaks the streak. The result remains advisory-only.
-fn trailing_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
+fn policy_operation_key(
+    fact: &astra_turn_core::evaluation::ToolEvaluationFact,
+) -> Option<astra_turn_core::evaluation::EvaluationOutcomeKey> {
+    fact.operation_identity()
+        .map(astra_turn_core::evaluation::EvaluationOutcomeKey::Stable)
+}
+
+fn trailing_single_tool_round_streak(
+    records: &[astra_turn_core::evaluation::ToolEvaluationFact],
+) -> usize {
     let mut index = records.len();
     let mut streak = 0;
 
@@ -827,7 +940,7 @@ fn trailing_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
             break;
         }
         let record = &round_records[0];
-        if record.effective_disposition() != ToolCallDisposition::Executed {
+        if !record.was_executed() {
             break;
         }
         streak += 1;
@@ -841,27 +954,27 @@ fn publish_policy_set(
     subject: RuntimePolicySubject,
     evaluated_at_round: u32,
     entries: Vec<RuntimePolicyFeedbackEntry>,
-) -> Option<RuntimePolicyFeedbackSet> {
-    let next_revision = match state.revision.checked_add(1) {
-        Some(revision) => revision,
-        None => {
-            state.latest = RuntimePolicyFeedbackSet::NotEvaluated;
-            return Some(state.latest.clone());
-        }
-    };
-    let candidate = RuntimePolicyFeedbackSet::Evaluated {
+) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
+    let mut candidate = RuntimePolicyFeedbackSet::Evaluated {
         schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
-        revision: next_revision,
+        revision: state.revision,
         evaluated_at_round,
         subject,
         entries,
     };
     if policy_semantically_equal(&state.latest, &candidate) {
-        return None;
+        return Ok(None);
+    }
+    let next_revision = state
+        .revision
+        .checked_add(1)
+        .ok_or(RuntimePolicyContinuationError::RevisionExhausted)?;
+    if let RuntimePolicyFeedbackSet::Evaluated { revision, .. } = &mut candidate {
+        *revision = next_revision;
     }
     state.revision = next_revision;
     state.latest = candidate.clone();
-    Some(candidate)
+    Ok(Some(candidate))
 }
 
 fn policy_semantically_equal(
@@ -1061,10 +1174,10 @@ fn recommendation_text(
             "Overlapping reads persisted after prior feedback. Do not reread known content; decide from it or inspect only one precise unseen range that directly resolves the active subject."
         }
         (RuntimePolicyRecommendation::DiagnoseToolOutcomes, RuntimePolicyStage::Observe) => {
-            "Multiple typed tool outcomes remain unresolved. Separate environment/capability failure from product failure; if the same operation has failed again, stop trying adjacent variants, use a known-good alternative or introspect live tool health, then resolve the exact failure. While a Work item has unresolved execution evidence, do not settle it as delivered: continue with a materially different repair or validation step, or settle blocked/failed with the verified limiting fact."
+            "Some tool calls failed. Treat each failure as scoped evidence: stop retrying the same operation, use a known-good alternative, and continue the task's next authorized mutation when its prerequisites are sufficient. Do not claim the affected Work item is delivered until its outcome is directly evidenced; report blocked/failed only when the failure prevents the requested result."
         }
         (RuntimePolicyRecommendation::DiagnoseToolOutcomes, RuntimePolicyStage::Converge) => {
-            "Tool outcomes remain unresolved after prior feedback. Stop retrying adjacent variants; use introspect for the live failure pattern, then change the execution path. Do not settle an active Work item as delivered until the relevant failure is resolved by direct evidence; if it cannot be resolved, settle blocked/failed with the verified limiting fact."
+            "The same operation still fails. Stop retrying adjacent variants; use introspect or one materially different path. This failure does not block unrelated authorized progress, but do not mark the affected Work item delivered until direct evidence resolves it; otherwise settle blocked/failed with the verified limitation."
         }
         (RuntimePolicyRecommendation::RepairToolRequest, RuntimePolicyStage::Observe) => {
             "Several tool requests were rejected before execution. Re-read the visible schema and repair the exact arguments or authority boundary before issuing another request."
@@ -1148,6 +1261,55 @@ mod tests {
         record
     }
 
+    #[test]
+    fn policy_continuation_preserves_windows_and_rebinds_only_local_cursor() {
+        let subject = work_subject("original-item");
+        let mut original = RuntimePolicyEvaluationState::default();
+        let mut records = Vec::new();
+        for round in 0..70 {
+            records.push(executed("grep", r#"{"pattern":"private-sentinel"}"#, round));
+            evaluate_tool_boundary(&mut original, subject.clone(), &records, round).unwrap();
+        }
+        let wire = original
+            .serialize_continuation(serde_json::value::Serializer)
+            .unwrap();
+        assert!(!wire.to_string().contains("private-sentinel"));
+        assert!(wire.get("records_cursor").is_none());
+        let mut restored =
+            RuntimePolicyEvaluationState::deserialize_continuation(wire.clone()).unwrap();
+        assert_eq!(restored.records_cursor, 0);
+        assert_eq!(restored.record_window.len(), 64);
+        assert!(
+            evaluate_tool_boundary(&mut restored, subject.clone(), &[], 69)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+        let mut suffix = Vec::new();
+        for round in 70..80 {
+            let record = executed("grep", r#"{"pattern":"different"}"#, round);
+            records.push(record.clone());
+            suffix.push(record);
+            let expected =
+                evaluate_tool_boundary(&mut original, subject.clone(), &records, round).unwrap();
+            let actual =
+                evaluate_tool_boundary(&mut restored, subject.clone(), &suffix, round).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        let before = serde_json::to_value(&original).unwrap();
+        let cursor = original.records_cursor;
+        assert_eq!(
+            evaluate_tool_boundary(&mut original, subject, &[], 80),
+            Err(RuntimePolicyContinuationError::HistoryUnavailable)
+        );
+        assert_eq!(original.records_cursor, cursor);
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
+    }
+
     fn entries(set: &RuntimePolicyFeedbackSet) -> &[RuntimePolicyFeedbackEntry] {
         let RuntimePolicyFeedbackSet::Evaluated { entries, .. } = set else {
             panic!("evaluated feedback expected");
@@ -1156,18 +1318,85 @@ mod tests {
     }
 
     #[test]
+    fn policy_continuation_rejects_contradictions_not_failed_request_arguments() {
+        let mut state = RuntimePolicyEvaluationState::default();
+        let record = failed(
+            "read_file",
+            r#"{"path":"","start_line":20,"end_line":1}"#,
+            1,
+            "execution_error",
+        );
+        evaluate_tool_boundary(&mut state, work_subject("item"), &[record], 1).unwrap();
+        let wire = state
+            .serialize_continuation(serde_json::value::Serializer)
+            .unwrap();
+        assert!(RuntimePolicyEvaluationState::deserialize_continuation(wire.clone()).is_ok());
+        let mut orphan = wire.clone();
+        orphan["subject"] = serde_json::Value::Null;
+        assert!(RuntimePolicyEvaluationState::deserialize_continuation(orphan).is_err());
+        let mut contradiction = wire;
+        contradiction["record_window"][0]["non_failure_outcome"] = serde_json::json!(true);
+        assert!(RuntimePolicyEvaluationState::deserialize_continuation(contradiction).is_err());
+        for field in [
+            "subject",
+            "record_window",
+            "latest",
+            "search_converged_followup_inspections",
+        ] {
+            let mut missing = serde_json::to_value(&state).unwrap();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(RuntimePolicyEvaluationState::deserialize_continuation(missing).is_err());
+        }
+    }
+
+    #[test]
+    fn exhausted_revision_allows_unchanged_feedback_without_losing_state() {
+        let subject = work_subject("item");
+        let mut state = RuntimePolicyEvaluationState::default();
+        let mut records = vec![executed("write_file", r#"{"path":"a","content":"x"}"#, 1)];
+        evaluate_tool_boundary(&mut state, subject.clone(), &records, 1).unwrap();
+        state.revision = u32::MAX;
+        if let RuntimePolicyFeedbackSet::Evaluated { revision, .. } = &mut state.latest {
+            *revision = u32::MAX;
+        }
+        assert!(
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+                .unwrap()
+                .is_none()
+        );
+        records.push(executed("write_file", r#"{"path":"a","content":"y"}"#, 2));
+        assert!(
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.records_cursor, 2);
+        let before = serde_json::to_value(&state).unwrap();
+        let cursor = state.records_cursor;
+        assert_eq!(
+            evaluate_tool_boundary(&mut state, work_subject("different-item"), &records, 2),
+            Err(RuntimePolicyContinuationError::RevisionExhausted)
+        );
+        assert_eq!(state.records_cursor, cursor);
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    }
+
+    #[test]
     fn canonical_policy_advances_only_on_new_authoritative_terminal_evidence() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = work_subject("item-1");
         let mut records = vec![executed("read_file", r#"{"path":"a.rs"}"#, 1)];
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+            .unwrap()
             .expect("initial evaluation");
         assert!(matches!(
             first,
             RuntimePolicyFeedbackSet::Evaluated { revision: 1, .. }
         ));
         assert!(
-            evaluate_tool_boundary(&mut state, subject.clone(), &records, 1).is_none(),
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+                .unwrap()
+                .is_none(),
             "request preparation/retry without a terminal tool fact must reuse exact bytes"
         );
 
@@ -1175,6 +1404,7 @@ mod tests {
         records.push(executed("read_file", r#"{"path":"a.rs"}"#, 3));
         records.push(executed("read_file", r#"{"path":"a.rs"}"#, 3));
         let converging = evaluate_tool_boundary(&mut state, subject, &records, 3)
+            .unwrap()
             .expect("calibrated redundant-read evidence changes policy");
         let RuntimePolicyFeedbackSet::Evaluated {
             revision, entries, ..
@@ -1189,6 +1419,7 @@ mod tests {
 
         records.push(executed("read_file", r#"{"path":"a.rs"}"#, 4));
         let converged = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 4)
+            .unwrap()
             .expect("continued redundant reads advance an observed signal to converge");
         assert!(matches!(
             converged,
@@ -1202,6 +1433,7 @@ mod tests {
             "the shared calibrated detector must treat mutation as invalidation"
         );
         let resolved = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 5)
+            .unwrap()
             .expect("a workspace mutation invalidates stale read-overlap evidence");
         assert!(matches!(
             resolved,
@@ -1214,7 +1446,9 @@ mod tests {
 
         records.push(executed("read_file", r#"{"path":"d.rs"}"#, 6));
         assert!(
-            evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 6).is_none(),
+            evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 6)
+                .unwrap()
+                .is_none(),
             "stable resolved evidence must reuse the exact policy revision"
         );
     }
@@ -1228,6 +1462,7 @@ mod tests {
             failed("bash", r#"{"command":"check-b"}"#, 2, "execution_error"),
         ];
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
+            .unwrap()
             .expect("failed terminal outcomes must advance policy evidence");
         assert!(entries(&observed).iter().any(|entry| {
             entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes
@@ -1240,6 +1475,7 @@ mod tests {
         recovered.push(executed("bash", r#"{"command":"check-b"}"#, 3));
         recovered.last_mut().unwrap().result_class = Some("success".to_string());
         let resolved = evaluate_tool_boundary(&mut state, subject, &recovered, 3)
+            .unwrap()
             .expect("authoritative success must clear stale failure feedback");
         assert!(
             !entries(&resolved)
@@ -1300,6 +1536,7 @@ mod tests {
             10,
             thresholds,
         )
+        .unwrap()
         .expect("failed terminal outcomes are authoritative evidence");
 
         let signals = entries(&feedback)
@@ -1328,6 +1565,7 @@ mod tests {
         records
             .extend((2..=4).map(|round| executed("read_file", r#"{"path":"src/lib.rs"}"#, round)));
         let first = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 4)
+            .unwrap()
             .expect("successful reads produce overlap evidence");
         assert!(
             entries(&first)
@@ -1343,6 +1581,7 @@ mod tests {
         ));
         let after_failed_mutation =
             evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 5)
+                .unwrap()
                 .expect("the failed mutation is new failure evidence");
         assert!(
             entries(&after_failed_mutation)
@@ -1360,6 +1599,7 @@ mod tests {
         failed_call.result_class = None;
         let records = vec![failed_call];
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+            .unwrap()
             .expect("an unclassified governed failure must still advance policy evidence");
         assert!(entries(&observed).iter().any(|entry| {
             entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes
@@ -1370,6 +1610,7 @@ mod tests {
         recovered.result_class = None;
         let resolved =
             evaluate_tool_boundary(&mut state, subject, &[records[0].clone(), recovered], 2)
+                .unwrap()
                 .expect("a matching successful operation must update policy evidence");
         assert!(
             !entries(&resolved)
@@ -1393,6 +1634,7 @@ mod tests {
         }];
 
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+            .unwrap()
             .expect("a typed rejection is actionable evidence");
         let first_entry = entries(&first)
             .iter()
@@ -1403,7 +1645,9 @@ mod tests {
         let mut continued = records;
         continued.push(executed("grep", r#"{"pattern":"next"}"#, 2));
         assert!(
-            evaluate_tool_boundary(&mut state, subject.clone(), &continued, 2).is_none(),
+            evaluate_tool_boundary(&mut state, subject.clone(), &continued, 2)
+                .unwrap()
+                .is_none(),
             "unrelated healthy evidence must not escalate or churn advisory bytes"
         );
         let latest_entry = entries(state.latest())
@@ -1422,6 +1666,7 @@ mod tests {
             ..Default::default()
         });
         let converged = evaluate_tool_boundary(&mut state, subject, &continued, 3)
+            .unwrap()
             .expect("additional rejected evidence advances the stage");
         let converged_entry = entries(&converged)
             .iter()
@@ -1444,6 +1689,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let feedback = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 1)
+            .unwrap()
             .expect("new authoritative evidence");
         assert_eq!(
             entries(&feedback)
@@ -1476,6 +1722,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let feedback = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 20)
+            .unwrap()
             .expect("new authoritative evidence");
         assert!(entries(&feedback).is_empty(), "{feedback:?}");
     }
@@ -1496,6 +1743,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold)
+            .unwrap()
             .expect("threshold boundary must publish typed cadence evidence");
         assert_eq!(
             entries(&observed)
@@ -1512,6 +1760,7 @@ mod tests {
         ));
         let still_observed =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1)
+                .unwrap()
                 .expect("one extra single-call round remains in the grace window");
         assert_eq!(
             entries(&still_observed)
@@ -1528,6 +1777,7 @@ mod tests {
         );
         let still_advisory =
             evaluate_tool_boundary(&mut state, subject, &records, convergence_round)
+                .unwrap()
                 .expect("cadence-only evidence remains advisory after the grace window");
         assert_eq!(
             entries(&still_advisory)
@@ -1546,7 +1796,15 @@ mod tests {
             .collect::<Vec<_>>();
         records.push(executed("probe", r#"{"query":"a"}"#, threshold));
         records.push(executed("probe", r#"{"query":"b"}"#, threshold));
-        assert_eq!(trailing_single_tool_round_streak(&records), 0);
+        assert_eq!(
+            trailing_single_tool_round_streak(
+                &records
+                    .iter()
+                    .map(astra_turn_core::evaluation::ToolEvaluationFact::from_record)
+                    .collect::<Vec<_>>()
+            ),
+            0
+        );
 
         records.push(executed(
             "str_replace",
@@ -1559,7 +1817,15 @@ mod tests {
             threshold + 2,
             "execution_error",
         ));
-        assert_eq!(trailing_single_tool_round_streak(&records), 2);
+        assert_eq!(
+            trailing_single_tool_round_streak(
+                &records
+                    .iter()
+                    .map(astra_turn_core::evaluation::ToolEvaluationFact::from_record)
+                    .collect::<Vec<_>>()
+            ),
+            2
+        );
     }
 
     #[test]
@@ -1570,6 +1836,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let feedback = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 6)
+            .unwrap()
             .expect("authoritative calls are evaluated");
         assert!(
             entries(&feedback)
@@ -1604,6 +1871,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold)
+            .unwrap()
             .expect("mixed single-call cadence is observed");
         assert_eq!(
             entries(&observed)
@@ -1623,6 +1891,7 @@ mod tests {
         }));
         let corroborator_converged =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, convergence_round)
+                .unwrap()
                 .expect("the independent failure signal first reaches convergence");
         assert_eq!(
             entries(&corroborator_converged)
@@ -1641,6 +1910,7 @@ mod tests {
         ));
         let converged =
             evaluate_tool_boundary(&mut state, subject, &records, convergence_round + 1)
+                .unwrap()
                 .expect("persisted converged corroboration is re-evaluated");
         assert_eq!(
             entries(&converged)
@@ -1661,6 +1931,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 5)
+            .unwrap()
             .expect("long serial cadence is visible");
         assert_eq!(
             entries(&observed)
@@ -1678,6 +1949,7 @@ mod tests {
         ));
         let after_failure =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 6)
+                .unwrap()
                 .expect("the failed hypothesis is evaluated");
         assert_eq!(
             entries(&after_failure)
@@ -1694,6 +1966,7 @@ mod tests {
             threshold + 7,
         ));
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, threshold + 7)
+            .unwrap()
             .expect("the recovered failure is evaluated");
         assert_eq!(
             entries(&recovered)
@@ -1716,7 +1989,7 @@ mod tests {
         let mut records = (1..=13)
             .map(|round| executed("probe", &format!(r#"{{"step":{round}}}"#), round))
             .collect::<Vec<_>>();
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 13);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 13).unwrap();
 
         for round in 14..=15 {
             records.push(failed(
@@ -1726,6 +1999,7 @@ mod tests {
                 "execution_error",
             ));
             let feedback = evaluate_tool_boundary(&mut state, subject.clone(), &records, round)
+                .unwrap()
                 .expect("late failure boundary is evaluated");
             assert!(
                 !feedback_requires_convergence(&feedback),
@@ -1735,6 +2009,7 @@ mod tests {
 
         records.push(executed("parser", r#"{"attempt":"persistent"}"#, 16));
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 16)
+            .unwrap()
             .expect("same-tool recovery is evaluated");
         assert!(!feedback_requires_convergence(&recovered));
         assert!(
@@ -1757,7 +2032,7 @@ mod tests {
             if round > 1 {
                 records.push(executed("probe", &format!(r#"{{"step":{round}}}"#), round));
             }
-            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
+            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
             assert!(
                 !feedback_requires_convergence(state.latest()),
                 "healthy serial progress must retain its execution budget at round {round}"
@@ -1779,7 +2054,7 @@ mod tests {
         let subject = RuntimePolicySubject::Run;
         let threshold = astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD as u32;
         let mut records = vec![failed("bash", r#"{"command":"slow-check"}"#, 1, "timeout")];
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1).unwrap();
 
         for round in 2..=threshold + 3 {
             records.push(executed(
@@ -1792,7 +2067,7 @@ mod tests {
                 &format!(r#"{{"round":{round},"part":"b"}}"#),
                 round,
             ));
-            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
+            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
             let feedback = state.latest();
             assert_eq!(
                 entries(feedback)
@@ -1817,6 +2092,7 @@ mod tests {
             "timeout",
         ));
         let reobserved = evaluate_tool_boundary(&mut state, subject, &records, threshold + 4)
+            .unwrap()
             .expect("the same failed operation is reobserved");
         assert!(entries(&reobserved).iter().any(|entry| {
             entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes
@@ -1845,6 +2121,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold)
+            .unwrap()
             .expect("threshold crossing must be visible without an unrelated failure");
         assert_eq!(
             entries(&observed)
@@ -1862,6 +2139,7 @@ mod tests {
         ));
         let unchanged =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1)
+                .unwrap()
                 .expect("the new non-search boundary updates cadence evidence");
         assert_eq!(
             entries(&unchanged)
@@ -1878,6 +2156,7 @@ mod tests {
             threshold + 2,
         ));
         let persisted = evaluate_tool_boundary(&mut state, subject, &records, threshold + 2)
+            .unwrap()
             .expect("additional search evidence advances the advisory");
         assert_eq!(
             entries(&persisted)
@@ -1912,9 +2191,11 @@ mod tests {
             subject.clone(),
             &records[..threshold as usize],
             threshold,
-        );
+        )
+        .unwrap();
         let converged =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1)
+                .unwrap()
                 .expect("new search evidence converges the advisory");
         assert!(!feedback_requires_convergence(&converged));
 
@@ -1925,6 +2206,7 @@ mod tests {
         ));
         let one_precise_followup =
             evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2)
+                .unwrap()
                 .expect("first precise inspection is evaluated");
         assert!(
             !feedback_requires_convergence(&one_precise_followup),
@@ -1937,6 +2219,7 @@ mod tests {
             threshold + 3,
         ));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
+            .unwrap()
             .expect("continued inspection after the allowance changes guidance");
         assert!(
             feedback_requires_convergence(&ignored),
@@ -1963,21 +2246,25 @@ mod tests {
             subject.clone(),
             &records[..threshold as usize],
             threshold,
-        );
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1);
+        )
+        .unwrap();
+        let _ =
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1).unwrap();
 
         records.push(executed(
             "read_file",
             r#"{"path":"src/exact_gap.rs"}"#,
             threshold + 2,
         ));
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2);
+        let _ =
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2).unwrap();
         records.push(executed(
             "bash",
             r#"{"command":"cargo test"}"#,
             threshold + 3,
         ));
         let acted = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 3)
+            .unwrap()
             .expect("decisive action updates feedback");
         assert!(!feedback_requires_convergence(&acted));
 
@@ -1989,6 +2276,7 @@ mod tests {
             ));
             let feedback =
                 evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + offset)
+                    .unwrap()
                     .expect("post-action inspection is evaluated");
             assert!(
                 !feedback_requires_convergence(&feedback),
@@ -2016,8 +2304,10 @@ mod tests {
             subject.clone(),
             &records[..threshold as usize],
             threshold,
-        );
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1);
+        )
+        .unwrap();
+        let _ =
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1).unwrap();
 
         records.push(executed(
             "introspect",
@@ -2025,6 +2315,7 @@ mod tests {
             threshold + 2,
         ));
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2)
+            .unwrap()
             .expect("introspection boundary is evaluated");
         assert!(!feedback_requires_convergence(&first));
 
@@ -2034,6 +2325,7 @@ mod tests {
             threshold + 3,
         ));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 3)
+            .unwrap()
             .expect("continued inspection is evaluated");
         assert!(feedback_requires_convergence(&ignored));
     }
@@ -2052,14 +2344,15 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1).unwrap();
         records.push(executed("bash", r#"{"command":"rg batch-b src"}"#, 2));
         let converged = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
+            .unwrap()
             .expect("second search boundary converges");
         assert!(!feedback_requires_convergence(&converged));
 
         records.push(executed("list_dir", r#"{"path":"src"}"#, 3));
-        let grace = evaluate_tool_boundary(&mut state, subject.clone(), &records, 3);
+        let grace = evaluate_tool_boundary(&mut state, subject.clone(), &records, 3).unwrap();
         assert!(
             grace
                 .as_ref()
@@ -2068,6 +2361,7 @@ mod tests {
         );
         records.push(executed("git", r#"{"action":"show","ref":"HEAD"}"#, 4));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, 4)
+            .unwrap()
             .expect("second observation advances guidance");
         assert!(feedback_requires_convergence(&ignored));
     }
@@ -2091,14 +2385,17 @@ mod tests {
             subject.clone(),
             &records[..threshold as usize],
             threshold,
-        );
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1);
+        )
+        .unwrap();
+        let _ =
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 1).unwrap();
         records.push(executed(
             "read_file",
             r#"{"path":"src/grace.rs"}"#,
             threshold + 2,
         ));
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2);
+        let _ =
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 2).unwrap();
         let before = state.latest().clone();
 
         records.push(ToolCallRecord {
@@ -2109,7 +2406,9 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 3).is_none(),
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, threshold + 3)
+                .unwrap()
+                .is_none(),
             "reused lifecycle metadata must not create a semantic revision"
         );
         assert_eq!(state.latest(), &before);
@@ -2120,6 +2419,7 @@ mod tests {
             threshold + 4,
         ));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, threshold + 4)
+            .unwrap()
             .expect("next authoritative inspection consumes the active watch");
         assert!(feedback_requires_convergence(&ignored));
     }
@@ -2207,7 +2507,8 @@ mod tests {
 
         assert!(!record_is_observation_only(&record));
         assert!(record_is_decisive_transition(&record));
-        let feedback = evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1);
+        let feedback =
+            evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1).unwrap();
         assert!(state.search_converged_followup_inspections.is_none());
         assert!(
             feedback
@@ -2250,6 +2551,7 @@ mod tests {
             assert!(!record_is_decisive_transition(&record));
             let feedback =
                 evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1)
+                    .unwrap()
                     .expect("second inspection advances ignored-advisory guidance");
             assert!(feedback_requires_convergence(&feedback));
             assert_eq!(state.search_converged_followup_inspections, Some(2));
@@ -2270,7 +2572,8 @@ mod tests {
                 ok: disposition == ToolCallDisposition::Executed,
                 ..Default::default()
             }];
-            let _ = evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 1);
+            let _ =
+                evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 1).unwrap();
             assert_eq!(
                 state.search_converged_followup_inspections.is_none(),
                 disposition == ToolCallDisposition::Executed,
@@ -2301,7 +2604,8 @@ mod tests {
             &records,
             2,
             thresholds,
-        );
+        )
+        .unwrap();
         records.extend([
             executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
             executed("read_file", r#"{"path":"src/a.rs"}"#, 3),
@@ -2329,6 +2633,7 @@ mod tests {
             3,
             thresholds,
         )
+        .unwrap()
         .expect("saturated projection is evaluated");
         assert!(
             entries(&saturated)
@@ -2349,7 +2654,8 @@ mod tests {
                 &records,
                 round,
                 thresholds,
-            );
+            )
+            .unwrap();
             let current = feedback.as_ref().unwrap_or_else(|| state.latest());
             assert!(
                 !feedback_requires_convergence(current),
@@ -2376,7 +2682,8 @@ mod tests {
             &records,
             1,
             thresholds,
-        );
+        )
+        .unwrap();
         records.push(executed("bash", r#"{"command":"rg second src"}"#, 2));
         let delivered = evaluate_tool_boundary_with_thresholds(
             &mut state,
@@ -2385,6 +2692,7 @@ mod tests {
             2,
             thresholds,
         )
+        .unwrap()
         .expect("search convergence is projected");
         assert!(entries(&delivered).iter().any(|entry| {
             entry.signal == RuntimePolicySignal::SearchFanout
@@ -2417,6 +2725,7 @@ mod tests {
             3,
             thresholds,
         )
+        .unwrap()
         .expect("the saturated projection changes");
         assert!(
             entries(&evicted)
@@ -2431,6 +2740,7 @@ mod tests {
         ));
         let ignored =
             evaluate_tool_boundary_with_thresholds(&mut state, subject, &records, 4, thresholds)
+                .unwrap()
                 .expect("ignored guidance reserves a projection slot");
         assert!(feedback_requires_convergence(&ignored));
     }
@@ -2457,7 +2767,8 @@ mod tests {
                 &records,
                 round,
                 thresholds,
-            );
+            )
+            .unwrap();
         }
         records.push(executed("bash", r#"{"command":"cargo test"}"#, 4));
         let reset = evaluate_tool_boundary_with_thresholds(
@@ -2466,7 +2777,8 @@ mod tests {
             &records,
             4,
             thresholds,
-        );
+        )
+        .unwrap();
         assert!(state.search_converged_followup_inspections.is_none());
         let current = reset.as_ref().unwrap_or_else(|| state.latest());
         assert!(!feedback_requires_convergence(current));
@@ -2483,7 +2795,8 @@ mod tests {
                 &records,
                 round,
                 thresholds,
-            );
+            )
+            .unwrap();
         }
         for round in 70..=72 {
             records.push(executed(
@@ -2497,7 +2810,8 @@ mod tests {
                 &records,
                 round,
                 thresholds,
-            );
+            )
+            .unwrap();
         }
         for round in 73..=74 {
             records.push(executed(
@@ -2511,7 +2825,8 @@ mod tests {
                 &records,
                 round,
                 thresholds,
-            );
+            )
+            .unwrap();
         }
         assert!(
             feedback_requires_convergence(state.latest()),
@@ -2526,9 +2841,10 @@ mod tests {
         let mut records = (1..=10)
             .map(|round| failed("probe", "{}", round, "execution_error"))
             .collect::<Vec<_>>();
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records[..8], 8);
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records[..9], 9);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records[..8], 8).unwrap();
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records[..9], 9).unwrap();
         let converged = evaluate_tool_boundary(&mut state, subject.clone(), &records, 10)
+            .unwrap()
             .expect("persistent failure cadence converges");
         assert!(
             feedback_requires_convergence(&converged),
@@ -2545,6 +2861,7 @@ mod tests {
             ..Default::default()
         });
         let still_converged = evaluate_tool_boundary(&mut state, subject, &records, 11)
+            .unwrap()
             .expect("failed batch is authoritative failure evidence");
         assert!(
             feedback_requires_convergence(&still_converged),
@@ -2558,6 +2875,7 @@ mod tests {
         let subject = RuntimePolicySubject::Run;
         let mut records = vec![failed("tool-a", "{}", 1, "execution_error")];
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 1)
+            .unwrap()
             .expect("first cause is observed");
         assert_eq!(
             entries(&first)
@@ -2569,7 +2887,7 @@ mod tests {
 
         records.push(executed("tool-a", r#"{"fix":true}"#, 2));
         records.push(failed("tool-b", "{}", 2, "execution_error"));
-        let _ = evaluate_tool_boundary(&mut state, subject, &records, 2);
+        let _ = evaluate_tool_boundary(&mut state, subject, &records, 2).unwrap();
         let rotated = state.latest();
         assert_eq!(
             entries(rotated)
@@ -2588,16 +2906,17 @@ mod tests {
         let mut records = (1..=8)
             .map(|round| executed("probe", &format!(r#"{{"step":{round}}}"#), round))
             .collect::<Vec<_>>();
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 8);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 8).unwrap();
         for round in 9..=11 {
             records.push(failed("tool-a", "{}", round, "execution_error"));
-            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
+            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
         }
         assert!(feedback_requires_convergence(state.latest()));
 
         records.push(failed("tool-b", "{}", 12, "execution_error"));
         records.push(executed("tool-a", "{}", 13));
         let demoted = evaluate_tool_boundary(&mut state, subject, &records, 13)
+            .unwrap()
             .expect("old cause recovery and new cause are evaluated together");
         assert!(
             !feedback_requires_convergence(&demoted),
@@ -2612,19 +2931,20 @@ mod tests {
         let mut records = (1..=8)
             .map(|round| executed("probe", &format!(r#"{{"step":{round}}}"#), round))
             .collect::<Vec<_>>();
-        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 8);
+        let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, 8).unwrap();
         for round in 9..=11 {
             records.push(failed("tool-a", "{}", round, "execution_error"));
-            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
+            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
         }
         assert!(feedback_requires_convergence(state.latest()));
 
         for round in 12..=14 {
             records.push(failed("tool-b", "{}", round, "execution_error"));
-            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
+            let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round).unwrap();
         }
         records.push(executed("tool-a", "{}", 15));
         let b_remains = evaluate_tool_boundary(&mut state, subject.clone(), &records, 15)
+            .unwrap()
             .expect("tool-a recovery changes the captured cause set");
         assert!(
             feedback_requires_convergence(&b_remains),
@@ -2633,6 +2953,7 @@ mod tests {
 
         records.push(executed("tool-b", "{}", 16));
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 16)
+            .unwrap()
             .expect("all independently captured causes recovered");
         assert!(!feedback_requires_convergence(&recovered));
     }
@@ -2656,6 +2977,7 @@ mod tests {
         }));
 
         let observed = evaluate_tool_boundary(&mut state, subject.clone(), &records, 8)
+            .unwrap()
             .expect("the unresolved outcome remains visible");
         assert_eq!(
             entries(&observed)
@@ -2673,6 +2995,7 @@ mod tests {
             "execution_error",
         ));
         let grace = evaluate_tool_boundary(&mut state, subject.clone(), &records, 9)
+            .unwrap()
             .expect("the independent cause converges before scheduler pressure");
         assert_eq!(
             entries(&grace)
@@ -2689,6 +3012,7 @@ mod tests {
             "execution_error",
         ));
         let converged = evaluate_tool_boundary(&mut state, subject.clone(), &records, 10)
+            .unwrap()
             .expect("persistent correlated churn converges after the grace boundary");
         assert_eq!(
             entries(&converged)
@@ -2708,6 +3032,7 @@ mod tests {
             )
         }));
         let still_converged = evaluate_tool_boundary(&mut state, subject.clone(), &records, 65)
+            .unwrap()
             .expect("window aging changes the visible projection");
         assert_eq!(
             entries(&still_converged)
@@ -2720,6 +3045,7 @@ mod tests {
 
         records.push(executed("read_file", r#"{"path":"missing"}"#, 66));
         let recovered = evaluate_tool_boundary(&mut state, subject, &records, 66)
+            .unwrap()
             .expect("same-tool success resolves the typed cause");
         assert_eq!(
             entries(&recovered)
@@ -2752,6 +3078,7 @@ mod tests {
             ));
         }
         let first = evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 5)
+            .unwrap()
             .expect("first subject evidence");
         assert!(
             entries(&first)
@@ -2760,6 +3087,7 @@ mod tests {
         );
 
         let switched = evaluate_tool_boundary(&mut state, work_subject("item-2"), &records, 5)
+            .unwrap()
             .expect("subject identity changes the projection");
         assert!(
             entries(&switched)
@@ -2782,6 +3110,7 @@ mod tests {
             failed("bash", r#"{"command":"cargo test"}"#, 2, "execution_error"),
         ];
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
+            .unwrap()
             .expect("first typed diagnosis");
         assert!(!feedback_requires_outcome_reconciliation(&first));
         assert_eq!(
@@ -2799,6 +3128,7 @@ mod tests {
             "test_failure",
         ));
         let converged = evaluate_tool_boundary(&mut state, subject, &records, 3)
+            .unwrap()
             .expect("persistent failure must advance its policy stage");
         let payload = policy_advisory_payload(&converged).expect("model advisory");
         assert!(feedback_requires_outcome_reconciliation(&converged));
@@ -2850,9 +3180,10 @@ mod tests {
             RuntimePolicyRecommendation::DiagnoseToolOutcomes,
             RuntimePolicyStage::Observe,
         );
-        assert!(outcomes.contains("known-good alternative or introspect"));
-        assert!(outcomes.contains("do not settle it as delivered"));
-        assert!(outcomes.contains("settle blocked/failed"));
+        assert!(outcomes.contains("known-good alternative"));
+        assert!(outcomes.contains("affected Work item"));
+        assert!(outcomes.contains("requested result"));
+        assert!(outcomes.contains("blocked/failed"));
     }
 
     #[test]
@@ -2864,6 +3195,7 @@ mod tests {
             failed("bash", r#"{"command":"cargo test"}"#, 2, "test_failure"),
         ];
         let failing = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
+            .unwrap()
             .expect("failures produce online guidance");
         assert!(
             entries(&failing)
@@ -2873,6 +3205,7 @@ mod tests {
 
         records.push(executed("bash", r#"{"command":"cargo test"}"#, 3));
         let recovered = evaluate_tool_boundary(&mut state, subject.clone(), &records, 3)
+            .unwrap()
             .expect("successful capability recovery changes the projection");
         assert!(
             entries(&recovered)
@@ -2888,6 +3221,7 @@ mod tests {
             "test_failure",
         ));
         let regressed = evaluate_tool_boundary(&mut state, subject, &records, 4)
+            .unwrap()
             .expect("a new failure after recovery changes the projection again");
         assert!(
             entries(&regressed)
@@ -2917,8 +3251,10 @@ mod tests {
             executed("read_file", r#"{"path":"a.rs"}"#, 3),
         ];
         evaluate_tool_boundary(&mut state, work_subject("item-1"), &records, 3)
+            .unwrap()
             .expect("first subject");
         let switched = evaluate_tool_boundary(&mut state, work_subject("item-2"), &records, 3)
+            .unwrap()
             .expect("subject switch is a semantic revision");
         let RuntimePolicyFeedbackSet::Evaluated {
             subject, entries, ..

@@ -8,11 +8,11 @@ use astra_services::{
     work::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt, PrimaryWorkAttemptAdvance,
-        PrimaryWorkAttemptCarrierState, WorkAttemptBlockerKind, WorkAttemptExecutionMode,
-        WorkAttemptOutcome, WorkAttemptSettlementError, WorkBranchId, WorkBranchRevision,
-        WorkChangeRef, WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemAttemptId,
-        WorkItemDeliveryStatus, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef,
-        WorkItemText, WorkOwnerId, WorkRepository, WorkTaskGraphQuery,
+        WorkAttemptBlockerKind, WorkAttemptExecutionMode, WorkAttemptOutcome,
+        WorkAttemptSettlementError, WorkBranchId, WorkBranchRevision, WorkChangeRef,
+        WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemAttemptId, WorkItemDeliveryStatus,
+        WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef, WorkItemText, WorkOwnerId,
+        WorkRepository, WorkTaskGraphQuery,
     },
 };
 use uuid::Uuid;
@@ -324,6 +324,16 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         "corrupt terminal authority must fail closed during durable validation"
     );
 
+    sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+        .bind(&owner_id).bind(&run_id).execute(pool.get()).await.unwrap();
+    assert_eq!(
+        service
+            .reconcile_primary_attempt_carriers(&owner_id, &work_id, &branch_id)
+            .await
+            .unwrap(),
+        0,
+        "carrier recovery must not rewrite delivered attempts"
+    );
     let attempts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work_item_attempts
          WHERE owner_id = ? AND executor_run_id = ? AND execution_mode = 'primary'
@@ -554,7 +564,7 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn paused_primary_attempt_takeover_requires_terminal_old_run_and_same_session() {
+async fn paused_primary_attempt_takeover_requires_inactive_old_run_and_same_session() {
     let pool = common::setup_pool().await;
     let owner_id = id("takeover-owner");
     let work_id = id("work");
@@ -621,16 +631,55 @@ async fn paused_primary_attempt_takeover_requires_terminal_old_run_and_same_sess
         })
         .await
         .expect("begin primary attempt");
-    assert!(
-        service
-            .transition_primary_carriers_for_run(
-                &owner_id,
-                &old_run_id,
-                PrimaryWorkAttemptCarrierState::Paused,
-            )
-            .await
-            .expect("pause attempt carrier")
-    );
+    for (run_status, waiting_for, changed) in [
+        ("running", None, 0),
+        ("waiting", Some("approval"), 0),
+        ("paused", Some("user_resume"), 0),
+        ("paused", None, 1),
+        ("paused", None, 0),
+    ] {
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, waiting_for = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(run_status)
+        .bind(waiting_for)
+        .bind(&owner_id)
+        .bind(&old_run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            service
+                .reconcile_primary_attempt_carriers(&owner_id, &work_id, &branch_id)
+                .await
+                .unwrap(),
+            changed,
+            "carrier projection for {run_status}/{waiting_for:?}"
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
+        )
+        .bind(&owner_id)
+        .bind(&attempt_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            status,
+            if run_status == "paused" && waiting_for.is_none() {
+                "paused"
+            } else {
+                "running"
+            }
+        );
+    }
+    // The transfer guard must still independently reject a live old executor.
+    sqlx::query("UPDATE agent_runs SET status = 'running' WHERE user_id = ? AND run_id = ?")
+        .bind(&owner_id)
+        .bind(&old_run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
@@ -680,18 +729,18 @@ async fn paused_primary_attempt_takeover_requires_terminal_old_run_and_same_sess
         ),
         "a still-live old run must retain exclusive ownership"
     );
-    sqlx::query("UPDATE agent_runs SET status = 'failed' WHERE user_id = ? AND run_id = ?")
+    sqlx::query("UPDATE agent_runs SET status = 'paused' WHERE user_id = ? AND run_id = ?")
         .bind(&owner_id)
         .bind(&old_run_id)
         .execute(pool.get())
         .await
-        .expect("terminate old run fixture");
-    assert!(
-        service
-            .take_over_paused_primary_attempt(&owner_id, &attempt_id, &new_run_id)
-            .await
-            .expect("take over paused attempt")
+        .expect("release old run for continuation");
+    let (reconciled, transferred) = tokio::join!(
+        service.reconcile_primary_attempt_carriers(&owner_id, &work_id, &branch_id),
+        service.take_over_paused_primary_attempt(&owner_id, &attempt_id, &new_run_id),
     );
+    assert_eq!(reconciled.expect("concurrent reconciliation"), 0);
+    assert!(transferred.expect("concurrent takeover"));
     let carrier: (String, String) = sqlx::query_as(
         "SELECT executor_run_id, status FROM work_item_attempts
          WHERE owner_id = ? AND attempt_id = ?",

@@ -1303,6 +1303,7 @@ fn build_ws_chat_request(
         agent_binding_owner_scope: None,
         execution_budget,
         execution_time_budget: None,
+        admitted_execution_deadline: None,
         conversation_authority: None,
         execution_policy: Default::default(),
         explain,

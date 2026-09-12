@@ -470,8 +470,34 @@ fn canonical_result_status(status: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ToolExecutionFact {
+    Executed(bool),
+    Unknown,
+}
+
+fn tool_execution_fact_from_result(result: &Value) -> Option<ToolExecutionFact> {
+    match result {
+        Value::Object(object) => {
+            let value = object
+                .get("executed")
+                .or_else(|| object.get("advisory").and_then(|v| v.get("executed")))?;
+            match value {
+                Value::Bool(executed) => Some(ToolExecutionFact::Executed(*executed)),
+                Value::Null => Some(ToolExecutionFact::Unknown),
+                _ => None,
+            }
+        }
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| tool_execution_fact_from_result(&parsed)),
+        _ => None,
+    }
+}
+
 pub fn build_tool_call_end_event(call_id: &str, result: Value) -> Map<String, Value> {
     let status = normalized_result_status(&result);
+    let execution_fact = tool_execution_fact_from_result(&result);
     let mut event = Map::from_iter([
         (
             "type".to_string(),
@@ -490,6 +516,19 @@ pub fn build_tool_call_end_event(call_id: &str, result: Value) -> Map<String, Va
         if status == "skipped" {
             event.insert("skipped".to_string(), Value::Bool(true));
         }
+    }
+    // Keep the producer-owned execution fact on the canonical envelope as
+    // well as inside the result body. Consumers must not infer ownership or
+    // side effects from status text; an explicit `false` closes a pre-admit
+    // rejection, while `null` closes as an outcome-unknown terminal.
+    if let Some(execution_fact) = execution_fact {
+        event.insert(
+            "executed".to_string(),
+            match execution_fact {
+                ToolExecutionFact::Executed(executed) => Value::Bool(executed),
+                ToolExecutionFact::Unknown => Value::Null,
+            },
+        );
     }
     event
 }
@@ -661,6 +700,38 @@ mod tests {
         );
         assert_eq!(denied.get("status").and_then(Value::as_str), Some("failed"));
         assert_eq!(denied.get("success").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn tool_call_end_event_projects_typed_execution_fact() {
+        let rejected = build_tool_call_end_event(
+            "call_rejected",
+            serde_json::json!({
+                "status": "rejected",
+                "error_kind": "deferred_tool_descriptor_stale",
+                "advisory": {"executed": false},
+            }),
+        );
+        assert_eq!(rejected.get("executed"), Some(&Value::Bool(false)));
+
+        let unknown = build_tool_call_end_event(
+            "call_unknown",
+            serde_json::json!({
+                "status": "unknown",
+                "advisory": {"executed": null},
+            }),
+        );
+        assert_eq!(unknown.get("executed"), Some(&Value::Null));
+
+        let string_body = build_tool_call_end_event(
+            "call_string_body",
+            Value::String(r#"{"status":"failed","executed":false}"#.to_string()),
+        );
+        assert_eq!(
+            string_body.get("executed"),
+            Some(&Value::Bool(false)),
+            "a string-encoded structured body preserves its typed fact"
+        );
     }
 
     #[test]

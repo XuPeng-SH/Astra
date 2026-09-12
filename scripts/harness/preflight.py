@@ -11,12 +11,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "crates/astra-test-harness"))
+from harbor_adapter_env import validate_server_readiness
 
 EXPECTED_BENCHMARK_AGENT = "harbor_adapter:Astra"
 # The default is deliberately explicit for ordinary scored runs.  The closed
@@ -76,7 +80,10 @@ VERIFIER_NETWORK_ENV_KEYS = (
     "no_proxy",
 )
 VERIFIER_NO_PROXY = "localhost,127.0.0.1,::1,172.17.0.1"
-VERIFIER_READINESS_TASK_CONCURRENCY = 4
+# Docker verifier lifecycle is daemon-global.  Keep the preflight invocation
+# aligned with verifier_readiness.py: a later task starts only after the prior
+# task has proved cleanup.
+VERIFIER_READINESS_TASK_CONCURRENCY = 1
 VERIFIER_READINESS_IMAGE_MATERIALIZATION_CONCURRENCY = 1
 VERIFIER_READINESS_IMAGE_INSPECT_TIMEOUT_SECONDS = 15.0
 VERIFIER_READINESS_MAX_IMAGE_INSPECTIONS_PER_MATERIALIZATION = 3
@@ -2097,13 +2104,8 @@ def main() -> int:
         health_ok = False
         detail: str
         try:
-            health = json.loads(health_out)
-            health_ok = (
-                health_rc == 0
-                and health.get("status") in {"healthy", "degraded"}
-                and health.get("database") == "connected"
-                and (expected is None or health.get("build_git_sha") == expected)
-            )
+            health = validate_server_readiness(health_out, expected)
+            health_ok = health_rc == 0
             detail = json.dumps(
                 {
                     "status": health.get("status"),

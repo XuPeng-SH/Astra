@@ -636,6 +636,15 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
     }
 
+    fn injects_round_guidance(&self) -> bool {
+        // This host is the CLI edge of a remote Server-owned provider
+        // boundary.  The server's canonical context pipeline computes the
+        // round guidance from the authoritative server history.  Claiming
+        // local ownership here would enqueue the same BudgetAdvisory on the
+        // edge and send a duplicate dynamic block across the boundary.
+        true
+    }
+
     fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
         self.executor.memory_recall_scope()
     }
@@ -781,7 +790,9 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // The guard restores the previous policy on drop — including on the
         // `?` early-return path below — so a turn that errored out cannot leak
         // a skill-scoped policy into subsequent turns.
-        let _sandbox_guard = if let Some(skill_policy) = state.skills.sandbox_policy.clone() {
+        let _sandbox_guard = if let Some(skill_policy) =
+            state.skills.execution.sandbox_policy.clone()
+        {
             // A selected skill may intentionally narrow even a root Bypass
             // turn; explicit capability constraints remain authoritative.
             SandboxPolicyGuard::install(&self.executor.sandbox_policy, Some(skill_policy))
@@ -877,12 +888,18 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     approval_request_tx: self.approval_request_tx.clone(),
                     ask_user_request_tx: self.ask_user_request_tx.clone(),
                     skill_resolver: state.skills.resolver.clone(),
-                    skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
-                    skill_agent_type: state.skills.agent_type.clone(),
+                    skill_effort: state
+                        .skills
+                        .execution
+                        .effort
+                        .as_ref()
+                        .map(|e| e.to_string()),
+                    skill_agent_type: state.skills.execution.agent_type.clone(),
                     interaction_mode,
                     turn_policy: &mut state.last_turn_policy,
                     skill_allowed_tools: state
                         .skills
+                        .execution
                         .allowed_tools
                         .as_ref()
                         .map(|s| s.iter().cloned().collect::<Vec<_>>()),

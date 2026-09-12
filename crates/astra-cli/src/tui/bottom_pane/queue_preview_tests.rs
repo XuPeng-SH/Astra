@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::BottomPane;
+use super::{BottomPane, UserIntentRejectReason};
 use crate::tui::task_status::TaskStatus;
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::time::Instant;
@@ -12,6 +12,40 @@ fn accept_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) {
         astra_turn_types::UserIntentStatus::AcceptedLocal,
         text,
     ));
+}
+
+#[test]
+fn whitespace_guidance_is_rejected_as_input_not_ownership() {
+    let mut pane = BottomPane::new();
+
+    let result = pane.try_accept_user_intent(
+        "intent-whitespace",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedLocal,
+        "  \n\t",
+    );
+
+    assert_eq!(result, Err(UserIntentRejectReason::EmptyText));
+    assert!(!pane.has_pending_user_intents());
+}
+
+#[test]
+fn known_guidance_identity_has_a_neutral_local_error() {
+    let mut pane = BottomPane::new();
+    accept_guidance(&mut pane, "known-intent", "keep investigating");
+
+    let result = pane.try_accept_user_intent(
+        "known-intent",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedLocal,
+        "keep investigating",
+    );
+
+    assert_eq!(result, Err(UserIntentRejectReason::IdentityAlreadyKnown));
+    assert_eq!(
+        UserIntentRejectReason::IdentityAlreadyKnown.message(),
+        "Could not queue guidance: this intent is already recorded locally."
+    );
 }
 
 fn apply_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) -> Option<String> {

@@ -1082,7 +1082,7 @@ class PreflightTests(unittest.TestCase):
             root = Path(directory)
             config = self._verifier_readiness_config(root, [10] * 3, [20] * 3)
             self.assertEqual(
-                preflight.verifier_readiness_timeout(config),
+                preflight.verifier_readiness_timeout(config, max_concurrency=4),
                 540 + 1 / 3,
             )
 
@@ -1093,7 +1093,7 @@ class PreflightTests(unittest.TestCase):
                 root, [2000, 1, 1], [1, 1, 1]
             )
             expected = 2149 + 2569 / 3 + (1 - 1 / 3) * 2189
-            timeout = preflight.verifier_readiness_timeout(config)
+            timeout = preflight.verifier_readiness_timeout(config, max_concurrency=4)
             self.assertAlmostEqual(timeout, expected)
             old_fixed_image_budget = 3087
             self.assertGreater(timeout, old_fixed_image_budget)
@@ -1107,7 +1107,7 @@ class PreflightTests(unittest.TestCase):
             # Eight serialized image budgets plus the four-worker
             # list-scheduling bound for eight equal tails.
             self.assertEqual(
-                preflight.verifier_readiness_timeout(config),
+                preflight.verifier_readiness_timeout(config, max_concurrency=4),
                 8 * 649 + 8 * 2588 / 4 + (1 - 1 / 4) * 2588,
             )
 
@@ -1116,6 +1116,20 @@ class PreflightTests(unittest.TestCase):
             root = Path(directory)
             config = self._verifier_readiness_config(root, [10], [20])
             self.assertEqual(preflight.verifier_readiness_timeout(config), 277)
+
+    def test_verifier_readiness_timeout_defaults_to_serial_task_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._verifier_readiness_config(root, [10] * 3, [20] * 3)
+            serial = preflight.verifier_readiness_timeout(config)
+            self.assertEqual(
+                serial,
+                preflight.verifier_readiness_timeout(config, max_concurrency=1),
+            )
+            self.assertGreater(
+                serial,
+                preflight.verifier_readiness_timeout(config, max_concurrency=4),
+            )
 
     def test_verifier_readiness_uses_complete_separate_verifier_environment(self):
         with tempfile.TemporaryDirectory() as directory:

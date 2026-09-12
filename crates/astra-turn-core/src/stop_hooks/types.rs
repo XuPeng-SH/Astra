@@ -14,32 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-/// A verification command surfaced at the completion boundary.
-///
-/// Only [`StopHook::authoritative`] hooks form a terminal contract; discovery
-/// hooks are advisory guidance and never block completion on their own.
-#[derive(Debug, Clone)]
-pub struct StopHook {
-    /// Human-readable label (e.g. "type-check", "lint").
-    pub label: String,
-    /// Shell command to execute (e.g. "cargo check").
-    pub command: String,
-    /// Working directory (informational, included in the prompt).
-    pub working_dir: Option<String>,
-    /// Labels of hooks that must complete before this one.
-    pub depends_on: Vec<String>,
-    /// Per-hook timeout hint (seconds). Included in the prompt for the LLM.
-    pub timeout_secs: Option<u32>,
-    /// Cache key for skipping re-runs. If present and the cache contains a
-    /// passing result for this key, the hook is omitted from the prompt.
-    pub cache_key: Option<String>,
-    /// Whether this hook is an explicit completion contract.
-    ///
-    /// Declarative hooks supplied by the caller/project are authoritative and
-    /// may be checked at terminal settlement. Auto-detected guidance remains
-    /// advisory because it is necessarily a best-effort guess about scope.
-    pub authoritative: bool,
-}
+pub use astra_turn_types::StopHook;
 
 /// Cached result from a previous stop-hook execution.
 #[derive(Debug, Clone)]

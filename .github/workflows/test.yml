@@ -200,6 +200,8 @@ jobs:
           -p astra-logging -p astra-sync-protocol
           --profile ci
       - name: Test server e2e-hooks (selective)
+        env:
+          RUST_MIN_STACK: "16777216"
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
           --features e2e-hooks --profile ci

@@ -1415,12 +1415,14 @@ impl StepRecorder {
         Some(HeavyCheckpoint {
             light,
             conversation_cursor: None,
+            run_execution_budget: None,
+            run_execution_control: None,
             messages: messages.to_vec(),
             budget_remaining_tokens,
             budget_remaining_rounds,
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: self
                 .current_step
                 .as_ref()

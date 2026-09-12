@@ -2288,13 +2288,19 @@ mod tests {
             &self,
             _purpose: astra_turn_types::InferencePurpose,
             _messages: &[Value],
-        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     text: text.clone(),
                     is_ptl_error: false,
+                    finish_reason: Some("stop".to_string()),
+                    usage: serde_json::Map::new(),
                 }),
-                None => Err("mock failure".to_string()),
+                None => Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Network,
+                    "mock failure",
+                )),
             }
         }
     }

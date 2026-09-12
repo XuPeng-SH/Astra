@@ -35,6 +35,8 @@ const MAX_ACTIVE_ATTACHMENTS_PER_BRANCH: i64 = 64;
 pub enum SessionHandoffError {
     #[error("invalid handoff request: {0}")]
     Invalid(String),
+    #[error("execution custody storage unavailable: {0}")]
+    StorageUnavailable(String),
     #[error("session handoff or attachment was not found")]
     NotFound,
     #[error("another handoff is active: {active_handoff_id}")]
@@ -904,6 +906,17 @@ impl DatabaseSessionHandoffService {
             return Ok(event.record);
         }
 
+        let locked_run = lock_handoff_execution_scope(
+            &mut tx,
+            &request.key,
+            &request.handoff_id,
+            request.patch.watermarks.as_ref(),
+            matches!(
+                request.next_state,
+                SessionHandoffStateV1::Checkpointed | SessionHandoffStateV1::Hydrating
+            ),
+        )
+        .await?;
         let row = sqlx::query(
             "SELECT record_json FROM session_handoffs
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -940,7 +953,12 @@ impl DatabaseSessionHandoffService {
             });
         }
         let from = record.state;
-        apply_patch(&mut record, &request.patch);
+        apply_patch(&mut record, &request.patch)?;
+        if !same_execution_reference(&record.watermarks, &locked_run) {
+            return Err(SessionHandoffError::Invalid(
+                "handoff execution changed while acquiring its authority locks".into(),
+            ));
+        }
         if record.mode == SessionHandoffModeV1::Forced
             && from == SessionHandoffStateV1::Fenced
             && request.next_state == SessionHandoffStateV1::Hydrating
@@ -1032,6 +1050,7 @@ impl DatabaseSessionHandoffService {
             return Ok(event.record);
         }
 
+        let locked_run = lock_handoff_execution_scope(&mut tx, key, handoff_id, None, true).await?;
         let row = sqlx::query(
             "SELECT record_json FROM session_handoffs
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -1049,6 +1068,11 @@ impl DatabaseSessionHandoffService {
         .ok_or(SessionHandoffError::NotFound)?;
         let mut record: SessionHandoffRecordV1 = decode_json_row(&row, "record_json", "handoff")?;
         validate_stored_handoff(&record, key)?;
+        if !same_execution_reference(&record.watermarks, &locked_run) {
+            return Err(SessionHandoffError::Invalid(
+                "handoff execution changed while acquiring its authority locks".into(),
+            ));
+        }
         if now > record.deadline_unix_ms {
             return Err(SessionHandoffError::DeadlineExpired);
         }
@@ -1090,7 +1114,7 @@ impl DatabaseSessionHandoffService {
         update_attachment_mode(&mut tx, &target).await?;
 
         let from = record.state;
-        apply_patch(&mut record, &request.patch);
+        apply_patch(&mut record, &request.patch)?;
         record
             .transition(from, SessionHandoffStateV1::Active, now)
             .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
@@ -1268,6 +1292,10 @@ fn validate_attach_request(request: &AttachSessionRequestV1) -> Result<(), Sessi
 
 fn validate_handoff_request(request: &RequestSessionHandoffV1) -> Result<(), SessionHandoffError> {
     request
+        .watermarks
+        .validate()
+        .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    request
         .key
         .validate()
         .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
@@ -1340,6 +1368,11 @@ fn validate_handoff_request(request: &RequestSessionHandoffV1) -> Result<(), Ses
 fn validate_transition_request(
     request: &TransitionSessionHandoffV1,
 ) -> Result<(), SessionHandoffError> {
+    if let Some(watermarks) = &request.patch.watermarks {
+        watermarks
+            .validate()
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    }
     validate_key_and_id(&request.key, &request.handoff_id)?;
     validate_identity(
         "idempotency key",
@@ -1444,7 +1477,15 @@ fn install_observation(attachment: &mut SessionAttachmentV1, delta: &ManifestDel
         .map(|head| head.latest_manifest_root.clone());
 }
 
-fn apply_patch(record: &mut SessionHandoffRecordV1, patch: &HandoffTransitionPatchV1) {
+fn apply_patch(
+    record: &mut SessionHandoffRecordV1,
+    patch: &HandoffTransitionPatchV1,
+) -> Result<(), SessionHandoffError> {
+    if let Some(watermarks) = &patch.watermarks {
+        record
+            .replace_watermarks(watermarks.clone())
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    }
     if let Some(cursor) = &patch.base_cursor {
         record.base_cursor = Some(cursor.clone());
     }
@@ -1454,12 +1495,10 @@ fn apply_patch(record: &mut SessionHandoffRecordV1, patch: &HandoffTransitionPat
     if let Some(workspace) = &patch.workspace {
         record.workspace = Some(workspace.clone());
     }
-    if let Some(watermarks) = &patch.watermarks {
-        record.watermarks = watermarks.clone();
-    }
     if let Some(detail) = &patch.status_detail {
         record.status_detail = Some(detail.clone());
     }
+    Ok(())
 }
 
 /// Seal the effect boundary after canonical authority has moved away from the
@@ -1597,6 +1636,124 @@ async fn quarantine_divergent_attachment(
         .await
         .map_err(|source| database_error("commit_attachment_quarantine", source))?;
     Ok(quarantine_id)
+}
+
+/// Share the execution admission fence before acquiring handoff/attachment
+/// locks. The same order applies to forced effect sealing and activation.
+async fn lock_handoff_execution_scope(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    handoff_id: &str,
+    proposed_watermarks: Option<&HandoffOperationWatermarksV1>,
+    require_execution_boundary: bool,
+) -> Result<HandoffOperationWatermarksV1, SessionHandoffError> {
+    crate::storage::admit_session_execution_write(tx, &key.session_id, &key.owner_user_id)
+        .await
+        .map_err(|source| database_error("admit_handoff_execution", source))?;
+    // This is a lock-order hint, not an authority snapshot. The caller must
+    // recheck the effective reference after locking the handoff itself.
+    let row = sqlx::query(
+        "SELECT record_json FROM session_handoffs
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ? AND handoff_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(handoff_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| database_error("load_handoff_execution_hint", source))?
+    .ok_or(SessionHandoffError::NotFound)?;
+    let mut hint: SessionHandoffRecordV1 = decode_json_row(&row, "record_json", "handoff")?;
+    validate_stored_handoff(&hint, key)?;
+    if let Some(proposed) = proposed_watermarks {
+        hint.watermarks = proposed.clone();
+    }
+    let run_id = hint.watermarks.run_id.clone();
+    if require_execution_boundary && hint.mode == SessionHandoffModeV1::Graceful {
+        let other_active: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ?
+             AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+             AND (? IS NULL OR run_id <> ?) LIMIT 1 FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| database_error("check_handoff_active_execution", source))?;
+        if other_active.is_some() {
+            return Err(SessionHandoffError::Invalid(
+                "another active execution is not covered by the handoff checkpoint".into(),
+            ));
+        }
+    }
+    if let Some(run_id) = &run_id {
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| database_error("lock_handoff_run", source))?;
+        if exists.is_none() {
+            return Err(SessionHandoffError::Invalid(
+                "handoff run does not belong to this session".into(),
+            ));
+        }
+    }
+    if require_execution_boundary && hint.mode == SessionHandoffModeV1::Graceful {
+        validate_execution_checkpoint(tx, &hint).await?;
+    }
+    lock_active_handoff(tx, key).await?;
+    Ok(hint.watermarks)
+}
+
+fn same_execution_reference(
+    left: &HandoffOperationWatermarksV1,
+    right: &HandoffOperationWatermarksV1,
+) -> bool {
+    left.run_id == right.run_id
+        && left.run_generation == right.run_generation
+        && left.checkpoint_id == right.checkpoint_id
+}
+
+async fn validate_execution_checkpoint(
+    tx: &mut Transaction<'_, MySql>,
+    record: &SessionHandoffRecordV1,
+) -> Result<(), SessionHandoffError> {
+    let Some(run_id) = record.watermarks.run_id.as_deref() else {
+        return Ok(());
+    };
+    let checkpoint_id = record.watermarks.checkpoint_id.as_deref().ok_or_else(|| {
+        SessionHandoffError::Invalid("execution checkpoint identity is missing".into())
+    })?;
+    let generation = record.watermarks.run_generation.ok_or_else(|| {
+        SessionHandoffError::Invalid("execution checkpoint generation is missing".into())
+    })?;
+    crate::runs::lock_and_validate_execution_handoff_reference_tx(
+        tx,
+        &record.key.owner_user_id,
+        &record.key.session_id,
+        run_id,
+        checkpoint_id,
+        generation,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::runs::ExecutionHandoffReferenceError::Rejected(reason) => {
+            SessionHandoffError::Invalid(reason.into())
+        }
+        crate::runs::ExecutionHandoffReferenceError::Unavailable(error) => {
+            SessionHandoffError::StorageUnavailable(error)
+        }
+    })
 }
 
 async fn ensure_slot(
@@ -2280,10 +2437,13 @@ mod tests {
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {
         for table in [
             "agent_session_execution_slots",
+            "run_checkpoints",
             "tool_invocation_ledger",
             "agent_run_events",
             "agent_events",
             "agent_runs",
+            "agent_sessions",
+            "agent_session_lifecycle_fences",
         ] {
             sqlx::query(&format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
@@ -2324,6 +2484,65 @@ mod tests {
         .execute(pool.get())
         .await
         .expect("cleanup segments");
+    }
+
+    async fn create_session_root(pool: &SharedPool, key: &SessionKeyV1) {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (user_id, session_id, status, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool.get())
+        .await
+        .expect("create active session root");
+    }
+
+    #[test]
+    fn handoff_admission_rejects_partial_execution_coordinates() {
+        let key = SessionKeyV1::owner_session("test", "owner", "session", "main");
+        let mut request = RequestSessionHandoffV1 {
+            idempotency_key: "request".into(),
+            key: key.clone(),
+            mode: SessionHandoffModeV1::Graceful,
+            from_attachment_id: Some("source".into()),
+            to_attachment_id: "target".into(),
+            from_placement: SessionPlacementV1::Cli,
+            to_placement: SessionPlacementV1::Edge,
+            target_actor: actor(&key.owner_user_id, "target"),
+            base_cursor: None,
+            authority_epochs: AuthorityEpochsV1::default(),
+            workspace: None,
+            watermarks: HandoffOperationWatermarksV1::default(),
+            risk: HandoffRiskEvidenceV1::default(),
+            reason: "move".into(),
+        };
+        let mut transition = TransitionSessionHandoffV1 {
+            idempotency_key: "transition".into(),
+            key,
+            handoff_id: "handoff".into(),
+            expected_state: SessionHandoffStateV1::Draining,
+            expected_transition_seq: 3,
+            next_state: SessionHandoffStateV1::Checkpointed,
+            patch: HandoffTransitionPatchV1::default(),
+        };
+        for (run_id, run_generation, valid) in [
+            (None, None, true),
+            (Some("run"), None, false),
+            (None, Some(0), false),
+            (Some("run"), Some(0), true),
+        ] {
+            request.watermarks = HandoffOperationWatermarksV1 {
+                run_id: run_id.map(str::to_owned),
+                run_generation,
+                checkpoint_id: Some("checkpoint".into()),
+                ..Default::default()
+            };
+            transition.patch.watermarks = Some(request.watermarks.clone());
+            assert_eq!(validate_handoff_request(&request).is_ok(), valid);
+            assert_eq!(validate_transition_request(&transition).is_ok(), valid);
+        }
     }
 
     #[test]
@@ -2514,6 +2733,64 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn graceful_handoff_is_durable_idempotent_and_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::WithoutExecution).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_with_exact_checkpoint_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::ExactCheckpoint).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_rejects_generation_change_before_activation() {
+        exercise_graceful_handoff(GracefulScenario::GenerationChanged).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_after_repeated_recovery_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredCheckpoint).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_recovered_execution_rejects_new_activity() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredNewActivity).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_recovered_execution_rejects_ancestor_cancellation() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredAncestorCancellation).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum GracefulScenario {
+        WithoutExecution,
+        ExactCheckpoint,
+        GenerationChanged,
+        RecoveredCheckpoint,
+        RecoveredNewActivity,
+        RecoveredAncestorCancellation,
+    }
+
+    async fn exercise_graceful_handoff(scenario: GracefulScenario) {
+        use crate::runs::RunStateStore;
+        let with_execution = !matches!(scenario, GracefulScenario::WithoutExecution);
+        let invalidate_before_activation = matches!(
+            scenario,
+            GracefulScenario::GenerationChanged
+                | GracefulScenario::RecoveredNewActivity
+                | GracefulScenario::RecoveredAncestorCancellation
+        );
+        let recovering = matches!(
+            scenario,
+            GracefulScenario::RecoveredCheckpoint
+                | GracefulScenario::RecoveredNewActivity
+                | GracefulScenario::RecoveredAncestorCancellation
+        );
         let pool = setup_handoff_db_it().await;
         let suffix = Uuid::new_v4();
         let key = SessionKeyV1::owner_session(
@@ -2524,6 +2801,7 @@ mod tests {
         );
         cleanup(&pool, &key).await;
         let authority_reader = DatabaseSessionContextCoordinator::new(pool.clone());
+        create_session_root(&pool, &key).await;
         let coordinator: Arc<dyn SessionContextCoordinator> = Arc::new(authority_reader.clone());
         let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
         let source_actor = actor(&key.owner_user_id, "source");
@@ -2716,22 +2994,253 @@ mod tests {
                 .await
                 .expect("advance handoff");
         }
+        let checkpoint_request = TransitionSessionHandoffV1 {
+            idempotency_key: "checkpoint".into(),
+            key: key.clone(),
+            handoff_id: handoff.handoff_id.clone(),
+            expected_state: handoff.state,
+            expected_transition_seq: handoff.transition_seq,
+            next_state: SessionHandoffStateV1::Checkpointed,
+            patch: HandoffTransitionPatchV1 {
+                watermarks: Some(HandoffOperationWatermarksV1 {
+                    checkpoint_id: Some("checkpoint-1".into()),
+                    effect_cursor: Some("effect-1".into()),
+                    ..HandoffOperationWatermarksV1::default()
+                }),
+                ..HandoffTransitionPatchV1::default()
+            },
+        };
+        let competing_run = format!("competing-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, ?, 0, 'running')",
+        )
+        .bind(&competing_run)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&competing_run)
+        .bind(&competing_run)
+        .execute(pool.get())
+        .await
+        .expect("insert competing execution");
+        assert!(matches!(
+            service.transition_handoff(&checkpoint_request).await,
+            Err(SessionHandoffError::Invalid(_))
+        ));
+        assert_eq!(
+            service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap()
+                .transition_seq,
+            handoff.transition_seq,
+            "rejected admission must not advance the durable handoff"
+        );
+        sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&key.owner_user_id)
+            .bind(&competing_run)
+            .execute(pool.get())
+            .await
+            .expect("release execution into ordinary continuation");
+        let checkpoint_id = format!("checkpoint-{suffix}");
+        let payload = serde_json::to_string(&crate::runs::DurableExecutionHandoff::V1 {
+            producer_run_id: competing_run.clone(),
+            producer_owner_generation: 0,
+            heavy: json!({"opaque_runtime_payload": [1, 2, 3]}),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json)
+             VALUES (?, ?, ?, ?, 'execution_handoff', 'execution_handoff_v1', ?, ?)",
+        )
+        .bind(&checkpoint_id)
+        .bind(&competing_run)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(format!("checkpoint:{competing_run}:execution_handoff:0"))
+        .bind(&payload)
+        .execute(pool.get()).await.expect("persist exact execution checkpoint");
+        let mut exact = checkpoint_request.clone();
+        exact.patch.watermarks = Some(HandoffOperationWatermarksV1 {
+            run_id: Some(competing_run.clone()),
+            run_generation: Some(0),
+            checkpoint_id: Some(checkpoint_id.clone()),
+            ..Default::default()
+        });
+        let mut bound_record = handoff.clone();
+        bound_record
+            .replace_watermarks(exact.patch.watermarks.clone().unwrap())
+            .unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        validate_execution_checkpoint(&mut tx, &bound_record)
+            .await
+            .expect("exact checkpoint validates");
+        tx.rollback().await.unwrap();
+        for (run_id, generation, checkpoint) in [
+            ("missing-run".to_owned(), 0, checkpoint_id.clone()),
+            (competing_run.clone(), 1, checkpoint_id.clone()),
+            (competing_run.clone(), 0, "missing-checkpoint".to_owned()),
+        ] {
+            let mut wrong = exact.clone();
+            wrong.patch.watermarks = Some(HandoffOperationWatermarksV1 {
+                run_id: Some(run_id),
+                run_generation: Some(generation),
+                checkpoint_id: Some(checkpoint),
+                ..Default::default()
+            });
+            assert!(matches!(
+                service.transition_handoff(&wrong).await,
+                Err(SessionHandoffError::Invalid(_))
+            ));
+        }
+        for (column, original, invalid) in [
+            ("session_id", key.session_id.as_str(), "other-session"),
+            ("checkpoint_kind", "execution_handoff", "phase"),
+            (
+                "checkpoint_version",
+                "execution_handoff_v1",
+                "phase_checkpoint_v1",
+            ),
+        ] {
+            let update = format!(
+                "UPDATE run_checkpoints SET {column} = ? WHERE user_id = ? AND checkpoint_id = ?"
+            );
+            sqlx::query(&update)
+                .bind(invalid)
+                .bind(&key.owner_user_id)
+                .bind(&checkpoint_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    service.transition_handoff(&exact).await,
+                    Err(SessionHandoffError::Invalid(_))
+                ),
+                "invalid {column} must not authorize handoff"
+            );
+            sqlx::query(&update)
+                .bind(original)
+                .bind(&key.owner_user_id)
+                .bind(&checkpoint_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let mut stale_reader = pool.get().begin().await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT run_generation FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&competing_run)
+        .fetch_one(&mut *stale_reader)
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
+        sqlx::query("UPDATE agent_runs SET run_generation = 1 WHERE user_id = ? AND run_id = ?")
+            .bind(&key.owner_user_id)
+            .bind(&competing_run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                validate_execution_checkpoint(&mut stale_reader, &bound_record).await,
+                Err(SessionHandoffError::Invalid(_))
+            ),
+            "authority validation must observe the generation committed after its earlier read"
+        );
+        stale_reader.rollback().await.unwrap();
+        assert!(matches!(
+            service.transition_handoff(&exact).await,
+            Err(SessionHandoffError::Invalid(_))
+        ));
+        assert_eq!(
+            service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap()
+                .transition_seq,
+            handoff.transition_seq
+        );
+        if with_execution {
+            let next_checkpoint = format!("next-{suffix}");
+            let next_payload = serde_json::to_string(&crate::runs::DurableExecutionHandoff::V1 {
+                producer_run_id: competing_run.clone(),
+                producer_owner_generation: 1,
+                heavy: json!({"opaque_runtime_payload": [4, 5, 6]}),
+            })
+            .unwrap();
+            let next_checkpoint = if recovering {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id("handoff-recovery-test");
+                if matches!(scenario, GracefulScenario::RecoveredAncestorCancellation) {
+                    let parent = format!("parent-{suffix}");
+                    sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status) VALUES (?, ?, ?, ?, ?, 0, 'paused')")
+                        .bind(&parent).bind(&key.owner_user_id).bind(&key.session_id).bind(&parent).bind(&parent)
+                        .execute(pool.get()).await.unwrap();
+                    sqlx::query("UPDATE agent_runs SET parent_run_id = ?, root_run_id = ?, ancestor_path = ?, depth = 1 WHERE user_id = ? AND run_id = ?")
+                        .bind(&parent).bind(&parent).bind(format!("{parent}/{competing_run}"))
+                        .bind(&key.owner_user_id).bind(&competing_run).execute(pool.get()).await.unwrap();
+                }
+                sqlx::query("UPDATE agent_runs SET status = 'running', owner_pod_id = 'handoff-recovery-test', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+                    .bind(&key.owner_user_id).bind(&competing_run).execute(pool.get()).await.unwrap();
+                let receipt = store
+                    .save_checkpoint(crate::runs::RunCheckpointWriteRequest {
+                        user_id: &key.owner_user_id,
+                        expected_session_id: &key.session_id,
+                        run_id: &competing_run,
+                        checkpoint_json: &next_payload,
+                        authority: crate::runs::CheckpointWriteAuthority::ExecutionOwner {
+                            expected_owner_generation: 1,
+                        },
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut last_claim = None;
+                for expected_generation in 2..=4 {
+                    let claim = store
+                        .claim_exact_recovery_candidate_for_test(&key.owner_user_id, &competing_run)
+                        .await
+                        .unwrap();
+                    assert_eq!(claim.run.run_generation, expected_generation);
+                    last_claim = Some(claim);
+                }
+                let recovered = store
+                    .reconcile_execution_handoff(&last_claim.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered.run.status, "paused");
+                assert_eq!(recovered.run.run_generation, 4);
+                assert_eq!(
+                    recovered.run.checkpoint_json.as_deref(),
+                    Some(next_payload.as_str())
+                );
+                receipt.checkpoint_id
+            } else {
+                sqlx::query(
+                "INSERT INTO run_checkpoints
+                 (checkpoint_id, run_id, user_id, session_id, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json)
+                 VALUES (?, ?, ?, ?, 'execution_handoff', 'execution_handoff_v1', ?, ?)",
+            )
+            .bind(&next_checkpoint).bind(&competing_run)
+            .bind(&key.owner_user_id).bind(&key.session_id)
+            .bind(format!("checkpoint:{competing_run}:execution_handoff:1"))
+            .bind(next_payload).execute(pool.get()).await.unwrap();
+                next_checkpoint
+            };
+            exact.patch.watermarks.as_mut().unwrap().run_generation = Some(1);
+            exact.patch.watermarks.as_mut().unwrap().checkpoint_id = Some(next_checkpoint);
+        }
         handoff = service
-            .transition_handoff(&TransitionSessionHandoffV1 {
-                idempotency_key: "checkpoint".into(),
-                key: key.clone(),
-                handoff_id: handoff.handoff_id.clone(),
-                expected_state: handoff.state,
-                expected_transition_seq: handoff.transition_seq,
-                next_state: SessionHandoffStateV1::Checkpointed,
-                patch: HandoffTransitionPatchV1 {
-                    watermarks: Some(HandoffOperationWatermarksV1 {
-                        checkpoint_id: Some("checkpoint-1".into()),
-                        effect_cursor: Some("effect-1".into()),
-                        ..HandoffOperationWatermarksV1::default()
-                    }),
-                    ..HandoffTransitionPatchV1::default()
-                },
+            .transition_handoff(if with_execution {
+                &exact
+            } else {
+                &checkpoint_request
             })
             .await
             .expect("checkpoint handoff");
@@ -2759,6 +3268,62 @@ mod tests {
             })
             .await
             .expect("hydrate target");
+        if invalidate_before_activation {
+            if matches!(scenario, GracefulScenario::RecoveredNewActivity) {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id("handoff-recovery-test");
+                store
+                    .append_event(
+                        &key.owner_user_id,
+                        &key.session_id,
+                        &competing_run,
+                        json!({"event_type":"tool_result", "data":{"result":"new activity"}}),
+                    )
+                    .await
+                    .unwrap();
+            } else if matches!(scenario, GracefulScenario::RecoveredAncestorCancellation) {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone());
+                assert!(
+                    store
+                        .request_run_cancellation(&key.owner_user_id, &format!("parent-{suffix}"))
+                        .await
+                        .unwrap()
+                );
+            } else {
+                sqlx::query("UPDATE agent_runs SET run_generation = run_generation + 1 WHERE user_id = ? AND run_id = ?")
+                .bind(&key.owner_user_id).bind(&competing_run)
+                .execute(pool.get()).await.unwrap();
+            }
+            let target_before = service
+                .load_attachment(&key, &target_attachment.attachment_id)
+                .await
+                .unwrap();
+            assert!(matches!(
+                service
+                    .activate_handoff(
+                        &key,
+                        &handoff.handoff_id,
+                        handoff.transition_seq,
+                        "activate"
+                    )
+                    .await,
+                Err(SessionHandoffError::Invalid(_))
+            ));
+            let persisted = service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap();
+            assert_eq!(persisted.state, SessionHandoffStateV1::Hydrating);
+            assert_eq!(persisted.transition_seq, handoff.transition_seq);
+            let target_after = service
+                .load_attachment(&key, &target_attachment.attachment_id)
+                .await
+                .unwrap();
+            assert_eq!(target_after.mode, target_before.mode);
+            assert_eq!(target_after.mode, SessionAttachmentModeV1::ReadOnly);
+            cleanup(&pool, &key).await;
+            return;
+        }
         handoff = service
             .activate_handoff(
                 &key,
@@ -2875,6 +3440,7 @@ mod tests {
             Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
         let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
         let source_actor = actor(&key.owner_user_id, "forced-source");
+        create_session_root(&pool, &key).await;
         let target_actor = actor(&key.owner_user_id, "forced-target");
         let _source_lease = acquired(
             coordinator

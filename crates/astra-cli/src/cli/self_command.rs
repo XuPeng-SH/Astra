@@ -493,6 +493,7 @@ async fn build_reflect_response(
         graph_slice,
         budget_result: ObservationBudgetResult::default(),
     }
+    .project_lightweight()
 }
 
 fn session_agent_delivery_summary(events: &[JournalEvent]) -> Option<String> {
@@ -2568,15 +2569,10 @@ mod tests {
                 .is_some_and(|ref_id| ref_id.starts_with("urn:astra:event:cloud:")),
             "{value}"
         );
-        assert_eq!(
-            value["graph_slice"]["nodes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|node| node["layer"] == "runtime")
-                .count(),
-            1
-        );
+        assert_eq!(value["depth"], "summary");
+        assert!(value["graph_slice"].get("nodes").is_none());
+        assert_eq!(value["budget_result"]["truncated"], true);
+        assert!(value["budget_result"]["omitted"]["nodes"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -2722,7 +2718,7 @@ mod tests {
         let request = ReflectRequest::from_observation_params(
             None,
             Some("errors"),
-            None,
+            Some("diagnostic"),
             None,
             8,
             "why did the operation fail?",
@@ -2740,6 +2736,19 @@ mod tests {
         assert_eq!(projected_event_labels, vec!["tool_call_error"]);
         assert_eq!(response.evidence.len(), 1);
         assert_eq!(response.evidence[0].source, "local_journal");
+        let summary_request = ReflectRequest::from_observation_params(
+            None,
+            Some("errors"),
+            None,
+            None,
+            8,
+            "why did the operation fail?",
+        );
+        let summary = build_reflect_response(&artifacts, 8, summary_request).await;
+        assert!(summary.graph_slice.nodes.is_empty());
+        assert_eq!(summary.evidence.len(), 1);
+        assert_eq!(summary.evidence[0].ref_id, response.evidence[0].ref_id);
+        assert!(summary.budget_result.truncated);
     }
 
     #[test]

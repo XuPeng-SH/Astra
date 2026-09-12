@@ -52,6 +52,9 @@ struct ServerReadiness {
 }
 
 fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
+    if stdout.len() > 65536 {
+        return Err("health response exceeds its bounded contract".to_string());
+    }
     let value: serde_json::Value = serde_json::from_slice(stdout)
         .map_err(|error| format!("health response is not valid JSON: {error}"))?;
     let status = value
@@ -92,6 +95,19 @@ fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
         interaction_api_major: interaction_api_major.to_string(),
         build_git_sha: build_git_sha.to_string(),
     })
+}
+
+fn validate_health_probe(stdout: &[u8], exit_code: Option<i32>) -> Result<ServerReadiness, String> {
+    // `astra health` uses ApiError (3) for any non-healthy body. Only a
+    // validated optional degradation is usable by this smoke harness.
+    if !matches!(exit_code, Some(0 | 3)) {
+        return Err(format!("health process failed: {exit_code:?}"));
+    }
+    let readiness = parse_server_readiness(stdout)?;
+    if exit_code == Some(3) && !readiness.degraded {
+        return Err("health process exit disagrees with healthy response".to_string());
+    }
+    Ok(readiness)
 }
 
 /// Validate the complete terminal evidence emitted by a successful model
@@ -163,18 +179,7 @@ async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
             detail: format!("failed to spawn: {e}"),
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PreflightError::ServerUnreachable {
-            detail: format!(
-                "exit {}: {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            ),
-        });
-    }
-
-    let readiness = parse_server_readiness(&output.stdout)
+    let readiness = validate_health_probe(&output.stdout, output.status.code())
         .map_err(|detail| PreflightError::ServerUnready { detail })?;
     eprintln!(
         "[astra-test] preflight: Server contract={} build={}",
@@ -467,6 +472,23 @@ async fn try_auto_register(astra_bin: &Path, profile: &str) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_server_readiness_contract() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/server_readiness.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let body = serde_json::to_vec(&case["body"]).unwrap();
+            let code = case["exit_code"].as_i64().unwrap() as i32;
+            assert_eq!(
+                super::validate_health_probe(&body, Some(code)).is_ok(),
+                case["ready"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+        assert!(super::validate_health_probe(&vec![b' '; 65537], Some(0)).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -573,6 +595,19 @@ mod tests {
 
     #[test]
     fn health_probe_distinguishes_core_readiness_from_optional_degradation() {
+        let degraded_body = br#"{"status":"degraded","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memoria":"unavailable"}"#;
+        assert!(validate_health_probe(degraded_body, Some(3)).is_ok());
+        assert!(validate_health_probe(degraded_body, Some(1)).is_err());
+        assert!(validate_health_probe(degraded_body, None).is_err());
+        assert!(
+            validate_health_probe(
+                br#"{"status":"degraded","database":"unavailable"}"#,
+                Some(3)
+            )
+            .is_err()
+        );
+        assert!(validate_health_probe(br#"{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#, Some(3)).is_err());
+        assert!(validate_health_probe(b"not JSON", Some(3)).is_err());
         let healthy = parse_server_readiness(
             br#"{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memoria":"available"}"#,
         )

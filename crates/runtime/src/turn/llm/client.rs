@@ -1016,7 +1016,6 @@ struct ControlledProviderAttemptObserver<'a> {
     started: Instant,
     work_budget: std::time::Duration,
     logical_budget: std::time::Duration,
-    settlement_reserve: std::time::Duration,
     cancel: LlmCancel<'a>,
 }
 
@@ -1026,8 +1025,9 @@ impl ControlledProviderAttemptObserver<'_> {
     }
 
     fn remaining_settlement(&self) -> std::time::Duration {
-        self.settlement_reserve
-            .min(self.logical_budget.saturating_sub(self.started.elapsed()))
+        // The reserve stops provider work early enough to leave time for
+        // settlement; it is not a second, shorter deadline for a fast reply.
+        self.logical_budget.saturating_sub(self.started.elapsed())
     }
 
     fn cancellation_error(&self, stage: &str) -> astra_core::ClassifiedError {
@@ -1325,7 +1325,7 @@ fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
     .ok()
 }
 
-fn attach_llm_result_details(
+pub(super) fn attach_llm_result_details(
     error: astra_core::ClassifiedError,
     result: &LlmCallResult,
 ) -> astra_core::ClassifiedError {
@@ -2733,68 +2733,7 @@ fn strip_internal_schema_extensions(value: &mut Value) {
             // well. Materialize one compact, deterministic description before
             // stripping so the provider sees the same contract the executor
             // enforces without relying on unsupported schema composition.
-            let mut requirements = Vec::new();
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} requires {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ANY_OF_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, alternatives) in per_action {
-                    let alternatives = alternatives
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_array)
-                        .map(|fields| {
-                            fields
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" + ")
-                        })
-                        .filter(|fields| !fields.is_empty())
-                        .collect::<Vec<_>>();
-                    if !alternatives.is_empty() {
-                        requirements.push(format!(
-                            "{action} also requires one of {}",
-                            alternatives.join(" or ")
-                        ));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if !requirements.is_empty() {
-                let contract = format!("Action contract: {}.", requirements.join("; "));
+            if let Some(contract) = astra_tools::schemas::action_contract_description(object) {
                 let description = object
                     .get("description")
                     .and_then(Value::as_str)
@@ -3138,6 +3077,9 @@ fn build_provider_request_body_with_cache_capability(
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
             || astra_turn_types::has_append_only_runtime_authority_policy(message)
+            || message
+                .get(astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD)
+                .is_some()
     }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
@@ -3736,6 +3678,7 @@ pub(crate) fn consolidate_system_messages_for_provider(
 
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     for message in messages {
+        astra_turn_core::tool::result::advisory::project_advisories(message);
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
         if let Some(object) = message.as_object_mut() {
             object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
@@ -3747,22 +3690,27 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             // useful in runtime history, but are not part of the provider
             // message contract and only add round-specific bytes to the
             // prompt cache suffix.
-            for key in ["_round_index", "_tool_name", "_timestamp", "_synthetic"] {
+            for key in [
+                "_round_index",
+                "_tool_name",
+                "_timestamp",
+                "_synthetic",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            ] {
                 object.remove(key);
             }
         }
     }
 }
 
-/// Project canonical messages through the metadata-only portion of the
-/// provider boundary.
+/// Project canonical messages through provider presentation and metadata removal.
 ///
 /// Canonical history retains typed provenance so intent, recovery, and
 /// append-only authority consumers can distinguish runtime-owned messages.
-/// Provider requests deliberately remove that metadata.  Any equality check
-/// across those two representations must therefore compare this projection,
-/// while preserving roles, content, ordering, and every provider-visible
-/// field exactly.
+/// Provider requests render per-tool guidance and remove internal metadata.
+/// Equality checks across these representations must use this same projection,
+/// including its derived content, roles, ordering, and provider-visible fields.
 fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
     let mut projected = messages.to_vec();
     for message in &mut projected {
@@ -3776,8 +3724,8 @@ fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
 /// of a staged canonical append.
 ///
 /// This is intentionally a shape check, not a content classifier: the only
-/// differences ignored are the same typed internal metadata fields removed
-/// at the provider boundary.
+/// differences accounted for are the same typed metadata and derived guidance
+/// presentation handled at the provider boundary.
 pub(crate) fn provider_request_preserves_projected_canonical_suffix(
     provider_messages: &[Value],
     canonical_appended: &[Value],
@@ -4740,7 +4688,6 @@ async fn call_llm_and_collect_with_total_budget(
             started,
             work_budget: total_budget,
             logical_budget: logical_total_budget,
-            settlement_reserve,
             cancel,
         });
     let attempt_observer = controlled_attempt_observer
@@ -6279,22 +6226,51 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         .into_iter()
         .map(|(_, v)| Value::Object(v))
         .collect();
-
-    // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
-    // tags in content instead of structured tool_calls. Recover them.
-    if let Some(parsed) =
-        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    // A non-empty provider surface is an exact execution authority. Keep an
+    // explicitly tool-less response intact for the private summary adapter so
+    // it can classify a provider-emitted call as invalid structured output;
+    // those calls never enter the agent executor. Ordinary tool-bearing turns
+    // retain only names present in the exact wire surface.
+    if let Some(authorized) = authorized_tool_names
+        && !authorized.is_empty()
     {
-        if tool_calls.is_empty() {
+        tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized.contains(name))
+        });
+    }
+
+    // Degraded tool-call fallback is governed by the same exact wire surface
+    // as native tool-call deltas. In particular, a text-only request carries
+    // `Some(empty)`: it must never manufacture an executable call after the
+    // stream has already passed native authorization.
+    let parsed_degraded =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text);
+    let text_only_degraded_response =
+        authorized_tool_names.is_some_and(HashSet::is_empty) && parsed_degraded.is_some();
+    if let Some(parsed) = parsed_degraded {
+        let admitted = parsed
+            .into_iter()
+            .filter(|call| {
+                let Some(name) = tool_call_name(call).and_then(canonical_valid_tool_name) else {
+                    return false;
+                };
+                authorized_tool_names.is_none_or(|authorized| authorized.contains(name))
+            })
+            .collect::<Vec<_>>();
+        if tool_calls.is_empty() && !admitted.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
-                parsed.len()
+                admitted.len()
             );
-            tool_calls = parsed;
+            tool_calls = admitted;
         }
     }
-    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    if !text_only_degraded_response {
+        full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    }
     reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
         &reasoning,
     );
@@ -7043,7 +7019,6 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             started,
             work_budget: timeout,
             logical_budget: logical_timeout,
-            settlement_reserve: llm_mandatory_settlement_reserve(logical_timeout),
             cancel: LlmCancel::None,
         });
     let attempt_observer = controlled_attempt_observer
@@ -7300,6 +7275,19 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         }
     };
     let mut result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    if matches!(tool_choice, RuntimeToolChoice::Auto) {
+        let authorized_tool_names = tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter_map(canonical_valid_tool_name)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        result.tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized_tool_names.contains(name))
+        });
+    }
     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
     if result.response_id.is_none() {
         result.response_id = transport_response_id;
@@ -10671,6 +10659,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degraded_tool_recovery_obeys_the_exact_wire_authority() {
+        let event = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\"><｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke><｜｜DSML｜｜invoke name=\"memory\"><｜｜DSML｜｜parameter name=\"action\" string=\"true\">recall</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"query\" string=\"true\">x</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"}}]});
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+
+        let allowed = HashSet::from(["bash".to_string()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body.clone()))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+        )
+        .await
+        .expect("collect with a partial exact surface");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+
+        let no_tools = HashSet::new();
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &no_tools,
+            None,
+        )
+        .await
+        .expect("collect with an explicitly empty surface");
+        assert!(result.tool_calls.is_empty());
+        assert!(
+            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&result.full_text)
+                .is_some(),
+            "a private no-tool caller must receive typed-invalid content for its bounded repair path"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
@@ -10989,6 +11021,24 @@ mod tests {
     }
 
     #[test]
+    fn early_provider_completion_keeps_unused_budget_for_terminalization() {
+        let inner = PendingAttemptObserver::default();
+        let logical_budget = std::time::Duration::from_secs(8);
+        let reserve = llm_mandatory_settlement_reserve(logical_budget);
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: logical_budget - reserve,
+            logical_budget,
+            cancel: LlmCancel::None,
+        };
+        assert!(
+            observer.remaining_settlement() > reserve,
+            "reserving the final slice must not discard unused provider time"
+        );
+    }
+
+    #[test]
     fn provider_deadline_transport_race_keeps_deadline_as_primary_diagnostic() {
         let partial = LlmCallResult {
             full_text: "partial answer".to_string(),
@@ -11022,14 +11072,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_attempt_terminalization_uses_only_the_reserved_slice() {
+    async fn provider_attempt_terminalization_obeys_remaining_logical_deadline() {
         let inner = PendingAttemptObserver::default();
         let observer = ControlledProviderAttemptObserver {
             inner: &inner,
-            started: Instant::now(),
+            started: Instant::now() - std::time::Duration::from_millis(980),
             work_budget: std::time::Duration::from_secs(1),
             logical_budget: std::time::Duration::from_secs(1),
-            settlement_reserve: std::time::Duration::from_millis(20),
             cancel: LlmCancel::None,
         };
         let terminal = provider_attempt_terminal_from_error(&astra_core::ClassifiedError::new(
@@ -11040,7 +11089,7 @@ mod tests {
         let error = observer
             .finish_attempt(0, &terminal)
             .await
-            .expect_err("pending persistence must stop at the settlement reserve");
+            .expect_err("pending persistence must stop at the logical deadline");
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert!(crate::turn::llm::durable::is_ledger_error(&error));
         let details: Value = serde_json::from_str(
@@ -11058,8 +11107,25 @@ mod tests {
         assert_eq!(details["provider_terminal"]["status"], "delivery_unknown");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(200),
-            "terminalization must not inherit the nearly one-second logical budget"
+            "terminalization must not restart the logical budget"
         );
+    }
+
+    #[tokio::test]
+    async fn terminalization_cancellation_does_not_consume_unused_budget() {
+        let inner = PendingFinishAttemptObserver;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: std::time::Duration::from_secs(7),
+            logical_budget: std::time::Duration::from_secs(8),
+            cancel: LlmCancel::Token(&cancel),
+        };
+        let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
+        let error = observer.finish_attempt(0, &terminal).await.unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
     }
 
     #[tokio::test]
@@ -11070,7 +11136,6 @@ mod tests {
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
             logical_budget: std::time::Duration::from_millis(25),
-            settlement_reserve: std::time::Duration::from_millis(5),
             cancel: LlmCancel::None,
         };
         let prepared = PreparedProviderRequest::from_json(
@@ -11223,7 +11288,6 @@ mod tests {
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
             logical_budget: std::time::Duration::from_millis(25),
-            settlement_reserve: std::time::Duration::from_millis(5),
             cancel: LlmCancel::None,
         };
         let provider_error = astra_core::ClassifiedError::new(
@@ -14249,6 +14313,14 @@ mod tests {
             "schema_version": 1,
             "turn_chain_id": "chain-current"
         });
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD] = json!("run-1");
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD] = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 4,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
         runtime["_round_index"] = json!(7);
         runtime["_tool_name"] = json!("read_file");
         runtime["_timestamp"] = json!(1234);
@@ -14273,9 +14345,108 @@ mod tests {
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
-        for key in ["_round_index", "_tool_name", "_timestamp", "_synthetic"] {
+        for key in [
+            "_round_index",
+            "_tool_name",
+            "_timestamp",
+            "_synthetic",
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+        ] {
             assert!(out[0].get(key).is_none(), "internal key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn direct_request_projects_tool_guidance_without_other_runtime_markers() {
+        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
+        let messages = vec![
+            json!({"role":"system", "content":"system"}),
+            json!({"role":"assistant", "content":"", "tool_calls":[{
+                "id":"call-probe", "type":"function", "function":{"name":"probe","arguments":"{}"}
+            }]}),
+            json!({"role":"tool", "tool_call_id":"call-probe", "content":"null",
+                TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"]}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "probe-model",
+            "openai",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let tool = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        assert!(
+            tool["content"]
+                .as_str()
+                .unwrap()
+                .contains("inspect the existing operation")
+        );
+        assert!(tool.get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
+        assert_eq!(messages[2]["content"], "null");
+    }
+
+    #[test]
+    fn tool_guidance_projection_preserves_canonical_suffix_and_does_not_accumulate() {
+        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
+        let canonical = vec![json!({
+            "role":"tool", "tool_call_id":"call-probe", "content":r#"{"executed":false}"#,
+            TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"],
+        })];
+        let projected = project_provider_message_metadata(&canonical);
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &projected, &canonical
+        ));
+        assert_eq!(project_provider_message_metadata(&projected), projected);
+        assert_eq!(canonical[0]["content"], r#"{"executed":false}"#);
+        assert!(
+            projected[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("inspect the existing operation")
+        );
+        assert!(projected[0].get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
+        let mut missing_guidance = projected.clone();
+        missing_guidance[0]["content"] = canonical[0]["content"].clone();
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &missing_guidance,
+            &canonical
+        ));
+    }
+
+    #[test]
+    fn provider_projection_preserves_nested_tool_result_data() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": {
+                "quoted": {
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-1",
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:
+                        {"unexpected": "nested"},
+                }
+            }
+        })];
+
+        let out = consolidate_system_messages_for_provider(&messages, "openai", None);
+        let quoted = &out[0]["content"]["quoted"];
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                .is_some_and(|value| value == "run-1")
+        );
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .is_some_and(|value| value == &json!({"unexpected": "nested"}))
+        );
     }
 
     #[test]
@@ -16465,6 +16636,7 @@ mod tests {
                 delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
                 payload: json!("Read-only plan mode."),
                 round_index: 0,
+                authority_lifetime: None,
             }).unwrap());
             messages.push(
                 runtime_system_context_message("Current goal: Translate only this sentence.", true)
@@ -17746,6 +17918,8 @@ mod tests {
             state.messages = history.clone();
             crate::turn::llm::context::assemble_wire_messages(
                 crate::turn::llm::context::LlmWireAssemblyInput {
+                    artifact_recovery_route:
+                        crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
                     system_messages: vec![json!({"role": "system", "content": "stable"})],
                     volatile_preamble: Vec::new(),
                     compacted_messages: history,

@@ -170,9 +170,11 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            charged_iterations: 0,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             budget_is_explicit: false,
             budget_policy: None,
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -205,7 +207,7 @@ mod tests {
             user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_finish_reason: None,
@@ -590,7 +592,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -604,11 +605,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -631,6 +634,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -675,7 +679,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -689,11 +692,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -716,6 +721,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: true,
@@ -769,7 +775,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -783,11 +788,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -810,6 +817,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -861,7 +869,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // Simulate: skill interception resolved call_skill before headless round
@@ -881,11 +888,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -908,6 +917,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -991,7 +1001,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // ALL tool calls were pre-resolved by upstream (skill + defer)
@@ -1011,11 +1020,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1038,6 +1049,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1093,7 +1105,10 @@ mod tests {
 
         // Edge round has the grep result (executed at edge during SSE)
         let edge_tool_round = vec![EdgeToolExecResult {
-            request_id: String::new(),
+            // Edge execution custody is keyed by the provider-emitted tool-call
+            // id.  An id-less result is diagnostic only and must not be
+            // attached to a different call by name/arguments.
+            request_id: "grep:1".into(),
             tool: "grep".to_string(),
             args: json!({"pattern": "TODO"}),
             output: "src/main.rs:10: // TODO fix".to_string(),
@@ -1113,9 +1128,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
         // Skill was pre-resolved; grep will be matched from edge_tool_round
         let pre_resolved = vec![("skill:0".to_string(), "Skill instructions".to_string())];
         let permission_context = PermissionSyncContext::shared_root(PermissionMode::Auto);
@@ -1131,11 +1143,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1158,6 +1172,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1224,7 +1239,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1238,11 +1252,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1265,6 +1281,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1361,7 +1378,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1375,11 +1391,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1402,6 +1420,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1500,7 +1519,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1514,11 +1532,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1541,6 +1561,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1593,7 +1614,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1607,11 +1627,13 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
-            tool_calls: &tool_calls,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1634,6 +1656,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
