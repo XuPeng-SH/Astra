@@ -37,11 +37,14 @@ async fn collect_full_sse_stream(
     req: Request<Body>,
     timeout_secs: u64,
 ) -> (StatusCode, String) {
-    let resp = app.clone().oneshot(req).await.expect("oneshot");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let resp = tokio::time::timeout_at(deadline, app.clone().oneshot(req))
+        .await
+        .unwrap_or_else(|_| panic!("SSE request did not return headers within {timeout_secs}s"))
+        .expect("oneshot");
     let status = resp.status();
     let mut stream = resp.into_body().into_data_stream();
     let mut acc = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(chunk)) => {
@@ -49,10 +52,19 @@ async fn collect_full_sse_stream(
                 acc.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(_) => panic!(
-                "SSE stream did not terminate within {timeout_secs}s; collected {} bytes",
-                acc.len()
-            ),
+            Err(_) => {
+                let events = parse_sse_events(&String::from_utf8_lossy(&acc));
+                let recent = events
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|event| (event["type"].as_str(), event["status"].as_str()))
+                    .collect::<Vec<_>>();
+                panic!(
+                    "SSE stream did not terminate within {timeout_secs}s; collected {} bytes; recent event type/status (newest first): {recent:?}",
+                    acc.len()
+                );
+            }
         }
     }
     (status, String::from_utf8_lossy(&acc).into_owned())
@@ -60,6 +72,15 @@ async fn collect_full_sse_stream(
 
 /// Stream a chat, wait for the full stream to end, return (status, raw_body).
 async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (StatusCode, String) {
+    stream_chat_full_with_timeout(app, auth, payload, 30).await
+}
+
+async fn stream_chat_full_with_timeout(
+    app: &axum::Router,
+    auth: &str,
+    payload: Value,
+    timeout_secs: u64,
+) -> (StatusCode, String) {
     let test_secret = std::env::var("ASTRA_TEST_E2E_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
@@ -69,7 +90,40 @@ async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (St
         .header("x-astra-e2e-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
         .expect("stream request");
-    collect_full_sse_stream(app, req, 30).await
+    collect_full_sse_stream(app, req, timeout_secs).await
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "SSE request did not return headers within 5s")]
+async fn sse_deadline_covers_pending_request_headers() {
+    let app =
+        axum::Router::new().route("/", axum::routing::get(|| std::future::pending::<String>()));
+    collect_full_sse_stream(&app, Request::new(Body::empty()), 5).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "SSE stream did not terminate within 5s")]
+async fn sse_deadline_is_shared_by_headers_and_body() {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Body::from_stream(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Ok::<_, std::convert::Infallible>("data: {\"type\":\"done\"}\n\n")
+            }))
+        }),
+    );
+    collect_full_sse_stream(&app, Request::new(Body::empty()), 5).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sse_deadline_accepts_a_complete_stream() {
+    let expected = "data: {\"type\":\"done\"}\n\n";
+    let app = axum::Router::new().route("/", axum::routing::get(move || async move { expected }));
+    let (status, body) = collect_full_sse_stream(&app, Request::new(Body::empty()), 5).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, expected);
 }
 
 fn mock_tool_call(id: &str, name: &str, args: Value) -> Value {
@@ -1109,13 +1163,11 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         .map(|case| concurrent_fanout_payload(ctx, case, shared_group_id))
         .collect::<Vec<_>>();
     let started = tokio::time::Instant::now();
-    let responses = futures_util::future::join_all(
-        cases
-            .iter()
-            .zip(payloads)
-            .map(|(case, payload)| stream_chat_full(app, case.auth.as_str(), payload)),
-    )
-    .await;
+    let responses =
+        futures_util::future::join_all(cases.iter().zip(payloads).map(|(case, payload)| {
+            stream_chat_full_with_timeout(app, case.auth.as_str(), payload, 20)
+        }))
+        .await;
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "four bounded fanouts exceeded the online concurrency budget"
