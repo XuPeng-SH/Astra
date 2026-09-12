@@ -4060,6 +4060,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         Err(error) => {
             state.restore_volatile_attempt_lease();
             fold_provider_completion_error_usage(state, &error);
+            if crate::turn::llm::durable::is_guidance_admission_fence(&error) {
+                // Admission rejected this request before HTTP delivery. Consume
+                // the authoritative guidance using the ordinary control lane;
+                // never retry the stale request or manufacture a new run.
+                if inject_polled_user_intents_before_action(host, state).await? {
+                    state.final_text.clear();
+                    state.final_text_streamed = false;
+                    state.step_recorder.end_turn(false);
+                    return Ok(TurnExecutionControl::ContinueLoop);
+                }
+                // A fence without applicable guidance is not permission to
+                // loop: cancellation/owner loss and inconsistent snapshots
+                // must remain fail-closed.
+                record_direct_llm_error_state(state, &error);
+                return Err(error);
+            }
             if schedule_safe_provider_recovery(state, &error) {
                 tracing::warn!(
                     target: "astra::provider_recovery",
@@ -16709,6 +16725,115 @@ mod tests {
             host.turn_completed_run_ids.is_empty(),
             "hook must not fire when ingest returns Fatal"
         );
+    }
+
+    #[tokio::test]
+    async fn guidance_admission_fence_reconciles_before_continuing() {
+        // The host boundary fails after pre-request polling, as happens when
+        // guidance races the final durable provider-attempt admission.
+        for (reason, available, should_continue) in [
+            (
+                astra_services::InferenceScopeRejection::GuidancePending,
+                true,
+                true,
+            ),
+            (
+                astra_services::InferenceScopeRejection::GuidancePending,
+                false,
+                false,
+            ),
+            (
+                astra_services::InferenceScopeRejection::Unavailable,
+                true,
+                false,
+            ),
+        ] {
+            let mut state = make_state();
+            state.current_run_id = Some("run-guidance-race".into());
+            state.current_run_owner_generation = Some(17);
+            state.context_manifest_user_id = Some("user-guidance-race".into());
+            let pending = UserIntentPoll {
+                next_cursor: 1,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "guidance-race".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "apply the revised objective"}),
+                }],
+                ..UserIntentPoll::default()
+            };
+            let provider = Arc::new(StubRunControlProvider::new(vec![
+                UserIntentPoll::default(),
+                if available {
+                    pending
+                } else {
+                    UserIntentPoll::default()
+                },
+            ]));
+            state.run_control = Some(provider.clone());
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "typed admission fence",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                    "scope_rejection": reason,
+                })
+                .to_string(),
+            );
+            let mut host = DirectErrorHost::new(error);
+            let result = execute_turn_and_ingest_phase(
+                &mut host,
+                &mut state,
+                0,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+            )
+            .await;
+            if should_continue {
+                assert!(matches!(
+                    result.unwrap(),
+                    TurnExecutionControl::ContinueLoop
+                ));
+                assert_eq!(state.message, "apply the revised objective");
+                assert_eq!(*provider.released.lock().await, vec![1]);
+                assert!(state.interruption.is_none());
+                assert!(state.final_text.is_empty());
+                let mut resumed = MockHost::new(vec![text_result("revised result", 12, 3, None)]);
+                let next = execute_turn_and_ingest_phase(
+                    &mut resumed,
+                    &mut state,
+                    1,
+                    TurnIterationPrep {
+                        quiet: true,
+                        turn_start_time: Instant::now(),
+                    },
+                )
+                .await
+                .expect("the same run can complete after applying guidance");
+                assert!(!matches!(next, TurnExecutionControl::ContinueLoop));
+                assert!(
+                    resumed.executed_messages[0]
+                        .iter()
+                        .any(|message| message["role"] == "user"
+                            && message["content"] == "apply the revised objective")
+                );
+                assert_eq!(
+                    *provider.released.lock().await,
+                    vec![1],
+                    "guidance is applied once"
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(provider.released.lock().await.is_empty());
+            }
+            assert_eq!(host.turn_count(), 1, "no stale request is retried in place");
+        }
     }
 
     #[tokio::test]

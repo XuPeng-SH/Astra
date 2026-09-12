@@ -3355,7 +3355,29 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
     )
     .await
     .expect_err("newer guidance cannot race provider admission");
-    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+    assert_eq!(error.kind, ServiceErrorKind::Conflict);
+    assert_eq!(
+        error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<astra_services::InferenceScopeRejection>()),
+        Some(&astra_services::InferenceScopeRejection::GuidancePending)
+    );
+    let combined = plan_for("combined_unobserved_guidance", exact.clone());
+    let error = admit_inference_invocation_with_first_provider_attempt(
+        &shared_pool,
+        &combined,
+        &provider_attempt(&combined, 0),
+    )
+    .await
+    .expect_err("combined admission must obey the same guidance fence");
+    assert_eq!(
+        error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<astra_services::InferenceScopeRejection>()),
+        Some(&astra_services::InferenceScopeRejection::GuidancePending)
+    );
 
     let mut observed_guidance = exact.clone();
     observed_guidance.expected_control_epoch = 0;
@@ -3365,6 +3387,34 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
     )
     .await
     .expect("applied guidance may admit under the same exact owner");
+
+    let recovery_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".into()),
+        error_message: Some("provider delivery was never authorized".into()),
+    };
+    // A lost admission ACK has two possible realities: no row, or an exact
+    // admitted row. New guidance must not turn either into ownership loss or
+    // permit stale physical delivery. Repeated resolution is idempotent.
+    let missing = plan_for("guidance_no_row", exact.clone());
+    let admitted = plan_for("guidance_ack_lost", observed_guidance.clone());
+    admit_inference_invocation(&shared_pool, &admitted)
+        .await
+        .unwrap();
+    append_run_control_event(pool, &user_id, &session_id, &run_id, 1, "user_intent").await;
+    for plan in [&missing, &admitted] {
+        for _ in 0..2 {
+            assert_eq!(
+                settle_uncertain_inference_admission(&shared_pool, plan, &recovery_terminal)
+                    .await
+                    .unwrap(),
+                InferenceInvocationAdmissionResolution::GuidancePending
+            );
+        }
+    }
 
     sqlx::query(
         "UPDATE agent_runs SET cancellation_requested_at = NOW(6)
@@ -3558,12 +3608,15 @@ async fn provider_attempt_revalidates_scope_authority_after_logical_admission() 
         .await
         .expect("admit before newer guidance");
     append_run_control_event(pool, &user_id, &session_id, &run_id, 0, "user_intent").await;
+    let error = begin_inference_provider_attempt(&shared_pool, &provider_attempt(&guided, 0))
+        .await
+        .expect_err("new guidance cannot race physical delivery");
     assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&guided, 0))
-            .await
-            .expect_err("new guidance cannot race physical delivery")
-            .kind,
-        ServiceErrorKind::NotFound
+        error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<astra_services::InferenceScopeRejection>()),
+        Some(&astra_services::InferenceScopeRejection::GuidancePending)
     );
 
     let mut observed = exact;

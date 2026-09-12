@@ -3886,6 +3886,7 @@ fn build_runtime_turn_evaluation_event(
     session_id: &str,
     source: &str,
     state: &AgenticLoopState,
+    settled_status: &str,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
@@ -3905,7 +3906,7 @@ fn build_runtime_turn_evaluation_event(
                 max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
             },
         );
-    astra_turn_core::evaluation::build_turn_evaluation_journal_event(
+    let mut event = astra_turn_core::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
         Some(state.session_turn),
         source,
@@ -3917,7 +3918,21 @@ fn build_runtime_turn_evaluation_event(
         state.telemetry.first_budget_pressure,
         &eval,
     )
-    .with_producer_scope(state.current_run_id.as_deref())
+    .with_producer_scope(state.current_run_id.as_deref());
+    if let Some(metadata) = event.metadata.as_mut().and_then(Value::as_object_mut) {
+        // Tool quality is evidence, not lifecycle authority. Successful tools
+        // cannot make a failed or interrupted run successful; retain their
+        // accurate health signals separately from the settled turn outcome.
+        metadata.insert("tool_evaluation_success".into(), Value::Bool(eval.success));
+        metadata.insert("run_status".into(), Value::String(settled_status.into()));
+        metadata.insert(
+            "success".into(),
+            Value::Bool(
+                eval.success && matches!(settled_status, STATUS_COMPLETED | STATUS_DELEGATED),
+            ),
+        );
+    }
+    event
 }
 
 fn persist_turn_evaluation_journal(
@@ -3925,12 +3940,13 @@ fn persist_turn_evaluation_journal(
     session_id: &str,
     source: &str,
     state: &AgenticLoopState,
+    settled_status: &str,
 ) {
     if session_id.is_empty() {
         return;
     }
 
-    let event = build_runtime_turn_evaluation_event(session_id, source, state);
+    let event = build_runtime_turn_evaluation_event(session_id, source, state, settled_status);
     match astra_services::session_journal::JournalWriter::for_user(user_id, session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
@@ -13832,6 +13848,7 @@ impl AgenticRunLifecycleService {
                         &bg_session_id,
                         "server_runtime",
                         &loop_state,
+                        persisted_status.as_str(),
                     );
                 }
 
@@ -17209,6 +17226,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_session_id,
                         "server_runtime",
                         &state,
+                        persisted_status.as_str(),
                     );
                     if let (Some(pool), Some(binding), Some(workspace)) = (
                         persist_ctx.shared_pool.clone(),
@@ -22415,6 +22433,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.session_id,
             "server_subrun",
             &loop_state,
+            control_authority.map_or(durable_status, DurableSubrunControlAuthority::status),
         );
         flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id, false);
 

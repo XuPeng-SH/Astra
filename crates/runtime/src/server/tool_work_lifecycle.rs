@@ -196,26 +196,11 @@ enum StartWorkActivation {
     Defer,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct InitialWorkItem {
-    item_id: String,
-    kind: &'static str,
-    objective: String,
-    expected_result: String,
-}
+type InitialWorkItem = astra_services::work::WorkEstablishmentItem;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InitialWorkTask {
-    objective: String,
-    expected_result: String,
-}
+type InitialWorkTask = astra_services::WorkAdmissionTask;
 
-#[derive(Serialize)]
-struct InitialWorkDependency {
-    predecessor_item_id: String,
-    successor_item_id: String,
-}
+type InitialWorkDependency = astra_services::work::WorkEstablishmentDependency;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct InitialRunnableItem {
@@ -389,23 +374,6 @@ fn canonical_board_tasks(snapshot: &WorkTaskExecutionSnapshot) -> Vec<WorkTaskBo
         .collect()
 }
 
-async fn canonical_task_board_update(
-    binding: &WorkRuntimeBinding,
-    goal: Option<&str>,
-    affected_item_ids: Option<&HashSet<String>>,
-) -> Result<WorkTaskBoardUpdateV1, ToolResult> {
-    let snapshot = binding
-        .repository
-        .load_task_execution_snapshot_for_session(&binding.owner_id, &binding.session_id)
-        .await
-        .map_err(|error| {
-            ToolResult::error(format!(
-                "canonical Work was committed but its task board could not be read: {error}"
-            ))
-        })?;
-    task_board_update_from_snapshot(binding, &snapshot, goal, affected_item_ids)
-}
-
 fn task_board_update_from_snapshot(
     binding: &WorkRuntimeBinding,
     snapshot: &WorkTaskExecutionSnapshot,
@@ -477,53 +445,12 @@ pub(super) fn active_primary_attempt_board_event(
 /// graph. IDs and task kind are server-owned; the model supplies only the
 /// semantic work and its expected result.
 ///
-/// Semantic admission does not declare precedence. Leaving dependencies empty
-/// preserves that fact instead of inventing a serial relationship that would
-/// misrepresent the user's outcomes and prevent a later genuine parallel
-/// execution boundary. The primary scheduler still dispatches one foreground
-/// task at a time by its own resource policy.
+/// Preserve explicitly admitted precedence, independently of identity ordering.
+/// Tasks without prerequisites remain independent.
 fn compile_initial_task_graph(
     tasks: &[InitialWorkTask],
-) -> (Vec<InitialWorkItem>, Vec<InitialWorkDependency>) {
-    let items = tasks
-        .iter()
-        .enumerate()
-        .map(|(index, task)| InitialWorkItem {
-            item_id: format!("task-{}", index + 1),
-            kind: "task",
-            objective: task.objective.clone(),
-            expected_result: task.expected_result.clone(),
-        })
-        .collect::<Vec<_>>();
-    let dependencies = Vec::new();
-    (items, dependencies)
-}
-
-/// Allocate retry-stable identities for server-owned graph additions.
-///
-/// A graph mutation may crash after its proposal commits but before the
-/// surrounding durable operation advances. Deriving IDs from the now-larger
-/// graph would change the proposal under the same idempotency key. The
-/// immutable logical operation therefore owns the ID namespace; physical
-/// retries reproduce the exact same proposal regardless of observed state.
-fn compile_graph_addition_items(
-    operation_id: &str,
-    tasks: &[InitialWorkTask],
-) -> Vec<InitialWorkItem> {
-    let mut digest = Sha256::new();
-    digest.update(b"continuation-work-items-v1\0");
-    digest.update(operation_id.as_bytes());
-    let namespace = format!("{:x}", digest.finalize());
-    tasks
-        .iter()
-        .enumerate()
-        .map(|(index, task)| InitialWorkItem {
-            item_id: format!("task-{}-{}", &namespace[..48], index + 1),
-            kind: "task",
-            objective: task.objective.clone(),
-            expected_result: task.expected_result.clone(),
-        })
-        .collect()
+) -> Result<(Vec<InitialWorkItem>, Vec<InitialWorkDependency>), String> {
+    astra_services::work::compile_initial_work_establishment_graph(tasks)
 }
 
 fn confirmed_assignment(
@@ -565,132 +492,75 @@ fn confirmed_assignment(
 /// primary model to author it again. The proposal identity and every new item
 /// identity derive from the immutable establishment operation, so a crash
 /// after proposal commit replays the same transition.
-async fn apply_admitted_graph_mutations(
+async fn reconcile_admitted_graph_mutations(
     executor: &RuntimeToolExecutor,
-    establishment_request: &WorkEstablishmentRequest,
-    decision: Option<&astra_services::WorkAdmissionDecision>,
-    admitted_candidates: &[InitialWorkItem],
     invocation: ToolInvocationMetadata<'_>,
 ) -> Result<Option<AppliedGraphMutations>, ToolResult> {
-    let mutations = decision.map_or(&[][..], |decision| decision.deferred_graph_mutations());
-    if mutations.is_empty() {
-        return Ok(None);
-    }
     let Some(binding) = executor.work_binding.get() else {
-        return Err(ToolResult::error(
-            "canonical Work binding disappeared before graph mutations".to_string(),
-        ));
+        return Ok(None);
     };
-    let context = binding
+    let snapshot = binding
         .repository
-        .load_plan_context_for_session(&binding.owner_id, &binding.session_id)
+        .load_task_execution_snapshot_for_session(&binding.owner_id, &binding.session_id)
         .await
         .map_err(|error| {
             ToolResult::error(format!(
-                "canonical Work mutation context could not be read: {error}"
+                "canonical Work mutation schedule could not be read: {error}"
             ))
         })?;
-    let addition_tasks = mutations
-        .iter()
-        .filter_map(astra_services::WorkAdmissionGraphMutation::addition)
-        .map(|task| InitialWorkTask {
-            objective: task.objective.clone(),
-            expected_result: task.expected_result.clone(),
-        })
-        .collect::<Vec<_>>();
-    let additions = compile_graph_addition_items(
-        &format!("{}-mutations", establishment_request.operation_id),
-        &addition_tasks,
-    );
-    let mut revisions = Vec::new();
-    for mutation in mutations {
-        let Some(candidate_number) = mutation.target_initial_candidate() else {
-            continue;
-        };
-        let Some(candidate) = candidate_number
-            .checked_sub(1)
-            .and_then(|index| admitted_candidates.get(index))
-        else {
+    let mut applied = None;
+    for group in snapshot.pending_graph_mutations() {
+        let context = binding
+            .repository
+            .load_plan_context_for_session(&binding.owner_id, &binding.session_id)
+            .await
+            .map_err(|error| {
+                ToolResult::error(format!(
+                    "canonical Work mutation context could not be read: {error}"
+                ))
+            })?;
+        let proposal = super::tool_work_plan::propose(
+            executor,
+            &group.proposal_arguments(context.context_id()),
+            ToolInvocationMetadata {
+                run_id: Some(&group.operation_id),
+                turn_chain_id: Some(&group.operation_id),
+                tool_call_id: Some(&group.tool_call_id),
+                ..invocation
+            },
+            None,
+        )
+        .await;
+        if proposal.is_error {
+            return Err(proposal);
+        }
+        let output: Value = serde_json::from_str(&proposal.output).map_err(|_| {
+            ToolResult::error("canonical Work mutation returned invalid planning state".to_string())
+        })?;
+        if output.get("status").and_then(Value::as_str) != Some("accepted") {
             return Err(ToolResult::error(
-                "persisted Work mutation targets an absent admitted candidate".to_string(),
-            ));
-        };
-        let Some(retirement) = mutation.retirement() else {
-            return Err(ToolResult::error(
-                "persisted Work mutation has no typed retirement target".to_string(),
-            ));
-        };
-        if retirement.objective != candidate.objective
-            || retirement.expected_result != candidate.expected_result
-        {
-            return Err(ToolResult::error(
-                "persisted Work mutation target conflicts with its admitted candidate".to_string(),
+                json!({
+                    "status": "graph_mutation_pending",
+                    "proposal": output,
+                    "next_action": "resume_work_after_graph_mutation_admission",
+                })
+                .to_string(),
             ));
         }
-        let Some(declaration_state) = mutation.required_declaration_state() else {
-            return Err(ToolResult::error(
-                "persisted Work mutation has no typed declaration transition".to_string(),
-            ));
-        };
-        revisions.push(json!({
-            "item_id": candidate.item_id,
-            "expected_revision": WorkItemRevision::INITIAL.get(),
-            "kind": candidate.kind,
-            "objective": candidate.objective,
-            "expected_result": candidate.expected_result,
-            "declaration_state": declaration_state,
-        }));
+        let revision = output
+            .get("result_graph_revision")
+            .and_then(Value::as_i64)
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| {
+                ToolResult::error(
+                    "canonical Work mutation returned no valid graph revision".to_string(),
+                )
+            })?;
+        applied = Some(AppliedGraphMutations {
+            graph_revision: revision,
+        });
     }
-    let mutation_call_id = format!("{}-mutations", establishment_request.operation_id);
-    let proposal_invocation = ToolInvocationMetadata {
-        run_id: Some(establishment_request.operation_id.as_str()),
-        turn_chain_id: Some(establishment_request.operation_id.as_str()),
-        tool_call_id: Some(mutation_call_id.as_str()),
-        ..invocation
-    };
-    let proposal = super::tool_work_plan::propose(
-        executor,
-        &json!({
-            "context_id": context.context_id(),
-            "reason": "Apply the persisted Work admission graph decision",
-            "additions": additions,
-            "revisions": revisions,
-            "dependencies": [],
-            "dependency_removals": [],
-        }),
-        proposal_invocation,
-        None,
-    )
-    .await;
-    if proposal.is_error {
-        return Err(proposal);
-    }
-    let output: Value = serde_json::from_str(&proposal.output).map_err(|_| {
-        ToolResult::error("canonical Work mutation returned invalid planning state".to_string())
-    })?;
-    if output.get("status").and_then(Value::as_str) != Some("accepted") {
-        return Err(ToolResult::error(
-            json!({
-                "status": "establishment_pending",
-                "phase": "graph_mutations",
-                "proposal": output,
-                "next_action": "resume_this_start_work_request_after_admission",
-            })
-            .to_string(),
-        ));
-    }
-    let revision = output
-        .get("result_graph_revision")
-        .and_then(Value::as_i64)
-        .filter(|revision| *revision > 0)
-        .ok_or_else(|| {
-            ToolResult::error(
-                "canonical Work mutation returned no valid graph revision".to_string(),
-            )
-        })?;
-    Ok(Some(AppliedGraphMutations {
-        graph_revision: revision,
-    }))
+    Ok(applied)
 }
 
 fn validate_initial_task_list(tasks: &[InitialWorkTask]) -> Result<(), &'static str> {
@@ -702,19 +572,6 @@ fn validate_initial_task_list(tasks: &[InitialWorkTask]) -> Result<(), &'static 
         }
     }
     Ok(())
-}
-
-fn initial_runnable_items(items: &[InitialWorkItem]) -> Vec<InitialRunnableItem> {
-    // The root receives exactly one initial foreground assignment. This is a
-    // scheduling choice, not a declaration that later tasks depend on it.
-    items
-        .first()
-        .map(|item| InitialRunnableItem {
-            item_id: item.item_id.clone(),
-            item_revision: WorkItemRevision::INITIAL.get(),
-        })
-        .into_iter()
-        .collect()
 }
 
 fn initial_declared_tasks(items: &[InitialWorkItem]) -> Vec<InitialDeclaredTask> {
@@ -838,22 +695,7 @@ fn canonical_start_work_payload(
 pub(super) fn decode_canonical_work_establishment_payload(
     payload_json: &str,
 ) -> Result<(Value, Option<astra_services::WorkAdmissionDecision>), String> {
-    let payload: Value = serde_json::from_str(payload_json)
-        .map_err(|error| format!("invalid canonical Work payload: {error}"))?;
-    if payload.get("schema_version").and_then(Value::as_u64) != Some(2) {
-        return Err("unsupported canonical Work payload schema".to_string());
-    }
-    let arguments = payload
-        .get("arguments")
-        .cloned()
-        .ok_or_else(|| "canonical Work payload has no start_work arguments".to_string())?;
-    let decision = payload
-        .get("admission_decision")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| format!("invalid persisted Work admission decision: {error}"))?;
-    Ok((arguments, decision))
+    astra_services::work::decode_work_establishment_payload(payload_json)
 }
 
 /// Build the same immutable operation request before the synthetic carrier is
@@ -874,7 +716,18 @@ pub(super) fn canonical_work_establishment_request(
         return Err("canonical start_work task list exceeds its lifecycle bound".to_string());
     }
     validate_initial_task_list(&args.tasks).map_err(str::to_string)?;
+    if let Some((_, admitted_tasks)) =
+        admission_decision.and_then(astra_services::WorkAdmissionDecision::initial_work_plan)
+        && admitted_tasks != args.tasks
+    {
+        return Err("canonical Work arguments disagree with admission tasks".to_string());
+    }
     let request_id = start_work_operation_id(owner_id, session_id, turn_chain_id, &args);
+    astra_services::work::compile_work_establishment_plan(
+        &request_id,
+        &args.tasks,
+        admission_decision.map_or(&[], |decision| decision.deferred_graph_mutations()),
+    )?;
     let creation = super::work_handlers::derive_work_creation(
         owner_id,
         WorkCreateRequestV1 {
@@ -944,6 +797,7 @@ async fn established_work_receipt(
         WorkTaskExecutionNext::Ready(_) => "ready",
         WorkTaskExecutionNext::InFlight(_) => "in_flight",
         WorkTaskExecutionNext::NeedsRecovery(_) => "needs_recovery",
+        WorkTaskExecutionNext::GraphMutationPending => "graph_mutation_pending",
         WorkTaskExecutionNext::Blocked => "blocked",
         WorkTaskExecutionNext::Complete => "complete",
     };
@@ -997,8 +851,10 @@ pub(super) async fn execute_start_work(
     if let Err(message) = validate_initial_task_list(&args.tasks) {
         return ToolResult::error(message.to_string());
     }
-    let (mut initial_items, initial_dependencies) = compile_initial_task_graph(&args.tasks);
-    let admitted_initial_items = initial_items.clone();
+    let (mut initial_items, initial_dependencies) = match compile_initial_task_graph(&args.tasks) {
+        Ok(graph) => graph,
+        Err(error) => return ToolResult::error(error),
+    };
     let activation = args.activation;
     let Some(run_id) = invocation.run_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return ToolResult::error(
@@ -1194,7 +1050,7 @@ pub(super) async fn execute_start_work(
             ));
         }
     };
-    let (durable_args, admission_decision) =
+    let (durable_args, _admission_decision) =
         match decode_canonical_work_establishment_payload(&establishment_request.payload_json) {
             Ok(payload) => payload,
             Err(error) => {
@@ -1591,15 +1447,7 @@ pub(super) async fn execute_start_work(
             ));
         }
     }
-    match apply_admitted_graph_mutations(
-        executor,
-        &establishment_request,
-        admission_decision.as_ref(),
-        &admitted_initial_items,
-        invocation,
-    )
-    .await
-    {
+    match reconcile_admitted_graph_mutations(executor, invocation).await {
         Ok(Some(applied)) => graph_revision = applied.graph_revision,
         Ok(None) => {}
         Err(result) => {
@@ -1610,7 +1458,6 @@ pub(super) async fn execute_start_work(
         }
     }
     let initial_item_count = initial_items.len();
-    let runnable_items = initial_runnable_items(&initial_items);
     let declared_tasks = initial_declared_tasks(&initial_items);
     // Ordinary Work establishment and its first executable assignment are
     // one product action. Explicitly deferred Work remains durably Ready and
@@ -1661,11 +1508,34 @@ pub(super) async fn execute_start_work(
             "Work establishment committed without installing its canonical binding".to_string(),
         );
     };
-    let task_board_update = match canonical_task_board_update(binding, Some(&work_goal), None).await
+    let snapshot = match binding
+        .repository
+        .load_task_execution_snapshot_for_session(&binding.owner_id, &binding.session_id)
+        .await
     {
-        Ok(update) => update,
-        Err(error) => return error,
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return ToolResult::error(format!(
+                "canonical Work was committed but its task board could not be read: {error}"
+            ));
+        }
     };
+    // Report the scheduler's actual selection, not the initial declaration's
+    // first ID, which may now be retired or have an explicit prerequisite.
+    let runnable_items = match snapshot.next_foreground_task() {
+        WorkTaskExecutionNext::Ready(item) | WorkTaskExecutionNext::InFlight(item) => {
+            vec![InitialRunnableItem {
+                item_id: item.item_id.as_str().to_string(),
+                item_revision: item.revision.get(),
+            }]
+        }
+        _ => Vec::new(),
+    };
+    let task_board_update =
+        match task_board_update_from_snapshot(binding, &snapshot, Some(&work_goal), None) {
+            Ok(update) => update,
+            Err(error) => return error,
+        };
     ToolResult::text(
         json!({
             "status": "started",
@@ -1878,10 +1748,29 @@ pub(super) async fn execute_run_next_work_item(
             .to_string(),
         );
     }
+    if let Err(error) = reconcile_admitted_graph_mutations(executor, invocation).await {
+        return error;
+    }
     let (graph_revision, selected) = match load_next_active_task(executor).await {
         Ok(selection) => selection,
         Err(error) => return error,
     };
+    if matches!(selected, WorkTaskExecutionNext::Complete) {
+        let Some(pool) = executor.context_manifest_pool.clone() else {
+            return ToolResult::error("canonical Work storage is unavailable".to_string());
+        };
+        if let Err(error) = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
+            .finalize_primary_graph_completion(
+                &executor.user_id,
+                &executor.session_id,
+                run_id,
+                invocation.expected_control_epoch,
+            )
+            .await
+        {
+            return ToolResult::error(format!("Work graph completion requires recovery: {error}"));
+        }
+    }
     match restore_primary_attempt_from_selection(executor, run_id, &selected).await {
         Ok(Some(restored)) => {
             let active = restored.active;
@@ -1912,6 +1801,7 @@ pub(super) async fn execute_run_next_work_item(
         let (status, item_id) = match selected {
             WorkTaskExecutionNext::InFlight(item) => ("in_flight", Some(item.item_id)),
             WorkTaskExecutionNext::NeedsRecovery(item) => ("needs_recovery", Some(item.item_id)),
+            WorkTaskExecutionNext::GraphMutationPending => ("graph_mutation_pending", None),
             WorkTaskExecutionNext::Blocked => ("blocked", None),
             WorkTaskExecutionNext::Complete => ("complete", None),
             WorkTaskExecutionNext::Ready(_) => unreachable!("handled above"),
@@ -2060,17 +1950,45 @@ pub(super) async fn execute_settle_work_item(
                         ));
                     }
                 };
-            service
+            let advanced = service
                 .record_and_advance_primary(
                     &executor.user_id,
                     &active.attempt_id,
                     run_id,
                     expected_control_epoch,
-                    settlement,
-                    successor_attempt_id,
+                    settlement.clone(),
+                    successor_attempt_id.clone(),
                 )
-                .await
-                .map(PrimarySettlementResult::Advanced)
+                .await;
+            if matches!(&advanced, Ok(result) if matches!(result.advance,
+                astra_services::work::PrimaryWorkAttemptAdvance::GraphMutationPending))
+            {
+                if let Err(error) = reconcile_admitted_graph_mutations(executor, invocation).await {
+                    return committed_settlement_resume_error(executor, active, error.output);
+                }
+                match service
+                    .record_and_advance_primary(
+                        &executor.user_id,
+                        &active.attempt_id,
+                        run_id,
+                        expected_control_epoch,
+                        settlement,
+                        successor_attempt_id,
+                    )
+                    .await
+                {
+                    Ok(advanced) => Ok(PrimarySettlementResult::Advanced(advanced)),
+                    Err(error) => {
+                        return committed_settlement_resume_error(
+                            executor,
+                            active,
+                            error.to_string(),
+                        );
+                    }
+                }
+            } else {
+                advanced.map(PrimarySettlementResult::Advanced)
+            }
         }
         // Explicitly delegated children carry immutable WorkItem identity on
         // their durable Run; no prompt text or model-supplied ID participates.
@@ -2125,6 +2043,9 @@ pub(super) async fn execute_settle_work_item(
                 }
                 astra_services::work::PrimaryWorkAttemptAdvance::Blocked => {
                     (None, None, "inspect_or_update_canonical_work")
+                }
+                astra_services::work::PrimaryWorkAttemptAdvance::GraphMutationPending => {
+                    (None, None, "resume_work_after_graph_mutation_admission")
                 }
                 astra_services::work::PrimaryWorkAttemptAdvance::Complete => {
                     (None, None, "synthesize_final_response")
@@ -2203,6 +2124,27 @@ enum PrimarySettlementResult {
     Recorded(astra_services::work::RecordedWorkAttemptSettlement),
 }
 
+fn committed_settlement_resume_error(
+    executor: &RuntimeToolExecutor,
+    active: &ActivePrimaryWorkAttempt,
+    detail: String,
+) -> ToolResult {
+    // Delivery already committed. Never advertise the delivered task as active
+    // when its follow-on graph transition or allocation needs recovery.
+    if let Err(error) = executor.advance_active_primary_work_attempt(&active.attempt_id, None) {
+        return ToolResult::error(format!(
+            "Work delivery committed but local state could not advance: {error}"
+        ));
+    }
+    ToolResult::error(
+        json!({
+            "status": "work_advance_pending", "settlement_recorded": true,
+            "detail": detail, "next_action": "run_next_work_item_to_resume_committed_work",
+        })
+        .to_string(),
+    )
+}
+
 /// The bounded scheduler's state after one Work-item settlement. This is not
 /// the Work delivery state: acceptance criteria and verification have their
 /// own durable authority and must never be implied by task scheduling.
@@ -2211,6 +2153,7 @@ enum TaskGraphExecutionStatus {
     Active,
     NeedsRecovery,
     Blocked,
+    GraphMutationPending,
     Complete,
 }
 
@@ -2220,6 +2163,7 @@ impl TaskGraphExecutionStatus {
             Self::Active => "active",
             Self::NeedsRecovery => "needs_recovery",
             Self::Blocked => "blocked",
+            Self::GraphMutationPending => "graph_mutation_pending",
             Self::Complete => "complete",
         }
     }
@@ -2238,6 +2182,9 @@ fn task_graph_execution_status(
         astra_services::work::PrimaryWorkAttemptAdvance::Blocked => {
             TaskGraphExecutionStatus::Blocked
         }
+        astra_services::work::PrimaryWorkAttemptAdvance::GraphMutationPending => {
+            TaskGraphExecutionStatus::GraphMutationPending
+        }
         astra_services::work::PrimaryWorkAttemptAdvance::Complete => {
             TaskGraphExecutionStatus::Complete
         }
@@ -2245,16 +2192,19 @@ fn task_graph_execution_status(
 }
 
 #[cfg(test)]
+#[path = "tool_work_lifecycle/precedence_tests.rs"]
+mod precedence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        InitialRunnableItem, InitialWorkItem, InitialWorkTask, StartWorkActivation, StartWorkArgs,
+        InitialWorkItem, InitialWorkTask, StartWorkActivation, StartWorkArgs,
         TaskGraphExecutionStatus, WORK_ERROR_KIND_ALREADY_BOUND, WORK_ERROR_KIND_NOT_BOUND,
         board_settled_task, canonical_settlement_transition, canonical_start_work_payload,
-        compile_graph_addition_items, compile_initial_task_graph, confirmed_assignment,
+        compile_initial_task_graph, confirmed_assignment,
         decode_canonical_work_establishment_payload, execute_run_next_work_item,
-        execute_start_work, initial_declared_tasks, initial_runnable_items,
-        start_work_operation_id, task_board_display_text, task_graph_execution_status,
-        validate_initial_task_list,
+        execute_start_work, initial_declared_tasks, start_work_operation_id,
+        task_board_display_text, task_graph_execution_status, validate_initial_task_list,
     };
     use crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt;
     use crate::server::runtime_tool_executor::RuntimeToolExecutor;
@@ -2275,7 +2225,7 @@ mod tests {
 
     static TEST_POOL: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
 
-    async fn setup_pool() -> SharedPool {
+    pub(super) async fn setup_pool() -> SharedPool {
         let _ = dotenvy::dotenv();
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -2296,7 +2246,7 @@ mod tests {
             .clone()
     }
 
-    async fn admit_running_test_session(
+    pub(super) async fn admit_running_test_session(
         pool: &SharedPool,
         owner: &WorkOwnerId,
         session: &InternalSessionId,
@@ -2359,16 +2309,20 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: goal.to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Original outcome".to_string(),
                 expected_result: "Original evidence".to_string(),
             }],
             deferred_graph_mutations: vec![astra_services::WorkAdmissionGraphMutation::Replace {
+                after_initial_tasks: vec![],
                 target_initial_candidate: 1,
                 target: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Original outcome".to_string(),
                     expected_result: "Original evidence".to_string(),
                 },
                 replacement: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Replacement outcome".to_string(),
                     expected_result: "Replacement evidence".to_string(),
                 },
@@ -2379,7 +2333,7 @@ mod tests {
         }
     }
 
-    fn database_work_executor(
+    pub(super) fn database_work_executor(
         workspace: &std::path::Path,
         pool: SharedPool,
         owner: &WorkOwnerId,
@@ -2405,6 +2359,7 @@ mod tests {
             goal: "Track a bounded goal".to_string(),
             activation: StartWorkActivation::Start,
             tasks: vec![InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Do one bounded thing".to_string(),
                 expected_result: "One verifiable result".to_string(),
             }],
@@ -2435,11 +2390,48 @@ mod tests {
     }
 
     #[test]
+    fn committed_settlement_failure_does_not_reissue_delivered_assignment() {
+        let temp = TempDir::new().expect("workspace");
+        let executor = RuntimeToolExecutor::new(
+            temp.path().to_path_buf(),
+            "owner".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        let active = super::ActivePrimaryWorkAttempt {
+            attempt_id: "attempt-1".into(),
+            executor_run_id: "run".into(),
+            item_id: "task-1".into(),
+            item_revision: 1,
+            objective: "Read README".into(),
+            expected_result: "README evidence".into(),
+        };
+        executor
+            .install_active_primary_work_attempt(active.clone())
+            .expect("active");
+        let error = super::committed_settlement_resume_error(
+            &executor,
+            &active,
+            "storage unavailable".into(),
+        );
+        assert!(error.is_error);
+        assert!(!executor.has_active_primary_work_attempt());
+        let payload: Value = serde_json::from_str(&error.output).expect("typed recovery result");
+        assert_eq!(payload["settlement_recorded"], true);
+        assert_eq!(
+            payload["next_action"],
+            "run_next_work_item_to_resume_committed_work"
+        );
+    }
+
+    #[test]
     fn establishment_envelope_round_trips_deferred_graph_mutations() {
         let args = StartWorkArgs {
             goal: "Establish then redirect one outcome".to_string(),
             activation: StartWorkActivation::Start,
             tasks: vec![InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Original outcome".to_string(),
                 expected_result: "Original evidence".to_string(),
             }],
@@ -2450,16 +2442,20 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: args.goal.clone(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Original outcome".to_string(),
                 expected_result: "Original evidence".to_string(),
             }],
             deferred_graph_mutations: vec![astra_services::WorkAdmissionGraphMutation::Replace {
+                after_initial_tasks: vec![],
                 target_initial_candidate: 1,
                 target: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Original outcome".to_string(),
                     expected_result: "Original evidence".to_string(),
                 },
                 replacement: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Replacement outcome".to_string(),
                     expected_result: "Replacement evidence".to_string(),
                 },
@@ -2602,15 +2598,18 @@ mod tests {
     fn initial_task_list_compiles_without_inventing_dependencies() {
         let tasks = vec![
             InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Inspect the narrow command surface".to_string(),
                 expected_result: "One cited command finding".to_string(),
             },
             InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Trace the corresponding client route".to_string(),
                 expected_result: "One cited route finding".to_string(),
             },
         ];
-        let (items, dependencies) = compile_initial_task_graph(&tasks);
+        let (items, dependencies) =
+            compile_initial_task_graph(&tasks).expect("valid initial graph");
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].item_id, "task-1");
@@ -2620,13 +2619,6 @@ mod tests {
         assert!(
             dependencies.is_empty(),
             "semantic admission did not establish a precedence relationship"
-        );
-        assert_eq!(
-            initial_runnable_items(&items),
-            vec![InitialRunnableItem {
-                item_id: "task-1".to_string(),
-                item_revision: 1,
-            }]
         );
         assert_eq!(
             initial_declared_tasks(&items)
@@ -2641,17 +2633,38 @@ mod tests {
     fn graph_addition_ids_are_server_owned_and_retry_stable() {
         let tasks = vec![
             InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Fetch the next bounded result".to_string(),
                 expected_result: "One cited result".to_string(),
             },
             InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: "Verify the result".to_string(),
                 expected_result: "One deterministic verification".to_string(),
             },
         ];
-        let items = compile_graph_addition_items("operation-1", &tasks);
-        let retried_after_graph_changed = compile_graph_addition_items("operation-1", &tasks);
-        let different_operation = compile_graph_addition_items("operation-2", &tasks);
+        let mutations = tasks
+            .iter()
+            .cloned()
+            .map(|task| astra_services::WorkAdmissionGraphMutation::Add {
+                task,
+                after_initial_tasks: vec![],
+            })
+            .collect::<Vec<_>>();
+        let compile = |operation| {
+            astra_services::work::compile_work_establishment_plan(
+                operation,
+                &tasks[..1],
+                &mutations,
+            )
+            .expect("valid additions")
+            .mutation_groups
+            .remove(0)
+            .additions
+        };
+        let items = compile("operation-1");
+        let retried_after_graph_changed = compile("operation-1");
+        let different_operation = compile("operation-2");
 
         assert_eq!(items, retried_after_graph_changed);
         assert_ne!(items[0].item_id, different_operation[0].item_id);
@@ -2700,6 +2713,7 @@ mod tests {
     fn initial_task_list_rejects_invalid_task_text_before_storage() {
         assert!(
             validate_initial_task_list(&[InitialWorkTask {
+                after_initial_tasks: vec![],
                 objective: " ".to_string(),
                 expected_result: "One result".to_string(),
             }])

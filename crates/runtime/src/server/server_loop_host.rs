@@ -7353,15 +7353,6 @@ impl ServerAgenticLoopHost {
             astra_services::WorkAdmissionActivation::Defer => "defer",
         };
         let (goal, tasks) = admission.initial_work_plan()?;
-        let tasks = tasks
-            .iter()
-            .map(|task| {
-                json!({
-                    "objective": task.objective,
-                    "expected_result": task.expected_result,
-                })
-            })
-            .collect::<Vec<_>>();
         let arguments = json!({
             "activation": activation,
             "goal": goal,
@@ -7724,10 +7715,7 @@ impl ServerAgenticLoopHost {
                 astra_services::WorkAdmissionActivation::Defer => "defer",
             },
             "goal": goal,
-            "tasks": tasks.iter().map(|task| json!({
-                "objective": task.objective,
-                "expected_result": task.expected_result,
-            })).collect::<Vec<_>>(),
+            "tasks": tasks,
         });
         let owner_id =
             astra_services::work::WorkOwnerId::parse(self.user_id.clone()).map_err(|error| {
@@ -30845,10 +30833,12 @@ mod tests {
                         goal: "Collect two independent outcomes".to_string(),
                         tasks: vec![
                             astra_services::WorkAdmissionTask {
+                                after_initial_tasks: vec![],
                                 objective: "Collect outcome A".to_string(),
                                 expected_result: "Outcome A is returned".to_string(),
                             },
                             astra_services::WorkAdmissionTask {
+                                after_initial_tasks: vec![],
                                 objective: "Collect outcome B".to_string(),
                                 expected_result: "Outcome B is returned".to_string(),
                             },
@@ -30906,6 +30896,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "sidecar graph".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "sidecar task".to_string(),
                 expected_result: "sidecar result".to_string(),
             }],
@@ -31095,6 +31086,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "persist before execution".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "one outcome".to_string(),
                 expected_result: "one result".to_string(),
             }],
@@ -31446,6 +31438,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "durable graph".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "durable task".to_string(),
                 expected_result: "durable result".to_string(),
             }],
@@ -31597,21 +31590,26 @@ mod tests {
             goal: "Produce two independent evidence-backed findings".to_string(),
             tasks: vec![
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Inspect the first source".to_string(),
                     expected_result: "One cited finding from the first source".to_string(),
                 },
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Inspect the second source".to_string(),
                     expected_result: "One cited finding from the second source".to_string(),
                 },
             ],
             deferred_graph_mutations: vec![astra_services::WorkAdmissionGraphMutation::Replace {
+                after_initial_tasks: vec![],
                 target_initial_candidate: 2,
                 target: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Inspect the second source".to_string(),
                     expected_result: "One cited finding from the second source".to_string(),
                 },
                 replacement: astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Replace the second outcome after the first is evidenced"
                         .to_string(),
                     expected_result: "One accepted cancellation and one replacement task"
@@ -31673,10 +31671,12 @@ mod tests {
             goal: "Prepare two independent evidence-backed findings".to_string(),
             tasks: vec![
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Inspect the first source".to_string(),
                     expected_result: "One cited finding from the first source".to_string(),
                 },
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Inspect the second source".to_string(),
                     expected_result: "One cited finding from the second source".to_string(),
                 },
@@ -31725,6 +31725,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "Track one outcome".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Produce the outcome".to_string(),
                 expected_result: "The outcome has evidence".to_string(),
             }],
@@ -31994,6 +31995,7 @@ mod tests {
                 astra_config::user_profile::MutationCompletionScope::Workspace,
             goal: "Deliver one verified workspace change".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Implement the declared change".to_string(),
                 expected_result: "The changed behavior passes its acceptance check".to_string(),
             }],
@@ -32177,6 +32179,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "Deliver one tracked outcome".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Produce the outcome".to_string(),
                 expected_result: "The outcome has evidence".to_string(),
             }],
@@ -32260,6 +32263,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "Deliver one tracked outcome".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Produce the outcome".to_string(),
                 expected_result: "The outcome has evidence".to_string(),
             }],
@@ -32306,10 +32310,12 @@ mod tests {
             goal: "Prepare two independently verifiable outcomes".to_string(),
             tasks: vec![
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Implement outcome A".to_string(),
                     expected_result: "A is implemented".to_string(),
                 },
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Verify outcome B".to_string(),
                     expected_result: "B has evidence".to_string(),
                 },
@@ -32752,6 +32758,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "one graph".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "one task".to_string(),
                 expected_result: "one result".to_string(),
             }],
@@ -32784,6 +32791,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "one graph".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "one task".to_string(),
                 expected_result: "one result".to_string(),
             }],
@@ -32855,10 +32863,12 @@ mod tests {
             goal: "Collect independent evidence concurrently".to_string(),
             tasks: vec![
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Collect evidence A".to_string(),
                     expected_result: "Evidence A is returned".to_string(),
                 },
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Collect evidence B".to_string(),
                     expected_result: "Evidence B is returned".to_string(),
                 },
@@ -32989,6 +32999,7 @@ mod tests {
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             goal: "Continue the owned Work item".to_string(),
             tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
                 objective: "Finish the owned item".to_string(),
                 expected_result: "The item has a truthful typed outcome".to_string(),
             }],
@@ -33531,10 +33542,12 @@ mod tests {
             goal: "Collect two admitted outcomes".into(),
             tasks: vec![
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Outcome A".into(),
                     expected_result: "Evidence A".into(),
                 },
                 astra_services::WorkAdmissionTask {
+                    after_initial_tasks: vec![],
                     objective: "Outcome B".into(),
                     expected_result: "Evidence B".into(),
                 },

@@ -299,6 +299,17 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
     assert!(description.contains("one canonical Work graph"));
     assert!(description.contains("never call start_work again"));
     assert!(description.contains("revision-pinned proposal"));
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "start_work",
+        &json!({
+            "goal": "Deliver two ordered outcomes", "activation": "start",
+            "tasks": [
+                {"objective": "First outcome", "expected_result": "First evidence"},
+                {"objective": "Second outcome", "expected_result": "Second evidence", "after_initial_tasks": [1]}
+            ]
+        }),
+        start,
+    ).expect("resident schema must retain explicit task precedence");
 }
 
 #[test]

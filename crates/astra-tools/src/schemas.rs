@@ -652,7 +652,7 @@ fn start_work_schema() -> Value {
         "type": "function",
         "function": {
             "name": "start_work",
-            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. For 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses agent_fanout, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Supply the smallest independently executable outcomes; task identity, ordering, and execution dependencies are assigned by the server. Preserve chronology: outcomes said to be added, replaced, cancelled, discovered, or decided later are omitted from initial tasks until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
+            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. For 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses agent_fanout, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Supply the smallest independently executable outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Preserve chronology: outcomes said to be added, replaced, cancelled, discovered, or decided later are omitted from initial tasks until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -679,7 +679,12 @@ fn start_work_schema() -> Value {
                             "additionalProperties": false,
                             "properties": {
                                 "objective": {"type": "string", "minLength": 1, "maxLength": 8192},
-                                "expected_result": {"type": "string", "minLength": 1, "maxLength": 8192}
+                                "expected_result": {"type": "string", "minLength": 1, "maxLength": 8192},
+                                "after_initial_tasks": {
+                                    "type": "array", "maxItems": 8, "uniqueItems": true,
+                                    "items": {"type": "integer", "minimum": 1, "maximum": 8},
+                                    "description": "Explicit prerequisites only: 1-based initial task indices that must deliver first. Omit for independent tasks."
+                                }
                             },
                             "required": ["objective", "expected_result"]
                         }

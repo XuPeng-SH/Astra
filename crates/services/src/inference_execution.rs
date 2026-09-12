@@ -394,6 +394,8 @@ pub enum InferenceProviderDeliveryState {
 /// original admission transaction, so `Absent` cannot race a late commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceInvocationAdmissionResolution {
+    /// The old admission is absent or closed; apply guidance before new work.
+    GuidancePending,
     Settled,
     ExactTerminal,
     ConflictingIdentity,
@@ -1203,8 +1205,29 @@ async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationScopeAuthority {
     Live,
+    GuidancePending,
     Unavailable,
 }
+
+/// Typed admission fence. New guidance invalidates a request snapshot, not
+/// the execution owner; callers must reconcile it before trying new work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceScopeRejection {
+    GuidancePending,
+    Unavailable,
+}
+
+impl std::fmt::Display for InferenceScopeRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::GuidancePending => "new user guidance requires a fresh execution snapshot",
+            Self::Unavailable => "inference execution scope is no longer available",
+        })
+    }
+}
+
+impl std::error::Error for InferenceScopeRejection {}
 
 async fn lock_invocation_scope_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -1365,7 +1388,7 @@ async fn lock_invocation_scope_authority(
                         )
                     })?;
                     if control_fence.is_some() {
-                        InvocationScopeAuthority::Unavailable
+                        InvocationScopeAuthority::GuidancePending
                     } else {
                         InvocationScopeAuthority::Live
                     }
@@ -1412,11 +1435,26 @@ async fn lock_invocation_scope_authority(
     Ok(authority)
 }
 
-fn unavailable_scope_error(input: &InferenceInvocationInput) -> ServiceError {
-    ServiceError::not_found(format!(
-        "inference {} scope is unavailable or no longer owned by this execution",
-        input.scope.kind()
-    ))
+fn unavailable_scope_error(
+    input: &InferenceInvocationInput,
+    authority: InvocationScopeAuthority,
+) -> ServiceError {
+    let reason = match authority {
+        InvocationScopeAuthority::GuidancePending => InferenceScopeRejection::GuidancePending,
+        InvocationScopeAuthority::Unavailable => InferenceScopeRejection::Unavailable,
+        InvocationScopeAuthority::Live => unreachable!("live authority is not a rejection"),
+    };
+    ServiceError::with_source(
+        match reason {
+            InferenceScopeRejection::GuidancePending => ServiceErrorKind::Conflict,
+            InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
+        },
+        format!(
+            "inference {} admission fenced: {reason}",
+            input.scope.kind()
+        ),
+        reason,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1543,10 +1581,9 @@ pub async fn admit_inference_invocation(
         )
     })?;
     let write_result: ServiceResult<()> = async {
-        if lock_invocation_scope_authority(&mut tx, &plan.input).await?
-            != InvocationScopeAuthority::Live
-        {
-            return Err(unavailable_scope_error(&plan.input));
+        let authority = lock_invocation_scope_authority(&mut tx, &plan.input).await?;
+        if authority != InvocationScopeAuthority::Live {
+            return Err(unavailable_scope_error(&plan.input, authority));
         }
         insert_inference_invocation_admission(&mut tx, plan).await
     }
@@ -1879,6 +1916,16 @@ pub async fn settle_uncertain_inference_admission(
             ProviderDeliveryState::PreDelivery,
         )
         .await?;
+    }
+    if scope_authority == InvocationScopeAuthority::GuidancePending
+        && matches!(
+            resolution,
+            InferenceInvocationAdmissionResolution::Settled
+                | InferenceInvocationAdmissionResolution::ExactTerminal
+                | InferenceInvocationAdmissionResolution::ScopeUnavailable
+        )
+    {
+        resolution = InferenceInvocationAdmissionResolution::GuidancePending;
     }
     if scope_authority == InvocationScopeAuthority::Unavailable
         && matches!(
@@ -2779,6 +2826,10 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
         )
     })?;
     let write_result: ServiceResult<()> = async {
+        let authority = lock_invocation_scope_authority(&mut tx, &invocation.input).await?;
+        if authority != InvocationScopeAuthority::Live {
+            return Err(unavailable_scope_error(&invocation.input, authority));
+        }
         insert_inference_invocation_admission(&mut tx, invocation).await?;
         insert_inference_provider_attempt_admission(&mut tx, attempt, provider_wire_bytes).await
     }
@@ -3025,11 +3076,13 @@ pub async fn begin_inference_provider_attempt(
             error,
         )
     })?;
-    if lock_invocation_scope_authority(&mut tx, &attempt.invocation_input).await?
-        != InvocationScopeAuthority::Live
-    {
+    let authority = lock_invocation_scope_authority(&mut tx, &attempt.invocation_input).await?;
+    if authority != InvocationScopeAuthority::Live {
         rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await;
-        return Err(unavailable_scope_error(&attempt.invocation_input));
+        return Err(unavailable_scope_error(
+            &attempt.invocation_input,
+            authority,
+        ));
     }
     // Provider-attempt admission is the final durable fence before HTTP. Keep
     // the canonical scope -> invocation lock order so a session deletion, run

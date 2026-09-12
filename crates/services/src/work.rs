@@ -33,6 +33,8 @@ mod criteria_read_repository;
 mod delivery_selection;
 mod delivery_selection_repository;
 mod establishment_operation;
+mod establishment_plan;
+mod establishment_plan_repository;
 mod event_read_repository;
 mod events;
 mod events_repository;
@@ -50,6 +52,7 @@ mod plan_context;
 mod plan_context_repository;
 mod proposal;
 mod proposal_acceptance_repository;
+mod proposal_identity;
 mod proposal_queue;
 mod proposal_repository;
 mod repository;
@@ -136,6 +139,12 @@ pub use establishment_operation::{
     WorkEstablishmentError, WorkEstablishmentOperation, WorkEstablishmentPhase,
     WorkEstablishmentRequest, WorkEstablishmentState,
 };
+pub use establishment_plan::{
+    WorkEstablishmentDependency, WorkEstablishmentItem, WorkEstablishmentItemRevision,
+    WorkEstablishmentMutationGroup, WorkEstablishmentPlan,
+    compile_initial_work_establishment_graph, compile_work_establishment_plan,
+    decode_work_establishment_payload,
+};
 pub use events::{
     WORK_EVENT_PAGE_MAX_ITEMS, WorkEventCoverage, WorkEventKind, WorkEventPage, WorkEventPageLimit,
     WorkEventQuery, WorkEventRecord, WorkEventSeq,
@@ -200,6 +209,7 @@ pub use proposal::{
     WorkPlanProposalResolution, WorkPlanProposalViolation, WorkProposalId, WorkProposalKind,
     WorkProposalSourceKind, WorkProposalStatus,
 };
+pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,

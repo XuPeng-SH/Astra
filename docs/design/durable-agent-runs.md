@@ -70,6 +70,20 @@ Checkpoint must include enough information to resume safely:
 
 ## Terminal outcomes
 
+Newly accepted guidance fences an older inference snapshot, not its run owner.
+Both logical inference admission and the final pre-HTTP attempt admission retain
+that typed distinction. After a guidance fence the shared loop applies durable
+guidance through its normal acknowledgement path and prepares a fresh request;
+it must not retry the stale wire request or terminalize the Work attempt solely
+because guidance arrived. Missing guidance, failed acknowledgement, cancellation,
+and owner loss remain fail-closed. Ambiguous admission is reconciled before
+continuation, preserving exact settlement custody.
+
+Turn-evaluation journals report settled `run_status` and separate
+`tool_evaluation_success` from overall `success`. Healthy tools do not promote
+a failed, cancelled, paused, or still-running execution to successful completion.
+Internal inference-ledger rejections are not provider HTTP-400 errors.
+
 Terminal states should distinguish:
 
 - completed;

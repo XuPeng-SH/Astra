@@ -14545,7 +14545,12 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
     assert_eq!(state.telemetry.first_round_prompt_tokens, Some(5_995));
     assert_eq!(state.telemetry.max_round_prompt_tokens, Some(15_922));
 
-    let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);
+    let event = build_runtime_turn_evaluation_event(
+        "session-1",
+        "server_runtime",
+        &state,
+        STATUS_COMPLETED,
+    );
 
     assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
     assert_eq!(event.turn, Some(state.session_turn));
@@ -14580,6 +14585,78 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             .any(|signal| signal["kind"] == "all_tools_healthy"),
         "cache/prompt churn must not be mislabeled as a fully healthy turn"
     );
+}
+
+#[test]
+fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_tool_health() {
+    let svc = test_service();
+    let request = test_request("git status");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.recent_tools = vec!["git_status".into()];
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "git_status".into(),
+        ok: true,
+        ms: 14,
+        output_bytes: Some(180),
+        result_preview: Some("working tree is clean".into()),
+        ..Default::default()
+    });
+
+    for source in ["server_runtime", "server_subrun"] {
+        for status in RunStatus::ALL {
+            let event =
+                build_runtime_turn_evaluation_event("session-1", source, &state, status.as_str());
+            let metadata = event.metadata.expect("turn evaluation metadata");
+            assert_eq!(metadata["run_status"], status.as_str());
+            assert_eq!(metadata["tool_evaluation_success"], true);
+            assert_eq!(
+                metadata["success"],
+                matches!(status, RunStatus::Completed | RunStatus::Delegated),
+                "healthy tools cannot override settled {status:?} for {source}"
+            );
+            assert!(
+                metadata["signals"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|signal| signal["kind"] == "all_tools_healthy"),
+                "a failed run must retain accurate evidence about its successful tools"
+            );
+        }
+    }
+
+    // A recovered provider deadline can remain in loop diagnostics. Evaluation
+    // must use the settled status, including a later unrelated terminal failure.
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        InterruptionKind::ProviderDeadline,
+        ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary::default(),
+    ));
+    for (status, expected_success) in [(STATUS_COMPLETED, true), (STATUS_FAILED, false)] {
+        let event =
+            build_runtime_turn_evaluation_event("session-1", "server_runtime", &state, status);
+        assert_eq!(event.metadata.unwrap()["success"], expected_success);
+    }
+
+    state.stall.tool_call_records[0].ok = false;
+    state.stall.tool_call_records[0].error = Some("tool execution failed".into());
+    let event = build_runtime_turn_evaluation_event(
+        "session-1",
+        "server_runtime",
+        &state,
+        STATUS_COMPLETED,
+    );
+    let metadata = event.metadata.expect("turn evaluation metadata");
+    assert_eq!(metadata["tool_evaluation_success"], false);
+    assert_eq!(metadata["success"], false);
 }
 
 #[test]

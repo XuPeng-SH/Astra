@@ -100,6 +100,19 @@ Semantic admission rejections identify the field path, violated rule and
 observed size or index without copying field contents into the diagnostic.
 These diagnostics do not relax validation or change the repair policy.
 
+Task identities are not execution-order authority. Admission retains explicit
+`after_initial_tasks` prerequisites as dependency edges; omitted prerequisites
+leave tasks independent. Replacement inherits the replaced task's precedence.
+The same field on a graph mutation is a separate application trigger: its
+referenced initial tasks must be delivered before the mutation is committed.
+The immutable establishment decision retains these triggers beyond establishment
+completion. Scheduling, including settlement's automatic successor allocation,
+must apply due mutations before selecting another task or declaring completion.
+Accepted proposals mark applied mutations, so recovery replays the same operation
+and item identities without repeating semantic admission.
+Initial-candidate references are not aliases for arbitrary later replacements;
+conflicting retirement/prerequisite lifetimes are rejected before establishment.
+
 Tasks are durable work items projected into UI boards.
 
 ```text
