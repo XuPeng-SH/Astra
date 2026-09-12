@@ -4460,19 +4460,19 @@ fn service_error(
         )
 }
 
+pub(crate) fn inference_scope_rejection(
+    error: &astra_core::ClassifiedError,
+) -> Option<astra_services::InferenceScopeRejection> {
+    if !is_ledger_error(error) {
+        return None;
+    }
+    let details: serde_json::Value = serde_json::from_str(error.details_json.as_deref()?).ok()?;
+    serde_json::from_value(details["scope_rejection"].clone()).ok()
+}
+
 pub(crate) fn is_guidance_admission_fence(error: &astra_core::ClassifiedError) -> bool {
-    is_ledger_error(error)
-        && error
-            .details_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|details| {
-                serde_json::from_value::<astra_services::InferenceScopeRejection>(
-                    details["scope_rejection"].clone(),
-                )
-                .ok()
-            })
-            == Some(astra_services::InferenceScopeRejection::GuidancePending)
+    inference_scope_rejection(error)
+        == Some(astra_services::InferenceScopeRejection::GuidancePending)
 }
 
 fn ledger_timeout_error_for_stage(stage: &'static str) -> astra_core::ClassifiedError {

@@ -439,6 +439,14 @@ fn validate_schema_value(
     }
 
     if let Some(values) = value.as_array() {
+        if schema.get("uniqueItems").and_then(Value::as_bool) == Some(true)
+            && values
+                .iter()
+                .enumerate()
+                .any(|(index, value)| values[..index].contains(value))
+        {
+            issues.push(format!("{path} requires unique items"));
+        }
         if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
             && values.len() < minimum as usize
         {
@@ -673,7 +681,7 @@ fn start_work_schema() -> Value {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "description": "Initial independent acceptance units, not steps. Honor explicit task counts. Keep one outcome's observation, verification and report together; independent reports may be tasks. Omit user-requested later graph additions/replacements.",
+                        "description": "Initial acceptance units, not steps; honor task counts. Keep each outcome's observation/verification/report together. Independent reports may be tasks; omit later additions/replacements.",
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -2922,9 +2930,8 @@ mod tests {
         assert!(description.contains("genesis transition"));
         assert!(description.contains("never call start_work again"));
         assert!(description.contains("propose_work_plan"));
-        assert!(description.contains(
-            "task identity, ordering, and execution dependencies are assigned by the server"
-        ));
+        assert!(description.contains("task identities are server-owned"));
+        assert!(description.contains("explicit execution prerequisites via after_initial_tasks"));
         assert_eq!(
             required_fields(schema),
             vec![
@@ -2954,8 +2961,12 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from(["expected_result", "objective"]),
-            "task schema must not ask the model for server-owned identity, kind, or dependency fields"
+            std::collections::BTreeSet::from([
+                "after_initial_tasks",
+                "expected_result",
+                "objective"
+            ]),
+            "tasks expose user precedence, but never server-owned identity or kind"
         );
         assert_eq!(
             parameters["properties"]["tasks"]["items"]["required"],
@@ -2985,12 +2996,26 @@ mod tests {
                     },
                     {
                         "objective": "Synthesize the evidence",
-                        "expected_result": "A concise conclusion"
+                        "expected_result": "A concise conclusion",
+                        "after_initial_tasks": [1]
                     }
                 ]
             }),
         )
-        .expect("ordered tasks are the initial Work contract");
+        .expect("explicit prerequisites are part of the initial Work contract");
+        for prerequisites in [json!([0]), json!([9]), json!([1, 1]), json!(["task-1"])] {
+            assert!(
+                validate_tool_arguments(
+                    "start_work",
+                    &json!({
+                        "goal": "Verify evidence", "activation": "start",
+                        "tasks": [{"objective": "Verify", "expected_result": "Evidence",
+                            "after_initial_tasks": prerequisites}]
+                    })
+                )
+                .is_err()
+            );
+        }
         for invalid in [
             json!({}),
             json!({"goal": "Ship it", "activation": "start", "tasks": []}),
@@ -3014,6 +3039,40 @@ mod tests {
             }),
         ] {
             assert!(validate_tool_arguments("start_work", &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn array_uniqueness_is_enforced_only_when_declared() {
+        for unique in [false, true] {
+            let schema = json!({"function": {"parameters": {
+                "type": "object", "properties": {"values": {
+                    "type": "array", "uniqueItems": unique
+                }}
+            }}});
+            for values in [
+                json!([1, 1]),
+                json!([{"a": 1}, {"a": 1}]),
+                json!([[1], [1]]),
+            ] {
+                assert_eq!(
+                    validate_tool_arguments_against_schema(
+                        "external_tool",
+                        &json!({"values": values}),
+                        &schema
+                    )
+                    .is_err(),
+                    unique
+                );
+            }
+            for values in [json!([]), json!([1, 2]), json!([{"a": 1}, {"a": 2}])] {
+                validate_tool_arguments_against_schema(
+                    "external_tool",
+                    &json!({"values": values}),
+                    &schema,
+                )
+                .expect("distinct values");
+            }
         }
     }
 

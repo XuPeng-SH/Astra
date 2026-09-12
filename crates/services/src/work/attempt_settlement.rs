@@ -808,7 +808,7 @@ impl DatabaseWorkAttemptSettlementService {
         )
         .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
 
-        let (recorded, _settlement_inserted) = record_exact_in_transaction(
+        let (recorded, settlement_inserted) = record_exact_in_transaction(
             &mut tx,
             owner_id,
             attempt_id,
@@ -940,6 +940,7 @@ impl DatabaseWorkAttemptSettlementService {
                         &branch_id,
                         attempt_id,
                         expected_cut,
+                        settlement_inserted,
                     )
                     .await?;
                 }
@@ -1041,6 +1042,7 @@ impl DatabaseWorkAttemptSettlementService {
                 snapshot.basis().branch_id.as_str(),
                 attempt.attempt_id.as_str(),
                 cut,
+                false,
             )
             .await?;
         }
@@ -1132,6 +1134,142 @@ impl DatabaseWorkAttemptSettlementService {
     }
 }
 
+/// An ordinary replay may only read its existing cut. The exceptional missing
+/// cut is recoverable only when durable admission and an accepted deferred
+/// patch prove why this Delivered attempt could not publish it initially.
+async fn accepted_deferred_mutation_owns_completion(
+    tx: &mut Transaction<'_, MySql>,
+    owner_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    attempt_id: &str,
+    graph_revision: GraphRevision,
+) -> Result<bool, WorkAttemptSettlementError> {
+    let attempt = sqlx::query(
+        "SELECT a.work_item_id, a.work_item_revision, a.graph_revision, r.session_id, r.status
+         FROM work_item_attempts a JOIN agent_runs r
+           ON r.user_id = a.owner_id AND r.run_id = a.executor_run_id
+         WHERE a.owner_id = ? AND a.work_id = ? AND a.branch_id = ? AND a.attempt_id = ?
+           AND a.execution_mode = 'primary' AND a.outcome = 'delivered'
+           AND a.run_generation = r.run_generation",
+    )
+    .bind(owner_id)
+    .bind(work_id)
+    .bind(branch_id)
+    .bind(attempt_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(persistence)?;
+    let Some(attempt) = attempt else {
+        return Ok(false);
+    };
+    if is_terminal_run(
+        &attempt
+            .try_get::<String, _>("status")
+            .map_err(persistence)?,
+    ) {
+        return Ok(false);
+    }
+    if attempt
+        .try_get::<i64, _>("graph_revision")
+        .map_err(persistence)?
+        >= graph_revision.get()
+    {
+        return Ok(false);
+    }
+    let session_id: String = attempt.try_get("session_id").map_err(persistence)?;
+    let item_id: String = attempt.try_get("work_item_id").map_err(persistence)?;
+    let item_revision: i64 = attempt.try_get("work_item_revision").map_err(persistence)?;
+    let operations = sqlx::query(
+        "SELECT operation_id, payload_json FROM work_establishment_operations
+         WHERE owner_id = ? AND session_id = ? AND work_id = ? AND branch_id = ?
+           AND operation_state IN ('pending', 'complete') LIMIT 2",
+    )
+    .bind(owner_id)
+    .bind(&session_id)
+    .bind(work_id)
+    .bind(branch_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(persistence)?;
+    if operations.len() != 1 {
+        return Ok(false);
+    }
+    let operation = &operations[0];
+    let operation_id: String = operation.try_get("operation_id").map_err(persistence)?;
+    let payload: String = operation.try_get("payload_json").map_err(persistence)?;
+    let (_, decision) = super::decode_work_establishment_payload(&payload)
+        .map_err(WorkAttemptSettlementError::Persistence)?;
+    let Some(decision) = decision else {
+        return Ok(false);
+    };
+    let Some((_, tasks)) = decision.initial_work_plan() else {
+        return Ok(false);
+    };
+    let plan = super::compile_work_establishment_plan(
+        &operation_id,
+        tasks,
+        decision.deferred_graph_mutations(),
+    )
+    .map_err(WorkAttemptSettlementError::Persistence)?;
+    for group in plan.mutation_groups {
+        if !group.trigger_items.iter().any(|trigger| {
+            trigger.item_id.as_str() == item_id && trigger.revision.get() == item_revision
+        }) {
+            continue;
+        }
+        let proposal_id = group
+            .proposal_id(owner_id, &session_id, work_id, branch_id)
+            .map_err(WorkAttemptSettlementError::Persistence)?;
+        let accepted: Option<i8> = sqlx::query_scalar(
+            "SELECT 1 FROM work_proposals WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+             AND proposal_id = ? AND proposal_kind = 'plan_patch' AND status = 'accepted'
+             AND result_graph_revision = ? LIMIT 1",
+        )
+        .bind(owner_id)
+        .bind(work_id)
+        .bind(branch_id)
+        .bind(proposal_id.as_str())
+        .bind(graph_revision.get())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(persistence)?;
+        if accepted.is_some() {
+            let owner = WorkOwnerId::parse(owner_id)
+                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+            let work = WorkId::parse(work_id)
+                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+            let branch = WorkBranchId::parse(branch_id)
+                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+            let (executions, deliveries) = super::plan_context_repository::load_item_executions(
+                tx,
+                &owner,
+                &work,
+                &branch,
+                &group.trigger_items,
+            )
+            .await
+            .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+            let all_delivered = group.trigger_items.iter().all(|item| {
+                deliveries.get(item).is_some_and(|delivery| {
+                    delivery.status == super::WorkItemDeliveryStatus::Delivered
+                })
+            });
+            let last_trigger = executions
+                .values()
+                .filter_map(|execution| execution.run.as_ref())
+                .max_by(|left, right| {
+                    left.updated_at
+                        .cmp(&right.updated_at)
+                        .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+                });
+            return Ok(all_delivered
+                && last_trigger.is_some_and(|attempt| attempt.attempt_id.as_str() == attempt_id));
+        }
+    }
+    Ok(false)
+}
+
 async fn ensure_terminal_cut(
     tx: &mut Transaction<'_, MySql>,
     owner_id: &str,
@@ -1139,6 +1277,7 @@ async fn ensure_terminal_cut(
     branch_id: &str,
     attempt_id: &str,
     cut: super::WorkAttemptTerminalCut,
+    settlement_inserted: bool,
 ) -> Result<(), WorkAttemptSettlementError> {
     let existing = sqlx::query("SELECT work_id, branch_id, graph_revision, control_epoch FROM work_terminal_cuts WHERE owner_id = ? AND attempt_id = ?")
         .bind(owner_id).bind(attempt_id).fetch_optional(&mut **tx).await.map_err(persistence)?;
@@ -1163,6 +1302,19 @@ async fn ensure_terminal_cut(
             return Err(WorkAttemptSettlementError::Conflict);
         }
         return Ok(());
+    }
+    if !settlement_inserted
+        && !accepted_deferred_mutation_owns_completion(
+            tx,
+            owner_id,
+            work_id,
+            branch_id,
+            attempt_id,
+            cut.graph_revision,
+        )
+        .await?
+    {
+        return Err(WorkAttemptSettlementError::Conflict);
     }
     match sqlx::query("INSERT INTO work_terminal_cuts (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(owner_id).bind(work_id).bind(branch_id).bind(cut.graph_revision.get()).bind(attempt_id).bind(cut.control_epoch)

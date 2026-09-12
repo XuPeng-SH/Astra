@@ -265,8 +265,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
     );
 
     // A replay reads the existing settlement and must never manufacture a
-    // missing terminal cut. Recovery authority comes only from the first
-    // branch-locked Delivered -> Complete transition.
+    // missing terminal cut without a durable deferred-mutation transition.
+    // This ordinary graph has no such recovery authority.
     sqlx::query("DELETE FROM work_terminal_cuts WHERE owner_id = ? AND attempt_id = ?")
         .bind(&owner_id)
         .bind(second_attempt_id.as_str())
@@ -287,6 +287,16 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         replay_without_cut,
         Err(WorkAttemptSettlementError::Conflict)
     ));
+    let fresh_completion_without_cut = service
+        .finalize_primary_graph_completion(&owner_id, &session_id, &run_id, Some(99))
+        .await;
+    assert!(
+        matches!(
+            fresh_completion_without_cut,
+            Err(WorkAttemptSettlementError::Conflict)
+        ),
+        "a fresh executor must not backfill an ordinary deleted cut either"
+    );
     let replay_cut: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work_terminal_cuts
          WHERE owner_id = ? AND attempt_id = ?",

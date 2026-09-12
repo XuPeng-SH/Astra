@@ -466,7 +466,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "skill" => (
             &["skill_name", "task"][..],
-            "Run a named skill from the available skill listing before substantive work.",
+            "Run a listed skill before substantive work.",
         ),
         "tool_search" => (
             &["query"][..],
@@ -478,7 +478,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "Create one canonical Work graph when unbound. When bound, inspect for a revision-pinned proposal; never call start_work again. start assigns the first task; defer waits.",
+            "Create one canonical Work graph: start assigns; defer waits. Once bound, never call start_work again; use a revision-pinned proposal.",
         ),
         "run_next_work_item" => (
             &[][..],
