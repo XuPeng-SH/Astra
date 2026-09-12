@@ -977,6 +977,16 @@ Primary and other purposes retain their budgets. This is **not** an eight-second
 end-to-end TTFT guarantee: pre-provider durable admission and post-provider
 logical settlement have their own lifecycle costs. Existing auxiliary failure
 handling remains responsible for degraded Work admission.
+The provider work allowance leaves a tail reserve for durable terminalization.
+That reserve is not a separate maximum for database settlement: an early provider
+response leaves its unused time available for settlement until the same logical
+deadline. Cancellation and the logical deadline still bound foreground delivery;
+late durable success does not reauthorize a cancelled or expired caller.
+Auxiliary summary calls preserve typed inference errors across the runtime
+boundary, including database and contract failures. A returned failure's
+observed provider usage is accounting evidence, not successful execution:
+Work admission consumes that usage once before propagating the failure.
+Missing usage remains unknown rather than being reconstructed from error text.
 The default is a latency policy, not a provider-success guarantee: K3 samples
 have exceeded the approximately 7.2-second provider work allowance. Rollout must
 measure Work-admission success/degradation rate and end-to-end TTFT together;

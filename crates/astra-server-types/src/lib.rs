@@ -1947,6 +1947,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         agent_binding_owner_scope: None,
         execution_budget: request.execution_budget,
         execution_time_budget: request.execution_time_budget,
+        admitted_execution_deadline: None,
         execution_policy: request.execution_policy,
         explain: request.explain,
         interaction_mode: request.interaction_mode,

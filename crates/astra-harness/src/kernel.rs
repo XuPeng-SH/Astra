@@ -289,7 +289,7 @@ mod tests {
         );
 
         let mut record = make_record(HookPoint::PostLlmResponse, 6, 0);
-        record.snapshot.settlement_rounds_reserved = 1;
+        record.snapshot.settlement_rounds_reserved = Some(1);
         assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
 
         record.snapshot.turns_used = 7;

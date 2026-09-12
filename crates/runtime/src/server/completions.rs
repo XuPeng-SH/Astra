@@ -32,7 +32,7 @@ fn completion_admission_estimated_tokens(
     messages: &[serde_json::Value],
     max_output_tokens: u32,
 ) -> u64 {
-    crate::prompts::estimate_tokens(messages, 0, 0)
+    crate::prompts::estimate_wire_input_tokens(messages, 0)
         .saturating_add(max_output_tokens as usize)
         .try_into()
         .unwrap_or(u64::MAX)
@@ -247,6 +247,18 @@ pub(super) async fn completions_handler(
 fn inference_ledger_http_error(
     error: astra_core::ClassifiedError,
 ) -> (StatusCode, Json<ErrorResponse>) {
+    // This endpoint accepts caller-owned session scope, unlike the agent loop's
+    // server-owned run authority. Preserve the typed cause across that boundary;
+    // an unavailable caller scope is not an internal ledger failure.
+    if crate::turn::llm::durable::inference_scope_rejection(&error)
+        == Some(astra_services::InferenceScopeRejection::Unavailable)
+    {
+        return crate::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "The requested inference scope is unavailable",
+            "invalid_inference_scope",
+        );
+    }
     let (status, error_code) = match error.kind {
         astra_core::ErrorKind::InvalidRequest => {
             (StatusCode::BAD_REQUEST, "invalid_inference_scope")
@@ -291,6 +303,48 @@ mod tests {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn inference_scope_http_mapping_uses_typed_cause_not_diagnostic_text() {
+        use astra_core::{ClassifiedError, ErrorKind};
+        use astra_services::InferenceScopeRejection;
+        for (source, reason, expected) in [
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                Some(InferenceScopeRejection::Unavailable),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                Some(InferenceScopeRejection::GuidancePending),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "other",
+                Some(InferenceScopeRejection::Unavailable),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let error = ClassifiedError::new(ErrorKind::ContractViolation, "scope unavailable")
+                .with_details_json(
+                    json!({"source": source, "scope_rejection": reason}).to_string(),
+                );
+            assert_eq!(inference_ledger_http_error(error).0, expected);
+        }
+        assert_eq!(
+            inference_ledger_http_error(ClassifiedError::new(
+                ErrorKind::DatabaseError,
+                "scope unavailable"
+            ))
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     struct Healthy;
 
@@ -551,8 +605,13 @@ mod tests {
     fn completion_admission_estimate_covers_prompt_and_server_bounded_output() {
         let messages = vec![json!({"role": "user", "content": "classify this request"})];
         let estimate = completion_admission_estimated_tokens(&messages, 64);
+        let expected = (crate::prompts::estimate_wire_input_tokens(&messages, 0) + 64) as u64;
+        assert_eq!(estimate, expected);
         assert!(estimate >= 64);
-        assert!(estimate > 14_000, "shared prompt estimate must be included");
+        assert!(
+            estimate < 14_000,
+            "opaque completion requests must not inherit the agent system-prompt estimate"
+        );
     }
 
     #[test]

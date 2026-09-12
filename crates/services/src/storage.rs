@@ -1155,16 +1155,13 @@ pub async fn admit_session_event_write(
 ///
 /// The caller supplies the session identity it already owns. We first fence
 /// the active, non-tombstoned session, then the session execution slot, and
-/// only then the exact run row. `allow_missing_run` is reserved for run
-/// creation: it retains the session/slot fence while proving that an existing
-/// exact run, when present, belongs to the same session.
-pub async fn admit_session_scoped_run_write(
+/// only then may the caller lock run rows. Sessions without an active run
+/// still use this fence, so run creation cannot race an idle handoff check.
+pub async fn admit_session_execution_write(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
-    run_id: &str,
-    allow_missing_run: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     admit_session_event_write(tx, session_id, user_id, false).await?;
 
     // Lock the derived slot before any run row. A missing slot is a valid
@@ -1178,7 +1175,19 @@ pub async fn admit_session_scoped_run_write(
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
+    Ok(())
+}
 
+/// Admit the session and execution slot before locking an exact run.
+/// `allow_missing_run` is reserved for run creation.
+pub async fn admit_session_scoped_run_write(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    run_id: &str,
+    allow_missing_run: bool,
+) -> Result<bool, sqlx::Error> {
+    admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",

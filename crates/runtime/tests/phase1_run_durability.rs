@@ -598,7 +598,7 @@ async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
             .await
             .unwrap()
             .iter()
-            .all(|run| run.run_id != run_id),
+            .all(|claim| claim.run.run_id != run_id),
         "startup recovery must not mark another live owner as crashed"
     );
 
@@ -608,7 +608,7 @@ async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
             .await
             .unwrap()
             .iter()
-            .any(|run| run.run_id == run_id),
+            .any(|claim| claim.run.run_id == run_id),
         "the current owner may recover its own running run"
     );
 }
@@ -693,11 +693,12 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
 
     assert!(
         store
-            .save_checkpoint(
-                &user_id,
-                &session_id,
-                &run_id,
-                &json!({
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+                checkpoint_json: &json!({
                     "version": "checkpoint_v1",
                     "graceful": true,
                     "last_batch_id": "batch-1",
@@ -710,13 +711,13 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
                     }
                 })
                 .to_string(),
-            )
+            })
             .await
-            .unwrap()
+            .unwrap().is_some()
     );
     assert!(
         store
-            .save_checkpoint(&user_id, &session_id, &run_id, r#"{"version":"bad"}"#)
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest { user_id: &user_id, expected_session_id: &session_id, run_id: &run_id, checkpoint_json: r#"{"version":"bad"}"#, authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane })
             .await
             .is_err()
     );
@@ -938,11 +939,12 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     active_store
         .read()
         .await
-        .save_checkpoint(
-            &user_id,
-            &session_id,
-            &run_id,
-            &json!({
+        .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+            user_id: &user_id,
+            expected_session_id: &session_id,
+            run_id: &run_id,
+            authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            checkpoint_json: &json!({
                 "version": "checkpoint_v1",
                 "graceful": true,
                 "last_batch_id": "batch-17",
@@ -955,9 +957,9 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
                 }
             })
             .to_string(),
-        )
+        })
         .await
-        .unwrap();
+        .unwrap().expect("checkpoint was persisted");
     let engine = RunEngine::new(Arc::new(active_store.read().await.clone()));
     let recovered = engine.recover_active_runs().await.unwrap();
     assert!(recovered.iter().any(|run| run.run_id == run_id));

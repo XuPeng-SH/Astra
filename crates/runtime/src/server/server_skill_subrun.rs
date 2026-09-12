@@ -717,6 +717,7 @@ impl ServerSkillSubRunExecutor {
     fn resolve_execution_policy(
         &self,
         task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+        runtime_ceiling: Option<std::num::NonZeroUsize>,
         effective_model: Option<&str>,
     ) -> Result<
         (
@@ -729,7 +730,7 @@ impl ServerSkillSubRunExecutor {
         let turn_budget =
             astra_turn_core::chat_turn_heuristics::resolve_isolated_agentic_turn_budget(
                 task_profile,
-                limits.max_turns,
+                runtime_ceiling,
             );
         let admitted_context_window = self
             .admitted_model_execution
@@ -757,6 +758,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         expected_control_epoch: Option<i64>,
         parent_turn_chain_id: Option<&str>,
     ) -> Result<SubRunResult, String> {
+        let runtime_ceiling = astra_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(false)?;
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
@@ -830,7 +834,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 replay,
             ) => {
                 return self
-                    .replay_outer_skill_result(&outer_identity, &replay.output)
+                    .replay_outer_skill_result(&outer_identity, &replay.result.output)
                     .await;
             }
             crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Superseded {
@@ -864,7 +868,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             } => owner_id,
             crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(replay) => {
                 return self
-                    .replay_outer_skill_result(&outer_identity, &replay.output)
+                    .replay_outer_skill_result(&outer_identity, &replay.result.output)
                     .await;
             }
         };
@@ -1005,7 +1009,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let task_profile = infer_task_execution_profile(task_context);
         let (agentic_turn_budget, max_turn_input_tokens) =
-            self.resolve_execution_policy(task_profile, effective_model.as_deref())?;
+            self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref())?;
         let initial_turns = agentic_turn_budget.initial_turns;
         let workspace_root_hint = self
             .edge_profile
@@ -1050,9 +1054,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             last_finish_reason: None,
             max_turns: initial_turns,
             remaining_turns: initial_turns,
+            charged_iterations: 0,
             agentic_turn_budget,
             budget_is_explicit: true,
             budget_policy: None,
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -1082,8 +1088,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 tool_event_hooks,
                 session_event_hooks,
                 // Skill-level effort/agent_type from manifest
-                effort: effort.and_then(crate::skills::manifest::EffortLevel::parse),
-                agent_type: agent_type.map(String::from),
+                execution: crate::turn::agentic_loop::host::SkillExecutionState {
+                    effort: effort.and_then(crate::skills::manifest::EffortLevel::parse),
+                    agent_type: agent_type.map(String::from),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             hooks: StopHookState {
@@ -1120,7 +1129,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
@@ -1230,10 +1239,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 if let Some(heartbeat) = outer_guard.heartbeat.take() {
                     heartbeat.stop().await;
                 }
-                if durable.is_error {
+                if durable.result.is_error {
                     return Err(format!(
                         "forked skill completed but its outer invocation could not settle: {}",
-                        durable.output
+                        durable.result.output
                     ));
                 }
                 outer_guard.settled = true;
@@ -1402,6 +1411,7 @@ mod tests {
         let server = build(server_execution)
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+                None,
                 Some("test-model"),
             )
             .expect("Server execution policy");
@@ -1409,6 +1419,7 @@ mod tests {
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+                None,
                 Some("test-model"),
             )
             .expect("Edge+Server execution policy");
@@ -1424,6 +1435,7 @@ mod tests {
         )
         .resolve_execution_policy(
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+            None,
             Some("test-model"),
         );
         assert!(

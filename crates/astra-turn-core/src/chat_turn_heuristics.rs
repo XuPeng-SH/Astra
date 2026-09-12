@@ -5,25 +5,23 @@
 //! tool/workspace evidence, not keyword lists over user text.
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use tracing::warn;
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
 const EXPLORATORY_STALL_WINDOW: usize = 4;
 const EXPLORATORY_ROUND_WINDOW: usize = 8;
 
-// Start with a useful execution slice, then renew only while observed progress
-// justifies it. Large up-front budgets postpone the first convergence decision
-// until after a weak model has already spent dozens of low-yield rounds.
-const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, 72, 12, 4);
-const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, 96, 16, 4);
-const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget =
-    AgenticTurnBudget::new(32, 96, 16, 4);
-const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget =
-    AgenticTurnBudget::new(40, 120, 20, 4);
+// Profiles select a useful initial slice and renewal step. The resolver uses
+// caller/administrator limits for the hard boundary, not these profile caps.
+// Renewal checks authoritative stop conditions, not availability of receipts.
+const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, None, 12);
+const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None, 16);
+const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None, 16);
+const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(40, None, 20);
 // Exploration changes stall sensitivity, not the amount of work a user has
 // authorized. Keep the same resource boundary for the same complexity.
 const STANDARD_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = STANDARD_ANALYSIS_TURN_BUDGET;
@@ -33,36 +31,31 @@ const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
 const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
     COMPLEX_IMPLEMENTATION_TURN_BUDGET;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskComplexity {
     Standard,
     Complex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgenticTurnBudget {
     pub initial_turns: usize,
-    pub hard_turn_limit: usize,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub hard_turn_limit: Option<NonZeroUsize>,
     pub extension_turns: usize,
-    pub max_extensions: u32,
-    /// Kept for wire compatibility. A hard turn limit is always a real
-    /// boundary; callers may raise it explicitly when they need a longer run.
-    pub renewable_past_review_limit: bool,
 }
 
 impl AgenticTurnBudget {
     pub const fn new(
         initial_turns: usize,
-        hard_turn_limit: usize,
+        hard_turn_limit: Option<NonZeroUsize>,
         extension_turns: usize,
-        max_extensions: u32,
     ) -> Self {
         Self {
             initial_turns,
             hard_turn_limit,
             extension_turns,
-            max_extensions,
-            renewable_past_review_limit: false,
         }
     }
 }
@@ -70,10 +63,11 @@ impl AgenticTurnBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AgenticTurnBudgetOverride {
     pub initial_turns: Option<usize>,
-    pub hard_turn_limit: Option<usize>,
+    pub hard_turn_limit: Option<NonZeroUsize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskExecutionProfile {
     pub mutates_workspace: bool,
     pub verification_required: bool,
@@ -170,53 +164,26 @@ fn default_agentic_turn_budget(
 #[must_use]
 pub fn resolve_agentic_turn_budget(
     profile: TaskExecutionProfile,
-    runtime_ceiling: usize,
+    runtime_ceiling: Option<NonZeroUsize>,
     override_budget: Option<AgenticTurnBudgetOverride>,
 ) -> AgenticTurnBudget {
-    let ceiling = runtime_ceiling.max(1);
-    let mut budget = profile.agentic_turn_budget;
-    let requested_hard = override_budget
-        .and_then(|value| value.hard_turn_limit)
-        .unwrap_or(budget.hard_turn_limit);
-    let hard_turn_limit = requested_hard.max(1).min(ceiling);
-    if requested_hard > hard_turn_limit {
-        warn!(
-            requested_hard,
-            ceiling,
-            hard_turn_limit,
-            "agentic turn budget override clamped: hard_turn_limit reduced to runtime ceiling"
-        );
-    }
+    let requested_hard = override_budget.and_then(|value| value.hard_turn_limit);
+    let hard_turn_limit = match (runtime_ceiling, requested_hard) {
+        (Some(runtime), Some(requested)) => Some(runtime.min(requested)),
+        (runtime, requested) => runtime.or(requested),
+    };
     let requested_initial = override_budget
         .and_then(|value| value.initial_turns)
-        .unwrap_or(budget.initial_turns);
-    let initial_turns = requested_initial.max(1).min(hard_turn_limit);
-    if requested_initial > initial_turns {
-        warn!(
-            requested_initial,
-            hard_turn_limit,
-            initial_turns,
-            "agentic turn budget override clamped: initial_turns reduced to hard_turn_limit"
-        );
+        .unwrap_or(profile.agentic_turn_budget.initial_turns)
+        .max(1);
+    let initial_turns = hard_turn_limit.map_or(requested_initial, |limit| {
+        requested_initial.min(limit.get())
+    });
+    AgenticTurnBudget {
+        initial_turns,
+        hard_turn_limit,
+        extension_turns: profile.agentic_turn_budget.extension_turns.max(1),
     }
-    let headroom = hard_turn_limit.saturating_sub(initial_turns);
-    let extension_turns = if headroom == 0 {
-        0
-    } else {
-        budget.extension_turns.max(1).min(headroom)
-    };
-    let max_extensions = if extension_turns == 0 {
-        0
-    } else {
-        let max_possible = headroom.div_ceil(extension_turns) as u32;
-        budget.max_extensions.min(max_possible).max(1)
-    };
-    budget.initial_turns = initial_turns;
-    budget.hard_turn_limit = hard_turn_limit;
-    budget.extension_turns = extension_turns;
-    budget.max_extensions = max_extensions;
-    budget.renewable_past_review_limit = false;
-    budget
 }
 
 /// Resolve the adaptive execution slices for an isolated child while keeping
@@ -229,7 +196,7 @@ pub fn resolve_agentic_turn_budget(
 #[must_use]
 pub fn resolve_isolated_agentic_turn_budget(
     profile: TaskExecutionProfile,
-    runtime_ceiling: usize,
+    runtime_ceiling: Option<NonZeroUsize>,
 ) -> AgenticTurnBudget {
     resolve_isolated_agentic_turn_budget_with_initial_slice(profile, runtime_ceiling, None)
 }
@@ -246,24 +213,17 @@ pub fn resolve_isolated_agentic_turn_budget(
 #[must_use]
 pub fn resolve_isolated_agentic_turn_budget_with_initial_slice(
     profile: TaskExecutionProfile,
-    runtime_ceiling: usize,
+    runtime_ceiling: Option<NonZeroUsize>,
     initial_slice: Option<usize>,
 ) -> AgenticTurnBudget {
-    let mut budget = resolve_agentic_turn_budget(
+    resolve_agentic_turn_budget(
         profile,
         runtime_ceiling,
         Some(AgenticTurnBudgetOverride {
             initial_turns: initial_slice,
-            hard_turn_limit: Some(runtime_ceiling),
+            hard_turn_limit: None,
         }),
-    );
-    if budget.extension_turns > 0 {
-        let headroom = budget.hard_turn_limit.saturating_sub(budget.initial_turns);
-        budget.max_extensions = headroom
-            .div_ceil(budget.extension_turns)
-            .min(u32::MAX as usize) as u32;
-    }
-    budget
+    )
 }
 
 /// Resolve the one shared child-run budget protocol used by local and server
@@ -275,9 +235,9 @@ pub fn resolve_isolated_agentic_turn_budget_with_initial_slice(
 #[must_use]
 pub fn resolve_spawned_agentic_turn_budget(
     profile: TaskExecutionProfile,
-    runtime_ceiling: usize,
+    runtime_ceiling: Option<NonZeroUsize>,
     initial_slice: usize,
-    explicit_hard_limit: Option<usize>,
+    explicit_hard_limit: Option<NonZeroUsize>,
 ) -> AgenticTurnBudget {
     let Some(explicit_hard_limit) = explicit_hard_limit else {
         return resolve_isolated_agentic_turn_budget_with_initial_slice(
@@ -290,7 +250,7 @@ pub fn resolve_spawned_agentic_turn_budget(
         profile,
         runtime_ceiling,
         Some(AgenticTurnBudgetOverride {
-            initial_turns: Some(initial_slice.min(explicit_hard_limit)),
+            initial_turns: Some(initial_slice.min(explicit_hard_limit.get())),
             hard_turn_limit: Some(explicit_hard_limit),
         }),
     )
@@ -381,6 +341,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn execution_profile_checkpoint_requires_complete_budget_facts() {
+        for hard_turn_limit in [None, NonZeroUsize::new(73)] {
+            let profile = TaskExecutionProfile {
+                agentic_turn_budget: AgenticTurnBudget::new(17, hard_turn_limit, 11),
+                ..TaskExecutionProfile::default()
+            };
+            let wire = serde_json::to_value(profile).unwrap();
+            assert_eq!(
+                serde_json::from_value::<TaskExecutionProfile>(wire.clone()).unwrap(),
+                profile
+            );
+            for field in ["initial_turns", "hard_turn_limit", "extension_turns"] {
+                let mut incomplete = wire.clone();
+                incomplete["agentic_turn_budget"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                assert!(serde_json::from_value::<TaskExecutionProfile>(incomplete).is_err());
+            }
+            let mut unknown = wire;
+            unknown["agentic_turn_budget"]["unknown"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<TaskExecutionProfile>(unknown).is_err());
+        }
+    }
+
+    #[test]
     fn natural_language_profile_inference_fails_closed() {
         let cases = [
             "implement the feature",
@@ -409,10 +395,8 @@ mod tests {
             implementation.agentic_turn_budget.initial_turns
                 > standard.agentic_turn_budget.initial_turns
         );
-        assert!(
-            implementation.agentic_turn_budget.hard_turn_limit
-                > standard.agentic_turn_budget.hard_turn_limit
-        );
+        assert_eq!(implementation.agentic_turn_budget.hard_turn_limit, None);
+        assert_eq!(standard.agentic_turn_budget.hard_turn_limit, None);
 
         let exploratory =
             TaskExecutionProfile::from_structured_intent(false, true, TaskComplexity::Complex);
@@ -422,64 +406,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agentic_turn_budget_clamps_override_to_runtime_ceiling() {
-        let profile =
-            TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard);
-        let budget = resolve_agentic_turn_budget(
-            profile,
-            12,
-            Some(AgenticTurnBudgetOverride {
-                initial_turns: Some(20),
-                hard_turn_limit: Some(30),
-            }),
-        );
-        assert_eq!(budget.initial_turns, 12);
-        assert_eq!(budget.hard_turn_limit, 12);
-        assert_eq!(budget.max_extensions, 0);
-        assert!(
-            !budget.renewable_past_review_limit,
-            "an explicit caller limit must remain a real resource boundary"
-        );
-        let default_budget = resolve_agentic_turn_budget(profile, 1_000, None);
-        assert!(
-            !default_budget.renewable_past_review_limit,
-            "a hard turn limit must not silently become an unbounded renewable checkpoint"
-        );
+    fn explicit_round_limits_intersect_without_manufacturing_defaults() {
+        let profile = TaskExecutionProfile::default();
+        for (runtime, requested, expected) in [
+            (None, None, None),
+            (Some(50), None, Some(50)),
+            (None, Some(50), Some(50)),
+            (Some(50), Some(80), Some(50)),
+            (Some(80), Some(50), Some(50)),
+        ] {
+            let budget = resolve_agentic_turn_budget(
+                profile,
+                runtime.and_then(NonZeroUsize::new),
+                Some(AgenticTurnBudgetOverride {
+                    initial_turns: Some(60),
+                    hard_turn_limit: requested.and_then(NonZeroUsize::new),
+                }),
+            );
+            assert_eq!(budget.hard_turn_limit, expected.and_then(NonZeroUsize::new));
+            assert_eq!(
+                budget.initial_turns,
+                expected.map_or(60, |limit| limit.min(60))
+            );
+            assert_eq!(budget.extension_turns, 12);
+        }
     }
 
     #[test]
-    fn isolated_budget_uses_profile_slice_with_nonrenewable_runtime_ceiling() {
+    fn root_and_child_share_uncapped_slices_and_explicit_boundaries() {
         let profile = TaskExecutionProfile::default();
-        let budget = resolve_isolated_agentic_turn_budget(profile, 300);
-
-        assert_eq!(
-            budget.initial_turns,
-            profile.agentic_turn_budget.initial_turns
+        for ceiling in [None, NonZeroUsize::new(12), NonZeroUsize::new(300)] {
+            let root = resolve_agentic_turn_budget(profile, ceiling, None);
+            let child = resolve_isolated_agentic_turn_budget(profile, ceiling);
+            assert_eq!(root, child);
+            assert_eq!(root.hard_turn_limit, ceiling);
+        }
+        let persona =
+            resolve_isolated_agentic_turn_budget_with_initial_slice(profile, None, Some(25));
+        assert_eq!(persona.initial_turns, 25);
+        assert_eq!(persona.hard_turn_limit, None);
+        let child = resolve_spawned_agentic_turn_budget(
+            profile,
+            NonZeroUsize::new(50),
+            25,
+            NonZeroUsize::new(80),
         );
-        assert_eq!(budget.hard_turn_limit, 300);
-        assert!(!budget.renewable_past_review_limit);
-        assert!(
-            budget.initial_turns
-                + budget.extension_turns * usize::try_from(budget.max_extensions).unwrap()
-                >= budget.hard_turn_limit,
-            "a progressing isolated run must be able to consume bounded slices through the administrator ceiling"
-        );
-
-        let clamped = resolve_isolated_agentic_turn_budget(profile, 24);
-        assert_eq!(clamped.initial_turns, 24);
-        assert_eq!(clamped.hard_turn_limit, 24);
-        assert_eq!(clamped.max_extensions, 0);
-
-        let persona_slice =
-            resolve_isolated_agentic_turn_budget_with_initial_slice(profile, 300, Some(12));
-        assert_eq!(persona_slice.initial_turns, 12);
-        assert_eq!(persona_slice.hard_turn_limit, 300);
-        assert!(
-            persona_slice.initial_turns
-                + persona_slice.extension_turns
-                    * usize::try_from(persona_slice.max_extensions).unwrap()
-                >= persona_slice.hard_turn_limit
-        );
+        assert_eq!(child.hard_turn_limit, NonZeroUsize::new(50));
     }
 
     #[test]

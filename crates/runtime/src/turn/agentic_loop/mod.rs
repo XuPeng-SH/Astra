@@ -6,3 +6,4 @@ pub(crate) mod lifecycle;
 pub(crate) mod source_recovery;
 pub(crate) mod tool_phase;
 pub(crate) mod tool_support;
+pub(crate) mod verification_frontier;

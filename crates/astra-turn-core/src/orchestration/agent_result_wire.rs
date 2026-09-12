@@ -143,6 +143,22 @@ pub fn agent_fanout_result_looks_like(value: &Value) -> bool {
 pub enum AgentFanoutControlReceiptKind {
     Group,
     RejectedBeforeAcceptance,
+    /// The control envelope reached a terminal boundary, but the producer
+    /// could not prove whether execution began. This is authoritative for
+    /// settlement; the host must not replay the action.
+    ExecutionUnknown,
+}
+
+/// Typed execution fact carried by a control result.
+///
+/// `None` means that the producer did not publish an execution fact. That
+/// absence is intentionally different from `Unknown`: an explicit unknown
+/// terminal closes a physical call without granting permission to replay it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentFanoutControlExecutionFact {
+    NotExecuted,
+    Executed,
+    Unknown,
 }
 
 /// Parse the canonical structured record from an agent-control output.
@@ -166,6 +182,27 @@ pub fn agent_control_result_value(output: &str) -> Option<Value> {
     })
 }
 
+fn execution_fact_from_receipt(receipt: &Value) -> Option<AgentFanoutControlExecutionFact> {
+    let value = receipt
+        .get("executed")
+        .or_else(|| receipt.pointer("/advisory/executed"))?;
+    match value {
+        Value::Bool(false) => Some(AgentFanoutControlExecutionFact::NotExecuted),
+        Value::Bool(true) => Some(AgentFanoutControlExecutionFact::Executed),
+        Value::Null => Some(AgentFanoutControlExecutionFact::Unknown),
+        _ => None,
+    }
+}
+
+/// Read the producer-owned execution fact from a structured fanout result.
+/// Only the exact boolean/null fields are recognized; display text and error
+/// prose never participate in lifecycle authority.
+pub fn agent_fanout_control_execution_fact(
+    output: &str,
+) -> Option<AgentFanoutControlExecutionFact> {
+    execution_fact_from_receipt(&agent_control_result_value(output)?)
+}
+
 pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutControlReceiptKind> {
     let receipt = agent_control_result_value(output)?;
     let status = receipt
@@ -173,6 +210,21 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|status| !status.is_empty())?;
+    let execution_fact = execution_fact_from_receipt(&receipt);
+    if execution_fact == Some(AgentFanoutControlExecutionFact::Unknown) {
+        return Some(AgentFanoutControlReceiptKind::ExecutionUnknown);
+    }
+    let normalized_status = status.to_ascii_lowercase();
+    if execution_fact == Some(AgentFanoutControlExecutionFact::NotExecuted)
+        && matches!(
+            normalized_status.as_str(),
+            "failed" | "rejected" | "blocked"
+        )
+    {
+        // A rejection can reference an existing group. Its identity is
+        // context, not proof that this request created or executed it.
+        return Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance);
+    }
     if receipt
         .get("group_id")
         .and_then(Value::as_str)
@@ -180,7 +232,17 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
     {
         return Some(AgentFanoutControlReceiptKind::Group);
     }
+    if execution_fact == Some(AgentFanoutControlExecutionFact::Executed) {
+        // An executed control action still needs its group receipt. Keeping
+        // it provisional prevents duplicate child creation when a result was
+        // flattened before the registry receipt arrived.
+        return None;
+    }
+    // Existing structured fanout errors without an explicit execution fact
+    // remain valid admission failures: the typed status+error pair proves
+    // that no group receipt exists. Plain text and incomplete JSON do not.
     (AgentToolResultStatusKind::parse_wire(status) == AgentToolResultStatusKind::Failed
+        && execution_fact.is_none()
         && receipt
             .get("error")
             .and_then(Value::as_str)
@@ -194,10 +256,12 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
 /// A `start` call has side effects before its response is delivered.  Plain
 /// text, an empty body, or ambiguous JSON without the canonical group identity
 /// cannot prove whether children were accepted, so the host must reconcile it
-/// from the fanout registry. A typed failure with an error is authoritative
-/// evidence that admission stopped before a group existed. Every action uses
-/// this same typed contract; arbitrary non-empty transport text is never a
-/// lifecycle result.
+/// from the fanout registry. A typed rejection with `executed=false` is
+/// authoritative evidence that this call did not execute, even if it references
+/// an existing group. An
+/// explicit `executed=null` closes as an unknown terminal and must never be
+/// replayed. Existing status+error admission failures remain accepted.
+/// Arbitrary non-empty transport text is never a lifecycle result.
 pub fn agent_fanout_control_result_is_usable(output: &str) -> bool {
     agent_fanout_control_receipt_kind(output).is_some()
 }
@@ -873,6 +937,12 @@ mod tests {
 
     #[test]
     fn fanout_start_requires_typed_identity_before_crossing_the_boundary() {
+        assert_eq!(
+            agent_fanout_control_receipt_kind(
+                r#"{"status":"failed","error_kind":"fanout_group_already_started","executed":false,"group_id":"existing-group"}"#
+            ),
+            Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+        );
         assert!(!agent_fanout_control_result_is_usable(""));
         assert!(!agent_fanout_control_result_is_usable(
             r#"{"status":"completed"}"#
@@ -889,6 +959,27 @@ mod tests {
             ),
             Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
         );
+        assert_eq!(
+            agent_fanout_control_execution_fact(
+                r#"{"status":"rejected","error_kind":"deferred_tool_descriptor_stale","advisory":{"executed":false}}"#
+            ),
+            Some(AgentFanoutControlExecutionFact::NotExecuted)
+        );
+        assert_eq!(
+            agent_fanout_control_receipt_kind(
+                r#"{"status":"rejected","error_kind":"deferred_tool_descriptor_stale","advisory":{"executed":false}}"#
+            ),
+            Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+        );
+        assert_eq!(
+            agent_fanout_control_receipt_kind(
+                r#"{"status":"unknown","error_kind":"action_outcome_unknown","advisory":{"executed":null}}"#
+            ),
+            Some(AgentFanoutControlReceiptKind::ExecutionUnknown)
+        );
+        assert!(!agent_fanout_control_result_is_usable(
+            r#"{"status":"failed","error":"a later registry receipt is required","advisory":{"executed":true}}"#
+        ));
         assert!(!agent_fanout_control_result_is_usable(
             r#"{"status":"failed"}"#
         ));

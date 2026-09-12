@@ -923,6 +923,49 @@ pub struct ToolInvocationRecord {
     pub completion_source: Option<ToolInvocationCompletionSource>,
 }
 
+/// Bounded reference to authoritative invocation evidence. A consumer must
+/// resolve the ledger row and compare this reference before trusting a proof;
+/// neither a displayed result nor this reference alone establishes success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInvocationCompletionRef {
+    pub identity: ToolInvocationIdentity,
+    pub fingerprint: ToolInvocationFingerprint,
+    pub state: ToolInvocationState,
+    pub dispatch_certainty: DispatchCertainty,
+    #[serde(deserialize_with = "crate::completion_settlement::deserialize_required_option")]
+    pub completion_source: Option<ToolInvocationCompletionSource>,
+    #[serde(deserialize_with = "crate::completion_settlement::deserialize_required_option")]
+    pub outcome_digest: Option<String>,
+}
+
+impl ToolInvocationCompletionRef {
+    pub fn from_record(record: &ToolInvocationRecord) -> Result<Self, ToolInvocationContractError> {
+        record.validate()?;
+        let outcome_digest = record
+            .outcome
+            .as_ref()
+            .map(|outcome| {
+                let value = serde_json::to_value(outcome).map_err(|error| {
+                    ToolInvocationContractError::ResultSerialization(error.to_string())
+                })?;
+                let bytes = serde_json::to_vec(&canonical_json(&value)).map_err(|error| {
+                    ToolInvocationContractError::ResultSerialization(error.to_string())
+                })?;
+                Ok::<_, ToolInvocationContractError>(format!("sha256:{:x}", Sha256::digest(bytes)))
+            })
+            .transpose()?;
+        Ok(Self {
+            identity: record.identity.clone(),
+            fingerprint: record.fingerprint.clone(),
+            state: record.state,
+            dispatch_certainty: record.dispatch_certainty,
+            completion_source: record.completion_source.clone(),
+            outcome_digest,
+        })
+    }
+}
+
 impl ToolInvocationRecord {
     pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
         self.decision.validate()?;
@@ -1095,7 +1138,7 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
-fn validate_sha256_content_id(
+pub(crate) fn validate_sha256_content_id(
     field: &'static str,
     value: &str,
 ) -> Result<(), ToolInvocationContractError> {
@@ -1615,6 +1658,45 @@ mod tests {
         });
         let mismatch = serde_json::from_value::<ToolInvocationRecord>(mismatched).unwrap_err();
         assert!(mismatch.to_string().contains("inconsistent"), "{mismatch}");
+    }
+
+    #[test]
+    fn completion_reference_binds_exact_outcome_and_requires_nullable_fields() {
+        let decision = decision();
+        let mut row = json!({
+            "identity": identity("call-1"),
+            "fingerprint": ToolInvocationFingerprint::new(
+                tool_ref(), &json!({"command": "verify"}), &decision.decision_id
+            ).unwrap(),
+            "decision": decision,
+            "state": "succeeded",
+            "dispatch_certainty": "dispatched",
+            "attempt_count": 1,
+            "outcome": {"kind": "succeeded", "result": {"output": "verified"}}
+        });
+        let record: ToolInvocationRecord = serde_json::from_value(row.clone()).unwrap();
+        let reference = ToolInvocationCompletionRef::from_record(&record).unwrap();
+        row["outcome"]["result"]["output"] = json!("different evidence");
+        let changed: ToolInvocationRecord = serde_json::from_value(row).unwrap();
+        assert_ne!(
+            reference.outcome_digest,
+            ToolInvocationCompletionRef::from_record(&changed)
+                .unwrap()
+                .outcome_digest
+        );
+        let encoded = serde_json::to_value(&reference).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolInvocationCompletionRef>(encoded.clone()).unwrap(),
+            reference
+        );
+        for field in ["completion_source", "outcome_digest"] {
+            let mut missing = encoded.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<ToolInvocationCompletionRef>(missing).is_err());
+        }
+        let mut invalid = record;
+        invalid.outcome = None;
+        assert!(ToolInvocationCompletionRef::from_record(&invalid).is_err());
     }
 
     #[test]

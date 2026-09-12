@@ -1,10 +1,45 @@
 """Dependency-free runtime contract for the Astra Harbor adapter."""
 
 import ipaddress
+import json
 import os
+import re
 import shlex
 from typing import Callable
 from urllib.parse import urlsplit
+
+
+def validate_server_readiness(stdout: str, expected_sha: str | None = None) -> dict:
+    """Validate core execution readiness, not overall monitoring health."""
+    if len(stdout.encode("utf-8")) > 65536:
+        raise ValueError("server health response exceeds its bounded contract")
+    try:
+        value = json.loads(stdout)
+    except (ValueError, TypeError) as error:
+        raise ValueError("server health response is not complete JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("server health response must be an object")
+    if value.get("status") not in ("healthy", "degraded"):
+        raise ValueError("server is not ready")
+    if value.get("database") != "connected":
+        raise ValueError("server database is not connected")
+    if value.get("interaction_api_major") != "3":
+        raise ValueError("server interaction API major is unsupported")
+    sha = value.get("build_git_sha")
+    if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+        raise ValueError("server build identity is invalid")
+    if expected_sha is not None and sha != expected_sha:
+        raise ValueError("server build identity differs from the candidate")
+    return value
+
+
+def validate_cli_readiness(stdout: str, exit_code: int, expected_sha: str | None) -> dict:
+    if exit_code not in (0, 3):
+        raise ValueError("server health command failed")
+    value = validate_server_readiness(stdout, expected_sha)
+    if exit_code == 3 and value["status"] != "degraded":
+        raise ValueError("server health exit disagrees with response")
+    return value
 
 
 _LOCAL_PROXY_BYPASSES = ("localhost", "127.0.0.1", "::1")
@@ -261,13 +296,8 @@ def astra_chat_command(
         raise ValueError("timeout_sec must leave room for Astra terminal finalization")
     return " ".join(
         [
-            # Harbor can be invoked directly, without the Rust harness
-            # preflight.  Refuse that run at the container boundary when the
-            # server contract or credential was not wired at all.  `astra
-            # health` is intentionally the only live probe here: it checks
-            # core API/database readiness while allowing the server's normal
-            # optional-component degradation semantics.  Do not probe a
-            # model or interpret task-specific output before the agent starts.
+            # Readiness is validated structurally by the adapter before this
+            # command. Credentials remain file-only inside the task boundary.
             "test -n \"${ASTRA_API_URL:-}\" || { echo 'astra harbor preflight: ASTRA_API_URL is missing' >&2; exit 78; }",
             ";",
             "test -r \"${ASTRA_ACCESS_TOKEN_FILE:-}\" || { echo 'astra harbor preflight: Astra access-token file is missing' >&2; exit 78; }",
@@ -277,8 +307,6 @@ def astra_chat_command(
             "export ASTRA_ACCESS_TOKEN",
             ";",
             "test -n \"${ASTRA_ACCESS_TOKEN:-}\" || { echo 'astra harbor preflight: Astra access-token file is empty' >&2; exit 78; }",
-            ";",
-            "astra health >/dev/null || { echo 'astra harbor preflight: API is not ready' >&2; exit 78; }",
             ";",
             "timeout",
             "--signal=TERM",

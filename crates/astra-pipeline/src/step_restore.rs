@@ -79,12 +79,18 @@ pub struct RestoredSession {
     pub budget_remaining_tokens: u64,
     /// Remaining turn rounds
     pub budget_remaining_rounds: u32,
-    /// Tools currently blocked (from stall/health tracking)
+    /// Accounting only; the run owner must authorize same-run reconstruction.
+    pub run_execution_budget: Option<crate::step_protocol::RunExecutionBudget>,
+    pub run_execution_control: Option<crate::step_protocol::RunExecutionControl>,
+    /// Legacy checkpoint tool restriction snapshot. This is diagnostic input
+    /// only; owning runtimes must re-derive hard policy from the current
+    /// request/capability boundary rather than restore this unscoped list.
     pub blocked_tools: Vec<String>,
     /// Recently used tools (for selection context)
     pub recent_tools: Vec<String>,
     /// Deferred schemas materialized in the retained prompt context.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed deferred selections usable by the stable carrier.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Turn number to resume from
     pub resume_turn: u32,
     /// Protocol version of the checkpoint
@@ -220,9 +226,11 @@ fn build_restored_session(
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
+        run_execution_budget: heavy.run_execution_budget,
+        run_execution_control: heavy.run_execution_control,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names,
+        deferred_tool_activations: heavy.deferred_tool_activations,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -528,9 +536,11 @@ mod tests {
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools,
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -685,9 +695,11 @@ mod tests {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             resume_turn: 3,
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),

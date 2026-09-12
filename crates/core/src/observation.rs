@@ -460,6 +460,16 @@ pub enum ObservationDepth {
 }
 
 impl ObservationDepth {
+    /// Maximum observation, evidence, and action-hint counts for this depth.
+    pub const fn report_limits(self) -> (usize, usize, usize) {
+        match self {
+            Self::Hint => (3, 1, 2),
+            Self::Summary => (8, 4, 4),
+            Self::Diagnostic => (32, 16, 8),
+            Self::Forensic => (100, 50, 8),
+        }
+    }
+
     pub fn from_arg(arg: &str) -> Self {
         match normalize_observation_arg(arg).as_str() {
             "hint" => Self::Hint,

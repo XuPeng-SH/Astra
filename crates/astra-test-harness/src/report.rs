@@ -425,12 +425,22 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             ));
             let health = crate::pipeline_analysis::analyze_pipeline_health(cap);
             if health.turns_with_feedback > 0 {
-                s.push_str(&format!(
-                    "    pipeline: turns={} cache={:.0}% compactions={}\n",
-                    health.turns_with_feedback,
-                    health.avg_cache_hit_ratio * 100.0,
-                    health.compaction_count,
-                ));
+                if let Some(stable_prefix_coverage) = health.stable_prefix_cache_coverage {
+                    s.push_str(&format!(
+                        "    pipeline: turns={} cache-read-share={:.0}% stable-prefix={:.0}% compactions={}\n",
+                        health.turns_with_feedback,
+                        health.avg_cache_hit_ratio * 100.0,
+                        stable_prefix_coverage * 100.0,
+                        health.compaction_count,
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "    pipeline: turns={} cache-read-share={:.0}% compactions={}\n",
+                        health.turns_with_feedback,
+                        health.avg_cache_hit_ratio * 100.0,
+                        health.compaction_count,
+                    ));
+                }
                 if health.cascade_detected {
                     s.push_str("    pipeline: ⚠ compaction cascade detected\n");
                 }

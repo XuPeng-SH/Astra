@@ -2,8 +2,8 @@ name: pipeline_cache_hit_multi_turn
 description: |
   **What**: 4-turn session with identical-shape prompts to measure prompt-cache hits
   accumulated across turns. Turn 1 creates cache; turns 2–4 must hit it.
-  **Tests**: Prompt-cache stability — the system prompt prefix and tool schemas must
-  be byte-identical across turns in the same session so Bedrock/Anthropic cache hits.
+  **Tests**: Inclusive prompt-cache cost across turns, including auxiliary requests.
+  This cost SLO is distinct from exact provider-final prefix continuity.
   **Why**: Cache hit ratio is the primary value prop of the context pipeline. A 0%
   hit ratio means stable content is being rebuilt every turn (HashMap drift, dynamic
   tool ordering, incompatible cache_control markers, etc.) and we're paying full
@@ -14,11 +14,14 @@ description: |
       cross-session cache is warm; 25k caps persistent ~5-6k/turn rebuilds)
     - token-weighted provider cache-read ratio after the first warm-up turn ≥ 98%
     - no tool calls; a tool-surface or ambient-context detour invalidates this measurement
-  **Fail means**: cache prefix broken every turn (non-deterministic skill enum,
-  `ttl: 1h` marker Bedrock silently drops, Session-scoped tool-dependent sections,
-  or any byte drift in the pinned prefix).
-  **Catches**: 100% → 60% hit-rate regressions. Tighter than the original
-  (min_read=8000, no max) threshold which would pass even at 0%.
+  **Fail means**: the inclusive cache-cost SLO was not met. Inspect primary and
+  auxiliary usage separately, provider-final system/tool identities, and conversation
+  prefix continuity before assigning a cause. New input, cache block boundaries,
+  auxiliary classification, and bounded repairs can lower this ratio without
+  rewriting the primary prefix. Do not exclude auxiliary cost or pad the prompt
+  to make the ratio pass; retain absolute fresh/input/output token measurements.
+  **Catches**: cache-cost regressions that a cumulative cache-read minimum alone
+  cannot detect. A pass does not by itself prove prefix continuity or tool behavior.
 prompt: |
   Reply with the single word ACK. Do not call any tools.
 capability: custom:cache

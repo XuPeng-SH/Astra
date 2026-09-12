@@ -55,6 +55,8 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub workspace_observation_quarantine:
         Option<&'a astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1>,
     pub max_turns: usize,
+    pub run_execution_budget: Option<astra_pipeline::step_protocol::RunExecutionBudget>,
+    pub run_execution_control: Option<astra_pipeline::step_protocol::RunExecutionControl>,
     pub recent_tools: &'a [String],
     pub last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
     pub interaction_mode: TurnInteractionMode,
@@ -97,6 +99,8 @@ pub fn apply_agentic_post_tool_policy(
         current_session_id,
         workspace_observation_quarantine,
         max_turns,
+        run_execution_budget,
+        run_execution_control,
         recent_tools,
         last_heavy_checkpoint,
         interaction_mode,
@@ -196,6 +200,8 @@ pub fn apply_agentic_post_tool_policy(
                 let cp = StepCheckpoint::Heavy(Box::new(heavy));
                 let mut cp = cp;
                 if let StepCheckpoint::Heavy(heavy) = &mut cp {
+                    heavy.run_execution_budget = run_execution_budget;
+                    heavy.run_execution_control = run_execution_control;
                     heavy.workspace_observation_quarantine =
                         workspace_observation_quarantine.cloned();
                 }
@@ -306,6 +312,8 @@ mod tests {
         let mut turn_guard = TurnGuard::new();
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -349,6 +357,8 @@ mod tests {
 
         for turn_index in 0..64 {
             let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+                run_execution_budget: None,
+                run_execution_control: None,
                 turn_index,
                 messages: &mut messages,
                 turn_guard: &mut turn_guard,
@@ -442,6 +452,8 @@ mod tests {
         turn_guard.record_tool_result("read_file", "fn main() {}");
         turn_guard.record_tool_result("read_file", "fn main() {}");
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -507,8 +519,28 @@ mod tests {
             astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
                 Some("warning-call".into()),
             );
+        let budget = astra_pipeline::step_protocol::RunExecutionBudget::V1 {
+            run_id: "test-run".into(),
+            producer_owner_generation: 3,
+            charged_iterations: 10,
+            granted_iteration_boundary: 20,
+            remaining_iterations: 10,
+            effective_hard_turn_limit: None,
+        };
 
+        let control = astra_pipeline::step_protocol::RunExecutionControl::V2 {
+            hook_obligations: astra_turn_types::StopHookObligations::default(),
+            completion_settlement: astra_turn_types::CompletionSettlementState {
+                work_settlement_only: true,
+                textless_response_retries: 1,
+                ..Default::default()
+            },
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        };
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: Some(budget.clone()),
+            run_execution_control: Some(control.clone()),
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -539,6 +571,8 @@ mod tests {
             heavy.budget_remaining_rounds, 10,
             "behavioral warning must not apply hidden budget penalties"
         );
+        assert_eq!(heavy.run_execution_budget, Some(budget));
+        assert_eq!(heavy.run_execution_control, Some(control));
         assert_eq!(
             heavy.workspace_observation_quarantine,
             Some(quarantine),
@@ -572,6 +606,8 @@ mod tests {
         turn_guard.record_cache_hit("read_file");
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -630,6 +666,8 @@ mod tests {
         turn_guard.record_tool_calls(&tool_calls);
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -695,6 +733,8 @@ mod tests {
         turn_guard.record_tool_calls(&tool_calls);
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
@@ -747,6 +787,8 @@ mod tests {
         }
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
             turn_index: 0,
             messages: &mut messages,
             turn_guard: &mut turn_guard,

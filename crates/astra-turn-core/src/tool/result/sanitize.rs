@@ -134,6 +134,14 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
         return content.to_string();
     }
 
+    if tool_name == "introspect"
+        && let Ok(report) = serde_json::from_str::<crate::introspect::IntrospectReport>(content)
+        && report.tool == "introspect"
+        && report.schema_version == crate::introspect::INTROSPECT_REPORT_SCHEMA_VERSION
+    {
+        return report.model_projection(max_chars);
+    }
+
     // An edit-capable source marker is an atomic model→tool contract.  The
     // semantic compressor's line/JSON elision is intentionally unaware of
     // that contract and can split a marker before the final boundary.  Keep
@@ -198,7 +206,7 @@ fn head_tail_truncate_fallback(tool_name: &str, content: &str, max_chars: usize)
     let head = &content[..head_end];
     let tail = &content[tail_start..];
     let recovery = if tool_name == "introspect" {
-        "request a narrower typed facet/depth on introspect to inspect omitted observation"
+        "inspect a narrower facet/depth only for needed evidence; another introspect call creates a new snapshot"
     } else {
         "use start_line/end_line to read specific sections"
     };
@@ -367,6 +375,66 @@ mod tests {
         assert!(
             out.contains("truncated") || out.contains("elided"),
             "folded output should explain truncation"
+        );
+    }
+
+    #[test]
+    fn introspection_projection_leaves_small_reports_and_artifact_windows_unchanged() {
+        let report = crate::introspect::build_introspect_report(
+            &crate::introspect::IntrospectSnapshot::default(),
+            &crate::introspect::IntrospectRequest::default(),
+        );
+        let raw = serde_json::to_string(&report).unwrap();
+        assert!(raw.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert_eq!(truncate_tool_result_for_model("introspect", &raw), raw);
+
+        let artifact = json!({"artifact": "artifact://session/tool-result/test", "offset": 0, "content": "window", "has_more": false}).to_string();
+        assert_eq!(
+            truncate_tool_result_for_model("introspect", &artifact),
+            artifact
+        );
+    }
+
+    #[test]
+    fn oversized_introspection_preserves_structured_observation_boundary() {
+        use crate::introspect::{
+            CapacityProviderCoverageEntry, IntrospectRequest, IntrospectSnapshot,
+            build_introspect_report,
+        };
+
+        let snapshot = IntrospectSnapshot {
+            capacity_provider_coverage: (0..60)
+                .map(|index| {
+                    CapacityProviderCoverageEntry::ready(
+                        astra_runtime_env::CapacityProviderType::ServerService,
+                        format!("provider-{index}"),
+                        vec!["bounded-capability".repeat(20)],
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            depth: astra_core::ObservationDepth::Diagnostic,
+            ..Default::default()
+        };
+        let report = build_introspect_report(&snapshot, &request);
+        let raw = serde_json::to_string(&report).expect("serialize report");
+        assert!(raw.chars().count() > INTROSPECT_MODEL_RESULT_CHARS);
+        let output = tool_result_content_for_model("introspect", &raw);
+        let projected: Value = serde_json::from_str(&output)
+            .expect("bounded introspection must remain structured JSON");
+        assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert_eq!(projected["summary"], report.summary);
+        assert_eq!(projected["projection_budget"]["truncated"], true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_result_content_for_model_unbounded(
+                "introspect",
+                &raw
+            ))
+            .unwrap(),
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            "durable source must remain complete"
         );
     }
 

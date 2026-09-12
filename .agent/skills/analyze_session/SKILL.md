@@ -22,12 +22,12 @@ allowed_tools:
 # Analyze Session
 
 Use the smallest authoritative evidence path that answers the question. For the
-active session, structured observation is primary: call `introspect` once with
-`facet=overview`, `depth=diagnostic`, and `horizon=recent`, then call `reflect`
-at most once with `topic=overview`, `facet=overview`, `depth=diagnostic`,
-`horizon=session`, and a concrete causal question. These overview calls are
-composite snapshots; do not scan individual facets unless their result identifies
-a specific evidence gap.
+active session, start with a summary `introspect` overview (`hint` for a quick
+check). Use `reflect` with a concrete causal question only when persisted
+evidence is needed; its summary overview is the default. Reuse observations
+already obtained within the relevant scope. Expand depth or facets only for a
+specific evidence gap or an explicitly requested deep audit; discover the full
+tool contract before using fields absent from the resident schema.
 
 Use `astra journal digest` for a named past/offline session, exact aggregate
 metrics, durable-event ordering, or a concrete gap reported by structured
@@ -83,6 +83,10 @@ the message/tool/prompt snapshot it contains.
 For structured observation, distinguish live `introspect` facts from persisted
 `reflect` evidence and cite that boundary in the answer. Do not turn the user's
 request for a retrospective into an exhaustive telemetry inventory.
+
+Snapshots exclude later calls, and completed-turn aggregates can exclude the
+ongoing turn. State the observed scope; a zero in that scope does not prove
+absence elsewhere. Account separately for diagnostic calls made afterward.
 
 When a digest is required, trust its stable schema:
 
@@ -166,6 +170,11 @@ Use only when the digest does not answer the question.
 | Tool surface implementation    | `crates/runtime/src/tool_registry/`, `crates/runtime/src/capabilities.rs` |
 
 ## Output Contract
+
+For routine checks, give a brief conclusion, supporting observation, and any
+remaining uncertainty. Use the detailed format below only for a substantive
+incident; include digest metrics and executable provenance only when relevant
+and actually obtained. Do not acquire extra evidence just to fill a template.
 
 ```text
 Findings:

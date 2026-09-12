@@ -146,7 +146,8 @@ impl SkillContext {
 
 /// Record of a skill invoked during this session.
 /// Used for same-session dedup and post-compaction re-injection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvokedSkill {
     /// Canonical skill name.
     pub name: String,
@@ -172,6 +173,7 @@ pub struct InvokedSkill {
     /// treated as a hard stop signal, not a passive dedup.
     pub reentry_count: u32,
     /// Closed topology authority copied from trusted skill manifest metadata.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub execution_topology: Option<astra_services::WorkExecutionTopology>,
 }
 
@@ -672,9 +674,11 @@ pub fn skill_tool_schema_v2() -> Value {
             "name": SKILL_TOOL_NAME,
             "description":
                 "Execute a skill from the <available_skills> system listing. \
-                 When the user's request matches an available skill, call this \
+                 Call it only when the user's request matches a skill whose \
+                 canonical name or alias appears literally in that listing; \
+                 never invent or infer a skill name. When it matches, call this \
                  tool before any other tool or substantive response. \
-                 `skill_name` is the canonical name or alias. `task` is optional \
+                 `skill_name` is the listed canonical name or alias. `task` is optional \
                  extra context; omit to use the current conversation. On seeing \
                  `<skill-loaded name=\"...\"/>` in a tool result, follow that \
                  skill's instructions — do not re-invoke it.",

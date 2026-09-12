@@ -600,6 +600,24 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 stdout, stderr, machine,
             ) {
                 (Ok(stdout), Ok(stderr), Ok(machine)) => (stdout, stderr, machine),
+                (Ok(stdout), Ok(stderr), Err(error)) => {
+                    // Keep terminal diagnostics, but never use an unbound
+                    // identity to load a journal or certify task success.
+                    let mut out = parse_executor_outcome(
+                        &String::from_utf8_lossy(&stdout),
+                        model,
+                        status.code().unwrap_or(-1),
+                    );
+                    out.exit_code = -1;
+                    out.session_id = None;
+                    out.run_id = None;
+                    out.stderr = format!(
+                        "{PROTOCOL_ERROR_MARKER} invalid machine events: {error}\n{}",
+                        String::from_utf8_lossy(&stderr)
+                    );
+                    out.duration_ms = start.elapsed().as_millis() as u64;
+                    return out;
+                }
                 (stdout_error, stderr_error, machine_error) => {
                     return RunOutcome {
                         model: model.into(),
@@ -1232,6 +1250,43 @@ mod tests {
         assert!(
             !follow_up_args.lines().any(|arg| arg == "--no-resume"),
             "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_machine_evidence_preserves_terminal_diagnostics_but_not_identity() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("fake-astra");
+        crate::test_support::write_executable_shim(
+            &shim,
+            r#"#!/bin/sh
+next_is_events=0
+for arg in "$@"; do
+  if [ "$next_is_events" = 1 ]; then : > "$arg"; next_is_events=0;
+  elif [ "$arg" = --stream-events ]; then next_is_events=1; fi
+done
+printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":"550e8400-e29b-41d4-a716-446655440000","text":"ACK","final_state":"completed","interruption_kind":null,"tool_result_class_counts":{},"prompt_tokens":448,"fresh_prompt_tokens":448,"cache":{"hit":true,"read_tokens":8320,"creation_tokens":0},"completion_tokens":31,"llm_rounds":1,"tool_calls_count":0,"tools_used":[],"persistence_error":null,"exit_code":0,"success":true,"error_kind":null}'
+"#,
+        )
+        .unwrap();
+        let out = AstraCliExecutor::new(RunnerConfig::new(shim))
+            .execute(&simple_case(), "m")
+            .await;
+        assert_eq!(out.exit_code, -1);
+        assert_eq!(out.text, "ACK");
+        assert_eq!(out.prompt_tokens, 448);
+        assert_eq!(out.cached_input_tokens, 8320);
+        assert_eq!(out.completion_tokens, 31);
+        assert_eq!(out.final_state.as_deref(), Some("completed"));
+        assert!(out.session_id.is_none());
+        assert!(out.run_id.is_none());
+        assert!(out.stderr.starts_with(PROTOCOL_ERROR_MARKER));
+        assert_eq!(
+            crate::classify::classify(&out, &[]),
+            crate::classify::FailureClass::BehaviorContractViolation
         );
     }
 

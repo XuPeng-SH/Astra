@@ -63,11 +63,23 @@ pub(super) async fn redeem(
     port: u16,
     state: &str,
 ) -> Result<String, String> {
-    super::validate_login_website(website)?;
-    let client = reqwest::Client::builder()
+    let website_url = super::validate_login_website(website)?;
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(15));
+    // A proxy cannot route a process-local test/dev website. Match the
+    // login-URL security boundary: local HTTP endpoints are direct, while
+    // remote HTTPS endpoints retain the configured proxy behavior.
+    let builder = if website_url
+        .host_str()
+        .is_some_and(super::login_website_host_is_loopback)
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    let client = builder
         .build()
         .map_err(|_| "Could not initialize login code exchange")?;
     let mut response = client

@@ -702,14 +702,16 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
     .to_string();
     assert!(
         store
-            .save_checkpoint(
-                &owner_user_id,
-                &owner_session_id,
-                &run_id,
-                &owner_checkpoint,
-            )
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &owner_user_id,
+                expected_session_id: &owner_session_id,
+                run_id: &run_id,
+                checkpoint_json: &owner_checkpoint,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane
+            })
             .await
-            .expect("save owner checkpoint"),
+            .expect("save owner checkpoint")
+            .is_some(),
         "owner checkpoint save must ignore foreign idempotency row"
     );
 

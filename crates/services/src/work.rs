@@ -32,6 +32,9 @@ mod criteria_proposal_repository;
 mod criteria_read_repository;
 mod delivery_selection;
 mod delivery_selection_repository;
+mod establishment_operation;
+mod establishment_plan;
+mod establishment_plan_repository;
 mod event_read_repository;
 mod events;
 mod events_repository;
@@ -49,6 +52,7 @@ mod plan_context;
 mod plan_context_repository;
 mod proposal;
 mod proposal_acceptance_repository;
+mod proposal_identity;
 mod proposal_queue;
 mod proposal_repository;
 mod repository;
@@ -128,6 +132,19 @@ pub use delivery_selection::{
     WorkDeliverySelectionBasisResource, WorkDeliverySelectionOutcome, WorkDeliverySelectionReceipt,
     WorkDeliverySelectionSubject,
 };
+pub(crate) use establishment_operation::cancel_pending_for_new_turn_tx;
+pub use establishment_operation::{
+    DatabaseWorkEstablishmentService, WORK_ESTABLISHMENT_OPERATION_SCHEMA_VERSION,
+    WorkEstablishmentActivation, WorkEstablishmentAdmission, WorkEstablishmentAdmissionDisposition,
+    WorkEstablishmentError, WorkEstablishmentOperation, WorkEstablishmentPhase,
+    WorkEstablishmentRequest, WorkEstablishmentState,
+};
+pub use establishment_plan::{
+    WorkEstablishmentDependency, WorkEstablishmentItem, WorkEstablishmentItemRevision,
+    WorkEstablishmentMutationGroup, WorkEstablishmentPlan,
+    compile_initial_work_establishment_graph, compile_work_establishment_plan,
+    decode_work_establishment_payload,
+};
 pub use events::{
     WORK_EVENT_PAGE_MAX_ITEMS, WorkEventCoverage, WorkEventKind, WorkEventPage, WorkEventPageLimit,
     WorkEventQuery, WorkEventRecord, WorkEventSeq,
@@ -192,6 +209,7 @@ pub use proposal::{
     WorkPlanProposalResolution, WorkPlanProposalViolation, WorkProposalId, WorkProposalKind,
     WorkProposalSourceKind, WorkProposalStatus,
 };
+pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
@@ -1295,6 +1313,10 @@ pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL: &str =
 /// task, plan, checklist, transcript, and reflection stores are deliberately
 /// absent: they are not inputs to a fresh WorkRepository.
 pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
+    (
+        "work_establishment_operations",
+        establishment_operation::WORK_ESTABLISHMENT_OPERATIONS_CREATE_SQL,
+    ),
     ("works", WORKS_CREATE_SQL),
     ("work_goal_revisions", WORK_GOAL_REVISIONS_CREATE_SQL),
     ("work_criteria", WORK_CRITERIA_CREATE_SQL),

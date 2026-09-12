@@ -22,6 +22,7 @@ pub use context::{
 };
 pub(crate) use context::{
     MODEL_FRAMING_TOKENS, PER_MESSAGE_OVERHEAD, estimate_single_message_tokens,
+    estimate_wire_input_tokens, measured_prompt_tokens_from_manifest,
 };
 pub use system::{
     CacheScope, DeferredToolsPromptBlock, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
@@ -38,7 +39,10 @@ pub use system::{
     parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
     tool_round_guidance, tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
-pub(crate) use system::{self_model_section, tool_conditional_section};
+pub(crate) use system::{
+    DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION, DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION,
+    tool_conditional_section,
+};
 
 #[cfg(test)]
 mod tests {
@@ -247,8 +251,8 @@ mod tests {
             "should include plan execution section"
         );
         assert!(
-            p.contains("acceptance criteria"),
-            "should mention acceptance criteria"
+            p.contains("Executable acceptance"),
+            "should mention executable acceptance"
         );
         assert!(p.contains("Don't skip ahead"), "should warn about ordering");
     }

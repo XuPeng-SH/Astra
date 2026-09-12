@@ -132,19 +132,19 @@ pub(crate) async fn judge_turn_intent_with_llm(
             // parser). Rejections are the model refusing to answer and are
             // expected to be rare but non-fatal.
             match &error {
-                TurnIntentJudgeError::Transport(detail) => tracing::warn!(
+                TurnIntentJudgeError::Inference(detail) => tracing::warn!(
                     target: "astra::turn_intent",
                     operation = "turn_intent.judge",
                     source = "llm_judge",
                     status = "error",
-                    error_kind = "transport",
+                    error_kind = detail.kind.as_str(),
                     duration_ms,
                     turn_count = ctx.turn_count,
                     has_prior_assistant_turn = ctx.has_prior_assistant_turn,
                     detail = %detail,
-                    "turn intent judge transport failure; proceeding without explicit turn intent"
+                    "turn intent judge inference failure; proceeding without explicit turn intent"
                 ),
-                TurnIntentJudgeError::Malformed { raw } => tracing::warn!(
+                TurnIntentJudgeError::Malformed { raw, detail } => tracing::warn!(
                     target: "astra::turn_intent",
                     operation = "turn_intent.judge",
                     source = "llm_judge",
@@ -154,6 +154,7 @@ pub(crate) async fn judge_turn_intent_with_llm(
                     turn_count = ctx.turn_count,
                     has_prior_assistant_turn = ctx.has_prior_assistant_turn,
                     raw = %raw,
+                    detail = %detail,
                     "turn intent judge returned malformed response; proceeding without explicit turn intent"
                 ),
                 TurnIntentJudgeError::Rejected(detail) => tracing::info!(
@@ -356,7 +357,9 @@ mod tests {
     async fn judge_transport_failure_returns_none() {
         let message = "please inspect the current changes";
 
-        let judge = FixedJudge::err(TurnIntentJudgeError::Transport("connection reset".into()));
+        let judge = FixedJudge::err(TurnIntentJudgeError::Inference(
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::Network, "connection reset"),
+        ));
         assert_eq!(
             judge_turn_intent_with_llm(&judge, &context(message, 1, false)).await,
             None
@@ -368,6 +371,7 @@ mod tests {
         let message = "why is this test failing?";
         let judge = FixedJudge::err(TurnIntentJudgeError::Malformed {
             raw: "garbled".into(),
+            detail: "json_syntax: expected value".into(),
         });
         assert_eq!(
             judge_turn_intent_with_llm(&judge, &context(message, 2, true)).await,

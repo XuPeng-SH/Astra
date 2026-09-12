@@ -702,65 +702,30 @@ impl SemanticDedup {
         result
     }
 
-    /// Run [`Self::check_and_record`] and append a user-visible hint when output matches a prior call.
-    pub fn append_near_duplicate_hint_if_any(
+    /// Record a raw observation and return presentation separately, so callers
+    /// can preserve structured tool output and persist guidance independently.
+    pub fn near_duplicate_hint_for_observation_with_generation(
         &mut self,
-        result_str: &mut String,
-        tool_name: &str,
-        args: &Value,
-        turn_index: usize,
-    ) {
-        self.append_near_duplicate_hint_if_any_with_generation(
-            result_str, tool_name, args, turn_index, 0,
-        );
-    }
-
-    /// Like [`Self::append_near_duplicate_hint_if_any`], scoped to an external
-    /// observation generation.
-    pub fn append_near_duplicate_hint_if_any_with_generation(
-        &mut self,
-        result_str: &mut String,
-        tool_name: &str,
-        args: &Value,
-        turn_index: usize,
-        context_generation: u64,
-    ) {
-        let observation = result_str.clone();
-        self.append_near_duplicate_hint_for_observation_with_generation(
-            result_str,
-            &observation,
-            tool_name,
-            args,
-            turn_index,
-            context_generation,
-        );
-    }
-
-    /// Record and compare a raw observation while appending any duplicate hint
-    /// to a separately transformed, model-visible result.
-    pub fn append_near_duplicate_hint_for_observation_with_generation(
-        &mut self,
-        result_str: &mut String,
         observation: &str,
         tool_name: &str,
         args: &Value,
         turn_index: usize,
         context_generation: u64,
-    ) {
-        if let Some((prev_turn, reason)) = self.check_and_record_with_generation(
+    ) -> Option<String> {
+        self.check_and_record_with_generation(
             tool_name,
             args,
             observation,
             turn_index,
             context_generation,
-        ) {
-            result_str.push_str(&format!(
-                "\n\n⚠️ DUPLICATE HINT: This {tool_name} output matches turn {} ({reason}). \
+        ).map(|(prev_turn, reason)| {
+            format!(
+                "⚠️ DUPLICATE HINT: This {tool_name} output matches turn {} ({reason}). \
                  If this is the same data, use the earlier result. \
                  If you intentionally changed arguments or need fresher data, this hint is informational.",
                 prev_turn + 1,
-            ));
-        }
+            )
+        })
     }
     pub fn output_log_size(&self) -> usize {
         self.output_log.len()
@@ -1357,18 +1322,30 @@ mod tests {
     }
 
     #[test]
-    fn append_near_duplicate_hint_inserts_on_second_read_file() {
+    fn duplicate_hint_is_separate_from_second_read_file_result() {
         let mut tracker = SemanticDedup::new(0.75);
         let args = json!({"path": "src/main.rs"});
-        let mut out1 = "fn main() {}".to_string();
-        tracker.append_near_duplicate_hint_if_any(&mut out1, "read_file", &args, 1);
+        let observation = "fn main() {}";
         assert!(
-            !out1.contains("DUPLICATE HINT"),
-            "first recording should not append hint"
+            tracker
+                .near_duplicate_hint_for_observation_with_generation(
+                    observation,
+                    "read_file",
+                    &args,
+                    1,
+                    0,
+                )
+                .is_none()
         );
-
-        let mut out2 = "fn main() {}".to_string();
-        tracker.append_near_duplicate_hint_if_any(&mut out2, "read_file", &args, 2);
+        let out2 = tracker
+            .near_duplicate_hint_for_observation_with_generation(
+                observation,
+                "read_file",
+                &args,
+                2,
+                0,
+            )
+            .expect("repeated observation has guidance");
         assert!(out2.contains("DUPLICATE HINT"));
         assert!(!out2.contains("Do NOT call this tool again"));
         assert!(out2.contains("read_file"));
@@ -1380,27 +1357,23 @@ mod tests {
         let args = json!({"path": "src/main.rs"});
         let observation = "raw provider observation that is long enough for reuse";
 
-        let mut first_visible = "redacted presentation one".to_string();
-        tracker.append_near_duplicate_hint_for_observation_with_generation(
-            &mut first_visible,
+        let first_hint = tracker.near_duplicate_hint_for_observation_with_generation(
             observation,
             "read_file",
             &args,
             1,
             7,
         );
-        assert!(!first_visible.contains("DUPLICATE HINT"));
+        assert!(first_hint.is_none());
 
-        let mut second_visible = "redacted presentation two".to_string();
-        tracker.append_near_duplicate_hint_for_observation_with_generation(
-            &mut second_visible,
+        let second_hint = tracker.near_duplicate_hint_for_observation_with_generation(
             observation,
             "read_file",
             &args,
             2,
             7,
         );
-        assert!(second_visible.contains("DUPLICATE HINT"));
+        assert!(second_hint.unwrap().contains("DUPLICATE HINT"));
 
         let (_, reused) = tracker
             .pre_check_block_with_generation("read_file", &args, 3, 7)
@@ -1477,13 +1450,23 @@ mod tests {
             "test must reproduce the high-similarity same-file range case"
         );
 
-        let mut first = output1.to_string();
-        tracker.append_near_duplicate_hint_if_any(&mut first, "read_file", &range1, 1);
-        let mut second = output2.to_string();
-        tracker.append_near_duplicate_hint_if_any(&mut second, "read_file", &range2, 2);
+        tracker.near_duplicate_hint_for_observation_with_generation(
+            output1,
+            "read_file",
+            &range1,
+            1,
+            0,
+        );
+        let second = tracker.near_duplicate_hint_for_observation_with_generation(
+            output2,
+            "read_file",
+            &range2,
+            2,
+            0,
+        );
         assert!(
-            !second.contains("DUPLICATE HINT") && !second.contains("DUPLICATE DETECTED"),
-            "different read_file ranges must not receive duplicate guidance: {second}"
+            second.is_none(),
+            "different read_file ranges must not receive duplicate guidance: {second:?}"
         );
     }
 

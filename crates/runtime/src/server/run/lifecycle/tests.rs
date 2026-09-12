@@ -36,9 +36,8 @@ fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
         state.interruption.as_ref().map(|record| record.kind),
         Some(InterruptionKind::ExecutionIncomplete)
     );
-    let preserve_execution_scratch =
-        should_preserve_execution_scratch(&outcome, state.interruption.is_some());
-    assert!(preserve_execution_scratch);
+    let allow_empty_delta = should_allow_empty_delta(&outcome, state.interruption.is_some());
+    assert!(allow_empty_delta);
     let messages = vec![
         json!({"role":"user","content":"run the tool"}),
         json!({
@@ -52,10 +51,9 @@ fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
         }),
         json!({"role":"tool","tool_call_id":"call-open-ledger","content":"partial"}),
     ];
-    let (_, segments) =
-        canonical_commit_delta(&[], false, &messages, None, preserve_execution_scratch)
-            .expect("resumable canonical delta")
-            .expect("resumable tool frames must remain committable");
+    let (_, segments) = canonical_commit_delta(&[], false, &messages, None, allow_empty_delta)
+        .expect("resumable canonical delta")
+        .expect("resumable tool frames must remain committable");
     assert!(
         segments
             .iter()
@@ -160,11 +158,12 @@ fn active_personal_skill_is_installed_as_exact_runtime_content() {
 
     let invoked = state
         .skills
+        .execution
         .invoked
         .get("review-exact")
         .expect("active personal skill must be in runtime prompt attachments");
     assert_eq!(invoked.content, "EXACT PERSONAL SKILL CONTENT");
-    assert!(state.skills.pinned.contains("review-exact"));
+    assert!(state.skills.execution.pinned.contains("review-exact"));
 }
 
 #[test]
@@ -212,12 +211,449 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
 use uuid::Uuid;
 
-static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+// Schema bootstrap is process-wide; live connections belong to each test's
+// Tokio runtime and must not survive into another test's runtime.
+static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<MatrixOneSettings> =
+    tokio::sync::OnceCell::const_new();
 const DURABLE_EVENT_PRESSURE_OPT_IN: &str = "ASTRA_DURABLE_EVENT_PRESSURE_PROBE";
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn session_continuation_restores_paused_primary_attempt_before_model_execution() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Direct).await;
+}
+
+#[tokio::test]
+async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
+    for mode in [
+        RunStartPersistenceMode::Insert,
+        RunStartPersistenceMode::ClaimOrReplay,
+    ] {
+        let service = test_service();
+        let mut request = test_request("Persist restrictions, without executing a model.");
+        request.model = None;
+        request.resolved_model_selection = None;
+        request.admitted_model_execution = None;
+        let mut request = service
+            .prepare_chat_request("user-1", request)
+            .await
+            .unwrap();
+        request.allow_tools = Some(vec!["introspect".into()]);
+        request.enabled_tools = Some(Vec::new());
+        request.allow_skills = None;
+        request.allow_skill_sources = Some(Vec::new());
+        request.execution_budget = Some(astra_services::runs::ExecutionBudget {
+            initial_turns: Some(50),
+            hard_turn_limit: Some(100),
+        });
+        request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+            remaining_seconds: 600,
+        });
+        request.admitted_execution_deadline = Some(
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                request.execution_time_budget.unwrap(),
+                1_000,
+            )
+            .unwrap(),
+        );
+        request.forward_headers.insert(
+            "authorization".into(),
+            "reconstruction-secret-sentinel".into(),
+        );
+        let mut missing_anchor = request.clone();
+        missing_anchor.admitted_execution_deadline = None;
+        assert!(
+            service
+                .persist_run_start(
+                    "missing-anchor-run",
+                    "user-1",
+                    "restriction-session",
+                    &missing_anchor,
+                    None,
+                    None,
+                    None,
+                    None,
+                    mode,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .run_engine
+                .load_run("user-1", "missing-anchor-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        service
+            .persist_run_start(
+                "restriction-run",
+                "user-1",
+                "restriction-session",
+                &request,
+                None,
+                None,
+                None,
+                None,
+                mode,
+            )
+            .await
+            .expect("persist through actual admission boundary");
+        let durable = service
+            .run_engine
+            .load_run("user-1", "restriction-run")
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = durable
+            .execution_restrictions()
+            .unwrap()
+            .expect("typed restriction reader");
+        assert_eq!(decoded.execution_deadline_unix_ms(), Some(601_000));
+        if mode == RunStartPersistenceMode::ClaimOrReplay {
+            let mut replay = request.clone();
+            replay.admitted_execution_deadline = Some(
+                astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                    replay.execution_time_budget.unwrap(),
+                    10_000,
+                )
+                .unwrap(),
+            );
+            let claim = service
+                .persist_run_start(
+                    "restriction-run",
+                    "user-1",
+                    "restriction-session",
+                    &replay,
+                    None,
+                    None,
+                    None,
+                    None,
+                    mode,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(claim, DurableRunStartClaim::Existing { .. }));
+            let replayed = service
+                .run_engine
+                .load_run("user-1", "restriction-run")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                replayed.execution_restrictions().unwrap(),
+                Some(decoded.clone())
+            );
+            assert_eq!(
+                replayed
+                    .events
+                    .iter()
+                    .filter(|event| event["event_type"] == "run_started")
+                    .count(),
+                1
+            );
+        }
+        let starts = durable
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        let restrictions = &starts[0]["data"]["execution_restrictions"];
+        assert!(
+            restrictions.is_object(),
+            "admission lost original execution restrictions"
+        );
+        assert_eq!(restrictions["allow_tools"], json!(["introspect"]));
+        assert_eq!(restrictions["enabled_tools"], json!([]));
+        assert_eq!(restrictions["allow_skills"], Value::Null);
+        assert_eq!(restrictions["allow_skill_sources"], json!([]));
+        assert_eq!(
+            restrictions["execution_budget"],
+            json!({"initial_turns":50,"hard_turn_limit":100})
+        );
+        assert!(
+            restrictions["execution_deadline_unix_ms"].is_u64(),
+            "wall-clock deadline must survive restart"
+        );
+        assert!(
+            !serde_json::to_string(&durable.events)
+                .unwrap()
+                .contains("reconstruction-secret-sentinel")
+        );
+        let mut unknown = durable.clone();
+        for field in [
+            "allow_tools",
+            "enabled_tools",
+            "allow_skills",
+            "allow_skill_sources",
+            "execution_budget",
+            "execution_deadline_unix_ms",
+        ] {
+            let mut incomplete = durable.clone();
+            incomplete.events[0]["data"]["execution_restrictions"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                incomplete.execution_restrictions().is_err(),
+                "missing field {field} must not become unrestricted"
+            );
+        }
+        unknown.events[0]["data"]["execution_restrictions"]["version"] = json!("future");
+        assert!(unknown.execution_restrictions().is_err());
+        let mut missing = durable;
+        missing.events[0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_restrictions");
+        assert_eq!(missing.execution_restrictions().unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn run_admission_records_trusted_catalog_source_without_execution_material() {
+    let service = test_service();
+    let mut request = test_request("Preserve the admitted source.");
+    request.model = None;
+    request.resolved_model_selection = None;
+    request.admitted_model_execution = None;
+    let request = service.prepare_chat_request("u1", request).await.unwrap();
+    let offering = request
+        .admitted_model_execution
+        .as_ref()
+        .unwrap()
+        .offering_id
+        .clone();
+    let mut unadmitted = request.clone();
+    unadmitted.admitted_model_execution = None;
+    assert!(
+        service
+            .persist_run_start(
+                "unadmitted-source-run",
+                "u1",
+                "source-session",
+                &unadmitted,
+                None,
+                None,
+                None,
+                None,
+                RunStartPersistenceMode::Insert,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .run_engine
+            .load_run("u1", "unadmitted-source-run")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    service
+        .persist_run_start(
+            "source-run",
+            "u1",
+            "source-session",
+            &request,
+            None,
+            None,
+            None,
+            None,
+            RunStartPersistenceMode::Insert,
+        )
+        .await
+        .unwrap();
+    drop(request);
+    let durable = service
+        .run_engine
+        .load_run("u1", "source-run")
+        .await
+        .unwrap()
+        .unwrap();
+    let started = durable
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "run_started")
+        .unwrap();
+    let source = &started["data"]["admission_source"];
+    assert_eq!(source["model_source"], "catalog_offering");
+    assert_eq!(source["capability_source"], "server_managed");
+    assert!(!source.to_string().contains("api_key"));
+    assert_eq!(offering, "model-test-model");
+    use astra_services::runs::{
+        DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
+    };
+    assert_eq!(
+        durable.admission_source().unwrap(),
+        Some(DurableAdmissionSource::V1 {
+            model_source: ModelAdmissionSource::CatalogOffering,
+            capability_source: RuntimeCapabilitySource::ServerManaged,
+        })
+    );
+    let started_index = durable
+        .events
+        .iter()
+        .position(|event| event["event_type"] == "run_started")
+        .unwrap();
+    for field in ["version", "model_source", "capability_source"] {
+        let mut incomplete = durable.clone();
+        incomplete.events[started_index]["data"]["admission_source"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(incomplete.admission_source().is_err(), "missing {field}");
+    }
+    let mut unknown = durable.clone();
+    unknown.events[started_index]["data"]["admission_source"]["version"] = json!("future");
+    assert!(unknown.admission_source().is_err());
+    let mut missing = durable;
+    missing.events[started_index]["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("admission_source");
+    assert_eq!(missing.admission_source().unwrap(), None);
+}
+
+#[test]
+fn execution_deadline_rejects_unrepresentable_budget() {
+    use astra_services::runs::{ExecutionDeadlineAuthority, ExecutionTimeBudget};
+    assert!(
+        ExecutionDeadlineAuthority::from_budget_at(
+            ExecutionTimeBudget {
+                remaining_seconds: u64::MAX
+            },
+            0
+        )
+        .is_err()
+    );
+    assert!(
+        ExecutionDeadlineAuthority::from_budget_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 1
+            },
+            u64::MAX
+        )
+        .is_err()
+    );
+    assert_eq!(
+        ExecutionDeadlineAuthority::from_budget_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 0
+            },
+            123
+        )
+        .unwrap()
+        .deadline_unix_ms,
+        123
+    );
+}
+
+#[tokio::test]
+async fn run_admission_preserves_mixed_capabilities_and_resolved_executor() {
+    for (edge, skill, expected) in [
+        (true, false, "bound_executor"),
+        (true, true, "request_scoped"),
+        (false, false, "server_managed"),
+    ] {
+        let service = test_service();
+        let mut request = test_request("Preserve all execution dependencies.");
+        request.model = None;
+        request.resolved_model_selection = None;
+        request.admitted_model_execution = None;
+        let mut request = service.prepare_chat_request("u1", request).await.unwrap();
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some("edge-original".into()),
+            display_name: None,
+            transport: None,
+            status: None,
+        });
+        if skill {
+            request.runtime_skill_binding =
+                Some(astra_services::runs::RuntimeSkillBindingRequest {
+                    id: "request-skill".into(),
+                    url: "https://runtime.invalid/skills".into(),
+                    authorization: "source-secret-sentinel".into(),
+                });
+        }
+        let executor = if edge {
+            ExecutorBinding::edge_agent(
+                "edge-resolved",
+                "Edge",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            )
+        } else {
+            ExecutorBinding::server_control_plane()
+        };
+        let bindings =
+            ExecutionBindingSnapshot::inferred(WorkspaceBinding::none(), executor.clone());
+        service
+            .persist_run_start(
+                "mixed-source-run",
+                "u1",
+                "mixed-session",
+                &request,
+                Some(&bindings),
+                None,
+                None,
+                None,
+                RunStartPersistenceMode::Insert,
+            )
+            .await
+            .unwrap();
+        let durable = service
+            .run_engine
+            .load_run("u1", "mixed-source-run")
+            .await
+            .unwrap()
+            .unwrap();
+        let data = &durable
+            .events
+            .iter()
+            .find(|event| event["event_type"] == "run_started")
+            .unwrap()["data"];
+        assert_eq!(data["admission_source"]["capability_source"], expected);
+        assert_eq!(data["executor"]["executor_id"], executor.executor_id);
+        assert!(
+            !serde_json::to_string(&durable.events)
+                .unwrap()
+                .contains("source-secret-sentinel")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn session_continuation_restores_primary_attempt_through_new_turn() {
+    exercise_primary_attempt_continuation(ContinuationFixture::NewTurn).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn session_continuation_compacts_history_before_first_provider_request() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Compacted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn session_continuation_restores_primary_attempt_after_run_recovery() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Recovered).await;
+}
+
+enum ContinuationFixture {
+    Direct,
+    NewTurn,
+    Compacted,
+    Recovered,
+}
+
+async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
+    let through_new_turn = !matches!(fixture, ContinuationFixture::Direct);
+    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
     use astra_services::work::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         InternalSessionId, NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt,
@@ -277,9 +713,9 @@ async fn session_continuation_restores_paused_primary_attempt_before_model_execu
             items: vec![WorkGraphItemChange::New(NewWorkItem {
                 item_id: item_id.clone(),
                 kind: WorkItemKind::Task,
-                objective: WorkItemText::parse("Inspect the exact PR evidence.")
+                objective: WorkItemText::parse("Read the current continuation live runtime overview.")
                     .expect("objective"),
-                expected_result: WorkItemText::parse("Produce one evidence-backed review.")
+                expected_result: WorkItemText::parse("Report depth, horizon and data coverage without claiming historical completeness.")
                     .expect("expected result"),
             })],
             edges: Vec::new(),
@@ -313,22 +749,77 @@ async fn session_continuation_restores_paused_primary_attempt_before_model_execu
         })
         .await
         .expect("begin attempt");
-    assert!(
-        attempts
-            .transition_primary_carriers_for_run(
+    if matches!(fixture, ContinuationFixture::Recovered) {
+        engine
+            .persist_checkpoint(
                 &owner,
+                &session,
                 &old_run,
-                PrimaryWorkAttemptCarrierState::Paused,
+                r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"fixture-shutdown"}"#,
             )
             .await
-            .expect("pause attempt")
-    );
-    sqlx::query("UPDATE agent_runs SET status = 'paused' WHERE user_id = ? AND run_id = ?")
-        .bind(&owner)
-        .bind(&old_run)
-        .execute(pool.get())
-        .await
-        .expect("pause old run");
+            .expect("persist graceful checkpoint");
+        // Exercise ordinary session-continuation classification for a graceful
+        // marker. Actual ownership claims are covered by recovery tests.
+        engine
+            .recover_session_continuation_for_test(&owner, &old_run)
+            .await;
+        assert_eq!(
+            engine
+                .load_run(&owner, &old_run)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PAUSED
+        );
+    } else {
+        assert!(
+            attempts
+                .transition_primary_carriers_for_run(
+                    &owner,
+                    &old_run,
+                    PrimaryWorkAttemptCarrierState::Paused,
+                )
+                .await
+                .expect("pause attempt")
+        );
+        sqlx::query("UPDATE agent_runs SET status = 'paused' WHERE user_id = ? AND run_id = ?")
+            .bind(&owner)
+            .bind(&old_run)
+            .execute(pool.get())
+            .await
+            .expect("pause old run");
+    }
+    if through_new_turn {
+        exercise_primary_continuation_entry(
+            &pool,
+            &owner,
+            &session,
+            &work,
+            &branch,
+            &attempt,
+            &old_run,
+            compact_history,
+        )
+        .await;
+        cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
+        crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
+        for table in [
+            "work_runtime_event_outbox_slots",
+            "work_runtime_event_outbox",
+            "work_item_attempts",
+        ] {
+            let remaining: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE owner_id = ?"))
+                    .bind(&owner)
+                    .fetch_one(pool.get())
+                    .await
+                    .expect("verify cleanup of durable execution artifacts");
+            assert_eq!(remaining, 0, "Work cleanup left rows in {table}");
+        }
+        return;
+    }
     engine
         .start_run(&new_run, &owner, &session)
         .await
@@ -419,6 +910,390 @@ async fn session_continuation_restores_paused_primary_attempt_before_model_execu
     crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
 }
 
+async fn exercise_primary_continuation_entry(
+    pool: &SharedPool,
+    owner: &str,
+    session: &str,
+    work: &str,
+    branch: &str,
+    attempt: &str,
+    old_run: &str,
+    compact_history: bool,
+) {
+    use axum::{Router, extract::State, response::IntoResponse, routing::post};
+    #[derive(Clone)]
+    struct Probe {
+        pool: SharedPool,
+        owner: String,
+        attempt: String,
+        observations: Arc<TokioMutex<Vec<(String, String, Option<String>)>>>,
+        settlements: Arc<AtomicUsize>,
+        tool_feedback: Arc<TokioMutex<Vec<Value>>>,
+        first_request: Arc<TokioMutex<Option<Value>>>,
+    }
+    async fn respond(
+        State(probe): State<Probe>,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        probe
+            .first_request
+            .lock()
+            .await
+            .get_or_insert_with(|| request.clone());
+        if let Some(messages) = request["messages"].as_array() {
+            *probe.tool_feedback.lock().await = messages
+                .iter()
+                .rev()
+                .filter(|message| message["role"] == "tool")
+                .take(2)
+                .cloned()
+                .collect();
+        }
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
+        ).bind(&probe.owner).bind(&probe.attempt).fetch_one(probe.pool.get()).await.expect("observe attempt at provider boundary");
+        probe.observations.lock().await.push(row.clone());
+        let can_settle = request["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "settle_work_item")
+        });
+        let evidence = request["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages.iter().rev().find(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == "continuation-overview"
+                })
+            })
+            .map(|message| {
+                let value: Value =
+                    serde_json::from_str(message["content"].as_str().expect("overview content"))
+                        .expect("structured overview");
+                assert!(
+                    value.get("error_kind").is_none(),
+                    "overview failed: {value}"
+                );
+                assert!(
+                    value["schema"] == "astra-introspect-model-projection-v1"
+                        && value["scope"]["depth"] == "summary"
+                        && value["scope"]["horizon"] == "current_turn",
+                    "overview missing scope: {value}"
+                );
+                assert!(
+                    value.get("data_coverage").is_some_and(|coverage| !coverage.is_null())
+                        || value["projection_budget"]["omitted_fields"].as_array().is_some_and(|fields| fields.iter().any(|field| field == "data_coverage")),
+                    "overview must provide coverage or explicitly disclose its omission: {value}"
+                );
+                json!({"scope":value["scope"],"data_coverage":value["data_coverage"],"projection_budget":value["projection_budget"],"source_budget":value["source_budget"]})
+            });
+        let message = if row.1 == "running" && evidence.is_none() {
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"introspect","arguments":json!({"facet":"overview","depth":"summary","format":"json"}).to_string()}}]})
+        } else if row.1 == "running" && can_settle {
+            probe
+                .settlements
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let settlement = json!({
+                "outcome": "delivered",
+                "summary": format!("Observed live overview scope: {}", evidence.expect("observed successful overview"))
+            });
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-settle","type":"function","function":{"name":"settle_work_item","arguments":serde_json::to_string(&settlement).unwrap()}}]})
+        } else {
+            json!({"role":"assistant","content":"Review delivered."})
+        };
+        let reason = if message.get("tool_calls").is_some() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        if request["stream"].as_bool() == Some(true) {
+            let mut delta = message.clone();
+            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    call["index"] = json!(index);
+                }
+            }
+            let chunk = json!({"choices":[{"index":0,"delta":delta}]});
+            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}});
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        } else {
+            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})).into_response()
+        }
+    }
+    let observations = Arc::new(TokioMutex::new(Vec::new()));
+    let settlements = Arc::new(AtomicUsize::new(0));
+    let tool_feedback = Arc::new(TokioMutex::new(Vec::new()));
+    let first_request = Arc::new(TokioMutex::new(None));
+    let probe = Probe {
+        pool: pool.clone(),
+        owner: owner.into(),
+        attempt: attempt.into(),
+        observations: observations.clone(),
+        settlements: settlements.clone(),
+        tool_feedback: tool_feedback.clone(),
+        first_request: first_request.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/chat/completions", post(respond))
+                .with_state(probe),
+        )
+        .await
+        .unwrap();
+    });
+    let _llm = TerminalTestLlm {
+        base_url: base_url.clone(),
+        requests: Arc::new(AtomicUsize::new(0)),
+        server,
+    };
+    let offering_id = format!("continuation-offering-{}", Uuid::new_v4());
+    let model_name = format!("continuation-model-{}", Uuid::new_v4());
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind(&offering_id).bind(&model_name)
+        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url)
+        .bind(r#"["text"]"#).bind(r#"["text"]"#).bind("[]").bind("{}").bind("[]").bind("{}")
+        .execute(pool.get()).await.expect("seed unique test Offering");
+    let service =
+        db_backed_test_service(pool, "continuation-entry-pod").with_model_service(Arc::new(
+            astra_services::DatabaseModelService::new(pool.settings().clone(), test_encryptor())
+                .with_pool(pool.clone()),
+        ));
+    let mut created = Vec::new();
+    if compact_history {
+        use astra_turn_core::conversation_log::{
+            SessionStateCompact,
+            manager::{CslManager, CslManagerConfig},
+        };
+        let mut history = vec![
+            json!({"role":"user","content":"Read the current continuation live runtime overview."}),
+        ];
+        for index in 0..160 {
+            let call_id = format!("prior-observation-{index}");
+            history.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(500)) } else { format!("Recent observation {index}") }}));
+        }
+        history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: owner.into(),
+            session_id: session.into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&history),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let mut manager = CslManager::new(
+            service
+                .build_csl_store(owner)
+                .expect("durable history store"),
+            session.into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        manager
+            .persist_turn(
+                1,
+                &history,
+                &SessionStateCompact {
+                    source_cursor: Some(cursor),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist complete prior history");
+    }
+    for turn in 0..2 {
+        let boundary = observations.lock().await.len();
+        let settlements_before = settlements.load(std::sync::atomic::Ordering::SeqCst);
+        let mut request = test_request("Continue the existing review; do not redo delivered work.");
+        request.model = Some(model_name.clone());
+        request.model_selection = Some(ModelSelection {
+            offering_id: offering_id.clone(),
+        });
+        request.session_id = Some(session.into());
+        request.work_binding = Some(astra_services::runs::WorkRuntimeBindingRequest {
+            work_id: work.into(),
+            branch_id: branch.into(),
+            item: None,
+        });
+        let run = service
+            .create_run(owner.into(), request)
+            .await
+            .expect("new turn entry");
+        let settled = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let durable = service
+                    .run_engine
+                    .load_run(owner, &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(
+                    durable.status.as_str(),
+                    "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+                ) {
+                    assert_eq!(durable.status, "completed", "{durable:?}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if settled.is_err() {
+            let durable = service
+                .run_engine
+                .load_run(owner, &run.run_id)
+                .await
+                .unwrap();
+            eprintln!("latest tool feedback: {:?}", tool_feedback.lock().await);
+            panic!(
+                "new turn did not settle: {durable:?}; observations={:?}; settlements={}",
+                observations.lock().await,
+                settlements.load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        let observed = observations.lock().await;
+        let first = observed
+            .get(boundary)
+            .expect("actual provider request observed");
+        if turn == 0 {
+            assert_ne!(first.0, old_run);
+            assert_eq!(first.0, run.run_id);
+            assert_eq!(first.1, "running");
+        } else {
+            assert_eq!(first.0, created[0]);
+            assert_eq!(first.1, "completed");
+            assert_eq!(first.2.as_deref(), Some("delivered"));
+            assert!(observed[boundary..].iter().all(|row| row == first));
+        }
+        assert_eq!(
+            settlements.load(std::sync::atomic::Ordering::SeqCst) - settlements_before,
+            usize::from(turn == 0)
+        );
+        drop(observed);
+        if compact_history && turn == 0 {
+            let captured = first_request.lock().await;
+            let messages = captured.as_ref().expect("first provider request")["messages"]
+                .as_array()
+                .expect("provider messages");
+            assert!(messages.len() < 160, "actual restored history must shrink");
+            let contract = messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .filter_map(|content| {
+                    // This Offering uses the default TailSuffix projection.
+                    // Decode its actual HTTP envelope, not internal provenance.
+                    let payload = content
+                        .strip_prefix("<astra-runtime-context>\n")?
+                        .strip_suffix("\n</astra-runtime-context>")?;
+                    serde_json::from_str::<Value>(payload).ok()
+                })
+                .find(|value| {
+                    value["attempt_id"] == attempt
+                        && value["schema"] == "active_work_attempt_start.v1"
+                })
+                .expect("postcompact request retains original typed attempt");
+            assert_eq!(
+                contract["objective"],
+                "Read the current continuation live runtime overview."
+            );
+            assert_eq!(
+                contract["expected_result"],
+                "Report depth, horizon and data coverage without claiming historical completeness."
+            );
+            let mut pending = HashSet::new();
+            for message in messages {
+                if message["role"] != "tool" {
+                    assert!(pending.is_empty(), "unresolved calls before next message");
+                }
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        assert!(pending.insert(call["id"].as_str().unwrap()));
+                    }
+                }
+                if message["role"] == "tool" {
+                    assert!(
+                        pending.remove(message["tool_call_id"].as_str().unwrap()),
+                        "orphaned tool result after compact"
+                    );
+                }
+            }
+            assert!(pending.is_empty(), "unresolved tool calls after compact");
+            use astra_pipeline::step_protocol::StepEventType;
+            let window =
+                astra_pipeline::step_checkpoint::FileBackedEventStore::load_recent_events_bounded(
+                    owner,
+                    session,
+                    4 * 1024 * 1024,
+                    1000,
+                )
+                .expect("compaction event journal");
+            assert!(!window.trailing_torn_line && window.events_dropped == 0);
+            let compact = window
+                .events
+                .iter()
+                .position(|event| {
+                    event.event_type == StepEventType::CompactionFired
+                        && event.payload.as_ref().is_some_and(|payload| {
+                            payload["kind"] == "resume"
+                                && payload["tokens_saved"]
+                                    .as_u64()
+                                    .is_some_and(|saved| saved > 0)
+                        })
+                })
+                .expect("actual resume compaction saved tokens");
+            let first_model = window
+                .events
+                .iter()
+                .position(|event| event.event_type == StepEventType::LlmRoundStarted)
+                .expect("model round event");
+            assert!(
+                compact < first_model,
+                "compaction must precede first provider round"
+            );
+        }
+        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
+            .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            terminal.0,
+            if turn == 0 { &run.run_id } else { &created[0] }.as_str()
+        );
+        assert_eq!(terminal.1, "completed");
+        assert_eq!(terminal.2.as_deref(), Some("delivered"));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_item_attempts WHERE owner_id = ? AND work_id = ?",
+        )
+        .bind(owner)
+        .bind(work)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        created.push(run.run_id);
+    }
+    for run in created {
+        cleanup_lifecycle_run_fixture(pool, owner, &run).await;
+    }
+    crate::server::run::cleanup_run_session_fixture(pool, owner, session).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&offering_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
 #[test]
 fn canonical_segment_packing_keeps_structured_tool_exchange_atomic() {
     let payload = "x".repeat(300 * 1024);
@@ -482,14 +1357,14 @@ fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
 }
 
 #[test]
-fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
+fn lifecycle_allows_empty_canonical_delta_only_for_unsettled_outcomes() {
     use crate::turn::agentic_loop::host::AgenticLoopOutcome;
 
-    assert!(!should_preserve_execution_scratch(
+    assert!(!should_allow_empty_delta(
         &Ok(AgenticLoopOutcome::Completed),
         false
     ));
-    assert!(should_preserve_execution_scratch(
+    assert!(should_allow_empty_delta(
         &Ok(AgenticLoopOutcome::Completed),
         true
     ));
@@ -499,9 +1374,9 @@ fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
         AgenticLoopOutcome::Delegated,
         AgenticLoopOutcome::Error("provider failed".into()),
     ] {
-        assert!(should_preserve_execution_scratch(&Ok(outcome), false));
+        assert!(should_allow_empty_delta(&Ok(outcome), false));
     }
-    assert!(should_preserve_execution_scratch(
+    assert!(should_allow_empty_delta(
         &Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::Unknown,
             "transport failed"
@@ -511,7 +1386,7 @@ fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
 }
 
 #[test]
-fn completed_turn_commits_semantics_without_transient_tool_transcript() {
+fn completed_turn_commits_tool_evidence_without_compacting_it() {
     let messages = vec![
         json!({"role": "user", "content": "inspect it"}),
         json!({
@@ -532,13 +1407,8 @@ fn completed_turn_commits_semantics_without_transient_tool_transcript() {
         .expect("completed turn delta");
 
     assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "inspect it"}),
-            json!({"role": "assistant", "content": "The invariant is broken."}),
-        ]
-    );
+    assert_eq!(packs.concat().len(), messages.len());
+    assert_eq!(packs.concat(), messages);
 }
 
 #[test]
@@ -581,7 +1451,7 @@ fn cancelled_turn_retains_complete_tool_group_for_recovery() {
 }
 
 #[test]
-fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() {
+fn an_admitted_prefix_is_not_compaction_authority_even_when_it_contains_tools() {
     let prior = vec![
         json!({"role": "user", "content": "old request"}),
         json!({
@@ -604,24 +1474,19 @@ fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() 
     let base_manifest_root = "a".repeat(64);
     let proof = CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
 
-    let (mode, packs) = canonical_commit_delta(&prior, true, &messages, Some(&proof), false)
-        .unwrap()
-        .expect("normalized replacement");
-
-    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "old request"}),
-            json!({"role": "assistant", "content": "old result"}),
-            json!({"role": "user", "content": "new request"}),
-            json!({"role": "assistant", "content": "new result"}),
-        ]
-    );
+    for allow_empty_delta in [false, true] {
+        let (mode, packs) =
+            canonical_commit_delta(&prior, true, &messages, Some(&proof), allow_empty_delta)
+                .unwrap()
+                .expect("append the new turn without rewriting the old one");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert_eq!(packs.concat(), messages[prior.len()..]);
+        assert_eq!([prior.clone(), packs.concat()].concat(), messages);
+    }
 }
 
 #[test]
-fn missing_proof_cannot_replace_prior_execution_scratch() {
+fn resumed_assistant_suffix_keeps_the_admitted_user_context_without_rewriting_it() {
     let prior = vec![
         json!({"role": "user", "content": "old request"}),
         json!({
@@ -636,23 +1501,15 @@ fn missing_proof_cannot_replace_prior_execution_scratch() {
         json!({"role": "tool", "tool_call_id": "old-call", "content": "old output"}),
     ];
     let mut messages = prior.clone();
-    messages.extend([
-        json!({"role": "user", "content": "continue"}),
-        json!({"role": "assistant", "content": "recovered result"}),
-    ]);
-
-    let (mode, packs) = canonical_commit_delta(&prior, true, &messages, None, false)
-        .unwrap()
-        .expect("safe append remains available without replacement authority");
-
-    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "continue"}),
-            json!({"role": "assistant", "content": "recovered result"}),
-        ]
-    );
+    messages.push(json!({"role": "assistant", "content": "recovered result"}));
+    for allow_empty_delta in [false, true] {
+        let (mode, packs) =
+            canonical_commit_delta(&prior, true, &messages, None, allow_empty_delta)
+                .unwrap()
+                .expect("safe append remains available without replacement authority");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert_eq!(packs.concat(), messages[prior.len()..]);
+    }
 }
 
 #[test]
@@ -862,16 +1719,11 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         assert_eq!(messages[1]["_compact_boundary"], true);
         assert_eq!(messages[2], tail, "typed tail survives real compaction");
 
-        for preserve_execution_scratch in [false, true] {
-            let (mode, packs) = canonical_commit_delta(
-                &prior,
-                true,
-                &messages,
-                Some(&proof),
-                preserve_execution_scratch,
-            )
-            .expect("verified compacted turn")
-            .expect("nonempty canonical delta");
+        for allow_empty_delta in [false, true] {
+            let (mode, packs) =
+                canonical_commit_delta(&prior, true, &messages, Some(&proof), allow_empty_delta)
+                    .expect("verified compacted turn")
+                    .expect("nonempty canonical delta");
             assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
             let committed = packs.concat();
             let users = committed
@@ -887,10 +1739,9 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");
-            assert_eq!(
+            assert!(
                 committed.iter().any(|message| message["role"] == "tool"),
-                preserve_execution_scratch,
-                "retained execution evidence follows the commit contract",
+                "retained execution evidence is independent of the terminal outcome",
             );
 
             let serialized = serde_json::to_string(&committed).unwrap();
@@ -1588,6 +2439,8 @@ async fn scheduled_post_loop_memory_cleanup_is_visible_to_shutdown_drain() {
 #[tokio::test]
 async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
     let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
+    let journal_dir = tempfile::tempdir().expect("post-loop journal dir");
+    let _journal_guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
     let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1647,6 +2500,7 @@ async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
 }
 
 #[tokio::test]
+#[serial_test::serial(session_journal_dir)]
 async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
     struct PersistFailingMemoria {
         purge_calls: std::sync::atomic::AtomicUsize,
@@ -1757,6 +2611,125 @@ async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
 }
 
 #[tokio::test]
+#[serial_test::serial(session_journal_dir)]
+async fn post_loop_memory_disabled_capability_settles_without_health_failure() {
+    struct DisabledMemoria;
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for DisabledMemoria {
+        async fn admits_operation(&self, _: bool) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+            _: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            Err("unreachable while memory access is disabled".to_string())
+        }
+
+        async fn purge_working(&self, _: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    let sessions = tempfile::tempdir().expect("temp sessions directory");
+    let _journal_guard =
+        astra_services::session_journal::ProcessJournalDirGuard::new(sessions.path());
+    let (ingestion, _rx) = astra_services::event_ingestion::IngestionSender::for_tests(32);
+    let service = Arc::new(crate::session_memory::MemoryExtractionService::new(
+        Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
+        Arc::new(DisabledMemoria),
+        ingestion,
+        "owner-disabled",
+        Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+    ));
+    let request = crate::session_memory::ExtractionRequest {
+        inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "session-disabled".to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "test_memory_disabled".to_string(),
+            logical_attempt: 0,
+        },
+        messages: vec![json!({
+            "role": "user",
+            "content": "A session with optional memory disabled must still complete."
+        })],
+        session_facts: astra_turn_types::session_facts::SessionFacts::default(),
+        had_error: false,
+        reanchors_current_objective: false,
+    };
+    assert_eq!(
+        service.maybe_spawn(request.clone()),
+        crate::session_memory::SpawnDecision::Spawned
+    );
+    assert_eq!(
+        service.wait_for_pending(Duration::from_secs(1)).await,
+        0,
+        "disabled capability must not leave background work pending"
+    );
+
+    let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    run_post_loop_memory_cleanup_work(
+        "owner-disabled".to_string(),
+        "session-disabled".to_string(),
+        "run-disabled".to_string(),
+        1,
+        astra_turn_types::session_facts::SessionFacts::default(),
+        Some(service),
+        Some(request),
+        Some(registry.clone()),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let rendered = registry.render_prometheus();
+    assert!(
+        rendered
+            .contains("astra_session_memory_post_loop_drains_total{outcome=\"access_disabled\"} 1")
+    );
+    assert!(!rendered.contains("outcome=\"not_durable\""));
+    let events = astra_services::session_journal::read_journal_for_user(
+        "owner-disabled",
+        "session-disabled",
+    )
+    .expect("post-loop journal");
+    assert!(events.iter().any(|event| {
+        event.event_type == astra_services::session_journal::JournalEventType::SubsystemSettled
+            && event.turn == Some(1)
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("subsystem"))
+                .and_then(serde_json::Value::as_str)
+                == Some("post_loop_memory")
+    }));
+    assert!(!events.iter().any(|event| {
+        event.event_type == astra_services::session_journal::JournalEventType::SubsystemDiagnostic
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str)
+                == Some("not_durable")
+    }));
+}
+
+#[tokio::test]
 async fn post_loop_memory_cleanup_waits_when_worker_pool_is_full() {
     let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
     let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
@@ -1858,11 +2831,19 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
     );
     state.max_turn_input_tokens = 123_456;
     state.remaining_turns = 9;
-    state.activated_deferred_tool_names = vec!["web_fetch".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "web_fetch".into(),
+        schema_digest: "sha256:checkpoint".into(),
+        descriptor: None,
+    }];
 
     restore_session_state_compact(
         astra_turn_core::conversation_log::SessionStateCompact {
-            activated_deferred_tool_names: vec!["github".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:csl".into(),
+                descriptor: None,
+            }],
             approval_overrides: Some(json!({"approval": "stale"})),
             budget_remaining_tokens: 42_000,
             budget_remaining_rounds: 3,
@@ -1890,14 +2871,14 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
     assert_eq!(state.consecutive_context_window_errors, 0);
     assert_eq!(state.compaction_effectiveness.attempt_count, 0);
     assert_eq!(
-        state.activated_deferred_tool_names,
-        vec!["github", "web_fetch"],
-        "CSL contributes prompt continuity but cannot erase a newer checkpoint activation"
+        state.deferred_tool_activations.len(),
+        2,
+        "CSL and checkpoint selections merge only as schema-addressed evidence"
     );
 }
 
 #[test]
-fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
+fn csl_restore_does_not_wire_name_only_activation_into_the_executor() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -1911,12 +2892,8 @@ fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
     );
     // This is the recovery order used by a resumed root run: the heavy
     // checkpoint is restored first and CSL follows as a transcript projection.
-    state.activated_deferred_tool_names = vec!["web_fetch".into()];
     restore_session_state_compact(
-        astra_turn_core::conversation_log::SessionStateCompact {
-            activated_deferred_tool_names: vec!["github".into()],
-            ..Default::default()
-        },
+        astra_turn_core::conversation_log::SessionStateCompact::default(),
         &mut state,
     );
 
@@ -1932,15 +2909,7 @@ fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
         &mut state,
     );
 
-    assert_eq!(
-        state
-            .runtime_tool_executor
-            .as_deref()
-            .expect("wired executor")
-            .activated_deferred_tool_names(),
-        vec!["github", "web_fetch"],
-        "the model-visible executor surface must retain every recovered deferred schema"
-    );
+    assert!(state.runtime_tool_executor.is_some());
 }
 
 #[test]
@@ -1974,7 +2943,11 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
         },
     ));
     state.compaction_effectiveness.attempt_count = 7;
-    state.activated_deferred_tool_names = vec!["github".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "github".into(),
+        schema_digest: "sha256:github".into(),
+        descriptor: None,
+    }];
 
     let compact = extract_session_state_compact(&state);
 
@@ -1989,14 +2962,13 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
     assert_eq!(compact.consecutive_ctx_errors, 0);
     assert!(compact.compaction_tracker.is_none());
     assert_eq!(
-        compact.activated_deferred_tool_names,
-        vec!["github"],
-        "CSL must carry prompt-visible deferred schema materialization across turns"
+        compact.deferred_tool_activations,
+        state.deferred_tool_activations
     );
 }
 
 #[test]
-fn csl_session_state_snapshots_live_executor_activation() {
+fn csl_session_state_preserves_typed_activation_without_executor_side_state() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -2008,7 +2980,11 @@ fn csl_session_state_snapshots_live_executor_activation() {
         None,
         None,
     );
-    state.activated_deferred_tool_names = vec!["stale-state-copy".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "stale-state-copy".into(),
+        schema_digest: "sha256:stale".into(),
+        descriptor: None,
+    }];
     let workspace = tempfile::tempdir().expect("workspace");
     let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
         workspace.path().to_path_buf(),
@@ -2017,16 +2993,13 @@ fn csl_session_state_snapshots_live_executor_activation() {
         None,
         None,
     );
-    executor
-        .restore_activated_deferred_tool_names_for_session(&["web_fetch".into(), "github".into()]);
     state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
 
     let compact = extract_session_state_compact(&state);
 
     assert_eq!(
-        compact.activated_deferred_tool_names,
-        vec!["github", "web_fetch"],
-        "settlement must snapshot the live executor rather than an older loop-state copy"
+        compact.deferred_tool_activations,
+        state.deferred_tool_activations
     );
 }
 
@@ -2171,7 +3144,7 @@ async fn csl_persist_after_restore_keeps_current_user_message() {
 }
 
 #[test]
-fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtime_state() {
+fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_policy() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -2184,13 +3157,19 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         None,
     );
     let restored = astra_pipeline::step_restore::RestoredSession {
+        run_execution_budget: None,
+        run_execution_control: None,
         conversation_cursor: None,
         messages: Vec::new(),
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
-        activated_deferred_tool_names: vec!["github".into()],
+        deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+            name: "github".into(),
+            schema_digest: "sha256:restored".into(),
+            descriptor: None,
+        }],
         resume_turn: 0,
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         completed_tool_results: HashMap::new(),
@@ -2221,9 +3200,19 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
 
     restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
 
-    assert!(state.restricted_tools.contains("flaky_tool"));
+    assert!(
+        state.restricted_tools.is_empty(),
+        "unscoped checkpoint restrictions must not become a new hard schema filter"
+    );
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
-    assert_eq!(state.activated_deferred_tool_names, vec!["github"]);
+    assert_eq!(
+        state.deferred_tool_activations,
+        vec![astra_turn_types::DeferredToolActivation {
+            name: "github".into(),
+            schema_digest: "sha256:restored".into(),
+            descriptor: None,
+        }]
+    );
     assert!(
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"
@@ -3623,7 +4612,9 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
 #[test]
 fn only_work_item_children_receive_the_typed_settlement_contract() {
     let ordinary = test_spawn_run_config(vec!["*"], false);
-    assert!(!spawn_system_prompt(&ordinary).contains("settle_work_item"));
+    let ordinary_prompt = spawn_system_prompt(&ordinary);
+    assert!(!ordinary_prompt.contains("settle_work_item"));
+    assert!(!ordinary_prompt.contains(&ordinary.agent_id));
 
     let mut assigned = ordinary;
     assigned.work_item = Some(
@@ -3633,6 +4624,7 @@ fn only_work_item_children_receive_the_typed_settlement_contract() {
         },
     );
     let prompt = spawn_system_prompt(&assigned);
+    assert!(!prompt.contains(&assigned.agent_id));
     assert!(prompt.contains("Complete only the declared WorkItem"));
     assert!(prompt.contains("stop once its expected result is supported"));
     assert!(!prompt.contains("Complete the task thoroughly"));
@@ -4592,8 +5584,8 @@ async fn server_runtime_cancel_cannot_cross_stopped_child_generation() {
         .expect("a recovery owner claims the child");
     let claimed_generation = claimed
         .iter()
-        .find(|run| run.run_id == "claimed-after-stop")
-        .map(|run| run.run_generation)
+        .find(|claim| claim.run.run_id == "claimed-after-stop")
+        .map(|claim| claim.run.run_generation)
         .expect("claimed child generation");
     assert!(claimed_generation > authority.owner_generation);
 
@@ -5427,12 +6419,12 @@ fn subrun_turn_budget_treats_explicit_spawn_budget_as_authoritative_ceiling() {
             true,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
         );
-    let budget = resolve_subrun_agentic_turn_budget(profile, Some(3), Some(12));
+    let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(3), Some(12))
+        .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 3);
-    assert_eq!(budget.hard_turn_limit, 3);
-    assert_eq!(budget.extension_turns, 0);
-    assert_eq!(budget.max_extensions, 0);
+    assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(3));
+    assert!(budget.extension_turns > 0);
 }
 
 #[test]
@@ -5440,11 +6432,11 @@ fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
     let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
         "answer this small question",
     );
-    let budget = resolve_subrun_agentic_turn_budget(profile, Some(240), Some(240));
+    let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(240), Some(240))
+        .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 240);
-    assert_eq!(budget.hard_turn_limit, 240);
-    assert_eq!(budget.max_extensions, 0);
+    assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(240));
 }
 
 #[test]
@@ -5455,11 +6447,12 @@ fn subrun_explicit_ceiling_can_have_a_smaller_adaptive_initial_slice() {
             true,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
         );
-    let budget = resolve_subrun_agentic_turn_budget(profile, Some(40), Some(10));
+    let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(40), Some(10))
+        .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 10);
-    assert_eq!(budget.hard_turn_limit, 40);
-    assert!(budget.max_extensions > 0);
+    assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(40));
+    assert!(budget.extension_turns > 0);
 }
 
 #[test]
@@ -5470,17 +6463,12 @@ fn subrun_persona_default_is_a_renewable_initial_slice() {
             true,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
         );
-    let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(12));
+    let budget = resolve_subrun_agentic_turn_budget(profile, None, None, Some(12))
+        .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 12);
-    assert!(budget.hard_turn_limit > budget.initial_turns);
+    assert_eq!(budget.hard_turn_limit, None);
     assert!(budget.extension_turns > 0);
-    assert!(
-        budget.initial_turns
-            + budget.extension_turns * usize::try_from(budget.max_extensions).unwrap()
-            >= budget.hard_turn_limit,
-        "a progressing child must be able to renew through the administrator ceiling"
-    );
 }
 
 #[test]
@@ -6585,6 +7573,29 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn reconcile_execution_handoff(
+        &self,
+        claim: &astra_services::runs::RecoveryClaim,
+    ) -> Result<Option<astra_services::runs::RecoveryReconciliation>, String> {
+        self.inner.reconcile_execution_handoff(claim).await
+    }
+
+    async fn claim_expired_recoverable_active_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
+        self.inner
+            .claim_expired_recoverable_active_runs(limit)
+            .await
+    }
+
+    async fn claim_recoverable_active_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
+        self.inner.claim_recoverable_active_runs(limit).await
+    }
+
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         self.inner.insert_run(record).await
     }
@@ -6957,14 +7968,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
 
     async fn save_checkpoint(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String> {
-        self.inner
-            .save_checkpoint(user_id, expected_session_id, run_id, checkpoint_json)
-            .await
+        request: astra_services::runs::RunCheckpointWriteRequest<'_>,
+    ) -> Result<Option<astra_services::runs::RunCheckpointReceipt>, String> {
+        self.inner.save_checkpoint(request).await
     }
 
     async fn load_latest_checkpoint(
@@ -8281,8 +9287,8 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
         .expect("remote recovery claim");
     let recovered_generation = claimed
         .iter()
-        .find(|run| run.run_id == "remote-grandchild")
-        .map(|run| run.run_generation)
+        .find(|claim| claim.run.run_id == "remote-grandchild")
+        .map(|claim| claim.run.run_generation)
         .expect("grandchild must be recovered under a later generation");
     assert!(recovered_generation > prior_generation);
     assert!(
@@ -8590,18 +9596,22 @@ async fn setup_lifecycle_run_db_it() -> SharedPool {
         Ok("1"),
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
-    LIFECYCLE_RUN_DB
+    let settings = LIFECYCLE_RUN_DB
         .get_or_init(|| async {
-            let settings = MatrixOneSettings::from_env();
+            let mut settings = MatrixOneSettings::from_env();
+            settings.db_pool_max_connections = settings.db_pool_max_connections.min(8);
+            settings.db_pool_min_connections = settings
+                .db_pool_min_connections
+                .min(settings.db_pool_max_connections);
             let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                 .unwrap_or_else(|_| "mysql".to_string());
             astra_services::ensure_core_schema(&settings, &catalog)
                 .await
                 .expect("ensure_core_schema");
-            SharedPool::new(&settings).await.expect("SharedPool::new")
+            settings
         })
-        .await
-        .clone()
+        .await;
+    SharedPool::new(settings).await.expect("SharedPool::new")
 }
 
 fn db_backed_test_service(
@@ -8989,6 +9999,7 @@ fn test_request(message: &str) -> ChatRequestData {
         forward_headers: HashMap::new(),
         execution_budget: None,
         execution_time_budget: None,
+        admitted_execution_deadline: None,
         execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
@@ -10140,9 +11151,9 @@ async fn durable_subrun_retry_requires_the_exact_prestarted_generation_before_pr
         .await
         .expect("rotate recoverable active runs");
     assert!(
-        claimed.iter().any(|run| {
-            run.run_id == "rotated-generation"
-                && run.run_generation > rotated_authority.owner_generation
+        claimed.iter().any(|claim| {
+            claim.run.run_id == "rotated-generation"
+                && claim.run.run_generation > rotated_authority.owner_generation
         }),
         "the recovery claim must rotate the tested child generation"
     );
@@ -10381,8 +11392,8 @@ async fn activation_user_winner_converges_recovered_subrun_grandchildren() {
         .expect("recover subrun tree");
     let recovered_subrun_generation = recovered
         .iter()
-        .find(|run| run.run_id == "activation-recovered-subrun")
-        .map(|run| run.run_generation)
+        .find(|claim| claim.run.run_id == "activation-recovered-subrun")
+        .map(|claim| claim.run.run_generation)
         .expect("recovered subrun generation");
 
     let result = settle_subrun_activation_cancellation(
@@ -10537,9 +11548,9 @@ async fn activation_cancellation_cas_cannot_terminalize_a_rotated_generation() {
         .claim_recoverable_active_runs(100)
         .await
         .expect("rotate recoverable generation");
-    assert!(claimed.iter().any(|run| {
-        run.run_id == "activation-generation-rotation"
-            && run.run_generation > authority.owner_generation
+    assert!(claimed.iter().any(|claim| {
+        claim.run.run_id == "activation-generation-rotation"
+            && claim.run.run_generation > authority.owner_generation
     }));
 
     let result = settlement.await.expect("settlement task");
@@ -12582,6 +13593,29 @@ async fn validate_request_constraints_requires_model_selection() {
 }
 
 #[tokio::test]
+async fn shutdown_rejects_new_chat_before_admission() {
+    let service = test_service();
+    assert!(
+        service
+            .drain_background_tasks_impl(Duration::from_millis(100))
+            .await
+    );
+    for input in ["new task", "   "] {
+        let error = service
+            .prepare_chat_request("shutdown-user", test_request(input))
+            .await
+            .expect_err("shutdown must precede input validation and provider admission");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("server_shutting_down")
+        );
+    }
+    assert!(service.runs.read().await.is_empty());
+    assert_eq!(service.background_task_count(), 0);
+}
+
+#[tokio::test]
 async fn prepare_chat_request_rejects_empty_effective_user_input() {
     let service = test_service();
     let request = test_request("   ");
@@ -13511,7 +14545,12 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
     assert_eq!(state.telemetry.first_round_prompt_tokens, Some(5_995));
     assert_eq!(state.telemetry.max_round_prompt_tokens, Some(15_922));
 
-    let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);
+    let event = build_runtime_turn_evaluation_event(
+        "session-1",
+        "server_runtime",
+        &state,
+        STATUS_COMPLETED,
+    );
 
     assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
     assert_eq!(event.turn, Some(state.session_turn));
@@ -13546,6 +14585,78 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             .any(|signal| signal["kind"] == "all_tools_healthy"),
         "cache/prompt churn must not be mislabeled as a fully healthy turn"
     );
+}
+
+#[test]
+fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_tool_health() {
+    let svc = test_service();
+    let request = test_request("git status");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.recent_tools = vec!["git_status".into()];
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "git_status".into(),
+        ok: true,
+        ms: 14,
+        output_bytes: Some(180),
+        result_preview: Some("working tree is clean".into()),
+        ..Default::default()
+    });
+
+    for source in ["server_runtime", "server_subrun"] {
+        for status in RunStatus::ALL {
+            let event =
+                build_runtime_turn_evaluation_event("session-1", source, &state, status.as_str());
+            let metadata = event.metadata.expect("turn evaluation metadata");
+            assert_eq!(metadata["run_status"], status.as_str());
+            assert_eq!(metadata["tool_evaluation_success"], true);
+            assert_eq!(
+                metadata["success"],
+                matches!(status, RunStatus::Completed | RunStatus::Delegated),
+                "healthy tools cannot override settled {status:?} for {source}"
+            );
+            assert!(
+                metadata["signals"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|signal| signal["kind"] == "all_tools_healthy"),
+                "a failed run must retain accurate evidence about its successful tools"
+            );
+        }
+    }
+
+    // A recovered provider deadline can remain in loop diagnostics. Evaluation
+    // must use the settled status, including a later unrelated terminal failure.
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        InterruptionKind::ProviderDeadline,
+        ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary::default(),
+    ));
+    for (status, expected_success) in [(STATUS_COMPLETED, true), (STATUS_FAILED, false)] {
+        let event =
+            build_runtime_turn_evaluation_event("session-1", "server_runtime", &state, status);
+        assert_eq!(event.metadata.unwrap()["success"], expected_success);
+    }
+
+    state.stall.tool_call_records[0].ok = false;
+    state.stall.tool_call_records[0].error = Some("tool execution failed".into());
+    let event = build_runtime_turn_evaluation_event(
+        "session-1",
+        "server_runtime",
+        &state,
+        STATUS_COMPLETED,
+    );
+    let metadata = event.metadata.expect("turn evaluation metadata");
+    assert_eq!(metadata["tool_evaluation_success"], false);
+    assert_eq!(metadata["success"], false);
 }
 
 #[test]
@@ -18058,6 +19169,10 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         "edge-macbook-1"
     );
     assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
+    assert_eq!(
+        durable.events[0]["data"]["admission_source"]["capability_source"],
+        "bound_executor"
+    );
 
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
@@ -18775,6 +19890,7 @@ fn extract_edge_tools_from_context() {
         forward_headers: HashMap::new(),
         execution_budget: None,
         execution_time_budget: None,
+        admitted_execution_deadline: None,
         execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
@@ -18862,6 +19978,7 @@ fn extract_edge_profile_from_context() {
         forward_headers: HashMap::new(),
         execution_budget: None,
         execution_time_budget: None,
+        admitted_execution_deadline: None,
         execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
@@ -18882,7 +19999,9 @@ fn build_initial_state_sets_user_message() {
     let req = test_request("write a test");
     let expected_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
         astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("write a test"),
-        astra_core::RuntimeLimits::global().max_turns,
+        astra_core::RuntimeLimits::global()
+            .max_rounds()
+            .expect("valid test config"),
         None,
     );
     let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
@@ -18896,6 +20015,295 @@ fn build_initial_state_sets_user_message() {
     assert_eq!(state.agentic_turn_budget, expected_budget);
     assert_eq!(state.message, "write a test");
     assert!(state.cancellation.token.is_none());
+}
+
+#[test]
+fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
+    let svc = test_service();
+    let request = test_request("current authorization, not a new user turn");
+    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let constraints = RequestConstraints::default();
+    let mut facts = svc
+        .prepare_initial_execution_facts(
+            "test-user",
+            &request,
+            "same-session",
+            "same-run",
+            None,
+            &edge,
+        )
+        .unwrap();
+    let messages = vec![
+        json!({"role": "user", "content": "original task"}),
+        json!({"role": "assistant", "content": "work already performed"}),
+    ];
+    facts.messages = messages.clone();
+    facts.original.message = "original task".to_string();
+    facts.original.user_intent = "original structured intent".to_string();
+    facts.original.session_turn = 7;
+    facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
+    facts.original.root_user_query_event_id = Some("original-query".to_string());
+    facts.original.total_prompt = 11;
+    facts.original.total_completion = 13;
+    facts.original.total_cache_read = 101;
+    facts.original.total_cache_creation = 17;
+    facts.original.has_any_usage = true;
+    facts.original.total_tool_calls = 5;
+    facts.original.total_observation_tool_calls = 3;
+    facts.max_turns = 50;
+    facts.remaining_turns = 31;
+    facts.charged_iterations = 19;
+    facts.original.current_round_index = 18;
+    facts.original.llm_rounds_completed = 16;
+    facts.original.budget_is_explicit = true;
+    facts.original.max_turn_input_tokens = 12345;
+    facts.original.last_request_message_count = Some(9);
+    facts.hooks.stop_hook_runs = 2;
+    facts.hooks.completion_settlement.text_only = true;
+    facts.original.error_recovery.consecutive_same_error = 2;
+    facts
+        .original
+        .provider_adaptation
+        .output_cap_action_first_pending = true;
+    facts
+        .original
+        .provider_adaptation
+        .action_convergence_attempted = true;
+    facts.original.provider_adaptation.force_next_thinking_off = true;
+    facts.original.skill_produced_output = true;
+    facts.original.skill_execution.effort = Some(crate::skills::manifest::EffortLevel::High);
+    facts.original.skill_execution.sandbox_policy = Some(
+        crate::tool_sandbox::SandboxPolicy::strict("/original-workspace"),
+    );
+    facts
+        .original
+        .skill_execution
+        .pinned
+        .extend(["z-skill".into(), "a-skill".into()]);
+    facts
+        .original
+        .skill_execution
+        .discovered
+        .insert("test-skill".into());
+    facts
+        .original
+        .skill_execution
+        .auto_route_attempts
+        .insert("original-attempt".into());
+    facts.original.skill_execution.invoked.insert(
+        "test-skill".into(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: "test-skill".into(),
+            content: "original delivered instructions".into(),
+            invoked_at_turn: 7,
+            reentry_count: 2,
+            execution_topology: None,
+        },
+    );
+    let expected_skills = serde_json::to_value(&facts.original.skill_execution).unwrap();
+    facts
+        .original
+        .pending_context
+        .push(crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+            payload: json!({"mode": "text_only"}),
+            round_index: 18,
+            attempt_leased: false,
+        });
+    facts.original.turn_guard.record_workspace_mutation();
+    facts
+        .original
+        .turn_guard
+        .record_validation_attempt("cargo test");
+    facts.original.turn_guard.nudge_count = 3;
+    crate::turn::runtime_policy::evaluate_tool_boundary(
+        &mut facts.original.runtime_policy_evaluation,
+        astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+        &[astra_services::session_journal::ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            round: Some(1),
+            ..Default::default()
+        }],
+        1,
+    )
+    .unwrap();
+    let expected_policy = facts.original.runtime_policy_evaluation.latest().clone();
+    facts.budget_wrapup_injected = true;
+    facts.budget_wrapup_ignored_rounds = 1;
+    let environment = svc.assemble_loop_environment(
+        "test-user",
+        &request,
+        "same-session",
+        "same-run",
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        None,
+        None,
+        Some(3),
+    );
+    let state = svc.assemble_loop_state(
+        "test-user",
+        &request,
+        "same-session",
+        "same-run",
+        constraints,
+        &edge,
+        None,
+        environment,
+        facts,
+    );
+    assert_eq!(state.messages, messages);
+    assert_eq!(state.message, "original task");
+    assert_eq!(state.user_intent, "original structured intent");
+    assert_eq!(state.session_turn, 7);
+    assert_eq!(
+        state.canonical_turn_chain_id.as_deref(),
+        Some("original-chain")
+    );
+    assert_eq!(
+        state.root_user_query_event_id.as_deref(),
+        Some("original-query")
+    );
+    assert_eq!(
+        (
+            state.total_prompt,
+            state.total_completion,
+            state.total_cache_read,
+            state.total_cache_creation
+        ),
+        (11, 13, 101, 17)
+    );
+    assert!(state.has_any_usage);
+    assert_eq!(
+        (state.total_tool_calls, state.total_observation_tool_calls),
+        (5, 3)
+    );
+    assert_eq!(
+        (
+            state.max_turns,
+            state.remaining_turns,
+            state.charged_iterations
+        ),
+        (50, 31, 19)
+    );
+    assert_eq!(
+        (state.current_round_index, state.llm_rounds_completed),
+        (18, 16)
+    );
+    assert!(state.budget_is_explicit);
+    assert_eq!(state.max_turn_input_tokens, 12345);
+    assert_eq!(state.last_request_message_count, Some(9));
+    assert_eq!(state.hooks.stop_hook_runs, 2);
+    assert!(state.hooks.completion_settlement.text_only);
+    assert_eq!(state.error_recovery.consecutive_same_error, 2);
+    assert!(state.provider_adaptation.output_cap_action_first_pending);
+    assert!(state.provider_adaptation.action_convergence_attempted);
+    assert!(state.provider_adaptation.force_next_thinking_off);
+    assert!(state.skill_produced_output);
+    assert_eq!(
+        serde_json::to_value(&state.skills.execution).unwrap(),
+        expected_skills
+    );
+    assert_eq!(state.volatile_pending.len(), 1);
+    assert_eq!(
+        state.volatile_pending[0].payload,
+        json!({"mode": "text_only"})
+    );
+    assert_eq!(state.volatile_pending[0].round_index, 18);
+    assert!(!state.volatile_pending[0].attempt_leased);
+    assert_eq!(state.turn_guard.workspace_epoch(), 1);
+    assert_eq!(
+        state
+            .turn_guard
+            .validation_attempts_since_workspace_mutation("cargo test"),
+        1
+    );
+    assert_eq!(state.turn_guard.nudge_count, 3);
+    assert_eq!(state.stall.active_policy_feedback, expected_policy);
+    assert_eq!(
+        state.stall.runtime_policy_evaluation.latest(),
+        &expected_policy
+    );
+    let original =
+        crate::turn::agentic_loop::host::OriginalLoopExecutionFacts::capture(&state).unwrap();
+    let wire = serde_json::to_value(&original).unwrap();
+    let restored: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored.total_cache_read, 101);
+    assert_eq!(restored.session_turn, 7);
+    assert_eq!(restored.message, "original task");
+    assert!(restored.provider_adaptation.action_convergence_attempted);
+    assert!(restored.skill_produced_output);
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+    for field in wire.as_object().unwrap().keys() {
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<crate::turn::agentic_loop::host::OriginalLoopExecutionFacts>(
+                missing
+            )
+            .is_err(),
+            "missing original execution fact accepted: {field}"
+        );
+    }
+    assert!(state.budget_wrapup_injected);
+    assert_eq!(state.budget_wrapup_ignored_rounds, 1);
+}
+
+#[test]
+fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
+    let svc = test_service();
+    let request = test_request("continue the original turn");
+    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let constraints = RequestConstraints::default();
+    let mut facts = svc
+        .prepare_initial_execution_facts("user", &request, "session", "run", None, &edge)
+        .unwrap();
+    facts.hooks.workspace_root_hint = Some("/app".into());
+    facts.original.canonical_turn_chain_id = Some("chain".into());
+    facts.stall.verification_frontier =
+        crate::turn::agentic_loop::verification_frontier::tests::restored_workspace_barrier();
+    assert!(facts.stall.tool_call_records.is_empty());
+    let environment = svc.assemble_loop_environment(
+        "user",
+        &request,
+        "session",
+        "run",
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        None,
+        None,
+        Some(3),
+    );
+    let state = svc.assemble_loop_state(
+        "user",
+        &request,
+        "session",
+        "run",
+        constraints,
+        &edge,
+        None,
+        environment,
+        facts,
+    );
+    assert!(state.stall.tool_call_records.is_empty());
+    assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
+    assert_eq!(
+        crate::turn::agentic_loop::execution_phase::checked_completion_evidence(&state).unwrap(),
+        (None, false),
+        "assembling a recovered loop must preserve its unobserved mutation despite an empty local suffix"
+    );
 }
 
 #[test]
@@ -19009,7 +20417,10 @@ fn build_initial_state_applies_execution_budget_override() {
     let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
     assert_eq!(state.max_turns, 4);
     assert_eq!(state.remaining_turns, 4);
-    assert_eq!(state.agentic_turn_budget.hard_turn_limit, 9);
+    assert_eq!(
+        state.agentic_turn_budget.hard_turn_limit,
+        std::num::NonZeroUsize::new(9)
+    );
 }
 
 #[test]
@@ -19041,16 +20452,33 @@ fn execution_time_budget_does_not_change_round_auto_expansion_policy() {
 }
 
 #[test]
-fn build_initial_state_clamps_execution_budget_override() {
+fn build_initial_state_rejects_zero_execution_budget_cap() {
     let svc = test_service();
     let mut req = test_request("go");
     req.execution_budget = Some(astra_services::runs::ExecutionBudget {
         initial_turns: Some(0),
         hard_turn_limit: Some(0),
     });
-    let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-    assert_eq!(state.max_turns, 1);
-    assert_eq!(state.agentic_turn_budget.hard_turn_limit, 1);
+    let result = svc.build_initial_state_inner(
+        "test-user",
+        &req,
+        "s",
+        "r",
+        None,
+        None,
+        None,
+        None,
+        None,
+        RequestConstraints::default(),
+        &EdgeContext::default(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let (status, error) = result.err().expect("zero cap must be rejected");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.0.detail, "hard_turn_limit must be positive");
 }
 
 #[test]
@@ -19595,23 +21023,25 @@ fn late_streaming_start_binds_owner_generation_into_action_state() {
     let request = test_request("ordinary streaming turn");
     let edge_context =
         AgenticRunLifecycleService::extract_edge_context(&request).expect("edge context");
-    let mut state = svc.build_initial_state_inner(
-        "test-user",
-        &request,
-        "session-late-authority",
-        "run-late-authority",
-        None,
-        None,
-        None,
-        None,
-        None,
-        RequestConstraints::default(),
-        &edge_context,
-        None,
-        None,
-        None,
-        None,
-    );
+    let mut state = svc
+        .build_initial_state_inner(
+            "test-user",
+            &request,
+            "session-late-authority",
+            "run-late-authority",
+            None,
+            None,
+            None,
+            None,
+            None,
+            RequestConstraints::default(),
+            &edge_context,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("valid test execution configuration");
     assert_eq!(state.current_run_owner_generation, None);
 
     bind_execution_owner_generation(&mut state, 7);
@@ -19641,27 +21071,32 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
     )
     .expect("valid agent binding prompt context");
 
-    let state = svc.build_initial_state_inner(
-        "test-user",
-        &req,
-        "s",
-        "r",
-        None,
-        None,
-        None,
-        None,
-        None,
-        RequestConstraints::default(),
-        &edge_context,
-        Some(&edge_profile),
-        None,
-        Some(&binding_context),
-        None,
-    );
+    let state = svc
+        .build_initial_state_inner(
+            "test-user",
+            &req,
+            "s",
+            "r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            RequestConstraints::default(),
+            &edge_context,
+            Some(&edge_profile),
+            None,
+            Some(&binding_context),
+            None,
+        )
+        .expect("valid test execution configuration");
 
     assert_eq!(state.max_turns, 8);
     assert_eq!(state.remaining_turns, 8);
-    assert_eq!(state.agentic_turn_budget.hard_turn_limit, 12);
+    assert_eq!(
+        state.agentic_turn_budget.hard_turn_limit,
+        std::num::NonZeroUsize::new(12)
+    );
     assert!(state.skills.registry_for_activation.is_none());
     assert_eq!(
         state
@@ -19778,23 +21213,25 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     let edge_context =
         AgenticRunLifecycleService::extract_edge_context(&request).expect("edge context");
 
-    let state = svc.build_initial_state_inner(
-        "external-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-        None,
-        None,
-        request_constraints,
-        &edge_context,
-        None,
-        capabilities.request_scoped_skill_resolver.clone(),
-        capabilities.agent_binding.as_ref(),
-        None,
-    );
+    let state = svc
+        .build_initial_state_inner(
+            "external-user",
+            &request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            request_constraints,
+            &edge_context,
+            None,
+            capabilities.request_scoped_skill_resolver.clone(),
+            capabilities.agent_binding.as_ref(),
+            None,
+        )
+        .expect("valid test execution configuration");
 
     assert!(state.skills.registry_for_activation.is_none());
     let resolver = state
@@ -24280,19 +25717,14 @@ async fn delegation_tracker_get_children() {
 /// P0-C: drain_background_tasks returns true when no tasks are running.
 #[tokio::test]
 async fn drain_background_tasks_returns_immediately_when_idle() {
-    // Test the drain logic directly: counter at 0 → drain returns true immediately.
-    let count = Arc::new(AtomicUsize::new(0));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
-    let drained = loop {
-        if count.load(Ordering::Acquire) == 0 {
-            break true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break false;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
-    assert!(drained, "counter at 0 — drain must return true immediately");
+    let service = test_service();
+    assert!(!service.execution_handoff_requested.load(Ordering::Acquire));
+    assert!(
+        service
+            .drain_background_tasks_impl(Duration::from_millis(100))
+            .await
+    );
+    assert!(service.execution_handoff_requested.load(Ordering::Acquire));
 }
 
 /// P0-C: background_task_count increments on spawn and decrements on exit.

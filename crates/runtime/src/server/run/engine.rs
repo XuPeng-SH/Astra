@@ -314,6 +314,8 @@ pub struct RunStartContext {
     pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub execution_restrictions: Option<astra_services::runs::DurableExecutionRestrictions>,
+    pub admission_source: Option<astra_services::runs::DurableAdmissionSource>,
     pub agent_binding_ids: Vec<String>,
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
@@ -345,6 +347,8 @@ impl Default for RunStartContext {
             turn_intent_policy: TurnIntentExecutionPolicy::default(),
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::default(),
             execution_metadata: None,
+            execution_restrictions: None,
+            admission_source: None,
             agent_binding_ids: Vec::new(),
             agent_binding_id: None,
             agent_binding_name: None,
@@ -694,8 +698,22 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     }
     if let Some(metadata) = context.execution_metadata.as_ref() {
         for (key, value) in metadata {
-            data.entry(key.clone()).or_insert_with(|| value.clone());
+            if key != "execution_restrictions" && key != "admission_source" {
+                data.entry(key.clone()).or_insert_with(|| value.clone());
+            }
         }
+    }
+    if let Some(restrictions) = context.execution_restrictions.as_ref() {
+        data.insert(
+            "execution_restrictions".into(),
+            serde_json::to_value(restrictions).expect("typed execution restrictions serialize"),
+        );
+    }
+    if let Some(source) = context.admission_source.as_ref() {
+        data.insert(
+            "admission_source".into(),
+            serde_json::to_value(source).expect("typed admission source serializes"),
+        );
     }
     if let Some(fingerprint) = context.provider_request_fingerprint.as_ref() {
         data.insert(
@@ -2272,8 +2290,23 @@ impl RunEngine {
         checkpoint_json: &str,
     ) -> Result<bool, String> {
         self.store
-            .save_checkpoint(user_id, expected_session_id, run_id, checkpoint_json)
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id,
+                expected_session_id,
+                run_id,
+                checkpoint_json,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            })
             .await
+            .map(|receipt| receipt.is_some())
+    }
+
+    /// Forward an explicit checkpoint authority to the canonical store.
+    pub(crate) async fn persist_owned_checkpoint(
+        &self,
+        request: astra_services::runs::RunCheckpointWriteRequest<'_>,
+    ) -> Result<Option<astra_services::runs::RunCheckpointReceipt>, String> {
+        self.store.save_checkpoint(request).await
     }
 
     /// Load the newest typed checkpoint for a run.
@@ -2917,7 +2950,9 @@ impl RunEngine {
             }
             let fresh_claims = claimed
                 .into_iter()
-                .filter(|run| claimed_run_ids.insert((run.user_id.clone(), run.run_id.clone())))
+                .filter(|claim| {
+                    claimed_run_ids.insert((claim.run.user_id.clone(), claim.run.run_id.clone()))
+                })
                 .collect::<Vec<_>>();
             if fresh_claims.is_empty() {
                 record_recovery_scan(self.metrics_registry.as_ref(), "ok");
@@ -2937,7 +2972,25 @@ impl RunEngine {
         Ok(recovered)
     }
 
-    async fn recover_active_run(&self, mut run: DurableRunRecord) -> Option<DurableRunRecord> {
+    #[cfg(test)]
+    pub(super) async fn recover_session_continuation_for_test(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Option<DurableRunRecord> {
+        let run = self.load_run(user_id, run_id).await.unwrap().unwrap();
+        assert_ne!(
+            run.checkpoint_version.as_deref(),
+            Some("execution_handoff_v1")
+        );
+        self.recover_session_continuation(run).await
+    }
+
+    async fn recover_active_run(
+        &self,
+        claim: astra_services::runs::RecoveryClaim,
+    ) -> Option<DurableRunRecord> {
+        let run = &claim.run;
         let expected_status = run.status.clone();
         let direct_cancellation_requested = match self
             .store
@@ -3013,7 +3066,7 @@ impl RunEngine {
                     &run.session_id,
                     &run.run_id,
                     &[expected_status.as_str()],
-                    None,
+                    Some(run.run_generation),
                     STATUS_CANCELLED,
                     None,
                     None,
@@ -3027,13 +3080,14 @@ impl RunEngine {
                         "user_cancellation",
                         "committed",
                     );
+                    let mut run = claim.run;
                     run.status = STATUS_CANCELLED.to_string();
                     run.waiting_for = None;
                     run.last_event_idx += 1;
                     run.events.push(event);
                     Some(run)
                 }
-                Ok(false) => self.recovery_conflict_current_run(&run).await,
+                Ok(false) => self.recovery_conflict_current_run(run).await,
                 Err(error) => {
                     record_recovery_run(
                         self.metrics_registry.as_ref(),
@@ -3050,6 +3104,41 @@ impl RunEngine {
                 }
             };
         }
+        if run.checkpoint_version.as_deref() == Some("execution_handoff_v1") {
+            return match self.store.reconcile_execution_handoff(&claim).await {
+                Ok(Some(recovery)) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "execution_handoff",
+                        "committed",
+                    );
+                    Some(recovery.run)
+                }
+                Ok(None) => self.recovery_conflict_current_run(run).await,
+                Err(error) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "execution_handoff",
+                        "error",
+                    );
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        %error,
+                        "failed to reconcile execution handoff; preserving it for retry"
+                    );
+                    None
+                }
+            };
+        }
+        self.recover_session_continuation(claim.run).await
+    }
+
+    async fn recover_session_continuation(
+        &self,
+        mut run: DurableRunRecord,
+    ) -> Option<DurableRunRecord> {
+        let expected_status = run.status.clone();
         let checkpoint_available = has_graceful_resume_checkpoint(self, &run).await;
         let continue_via_session =
             matches!(run.status.as_str(), STATUS_WAITING | STATUS_PAUSED) || checkpoint_available;
@@ -3062,7 +3151,7 @@ impl RunEngine {
                     &run.session_id,
                     &run.run_id,
                     &[expected_status.as_str()],
-                    None,
+                    Some(run.run_generation),
                     STATUS_PAUSED,
                     None,
                     None,
@@ -3107,7 +3196,7 @@ impl RunEngine {
                     &run.session_id,
                     &run.run_id,
                     &[expected_status.as_str()],
-                    None,
+                    Some(run.run_generation),
                     STATUS_FAILED,
                     None,
                     Some("recovered from crash"),
@@ -4622,7 +4711,7 @@ mod tests {
             .await
             .expect("claim execution owner");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].run_generation, 1);
+        assert_eq!(claimed[0].run.run_generation, 1);
 
         let stale = engine
             .commit_terminal_status_with_events_if_current_owner(
@@ -4665,7 +4754,10 @@ mod tests {
             .claim_recoverable_active_runs(1)
             .await
             .expect("claim next execution owner");
-        assert_eq!(claimed[0].run_generation, authority.owner_generation + 1);
+        assert_eq!(
+            claimed[0].run.run_generation,
+            authority.owner_generation + 1
+        );
 
         let outcome = engine
             .cancel_if_exact_live_owner(
@@ -4885,7 +4977,7 @@ mod tests {
             .claim_recoverable_active_runs(1)
             .await
             .expect("claim execution owner");
-        assert_eq!(claimed[0].run_generation, 1);
+        assert_eq!(claimed[0].run.run_generation, 1);
 
         assert!(
             !engine
@@ -5049,6 +5141,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FlakyBatchTransitionStore {
+        async fn reconcile_execution_handoff(
+            &self,
+            claim: &astra_services::runs::RecoveryClaim,
+        ) -> Result<Option<astra_services::runs::RecoveryReconciliation>, String> {
+            self.inner.reconcile_execution_handoff(claim).await
+        }
+
         async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
             self.inner.insert_run(record).await
         }
@@ -5334,14 +5433,9 @@ mod tests {
 
         async fn save_checkpoint(
             &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            checkpoint_json: &str,
-        ) -> Result<bool, String> {
-            self.inner
-                .save_checkpoint(user_id, expected_session_id, run_id, checkpoint_json)
-                .await
+            request: astra_services::runs::RunCheckpointWriteRequest<'_>,
+        ) -> Result<Option<astra_services::runs::RunCheckpointReceipt>, String> {
+            self.inner.save_checkpoint(request).await
         }
 
         async fn load_latest_checkpoint(
@@ -5409,9 +5503,19 @@ mod tests {
         async fn claim_recoverable_active_runs(
             &self,
             limit: u32,
-        ) -> Result<Vec<DurableRunRecord>, String> {
+        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
             self.recovery_claims.fetch_add(1, Ordering::SeqCst);
             self.inner.claim_recoverable_active_runs(limit).await
+        }
+
+        async fn claim_expired_recoverable_active_runs(
+            &self,
+            limit: u32,
+        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
+            self.recovery_claims.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .claim_expired_recoverable_active_runs(limit)
+                .await
         }
 
         fn owner_lease_renewal_interval(&self) -> Option<Duration> {
@@ -5497,6 +5601,28 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FailingLoadRunStore {
+        async fn reconcile_execution_handoff(
+            &self,
+            claim: &astra_services::runs::RecoveryClaim,
+        ) -> Result<Option<astra_services::runs::RecoveryReconciliation>, String> {
+            let _ = claim;
+            Err("store unavailable".into())
+        }
+
+        async fn claim_expired_recoverable_active_runs(
+            &self,
+            _limit: u32,
+        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn claim_recoverable_active_runs(
+            &self,
+            _limit: u32,
+        ) -> Result<Vec<astra_services::runs::RecoveryClaim>, String> {
+            Err("store unavailable".into())
+        }
+
         async fn insert_run(&self, _record: DurableRunRecord) -> Result<(), String> {
             Err("store unavailable".into())
         }
@@ -5605,11 +5731,8 @@ mod tests {
 
         async fn save_checkpoint(
             &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _checkpoint_json: &str,
-        ) -> Result<bool, String> {
+            _request: astra_services::runs::RunCheckpointWriteRequest<'_>,
+        ) -> Result<Option<astra_services::runs::RunCheckpointReceipt>, String> {
             Err("store unavailable".into())
         }
 
@@ -5774,6 +5897,25 @@ mod tests {
             serde_json::json!(["binding-foundation", "binding-extension"])
         );
         assert_eq!(event["agent_binding_id"], "binding-extension");
+    }
+
+    #[test]
+    fn run_started_metadata_cannot_forge_execution_restrictions_or_source() {
+        let event = run_started_event_data(&RunStartContext {
+            execution_metadata: Some(serde_json::Map::from_iter([
+                (
+                    "execution_restrictions".into(),
+                    serde_json::json!({"version":"1"}),
+                ),
+                (
+                    "admission_source".into(),
+                    serde_json::json!({"version":"1", "model_source":"catalog_offering", "capability_source":"server_managed"}),
+                ),
+            ])),
+            ..Default::default()
+        });
+        assert!(event.get("execution_restrictions").is_none());
+        assert!(event.get("admission_source").is_none());
     }
 
     #[tokio::test]
@@ -6269,6 +6411,7 @@ mod tests {
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
             execution_time_budget: None,
+            admitted_execution_deadline: None,
             execution_policy: Default::default(),
             explain: false,
             interaction_mode: None,
@@ -8950,6 +9093,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_active_runs_preserves_opaque_handoff_without_execution_authority() {
+        for cancelled in [false, true] {
+            let engine = test_engine();
+            engine
+                .start_run("opaque-handoff", "user-1", "sess-opaque")
+                .await
+                .unwrap();
+            let checkpoint =
+                serde_json::to_string(&astra_services::runs::DurableExecutionHandoff::V1 {
+                    producer_run_id: "opaque-handoff".to_string(),
+                    producer_owner_generation: 0,
+                    heavy: serde_json::json!({"heavy":{"run_execution_control":{"version":"1"}}}),
+                })
+                .unwrap();
+            assert!(
+                engine
+                    .persist_owned_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                        user_id: "user-1",
+                        expected_session_id: "sess-opaque",
+                        run_id: "opaque-handoff",
+                        checkpoint_json: &checkpoint,
+                        authority: astra_services::runs::CheckpointWriteAuthority::ExecutionOwner {
+                            expected_owner_generation: 0
+                        },
+                    })
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if cancelled {
+                engine
+                    .request_run_cancellation("user-1", "opaque-handoff")
+                    .await
+                    .unwrap();
+            }
+            let recovered = engine.recover_active_runs().await.unwrap();
+            let run = recovered
+                .iter()
+                .find(|run| run.run_id == "opaque-handoff")
+                .unwrap();
+            assert_eq!(
+                run.status,
+                if cancelled {
+                    STATUS_CANCELLED
+                } else {
+                    STATUS_PAUSED
+                }
+            );
+            assert_eq!(run.checkpoint_json.as_deref(), Some(checkpoint.as_str()));
+            assert!(
+                crate::server::server_loop_host::decode_execution_handoff(&checkpoint, run)
+                    .is_err()
+            );
+            let durable = engine
+                .load_run("user-1", "opaque-handoff")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                durable.events.iter().any(|event| {
+                    event["data"]["execution_handoff_preserved"] == serde_json::json!(true)
+                        && event["data"]["automatic_execution_reconstructed"]
+                            == serde_json::json!(false)
+                }),
+                !cancelled
+            );
+            if !cancelled {
+                assert!(
+                    run.events.is_empty(),
+                    "recovery returns metadata, not reconstructed history"
+                );
+                let association: astra_services::runs::ExecutionHandoffRecovery =
+                    serde_json::from_value(
+                        durable.events.last().unwrap()["data"]["execution_handoff_recovery"]
+                            .clone(),
+                    )
+                    .unwrap();
+                assert_eq!(association.producer_generation, 0);
+                assert_eq!(association.recovered_generation, run.run_generation);
+                assert_eq!(durable.last_event_idx, run.last_event_idx);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn recover_active_runs_releases_graceful_checkpoint_for_session_continuation() {
         let engine = test_engine();
         engine
@@ -9297,9 +9525,11 @@ mod tests {
             .await
             .unwrap();
         let stale_running = engine
-            .load_run("user-1", "run-race")
+            .store
+            .claim_recoverable_active_runs(1)
             .await
             .unwrap()
+            .pop()
             .unwrap();
         engine
             .persist_status(

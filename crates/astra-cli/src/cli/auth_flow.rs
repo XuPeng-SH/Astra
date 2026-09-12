@@ -642,14 +642,17 @@ pub(crate) async fn discover_login_website(
     }
 }
 
+fn login_website_host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn validate_login_website(value: &str) -> Result<url::Url, String> {
     let url = url::Url::parse(value).map_err(|_| "Invalid Server login URL")?;
-    let loopback = url.host_str().is_some_and(|h| {
-        h == "localhost"
-            || h.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
+    let loopback = url.host_str().is_some_and(login_website_host_is_loopback);
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()

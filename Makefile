@@ -1089,7 +1089,7 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_offline_or_unknown_status_blocks_without_dispatch
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
@@ -1139,7 +1139,7 @@ test-workspace: sweep
 .PHONY: test-runtime-e2e-hooks
 test-runtime-e2e-hooks: sweep
 	@echo "Running astra-runtime tests with feature e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--features e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:

@@ -1969,6 +1969,9 @@ async fn reconcile_provider_settlement_job(
                 astra_services::InferenceInvocationAdmissionResolution::ExactTerminal => {
                     Ok(ProviderSettlementDisposition::Settled)
                 }
+                astra_services::InferenceInvocationAdmissionResolution::GuidancePending => {
+                    Ok(ProviderSettlementDisposition::Settled)
+                }
                 astra_services::InferenceInvocationAdmissionResolution::ScopeUnavailable => {
                     tracing::warn!(
                         invocation_id = %job.invocation.invocation_id(),
@@ -3011,6 +3014,17 @@ impl DurableInferenceLedger {
             };
 
             match resolution {
+                astra_services::InferenceInvocationAdmissionResolution::GuidancePending => {
+                    drop(admission_guard.into_reservation());
+                    return Err(service_error(
+                        "logical invocation admission recovery",
+                        astra_services::ServiceError::with_source(
+                            astra_services::ServiceErrorKind::Conflict,
+                            "new guidance fenced the recovered inference snapshot",
+                            astra_services::InferenceScopeRejection::GuidancePending,
+                        ),
+                    ));
+                }
                 astra_services::InferenceInvocationAdmissionResolution::Settled
                 | astra_services::InferenceInvocationAdmissionResolution::ExactTerminal => {}
                 astra_services::InferenceInvocationAdmissionResolution::ScopeUnavailable => {
@@ -3128,7 +3142,7 @@ impl DurableInferenceLedger {
                             %e,
                             "LLM call succeeded and its provider attempt terminal was recorded, but logical invocation settlement failed"
                         );
-                        return Err(e);
+                        return Err(super::client::attach_llm_result_details(e, &result));
                     }
                     Ok(result)
                 }
@@ -3234,7 +3248,8 @@ impl DurableInferenceLedger {
                         .settle(NonstreamSettlementCommand::Terminal(terminal_from_result(
                             &result,
                         )))
-                        .await?;
+                        .await
+                        .map_err(|error| super::client::attach_llm_result_details(error, &result))?;
                     Ok(result)
                 }
                 Err(error) => {
@@ -3301,7 +3316,8 @@ impl DurableInferenceLedger {
                     .settle(NonstreamSettlementCommand::Terminal(terminal_from_result(
                         &result,
                     )))
-                    .await?;
+                    .await
+                    .map_err(|error| super::client::attach_llm_result_details(error, &result))?;
                 Ok(result)
             }
             Err(error) => {
@@ -4416,11 +4432,16 @@ fn service_error(
     stage: &'static str,
     error: astra_services::ServiceError,
 ) -> astra_core::ClassifiedError {
+    let scope_rejection = error
+        .source
+        .as_deref()
+        .and_then(|source| source.downcast_ref::<astra_services::InferenceScopeRejection>())
+        .copied();
     let kind = match error.kind {
         astra_services::ServiceErrorKind::Persistence => astra_core::ErrorKind::DatabaseError,
         astra_services::ServiceErrorKind::Network => astra_core::ErrorKind::Network,
         astra_services::ServiceErrorKind::Invalid | astra_services::ServiceErrorKind::NotFound => {
-            astra_core::ErrorKind::InvalidRequest
+            astra_core::ErrorKind::ContractViolation
         }
         astra_services::ServiceErrorKind::Verification
         | astra_services::ServiceErrorKind::Conflict
@@ -4433,9 +4454,25 @@ fn service_error(
                 "source": INFERENCE_LEDGER_ERROR_SOURCE,
                 "stage": stage,
                 "service_error_kind": error.kind.as_str(),
+                "scope_rejection": scope_rejection,
             })
             .to_string(),
         )
+}
+
+pub(crate) fn inference_scope_rejection(
+    error: &astra_core::ClassifiedError,
+) -> Option<astra_services::InferenceScopeRejection> {
+    if !is_ledger_error(error) {
+        return None;
+    }
+    let details: serde_json::Value = serde_json::from_str(error.details_json.as_deref()?).ok()?;
+    serde_json::from_value(details["scope_rejection"].clone()).ok()
+}
+
+pub(crate) fn is_guidance_admission_fence(error: &astra_core::ClassifiedError) -> bool {
+    inference_scope_rejection(error)
+        == Some(astra_services::InferenceScopeRejection::GuidancePending)
 }
 
 fn ledger_timeout_error_for_stage(stage: &'static str) -> astra_core::ClassifiedError {
@@ -6483,7 +6520,7 @@ mod tests {
         };
 
         assert_eq!(failure.logical_attempt, 0);
-        assert_eq!(failure.error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert_eq!(failure.error.kind, astra_core::ErrorKind::ContractViolation);
         assert_eq!(persistence.uncertain_settlements.load(Ordering::SeqCst), 0);
         assert_eq!(persistence.provider_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(coordinator.available_permits(), 1);
@@ -6491,6 +6528,36 @@ mod tests {
             coordinator
                 .close_and_drain(std::time::Duration::from_secs(1))
                 .await
+        );
+    }
+
+    #[test]
+    fn admission_fence_classification_preserves_typed_control_cause() {
+        for reason in [
+            astra_services::InferenceScopeRejection::GuidancePending,
+            astra_services::InferenceScopeRejection::Unavailable,
+        ] {
+            let error = service_error(
+                "provider attempt admission",
+                astra_services::ServiceError::with_source(
+                    astra_services::ServiceErrorKind::NotFound,
+                    "arbitrary diagnostic wording",
+                    reason,
+                ),
+            );
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            assert_eq!(
+                is_guidance_admission_fence(&error),
+                reason == astra_services::InferenceScopeRejection::GuidancePending
+            );
+        }
+        let untyped = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "new user guidance requires a fresh execution snapshot",
+        );
+        assert!(
+            !is_guidance_admission_fence(&untyped),
+            "prose cannot authorize recovery"
         );
     }
 

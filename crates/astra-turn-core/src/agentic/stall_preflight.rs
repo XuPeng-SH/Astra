@@ -21,7 +21,7 @@ pub const REPETITION_THRESHOLD_EVENT: &str = "repetition_threshold";
 pub struct CliAgenticStallPreflightRequest<'a> {
     pub turn_index: u32,
     pub tool_calls_for_guard: &'a [Value],
-    pub turn_sigs: &'a mut Vec<BTreeSet<String>>,
+    pub turn_sigs: &'a mut Vec<BTreeSet<crate::stall::StallSignature>>,
     pub turn_tool_names: &'a mut Vec<HashSet<String>>,
     pub stall_events: &'a mut Vec<(String, u32)>,
     pub turn_guard: &'a mut TurnGuard,

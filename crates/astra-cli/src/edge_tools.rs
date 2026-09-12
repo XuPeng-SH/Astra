@@ -406,6 +406,7 @@ pub(crate) fn nonexecuted_tool_result_fields(
     disposition: astra_services::session_journal::ToolCallDisposition,
 ) -> serde_json::Map<String, Value> {
     serde_json::Map::from_iter([
+        ("executed".to_string(), Value::Bool(false)),
         (
             "result_class".to_string(),
             Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
@@ -1478,12 +1479,6 @@ pub struct ToolExecutor {
     /// activation paths. Keeping them behind one lock prevents impossible
     /// mixed snapshots such as "new activatable names with old visible names".
     current_tool_surface: std::sync::RwLock<ToolSurfaceNames>,
-    /// Deferred tool names whose full schema has been fetched via
-    /// `tool_search(query="select:NAME")`. Names remain materialized in the
-    /// session's retained context until a non-empty runtime surface proves the
-    /// activation stale. Session reset and context restoration own this state;
-    /// a successful call never revokes it.
-    activated_deferred_tools: std::sync::RwLock<HashSet<String>>,
     /// Cached plan-mode authoring flag keyed by the session it was
     /// computed for. Mirrors the server-side write guard so a CLI run
     /// that talks to the same plan store cannot bypass plan mode by
@@ -1542,7 +1537,6 @@ impl ToolExecutor {
             .unwrap_or_else(|_| Client::new()),
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
-            activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -1635,10 +1629,9 @@ impl ToolExecutor {
                 }
             })
         }));
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
-        *guard = ToolSurfaceNames::installed(names, HashSet::new());
+        *guard = ToolSurfaceNames::installed_with_schemas(schemas, HashSet::new());
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
@@ -1691,69 +1684,6 @@ impl ToolExecutor {
             .lock()
             .ok()
             .and_then(|mut g| g.take())
-    }
-
-    /// Names of deferred tools currently materialized for schema injection.
-    /// Stale entries are pruned against the current visible/activatable
-    /// surface so this side set cannot become a long-lived allowlist.
-    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let surface =
-            self.current_tool_surface_snapshot("current_tool_surface_activation_retention");
-        if matches!(surface, ToolSurfaceNames::Uninstalled) {
-            return Vec::new();
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_prune",
-        );
-        let retained =
-            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_tool_names(
-                &guard,
-                &surface,
-                |name| self.tool_has_runtime_binding(name),
-            );
-        // Use set-based comparison, not length comparison: same-count with
-        // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
-        let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
-        let before = guard.len();
-        guard.retain(|name| retained_set.contains(name.as_str()));
-        let after = guard.len();
-        tracing::debug!(before, after, "pruned CLI activated_deferred_tools entries");
-        retained
-    }
-
-    /// Return deferred tools materialized by retained conversation context for
-    /// the next schema-selection round. Calls do not consume this state: a
-    /// schema admitted to the model remains admitted until context/session
-    /// reset or a real surface change.
-    pub fn activated_deferred_tool_names_for_schema_injection(&self) -> Vec<String> {
-        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation_take");
-        if matches!(surface, ToolSurfaceNames::Uninstalled) {
-            return Vec::new();
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_take",
-        );
-        let before = guard.len();
-        let retained =
-            astra_turn_core::tool::deferred_activation::activated_tool_names_for_schema_injection(
-                &mut guard,
-                &surface,
-                |name| self.tool_has_runtime_binding(name),
-            );
-        let after = guard.len();
-        if before > 0 {
-            tracing::debug!(
-                before,
-                after,
-                returned = retained.len(),
-                "resolved CLI activated_deferred_tools for schema injection"
-            );
-        }
-        retained
     }
 
     /// Set the spawn context for agent spawning.
@@ -1843,11 +1773,10 @@ impl ToolExecutor {
     /// Install the visible `tools[]` names for the current LLM request.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
         let visible_schemas = self.runtime_bound_tool_schemas(schemas.to_vec());
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let activatable = guard.activatable().cloned().unwrap_or_default();
-        *guard = ToolSurfaceNames::installed(names, activatable);
+        *guard = ToolSurfaceNames::installed_with_schemas(visible_schemas, activatable);
     }
 
     /// Install the names that this turn's deferred manifest allows
@@ -1857,7 +1786,12 @@ impl ToolExecutor {
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let visible = guard.visible().cloned().unwrap_or_default();
-        *guard = ToolSurfaceNames::installed(visible, names);
+        let visible_schemas = guard.visible_schemas().unwrap_or_default().to_vec();
+        *guard = ToolSurfaceNames::Installed {
+            visible,
+            activatable: names,
+            visible_schemas: std::sync::Arc::new(visible_schemas),
+        };
     }
 
     /// Reconcile a Server-owned wire-schema admission into the Edge executor.
@@ -1887,13 +1821,6 @@ impl ToolExecutor {
                 visible.insert(name.to_string());
             }
         }
-        drop(surface);
-
-        rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_server_admission",
-        )
-        .insert(name.to_string());
         Ok(())
     }
 
@@ -1908,35 +1835,10 @@ impl ToolExecutor {
         activatable_names: HashSet<String>,
     ) {
         let visible_schemas = self.runtime_bound_tool_schemas(visible_schemas.to_vec());
-        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let activatable = self.runtime_bound_tool_names(activatable_names);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
-        *guard = ToolSurfaceNames::installed(visible, activatable);
-    }
-
-    pub(crate) fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
-        let restored: HashSet<String> = names
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        {
-            let mut surface = rwlock_write_reset_on_poison(
-                &self.current_tool_surface,
-                "current_tool_surface_restore_deferred_activation",
-            );
-            if !restored.is_empty() && matches!(*surface, ToolSurfaceNames::Uninstalled) {
-                *surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
-            }
-        }
-
-        *rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_restore",
-        ) = restored;
+        *guard = ToolSurfaceNames::installed_with_schemas(visible_schemas, activatable);
     }
 
     #[cfg(test)]
@@ -1945,11 +1847,6 @@ impl ToolExecutor {
             &self.current_tool_surface,
             "current_tool_surface_test_clear",
         ) = ToolSurfaceNames::default();
-        rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_test_clear",
-        )
-        .clear();
     }
 
     /// Snapshot of the names that the model's `<deferred-tools>` manifest
@@ -1959,6 +1856,17 @@ impl ToolExecutor {
         self.current_tool_surface_snapshot("current_tool_surface_snapshot")
             .activatable()
             .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the exact provider-facing schemas from the last outbound
+    /// request.  Retention uses this structural snapshot so a follow-up
+    /// surface never replaces a compact/provider-specific schema with the
+    /// richer canonical catalog entry.
+    pub fn current_visible_tool_schemas_snapshot(&self) -> Vec<Value> {
+        self.current_tool_surface_snapshot("current_visible_tool_schemas_snapshot")
+            .visible_schemas()
+            .map(|schemas| schemas.to_vec())
             .unwrap_or_default()
     }
 
@@ -2267,66 +2175,26 @@ impl ToolExecutor {
         }
 
         let can_select = surface.activatable_contains(name);
-        use astra_turn_core::tool::deferred_activation::{
-            DirectDeferredCallAdmission, classify_direct_deferred_call,
-            direct_deferred_call_activation_message, tool_not_admitted_message,
-        };
-
-        match classify_direct_deferred_call(name, can_select, |tool_name| {
-            self.tool_has_runtime_binding(tool_name)
-        }) {
-            DirectDeferredCallAdmission::Activate {
-                name: activated_name,
-            } => {
-                // Direct deferred call: the model called a tool advertised in
-                // `<deferred-tools>` without first selecting it via
-                // `tool_search(select:NAME)`. Treat as activation intent —
-                // record the name so the next turn's `tools[]` includes the
-                // full schema, then ask the model to retry. Do NOT execute:
-                // the args are untrusted because the schema was not visible.
-                let mut guard = rwlock_write_reset_on_poison(
-                    &self.activated_deferred_tools,
-                    "activated_deferred_tools_direct_call",
-                );
-                astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(
-                    &mut guard,
-                    [activated_name.clone()],
-                );
-                return Some(EdgeToolRun::classified_error(
-                    direct_deferred_call_activation_message(&activated_name),
-                    astra_core::ErrorKind::ToolBinding,
-                ));
-            }
-            DirectDeferredCallAdmission::NotAdmitted => {
-                return Some(EdgeToolRun::classified_error(
-                    tool_not_admitted_message(name, true),
-                    astra_core::ErrorKind::ToolBinding,
-                ));
-            }
-            DirectDeferredCallAdmission::Unknown => {}
+        // A deferred target cannot be called by its own name merely because
+        // it appeared in discovery metadata.  Older clients turned such a
+        // call into a mutable name-only activation and reinjected the full
+        // schema next round, which both widened authority and changed the
+        // provider prefix.  The only transition is now
+        // `tool_search(select:NAME)` followed by the stable `invoke_tool`
+        // carrier, whose schema-addressed evidence is resolved by the shared
+        // admission path.
+        if can_select {
+            return Some(EdgeToolRun::classified_error(
+                format!(
+                    "Tool '{name}' is deferred. Call tool_search with query 'select:{name}', then invoke it through invoke_tool."
+                ),
+                astra_core::ErrorKind::ToolBinding,
+            ));
         }
         Some(EdgeToolRun::classified_error(
-            tool_not_admitted_message(name, can_select),
+            astra_turn_core::tool::deferred_activation::tool_not_admitted_message(name, false),
             astra_core::ErrorKind::ToolBinding,
         ))
-    }
-
-    fn record_tool_search_activation_output(&self, output: &str) {
-        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation");
-        let names = astra_turn_core::tool::deferred_activation::recordable_activated_tool_names(
-            output,
-            &surface,
-            |name| self.tool_has_runtime_binding(name),
-        );
-        if names.is_empty() {
-            return;
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools",
-        );
-        astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(&mut guard, names);
     }
 
     pub(crate) fn runtime_bound_provider_owned_schemas_excluding(
@@ -4767,7 +4635,25 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> EdgeToolRun {
-        if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
+        let argument_validation = if astra_runtime_env::ToolRegistry::builtins()
+            .get(name)
+            .is_none()
+        {
+            self.provider_owned_schemas_snapshot("provider_owned_schema_argument_validation")
+                .into_iter()
+                .find(|schema| {
+                    astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                })
+                .map(|schema| {
+                    astra_tools::schemas::validate_tool_arguments_against_schema(
+                        name, args, &schema,
+                    )
+                })
+                .unwrap_or(Ok(()))
+        } else {
+            astra_tools::schemas::validate_tool_arguments(name, args)
+        };
+        if let Err(error) = argument_validation {
             let evidence = error.failure_evidence();
             return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
@@ -5107,11 +4993,7 @@ impl ToolExecutor {
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => {
-                    let output = self.tool_search(args);
-                    self.record_tool_search_activation_output(&output);
-                    output
-                }
+                "tool_search" => self.tool_search(args),
                 "read_file" => {
                     let (output, fields) = self.read_file_with_metadata(args);
                     *tool_result_fields = fields;
@@ -5126,6 +5008,7 @@ impl ToolExecutor {
                         } else {
                             self.write_file_with_applied(args)
                         };
+                    let mut output = output;
                     if applied {
                         tool_result_fields
                             .get_or_insert_with(Default::default)
@@ -5140,21 +5023,32 @@ impl ToolExecutor {
                             astra_tools::workspace_observation::workspace_file_state_identity(
                                 content.as_bytes(),
                             );
-                        let desired_state = astra_tools::fs_ops::write_file_desired_state_identity(
-                            &self.project_root,
-                            args,
-                        )
-                        .unwrap_or_else(|| requested_state.clone());
-                        tool_result_fields
-                            .get_or_insert_with(Default::default)
-                            .insert(
-                                astra_tools::workspace_observation::DESIRED_STATE_CONVERGED_FIELD
-                                    .to_string(),
-                                astra_tools::workspace_observation::workspace_desired_state_convergence_marker(
-                                    &requested_state,
-                                    &desired_state,
-                                ),
+                        if let Some(desired_state) =
+                            astra_tools::fs_ops::write_file_desired_state_identity(
+                                &self.project_root,
+                                args,
+                            )
+                        {
+                            tool_result_fields
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    astra_tools::workspace_observation::DESIRED_STATE_CONVERGED_FIELD
+                                        .to_string(),
+                                    astra_tools::workspace_observation::workspace_desired_state_convergence_marker(
+                                        &requested_state,
+                                        &desired_state,
+                                    ),
+                                );
+                        } else {
+                            // A successful no-op writer must always have a
+                            // typed desired state. Do not mint a weaker
+                            // marker from display/request text when the
+                            // canonical state function cannot bind the call.
+                            *source_is_error = Some(true);
+                            output.push_str(
+                                "\n\nError: write_file no-op did not produce a typed desired state; no convergence authority was issued.",
                             );
+                        }
                     }
                     output
                 }
@@ -6383,6 +6277,7 @@ mod tests {
                 model_context_window_tokens: Some(1_000_000),
                 effective_input_limit_tokens: Some(800_000),
                 estimated_input_tokens: Some(12_345),
+                estimated_cache_eligible_tokens: None,
                 token_pressure: Some(12_345.0 / 800_000.0),
                 compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
             },
@@ -6893,6 +6788,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowed_absolute_noop_write_does_not_recheck_with_workspace_only_resolver() {
+        let (project, executor) = temp_executor();
+        let external = tempfile::tempdir_in("/var/tmp").expect("allowed external directory");
+        let target = external.path().join("post-receive");
+        let content = "#!/bin/sh\nexit 0\n";
+        std::fs::write(&target, content).expect("target");
+
+        let result = executor
+            .execute_with_invocation_metadata(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": content,
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: Some("run-external-noop"),
+                    turn_chain_id: Some("turn-external-noop"),
+                    tool_call_id: Some("call-external-noop"),
+                    admission_source: None,
+                    expected_control_epoch: None,
+                },
+            )
+            .await;
+
+        assert!(
+            !result.is_error,
+            "an explicitly allowed absolute no-op must not fail its typed writer check: {result:?}"
+        );
+        assert!(
+            result.output.contains("already_desired"),
+            "the owner should report the idempotent outcome: {result:?}"
+        );
+        assert!(project.path().exists());
+    }
+
+    #[tokio::test]
     async fn structured_writer_failure_cannot_mint_a_mutation_receipt() {
         let (dir, executor) = temp_executor();
         let outcome = executor
@@ -7269,6 +7200,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_dynamic_provider_schema_rejects_invalid_arguments_before_dispatch() {
+        let executor = test_executor();
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "custom_weather",
+                "description": "Get a forecast.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_visible_tool_schemas(&[schema]);
+
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"city": 42}),
+            serde_json::json!({"city": "Shanghai", "extra": true}),
+        ] {
+            let output = executor.execute("custom_weather", &args).await;
+            assert!(
+                output.contains("Invalid arguments for tool `custom_weather`"),
+                "dynamic schema rejection must happen before handler dispatch: {output}"
+            );
+            assert!(!output.contains("not implemented by the CLI executor"));
+        }
+
+        let valid = executor
+            .execute("custom_weather", &serde_json::json!({"city": "Shanghai"}))
+            .await;
+        assert!(
+            valid.contains("not implemented by the CLI executor"),
+            "only a schema-valid call may reach provider handler dispatch: {valid}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn cli_run_script_is_explicit_shared_tool_delegate() {
         let scope = astra_sandbox::apply_process_scope();
@@ -7432,6 +7404,11 @@ mod tests {
             surface.visible().cloned().unwrap_or_default(),
             HashSet::from(["read_file".to_string()]),
             "manual visible-surface installation must not admit internal helper schemas"
+        );
+        assert_eq!(
+            executor.current_visible_tool_schemas_snapshot(),
+            vec![function_schema("read_file")],
+            "the executor must retain the exact runtime-bound schema snapshot"
         );
         assert!(
             surface
@@ -9009,7 +8986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_deferred_tool_call_activates_without_executing_on_cli_path() {
+    async fn direct_deferred_tool_call_requires_the_carrier_protocol_on_cli_path() {
         let executor = test_executor();
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
@@ -9024,10 +9001,9 @@ mod tests {
         )
         .await;
         assert_tool_error_kind(&before, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "direct deferred call must record activation for the next schema-selection round"
+        assert!(
+            before.output.contains("invoke_tool"),
+            "a direct deferred name must receive the carrier recovery protocol: {before:?}"
         );
 
         let search = executor
@@ -9042,65 +9018,6 @@ mod tests {
             vec!["session".to_string()]
         );
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()]
-        );
-
-        let after = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "session",
-            &serde_json::json!({"action": "history_page"}),
-        )
-        .await;
-        assert_tool_error_kind(&after, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["session".to_string()],
-            "schema assembly should surface the selected deferred tool"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "schema assembly must preserve retained deferred materialization"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["session".to_string()],
-            "repeated schema assembly must keep the selected tool available"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "activation must remain available while conversation context retains it"
-        );
-
-        executor.set_current_visible_tool_schemas(&[
-            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
-            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
-            serde_json::json!({"type": "function", "function": {"name": "session"}}),
-        ]);
-        executor.set_current_activatable_tool_names(HashSet::new());
-        let injected = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "session",
-            &serde_json::json!({"action": "history_page"}),
-        )
-        .await;
-        assert_ne!(
-            injected
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("error_kind"))
-                .and_then(serde_json::Value::as_str),
-            Some(astra_core::ErrorKind::ToolBinding.as_str()),
-            "a visible tool call must reach its executor instead of the deferred binding gate: {injected:?}"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "a successful call must not revoke retained schema materialization"
-        );
     }
 
     #[test]
@@ -9130,10 +9047,6 @@ mod tests {
                 "Edge must not independently reject Server-visible {tool}"
             );
         }
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string(), "web_fetch".to_string()]
-        );
         assert!(
             executor
                 .accept_server_tool_surface_admission("definitely_unbound_tool")
@@ -9158,10 +9071,6 @@ mod tests {
         )
         .await;
         assert_tool_error_kind(&activation, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
-        );
 
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
@@ -9169,11 +9078,6 @@ mod tests {
         ]);
         executor.set_current_activatable_tool_names(HashSet::new());
 
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale activation must be pruned once the tool is neither visible nor activatable"
-        );
         let denied = astra_tools::ToolExecutor::execute_with_metadata(
             &executor,
             "memory",
@@ -9608,11 +9512,6 @@ mod tests {
             tool_search_string_array(&parsed, "missing"),
             vec!["mcp__weather".to_string()]
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale MCP schemas must not create deferred activation state"
-        );
     }
 
     #[test]
@@ -9680,59 +9579,6 @@ mod tests {
                 .and_then(|fields| fields.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolBinding.as_str())
-        );
-    }
-
-    #[test]
-    fn restored_activated_deferred_tool_survives_first_schema_injection() {
-        let executor = test_executor();
-        executor.restore_activated_deferred_tool_names_for_session(&[
-            "memory".to_string(),
-            " ".to_string(),
-        ]);
-
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "session restore should seed valid pending activation"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
-            "restored activation must survive until the first schema-injection opportunity"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "schema injection preserves retained deferred materialization"
-        );
-    }
-
-    #[test]
-    fn activated_deferred_tool_is_pruned_when_runtime_binding_disappears() {
-        let executor = test_executor();
-        executor.set_current_visible_tool_schemas(&[serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__weather",
-                "description": "Get weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
-                }
-            }
-        })]);
-        executor
-            .activated_deferred_tools
-            .write()
-            .unwrap()
-            .insert("mcp__weather".to_string());
-
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale visible MCP schemas must not retain activation after runtime binding disappears"
         );
     }
 
@@ -9847,20 +9693,18 @@ mod tests {
         let session_dir = astra_services::SessionArtifactStore::session_dir(&store, session_id)
             .expect("safe session id resolves to its artifact directory");
         let content = "checked evidence 😀\n".repeat(4_000);
-        assert!(
-            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
-                &session_dir,
-                "call-artifact-cli",
-                "git",
-                &content,
-            )
-            .is_some(),
-            "setup must create an oversized session artifact"
-        );
-
-        let artifact = astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            &session_dir,
+            "run-artifact-cli",
             "call-artifact-cli",
-        );
+            "git",
+            &content,
+        )
+        .expect("setup must create an oversized immutable session artifact");
+        let artifact =
+            astra_turn_core::tool_result_storage::session_tool_result_artifact_uri_for_descriptor(
+                &persisted.descriptor,
+            );
         let active = test_executor().with_active_session_id(session_id);
         let first = active.handle_introspect(&serde_json::json!({
             "artifact": artifact,

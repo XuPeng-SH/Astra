@@ -73,6 +73,34 @@ const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration:
 /// the Server never receives a rounded-up execution slice.
 const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+async fn settle_one_shot_stream_event_writer(
+    writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    terminal_deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    let Some(mut writer) = writer else {
+        return Ok(());
+    };
+
+    let result = if let Some(deadline) = terminal_deadline {
+        let writer_budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(std::time::Duration::from_secs(5));
+        match tokio::time::timeout(writer_budget, &mut writer).await {
+            Ok(result) => result,
+            Err(_) => {
+                writer.abort();
+                return Err("request wall deadline stream-event writer did not settle".to_string());
+            }
+        }
+    } else {
+        writer.await
+    };
+
+    result
+        .map_err(|error| format!("stream-event writer task failed: {error}"))?
+        .map_err(|error| format!("stream-event file write failed: {error}"))
+}
+
 fn durable_run_is_terminal(status: Option<&str>) -> bool {
     matches!(status, Some("completed" | "failed" | "cancelled"))
 }
@@ -248,7 +276,11 @@ pub(crate) fn persist_headless_session_state(
             let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
                 source_cursor: Some(persisted.cursor),
                 recent_tools: sr.tools_used.clone(),
-                activated_deferred_tool_names: sr.activated_deferred_tool_names.clone(),
+                deferred_tool_activations:
+                    astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                        &sr.final_messages,
+                        sr.deferred_tool_activations.clone(),
+                    ),
                 ..Default::default()
             };
             match crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
@@ -958,7 +990,7 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let (mut continuation_messages, activated_deferred_tool_names) =
+            let (mut continuation_messages, deferred_tool_activations) =
                 session_routing.continuation_turn_inputs()?;
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = PermissionManager::with_load_policy(
@@ -998,7 +1030,7 @@ async fn execute_cli_command_impl(
             };
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
-                activated_deferred_tool_names,
+                deferred_tool_activations,
                 turn_index: Some(session_routing.next_server_turn_index()),
                 request_session_execution_lease: Some(request_session_execution_lease.clone()),
                 ..Default::default()
@@ -1499,7 +1531,7 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let (mut continuation_messages, activated_deferred_tool_names) =
+            let (mut continuation_messages, deferred_tool_activations) =
                 session_routing.continuation_turn_inputs()?;
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
@@ -1608,7 +1640,7 @@ async fn execute_cli_command_impl(
             });
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
-                activated_deferred_tool_names,
+                deferred_tool_activations,
                 append_system_prompt: args.append_system_prompt.clone(),
                 execution_time_budget: one_shot_execution_time_budget,
                 disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
@@ -1795,43 +1827,7 @@ async fn execute_cli_command_impl(
             // Child progress shares the root stream. Close and flush it only
             // after every terminal child event has had a chance to arrive.
             drop(chat_ctx);
-            if let Some(mut handle) = stream_event_writer {
-                if let Some(deadline) = terminal_deadline {
-                    let writer_budget = deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .min(std::time::Duration::from_secs(5));
-                    match tokio::time::timeout(writer_budget, &mut handle).await {
-                        Err(_) => {
-                            handle.abort();
-                            terminal_settlement_error = Some(
-                                "request wall deadline stream-event writer did not settle"
-                                    .to_string(),
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            terminal_settlement_error =
-                                Some(format!("stream-event writer task failed: {error}"));
-                        }
-                        Ok(Ok(Err(error))) => {
-                            terminal_settlement_error =
-                                Some(format!("stream-event file write failed: {error}"));
-                        }
-                        Ok(Ok(Ok(()))) => {}
-                    }
-                } else {
-                    match handle.await {
-                        Err(error) => {
-                            terminal_settlement_error =
-                                Some(format!("stream-event writer task failed: {error}"));
-                        }
-                        Ok(Err(error)) => {
-                            terminal_settlement_error =
-                                Some(format!("stream-event file write failed: {error}"));
-                        }
-                        Ok(Ok(())) => {}
-                    }
-                }
-            }
+            settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await?;
 
             let mut sr = match turn_result {
                 Ok(sr) => sr,
@@ -2779,7 +2775,7 @@ pub(crate) async fn run_print_mode(
         session_routing.restored_permission_mode(),
         true,
     )?;
-    let (mut continuation_messages, activated_deferred_tool_names) =
+    let (mut continuation_messages, deferred_tool_activations) =
         session_routing.continuation_turn_inputs()?;
     let _pipeline = create_pipeline_modules(api, profile);
     // Print mode is non-interactive. Restored session mode wins when present;
@@ -2846,7 +2842,7 @@ pub(crate) async fn run_print_mode(
 
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
-        activated_deferred_tool_names,
+        deferred_tool_activations,
         turn_index: Some(session_turn),
         request_session_execution_lease: Some(request_session_execution_lease.clone()),
         ..Default::default()
@@ -3154,7 +3150,8 @@ mod exit_code_tests {
     use super::{
         ExitCode, StreamResult, WALL_BUDGET_REQUEST_SAFETY_MARGIN,
         WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN, apply_wall_deadline_interruption,
-        compute_exit_code, durable_run_is_terminal, stream_result_from_incremental_snapshot,
+        compute_exit_code, durable_run_is_terminal, settle_one_shot_stream_event_writer,
+        stream_result_from_incremental_snapshot,
     };
     use crate::cli::stream::streaming_types::VerdictEvent;
 
@@ -3198,6 +3195,40 @@ mod exit_code_tests {
         assert!(durable_run_is_terminal(Some("completed")));
         assert!(durable_run_is_terminal(Some("failed")));
         assert!(durable_run_is_terminal(Some("cancelled")));
+    }
+
+    #[tokio::test]
+    async fn one_shot_stream_event_writer_propagates_enospc_with_and_without_deadline() {
+        let expected = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        for terminal_deadline in [
+            None,
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        ] {
+            let writer = tokio::spawn(async {
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+
+            let error = settle_one_shot_stream_event_writer(Some(writer), terminal_deadline)
+                .await
+                .expect_err("an explicitly requested stream-event sink must not fail silently");
+
+            assert_eq!(error, format!("stream-event file write failed: {expected}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_stream_event_writer_accepts_disabled_and_successful_sinks() {
+        settle_one_shot_stream_event_writer(None, None)
+            .await
+            .expect("a disabled stream-event sink has nothing to settle");
+
+        let writer = tokio::spawn(async { Ok(()) });
+        settle_one_shot_stream_event_writer(
+            Some(writer),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("a successful stream-event sink must preserve command success");
     }
 
     #[test]
@@ -3967,8 +3998,16 @@ mod one_shot_persistence_tests {
         let mut result = crate::tests::stub_stream_result("manifest inspected");
         result.session_id = Some(sid.clone());
         result.tools_used = vec!["read_file".to_string()];
-        result.activated_deferred_tool_names = vec!["github".to_string()];
         result.tool_calls_count = 1;
+        // The selecting tool-search message may already have been compacted
+        // out of this one-shot transcript. Its typed digest evidence must
+        // survive independently, then be revalidated against the next turn's
+        // current capability-scoped deferred catalog.
+        result.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "memory".to_string(),
+            schema_digest: "sha256:memory-v1".to_string(),
+            descriptor: None,
+        }];
         result.final_messages = vec![
             serde_json::json!({"role": "user", "content": "inspect Cargo.toml"}),
             serde_json::json!({
@@ -4028,9 +4067,8 @@ mod one_shot_persistence_tests {
             crate::cli::session::session_continuation::load_csl_continuation(&sid)
                 .unwrap()
                 .unwrap()
-                .activated_deferred_tool_names,
-            vec!["github"],
-            "one-shot settlement must make deferred activation durable for the next process"
+                .deferred_tool_activations,
+            result.deferred_tool_activations
         );
     }
 
@@ -4303,7 +4341,6 @@ mod one_shot_persistence_tests {
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
             tool_call_records: Vec::new(),
             budget_used: 0,
             budget_pressure: 0.0,
@@ -4328,6 +4365,7 @@ mod one_shot_persistence_tests {
             server_terminal_authoritative: false,
             tool_record_coverage_partial: false,
             final_messages: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
@@ -4436,7 +4474,6 @@ mod one_shot_persistence_tests {
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
             tool_call_records: Vec::new(),
             budget_used: 0,
             budget_pressure: 0.0,
@@ -4461,6 +4498,7 @@ mod one_shot_persistence_tests {
             server_terminal_authoritative: false,
             tool_record_coverage_partial: false,
             final_messages: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),

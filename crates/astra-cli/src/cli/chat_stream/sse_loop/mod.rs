@@ -6,7 +6,6 @@
 
 mod agentic_loop_turn;
 mod agentic_sse_loop;
-mod deferred_activation_state;
 mod server_admission_host;
 
 pub(crate) use agentic_loop_turn::{
@@ -564,7 +563,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref mgr) = p.mcp_manager {
         executor.install_mcp_bundle(mgr.clone(), mcp_runtime_schemas);
     }
-    deferred_activation_state::restore_into_executor(&p.activated_deferred_tool_names, &executor);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
@@ -657,10 +655,24 @@ pub(crate) async fn stream_chat_sse(
         TurnGuard::with_health_and_profile(health, task_profile)
     };
 
-    let max_turns = {
+    let runtime_ceiling = {
         let cfg = astra_config::RuntimeConfig::cached();
-        cfg.runtime_limits.resolve_turn_ceiling(p.is_plan_subtask)
+        cfg.runtime_limits
+            .resolve_turn_ceiling(p.is_plan_subtask)
+            .map_err(|error| crate::TurnFailure {
+                error,
+                partial: crate::PartialTurnData {
+                    session_id: p.session_id.map(str::to_string),
+                    ..Default::default()
+                },
+            })?
     };
+    let agentic_turn_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+        task_profile,
+        runtime_ceiling,
+        None,
+    );
+    let max_turns = agentic_turn_budget.initial_turns;
     let current_user_id = cli_user_id();
     let step_recorder = step_recorder_for_cli_turn(
         &current_user_id,
@@ -815,6 +827,14 @@ pub(crate) async fn stream_chat_sse(
         })
         .clone();
 
+    let deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+            &messages,
+            p.deferred_tool_activations
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
+        );
     let mut state = AgenticLoopState {
         observation_journal: Default::default(),
         tool_ledger_receipt: Default::default(),
@@ -847,8 +867,10 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
-        agentic_turn_budget: task_profile.agentic_turn_budget,
+        charged_iterations: 0,
+        agentic_turn_budget,
         budget_is_explicit: false,
+        loop_entry: Default::default(),
         current_round_index: 0,
         llm_rounds_completed: 0,
         last_request_message_count: None,
@@ -867,31 +889,13 @@ pub(crate) async fn stream_chat_sse(
         max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
         repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-        stall: StallTrackingState {
-            workspace_observation_quarantine: p.workspace_observation_quarantine.clone(),
-            work_unit_observations: Default::default(),
-            active_work_registry: None,
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            events: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            server_terminal_unverified: false,
-            execution_escalation_advisory_emitted: false,
-            work_evidence_advisory_emitted: false,
-            parallel_batching_advisory_emitted: false,
-            repetition_advisory_emitted: false,
-            introspection_count: 0,
-            cache_waste_advisory_emitted: false,
-            active_policy_feedback: Default::default(),
-            runtime_policy_evaluation: Default::default(),
-            nudge_count: 0,
-            circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+        stall: {
+            let mut stall = StallTrackingState::default();
+            stall.workspace_observation_quarantine = p.workspace_observation_quarantine.clone();
+            stall.circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
-            ),
-            guardrail_tuner: astra_runtime::config_admin::guardrail::GuardrailTuner::default(),
-            guardrail_tuner_records_cursor: 0,
+            );
+            stall
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
@@ -937,11 +941,13 @@ pub(crate) async fn stream_chat_sse(
             quality_tracker: p.skill_quality_tracker.clone(),
             quality_tracker_baseline: p.skill_quality_tracker.clone(),
             improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            discovered: discovered_skills,
+            execution: astra_runtime::turn::agentic_loop::host::SkillExecutionState {
+                discovered: discovered_skills,
+                ..Default::default()
+            },
             tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&project_root),
             session_event_hooks: astra_skills::hooks::load_session_event_hooks(&project_root),
             listing_message: None,
-            invoked: std::collections::HashMap::new(),
             ..Default::default()
         },
         hooks: StopHookState {
@@ -990,7 +996,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message.to_string(),
         user_intent: p.user_intent.to_string(),
         recent_tools: p.recent_tools.to_vec(),
-        activated_deferred_tool_names: host.executor.activated_deferred_tool_names(),
+        deferred_tool_activations,
         has_prior_assistant_turn: false,
         turn_intent: None,
         task_profile,
@@ -1134,13 +1140,12 @@ pub(crate) async fn stream_chat_sse(
             .map(|failure| failure.message().to_string()),
     };
     if let Some(error) = loop_failure {
-        deferred_activation_state::snapshot_from_executor(
-            &mut p.activated_deferred_tool_names,
-            host.executor.as_ref(),
-        );
+        if let Some(slot) = &mut p.deferred_tool_activations {
+            **slot = state.deferred_tool_activations.clone();
+        }
         finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
-            *shared = state.skills.discovered.clone();
+            *shared = state.skills.execution.discovered.clone();
         }
         let (tool_calls_count, tools_used) = resolved_tool_metrics(
             state.total_tool_calls,
@@ -1198,15 +1203,13 @@ pub(crate) async fn stream_chat_sse(
     let post_loop_projection_started_at = Instant::now();
 
     // ─── Finalize ────────────────────────────────────────────────────────
-    deferred_activation_state::snapshot_from_executor(
-        &mut p.activated_deferred_tool_names,
-        host.executor.as_ref(),
-    );
-    let activated_deferred_tool_names = host.executor.activated_deferred_tool_names();
+    if let Some(slot) = &mut p.deferred_tool_activations {
+        **slot = state.deferred_tool_activations.clone();
+    }
     // Merge skill quality data back to session-scoped tracker
     *p.skill_quality_tracker = state.skills.quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
-        *shared = state.skills.discovered.clone();
+        *shared = state.skills.execution.discovered.clone();
     }
     finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
 
@@ -1333,7 +1336,6 @@ pub(crate) async fn stream_chat_sse(
         first_surface_report: state.telemetry.first_selection_report,
         selected_skills: state.telemetry.all_selected_skills,
         tools_used: state.telemetry.all_tools_used,
-        activated_deferred_tool_names,
         tool_call_records: state.stall.tool_call_records,
         budget_pressure: state.telemetry.first_budget_pressure,
         stall_events: state.stall.events,
@@ -1368,6 +1370,7 @@ pub(crate) async fn stream_chat_sse(
             }),
         tool_record_coverage_partial: state.telemetry.server_record_gap_observed,
         final_messages,
+        deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,
         applied_user_intents,
     });

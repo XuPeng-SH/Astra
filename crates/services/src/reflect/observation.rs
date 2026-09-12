@@ -88,13 +88,18 @@ pub(super) fn build_observation_envelope(
     observations.extend(insight_obs);
     evidence.extend(insight_ev);
 
+    let graph_evidence = build_graph_evidence(evidence_graph);
     if observations.is_empty() {
-        observations.push(build_fallback_session_observation(
-            &summary, overview, request, session_id,
-        ));
+        let mut observation =
+            build_fallback_session_observation(&summary, overview, request, session_id);
+        observation.evidence_refs = graph_evidence
+            .iter()
+            .map(|item| item.ref_id.clone())
+            .collect();
+        observations.push(observation);
     }
 
-    evidence.extend(build_graph_evidence(evidence_graph));
+    evidence.extend(graph_evidence);
 
     let action_hints =
         build_action_hints_from_recommendations(recommendations, &observations, session_id);

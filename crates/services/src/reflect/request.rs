@@ -65,7 +65,7 @@ impl ReflectRequest {
         Self {
             topic,
             facet,
-            depth: ObservationDepth::from_arg(depth.unwrap_or("diagnostic")),
+            depth: ObservationDepth::from_arg(depth.unwrap_or("summary")),
             horizon: ObservationHorizon::from_arg(horizon.unwrap_or("session")),
             source_policy: SourcePolicy::from_arg(source_policy.unwrap_or("auto")),
             include_context,
@@ -345,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn omitted_depth_prefers_summary_without_weakening_explicit_diagnostics() {
+        let default = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
+        assert_eq!(default.depth, ObservationDepth::Summary);
+        for (value, expected) in [
+            ("diagnostic", ObservationDepth::Diagnostic),
+            ("forensic", ObservationDepth::Forensic),
+        ] {
+            let explicit =
+                ReflectRequest::from_observation_params(None, None, Some(value), None, 20, "");
+            assert_eq!(explicit.depth, expected);
+        }
+        assert_eq!(
+            ReflectRequest::decision_trace(20, "why").depth,
+            ObservationDepth::Diagnostic
+        );
+    }
+
+    #[test]
     fn default_request_is_overview_without_legacy_input() {
         let request = ReflectRequest::from_observation_params(
             None,
@@ -378,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_minimal_depth_alias_defaults_to_diagnostic() {
+    fn removed_minimal_depth_alias_uses_summary_default() {
         let request = ReflectRequest::from_observation_params(
             Some("execution"),
             Some("errors"),

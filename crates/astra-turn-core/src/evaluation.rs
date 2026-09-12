@@ -992,10 +992,21 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
 fn unresolved_tool_outcome_failure_counts(
     records: &[ToolCallRecord],
 ) -> std::collections::BTreeMap<String, usize> {
-    let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
+    unresolved_tool_outcome_fact_counts(
+        &records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect::<Vec<_>>(),
+    )
+}
 
-    for (record_index, record) in records.iter().enumerate() {
-        let disposition = record.effective_disposition();
+fn unresolved_tool_outcome_fact_counts(
+    facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut unresolved_by_key = std::collections::BTreeMap::<EvaluationOutcomeKey, String>::new();
+
+    for (record_index, record) in facts.iter().enumerate() {
+        let disposition = record.disposition;
         if !matches!(
             disposition,
             astra_services::session_journal::ToolCallDisposition::Executed
@@ -1011,7 +1022,7 @@ fn unresolved_tool_outcome_failure_counts(
         // `execution_error` means route/launch setup was attempted and failed
         // before the executor could report an Executed disposition.
         if disposition == astra_services::session_journal::ToolCallDisposition::Rejected
-            && effective_tool_result_class(record).as_deref() != Some("execution_error")
+            && record.effective_result_class.as_deref() != Some("execution_error")
         {
             continue;
         }
@@ -1024,20 +1035,13 @@ fn unresolved_tool_outcome_failure_counts(
         // signal and must not be double-counted as unresolved execution.
         if disposition == astra_services::session_journal::ToolCallDisposition::Executed
             && !record.ok
-            && !record_is_non_failure_outcome(record)
+            && !record.non_failure_outcome
         {
-            let key = outcome_resolution_key(record).unwrap_or_else(|| {
-                fallback_tool_outcome_identity(record).unwrap_or_else(|| {
-                    // Without structured class, arguments, preview, or a
-                    // provider call id, there is no safe success-to-failure
-                    // identity. Keep the failure visible under a unique
-                    // opaque key instead of allowing another same-named call
-                    // to erase it.
-                    format!("tool::{}::opaque::{record_index}", record.name)
-                })
-            });
-            let class =
-                effective_tool_result_class(record).unwrap_or_else(|| "tool_failure".to_string());
+            let key = record.outcome_key(record_index);
+            let class = record
+                .effective_result_class
+                .clone()
+                .unwrap_or_else(|| "tool_failure".to_string());
             unresolved_by_key.insert(key, class);
             continue;
         }
@@ -1046,27 +1050,21 @@ fn unresolved_tool_outcome_failure_counts(
         // failure for the same governed operation. Typed classes below still
         // provide the more precise resolution path when available.
         if record.ok {
-            if let Some(key) = fallback_tool_outcome_identity(record) {
-                unresolved_by_key.remove(&key);
-            }
-            // A successful exact operation resolves a typed failure even when
-            // the success record omits an optional result class. This keeps
-            // the recovery contract based on the canonical operation identity
-            // rather than requiring every executor path to repeat metadata.
-            if let Some(key) = untyped_operation_key(record) {
-                unresolved_by_key.remove(&key);
+            if let Some(key) = record.operation_identity {
+                unresolved_by_key.remove(&EvaluationOutcomeKey::Stable(key));
             }
         }
-        let Some(class) = effective_tool_result_class(record) else {
+        let Some(class) = &record.effective_result_class else {
             continue;
         };
-        let Some(key) = outcome_resolution_key(record) else {
+        let Some(identity) = record.operation_identity else {
             continue;
         };
+        let key = EvaluationOutcomeKey::Stable(identity);
 
-        if result_class_is_outcome_failure(&class) {
-            unresolved_by_key.insert(key, class);
-        } else if result_class_resolves_outcome_failure(&class) {
+        if result_class_is_outcome_failure(class) {
+            unresolved_by_key.insert(key, class.clone());
+        } else if result_class_resolves_outcome_failure(class) {
             unresolved_by_key.remove(&key);
         }
     }
@@ -1120,40 +1118,47 @@ pub fn tool_outcome_recovery_keys(record: &ToolCallRecord) -> Vec<String> {
 pub fn active_execution_failure_operation_keys(
     records: &[ToolCallRecord],
 ) -> std::collections::BTreeSet<String> {
-    let mut unresolved = std::collections::BTreeMap::<String, String>::new();
+    active_failure_keys(records.iter().map(|record| {
+        (
+            record_was_executed(record),
+            record.ok,
+            record_is_non_failure_outcome(record),
+            operation_identity_key(record),
+        )
+    }))
+}
 
-    for record in records {
-        if record.effective_disposition()
-            != astra_services::session_journal::ToolCallDisposition::Executed
-        {
+fn active_failure_keys<K: Ord>(
+    facts: impl IntoIterator<Item = (bool, bool, bool, Option<K>)>,
+) -> std::collections::BTreeSet<K> {
+    let mut unresolved = std::collections::BTreeSet::new();
+    for (executed, ok, non_failure, key) in facts {
+        if !executed {
             continue;
         }
-        if !record.ok && !record_is_non_failure_outcome(record) {
-            if let Some(key) = tool_outcome_operation_key(record) {
-                let class = effective_tool_result_class(record)
-                    .unwrap_or_else(|| "tool_failure".to_string());
-                unresolved.insert(key, class);
-            }
+        let Some(key) = key else {
             continue;
-        }
-        if let Some(key) = fallback_tool_outcome_identity(record) {
-            unresolved.remove(&key);
-        }
-        if let Some(key) = untyped_operation_key(record) {
-            unresolved.remove(&key);
-        }
-        if let Some(key) = outcome_resolution_key(record)
-            && result_class_resolves_outcome_failure(
-                effective_tool_result_class(record)
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-        {
+        };
+        if !ok && !non_failure {
+            unresolved.insert(key);
+        } else {
             unresolved.remove(&key);
         }
     }
+    unresolved
+}
 
-    unresolved.into_keys().collect()
+pub fn active_execution_failure_fact_keys(
+    facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeSet<EvaluationIdentity> {
+    active_failure_keys(facts.iter().map(|fact| {
+        (
+            fact.was_executed(),
+            fact.ok,
+            fact.non_failure_outcome,
+            fact.operation_identity,
+        )
+    }))
 }
 
 fn untyped_operation_key(record: &ToolCallRecord) -> Option<String> {
@@ -1165,13 +1170,23 @@ fn untyped_operation_key(record: &ToolCallRecord) -> Option<String> {
 pub fn active_rejected_operation_keys(
     records: &[ToolCallRecord],
 ) -> std::collections::BTreeSet<String> {
+    active_rejected_keys(records.iter().enumerate().map(|(index, record)| {
+        (
+            record_is_rejected_attempt(record),
+            record_was_executed(record) && record.ok,
+            blocked_resolution_key(record, index),
+        )
+    }))
+}
+
+fn active_rejected_keys<K: Ord>(
+    facts: impl IntoIterator<Item = (bool, bool, K)>,
+) -> std::collections::BTreeSet<K> {
     let mut unresolved = std::collections::BTreeSet::new();
-    for (record_index, record) in records.iter().enumerate() {
-        let key = rejected_operation_key(record)
-            .unwrap_or_else(|| blocked_resolution_key(record, record_index));
-        if record_is_rejected_attempt(record) {
+    for (rejected, executed_ok, key) in facts {
+        if rejected {
             unresolved.insert(key);
-        } else if record_was_executed(record) && record.ok {
+        } else if executed_ok {
             unresolved.remove(&key);
         }
     }
@@ -1340,7 +1355,7 @@ fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[
     eval.success = false;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ExplorationFamily {
     Diff,
     Search,
@@ -1399,6 +1414,17 @@ fn is_diff_like_tool_call(name: &str, args: &str) -> bool {
 fn longest_exploration_family_round_streak(
     records: &[ToolCallRecord],
 ) -> Option<(ExplorationFamily, usize)> {
+    longest_exploration_family_fact_streak(
+        &records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn longest_exploration_family_fact_streak(
+    facts: &[ToolEvaluationFact],
+) -> Option<(ExplorationFamily, usize)> {
     use std::collections::BTreeMap;
 
     #[derive(Clone, Copy, Default)]
@@ -1409,8 +1435,8 @@ fn longest_exploration_family_round_streak(
     }
 
     let mut per_round: BTreeMap<u32, RoundState> = BTreeMap::new();
-    for record in records {
-        if !record_was_executed(record) {
+    for record in facts {
+        if !record.was_executed() {
             continue;
         }
         let Some(round) = record.round else { continue };
@@ -1420,7 +1446,7 @@ fn longest_exploration_family_round_streak(
             count: 0,
         });
         state.count += 1;
-        let Some(family) = classify_exploration_family(record) else {
+        let Some(family) = record.exploration_family else {
             state.homogeneous = false;
             continue;
         };
@@ -1478,6 +1504,12 @@ pub fn exploration_family_round_streak(
         .map(|(family, streak)| (family.as_str(), streak))
 }
 
+pub fn exploration_family_fact_streak(
+    facts: &[ToolEvaluationFact],
+) -> Option<(&'static str, usize)> {
+    longest_exploration_family_fact_streak(facts).map(|(family, streak)| (family.as_str(), streak))
+}
+
 fn bash_command_text(args: &str) -> String {
     let trimmed = args.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
@@ -1508,12 +1540,160 @@ fn is_search_like_tool_call(name: &str, args: &str) -> bool {
 /// post-mortem evaluation only — this signal is intentionally broad, so the
 /// threshold is set conservatively and the penalty is mild.
 pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
-    records
+    count_search_fanout_facts(
+        &records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Behavioral evidence extracted once at an authoritative tool boundary.
+/// This is not a tool invocation and cannot be used to reconstruct arguments
+/// or authorize execution. Additional detectors consume the same projection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolEvaluationFact {
+    tool_name: String,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    operation_identity: Option<EvaluationIdentity>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    effective_result_class: Option<String>,
+    non_failure_outcome: bool,
+    is_rejected_attempt: bool,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub round: Option<u32>,
+    pub disposition: astra_services::session_journal::ToolCallDisposition,
+    pub ok: bool,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    exploration_family: Option<ExplorationFamily>,
+    is_search: bool,
+    read_invalidation: ReadInvalidation,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    read_target: Option<ReadRange>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    validation_prefix: Option<EvaluationIdentity>,
+}
+
+/// Opaque failures are local to the current evidence window and never match a
+/// success. Their index is deliberately not a durable operation identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "identity", deny_unknown_fields)]
+pub enum EvaluationOutcomeKey {
+    Stable(EvaluationIdentity),
+    Opaque { tool_name: String, index: usize },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "file", deny_unknown_fields)]
+enum ReadInvalidation {
+    None,
+    File(String),
+    All,
+}
+
+/// Equality-only evidence identity. It is domain-separated from execution and
+/// health identities and grants no permission to reuse a result.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationIdentity {
+    digest: [u8; 32],
+}
+
+impl EvaluationIdentity {
+    fn new(domain: &[u8], value: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"astra.evaluation.identity.v1\0");
+        hash.update((domain.len() as u64).to_be_bytes());
+        hash.update(domain);
+        hash.update(value.as_bytes());
+        Self {
+            digest: hash.finalize().into(),
+        }
+    }
+}
+
+impl ToolEvaluationFact {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let class = self.effective_result_class.as_deref().unwrap_or("");
+        let resolves = result_class_resolves_outcome_failure(class);
+        if (result_class_is_outcome_failure(class) && self.non_failure_outcome)
+            || (resolves && !self.non_failure_outcome)
+            || (self.non_failure_outcome && self.ok && !resolves)
+        {
+            return Err("contradictory tool outcome classification");
+        }
+        Ok(())
+    }
+
+    pub fn from_record(record: &ToolCallRecord) -> Self {
+        let args = record.authoritative_args_full().unwrap_or("");
+        Self {
+            tool_name: record.name.clone(),
+            operation_identity: operation_identity_key(record)
+                .map(|key| EvaluationIdentity::new(b"operation", &key)),
+            effective_result_class: effective_tool_result_class(record),
+            non_failure_outcome: record_is_non_failure_outcome(record),
+            is_rejected_attempt: record_is_rejected_attempt(record),
+            round: record.round,
+            disposition: record.effective_disposition(),
+            ok: record.ok,
+            exploration_family: classify_exploration_family(record),
+            is_search: is_search_like_tool_call(&record.name, args),
+            read_invalidation: if is_mutation_for_redundant_read(&record.name, args) {
+                mutation_target_file(&record.name, args)
+                    .map_or(ReadInvalidation::All, ReadInvalidation::File)
+            } else {
+                ReadInvalidation::None
+            },
+            read_target: extract_read_target(&record.name, args),
+            validation_prefix: normalize_validation_prefix(&record.name, args)
+                .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
+        }
+    }
+
+    pub fn was_executed(&self) -> bool {
+        self.disposition == astra_services::session_journal::ToolCallDisposition::Executed
+    }
+
+    fn outcome_key(&self, index: usize) -> EvaluationOutcomeKey {
+        self.operation_identity.map_or_else(
+            || EvaluationOutcomeKey::Opaque {
+                tool_name: self.tool_name.clone(),
+                index,
+            },
+            EvaluationOutcomeKey::Stable,
+        )
+    }
+
+    pub fn operation_identity(&self) -> Option<EvaluationIdentity> {
+        self.operation_identity
+    }
+}
+
+pub fn active_rejected_fact_keys(
+    facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeSet<EvaluationOutcomeKey> {
+    active_rejected_keys(facts.iter().enumerate().map(|(index, fact)| {
+        (
+            fact.is_rejected_attempt,
+            fact.was_executed() && fact.ok,
+            fact.outcome_key(index),
+        )
+    }))
+}
+
+pub fn count_unresolved_tool_outcome_fact_failures(facts: &[ToolEvaluationFact]) -> usize {
+    unresolved_tool_outcome_fact_counts(facts).values().sum()
+}
+
+pub fn count_search_fanout_facts(facts: &[ToolEvaluationFact]) -> usize {
+    facts
         .iter()
-        .filter(|rec| record_was_executed(rec))
-        .filter(|rec| {
-            is_search_like_tool_call(&rec.name, rec.authoritative_args_full().unwrap_or(""))
-        })
+        .filter(|fact| fact.was_executed() && fact.is_search)
         .count()
 }
 
@@ -2476,20 +2656,28 @@ pub fn shell_segment_has_non_benign_redirect(segment: &str) -> bool {
 /// retry count of 2 means the same prefix ran 3 times in one no-mutation
 /// window.
 pub fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
+    max_redundant_validation_retries_facts(
+        &records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> usize {
     use std::collections::HashMap;
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<EvaluationIdentity, usize> = HashMap::new();
     let mut best = 0usize;
-    for rec in records {
-        if !record_was_executed(rec) {
+    for rec in facts {
+        if !rec.was_executed() {
             continue;
         }
-        let args = rec.authoritative_args_full().unwrap_or("");
-        if is_mutation_for_redundant_read(&rec.name, args) {
+        if !matches!(rec.read_invalidation, ReadInvalidation::None) {
             seen.clear();
             continue;
         }
-        if let Some(prefix) = normalize_validation_prefix(&rec.name, args) {
-            let entry = seen.entry(prefix).or_insert(0);
+        if let Some(prefix) = &rec.validation_prefix {
+            let entry = seen.entry(*prefix).or_insert(0);
             *entry += 1;
             best = best.max(entry.saturating_sub(1));
         }
@@ -2498,10 +2686,12 @@ pub fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
 }
 
 /// Parsed read target for redundancy detection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadRange {
     file: String,
     /// Line range, or `None` for whole-file reads.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     range: Option<(u32, u32)>,
 }
 
@@ -2736,35 +2926,43 @@ pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
 /// historical counter remains appropriate for terminal audit; runtime policy
 /// must not keep advising against behavior that the agent has already left.
 pub fn count_active_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
+    count_active_redundant_overlapping_read_facts(
+        &records
+            .iter()
+            .map(ToolEvaluationFact::from_record)
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub fn count_active_redundant_overlapping_read_facts(facts: &[ToolEvaluationFact]) -> usize {
     use std::collections::HashMap;
 
     let mut per_file: HashMap<String, ReadCoverage> = HashMap::new();
     let mut redundant_per_file: HashMap<String, usize> = HashMap::new();
-    for rec in records {
-        if !record_was_executed(rec) || !rec.ok {
+    for rec in facts {
+        if !rec.was_executed() || !rec.ok {
             continue;
         }
-        let args = rec.authoritative_args_full().unwrap_or("");
-        if is_mutation_for_redundant_read(&rec.name, args) {
-            match mutation_target_file(&rec.name, args) {
-                Some(file) => {
-                    per_file.remove(&file);
-                    redundant_per_file.remove(&file);
-                }
-                None => {
-                    per_file.clear();
-                    redundant_per_file.clear();
-                }
+        match &rec.read_invalidation {
+            ReadInvalidation::File(file) => {
+                per_file.remove(file);
+                redundant_per_file.remove(file);
+                continue;
             }
-            continue;
+            ReadInvalidation::All => {
+                per_file.clear();
+                redundant_per_file.clear();
+                continue;
+            }
+            ReadInvalidation::None => {}
         }
-        if let Some(target) = extract_read_target(&rec.name, args) {
+        if let Some(target) = &rec.read_target {
             let coverage = per_file.entry(target.file.clone()).or_default();
-            if coverage.already_covers(&target) {
+            if coverage.already_covers(target) {
                 let count = redundant_per_file.entry(target.file.clone()).or_default();
                 *count = count.saturating_add(1);
             }
-            coverage.record(&target);
+            coverage.record(target);
         }
     }
     redundant_per_file.values().copied().sum()

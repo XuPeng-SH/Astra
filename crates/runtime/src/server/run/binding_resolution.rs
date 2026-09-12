@@ -206,6 +206,8 @@ pub(crate) fn run_start_context_from_request(
         skill_auto_route_policy: request.execution_policy.skill_auto_route,
         execution_metadata: execution_bindings
             .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
+        execution_restrictions: None,
+        admission_source: None,
         agent_binding_ids,
         agent_binding_id: resolved_primary_binding
             .map(|binding| binding.id.clone())
@@ -547,6 +549,7 @@ mod tests {
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
             execution_time_budget: None,
+            admitted_execution_deadline: None,
             execution_policy: Default::default(),
             explain: false,
             interaction_mode: None,

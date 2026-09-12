@@ -202,8 +202,8 @@ pub use inference_execution::{
     InferenceCanonicalTransitionReceipt, InferenceInvocationAdmissionResolution,
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
     InferenceProviderAttemptPlan, InferenceProviderDeliveryState, InferenceProviderWireIdentity,
-    InferenceRunAdmissionAuthority, InferenceSettlementReconcileOutcome, InferenceTerminalStatus,
-    InferenceUsage, InferenceUsageStatus, admit_inference_invocation,
+    InferenceRunAdmissionAuthority, InferenceScopeRejection, InferenceSettlementReconcileOutcome,
+    InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
@@ -390,10 +390,12 @@ pub use triggers::{
     UnconfiguredTriggerService, WebhookFireData,
 };
 pub use turn_intent_judge::{
-    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, WorkAdmissionActivation,
-    WorkAdmissionCapability, WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask,
-    WorkExecutionTopology, build_turn_intent_prompt, parse_turn_intent_response,
-    parse_work_admission_response, turn_intent_judge_messages, work_admission_judge_messages,
+    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
+    WORK_ADMISSION_MAX_OUTPUT_TOKENS, WORK_ADMISSION_MAX_UNITS, WORK_ADMISSION_TARGET_TEXT_CHARS,
+    WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision,
+    WorkAdmissionGraphMutation, WorkAdmissionTask, WorkExecutionTopology, build_turn_intent_prompt,
+    parse_turn_intent_response, parse_work_admission_response, turn_intent_judge_messages,
+    work_admission_judge_messages, work_admission_repair_hints,
 };
 pub use verification::{
     LlmJudge, SubtaskVerificationReport, VerificationCriterion, VerificationResult,

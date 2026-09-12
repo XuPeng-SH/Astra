@@ -59,7 +59,59 @@ A run may be resumed when its state and checkpoint indicate resumability. Resume
 
 A turn is the user/agent interaction unit used for context, prompt, trace, and tool sequencing. Tool calls inside a turn inherit provider decisions from the capability system.
 
+### Bounded continuation and completion
+
+An execution slice is a capacity checkpoint, not a task-completion boundary.
+Task profiles choose the initial slice and renewal step, not an implicit
+terminal cutoff or a fixed number of renewals. Root and child runs resolve the
+same optional hard boundary from administrator configuration and any explicit
+caller limit. Without either limit, there is no built-in total-round cutoff;
+execution continues in renewable slices, including across long tasks. With a
+limit, renewal cannot exceed it. A bounded closing allowance is
+separate from ordinary execution capacity and cannot reopen exploration.
+
+Fresh executor-confirmed workspace changes, new authoritative observations, or
+recovery of a failed operation can justify another bounded slice, including
+during an implementation task. A successful edit need not be followed by full
+validation before another edit is allowed.
+
+Missing progress receipts do not establish a stall: capabilities have different
+evidence coverage. In the absence of an authoritative stop condition, another
+bounded slice is allowed without a separate progress-credit ledger or mandatory
+reflection call. Explicit hard limits, cancellation, workspace quarantine,
+and repetition controls remain authoritative. Historical guard verdicts remain
+audit and recovery advice, not sticky execution vetoes. Continuation
+does not make unexecuted requests successful or grant them completion evidence.
+
+Progress does not discharge completion obligations. Required validation must
+still apply to the final mutation state; a renewed slice must not be reported
+as successful completion or bypass provider and permission boundaries.
+
 ## Tasks
+
+Work admission counts user acceptance units, not execution phases. Observation,
+verification, reporting, and settlement for one result belong to that task;
+a separately requested report deliverable may itself be a task. Initial tasks
+and admitted graph mutations together must respect explicit user task-count
+constraints unless the user explicitly revises them. Graph mutations represent
+requested additions, cancellations, or replacements, not merely steps described
+as happening later. Do not duplicate a requested mutation in the initial tasks.
+Semantic admission rejections identify the field path, violated rule and
+observed size or index without copying field contents into the diagnostic.
+These diagnostics do not relax validation or change the repair policy.
+
+Task identities are not execution-order authority. Admission retains explicit
+`after_initial_tasks` prerequisites as dependency edges; omitted prerequisites
+leave tasks independent. Replacement inherits the replaced task's precedence.
+The same field on a graph mutation is a separate application trigger: its
+referenced initial tasks must be delivered before the mutation is committed.
+The immutable establishment decision retains these triggers beyond establishment
+completion. Scheduling, including settlement's automatic successor allocation,
+must apply due mutations before selecting another task or declaring completion.
+Accepted proposals mark applied mutations, so recovery replays the same operation
+and item identities without repeating semantic admission.
+Initial-candidate references are not aliases for arbitrary later replacements;
+conflicting retirement/prerequisite lifetimes are rejected before establishment.
 
 Tasks are durable work items projected into UI boards.
 

@@ -3561,6 +3561,7 @@ pub(super) async fn post_work_branch_turn_handler(
         agent_binding_owner_scope: None,
         execution_budget: None,
         execution_time_budget: None,
+        admitted_execution_deadline: None,
         execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,

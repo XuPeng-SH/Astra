@@ -15,10 +15,27 @@ const RAW_CACHE_BREAK_MIN_RATIO: f64 = 0.25;
 /// Aggregate pipeline health metrics for a session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineHealthReport {
-    /// Per-turn cache hit ratio (0.0–1.0). Index = turn - 1.
+    /// Per-turn billable cache-read share (0.0–1.0). This uses the complete
+    /// provider input accounting denominator, so it is not the same as
+    /// stable-prefix coverage when conversation history is uncached.
     pub cache_hit_ratios: Vec<f64>,
-    /// Average cache hit ratio across all turns.
+    /// Average billable cache-read share across all turns.
     pub avg_cache_hit_ratio: f64,
+    /// Sum of the runtime's stable provider-prefix estimates for feedback
+    /// turns that carried both an estimate and request usage.
+    #[serde(default)]
+    pub stable_prefix_cache_eligible_tokens: u64,
+    /// Cache-read tokens attributable to the stable prefix under the
+    /// `provider-prefix-v1` layout. Reads are capped at the corresponding
+    /// eligible prefix so conversation-history caching cannot inflate this
+    /// diagnostic above 100%.
+    #[serde(default)]
+    pub stable_prefix_cache_read_tokens: u64,
+    /// Token-weighted stable-prefix coverage. `None` means no feedback turn
+    /// exposed the typed stable-prefix estimate; it must not be rendered as a
+    /// zero-hit cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_prefix_cache_coverage: Option<f64>,
     /// Number of compaction events recorded.
     pub compaction_count: u32,
     /// Total tokens freed by compaction.
@@ -84,6 +101,17 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                     continue;
                 };
                 feedback_ratios.push(ratio);
+                if let (Some(eligible), Some(usage)) = (
+                    frame.context.estimated_cache_eligible_tokens,
+                    frame.request_usage.as_ref(),
+                ) {
+                    report.stable_prefix_cache_eligible_tokens = report
+                        .stable_prefix_cache_eligible_tokens
+                        .saturating_add(eligible);
+                    report.stable_prefix_cache_read_tokens = report
+                        .stable_prefix_cache_read_tokens
+                        .saturating_add(usage.cache_read.min(eligible));
+                }
             }
             "llm_response_full" => {
                 if let Some(ratio) = raw_llm_response_cache_hit_ratio(event) {
@@ -153,6 +181,12 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
     if !report.cache_hit_ratios.is_empty() {
         report.avg_cache_hit_ratio =
             report.cache_hit_ratios.iter().sum::<f64>() / report.cache_hit_ratios.len() as f64;
+    }
+    if report.stable_prefix_cache_eligible_tokens > 0 {
+        report.stable_prefix_cache_coverage = Some(
+            report.stable_prefix_cache_read_tokens as f64
+                / report.stable_prefix_cache_eligible_tokens as f64,
+        );
     }
 
     report
@@ -331,9 +365,17 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
         report.turns_with_feedback
     ));
     out.push_str(&format!(
-        "  Avg cache hit ratio: {:.1}%\n",
+        "  Avg billable cache-read share: {:.1}%\n",
         report.avg_cache_hit_ratio * 100.0
     ));
+    if let Some(coverage) = report.stable_prefix_cache_coverage {
+        out.push_str(&format!(
+            "  Stable-prefix cache coverage: {:.1}% ({}/{} tokens, provider-prefix-v1)\n",
+            coverage * 100.0,
+            report.stable_prefix_cache_read_tokens,
+            report.stable_prefix_cache_eligible_tokens,
+        ));
+    }
     if report.invalid_events > 0 {
         out.push_str(&format!(
             "  ⚠ Invalid pipeline event payloads: {} (evidence incomplete)\n",
@@ -618,6 +660,25 @@ mod tests {
     }
 
     #[test]
+    fn stable_prefix_coverage_is_reported_separately_from_billable_share() {
+        let mut first = make_feedback_event(1, 0.5);
+        first.raw["metadata"]["runtime_feedback"]["context"]["estimated_cache_eligible_tokens"] =
+            serde_json::json!(800);
+        let mut second = make_feedback_event(2, 0.9);
+        second.raw["metadata"]["runtime_feedback"]["context"]["estimated_cache_eligible_tokens"] =
+            serde_json::json!(800);
+
+        let report = analyze_pipeline_health(&make_capture(vec![first, second]));
+
+        assert_eq!(report.stable_prefix_cache_eligible_tokens, 1_600);
+        assert_eq!(report.stable_prefix_cache_read_tokens, 1_300);
+        assert_eq!(report.stable_prefix_cache_coverage, Some(0.8125));
+        let rendered = render_pipeline_health(&report);
+        assert!(rendered.contains("Avg billable cache-read share"));
+        assert!(rendered.contains("Stable-prefix cache coverage: 81.2%"));
+    }
+
+    #[test]
     fn pipeline_feedback_takes_precedence_over_raw_usage_fallback() {
         let capture = make_capture(vec![
             make_llm_response_event(100, 9_900, 0),
@@ -725,7 +786,7 @@ mod tests {
         ]);
         let report = analyze_pipeline_health(&capture);
         let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Avg cache hit ratio"));
+        assert!(rendered.contains("Avg billable cache-read share"));
         assert!(rendered.contains("Compactions: 1"));
         assert!(rendered.contains("Cache trend"));
     }

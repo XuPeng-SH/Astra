@@ -486,13 +486,33 @@ pub fn normalize_tool_arguments(val: &Value) -> Value {
 
 /// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
 pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
-    let (name, normalized) = canonical_read_only_tool_signature(name, args)
-        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)));
+    let (name, normalized) = canonical_tool_identity_parts(name, args);
     format!(
         "{}:{}",
         name,
         serde_json::to_string(&normalized).unwrap_or_default()
     )
+}
+
+/// Health evidence uses the same alias/argument normalization as execution
+/// deduplication, but owns an opaque identity rather than the argument string.
+pub fn tool_health_identity(name: &str, args: &Value) -> astra_pipeline::ToolHealthIdentity {
+    scoped_tool_health_identity(name, args, None)
+}
+
+pub fn scoped_tool_health_identity(
+    name: &str,
+    args: &Value,
+    observation_epoch: Option<u64>,
+) -> astra_pipeline::ToolHealthIdentity {
+    let (name, normalized) = canonical_tool_identity_parts(name, args);
+    let canonical = serde_json::to_vec(&normalized).expect("JSON values serialize without failure");
+    astra_pipeline::ToolHealthIdentity::scoped(name, &canonical, observation_epoch)
+}
+
+pub(crate) fn canonical_tool_identity_parts(name: &str, args: &Value) -> (String, Value) {
+    canonical_read_only_tool_signature(name, args)
+        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)))
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
@@ -627,6 +647,29 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn health_identity_preserves_canonical_aliases_without_argument_strings() {
+        let alias = tool_health_identity("git_diff", &json!({"path":"src/"}));
+        let canonical = tool_health_identity("git", &json!({"action":"diff","path":"src"}));
+        assert_eq!(alias, canonical);
+        assert_eq!(alias.tool_name(), "git");
+        let identity = tool_health_identity("bash", &json!({"command":"SECRET_ARGUMENT_SENTINEL"}));
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert!(!wire.to_string().contains("SECRET_ARGUMENT_SENTINEL"));
+        assert_eq!(
+            serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        let mut bad = wire.clone();
+        bad["digest"] = json!([0, 1]);
+        assert!(serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(bad).is_err());
+        for field in ["tool_name", "digest"] {
+            let mut bad = wire.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(bad).is_err());
+        }
+    }
 
     #[test]
     fn tool_error_success_with_null_error_is_not_error() {

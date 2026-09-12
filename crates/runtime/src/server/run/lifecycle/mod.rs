@@ -1570,8 +1570,6 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
-    executor
-        .restore_activated_deferred_tool_names_for_session(&state.activated_deferred_tool_names);
     let executor = std::sync::Arc::new(executor);
     state.runtime_tool_executor = Some(executor);
 }
@@ -3480,6 +3478,30 @@ async fn run_post_loop_memory_cleanup_work(
                         metrics_registry.as_ref(),
                         "clean",
                     );
+                } else if matches!(svc.write_access_enabled().await, Ok(false)) {
+                    // A disabled optional capability is a normal settled
+                    // outcome only when no current snapshot was confirmed.
+                    // Check freshness first so revocation after a successful
+                    // write cannot hide a healthy extraction as a skip.
+                    record_session_memory_post_loop_drain_metrics(
+                        metrics_registry.as_ref(),
+                        "access_disabled",
+                    );
+                    persist_post_loop_memory_event(
+                        &owner_id,
+                        &session_id,
+                        &run_id,
+                        &astra_services::session_journal::JournalEvent::subsystem_settled(
+                            Some(&session_id),
+                            session_turn,
+                            "post_loop_memory",
+                        ),
+                    );
+                    record_post_loop_memory_cleanup_worker_metrics(
+                        metrics_registry.as_ref(),
+                        "completed",
+                    );
+                    return;
                 } else {
                     // A finished worker is not necessarily a successful
                     // extraction: e.g. persistence can fail after the
@@ -3655,8 +3677,12 @@ fn install_active_personal_skills(
     active_skills: Vec<astra_services::ActivePersonalSkillRecord>,
 ) {
     for skill in active_skills {
-        state.skills.pinned.insert(skill.skill_name.clone());
-        state.skills.invoked.insert(
+        state
+            .skills
+            .execution
+            .pinned
+            .insert(skill.skill_name.clone());
+        state.skills.execution.invoked.insert(
             skill.skill_name.clone(),
             crate::turn::skill_tool::InvokedSkill {
                 name: skill.skill_name,
@@ -3856,21 +3882,11 @@ pub(crate) fn has_turn_verdict_warning(
     })
 }
 
-/// Warnings describe convergence pressure but do not revoke a productive
-/// adaptive slice. Only a critical verdict is a scheduler stop; the typed
-/// evidence and repetition guards still bound warning-only renewal.
-pub(crate) fn has_turn_verdict_critical(
-    verdict_events: &[astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent],
-) -> bool {
-    verdict_events
-        .iter()
-        .any(|event| event.severity.eq_ignore_ascii_case("critical"))
-}
-
 fn build_runtime_turn_evaluation_event(
     session_id: &str,
     source: &str,
     state: &AgenticLoopState,
+    settled_status: &str,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
@@ -3890,7 +3906,7 @@ fn build_runtime_turn_evaluation_event(
                 max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
             },
         );
-    astra_turn_core::evaluation::build_turn_evaluation_journal_event(
+    let mut event = astra_turn_core::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
         Some(state.session_turn),
         source,
@@ -3902,7 +3918,21 @@ fn build_runtime_turn_evaluation_event(
         state.telemetry.first_budget_pressure,
         &eval,
     )
-    .with_producer_scope(state.current_run_id.as_deref())
+    .with_producer_scope(state.current_run_id.as_deref());
+    if let Some(metadata) = event.metadata.as_mut().and_then(Value::as_object_mut) {
+        // Tool quality is evidence, not lifecycle authority. Successful tools
+        // cannot make a failed or interrupted run successful; retain their
+        // accurate health signals separately from the settled turn outcome.
+        metadata.insert("tool_evaluation_success".into(), Value::Bool(eval.success));
+        metadata.insert("run_status".into(), Value::String(settled_status.into()));
+        metadata.insert(
+            "success".into(),
+            Value::Bool(
+                eval.success && matches!(settled_status, STATUS_COMPLETED | STATUS_DELEGATED),
+            ),
+        );
+    }
+    event
 }
 
 fn persist_turn_evaluation_journal(
@@ -3910,12 +3940,13 @@ fn persist_turn_evaluation_journal(
     session_id: &str,
     source: &str,
     state: &AgenticLoopState,
+    settled_status: &str,
 ) {
     if session_id.is_empty() {
         return;
     }
 
-    let event = build_runtime_turn_evaluation_event(session_id, source, state);
+    let event = build_runtime_turn_evaluation_event(session_id, source, state, settled_status);
     match astra_services::session_journal::JournalWriter::for_user(user_id, session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
@@ -4342,6 +4373,60 @@ struct PreparedAgentBindingLoopContext {
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     skill_catalogs: Vec<agent_binding_skill_runtime::AgentBindingSkillCatalog>,
     prompt_section: String,
+}
+
+/// Validated execution facts supplied to the shared loop assembler.
+/// This is not a serialized checkpoint and must not acquire a Default fallback.
+struct LoopExecutionFacts {
+    original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
+    messages: Vec<Value>,
+    tool_ledger_receipt: crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator,
+    max_turns: usize,
+    remaining_turns: usize,
+    charged_iterations: u64,
+    stall: crate::turn::agentic_loop::host::StallTrackingState,
+    user_intents: crate::turn::agentic_loop::host::UserIntentState,
+    hooks: StopHookState,
+    tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
+    session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
+    budget_wrapup_injected: bool,
+    budget_wrapup_ignored_rounds: u32,
+    last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy,
+    step_recorder: StepRecorder,
+}
+
+/// Process-local dependencies, never serialized as execution continuation.
+struct LoopEnvironment {
+    skill_registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    skill_executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
+    permission_context: Option<Arc<tokio::sync::RwLock<PermissionSyncContext>>>,
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    harness: crate::turn::harness_adapter::HarnessSlot,
+}
+
+/// An already admitted execution. Both fresh and recovered turns enter the
+/// same background runner only after their respective authority checks.
+/// These are live resources, not a second durable execution-state record.
+struct OwnedBackgroundExecution {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    request: ChatRequestData,
+    host: server_loop_host::ServerAgenticLoopHost,
+    loop_state: AgenticLoopState,
+    execution_owner_generation: u64,
+    owner_lease_heartbeat: Option<crate::server::run::engine::RunOwnerLeaseHeartbeat>,
+    canonical_turn: Option<CanonicalTurnAdmission>,
+    root_runtime_context_guard: Option<ServerRootRuntimeContextGuard>,
+    work_runtime_binding: Option<ValidatedWorkRuntimeBinding>,
+    tool_runtime_workspace: Option<PathBuf>,
+    cloud_workspace_record: Option<RuntimeWorkspaceRecord>,
+    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+    llm_cancel_token: Arc<CancellationToken>,
+    execution_lease_lost: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -5032,6 +5117,9 @@ pub struct AgenticRunLifecycleService {
     /// handles are pruned on every insertion; shutdown aborts only after the
     /// cooperative run/LLM cancellation grace expires.
     background_run_abort_handles: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Process shutdown asks executors to hand off at their next settled
+    /// boundary. This never acts as a user cancellation marker.
+    execution_handoff_requested: Arc<AtomicBool>,
     /// Global admission control: limits the number of concurrently executing
     /// agentic loop tasks across all users. A permit is acquired before
     /// spawn and automatically released when the task completes.
@@ -5138,6 +5226,7 @@ impl AgenticRunLifecycleService {
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             background_run_abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
+            execution_handoff_requested: Arc::new(AtomicBool::new(false)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
             weighted_admission: astra_services::WeightedAdmissionController::new(
                 canonical_session_admission_limits(),
@@ -5511,7 +5600,7 @@ impl AgenticRunLifecycleService {
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
         rewrite_proof: Option<&CanonicalRewriteProof>,
-        preserve_execution_scratch: bool,
+        allow_empty_delta: bool,
         run_id: &str,
     ) -> Result<Option<astra_turn_types::SessionCursorV1>, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
@@ -5524,7 +5613,7 @@ impl AgenticRunLifecycleService {
                 admission.had_canonical_head,
                 messages,
                 rewrite_proof,
-                preserve_execution_scratch,
+                allow_empty_delta,
             )?
             else {
                 return Ok(None);
@@ -6667,7 +6756,7 @@ impl AgenticRunLifecycleService {
         let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
-                let mut session_state = mat.session_state;
+                let session_state = mat.session_state;
                 resume_cursor = session_state.source_cursor.clone();
                 if resume_cursor.is_none() {
                     tracing::warn!(
@@ -6680,11 +6769,6 @@ impl AgenticRunLifecycleService {
                     }
                     return Some(mgr);
                 }
-                session_state.activated_deferred_tool_names =
-                    astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
-                        &mat.messages,
-                        session_state.activated_deferred_tool_names,
-                    );
                 restored_messages = mat.messages;
                 restored_session_state = Some(session_state);
             }
@@ -6947,12 +7031,15 @@ impl AgenticRunLifecycleService {
         }
     }
 
-    /// Wait for all in-flight background agentic loop tasks to finish.
+    /// Request cooperative execution handoff, then wait within the shutdown
+    /// deadline. Frozen executors are disposed by the subsequent bounded abort.
     ///
     /// Called during graceful shutdown. Polls the task counter with 100ms
     /// intervals up to `timeout`. Returns `true` if all tasks drained within
     /// the timeout, `false` if tasks are still running.
     async fn drain_background_tasks_impl(&self, timeout: std::time::Duration) -> bool {
+        self.execution_handoff_requested
+            .store(true, Ordering::Release);
         self.drain_background_tasks_with_checkpoint(timeout, true)
             .await
     }
@@ -7132,14 +7219,17 @@ impl AgenticRunLifecycleService {
                 "last_batch_id": format!("shutdown-{run_id}"),
                 "extra": {}
             });
-            astra_core::log_persist!(
-                engine
-                    .persist_checkpoint(&user_id, &session_id, &run_id, &checkpoint.to_string())
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "graceful_shutdown_checkpoint"
-            );
+            match engine
+                .persist_checkpoint(&user_id, &session_id, &run_id, &checkpoint.to_string())
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(run_id, %error, "shutdown checkpoint write failed");
+                    continue;
+                }
+            }
             astra_core::log_persist!(
                 engine
                     .append_event(
@@ -7325,12 +7415,53 @@ impl AgenticRunLifecycleService {
         start_request_fingerprint: Option<&str>,
         mode: RunStartPersistenceMode,
     ) -> Result<DurableRunStartClaim, (StatusCode, Json<ErrorResponse>)> {
+        Self::validate_resolved_model_selection(request)?;
+        self.validate_runtime_profile_shape(request)?;
         let mut context = run_start_context_from_request(
             request,
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
+        use astra_services::runs::{
+            DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
+        };
+        context.admission_source = Some(DurableAdmissionSource::V1 {
+            model_source: if request.provider_runtime_authorized {
+                ModelAdmissionSource::ProviderAuthorizedRuntime
+            } else {
+                ModelAdmissionSource::CatalogOffering
+            },
+            capability_source: if request.has_agent_binding_runtime() {
+                RuntimeCapabilitySource::AgentBindingRegistry
+            } else if !request.runtime_mcp_bindings.is_empty()
+                || request.runtime_skill_binding.is_some()
+                || request.capability_descriptors.is_some()
+                || request.edge_executor_id.is_some()
+                || matches!(
+                    request.runtime_profile,
+                    Some(RuntimeProfileRequest::RequestScopedRuntimeMcp)
+                )
+            {
+                RuntimeCapabilitySource::RequestScoped
+            } else if match execution_bindings {
+                Some(bindings) => {
+                    bindings.executor.kind != ExecutorBindingKind::ServerLocal
+                        || bindings.executor.transport != ToolTransportKind::ServerLocal
+                }
+                None => request.executor_binding.as_ref().is_some_and(|binding| {
+                    binding.kind != astra_services::runs::ExecutorBindingRequestKind::ServerLocal
+                }),
+            } {
+                RuntimeCapabilitySource::BoundExecutor
+            } else {
+                RuntimeCapabilitySource::ServerManaged
+            },
+        });
+        context.execution_restrictions = Some(
+            astra_services::runs::DurableExecutionRestrictions::from_admitted_request(request)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?,
+        );
         context.start_request_fingerprint = start_request_fingerprint.map(ToString::to_string);
         let result = match mode {
             RunStartPersistenceMode::Insert => self
@@ -8870,7 +9001,49 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+        if self.execution_handoff_requested.load(Ordering::Acquire) {
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is shutting down; retry on an available server",
+                "server_shutting_down",
+            ));
+        }
         Self::validate_effective_user_input(&request)?;
+        if request.admitted_execution_deadline.is_none() {
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Admission clock is before Unix epoch",
+                    )
+                })?
+                .as_millis();
+            let now_unix_ms = u64::try_from(now_unix_ms).map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Admission clock exceeds supported range",
+                )
+            })?;
+            request.admitted_execution_deadline = request
+                .execution_time_budget
+                .map(|budget| {
+                    astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                        budget,
+                        now_unix_ms,
+                    )
+                })
+                .transpose()
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
+        astra_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(
+                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
+                    &request.context,
+                ),
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         if request.model_selection_mode == ModelSelectionMode::ServerDefault {
             if request.provider_runtime_authorized
                 || request.model_selection.is_some()
@@ -10516,7 +10689,7 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
-        .with_execution_time_budget(request.execution_time_budget)
+        .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
         .with_full_llm_capture(request.full_llm_capture)
@@ -10885,33 +11058,28 @@ impl AgenticRunLifecycleService {
             None,
             None,
         )
+        .expect("valid test execution budget")
     }
 
-    fn build_initial_state_inner(
+    /// Rebuild process-local services from current authorization. This does not
+    /// create a turn, infer its intent, or initialize execution accounting.
+    fn assemble_loop_environment(
         &self,
         user_id: &str,
         request: &ChatRequestData,
         session_id: &str,
         run_id: &str,
-        workspace_override: Option<&std::path::Path>,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         cancel_token: Option<Arc<CancellationToken>>,
         execution_lease_lost: Option<Arc<AtomicBool>>,
         interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
-        request_constraints: RequestConstraints,
+        request_constraints: &RequestConstraints,
         edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
         request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         execution_owner_generation: Option<u64>,
-    ) -> AgenticLoopState {
-        use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
-        use astra_text_utils::semantic_dedup::SemanticDedup;
-        use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-        use astra_turn_core::stop_hooks_yaml::{
-            detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
-        };
-
+    ) -> LoopEnvironment {
         let (skill_registry, skill_resolver) = if let Some(binding_context) = agent_binding_context
         {
             (None, binding_context.skill_resolver.clone())
@@ -10921,7 +11089,7 @@ impl AgenticRunLifecycleService {
             let (skill_registry, raw_skill_resolver) =
                 build_server_skill_resolver(self.skill_service.clone(), user_id);
             let skill_resolver =
-                    apply_normalized_skill_allowlist(raw_skill_resolver, &request_constraints)
+                    apply_normalized_skill_allowlist(raw_skill_resolver, request_constraints)
                         .unwrap_or_else(|err| {
                             tracing::error!(
                                 error = %err,
@@ -10931,63 +11099,8 @@ impl AgenticRunLifecycleService {
                         });
             (skill_registry, skill_resolver)
         };
-        use astra_turn_core::turn_guard::TurnGuard;
-
-        let prompt_user_message = request.message.trim().to_string();
-        let prompt_user_intent = request
-            .user_intent
-            .as_deref()
-            .filter(|intent| !intent.trim().is_empty())
-            .unwrap_or(request.message.as_str())
-            .trim()
-            .to_string();
-        let user_message = json!({
-            "role": "user",
-            "content": prompt_user_message,
-        });
-
-        let task_profile = infer_task_execution_profile(&prompt_user_message);
-        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
-        let requested_budget = request.execution_budget.as_ref().map(|budget| {
-            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                initial_turns: budget.initial_turns.map(|value| value as usize),
-                hard_turn_limit: budget.hard_turn_limit.map(|value| value as usize),
-            }
-        });
-        let agentic_turn_budget =
-            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-                task_profile,
-                runtime_turn_ceiling,
-                requested_budget,
-            );
-        let budget_is_explicit = request.execution_budget.is_some();
-        let max_turns = agentic_turn_budget.initial_turns;
-        // Use edge profile's git_root/cwd if available; fall back to provisioned
-        // server workspace so web-agent sessions still load stop-hooks.yaml.
-        let project_root_buf = project_root_for_stop_hooks(edge_context)
-            .or_else(|| workspace_override.map(|p| p.to_path_buf()));
-        let hook_sets = project_root_buf
-            .as_ref()
-            .map(|root| {
-                detect_turn_hook_sets(
-                    root.as_path(),
-                    task_profile,
-                    is_plan_subtask_from_chat_context(&request.context),
-                )
-            })
-            .unwrap_or_default();
-        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
-            .as_ref()
-            .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
-            .unwrap_or_default();
-        let thinking_config =
-            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                .expect("thinking configuration was validated during request admission");
         let root_permissions =
-            Self::inherited_permissions_from_request(request, &request_constraints);
+            Self::inherited_permissions_from_request(request, request_constraints);
         let root_permission_context = Some(PermissionSyncContext::shared(root_permissions.clone()));
 
         // Create harness sink early so sub-run executors can share it.
@@ -11014,7 +11127,7 @@ impl AgenticRunLifecycleService {
         // execution_context: Fork can run in isolated sub-agent loops.
         let edge_tools = edge_context.edge_tools.clone();
         let edge_profile = edge_profile_override.cloned().unwrap_or_else(|| {
-            Self::edge_profile_with_skill_listing(edge_context, &request_constraints)
+            Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
         let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
             match svc.scoped_to_owner(user_id) {
@@ -11066,186 +11179,12 @@ impl AgenticRunLifecycleService {
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .resolve_for_model(request.model.as_deref());
-        let max_turn_input_tokens = effective_max_turn_input_tokens(
-            astra_core::RuntimeLimits::global(),
-            request.model.as_deref(),
-            request.admitted_model_execution.as_ref(),
-        );
-        AgenticLoopState {
-            messages: vec![user_message],
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            current_session_id: Some(session_id.to_string()),
-            current_run_id: Some(run_id.to_string()),
-            current_run_owner_generation: None,
-            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            context_manifest_pool: self.shared_pool.clone(),
-            context_manifest_user_id: None,
-            context_manifest_model_name: request.model.clone(),
-            runtime_manifest: None,
-            recursion_depth: 0,
-            final_text: String::new(),
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            total_observation_tool_calls: 0,
-            tool_ledger_receipt: Default::default(),
-            has_any_usage: false,
-            last_finish_reason: None,
-            max_turns,
-            remaining_turns: max_turns,
-            agentic_turn_budget,
-            budget_is_explicit,
-            budget_policy: None,
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
-            turn_guard: TurnGuard::with_profile(task_profile),
-            restricted_tools: std::collections::HashSet::new(),
-            boosted_tools: std::collections::HashSet::new(),
-            widen_selection_pending: false,
-            step_recorder: StepRecorder::with_persistence_for_run(
-                user_id, session_id, run_id, run_id,
-            ),
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(0.75),
-            call_counts: HashMap::new(),
-            // Per-model workflow-guard policy (see
-            // `ToolSelectionConfig::resolve_for_model`). Built-in profiles
-            // give stronger models (opus/sonnet-4) more rope than haiku.
-            // Security guards (shell_obfuscation, destructive_sql) are
-            // unaffected and stay uniform across models.
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
-            telemetry: Default::default(),
-            skills: SkillState {
-                registry_for_activation: if request_constraints.allowed_skills.is_some() {
-                    None
-                } else {
-                    skill_registry
-                },
-                resolver: skill_resolver,
-                executor: skill_executor,
-                client_pipeline_skill_names: edge_context
-                    .edge_skills
-                    .iter()
-                    .filter(|skill| Self::edge_skill_is_allowed(skill, &request_constraints))
-                    .flat_map(|skill| {
-                        std::iter::once(skill.name.clone()).chain(skill.aliases.iter().cloned())
-                    })
-                    .map(|name| name.trim().to_ascii_lowercase())
-                    .collect(),
-                request_constraints,
-                listing_message: agent_binding_context.map(|context| {
-                    json!({
-                        "role": "system",
-                        "content": context.prompt_section,
-                    })
-                }),
-                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                tool_event_hooks,
-                session_event_hooks,
-                ..Default::default()
-            },
-            hooks: StopHookState {
-                stop_hooks: hook_sets.stop_hooks,
-                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
-                workspace_root_hint,
-                forward_headers: request.forward_headers.clone(),
-                admitted_model_execution: request.admitted_model_execution.clone(),
-                ..Default::default()
-            },
-            cancellation: Default::default(),
-            messaging: Default::default(),
-            user_intents: Default::default(),
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
-            pipeline_session: Some(
-                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date_for_user(
-                        user_id, session_id,
-                    ),
-                ),
-            ),
-            message: prompt_user_message.clone(),
-            user_intent: prompt_user_intent,
-            recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
-            task_profile,
-            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
-                .expect("valid dummy URL"),
-            api_token: String::new(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
-            self_agent_id: "main".to_string(),
-            project_context: None,
-            checkpoint_gate: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            data_snapshot_provider: None,
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
-            thinking: thinking_config,
+        LoopEnvironment {
+            skill_registry,
+            skill_resolver,
+            skill_executor,
             permission_context: root_permission_context,
-            permission_handler: None,
-            tactical_adapter: None,
-            step_signal_collector: None,
-            recent_tactical_actions: Vec::new(),
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
             memory_extraction_service,
-            observation_journal: Default::default(),
-            session_memory_state: Default::default(),
-            compact_strategy: request
-                .admitted_model_execution
-                .as_ref()
-                .map(|execution| {
-                    crate::turn::llm::context::compact_strategy_from_model_metadata(
-                        execution.cache_capability,
-                        &execution.provider,
-                    )
-                })
-                .unwrap_or_default(),
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
-            canonical_turn_chain_id: Some(format!("{}:harness", session_id)),
-            root_user_query_event_id: None,
-            turn_event_buffer: None,
             harness: {
                 #[cfg(feature = "harness")]
                 {
@@ -11293,6 +11232,415 @@ impl AgenticRunLifecycleService {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
+        }
+    }
+
+    fn build_initial_state_inner(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+        session_id: &str,
+        run_id: &str,
+        workspace_override: Option<&std::path::Path>,
+        execution_bindings: Option<&ExecutionBindingSnapshot>,
+        cancel_token: Option<Arc<CancellationToken>>,
+        execution_lease_lost: Option<Arc<AtomicBool>>,
+        interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
+        request_constraints: RequestConstraints,
+        edge_context: &EdgeContext,
+        edge_profile_override: Option<&Map<String, Value>>,
+        request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+        agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
+        execution_owner_generation: Option<u64>,
+    ) -> Result<AgenticLoopState, (StatusCode, Json<ErrorResponse>)> {
+        let facts = self.prepare_initial_execution_facts(
+            user_id,
+            request,
+            session_id,
+            run_id,
+            workspace_override,
+            edge_context,
+        )?;
+        let environment = self.assemble_loop_environment(
+            user_id,
+            request,
+            session_id,
+            run_id,
+            execution_bindings,
+            cancel_token,
+            execution_lease_lost,
+            interaction_sink,
+            &request_constraints,
+            edge_context,
+            edge_profile_override,
+            request_scoped_skill_resolver,
+            agent_binding_context,
+            execution_owner_generation,
+        );
+        Ok(self.assemble_loop_state(
+            user_id,
+            request,
+            session_id,
+            run_id,
+            request_constraints,
+            edge_context,
+            agent_binding_context,
+            environment,
+            facts,
+        ))
+    }
+
+    fn prepare_initial_execution_facts(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+        session_id: &str,
+        run_id: &str,
+        workspace_override: Option<&std::path::Path>,
+        edge_context: &EdgeContext,
+    ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
+        use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+        use astra_turn_core::stop_hooks_yaml::{
+            detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
+        };
+
+        use astra_turn_core::turn_guard::TurnGuard;
+
+        let prompt_user_message = request.message.trim().to_string();
+        let prompt_user_intent = request
+            .user_intent
+            .as_deref()
+            .filter(|intent| !intent.trim().is_empty())
+            .unwrap_or(request.message.as_str())
+            .trim()
+            .to_string();
+        let user_message = json!({
+            "role": "user",
+            "content": prompt_user_message,
+        });
+
+        let task_profile = infer_task_execution_profile(&prompt_user_message);
+        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        let requested_budget = request
+            .execution_budget
+            .as_ref()
+            .map(|budget| {
+                Ok::<_, (StatusCode, Json<ErrorResponse>)>(
+                    astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                        initial_turns: budget.initial_turns.map(|value| value as usize),
+                        hard_turn_limit: budget
+                            .hard_turn_limit
+                            .map(|value| {
+                                std::num::NonZeroUsize::new(value as usize).ok_or_else(|| {
+                                    error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "hard_turn_limit must be positive".to_string(),
+                                    )
+                                })
+                            })
+                            .transpose()?,
+                    },
+                )
+            })
+            .transpose()?;
+        let agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                task_profile,
+                runtime_turn_ceiling,
+                requested_budget,
+            );
+        let budget_is_explicit = request.execution_budget.is_some();
+        let max_turns = agentic_turn_budget.initial_turns;
+        // Use edge profile's git_root/cwd if available; fall back to provisioned
+        // server workspace so web-agent sessions still load stop-hooks.yaml.
+        let project_root_buf = project_root_for_stop_hooks(edge_context)
+            .or_else(|| workspace_override.map(|p| p.to_path_buf()));
+        let hook_sets = project_root_buf
+            .as_ref()
+            .map(|root| {
+                detect_turn_hook_sets(
+                    root.as_path(),
+                    task_profile,
+                    is_plan_subtask_from_chat_context(&request.context),
+                )
+            })
+            .unwrap_or_default();
+        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
+            .as_ref()
+            .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
+            .unwrap_or_default();
+        let max_turn_input_tokens = effective_max_turn_input_tokens(
+            astra_core::RuntimeLimits::global(),
+            request.model.as_deref(),
+            request.admitted_model_execution.as_ref(),
+        );
+        Ok(LoopExecutionFacts {
+            messages: vec![user_message],
+            tool_ledger_receipt: Default::default(),
+            max_turns,
+            remaining_turns: max_turns,
+            charged_iterations: 0,
+            original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts {
+                pending_context: Vec::new(),
+                context_compression_triggered: false,
+                skill_execution: Default::default(),
+                runtime_policy_evaluation: Default::default(),
+                turn_guard: TurnGuard::with_profile(task_profile),
+                message: prompt_user_message.clone(),
+                user_intent: prompt_user_intent,
+                turn_intent: None,
+                task_profile,
+                session_turn: 0,
+                canonical_turn_chain_id: Some(format!("{}:harness", session_id)),
+                root_user_query_event_id: None,
+                total_prompt: 0,
+                total_completion: 0,
+                total_cache_read: 0,
+                total_cache_creation: 0,
+                total_tool_calls: 0,
+                total_observation_tool_calls: 0,
+                has_any_usage: false,
+                agentic_turn_budget,
+                budget_is_explicit,
+                budget_policy: None,
+                loop_entry: Default::default(),
+                current_round_index: 0,
+                llm_rounds_completed: 0,
+                last_request_message_count: None,
+                max_turn_input_tokens,
+                last_finish_reason: None,
+                final_text: String::new(),
+                final_text_streamed: false,
+                final_output_ready_notified: false,
+                error_recovery: Default::default(),
+                provider_adaptation: Default::default(),
+                skill_produced_output: false,
+            },
+            stall: Default::default(),
+            user_intents: Default::default(),
+            hooks: StopHookState {
+                stop_hooks: hook_sets.stop_hooks,
+                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+                workspace_root_hint,
+                forward_headers: request.forward_headers.clone(),
+                admitted_model_execution: request.admitted_model_execution.clone(),
+                ..Default::default()
+            },
+            tool_event_hooks,
+            session_event_hooks,
+            budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
+            step_recorder: StepRecorder::with_persistence_for_run(
+                user_id, session_id, run_id, run_id,
+            ),
+        })
+    }
+
+    /// Assemble one loop without inferring or resetting its execution facts.
+    fn assemble_loop_state(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+        session_id: &str,
+        run_id: &str,
+        request_constraints: RequestConstraints,
+        edge_context: &EdgeContext,
+        agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
+        environment: LoopEnvironment,
+        facts: LoopExecutionFacts,
+    ) -> AgenticLoopState {
+        use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+        use astra_text_utils::semantic_dedup::SemanticDedup;
+        let LoopEnvironment {
+            skill_registry,
+            skill_resolver,
+            skill_executor,
+            permission_context: root_permission_context,
+            memory_extraction_service,
+            harness,
+        } = environment;
+        let thinking_config =
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+                .expect("thinking configuration was validated during request admission");
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .resolve_for_model(request.model.as_deref());
+        AgenticLoopState {
+            messages: facts.messages,
+            run_transcript_capture: None,
+            volatile_pending: facts.original.pending_context,
+            recent_rounds: Vec::new(),
+            tool_results: Vec::new(),
+            current_session_id: Some(session_id.to_string()),
+            current_run_id: Some(run_id.to_string()),
+            current_run_owner_generation: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            context_manifest_pool: self.shared_pool.clone(),
+            context_manifest_user_id: None,
+            context_manifest_model_name: request.model.clone(),
+            runtime_manifest: None,
+            recursion_depth: 0,
+            final_text: facts.original.final_text,
+            final_text_streamed: facts.original.final_text_streamed,
+            final_output_ready_notified: facts.original.final_output_ready_notified,
+            total_prompt: facts.original.total_prompt,
+            total_completion: facts.original.total_completion,
+            total_cache_read: facts.original.total_cache_read,
+            total_cache_creation: facts.original.total_cache_creation,
+            total_tool_calls: facts.original.total_tool_calls,
+            total_observation_tool_calls: facts.original.total_observation_tool_calls,
+            tool_ledger_receipt: facts.tool_ledger_receipt,
+            has_any_usage: facts.original.has_any_usage,
+            last_finish_reason: facts.original.last_finish_reason,
+            max_turns: facts.max_turns,
+            remaining_turns: facts.remaining_turns,
+            charged_iterations: facts.charged_iterations,
+            agentic_turn_budget: facts.original.agentic_turn_budget,
+            budget_is_explicit: facts.original.budget_is_explicit,
+            budget_policy: facts.original.budget_policy,
+            current_round_index: facts.original.current_round_index,
+            loop_entry: facts.original.loop_entry,
+            llm_rounds_completed: facts.original.llm_rounds_completed,
+            last_request_message_count: facts.original.last_request_message_count,
+            turn_guard: facts.original.turn_guard,
+            restricted_tools: std::collections::HashSet::new(),
+            boosted_tools: std::collections::HashSet::new(),
+            widen_selection_pending: false,
+            step_recorder: facts.step_recorder,
+            idempotency_cache: InMemoryIdempotencyCache::new(),
+            semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
+            // Per-model workflow-guard policy (see
+            // `ToolSelectionConfig::resolve_for_model`). Built-in profiles
+            // give stronger models (opus/sonnet-4) more rope than haiku.
+            // Security guards (shell_obfuscation, destructive_sql) are
+            // unaffected and stay uniform across models.
+            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
+            stall: crate::turn::agentic_loop::host::StallTrackingState {
+                active_policy_feedback: facts.original.runtime_policy_evaluation.latest().clone(),
+                runtime_policy_evaluation: facts.original.runtime_policy_evaluation,
+                ..facts.stall
+            },
+            telemetry: Default::default(),
+            skills: SkillState {
+                execution: facts.original.skill_execution,
+                registry_for_activation: if request_constraints.allowed_skills.is_some() {
+                    None
+                } else {
+                    skill_registry
+                },
+                resolver: skill_resolver,
+                executor: skill_executor,
+                client_pipeline_skill_names: edge_context
+                    .edge_skills
+                    .iter()
+                    .filter(|skill| Self::edge_skill_is_allowed(skill, &request_constraints))
+                    .flat_map(|skill| {
+                        std::iter::once(skill.name.clone()).chain(skill.aliases.iter().cloned())
+                    })
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .collect(),
+                request_constraints,
+                listing_message: agent_binding_context.map(|context| {
+                    json!({
+                        "role": "system",
+                        "content": context.prompt_section,
+                    })
+                }),
+                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+                tool_event_hooks: facts.tool_event_hooks,
+                session_event_hooks: facts.session_event_hooks,
+                ..Default::default()
+            },
+            hooks: facts.hooks,
+            cancellation: Default::default(),
+            messaging: Default::default(),
+            user_intents: facts.user_intents,
+            error_recovery: facts.original.error_recovery,
+            provider_adaptation: facts.original.provider_adaptation,
+            run_control: None,
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::session_current_date::resolve_session_current_date_for_user(
+                        user_id, session_id,
+                    ),
+                ),
+            ),
+            message: facts.original.message,
+            user_intent: facts.original.user_intent,
+            recent_tools: Vec::new(),
+            deferred_tool_activations: Vec::new(),
+            has_prior_assistant_turn: false,
+            turn_intent: facts.original.turn_intent,
+            task_profile: facts.original.task_profile,
+            last_turn_policy: facts.last_turn_policy,
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+                .expect("valid dummy URL"),
+            api_token: String::new(),
+            delegation_engine: None,
+            delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "main".to_string(),
+            project_context: None,
+            checkpoint_gate: None,
+            last_llm_context_manifest_trace: None,
+            rate_limit_cooldown: Default::default(),
+            data_snapshot_provider: None,
+            last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
+            compaction_effectiveness: Default::default(),
+            pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
+            max_turn_input_tokens: facts.original.max_turn_input_tokens,
+            budget_wrapup_injected: facts.budget_wrapup_injected,
+            context_compression_triggered: facts.original.context_compression_triggered,
+            canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head: None,
+            budget_wrapup_ignored_rounds: facts.budget_wrapup_ignored_rounds,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
+            skill_produced_output: facts.original.skill_produced_output,
+            thinking: thinking_config,
+            permission_context: root_permission_context,
+            permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
+            recent_tactical_actions: Vec::new(),
+            runtime_tool_executor: None,
+            interruption: None,
+            session_facts: Default::default(),
+            memory_extraction_service,
+            observation_journal: Default::default(),
+            session_memory_state: Default::default(),
+            compact_strategy: request
+                .admitted_model_execution
+                .as_ref()
+                .map(|execution| {
+                    crate::turn::llm::context::compact_strategy_from_model_metadata(
+                        execution.cache_capability,
+                        &execution.provider,
+                    )
+                })
+                .unwrap_or_default(),
+            approval_overrides: None,
+            confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
+            session_turn: facts.original.session_turn,
+            canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
+            root_user_query_event_id: facts.original.root_user_query_event_id,
+            turn_event_buffer: None,
+            harness,
         }
     }
 
@@ -12052,7 +12400,7 @@ impl AgenticRunLifecycleService {
     }
 }
 
-fn should_preserve_execution_scratch(
+fn should_allow_empty_delta(
     outcome: &Result<
         crate::turn::agentic_loop::host::AgenticLoopOutcome,
         astra_core::ClassifiedError,
@@ -12659,6 +13007,944 @@ fn work_subject_invalidation_response(
         "work_subject_unavailable",
     )
 }
+impl AgenticRunLifecycleService {
+    async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
+        let OwnedBackgroundExecution {
+            user_id,
+            session_id,
+            run_id,
+            request,
+            mut host,
+            mut loop_state,
+            execution_owner_generation,
+            owner_lease_heartbeat,
+            canonical_turn,
+            root_runtime_context_guard,
+            work_runtime_binding,
+            tool_runtime_workspace,
+            cloud_workspace_record,
+            csl_manager,
+            cancel_flag,
+            pause_flag,
+            llm_cancel_token,
+            execution_lease_lost,
+        } = execution;
+        // Keep the same session-owned descendant authority that was wired
+        // into the runtime tool executor. Non-streaming settlement must not
+        // lose child governance merely because it has no SSE fanout bridge.
+        let bg_descendant_spawner = self
+            .server_agent_spawner_for_session(&user_id, &session_id)
+            .await
+            .spawner;
+
+        // Clone handles we need inside the spawned task.
+        let bg_approval_channels = self.approval_channels.clone();
+        let bg_user_prompt_channels = self.user_prompt_channels.clone();
+        let bg_progress_channels = self.progress_channels.clone();
+        let runs = self.runs_handle();
+        let run_engine = self.run_engine.clone();
+        let bg_run_semaphore = self.run_semaphore.clone();
+        let bg_run_id = run_id.clone();
+        let bg_session_id = session_id.clone();
+        let bg_resource_governor = self.resource_governor.clone();
+        let bg_user_id = user_id.clone();
+        let bg_work_runtime_binding = work_runtime_binding.clone();
+        let bg_work_workspace = tool_runtime_workspace.clone();
+        let bg_cloud_workspace_record = cloud_workspace_record.clone();
+        let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_metrics_registry = self.metrics_registry.clone();
+        let bg_cancel_flag = cancel_flag.clone();
+        let bg_pause_flag = pause_flag.clone();
+        let bg_llm_cancel_token = llm_cancel_token.clone();
+        let bg_execution_lease_lost = execution_lease_lost.clone();
+        let mut bg_root_runtime_context_guard = root_runtime_context_guard;
+        #[cfg(feature = "e2e-hooks")]
+        let bg_test_post_loop_settlement_delay_ms = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
+        let bg_root_mailbox_agent_id = request
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "root-agent".to_string());
+        let persist_ctx = PostLoopPersistContext {
+            matrixone: self.matrixone.clone(),
+            shared_pool: self.shared_pool.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            expected_owner_generation: Some(execution_owner_generation),
+            owner_lease_duration: self.run_engine.owner_lease_duration(),
+            agent_id: request.agent_id.clone(),
+            model_name: request.model.clone(),
+            user_message: request.message.clone(),
+            hook_db_writer: self.hook_db_writer.clone(),
+            observer_worker: self.observer_worker.clone(),
+            metrics_registry: self.metrics_registry.clone(),
+            csl_manager: csl_manager.map(tokio::sync::Mutex::new),
+        };
+
+        // Background task tracking: background_task_count is incremented before
+        // spawn and decremented via RAII guard on exit. serve()'s shutdown path
+        // calls drain_background_tasks() to wait for in-flight runs.
+        let bg_task_count_1 = Arc::clone(&self.background_task_count);
+        let bg_memory_task_count_1 = Arc::clone(&bg_task_count_1);
+        bg_task_count_1.fetch_add(1, Ordering::Release);
+        let run_abort_handle = spawn_observed(
+            async move {
+                // Count the full lifecycle, including fair capacity wait.
+                // Otherwise a cancellation before permit acquisition leaks
+                // shutdown accounting.
+                struct TaskCountGuard(Arc<AtomicUsize>);
+                impl Drop for TaskCountGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Release);
+                    }
+                }
+                let _guard = TaskCountGuard(bg_task_count_1);
+                // Start fencing as soon as the durable owner enters its task,
+                // before queueing for shared execution capacity. A queued run
+                // must not let its lease expire and later begin side effects
+                // under authority already recovered by another executor.
+                let _owner_lease_heartbeat = owner_lease_heartbeat;
+                if bg_execution_lease_lost.load(Ordering::Acquire) {
+                    runs.write().await.remove(&bg_run_id);
+                    bg_approval_channels.lock().await.remove(&bg_run_id);
+                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                    bg_progress_channels.lock().await.remove(&bg_run_id);
+                    return;
+                }
+                if let Err(error) = persist_ctx.persist_turn_start(&loop_state).await {
+                    tracing::warn!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %error,
+                        "accepted turn audit projection could not be persisted"
+                    );
+                }
+                let permit = match Self::acquire_run_permit_with(
+                    bg_run_semaphore,
+                    bg_metrics_registry.clone(),
+                    run_admission_timeout(),
+                    Some((*bg_llm_cancel_token).clone()),
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(RunAdmissionError::Cancelled) => {
+                        let _ = Self::cancel_started_run_before_admission_with_handles(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                        )
+                        .await;
+                        bg_approval_channels.lock().await.remove(&bg_run_id);
+                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                        bg_progress_channels.lock().await.remove(&bg_run_id);
+                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                            Self::cleanup_cloud_workspace_after_terminal_run(
+                                bg_workspace_record_store.clone(),
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                record,
+                                &RunStatus::Cancelled,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    Err(error @ (RunAdmissionError::Timeout | RunAdmissionError::Closed)) => {
+                        let failure_reason = match error {
+                            RunAdmissionError::Timeout => {
+                                "server capacity timeout before agentic loop start"
+                            }
+                            RunAdmissionError::Closed => {
+                                "server capacity admission closed before agentic loop start"
+                            }
+                            RunAdmissionError::Cancelled => unreachable!("handled above"),
+                        };
+                        let committed = Self::fail_started_run_before_spawn_with_handles(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                            failure_reason,
+                            error.into(),
+                        )
+                        .await;
+                        bg_approval_channels.lock().await.remove(&bg_run_id);
+                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                        bg_progress_channels.lock().await.remove(&bg_run_id);
+                        if committed {
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                                Self::cleanup_cloud_workspace_with_debt(
+                                    bg_workspace_record_store.clone(),
+                                    &bg_user_id,
+                                    &bg_session_id,
+                                    &bg_run_id,
+                                    record,
+                                    RuntimeCleanupReason::Failed,
+                                    failure_reason.to_string(),
+                                )
+                                .await;
+                            }
+                        }
+                        return;
+                    }
+                };
+                let execution_permit = permit;
+
+                // Pre-flight: check daily token budget before starting the agentic loop.
+                if let Some(ref gov) = bg_resource_governor {
+                    use astra_services::resource_governor::LimitCheck;
+                    if let LimitCheck::Denied { limit, reason } =
+                        gov.check_token_budget(&bg_user_id).await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            user_id = %bg_user_id,
+                            run_id = %bg_run_id,
+                            limit = %limit.as_str(),
+                            reason = %reason,
+                            "run rejected: daily token budget exhausted"
+                        );
+                        let budget_reject_committed = Self::persist_started_run_quota_rejection(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                            limit,
+                            &reason,
+                        )
+                        .await
+                        .is_some();
+                        // Clean up channels for this run.
+                        bg_approval_channels.lock().await.remove(&bg_run_id);
+                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                        bg_progress_channels.lock().await.remove(&bg_run_id);
+                        if budget_reject_committed
+                            && let Some(record) = bg_cloud_workspace_record.as_ref()
+                        {
+                            Self::cleanup_cloud_workspace_with_debt(
+                            bg_workspace_record_store.clone(),
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            record,
+                            RuntimeCleanupReason::Failed,
+                            format!(
+                                "run rejected before agentic loop start: daily token budget exhausted: {reason}"
+                            ),
+                        )
+                        .await;
+                        }
+                        if budget_reject_committed {
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        }
+                        return;
+                    }
+                }
+                install_server_root_mailbox(
+                    &mut loop_state,
+                    &bg_root_mailbox_router,
+                    &bg_session_id,
+                    &bg_run_id,
+                    &bg_root_mailbox_agent_id,
+                )
+                .await;
+                let _control_watcher = start_active_run_control_watcher(
+                    loop_state.run_control.clone(),
+                    bg_user_id.clone(),
+                    bg_run_id.clone(),
+                    bg_cancel_flag.clone(),
+                    bg_pause_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
+
+                let outcome =
+                    run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
+                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.settlement_in_progress = true;
+                }
+                let _ = Self::persist_settlement_started(
+                    &run_engine,
+                    &bg_user_id,
+                    &bg_session_id,
+                    &bg_run_id,
+                    execution_owner_generation,
+                )
+                .await;
+                #[cfg(feature = "e2e-hooks")]
+                if bg_test_post_loop_settlement_delay_ms > 0 {
+                    run_engine
+                        .append_event(
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            json!({
+                                "event_type": "test_post_loop_settlement_barrier_reached",
+                                "idempotency_key": format!(
+                                    "test-post-loop-settlement-barrier:{execution_owner_generation}"
+                                ),
+                                "data": {}
+                            }),
+                        )
+                        .await
+                        .expect("persist post-loop settlement test barrier");
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        bg_test_post_loop_settlement_delay_ms,
+                    ))
+                    .await;
+                }
+                if bg_execution_lease_lost.load(Ordering::Acquire) {
+                    if let Some((waiting_for, status)) =
+                        Self::load_exact_preexisting_control_terminal(
+                            &run_engine,
+                            &bg_user_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                        )
+                        .await
+                    {
+                        // A remote control transition intentionally stops
+                        // lease renewal without rotating execution ownership.
+                        // Reclassify that wake-up before finalization so this
+                        // exact generation may settle observations/accounting,
+                        // but never publish a second lifecycle terminal.
+                        bg_execution_lease_lost.store(false, Ordering::Release);
+                        if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                            run.status = status;
+                            run.waiting_for = waiting_for;
+                            run.live_tx = None;
+                        }
+                    } else {
+                        // This executor is no longer a durable authority. Do not
+                        // synthesize or persist a terminal outcome: the recovery
+                        // owner that rotated the generation is the only writer
+                        // allowed to classify the run. Local cancellation exists
+                        // solely to stop provider/tool work promptly.
+                        drop(execution_permit);
+                        park_server_root_mailbox(&mut loop_state).await;
+                        bg_approval_channels.lock().await.remove(&bg_run_id);
+                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                        bg_progress_channels.lock().await.remove(&bg_run_id);
+                        runs.write().await.remove(&bg_run_id);
+                        drop(_owner_lease_heartbeat);
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            execution_owner_generation,
+                            "abandoned stale local execution after durable lease fencing"
+                        );
+                        return;
+                    }
+                }
+                Self::converge_primary_work_attempt_with_run(
+                    &mut host,
+                    &loop_state,
+                    &outcome,
+                    &bg_run_id,
+                )
+                .await;
+                // Admission protects provider/tool execution, not durable
+                // settlement. Holding it through trace writes, transcript
+                // materialization, workspace cleanup, and memory extraction
+                // turns post-loop I/O into a cross-user model queue.
+                drop(execution_permit);
+                park_server_root_mailbox(&mut loop_state).await;
+                host.on_loop_terminal(&loop_state, &outcome).await;
+                let (outcome, events) = host.settle_loop_turn(outcome);
+                enforce_completed_tool_ledger_closure(&outcome, &mut loop_state);
+                let allow_empty_delta =
+                    should_allow_empty_delta(&outcome, loop_state.interruption.is_some());
+                let loop_success = outcome.is_ok() && loop_state.interruption.is_none();
+                let (mut events, final_status, error_msg) =
+                    Self::finalize_run_events(outcome, events, &loop_state);
+                Self::stamp_run_finished_owner_generation(&mut events, execution_owner_generation);
+                let mut user_cancellation = false;
+                if matches!(&final_status, RunStatus::Cancelled) {
+                    let cancellation_origin = resolve_cancellation_origin(&mut loop_state).await;
+                    Self::annotate_cancelled_run_finished_event(&mut events, cancellation_origin);
+                    if cancellation_origin == CancellationOrigin::User {
+                        Self::converge_local_user_cancelled_run_descendants(
+                            Some(bg_descendant_spawner.as_ref()),
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                        )
+                        .await;
+                        user_cancellation = true;
+                    }
+                }
+                let mut core_trace_result = Err(
+                    "canonical terminal settlement did not acquire durable authority".to_string(),
+                );
+                let mut canonical_context_cursor = None;
+
+                // Clean up channels for this run.
+                bg_approval_channels.lock().await.remove(&bg_run_id);
+                bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                bg_progress_channels.lock().await.remove(&bg_run_id);
+                let terminal_events = enforce_durable_run_event_batch_budget(
+                    terminal_events_for_persistence(&events),
+                );
+                record_durable_run_event_batch_metrics(
+                    bg_metrics_registry.as_ref(),
+                    "non_streaming_terminal",
+                    "planned",
+                    &terminal_events,
+                );
+
+                // Publish terminal run state before best-effort post-run side effects
+                // so background observers do not stay stuck in "running" because a
+                // hook, event write, or learning save is slow.
+                let mut persisted_status = final_status;
+                let mut persist_status_update = true;
+                let mut persist_terminal_events = true;
+                let mut preexisting_terminal_status = None;
+
+                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.execution_live = false;
+                    run.settlement_in_progress = true;
+                    if run.status == RunStatus::Cancelled {
+                        preexisting_terminal_status = Some(RunStatus::Cancelled);
+                        persist_status_update = false;
+                        persist_terminal_events = false;
+                        merge_cancelled_run_events(run, events);
+                        if final_status != RunStatus::Waiting {
+                            run.live_tx = None;
+                        }
+                        flush_turn_observability(
+                            &mut loop_state,
+                            &bg_user_id,
+                            &bg_session_id,
+                            true,
+                        );
+                    } else {
+                        run.events.extend(events);
+                        if should_preserve_manual_pause_on_completion(
+                            &run.status,
+                            run.waiting_for.as_deref(),
+                            &final_status,
+                        ) {
+                            persist_status_update = false;
+                            persisted_status = RunStatus::Paused;
+                            preexisting_terminal_status = Some(RunStatus::Paused);
+                            run.waiting_for
+                                .get_or_insert_with(|| "user_resume".to_string());
+                            run.live_tx = None;
+                        } else if run.status.try_transition(&final_status).is_ok() {
+                            run.status = final_status;
+                        }
+                        if !run.status.is_resumable() {
+                            run.live_tx = None;
+                        }
+                    }
+                }
+
+                if persist_status_update
+                    && should_preserve_manual_pause_from_durable(
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_run_id,
+                        &final_status,
+                    )
+                    .await
+                {
+                    persist_status_update = false;
+                    persisted_status = RunStatus::Paused;
+                    preexisting_terminal_status = Some(RunStatus::Paused);
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                        if run.status == RunStatus::Paused
+                            || run.status.try_transition(&RunStatus::Paused).is_ok()
+                        {
+                            run.status = RunStatus::Paused;
+                            run.pause_flag.store(true, Ordering::SeqCst);
+                            run.waiting_for
+                                .get_or_insert_with(|| "user_resume".to_string());
+                            run.live_tx = None;
+                        } else {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                current_status = %run.status.as_str(),
+                                "durable pause projection arrived after an incompatible local terminal state"
+                            );
+                        }
+                    }
+                }
+
+                let mut durable_status_committed = !persist_status_update;
+                let mut owner_terminal_committed = false;
+                let mut atomic_terminal_committed = false;
+                let mut terminal_events_committed = false;
+                if !persist_terminal_events {
+                    record_durable_run_event_batch_metrics(
+                        bg_metrics_registry.as_ref(),
+                        "non_streaming_terminal",
+                        "skipped",
+                        &terminal_events,
+                    );
+                }
+                if persist_status_update {
+                    let events_for_transition: &[Value] = if persist_terminal_events {
+                        terminal_events.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let terminal_expected_statuses: &[&str] =
+                        if persisted_status == RunStatus::Cancelled {
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED]
+                        } else {
+                            &[STATUS_RUNNING, STATUS_WAITING]
+                        };
+                    match persist_ctx
+                        .persist_atomic_terminal_settlement(
+                            &loop_state,
+                            terminal_expected_statuses,
+                            execution_owner_generation,
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref(),
+                            events_for_transition,
+                        )
+                        .await
+                    {
+                        Ok(Some(commit)) => {
+                            let _ = commit;
+                            core_trace_result = Ok(());
+                            durable_status_committed = true;
+                            owner_terminal_committed = true;
+                            atomic_terminal_committed = true;
+                            terminal_events_committed =
+                                persist_terminal_events && !terminal_events.is_empty();
+                            if terminal_events_committed {
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "non_streaming_terminal",
+                                    "committed",
+                                    &terminal_events,
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            core_trace_result = persist_ctx
+                                .persist_core_and_trace_in_transaction(&loop_state)
+                                .await;
+                            if core_trace_result.is_ok() {
+                                match run_engine
+                                    .commit_terminal_status_with_events_if_current_owner(
+                                        &bg_user_id,
+                                        &bg_session_id,
+                                        &bg_run_id,
+                                        terminal_expected_statuses,
+                                        execution_owner_generation,
+                                        persisted_status.as_str(),
+                                        None,
+                                        error_msg.as_deref(),
+                                        events_for_transition,
+                                    )
+                                    .await
+                                {
+                                    Ok(TerminalTransitionOutcome::Committed(_)) => {
+                                        durable_status_committed = true;
+                                        owner_terminal_committed = true;
+                                        terminal_events_committed =
+                                            persist_terminal_events && !terminal_events.is_empty();
+                                    }
+                                    Ok(TerminalTransitionOutcome::Superseded(durable)) => {
+                                        persist_terminal_events = false;
+                                        if let Some(status) =
+                                            Self::exact_preexisting_control_terminal_status(
+                                                &durable.status,
+                                                durable.run_generation,
+                                                execution_owner_generation,
+                                            )
+                                        {
+                                            preexisting_terminal_status = Some(status);
+                                            durable_status_committed = true;
+                                        }
+                                        if let Some(authoritative_status) =
+                                            RunStatus::from_durable_status(&durable.status)
+                                        {
+                                            persisted_status = authoritative_status;
+                                            if let Some(run) =
+                                                runs.write().await.get_mut(&bg_run_id)
+                                            {
+                                                run.status = authoritative_status;
+                                                run.waiting_for = durable.waiting_for.clone();
+                                                run.live_tx = None;
+                                            }
+                                        } else {
+                                            runs.write().await.remove(&bg_run_id);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        persist_terminal_events = false;
+                                        runs.write().await.remove(&bg_run_id);
+                                        tracing::warn!(
+                                            target: "astra_runtime::run_lifecycle",
+                                            run_id = %bg_run_id,
+                                            error = %error,
+                                            "failed to persist fallback terminal settlement"
+                                        );
+                                    }
+                                }
+                            } else {
+                                persist_terminal_events = false;
+                                runs.write().await.remove(&bg_run_id);
+                            }
+                        }
+                        Err(error) => {
+                            persist_terminal_events = false;
+                            let durable_control_terminal =
+                                Self::load_exact_preexisting_control_terminal(
+                                    &run_engine,
+                                    &bg_user_id,
+                                    &bg_run_id,
+                                    execution_owner_generation,
+                                )
+                                .await;
+                            if let Some((waiting_for, status)) = durable_control_terminal {
+                                preexisting_terminal_status = Some(status);
+                                persisted_status = status;
+                                durable_status_committed = true;
+                                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                                    run.status = status;
+                                    run.waiting_for = waiting_for;
+                                    run.live_tx = None;
+                                }
+                                tracing::debug!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %bg_run_id,
+                                    status = status.as_str(),
+                                    error = %error,
+                                    "atomic settlement lost to an exact-generation control terminal; repairing trace and accounting"
+                                );
+                            } else {
+                                core_trace_result = Err(error.clone());
+                                // The durable result is unknown. Remove the stale
+                                // process-local projection so later reads must
+                                // reconcile from the durable authority.
+                                runs.write().await.remove(&bg_run_id);
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "non_streaming_terminal",
+                                    "error",
+                                    &terminal_events,
+                                );
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %bg_run_id,
+                                    error = %error,
+                                    "failed to persist atomic canonical terminal settlement"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if user_cancellation
+                    && durable_status_committed
+                    && persisted_status == RunStatus::Cancelled
+                {
+                    Self::schedule_durable_user_cancelled_run_descendants(
+                        run_engine.clone(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        false,
+                    );
+                }
+
+                if let Some(status) = preexisting_terminal_status {
+                    core_trace_result = persist_ctx
+                        .persist_trace_after_authoritative_terminal(&loop_state, status.as_str())
+                        .await;
+                    if let Err(error) = core_trace_result.as_ref() {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            status = status.as_str(),
+                            error = %error,
+                            "failed to retain observations after an independently committed terminal"
+                        );
+                    }
+                }
+
+                if owner_terminal_committed && core_trace_result.is_ok() {
+                    match Self::commit_canonical_turn(
+                        canonical_turn.as_ref(),
+                        &loop_state.messages,
+                        loop_state.canonical_rewrite_proof(),
+                        allow_empty_delta
+                            || bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
+                        &bg_run_id,
+                    )
+                    .await
+                    {
+                        Ok(cursor) => canonical_context_cursor = cursor,
+                        Err(error) => tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            error = %error,
+                            "durable terminal committed but canonical context projection failed"
+                        ),
+                    }
+                }
+
+                // Evict only after the durable outcome is authoritative. A
+                // lost or unknown CAS must never evict based on stale local
+                // completion.
+                if (durable_status_committed || !persist_status_update)
+                    && !persisted_status.is_resumable()
+                {
+                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                }
+                if (owner_terminal_committed || preexisting_terminal_status.is_some())
+                    && !atomic_terminal_committed
+                {
+                    astra_core::log_persist!(
+                        run_engine
+                            .persist_usage_if_current_owner(
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                execution_owner_generation,
+                                loop_state.provider_input_tokens(),
+                                loop_state.total_completion,
+                                loop_state.total_tool_calls,
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "owner_fenced_usage"
+                    );
+                }
+                // Record tokens consumed so check_token_budget sees up-to-date usage.
+                if let Some(ref gov) = bg_resource_governor {
+                    let total = loop_state.provider_total_tokens();
+                    if total > 0 {
+                        gov.record_tokens(&bg_user_id, total).await;
+                    }
+                }
+                if should_append_generic_terminal_batch(
+                    durable_status_committed,
+                    persist_terminal_events,
+                    terminal_events.len(),
+                    terminal_events_committed,
+                    preexisting_terminal_status.is_some(),
+                ) {
+                    match run_engine
+                        .append_events_batch(
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            &terminal_events,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            terminal_events_committed = true;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "committed",
+                                &terminal_events,
+                            );
+                        }
+                        Err(error) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "error",
+                                &terminal_events,
+                            );
+                            astra_core::agent_warn!(
+                                "run_lifecycle",
+                                "persist append_terminal_events_batch for run {}: {}",
+                                bg_run_id,
+                                error
+                            );
+                        }
+                    }
+                }
+                // The finalized marker is also the bounded status API's proof
+                // that every earlier terminal/buffered-completion fact for
+                // this draining generation has reached durable storage.
+                let control_terminal_settlement_committed =
+                    if let Some(status) = preexisting_terminal_status {
+                        let uncommitted_terminal_events = if status != RunStatus::Paused
+                            || terminal_batch_settlement_ready(
+                                terminal_events.len(),
+                                terminal_events_committed,
+                            ) {
+                            &[][..]
+                        } else {
+                            terminal_events.as_slice()
+                        };
+                        Some(
+                            Self::persist_finalized_accounting_after_preexisting_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                status,
+                                execution_owner_generation,
+                                &loop_state,
+                                uncommitted_terminal_events,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
+                let all_settlement_facts_committed = settlement_facts_committed(
+                    control_terminal_settlement_committed,
+                    durable_status_committed,
+                    terminal_events.len(),
+                    terminal_events_committed,
+                );
+                let settlement_closed = all_settlement_facts_committed
+                    && Self::persist_settlement_finished(
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                    )
+                    .await;
+                let durable_fence_closed = durable_settlement_fence_closed(
+                    control_terminal_settlement_committed,
+                    settlement_closed,
+                );
+                if durable_fence_closed && let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.settlement_in_progress = false;
+                }
+
+                // The execution is no longer resumable once its durable final
+                // state has been reconciled. Release cross-pod ownership before
+                // slower observability, memory, and workspace cleanup so those
+                // side effects do not extend the executor's apparent lifetime.
+                drop(_owner_lease_heartbeat);
+
+                if owner_terminal_committed && persist_terminal_events {
+                    flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
+                    persist_turn_evaluation_journal(
+                        &bg_user_id,
+                        &bg_session_id,
+                        "server_runtime",
+                        &loop_state,
+                        persisted_status.as_str(),
+                    );
+                }
+
+                if owner_terminal_committed {
+                    if let (Some(pool), Some(binding), Some(workspace)) = (
+                        persist_ctx.shared_pool.clone(),
+                        bg_work_runtime_binding.as_ref(),
+                        bg_work_workspace.as_deref(),
+                    ) && let Err(error) = Self::synchronize_work_subject_after_execution(
+                        pool, binding, workspace, &bg_run_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            work_id = %binding.work_id.as_str(),
+                            branch_id = %binding.branch_id.as_str(),
+                            run_id = %bg_run_id,
+                            error = %error,
+                            "Work subject remains unavailable after execution"
+                        );
+                    }
+
+                    // Derived projections and cleanup may only observe a
+                    // generation whose terminal transition won. A stale
+                    // executor still retains its append-only attempt evidence,
+                    // but must not publish session state, memory, or workspace
+                    // effects after another owner has taken over.
+                    if let Err(e) = persist_ctx
+                        .run_after_core(
+                            &loop_state,
+                            loop_success,
+                            core_trace_result,
+                            canonical_context_cursor.is_some(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "post-loop persistence failed"
+                        );
+                    }
+                    if let Err(e) = persist_ctx
+                        .materialize_run_transcript_evidence(
+                            &loop_state,
+                            canonical_context_cursor.as_ref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "durable transcript evidence materialization failed"
+                        );
+                    }
+
+                    // Post-loop memory cleanup is detached from the terminal
+                    // response. It has its own bounded worker and shutdown drain;
+                    // a slow selector must not extend the run's visible lifetime.
+                    schedule_post_loop_memory_cleanup(
+                        Arc::clone(&bg_memory_task_count_1),
+                        bg_user_id.clone(),
+                        loop_state.current_session_id.clone().unwrap_or_default(),
+                        bg_run_id.clone(),
+                        loop_state.session_turn,
+                        loop_state.session_facts.clone(),
+                        loop_state.memory_extraction_service.clone(),
+                        build_shutdown_extraction_request(&loop_state),
+                        bg_metrics_registry.clone(),
+                    );
+
+                    if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                        Self::cleanup_cloud_workspace_after_terminal_run(
+                            bg_workspace_record_store,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            record,
+                            &persisted_status,
+                        )
+                        .await;
+                    }
+                }
+                if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
+                    guard.settle().await;
+                }
+            },
+            "agentic_loop_create_run",
+        );
+        self.track_background_run_abort_handle(run_abort_handle);
+    }
+}
+
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
     fn execution_owner_pod_id(&self) -> Option<&str> {
@@ -12964,7 +14250,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_tool_schemas_with_native_ids(
+                bundle.schemas.clone(),
+                bundle.control_tools.clone(),
+                bundle.native_tool_ids_by_public_name(),
+            );
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         // In agent-binding mode with an EdgeAgent executor, the host only installs
@@ -13041,7 +14331,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             Some(execution_owner_generation),
-        );
+        )?;
         install_active_personal_skills(&mut loop_state, active_personal_skills);
         loop_state.context_manifest_user_id = Some(user_id.clone());
         bind_execution_owner_generation(&mut loop_state, execution_owner_generation);
@@ -13060,6 +14350,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
         if let Some(admission) = canonical_turn.as_ref() {
             loop_state.initialize_provider_canonical_wal_base(&admission.prior_messages);
+            host.bind_execution_handoff(
+                self.execution_handoff_requested.clone(),
+                self.run_engine.clone(),
+                admission.reservation.clone(),
+            );
         }
         if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
@@ -13429,923 +14724,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        // Keep the same session-owned descendant authority that was wired
-        // into the runtime tool executor. Non-streaming settlement must not
-        // lose child governance merely because it has no SSE fanout bridge.
-        let bg_descendant_spawner = self
-            .server_agent_spawner_for_session(&user_id, &session_id)
-            .await
-            .spawner;
-
-        // Clone handles we need inside the spawned task.
-        let bg_approval_channels = self.approval_channels.clone();
-        let bg_user_prompt_channels = self.user_prompt_channels.clone();
-        let bg_progress_channels = self.progress_channels.clone();
-        let runs = self.runs_handle();
-        let run_engine = self.run_engine.clone();
-        let bg_run_semaphore = self.run_semaphore.clone();
-        let bg_run_id = run_id.clone();
-        let bg_session_id = session_id.clone();
-        let bg_resource_governor = self.resource_governor.clone();
-        let bg_user_id = user_id.clone();
-        let bg_work_runtime_binding = work_runtime_binding.clone();
-        let bg_work_workspace = tool_runtime_workspace.clone();
-        let bg_cloud_workspace_record = cloud_workspace_record.clone();
-        let bg_workspace_record_store = self.workspace_record_store.clone();
-        let bg_metrics_registry = self.metrics_registry.clone();
-        let bg_cancel_flag = cancel_flag.clone();
-        let bg_pause_flag = pause_flag.clone();
-        let bg_llm_cancel_token = llm_cancel_token.clone();
-        let bg_execution_lease_lost = execution_lease_lost.clone();
-        let mut bg_root_runtime_context_guard = root_runtime_context_guard;
-        #[cfg(feature = "e2e-hooks")]
-        let bg_test_post_loop_settlement_delay_ms = request
-            .context
-            .as_ref()
-            .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
-        let bg_root_mailbox_agent_id = request
-            .agent_id
-            .clone()
-            .unwrap_or_else(|| "root-agent".to_string());
-        let persist_ctx = PostLoopPersistContext {
-            matrixone: self.matrixone.clone(),
-            shared_pool: self.shared_pool.clone(),
-            user_id: user_id.clone(),
+        let explain = request.explain;
+        self.launch_owned_background_execution(OwnedBackgroundExecution {
+            user_id,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
-            expected_owner_generation: Some(execution_owner_generation),
-            owner_lease_duration: self.run_engine.owner_lease_duration(),
-            agent_id: request.agent_id.clone(),
-            model_name: request.model.clone(),
-            user_message: request.message.clone(),
-            hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: self.observer_worker.clone(),
-            metrics_registry: self.metrics_registry.clone(),
-            csl_manager: csl_manager.map(tokio::sync::Mutex::new),
-        };
-
-        // Background task tracking: background_task_count is incremented before
-        // spawn and decremented via RAII guard on exit. serve()'s shutdown path
-        // calls drain_background_tasks() to wait for in-flight runs.
-        let bg_task_count_1 = Arc::clone(&self.background_task_count);
-        let bg_memory_task_count_1 = Arc::clone(&bg_task_count_1);
-        bg_task_count_1.fetch_add(1, Ordering::Release);
-        let run_abort_handle = spawn_observed(
-            async move {
-                // Count the full lifecycle, including fair capacity wait.
-                // Otherwise a cancellation before permit acquisition leaks
-                // shutdown accounting.
-                struct TaskCountGuard(Arc<AtomicUsize>);
-                impl Drop for TaskCountGuard {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::Release);
-                    }
-                }
-                let _guard = TaskCountGuard(bg_task_count_1);
-                // Start fencing as soon as the durable owner enters its task,
-                // before queueing for shared execution capacity. A queued run
-                // must not let its lease expire and later begin side effects
-                // under authority already recovered by another executor.
-                let _owner_lease_heartbeat = owner_lease_heartbeat;
-                if bg_execution_lease_lost.load(Ordering::Acquire) {
-                    runs.write().await.remove(&bg_run_id);
-                    bg_approval_channels.lock().await.remove(&bg_run_id);
-                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                    bg_progress_channels.lock().await.remove(&bg_run_id);
-                    return;
-                }
-                if let Err(error) = persist_ctx.persist_turn_start(&loop_state).await {
-                    tracing::warn!(
-                        session_id = %bg_session_id,
-                        run_id = %bg_run_id,
-                        error = %error,
-                        "accepted turn audit projection could not be persisted"
-                    );
-                }
-                let permit = match Self::acquire_run_permit_with(
-                    bg_run_semaphore,
-                    bg_metrics_registry.clone(),
-                    run_admission_timeout(),
-                    Some((*bg_llm_cancel_token).clone()),
-                )
-                .await
-                {
-                    Ok(permit) => permit,
-                    Err(RunAdmissionError::Cancelled) => {
-                        let _ = Self::cancel_started_run_before_admission_with_handles(
-                            &run_engine,
-                            &runs,
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            execution_owner_generation,
-                        )
-                        .await;
-                        bg_approval_channels.lock().await.remove(&bg_run_id);
-                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                        bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
-                            Self::cleanup_cloud_workspace_after_terminal_run(
-                                bg_workspace_record_store.clone(),
-                                &bg_user_id,
-                                &bg_session_id,
-                                &bg_run_id,
-                                record,
-                                &RunStatus::Cancelled,
-                            )
-                            .await;
-                        }
-                        return;
-                    }
-                    Err(error @ (RunAdmissionError::Timeout | RunAdmissionError::Closed)) => {
-                        let failure_reason = match error {
-                            RunAdmissionError::Timeout => {
-                                "server capacity timeout before agentic loop start"
-                            }
-                            RunAdmissionError::Closed => {
-                                "server capacity admission closed before agentic loop start"
-                            }
-                            RunAdmissionError::Cancelled => unreachable!("handled above"),
-                        };
-                        let committed = Self::fail_started_run_before_spawn_with_handles(
-                            &run_engine,
-                            &runs,
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            execution_owner_generation,
-                            failure_reason,
-                            error.into(),
-                        )
-                        .await;
-                        bg_approval_channels.lock().await.remove(&bg_run_id);
-                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                        bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if committed {
-                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
-                                Self::cleanup_cloud_workspace_with_debt(
-                                    bg_workspace_record_store.clone(),
-                                    &bg_user_id,
-                                    &bg_session_id,
-                                    &bg_run_id,
-                                    record,
-                                    RuntimeCleanupReason::Failed,
-                                    failure_reason.to_string(),
-                                )
-                                .await;
-                            }
-                        }
-                        return;
-                    }
-                };
-                let execution_permit = permit;
-
-                // Pre-flight: check daily token budget before starting the agentic loop.
-                if let Some(ref gov) = bg_resource_governor {
-                    use astra_services::resource_governor::LimitCheck;
-                    if let LimitCheck::Denied { limit, reason } =
-                        gov.check_token_budget(&bg_user_id).await
-                    {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            user_id = %bg_user_id,
-                            run_id = %bg_run_id,
-                            limit = %limit.as_str(),
-                            reason = %reason,
-                            "run rejected: daily token budget exhausted"
-                        );
-                        let budget_reject_committed = Self::persist_started_run_quota_rejection(
-                            &run_engine,
-                            &runs,
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            execution_owner_generation,
-                            limit,
-                            &reason,
-                        )
-                        .await
-                        .is_some();
-                        // Clean up channels for this run.
-                        bg_approval_channels.lock().await.remove(&bg_run_id);
-                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                        bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if budget_reject_committed
-                            && let Some(record) = bg_cloud_workspace_record.as_ref()
-                        {
-                            Self::cleanup_cloud_workspace_with_debt(
-                            bg_workspace_record_store.clone(),
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            record,
-                            RuntimeCleanupReason::Failed,
-                            format!(
-                                "run rejected before agentic loop start: daily token budget exhausted: {reason}"
-                            ),
-                        )
-                        .await;
-                        }
-                        if budget_reject_committed {
-                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                        }
-                        return;
-                    }
-                }
-                install_server_root_mailbox(
-                    &mut loop_state,
-                    &bg_root_mailbox_router,
-                    &bg_session_id,
-                    &bg_run_id,
-                    &bg_root_mailbox_agent_id,
-                )
-                .await;
-                let _control_watcher = start_active_run_control_watcher(
-                    loop_state.run_control.clone(),
-                    bg_user_id.clone(),
-                    bg_run_id.clone(),
-                    bg_cancel_flag.clone(),
-                    bg_pause_flag.clone(),
-                    bg_llm_cancel_token.clone(),
-                );
-
-                let outcome =
-                    run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
-                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                    run.settlement_in_progress = true;
-                }
-                let _ = Self::persist_settlement_started(
-                    &run_engine,
-                    &bg_user_id,
-                    &bg_session_id,
-                    &bg_run_id,
-                    execution_owner_generation,
-                )
-                .await;
-                #[cfg(feature = "e2e-hooks")]
-                if bg_test_post_loop_settlement_delay_ms > 0 {
-                    run_engine
-                        .append_event(
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            json!({
-                                "event_type": "test_post_loop_settlement_barrier_reached",
-                                "idempotency_key": format!(
-                                    "test-post-loop-settlement-barrier:{execution_owner_generation}"
-                                ),
-                                "data": {}
-                            }),
-                        )
-                        .await
-                        .expect("persist post-loop settlement test barrier");
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        bg_test_post_loop_settlement_delay_ms,
-                    ))
-                    .await;
-                }
-                if bg_execution_lease_lost.load(Ordering::Acquire) {
-                    if let Some((waiting_for, status)) =
-                        Self::load_exact_preexisting_control_terminal(
-                            &run_engine,
-                            &bg_user_id,
-                            &bg_run_id,
-                            execution_owner_generation,
-                        )
-                        .await
-                    {
-                        // A remote control transition intentionally stops
-                        // lease renewal without rotating execution ownership.
-                        // Reclassify that wake-up before finalization so this
-                        // exact generation may settle observations/accounting,
-                        // but never publish a second lifecycle terminal.
-                        bg_execution_lease_lost.store(false, Ordering::Release);
-                        if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                            run.status = status;
-                            run.waiting_for = waiting_for;
-                            run.live_tx = None;
-                        }
-                    } else {
-                        // This executor is no longer a durable authority. Do not
-                        // synthesize or persist a terminal outcome: the recovery
-                        // owner that rotated the generation is the only writer
-                        // allowed to classify the run. Local cancellation exists
-                        // solely to stop provider/tool work promptly.
-                        drop(execution_permit);
-                        park_server_root_mailbox(&mut loop_state).await;
-                        bg_approval_channels.lock().await.remove(&bg_run_id);
-                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                        bg_progress_channels.lock().await.remove(&bg_run_id);
-                        runs.write().await.remove(&bg_run_id);
-                        drop(_owner_lease_heartbeat);
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %bg_run_id,
-                            execution_owner_generation,
-                            "abandoned stale local execution after durable lease fencing"
-                        );
-                        return;
-                    }
-                }
-                Self::converge_primary_work_attempt_with_run(
-                    &mut host,
-                    &loop_state,
-                    &outcome,
-                    &bg_run_id,
-                )
-                .await;
-                // Admission protects provider/tool execution, not durable
-                // settlement. Holding it through trace writes, transcript
-                // materialization, workspace cleanup, and memory extraction
-                // turns post-loop I/O into a cross-user model queue.
-                drop(execution_permit);
-                park_server_root_mailbox(&mut loop_state).await;
-                let (outcome, events) = host.settle_loop_turn(outcome);
-                enforce_completed_tool_ledger_closure(&outcome, &mut loop_state);
-                let preserve_execution_scratch =
-                    should_preserve_execution_scratch(&outcome, loop_state.interruption.is_some());
-                let loop_success = outcome.is_ok() && loop_state.interruption.is_none();
-                let (mut events, final_status, error_msg) =
-                    Self::finalize_run_events(outcome, events, &loop_state);
-                Self::stamp_run_finished_owner_generation(&mut events, execution_owner_generation);
-                let mut user_cancellation = false;
-                if matches!(&final_status, RunStatus::Cancelled) {
-                    let cancellation_origin = resolve_cancellation_origin(&mut loop_state).await;
-                    Self::annotate_cancelled_run_finished_event(&mut events, cancellation_origin);
-                    if cancellation_origin == CancellationOrigin::User {
-                        Self::converge_local_user_cancelled_run_descendants(
-                            Some(bg_descendant_spawner.as_ref()),
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                        )
-                        .await;
-                        user_cancellation = true;
-                    }
-                }
-                let mut core_trace_result = Err(
-                    "canonical terminal settlement did not acquire durable authority".to_string(),
-                );
-                let mut canonical_context_cursor = None;
-
-                // Clean up channels for this run.
-                bg_approval_channels.lock().await.remove(&bg_run_id);
-                bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                bg_progress_channels.lock().await.remove(&bg_run_id);
-                let terminal_events = enforce_durable_run_event_batch_budget(
-                    terminal_events_for_persistence(&events),
-                );
-                record_durable_run_event_batch_metrics(
-                    bg_metrics_registry.as_ref(),
-                    "non_streaming_terminal",
-                    "planned",
-                    &terminal_events,
-                );
-
-                // Publish terminal run state before best-effort post-run side effects
-                // so background observers do not stay stuck in "running" because a
-                // hook, event write, or learning save is slow.
-                let mut persisted_status = final_status;
-                let mut persist_status_update = true;
-                let mut persist_terminal_events = true;
-                let mut preexisting_terminal_status = None;
-
-                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                    run.execution_live = false;
-                    run.settlement_in_progress = true;
-                    if run.status == RunStatus::Cancelled {
-                        preexisting_terminal_status = Some(RunStatus::Cancelled);
-                        persist_status_update = false;
-                        persist_terminal_events = false;
-                        merge_cancelled_run_events(run, events);
-                        if final_status != RunStatus::Waiting {
-                            run.live_tx = None;
-                        }
-                        flush_turn_observability(
-                            &mut loop_state,
-                            &bg_user_id,
-                            &bg_session_id,
-                            true,
-                        );
-                    } else {
-                        run.events.extend(events);
-                        if should_preserve_manual_pause_on_completion(
-                            &run.status,
-                            run.waiting_for.as_deref(),
-                            &final_status,
-                        ) {
-                            persist_status_update = false;
-                            persisted_status = RunStatus::Paused;
-                            preexisting_terminal_status = Some(RunStatus::Paused);
-                            run.waiting_for
-                                .get_or_insert_with(|| "user_resume".to_string());
-                            run.live_tx = None;
-                        } else if run.status.try_transition(&final_status).is_ok() {
-                            run.status = final_status;
-                        }
-                        if !run.status.is_resumable() {
-                            run.live_tx = None;
-                        }
-                    }
-                }
-
-                if persist_status_update
-                    && should_preserve_manual_pause_from_durable(
-                        &run_engine,
-                        &bg_user_id,
-                        &bg_run_id,
-                        &final_status,
-                    )
-                    .await
-                {
-                    persist_status_update = false;
-                    persisted_status = RunStatus::Paused;
-                    preexisting_terminal_status = Some(RunStatus::Paused);
-                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                        if run.status == RunStatus::Paused
-                            || run.status.try_transition(&RunStatus::Paused).is_ok()
-                        {
-                            run.status = RunStatus::Paused;
-                            run.pause_flag.store(true, Ordering::SeqCst);
-                            run.waiting_for
-                                .get_or_insert_with(|| "user_resume".to_string());
-                            run.live_tx = None;
-                        } else {
-                            tracing::warn!(
-                                target: "astra_runtime::run_lifecycle",
-                                run_id = %bg_run_id,
-                                current_status = %run.status.as_str(),
-                                "durable pause projection arrived after an incompatible local terminal state"
-                            );
-                        }
-                    }
-                }
-
-                let mut durable_status_committed = !persist_status_update;
-                let mut owner_terminal_committed = false;
-                let mut atomic_terminal_committed = false;
-                let mut terminal_events_committed = false;
-                if !persist_terminal_events {
-                    record_durable_run_event_batch_metrics(
-                        bg_metrics_registry.as_ref(),
-                        "non_streaming_terminal",
-                        "skipped",
-                        &terminal_events,
-                    );
-                }
-                if persist_status_update {
-                    let events_for_transition: &[Value] = if persist_terminal_events {
-                        terminal_events.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let terminal_expected_statuses: &[&str] =
-                        if persisted_status == RunStatus::Cancelled {
-                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED]
-                        } else {
-                            &[STATUS_RUNNING, STATUS_WAITING]
-                        };
-                    match persist_ctx
-                        .persist_atomic_terminal_settlement(
-                            &loop_state,
-                            terminal_expected_statuses,
-                            execution_owner_generation,
-                            persisted_status.as_str(),
-                            None,
-                            error_msg.as_deref(),
-                            events_for_transition,
-                        )
-                        .await
-                    {
-                        Ok(Some(commit)) => {
-                            let _ = commit;
-                            core_trace_result = Ok(());
-                            durable_status_committed = true;
-                            owner_terminal_committed = true;
-                            atomic_terminal_committed = true;
-                            terminal_events_committed =
-                                persist_terminal_events && !terminal_events.is_empty();
-                            if terminal_events_committed {
-                                record_durable_run_event_batch_metrics(
-                                    bg_metrics_registry.as_ref(),
-                                    "non_streaming_terminal",
-                                    "committed",
-                                    &terminal_events,
-                                );
-                            }
-                        }
-                        Ok(None) => {
-                            core_trace_result = persist_ctx
-                                .persist_core_and_trace_in_transaction(&loop_state)
-                                .await;
-                            if core_trace_result.is_ok() {
-                                match run_engine
-                                    .commit_terminal_status_with_events_if_current_owner(
-                                        &bg_user_id,
-                                        &bg_session_id,
-                                        &bg_run_id,
-                                        terminal_expected_statuses,
-                                        execution_owner_generation,
-                                        persisted_status.as_str(),
-                                        None,
-                                        error_msg.as_deref(),
-                                        events_for_transition,
-                                    )
-                                    .await
-                                {
-                                    Ok(TerminalTransitionOutcome::Committed(_)) => {
-                                        durable_status_committed = true;
-                                        owner_terminal_committed = true;
-                                        terminal_events_committed =
-                                            persist_terminal_events && !terminal_events.is_empty();
-                                    }
-                                    Ok(TerminalTransitionOutcome::Superseded(durable)) => {
-                                        persist_terminal_events = false;
-                                        if let Some(status) =
-                                            Self::exact_preexisting_control_terminal_status(
-                                                &durable.status,
-                                                durable.run_generation,
-                                                execution_owner_generation,
-                                            )
-                                        {
-                                            preexisting_terminal_status = Some(status);
-                                            durable_status_committed = true;
-                                        }
-                                        if let Some(authoritative_status) =
-                                            RunStatus::from_durable_status(&durable.status)
-                                        {
-                                            persisted_status = authoritative_status;
-                                            if let Some(run) =
-                                                runs.write().await.get_mut(&bg_run_id)
-                                            {
-                                                run.status = authoritative_status;
-                                                run.waiting_for = durable.waiting_for.clone();
-                                                run.live_tx = None;
-                                            }
-                                        } else {
-                                            runs.write().await.remove(&bg_run_id);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        persist_terminal_events = false;
-                                        runs.write().await.remove(&bg_run_id);
-                                        tracing::warn!(
-                                            target: "astra_runtime::run_lifecycle",
-                                            run_id = %bg_run_id,
-                                            error = %error,
-                                            "failed to persist fallback terminal settlement"
-                                        );
-                                    }
-                                }
-                            } else {
-                                persist_terminal_events = false;
-                                runs.write().await.remove(&bg_run_id);
-                            }
-                        }
-                        Err(error) => {
-                            persist_terminal_events = false;
-                            let durable_control_terminal =
-                                Self::load_exact_preexisting_control_terminal(
-                                    &run_engine,
-                                    &bg_user_id,
-                                    &bg_run_id,
-                                    execution_owner_generation,
-                                )
-                                .await;
-                            if let Some((waiting_for, status)) = durable_control_terminal {
-                                preexisting_terminal_status = Some(status);
-                                persisted_status = status;
-                                durable_status_committed = true;
-                                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                                    run.status = status;
-                                    run.waiting_for = waiting_for;
-                                    run.live_tx = None;
-                                }
-                                tracing::debug!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    status = status.as_str(),
-                                    error = %error,
-                                    "atomic settlement lost to an exact-generation control terminal; repairing trace and accounting"
-                                );
-                            } else {
-                                core_trace_result = Err(error.clone());
-                                // The durable result is unknown. Remove the stale
-                                // process-local projection so later reads must
-                                // reconcile from the durable authority.
-                                runs.write().await.remove(&bg_run_id);
-                                record_durable_run_event_batch_metrics(
-                                    bg_metrics_registry.as_ref(),
-                                    "non_streaming_terminal",
-                                    "error",
-                                    &terminal_events,
-                                );
-                                tracing::warn!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    error = %error,
-                                    "failed to persist atomic canonical terminal settlement"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if user_cancellation
-                    && durable_status_committed
-                    && persisted_status == RunStatus::Cancelled
-                {
-                    Self::schedule_durable_user_cancelled_run_descendants(
-                        run_engine.clone(),
-                        &bg_user_id,
-                        &bg_session_id,
-                        &bg_run_id,
-                        false,
-                    );
-                }
-
-                if let Some(status) = preexisting_terminal_status {
-                    core_trace_result = persist_ctx
-                        .persist_trace_after_authoritative_terminal(&loop_state, status.as_str())
-                        .await;
-                    if let Err(error) = core_trace_result.as_ref() {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %bg_run_id,
-                            status = status.as_str(),
-                            error = %error,
-                            "failed to retain observations after an independently committed terminal"
-                        );
-                    }
-                }
-
-                if owner_terminal_committed && core_trace_result.is_ok() {
-                    match Self::commit_canonical_turn(
-                        canonical_turn.as_ref(),
-                        &loop_state.messages,
-                        loop_state.canonical_rewrite_proof(),
-                        preserve_execution_scratch
-                            || bg_cancel_flag.load(Ordering::Acquire)
-                            || bg_llm_cancel_token.is_cancelled(),
-                        &bg_run_id,
-                    )
-                    .await
-                    {
-                        Ok(cursor) => canonical_context_cursor = cursor,
-                        Err(error) => tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %bg_run_id,
-                            error = %error,
-                            "durable terminal committed but canonical context projection failed"
-                        ),
-                    }
-                }
-
-                // Evict only after the durable outcome is authoritative. A
-                // lost or unknown CAS must never evict based on stale local
-                // completion.
-                if (durable_status_committed || !persist_status_update)
-                    && !persisted_status.is_resumable()
-                {
-                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                }
-                if (owner_terminal_committed || preexisting_terminal_status.is_some())
-                    && !atomic_terminal_committed
-                {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_usage_if_current_owner(
-                                &bg_user_id,
-                                &bg_session_id,
-                                &bg_run_id,
-                                execution_owner_generation,
-                                loop_state.provider_input_tokens(),
-                                loop_state.total_completion,
-                                loop_state.total_tool_calls,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "owner_fenced_usage"
-                    );
-                }
-                // Record tokens consumed so check_token_budget sees up-to-date usage.
-                if let Some(ref gov) = bg_resource_governor {
-                    let total = loop_state.provider_total_tokens();
-                    if total > 0 {
-                        gov.record_tokens(&bg_user_id, total).await;
-                    }
-                }
-                if should_append_generic_terminal_batch(
-                    durable_status_committed,
-                    persist_terminal_events,
-                    terminal_events.len(),
-                    terminal_events_committed,
-                    preexisting_terminal_status.is_some(),
-                ) {
-                    match run_engine
-                        .append_events_batch(
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            &terminal_events,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            terminal_events_committed = true;
-                            record_durable_run_event_batch_metrics(
-                                bg_metrics_registry.as_ref(),
-                                "non_streaming_terminal",
-                                "committed",
-                                &terminal_events,
-                            );
-                        }
-                        Err(error) => {
-                            record_durable_run_event_batch_metrics(
-                                bg_metrics_registry.as_ref(),
-                                "non_streaming_terminal",
-                                "error",
-                                &terminal_events,
-                            );
-                            astra_core::agent_warn!(
-                                "run_lifecycle",
-                                "persist append_terminal_events_batch for run {}: {}",
-                                bg_run_id,
-                                error
-                            );
-                        }
-                    }
-                }
-                // The finalized marker is also the bounded status API's proof
-                // that every earlier terminal/buffered-completion fact for
-                // this draining generation has reached durable storage.
-                let control_terminal_settlement_committed =
-                    if let Some(status) = preexisting_terminal_status {
-                        let uncommitted_terminal_events = if status != RunStatus::Paused
-                            || terminal_batch_settlement_ready(
-                                terminal_events.len(),
-                                terminal_events_committed,
-                            ) {
-                            &[][..]
-                        } else {
-                            terminal_events.as_slice()
-                        };
-                        Some(
-                            Self::persist_finalized_accounting_after_preexisting_terminal(
-                                &run_engine,
-                                &bg_user_id,
-                                &bg_session_id,
-                                &bg_run_id,
-                                status,
-                                execution_owner_generation,
-                                &loop_state,
-                                uncommitted_terminal_events,
-                            )
-                            .await,
-                        )
-                    } else {
-                        None
-                    };
-                let all_settlement_facts_committed = settlement_facts_committed(
-                    control_terminal_settlement_committed,
-                    durable_status_committed,
-                    terminal_events.len(),
-                    terminal_events_committed,
-                );
-                let settlement_closed = all_settlement_facts_committed
-                    && Self::persist_settlement_finished(
-                        &run_engine,
-                        &bg_user_id,
-                        &bg_session_id,
-                        &bg_run_id,
-                        execution_owner_generation,
-                    )
-                    .await;
-                let durable_fence_closed = durable_settlement_fence_closed(
-                    control_terminal_settlement_committed,
-                    settlement_closed,
-                );
-                if durable_fence_closed && let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                    run.settlement_in_progress = false;
-                }
-
-                // The execution is no longer resumable once its durable final
-                // state has been reconciled. Release cross-pod ownership before
-                // slower observability, memory, and workspace cleanup so those
-                // side effects do not extend the executor's apparent lifetime.
-                drop(_owner_lease_heartbeat);
-
-                if owner_terminal_committed && persist_terminal_events {
-                    flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
-                    persist_turn_evaluation_journal(
-                        &bg_user_id,
-                        &bg_session_id,
-                        "server_runtime",
-                        &loop_state,
-                    );
-                }
-
-                if owner_terminal_committed {
-                    if let (Some(pool), Some(binding), Some(workspace)) = (
-                        persist_ctx.shared_pool.clone(),
-                        bg_work_runtime_binding.as_ref(),
-                        bg_work_workspace.as_deref(),
-                    ) && let Err(error) = Self::synchronize_work_subject_after_execution(
-                        pool, binding, workspace, &bg_run_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            work_id = %binding.work_id.as_str(),
-                            branch_id = %binding.branch_id.as_str(),
-                            run_id = %bg_run_id,
-                            error = %error,
-                            "Work subject remains unavailable after execution"
-                        );
-                    }
-
-                    // Derived projections and cleanup may only observe a
-                    // generation whose terminal transition won. A stale
-                    // executor still retains its append-only attempt evidence,
-                    // but must not publish session state, memory, or workspace
-                    // effects after another owner has taken over.
-                    if let Err(e) = persist_ctx
-                        .run_after_core(
-                            &loop_state,
-                            loop_success,
-                            core_trace_result,
-                            canonical_context_cursor.is_some(),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            session_id = %bg_session_id,
-                            run_id = %bg_run_id,
-                            error = %e,
-                            "post-loop persistence failed"
-                        );
-                    }
-                    if let Err(e) = persist_ctx
-                        .materialize_run_transcript_evidence(
-                            &loop_state,
-                            canonical_context_cursor.as_ref(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            session_id = %bg_session_id,
-                            run_id = %bg_run_id,
-                            error = %e,
-                            "durable transcript evidence materialization failed"
-                        );
-                    }
-
-                    // Post-loop memory cleanup is detached from the terminal
-                    // response. It has its own bounded worker and shutdown drain;
-                    // a slow selector must not extend the run's visible lifetime.
-                    schedule_post_loop_memory_cleanup(
-                        Arc::clone(&bg_memory_task_count_1),
-                        bg_user_id.clone(),
-                        loop_state.current_session_id.clone().unwrap_or_default(),
-                        bg_run_id.clone(),
-                        loop_state.session_turn,
-                        loop_state.session_facts.clone(),
-                        loop_state.memory_extraction_service.clone(),
-                        build_shutdown_extraction_request(&loop_state),
-                        bg_metrics_registry.clone(),
-                    );
-
-                    if let Some(record) = bg_cloud_workspace_record.as_ref() {
-                        Self::cleanup_cloud_workspace_after_terminal_run(
-                            bg_workspace_record_store,
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            record,
-                            &persisted_status,
-                        )
-                        .await;
-                    }
-                }
-                if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
-                    guard.settle().await;
-                }
-            },
-            "agentic_loop_create_run",
-        );
-        self.track_background_run_abort_handle(run_abort_handle);
+            request,
+            host,
+            loop_state,
+            execution_owner_generation,
+            owner_lease_heartbeat,
+            canonical_turn,
+            root_runtime_context_guard,
+            work_runtime_binding,
+            tool_runtime_workspace,
+            cloud_workspace_record,
+            csl_manager,
+            cancel_flag,
+            pause_flag,
+            llm_cancel_token,
+            execution_lease_lost,
+        })
+        .await;
 
         Ok(ChatRunRecord {
             session_id,
             run_id,
             status: STATUS_RUNNING.to_string(),
-            explain: if request.explain {
+            explain: if explain {
                 Some(json!({"mode": "background"}))
             } else {
                 None
@@ -15065,7 +15471,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             execution_owner_generation,
-        );
+        )?;
         install_active_personal_skills(&mut state, active_personal_skills);
         state.context_manifest_user_id = Some(user_id.clone());
         state.current_run_owner_generation = execution_owner_generation;
@@ -15198,6 +15604,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_authoring_active,
             work_runtime_binding.as_ref(),
         );
+        if let Some(admission) = canonical_turn.as_ref() {
+            host.bind_execution_handoff(
+                self.execution_handoff_requested.clone(),
+                self.run_engine.clone(),
+                admission.reservation.clone(),
+            );
+        }
         self.configure_host_approval_audit_context(
             &mut host,
             &user_id,
@@ -15271,7 +15684,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_tool_schemas_with_native_ids(
+                bundle.schemas.clone(),
+                bundle.control_tools.clone(),
+                bundle.native_tool_ids_by_public_name(),
+            );
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         // In agent-binding mode with an EdgeAgent executor, the host only installs
@@ -16117,10 +16534,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 park_server_root_mailbox(&mut state).await;
+                host.on_loop_terminal(&state, &loop_result).await;
                 let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 enforce_completed_tool_ledger_closure(&loop_result, &mut state);
-                let preserve_execution_scratch =
-                    should_preserve_execution_scratch(&loop_result, state.interruption.is_some());
+                let allow_empty_delta =
+                    should_allow_empty_delta(&loop_result, state.interruption.is_some());
                 let loop_success = loop_result.is_ok() && state.interruption.is_none();
                 let (mut final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, emitted_events, &state);
@@ -16591,7 +17009,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &state.messages,
                         state.canonical_rewrite_proof(),
-                        preserve_execution_scratch
+                        allow_empty_delta
                             || bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
@@ -16808,6 +17226,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_session_id,
                         "server_runtime",
                         &state,
+                        persisted_status.as_str(),
                     );
                     if let (Some(pool), Some(binding), Some(workspace)) = (
                         persist_ctx.shared_pool.clone(),
@@ -19074,14 +19493,11 @@ fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
         ("Complete the task thoroughly.", "")
     };
     if config.system_prompt_addendum.trim().is_empty() {
-        format!(
-            "You are '{}', a specialized sub-agent. {completion_contract}{work_settlement}",
-            config.agent_id,
-        )
+        format!("You are a specialized sub-agent. {completion_contract}{work_settlement}",)
     } else {
         format!(
-            "You are '{}', a specialized sub-agent.\n\n{}\n\n{completion_contract}{work_settlement}",
-            config.agent_id, config.system_prompt_addendum,
+            "You are a specialized sub-agent.\n\n{}\n\n{completion_contract}{work_settlement}",
+            config.system_prompt_addendum,
         )
     }
 }
@@ -20532,18 +20948,25 @@ fn subrun_task_profile_for_workspace_intent(
 
 fn resolve_subrun_agentic_turn_budget(
     task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+    runtime_ceiling: Option<std::num::NonZeroUsize>,
     explicit_max_turns: Option<u32>,
     initial_turns: Option<u32>,
-) -> astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-    let runtime_ceiling = astra_core::RuntimeLimits::global().max_turns;
-    astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
-        task_profile,
-        runtime_ceiling,
-        initial_turns
-            .or(explicit_max_turns)
-            .map(|turns| turns as usize)
-            .unwrap_or(task_profile.agentic_turn_budget.initial_turns),
-        explicit_max_turns.map(|turns| turns as usize),
+) -> Result<astra_turn_core::chat_turn_heuristics::AgenticTurnBudget, String> {
+    Ok(
+        astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
+            task_profile,
+            runtime_ceiling,
+            initial_turns
+                .or(explicit_max_turns)
+                .map(|turns| turns as usize)
+                .unwrap_or(task_profile.agentic_turn_budget.initial_turns),
+            explicit_max_turns
+                .map(|turns| {
+                    std::num::NonZeroUsize::new(turns as usize)
+                        .ok_or_else(|| "max_turns must be positive".to_string())
+                })
+                .transpose()?,
+        ),
     )
 }
 
@@ -20784,6 +21207,16 @@ impl SubRunExecutor for ServerSubRunExecutor {
         &self,
         mut config: SubRunConfig,
     ) -> Result<astra_services::coordination::AgentResult, String> {
+        let runtime_ceiling = astra_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(
+                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
+                    &config.context,
+                ),
+            )?;
+        if config.max_turns == Some(0) {
+            return Err("max_turns must be positive".to_string());
+        }
         use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
         use astra_text_utils::semantic_dedup::SemanticDedup;
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
@@ -21156,9 +21589,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             });
         let agentic_turn_budget = resolve_subrun_agentic_turn_budget(
             task_profile,
+            runtime_ceiling,
             config.max_turns,
             config.initial_turns,
-        );
+        )?;
         let max_turns = agentic_turn_budget.initial_turns;
         let project_root_buf = project_root_from_delegation_context(&config.context);
         let hook_sets = project_root_buf
@@ -21218,9 +21652,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,
+            charged_iterations: 0,
             agentic_turn_budget,
             budget_is_explicit: true,
             budget_policy: None,
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -21293,7 +21729,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task.clone(),
             user_intent: full_task,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: inherited_turn_intent,
             task_profile,
@@ -21569,6 +22005,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     .unwrap_or_default()
             ));
         }
+        host.on_loop_terminal(&loop_state, &outcome).await;
         let (outcome, retained_host_events) = host.settle_loop_turn(outcome);
         // Loop lifecycle is explicit control-plane state. Tool-level outcome
         // failures remain evaluation/evidence facts and must not vote a
@@ -21996,6 +22433,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.session_id,
             "server_subrun",
             &loop_state,
+            control_authority.map_or(durable_status, DurableSubrunControlAuthority::status),
         );
         flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id, false);
 

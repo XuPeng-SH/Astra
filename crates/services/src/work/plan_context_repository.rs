@@ -594,13 +594,22 @@ pub(super) async fn load_task_execution_snapshot_in_transaction(
         &graph.item_refs,
     )
     .await?;
-    let snapshot = super::WorkTaskExecutionSnapshot::from_parts(
+    let mut snapshot = super::WorkTaskExecutionSnapshot::from_parts(
         basis,
         items,
         executions,
         deliveries,
         graph.edges,
     )?;
+    let (pending, has_unapplied) =
+        super::establishment_plan_repository::load_graph_mutation_barrier(
+            transaction,
+            owner_id,
+            session_id,
+            &snapshot,
+        )
+        .await?;
+    snapshot.set_graph_mutation_barrier(pending, has_unapplied);
     Ok(snapshot)
 }
 
@@ -620,7 +629,7 @@ fn decode_execution_status(status: &str) -> Result<WorkItemExecutionStatus, Work
     }
 }
 
-async fn load_item_executions(
+pub(super) async fn load_item_executions(
     transaction: &mut Transaction<'_, MySql>,
     owner_id: &WorkOwnerId,
     work_id: &WorkId,

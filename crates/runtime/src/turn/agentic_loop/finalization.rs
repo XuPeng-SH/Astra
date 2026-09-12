@@ -293,17 +293,11 @@ fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
     }
 }
 
-pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
-    let Some(sid) = state.current_session_id.as_ref() else {
-        return;
-    };
-    let Some(user_id) = state.context_manifest_user_id.as_deref() else {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Skipping local step checkpoint for session {sid}: missing user_id"
-        );
-        return;
-    };
+/// Build this boundary's snapshot without borrowing a previously cached one
+/// or publishing it to a host-specific persistence boundary.
+pub(crate) fn build_current_heavy_checkpoint(
+    state: &mut AgenticLoopState,
+) -> Option<astra_pipeline::step_protocol::HeavyCheckpoint> {
     // Serialize the interruption record (if any) for checkpoint persistence.
     let interruption_json = state.interruption.as_ref().map(|ir| ir.to_json());
 
@@ -331,7 +325,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // Zero is the legacy checkpoint sentinel for an unavailable diagnostic.
         _ => 0,
     };
-    let Some(mut heavy) = state
+    let mut heavy = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
             &checkpoint_messages,
@@ -342,20 +336,18 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             interruption_json,
             approval_overrides_json,
             state.consecutive_context_window_errors,
-        )
-    else {
-        return;
-    };
-    let persisted_activation = state
-        .runtime_tool_executor
-        .as_deref()
-        .map(|executor| executor.activated_deferred_tool_names())
-        .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
-    heavy.activated_deferred_tool_names =
-        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+        )?;
+    heavy.run_execution_budget = state.run_execution_budget_snapshot();
+    heavy.run_execution_control = state.run_execution_control_snapshot();
+    // Carrier authority is deliberately reconstructed only from paired
+    // tool_search evidence with a schema digest. Name-only selection state is
+    // neither prompt continuity nor execution authority in this protocol.
+    state.deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &checkpoint_messages,
-            persisted_activation,
+            std::mem::take(&mut state.deferred_tool_activations),
         );
+    heavy.deferred_tool_activations = state.deferred_tool_activations.clone();
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
     // Persist context pipeline state for warm-start on resume (includes emergent context).
@@ -376,6 +368,31 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     // checkpoint.  The next process must not infer safety from a trimmed
     // local record window or from prose-only conversation state.
     heavy.workspace_observation_quarantine = state.stall.workspace_observation_quarantine.clone();
+    Some(heavy)
+}
+
+pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
+    if state.current_session_id.is_none() {
+        return;
+    }
+    if state.context_manifest_user_id.is_none() {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Skipping local step checkpoint: missing user_id"
+        );
+        return;
+    }
+    let Some(heavy) = build_current_heavy_checkpoint(state) else {
+        return;
+    };
+    let sid = state
+        .current_session_id
+        .as_ref()
+        .expect("checked session identity");
+    let user_id = state
+        .context_manifest_user_id
+        .as_deref()
+        .expect("checked user identity");
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if state
         .stall
@@ -616,6 +633,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     }
 
     record_loop_completion_feedback(state, &result);
+    // A returned loop is no longer an unfinished execution. Reusing the state
+    // for another user turn must enter its preamble; a frozen handoff never
+    // reaches this reset.
+    state.loop_entry = super::host::LoopEntry::BeforePreamble;
     result
 }
 
@@ -983,6 +1004,7 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     state.stall.parallel_batching_advisory_emitted = false;
     state.stall.repetition_advisory_emitted = false;
     state.stall.cache_waste_advisory_emitted = false;
+    state.stall.begin_fresh_user_turn();
     state.stall.active_policy_feedback = Default::default();
     state.stall.runtime_policy_evaluation = Default::default();
     state.hooks.completion_settlement = Default::default();
@@ -1528,6 +1550,27 @@ mod tests {
     }
 
     #[test]
+    fn current_heavy_checkpoint_never_reuses_cached_snapshot() {
+        let mut state = make_state();
+        state.step_recorder.begin_turn(0);
+        state.messages = vec![serde_json::json!({"role":"user","content":"first"})];
+        let original = build_current_heavy_checkpoint(&mut state).expect("active step");
+        state.stall.last_heavy_checkpoint = Some(StepCheckpoint::Heavy(Box::new(original)));
+        state
+            .messages
+            .push(serde_json::json!({"role":"assistant","content":"next"}));
+        let current = build_current_heavy_checkpoint(&mut state).expect("current step");
+        assert_eq!(current.messages.len(), 2);
+        let Some(StepCheckpoint::Heavy(cached)) = &state.stall.last_heavy_checkpoint else {
+            panic!("cached snapshot remains separate");
+        };
+        assert_eq!(cached.messages.len(), 1);
+        state.step_recorder = astra_pipeline::step_recorder::StepRecorder::new("u", "s", "t");
+        assert!(build_current_heavy_checkpoint(&mut state).is_none());
+        assert!(state.stall.last_heavy_checkpoint.is_some());
+    }
+
+    #[test]
     #[serial_test::serial(session_journal_dir)]
     fn heavy_checkpoint_blocked_tools_do_not_include_soft_health_avoidance_health() {
         let user_id = "test-user";
@@ -1654,7 +1697,11 @@ mod tests {
         state.context_manifest_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
-        state.activated_deferred_tool_names = vec!["github".to_string()];
+        state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "github".to_string(),
+            schema_digest: "sha256:compacted-selection".to_string(),
+            descriptor: None,
+        }];
         state.messages = vec![
             serde_json::json!({"role": "system", "content": "compacted", "_compact_boundary": true}),
             serde_json::json!({"role": "user", "content": "continue"}),
@@ -1668,9 +1715,8 @@ mod tests {
                 .expect("read checkpoint")
                 .expect("heavy checkpoint");
         assert_eq!(
-            heavy.activated_deferred_tool_names,
-            vec!["github"],
-            "compaction may remove tool-search messages but must not erase schema materialization state"
+            heavy.deferred_tool_activations, state.deferred_tool_activations,
+            "compaction may remove tool-search messages but must retain schema-addressed carrier evidence"
         );
     }
 
@@ -1885,6 +1931,7 @@ mod tests {
         let mut host = MockHost::new(vec![
             text_result(answer, 10, 5, Some(42)),
             text_result(answer, 10, 5, Some(42)),
+            text_result(answer, 10, 5, Some(42)),
         ]);
         let mut state = make_state();
         state.message = "fix the bug".to_string();
@@ -1894,7 +1941,11 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
-        assert_eq!(host.turn_count(), 2);
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "one action correction is bounded; a repeated omission is terminal"
+        );
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)

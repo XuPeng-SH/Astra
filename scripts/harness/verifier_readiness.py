@@ -59,7 +59,12 @@ VENV_DIGEST_PREFIX = "__ASTRA_VENV_ACTIVATE_SHA256_V1__"
 DEPENDENCY_SETUP_POLICY = "astra.harness.dependency_setup_entrypoint.v3"
 MAX_SOURCE_BYTES = 64 * 1024
 MAX_STATIC_BINDING_VALUE_BYTES = 512
-DEFAULT_MAX_CONCURRENCY = 4
+# Docker environment lifecycle is daemon-global rather than task-local.  A
+# readiness probe may create networks, volumes, and Compose projects, so a
+# later probe must not begin until the preceding probe has proved cleanup.
+# Keep the supported launcher deterministic; callers that need a different
+# policy must establish its isolation contract explicitly.
+DEFAULT_MAX_CONCURRENCY = 1
 MAX_CONCURRENCY = 8
 IMAGE_MATERIALIZATION_CONCURRENCY = 1
 IMAGE_INSPECT_TIMEOUT_SECONDS = 15.0

@@ -688,8 +688,46 @@ pub struct LightCheckpoint {
     pub created_at: u64,
 }
 
-/// Heavy checkpoint: light + full conversation state + tool results.
-/// Written infrequently (phase transitions, before expensive operations).
+/// Run-scoped accounting facts, not permission to resume execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum RunExecutionBudget {
+    #[serde(rename = "1")]
+    V1 {
+        run_id: String,
+        producer_owner_generation: u64,
+        charged_iterations: u64,
+        granted_iteration_boundary: u64,
+        remaining_iterations: u64,
+        #[serde(deserialize_with = "deserialize_required_budget_limit")]
+        effective_hard_turn_limit: Option<std::num::NonZeroU64>,
+    },
+}
+
+fn deserialize_required_budget_limit<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::num::NonZeroU64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+/// Control facts paired with the budget in the same heavy checkpoint.
+/// Absence never grants ordinary execution or replenishes action attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum RunExecutionControl {
+    #[serde(rename = "2")]
+    V2 {
+        completion_settlement: astra_turn_types::CompletionSettlementState,
+        hook_obligations: astra_turn_types::StopHookObligations,
+        budget_wrapup_injected: bool,
+        budget_wrapup_ignored_rounds: u32,
+    },
+}
+
+/// Heavy checkpoint: conversation and execution facts at one frontier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeavyCheckpoint {
     /// All fields from light checkpoint
@@ -709,15 +747,21 @@ pub struct HeavyCheckpoint {
     /// signal.
     pub budget_remaining_tokens: u64,
     pub budget_remaining_rounds: u32,
-    /// Session state
+    /// Bound to this checkpoint's execution and conversation frontiers.
+    /// Missing accounting cannot be interpreted as a fresh allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_execution_budget: Option<RunExecutionBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_execution_control: Option<RunExecutionControl>,
+    /// Legacy diagnostic snapshot of names that were restricted at checkpoint
+    /// time. It has no scope/provenance and must not be treated as current
+    /// execution authority on restore.
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    /// Deferred schemas already materialized in the retained prompt context.
-    ///
-    /// This is not execution authority; resume paths must intersect it with
-    /// the current advertised surface and live runtime bindings.
+    /// Schema-addressed deferred selections. This is the durable carrier
+    /// authorization evidence; names above are only legacy prompt continuity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activated_deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -920,9 +964,11 @@ impl StepCheckpoint {
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -1657,7 +1703,62 @@ fn compute_idempotency_key(
 mod tests {
     use super::*;
 
+    #[test]
+    fn run_execution_budget_requires_explicit_limit_and_known_version() {
+        for limit in [None, std::num::NonZeroU64::new(100)] {
+            let snapshot = RunExecutionBudget::V1 {
+                run_id: "run".into(),
+                producer_owner_generation: 3,
+                charged_iterations: 2,
+                granted_iteration_boundary: 50,
+                remaining_iterations: 48,
+                effective_hard_turn_limit: limit,
+            };
+            let wire = serde_json::to_value(&snapshot).unwrap();
+            assert!(wire.get("effective_hard_turn_limit").is_some());
+            assert_eq!(
+                serde_json::from_value::<RunExecutionBudget>(wire.clone()).unwrap(),
+                snapshot
+            );
+            let mut missing = wire.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("effective_hard_turn_limit");
+            assert!(serde_json::from_value::<RunExecutionBudget>(missing).is_err());
+            let mut unknown = wire;
+            unknown["version"] = serde_json::json!("2");
+            assert!(serde_json::from_value::<RunExecutionBudget>(unknown).is_err());
+        }
+    }
+
     const TEST_USER_ID: &str = "test-user";
+
+    #[test]
+    fn run_execution_control_requires_complete_known_contract() {
+        let snapshot = RunExecutionControl::V2 {
+            completion_settlement: astra_turn_types::CompletionSettlementState::default(),
+            hook_obligations: astra_turn_types::StopHookObligations::default(),
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        };
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RunExecutionControl>(wire.clone()).unwrap(),
+            snapshot
+        );
+        for field in wire.as_object().unwrap().keys() {
+            let mut incomplete = wire.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<RunExecutionControl>(incomplete).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut unknown = wire;
+        unknown["version"] = serde_json::json!("future");
+        assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+    }
 
     // ── Protocol Version ──
 
@@ -2979,9 +3080,11 @@ mod tests {
             messages: vec![], // empty for non-Perceive!
             budget_remaining_tokens: 1000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3017,9 +3120,11 @@ mod tests {
             messages: vec![],
             budget_remaining_tokens: 4000,
             budget_remaining_rounds: 10,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3134,7 +3239,11 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
-            h.activated_deferred_tool_names = vec!["github".into()];
+            h.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }];
             h.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
                 reason: "weak_process_ownership".into(),
                 scope: "bound_workspace".into(),
@@ -3148,7 +3257,14 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
-            assert_eq!(h.activated_deferred_tool_names, vec!["github"]);
+            assert_eq!(
+                h.deferred_tool_activations,
+                vec![astra_turn_types::DeferredToolActivation {
+                    name: "github".into(),
+                    schema_digest: "sha256:checkpoint".into(),
+                    descriptor: None,
+                }]
+            );
             assert_eq!(
                 h.workspace_observation_quarantine,
                 Some(WorkspaceObservationQuarantineV1 {
@@ -3163,14 +3279,22 @@ mod tests {
         legacy_json["Heavy"]
             .as_object_mut()
             .expect("externally tagged heavy checkpoint")
-            .remove("activated_deferred_tool_names");
+            .insert(
+                "activated_deferred_tool_names".into(),
+                serde_json::json!(["github"]),
+            );
         let legacy: StepCheckpoint = serde_json::from_value(legacy_json).unwrap();
         let StepCheckpoint::Heavy(legacy) = legacy else {
             panic!("expected heavy checkpoint");
         };
-        assert!(
-            legacy.activated_deferred_tool_names.is_empty(),
-            "checkpoints written before activation persistence must remain readable"
+        assert_eq!(
+            legacy.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }],
+            "unknown name-only checkpoint fields must not alter typed evidence"
         );
     }
 

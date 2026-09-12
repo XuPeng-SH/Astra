@@ -134,6 +134,32 @@ pub(crate) struct PendingUserIntent {
     custody: PendingUserIntentCustody,
 }
 
+/// Why a local guidance intent was not admitted into the pending queue.
+///
+/// Admission is a local input/state check. Keeping the reason typed prevents
+/// callers from presenting an input error as an ownership-transfer failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserIntentRejectReason {
+    EmptyIntentId,
+    EmptyText,
+    InvalidStatus,
+    IdentityAlreadyKnown,
+}
+
+impl UserIntentRejectReason {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::EmptyIntentId => "Could not queue guidance: missing intent identity.",
+            // Empty input is intentionally silent at the event-loop boundary.
+            Self::EmptyText => "",
+            Self::InvalidStatus => "Could not queue guidance: invalid local acceptance state.",
+            Self::IdentityAlreadyKnown => {
+                "Could not queue guidance: this intent is already recorded locally."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingUserIntentCustody {
     /// No request can have committed; the client may safely recover the text.
@@ -329,6 +355,20 @@ impl BottomPane {
         status: astra_turn_types::UserIntentStatus,
         text: impl Into<String>,
     ) -> bool {
+        self.try_accept_user_intent(intent_id, delivery, status, text)
+            .is_ok()
+    }
+
+    /// Admit an active-run guidance intent and retain the precise local
+    /// rejection reason for the event loop. The bool API above remains the
+    /// compact projection used by existing callers and tests.
+    pub(crate) fn try_accept_user_intent(
+        &mut self,
+        intent_id: impl Into<String>,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        text: impl Into<String>,
+    ) -> Result<(), UserIntentRejectReason> {
         self.accept_user_intent_for_target(
             intent_id.into(),
             delivery,
@@ -352,6 +392,7 @@ impl BottomPane {
             text,
             PendingUserIntentTarget::AgentRun { run_id, agent_name },
         )
+        .is_ok()
     }
 
     fn accept_user_intent_for_target(
@@ -361,21 +402,29 @@ impl BottomPane {
         status: astra_turn_types::UserIntentStatus,
         text: String,
         target: PendingUserIntentTarget,
-    ) -> bool {
-        if intent_id.trim().is_empty()
-            || text.trim().is_empty()
-            || !matches!(
-                status,
-                astra_turn_types::UserIntentStatus::AcceptedLocal
-                    | astra_turn_types::UserIntentStatus::AcceptedRemote
-            )
-            || self.applied_user_intent_ids.contains(&intent_id)
+    ) -> Result<(), UserIntentRejectReason> {
+        let rejection = if intent_id.trim().is_empty() {
+            Some(UserIntentRejectReason::EmptyIntentId)
+        } else if text.trim().is_empty() {
+            Some(UserIntentRejectReason::EmptyText)
+        } else if !matches!(
+            status,
+            astra_turn_types::UserIntentStatus::AcceptedLocal
+                | astra_turn_types::UserIntentStatus::AcceptedRemote
+        ) {
+            Some(UserIntentRejectReason::InvalidStatus)
+        } else if self.applied_user_intent_ids.contains(&intent_id)
             || self
                 .pending_user_intents
                 .iter()
                 .any(|pending| pending.intent_id == intent_id)
         {
-            return false;
+            Some(UserIntentRejectReason::IdentityAlreadyKnown)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            return Err(reason);
         }
         self.pending_user_intents.push_back(PendingUserIntent {
             intent_id,
@@ -389,7 +438,7 @@ impl BottomPane {
                 PendingUserIntentCustody::Client
             },
         });
-        true
+        Ok(())
     }
 
     pub fn promote_agent_guide_accepted(&mut self, intent_id: &str) -> bool {

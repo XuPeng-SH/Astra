@@ -2,9 +2,10 @@
 //!
 //! Transports implement [`MemoriaPort`]. Prompt-facing tool gateways adapt
 //! cognitive verbs to a port or HTTP protocol, but do not own a second memory
-//! model. Ephemeral attention, surfaced-memory deduplication, and recall
+//! model. Ephemeral attention, surfaced-memory observation, and recall
 //! attribution live in one session-keyed runtime state so every deployment
-//! shape observes the same semantics.
+//! shape observes the same semantics. Prompt assembly owns per-payload
+//! deduplication; this state never suppresses an explicit memory read.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock};

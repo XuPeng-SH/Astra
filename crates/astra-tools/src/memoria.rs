@@ -564,6 +564,24 @@ fn exact_memory_ids_from_args(args: &Value) -> Vec<String> {
     ids
 }
 
+/// Borrow the collection carried by a successful Memoria recall response.
+/// Memoria v1 has emitted both a bare array and object envelopes over time;
+/// keeping this projection structural lets decoration preserve either wire
+/// shape without interpreting prose or error messages.
+fn recall_entries_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
+    match value {
+        Value::Array(entries) => Some(entries),
+        Value::Object(object) => {
+            if object.contains_key("memories") {
+                object.get_mut("memories").and_then(Value::as_array_mut)
+            } else {
+                object.get_mut("items").and_then(Value::as_array_mut)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn confirmed_purge_count(output: &str) -> Option<u64> {
     let response = serde_json::from_str::<Value>(output).ok()?;
     response
@@ -825,17 +843,22 @@ impl MemoriaToolGateway {
         projected
     }
 
-    /// Record memory_ids surfaced to the LLM in a given session
+    /// Record memory IDs surfaced to the LLM in a given session
     /// (process-global store).
     ///
-    /// This is the single canonical "already surfaced" store for the
+    /// This is an observability/feedback ledger only. It must never be used
+    /// to hide a later explicit `recall` result: a read operation is governed
+    /// by its current query, scope, and backend response.
+    ///
+    /// This is the single canonical surfaced-evidence ledger for the
     /// process; callers use the gateway rather than maintaining a second
-    /// recall lifecycle.
+    /// recall lifecycle. Prompt assembly performs any per-payload
+    /// deduplication locally and does not consult this ledger as a gate.
     pub fn record_seen(session_id: &str, ids: impl IntoIterator<Item = String>) {
         astra_memoria::memoria_runtime_state().record_seen(session_id, ids);
     }
 
-    /// Snapshot surfaced ids for a session (process-global store);
+    /// Snapshot surfaced IDs for a session (process-global store);
     /// caller drops the clone after use.
     ///
     /// Public: see [`record_seen`].
@@ -843,7 +866,7 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().seen_snapshot(session_id)
     }
 
-    /// Clear the "already surfaced" set for a session. Intended for
+    /// Clear the surfaced-evidence set for a session. Intended for
     /// session-end cleanup. Public so the runtime's session-end path
     /// can keep tool-side state in lock-step with its own seen ledger.
     pub fn reset_seen(session_id: &str) {
@@ -1054,50 +1077,62 @@ impl MemoriaToolGateway {
         report
     }
 
-    /// Post-process a `recall` response so the LLM gets the same two
+    /// Post-process an explicit `recall` response so the LLM gets the same two
     /// signals the prefetch path gives it:
     ///
     /// 1. **Freshness suffix** appended to each memory's `content`
     ///    (e.g. ` (this week)`, ` (stale — verify first)`) — derived
     ///    from `observed_at`/`updated_at` and the memory's `trust_tier`.
-    /// 2. **Surface-once dedup**: memories whose `memory_id` already
-    ///    appeared in an earlier recall this session are dropped.
+    /// 2. **Per-response identity dedup**: duplicate `memory_id` values in
+    ///    one backend response are reduced to the first result. A prior
+    ///    session recall is deliberately not an admission filter: explicit
+    ///    reads must remain repeatable and `[]` must mean a real empty result.
     ///
     /// Input `raw_text` is the HTTP body from Memoria's retrieve
-    /// endpoint — expected to be a top-level JSON array of memory
-    /// entries. Non-array bodies (error envelopes, etc.) pass through
-    /// unchanged so the LLM still sees the original error.
+    /// endpoint — expected to be a top-level array or a `{memories: [...]}` /
+    /// `{items: [...]}` envelope. Unsupported bodies (error envelopes, etc.)
+    /// pass through unchanged so the LLM still sees the original error.
     ///
     /// Pure so the wiring + the decoration logic stay testable in
-    /// isolation. `seen` is the callers' snapshot of memory_ids
-    /// previously surfaced; `newly_surfaced` receives the ids in the
-    /// final (post-filter) output so the caller can record them.
+    /// isolation. `returned_memory_ids` receives the unique IDs in the
+    /// final (post-dedup) output so the caller can record this invocation's
+    /// selection and feedback snapshot.
     pub fn decorate_recall_response(
         raw_text: &str,
-        seen: &std::collections::HashSet<String>,
-        newly_surfaced: &mut Vec<String>,
+        returned_memory_ids: &mut Vec<String>,
     ) -> String {
-        Self::decorate_recall_response_with_view(raw_text, seen, newly_surfaced, None)
+        Self::decorate_recall_response_with_view(raw_text, returned_memory_ids, None)
     }
 
     pub fn decorate_recall_response_with_view(
         raw_text: &str,
-        seen: &std::collections::HashSet<String>,
-        newly_surfaced: &mut Vec<String>,
+        returned_memory_ids: &mut Vec<String>,
         requested_view: Option<&str>,
     ) -> String {
+        // An error envelope is not a recall payload, even if a faulty or
+        // proxying service attaches an `items`/`memories` field to it.  Keep
+        // the original error visible and never turn its incidental entries
+        // into selection or feedback evidence.
+        if memoria_output_is_error(raw_text) {
+            return raw_text.to_string();
+        }
         let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
             return raw_text.to_string();
         };
-        let Some(arr) = parsed.as_array_mut() else {
+        let Some(arr) = recall_entries_mut(&mut parsed) else {
             return raw_text.to_string();
         };
+        // Deduplicate only within this one backend response. Historical
+        // surfaced state is intentionally not consulted: explicit recall is a
+        // repeatable read, and an empty result must not conflate a cache/dedup
+        // decision with the backend's actual answer.
+        let mut response_ids = std::collections::HashSet::new();
         arr.retain(|item| {
             let id = item
                 .get("memory_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            id.is_empty() || !seen.contains(id)
+            id.is_empty() || response_ids.insert(id.to_string())
         });
         for item in arr.iter_mut() {
             let id = item
@@ -1130,7 +1165,7 @@ impl MemoriaToolGateway {
             if let Some(id) = id
                 && !id.is_empty()
             {
-                newly_surfaced.push(id);
+                returned_memory_ids.push(id);
             }
         }
         serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
@@ -1468,9 +1503,10 @@ impl MemoriaToolGateway {
             }
         }
 
-        // Post-process recall responses with requested view shaping,
-        // freshness suffixes, and surface-once dedup so LLM-driven recalls
-        // carry the same signals as the bridge-side prefetch path.
+        // Post-process explicit recall responses with requested view shaping,
+        // freshness suffixes, and per-response identity dedup. The surfaced
+        // ledger is recorded for attribution only; it never suppresses a
+        // later explicit read.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
             if let Err(error) = validate_strict_recall_response(&raw_text, args) {
@@ -1488,23 +1524,22 @@ impl MemoriaToolGateway {
                 })
                 .to_string();
             }
-            let seen = Self::seen_snapshot(session_id);
-            let mut newly_surfaced = Vec::new();
+            let mut returned_memory_ids = Vec::new();
             let decorated = Self::decorate_recall_response_with_view(
                 &raw_text,
-                &seen,
-                &mut newly_surfaced,
+                &mut returned_memory_ids,
                 args.get("view").and_then(Value::as_str),
             );
-            if !newly_surfaced.is_empty() {
-                // (a) dedup store: don't re-show same id this session
-                Self::record_seen(session_id, newly_surfaced.clone());
+            if !returned_memory_ids.is_empty() {
+                // Keep the bounded surfaced ledger for observability and
+                // feedback bookkeeping. It is not an admission cache.
+                Self::record_seen(session_id, returned_memory_ids.clone());
             }
             // The invocation token, rather than response arrival order, owns
             // the session's referential selection. Every producer result still
             // enters its own bounded feedback lane.
             if let Some(lifecycle) = recall_lifecycle.as_mut() {
-                lifecycle.complete(newly_surfaced);
+                lifecycle.complete(returned_memory_ids);
             }
             return decorated;
         }
@@ -3722,7 +3757,7 @@ mod memoria_http_client_tests {
         ));
     }
 
-    // ── P6: decorate_recall_response (freshness + surface-once) ────────
+    // ── P6: decorate_recall_response (freshness + per-response identity) ──
 
     fn days_ago_ts(days: i64) -> String {
         let secs = std::time::SystemTime::now()
@@ -3768,9 +3803,8 @@ mod memoria_http_client_tests {
             },
         ])
         .to_string();
-        let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaToolGateway::decorate_recall_response(&raw, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(&raw, &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(
@@ -3792,21 +3826,40 @@ mod memoria_http_client_tests {
     }
 
     #[test]
-    fn decorate_recall_filters_already_surfaced_ids() {
+    fn decorate_recall_deduplicates_duplicate_ids_within_one_response() {
         use super::*;
         let raw = serde_json::json!([
-            {"memory_id": "m-seen", "content": "old one"},
+            {"memory_id": "m-duplicate", "content": "first result"},
+            {"memory_id": "m-duplicate", "content": "duplicate result"},
             {"memory_id": "m-new", "content": "new one"},
         ])
         .to_string();
-        let mut seen = std::collections::HashSet::new();
-        seen.insert("m-seen".to_string());
         let mut newly = Vec::new();
-        let out = MemoriaToolGateway::decorate_recall_response(&raw, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(&raw, &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
-        assert_eq!(arr.len(), 1, "seen id must be filtered");
-        assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
-        assert_eq!(newly, vec!["m-new"], "only surviving ids recorded");
+        assert_eq!(
+            arr.len(),
+            2,
+            "duplicate IDs must collapse within one response"
+        );
+        assert_eq!(arr[0]["content"].as_str(), Some("first result"));
+        assert_eq!(arr[1]["memory_id"].as_str(), Some("m-new"));
+        assert_eq!(newly, vec!["m-duplicate", "m-new"]);
+    }
+
+    #[test]
+    fn decorate_recall_does_not_filter_ids_from_an_earlier_explicit_read() {
+        use super::*;
+        let session_id = "explicit-recall-repeat";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_seen(session_id, ["m-seen".into()]);
+        let raw = serde_json::json!([{"memory_id": "m-seen", "content": "same fact"}]).to_string();
+        let mut returned = Vec::new();
+        let out = MemoriaToolGateway::decorate_recall_response(&raw, &mut returned);
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(returned, vec!["m-seen"]);
+        MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
     #[test]
@@ -4045,6 +4098,23 @@ mod memoria_http_client_tests {
     }
 
     #[test]
+    fn decorate_recall_preserves_supported_object_envelopes() {
+        use super::*;
+        for key in ["memories", "items"] {
+            let raw = serde_json::json!({
+                key: [{"memory_id": "m-envelope", "content": "same fact"}],
+                "total": 1,
+            })
+            .to_string();
+            let mut returned = Vec::new();
+            let out = MemoriaToolGateway::decorate_recall_response(&raw, &mut returned);
+            let parsed: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed[key].as_array().map(Vec::len), Some(1));
+            assert_eq!(returned, vec!["m-envelope"]);
+        }
+    }
+
+    #[test]
     fn decorate_recall_honors_compact_view() {
         use super::*;
         let raw = serde_json::json!([
@@ -4061,11 +4131,9 @@ mod memoria_http_client_tests {
             }
         ])
         .to_string();
-        let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
         let out = MemoriaToolGateway::decorate_recall_response_with_view(
             &raw,
-            &seen,
             &mut newly,
             Some("compact"),
         );
@@ -4196,29 +4264,39 @@ mod memoria_http_client_tests {
     fn decorate_recall_passes_through_non_array_bodies() {
         use super::*;
         let err = r#"{"error": "server down"}"#;
-        let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaToolGateway::decorate_recall_response(err, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(err, &mut newly);
         assert_eq!(out, err);
         assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn decorate_recall_passes_through_error_envelope_with_incidental_items() {
+        use super::*;
+        let err = r#"{"error":{"code":"upstream_failure"},"items":[{"memory_id":"m-incidental","content":"not authoritative"}]}"#;
+        let mut returned = Vec::new();
+        let out = MemoriaToolGateway::decorate_recall_response(err, &mut returned);
+        assert_eq!(out, err);
+        assert!(
+            returned.is_empty(),
+            "error entries must not become evidence"
+        );
     }
 
     #[test]
     fn decorate_recall_passes_through_invalid_json() {
         use super::*;
         let bad = "not json at all";
-        let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaToolGateway::decorate_recall_response(bad, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(bad, &mut newly);
         assert_eq!(out, bad);
     }
 
     #[test]
     fn decorate_recall_empty_array_is_noop() {
         use super::*;
-        let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaToolGateway::decorate_recall_response("[]", &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response("[]", &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert!(arr.is_empty());
         assert!(newly.is_empty());

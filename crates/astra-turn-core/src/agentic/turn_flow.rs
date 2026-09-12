@@ -15,7 +15,7 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
     turn_index: usize,
     server_tool_calls: &[Value],
     edge_round: &[T],
-    turn_sigs: &mut Vec<BTreeSet<String>>,
+    turn_sigs: &mut Vec<BTreeSet<crate::stall::StallSignature>>,
     turn_tool_names: &mut Vec<HashSet<String>>,
     stall_events: &mut Vec<(String, u32)>,
     turn_guard: &mut TurnGuard,

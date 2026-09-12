@@ -28,12 +28,14 @@ pub enum HeadlessOutputEnrichSignal {
 /// Mutable state used while enriching one headless tool result.
 pub struct HeadlessOutputEnrichCtx<'a> {
     pub turn_guard: &'a mut TurnGuard,
+    /// Runtime-authored guidance, separate from the executor's result document.
+    pub advisories: &'a mut Vec<String>,
 }
 
-/// Inputs and mutable output for enriching one headless tool result.
+/// Immutable executor output and mutable classification for one tool result.
 pub struct HeadlessOutputEnrichRequest<'a> {
     pub name: &'a str,
-    pub result_str: &'a mut String,
+    pub result_str: &'a str,
     pub is_err: &'a mut bool,
     pub source_error_kind: Option<ErrorCategory>,
     pub source_recovery_evidence: Option<&'a astra_core::ToolFailureEvidence>,
@@ -66,7 +68,7 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         .unwrap_or(false);
 
     if *is_err && !tool_already_restricted && !is_typed_wait {
-        let category = source_error_kind.unwrap_or_else(|| classify_error(result_str.as_str()));
+        let category = source_error_kind.unwrap_or_else(|| classify_error(result_str));
 
         if matches!(category, ErrorCategory::ResourceLimit) {
             ctx.turn_guard.health.record_resource_limit_failure(name);
@@ -84,15 +86,15 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         let avoidance_advised = ctx.turn_guard.health.health_avoidance_tools();
         let recovery_msg = build_recovery_message_with_evidence(
             name,
-            result_str.as_str(),
+            result_str,
             category,
             &avoidance_advised,
             source_recovery_evidence,
         );
-        result_str.push_str(&format!("\n{recovery_msg}"));
+        ctx.advisories.push(recovery_msg);
     }
 
-    if !*is_err && !tool_already_restricted && is_resource_limit_output(result_str.as_str()) {
+    if !*is_err && !tool_already_restricted && is_resource_limit_output(result_str) {
         ctx.turn_guard.health.record_resource_limit_failure(name);
         ctx.turn_guard
             .errors
@@ -107,21 +109,22 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
     resource_limit_recorded
 }
 
-/// Record tool result quality and append optional TurnGuard feedback into `result_str`.
+/// Record result quality without rewriting the executor's result document.
 pub fn append_headless_result_quality_feedback(
     name: &str,
-    result_str: &mut String,
+    result_str: &str,
     source_error_kind: Option<ErrorCategory>,
     execution_failed: bool,
     resource_limit_recorded: bool,
     turn_guard: &mut TurnGuard,
+    advisories: &mut Vec<String>,
 ) -> ResultQuality {
     let result_quality = if resource_limit_recorded {
         ResultQuality::Error
     } else if execution_failed {
-        turn_guard.record_failed_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
+        turn_guard.record_failed_tool_result_with_kind(name, result_str, source_error_kind)
     } else {
-        turn_guard.record_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
+        turn_guard.record_tool_result_with_kind(name, result_str, source_error_kind)
     };
     // Execution errors already received classified recovery evidence in
     // `enrich_headless_tool_output_for_errors_and_limits`. Appending generic
@@ -131,7 +134,7 @@ pub fn append_headless_result_quality_feedback(
         && !resource_limit_recorded
         && let Some(feedback) = turn_guard.result_feedback(name, result_quality)
     {
-        result_str.push_str(&format!("\n{feedback}"));
+        advisories.push(feedback);
     }
     result_quality
 }
@@ -189,8 +192,8 @@ impl HeadlessStepDeadline {
 pub struct HeadlessCacheableRecordCtx<'a> {
     /// Raw provider observation used for cache identity and similarity.
     pub observation: &'a str,
-    /// Per-invocation, model-visible result that may receive a duplicate hint.
-    pub result_str: &'a mut String,
+    /// Per-invocation guidance, kept separate from the provider observation.
+    pub advisories: &'a mut Vec<String>,
     pub call_id: Option<&'a str>,
     pub turn_index: usize,
     pub semantic_context_generation: u64,
@@ -237,15 +240,18 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
             .attach_cached_result(cached_result.clone());
     }
     ctx.idempotency_cache.record(idem_key, cached_result);
-    ctx.semantic_dedup
-        .append_near_duplicate_hint_for_observation_with_generation(
-            ctx.result_str,
+    if let Some(hint) = ctx
+        .semantic_dedup
+        .near_duplicate_hint_for_observation_with_generation(
             ctx.observation,
             name,
             args,
             ctx.turn_index,
             ctx.semantic_context_generation,
-        );
+        )
+    {
+        ctx.advisories.push(hint);
+    }
 }
 
 /// Best-effort light checkpoint after each tool (matches CLI headless path).
@@ -295,6 +301,7 @@ mod tests {
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
+            advisories: &mut Vec::new(),
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             HeadlessOutputEnrichRequest {
@@ -326,6 +333,7 @@ mod tests {
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
+            advisories: &mut Vec::new(),
         };
 
         let rec = enrich_headless_tool_output_for_errors_and_limits(
@@ -358,6 +366,7 @@ mod tests {
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
+            advisories: &mut Vec::new(),
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             HeadlessOutputEnrichRequest {
@@ -382,6 +391,43 @@ mod tests {
     }
 
     #[test]
+    fn recovery_enrichment_preserves_structured_result_bytes() {
+        // Runtime guidance must not change the tool's document shape or make
+        // an otherwise complete JSON result impossible to recover from a journal.
+        for original in [
+            r#"{ "status": "failed", "executed": false, "error_kind": "probe_rejected" }"#,
+            r#"["opaque", {"failure": true}]"#,
+            r#""opaque failure""#,
+            "null",
+        ] {
+            let mut turn_guard = TurnGuard::new();
+            let mut output = original.to_string();
+            let mut is_error = true;
+            let mut advisories = Vec::new();
+            enrich_headless_tool_output_for_errors_and_limits(
+                HeadlessOutputEnrichRequest {
+                    name: "probe",
+                    result_str: &mut output,
+                    is_err: &mut is_error,
+                    source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                    source_recovery_evidence: None,
+                    tool_already_restricted: false,
+                },
+                &mut HeadlessOutputEnrichCtx {
+                    turn_guard: &mut turn_guard,
+                    advisories: &mut advisories,
+                },
+                |_| {},
+            );
+            assert_eq!(output, original, "runtime guidance changed tool evidence");
+            assert!(
+                !advisories.is_empty(),
+                "opaque JSON errors still need recovery guidance"
+            );
+        }
+    }
+
+    #[test]
     fn typed_wait_remains_parseable_without_generic_failure_advice() {
         let mut turn_guard = TurnGuard::new();
         let mut output = json!({
@@ -394,6 +440,7 @@ mod tests {
         let mut is_error = true;
         let mut context = HeadlessOutputEnrichCtx {
             turn_guard: &mut turn_guard,
+            advisories: &mut Vec::new(),
         };
 
         let resource_limit = enrich_headless_tool_output_for_errors_and_limits(
@@ -424,6 +471,7 @@ mod tests {
         let mut is_error = true;
         let mut context = HeadlessOutputEnrichCtx {
             turn_guard: &mut turn_guard,
+            advisories: &mut Vec::new(),
         };
         let evidence = astra_core::ToolFailureEvidence::new(
             astra_core::ErrorKind::ToolInvalidArgs,
@@ -445,42 +493,52 @@ mod tests {
             |_| {},
         );
 
-        assert!(output.contains("targeted line/range read"), "{output}");
-        assert!(!output.contains("retry the same tool"), "{output}");
+        let guidance = context.advisories.join("\n");
+        assert_eq!(output, "opaque external failure");
+        assert!(guidance.contains("targeted line/range read"), "{guidance}");
+        assert!(!guidance.contains("retry the same tool"), "{guidance}");
     }
 
     #[test]
     fn append_feedback_after_success() {
         let mut tg = TurnGuard::new();
-        let mut out = "ok".to_string();
-        let _q =
-            append_headless_result_quality_feedback("bash", &mut out, None, false, false, &mut tg);
-        // May or may not append depending on classifier; string should remain valid UTF-8.
-        assert!(!out.is_empty());
+        let out = "ok".to_string();
+        let _q = append_headless_result_quality_feedback(
+            "bash",
+            &out,
+            None,
+            false,
+            false,
+            &mut tg,
+            &mut Vec::new(),
+        );
+        assert_eq!(out, "ok");
     }
 
     #[test]
     fn append_feedback_preserves_structured_execution_failure() {
         let mut tg = TurnGuard::new();
-        let mut out = json!({
+        let out = json!({
             "status": "failed",
             "error": "Unknown tool `outline`",
             "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
             "retryable": false
         })
         .to_string();
-        out.push_str("\nadditional recovery guidance");
+        let original = out.clone();
 
         let quality = append_headless_result_quality_feedback(
             "outline",
-            &mut out,
+            &out,
             Some(astra_core::ErrorKind::ToolNotFound),
             true,
             false,
             &mut tg,
+            &mut Vec::new(),
         );
 
         assert_eq!(quality, ResultQuality::Error);
+        assert_eq!(out, original);
         let health = tg.health.get("outline").expect("tool health");
         assert_eq!(health.total_failures, 1);
         assert_eq!(health.consecutive_failures, 1);

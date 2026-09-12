@@ -24,7 +24,7 @@ use axum::{
     Json, Router,
     body::{self, Body},
     http::{Request, StatusCode},
-    routing::get,
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
@@ -134,8 +134,17 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
     )
 }
 
-async fn build_state(memoria: Arc<E2eMemoriaStub>) -> (astra_runtime::AppState, String, String) {
-    let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+async fn build_state(
+    memoria: Arc<E2eMemoriaStub>,
+    memoria_base_url: String,
+) -> (astra_runtime::AppState, String, String) {
+    let mut settings =
+        AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+    // Runtime memory/observer clients are constructed by build_server_state,
+    // independently of the forwarder replaced below. Bind every client to
+    // the fixture before construction; never let this mock-provider suite
+    // observe or mutate the Memoria service configured in a developer's env.
+    settings.memoria.base_url = memoria_base_url;
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
@@ -200,8 +209,9 @@ impl MemoriaForwarder for E2eMemoriaStub {
     }
 }
 
-async fn start_mock_memoria_health() -> String {
+async fn start_mock_memoria() -> String {
     let app = Router::new()
+        .route("/v1/observe", post(|| async { StatusCode::NO_CONTENT }))
         .route(
             "/v1/health/storage",
             get(|| async move {
@@ -250,6 +260,45 @@ async fn start_mock_memoria_health() -> String {
     });
     tokio::task::yield_now().await;
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn mock_memoria_accepts_production_observer_without_blanket_success() {
+    use astra_runtime::{DatabaseTurnObserverWorker, TurnObserverRequest, TurnObserverWorker};
+
+    let base_url = start_mock_memoria().await;
+    let observer = DatabaseTurnObserverWorker::new(
+        base_url.clone(),
+        Some("system-e2e-mock-master-key".to_string()),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observer.run(TurnObserverRequest {
+            user_id: "fixture-user".to_string(),
+            session_id: "fixture-session".to_string(),
+            messages: vec![
+                json!({"role": "user", "content": "fixture observation"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ],
+            turn_count: 1,
+            session_start: None,
+        }),
+    )
+    .await
+    .expect("local observer deadline")
+    .expect("production observer reaches fixture");
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/unimplemented-operation"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 pub async fn get_json(
@@ -897,7 +946,9 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
-    let (state, matrixone_database, url) = build_state(memoria.clone()).await;
+    let memoria_base_url = start_mock_memoria().await;
+    let (state, matrixone_database, url) =
+        build_state(memoria.clone(), memoria_base_url.clone()).await;
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
@@ -916,12 +967,11 @@ pub async fn bootstrap() -> BootstrapResult {
         .expect("build_server_state wires a shared MatrixOne pool")
         .clone();
     let matrixone_settings = session_lifecycle_pool.settings().clone();
-    let memoria_health_base_url = start_mock_memoria_health().await;
     let state = state.with_evaluation_service(Arc::new(
         DatabaseEvaluationService::new(matrixone_settings)
             .with_pool(session_lifecycle_pool.clone())
             .with_memoria_config(
-                memoria_health_base_url,
+                memoria_base_url,
                 Some("system-e2e-mock-master-key".to_string()),
             ),
     ));

@@ -327,6 +327,8 @@ pub struct WorkTaskExecutionSnapshot {
     basis: WorkPlanBasis,
     items: Vec<WorkTaskExecutionItem>,
     dependencies: Vec<WorkItemEdge>,
+    pending_graph_mutations: Vec<super::WorkEstablishmentMutationGroup>,
+    has_unapplied_graph_mutations: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +351,7 @@ pub enum WorkTaskExecutionNext {
     Ready(WorkTaskExecutionItem),
     InFlight(WorkTaskExecutionItem),
     NeedsRecovery(WorkTaskExecutionItem),
+    GraphMutationPending,
     Blocked,
     Complete,
 }
@@ -401,6 +404,8 @@ impl WorkTaskExecutionSnapshot {
             basis,
             items,
             dependencies,
+            pending_graph_mutations: Vec::new(),
+            has_unapplied_graph_mutations: false,
         })
     }
 
@@ -414,6 +419,19 @@ impl WorkTaskExecutionSnapshot {
 
     pub fn dependencies(&self) -> &[WorkItemEdge] {
         &self.dependencies
+    }
+
+    pub fn pending_graph_mutations(&self) -> &[super::WorkEstablishmentMutationGroup] {
+        &self.pending_graph_mutations
+    }
+
+    pub(crate) fn set_graph_mutation_barrier(
+        &mut self,
+        pending: Vec<super::WorkEstablishmentMutationGroup>,
+        has_unapplied: bool,
+    ) {
+        self.pending_graph_mutations = pending;
+        self.has_unapplied_graph_mutations = has_unapplied;
     }
 
     /// Whether exactly one completed primary attempt from this durable Run
@@ -476,6 +494,9 @@ impl WorkTaskExecutionSnapshot {
         }) {
             return WorkTaskExecutionNext::InFlight(item.clone());
         }
+        if !self.pending_graph_mutations.is_empty() {
+            return WorkTaskExecutionNext::GraphMutationPending;
+        }
         if let Some(item) = self.items.iter().filter(is_active_task).find(|item| {
             item.execution.status != WorkItemExecutionStatus::NotStarted
                 && item.delivery.status != WorkItemDeliveryStatus::Delivered
@@ -520,10 +541,42 @@ impl WorkTaskExecutionSnapshot {
             .filter(is_active_task)
             .all(|item| item.delivery.status == WorkItemDeliveryStatus::Delivered)
         {
-            WorkTaskExecutionNext::Complete
+            if self.has_unapplied_graph_mutations {
+                WorkTaskExecutionNext::Blocked
+            } else {
+                WorkTaskExecutionNext::Complete
+            }
         } else {
             WorkTaskExecutionNext::Blocked
         }
+    }
+
+    /// Dependency authority for a specific allocation, independent of retry
+    /// status or canonical ordering among unrelated ready tasks.
+    pub fn has_satisfied_dependencies(&self, item: &WorkItemRevisionRef) -> bool {
+        let Some(task) = self.items.iter().find(|candidate| {
+            candidate.item_id == item.item_id && candidate.revision == item.revision
+        }) else {
+            return false;
+        };
+        let items_by_id = self
+            .items
+            .iter()
+            .map(|item| (&item.item_id, item))
+            .collect();
+        let mut predecessors = BTreeMap::<&WorkItemId, Vec<&WorkItemId>>::new();
+        for edge in &self.dependencies {
+            predecessors
+                .entry(&edge.successor_item_id)
+                .or_default()
+                .push(&edge.predecessor_item_id);
+        }
+        Self::task_dependencies_are_delivered(
+            task,
+            &items_by_id,
+            &predecessors,
+            &mut BTreeMap::new(),
+        )
     }
 
     fn task_dependencies_are_delivered<'a>(
@@ -1111,6 +1164,57 @@ mod tests {
             snapshot.next_foreground_task(),
             WorkTaskExecutionNext::Ready(task) if task.item_id.as_str() == "task-b"
         ));
+    }
+
+    #[test]
+    fn due_graph_mutation_blocks_successor_and_completion_but_future_trigger_keeps_ready_work() {
+        let task = crate::WorkAdmissionTask {
+            objective: "first".into(),
+            expected_result: "evidence".into(),
+            after_initial_tasks: Vec::new(),
+        };
+        let plan = super::super::compile_work_establishment_plan(
+            "op",
+            std::slice::from_ref(&task),
+            &[crate::WorkAdmissionGraphMutation::Add {
+                task: task.clone(),
+                after_initial_tasks: vec![1],
+            }],
+        )
+        .unwrap();
+        let mut snapshot = execution_snapshot(
+            vec![item("task-1"), item("task-2")],
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        snapshot.set_graph_mutation_barrier(Vec::new(), true);
+        assert!(matches!(
+            snapshot.next_foreground_task(),
+            WorkTaskExecutionNext::Ready(_)
+        ));
+        snapshot.set_graph_mutation_barrier(plan.mutation_groups.clone(), true);
+        assert_eq!(
+            snapshot.next_foreground_task(),
+            WorkTaskExecutionNext::GraphMutationPending
+        );
+
+        let mut complete = execution_snapshot(
+            vec![item("task-1")],
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::from([(task_ref("task-1"), delivered())]),
+        );
+        complete.set_graph_mutation_barrier(plan.mutation_groups, true);
+        assert_eq!(
+            complete.next_foreground_task(),
+            WorkTaskExecutionNext::GraphMutationPending
+        );
+        complete.set_graph_mutation_barrier(Vec::new(), false);
+        assert_eq!(
+            complete.next_foreground_task(),
+            WorkTaskExecutionNext::Complete
+        );
     }
 
     #[test]

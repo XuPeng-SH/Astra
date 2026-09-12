@@ -881,8 +881,8 @@ pub struct SubRunConfig {
     /// Optional explicit turn budget for the child loop.
     pub max_turns: Option<u32>,
     /// Optional initial adaptive slice. When `max_turns` is absent this value
-    /// is only a convergence checkpoint and can renew up to the runtime
-    /// ceiling while concrete progress continues.
+    /// is only a convergence checkpoint and can renew subject to current
+    /// execution health and any explicitly configured runtime ceiling.
     pub initial_turns: Option<u32>,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
     /// When set to `true`, the sub-run should yield with status "paused".
@@ -7894,7 +7894,7 @@ mod tests {
             .await
             .expect("recovery claims the expired execution owner");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].run_generation, 1);
+        assert_eq!(claimed[0].run.run_generation, 1);
 
         let authoritative = reconcile_agent_result_with_durable_authority(
             &engine,
@@ -7940,7 +7940,7 @@ mod tests {
             .claim_recoverable_active_runs(1)
             .await
             .expect("recovery claims the expired execution owner");
-        let winner_generation = claimed[0].run_generation;
+        let winner_generation = claimed[0].run.run_generation;
         assert_ne!(winner_generation, authority.owner_generation);
         assert!(
             engine
@@ -7996,7 +7996,7 @@ mod tests {
             .claim_recoverable_active_runs(1)
             .await
             .expect("recovery claims the expired execution owner");
-        let winner_generation = claimed[0].run_generation;
+        let winner_generation = claimed[0].run.run_generation;
         assert!(
             engine
                 .persist_delegation_outcome_status_if_current_owner(

@@ -78,11 +78,10 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeSuccessfulToolCompletion {
-    pub tool_name: String,
-    pub final_text: Option<String>,
-}
+pub use astra_turn_types::{
+    BudgetWrapupOrigin, CompletionAction, CompletionActionWindow, CompletionSettlementState,
+    ForegroundFanoutPagination, RuntimeSuccessfulToolCompletion,
+};
 
 /// Which execution ledger owns the terminal outcome of one CLI logical turn.
 ///
@@ -201,15 +200,40 @@ pub struct SkillAutoRouteJudgeContext<'a> {
 
 #[derive(Clone)]
 pub struct RejectedToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) canonical_call: Value,
+    pub(crate) invocation: astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
     pub(crate) result: String,
+}
+
+impl RejectedToolCall {
+    #[must_use]
+    pub(crate) fn ordinary(canonical_call: Value, result: String) -> Self {
+        Self {
+            invocation:
+                astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
+                    canonical_call,
+                ),
+            result,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn provider_call_id(&self) -> &str {
+        self.invocation.provider_call_id().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub(crate) fn logical_name(&self) -> &str {
+        astra_turn_core::tool::args::shape::tool_call_name(self.invocation.logical_target_call())
+            .unwrap_or("unknown")
+    }
 }
 
 #[derive(Clone)]
 pub struct ToolCallAdmission {
-    pub(crate) admitted: Vec<Value>,
+    /// One provider identity paired with its logical execution target.
+    /// Direct calls retain one JSON value; deferred carriers add a target only
+    /// after shared resolution has proved their activation evidence.
+    pub(crate) admitted: Vec<astra_turn_core::tool::deferred_activation::CanonicalToolInvocation>,
     pub(crate) rejected: Vec<RejectedToolCall>,
     /// Whether the typed completion-action filter has already been applied to
     /// this admission result. Server turns may pre-admit before the shared
@@ -489,6 +513,58 @@ pub trait AgenticLoopHost: Send {
         crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
     }
 
+    /// Catalog of deferred contracts available to this host. The default is
+    /// empty: a host that cannot prove the current schema revision must not
+    /// turn a carrier into an executable target.
+    fn deferred_tool_contract_schemas(&self) -> &[Value] {
+        &[]
+    }
+
+    /// Convert admitted provider carrier calls into paired logical targets
+    /// before shared terminal policy and execution. Every host uses this same
+    /// transition; only the host-owned current contract catalog varies.
+    fn canonicalize_deferred_tool_admission(
+        &mut self,
+        state: &AgenticLoopState,
+        admission: ToolCallAdmission,
+    ) -> ToolCallAdmission {
+        let schemas = self.deferred_tool_contract_schemas();
+        if schemas.is_empty() {
+            return admission;
+        }
+        let activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &state.messages,
+                state.deferred_tool_activations.clone(),
+            );
+        crate::turn::agentic::tool_interception::resolve_deferred_tool_admission(
+            admission,
+            &activations,
+            |name| {
+                schemas
+                    .iter()
+                    .find(|schema| {
+                        astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                    })
+                    .and_then(astra_tools::tool_search::tool_selection_contract)
+                    .map(|contract| {
+                        astra_tools::tool_search::tool_selection_contract_digest(&contract)
+                    })
+            },
+        )
+    }
+
+    /// Bind fresh schema-addressed selections to the current resolved
+    /// provider descriptor. Hosts with an authenticated provider ledger may
+    /// override this to retain identity across the carrier boundary; the
+    /// default keeps provider-neutral hosts unchanged.
+    fn bind_deferred_tool_activations(
+        &mut self,
+        _state: &mut AgenticLoopState,
+        _activations: &[astra_turn_types::DeferredToolActivation],
+    ) {
+    }
+
     /// Exact process-local recall ledger scope owned by this loop.
     ///
     /// The default covers ordinary CLI and server runs. Hosts whose tool
@@ -526,6 +602,34 @@ pub trait AgenticLoopHost: Send {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
 
+    /// Close durable host-owned carriers before the loop's terminal result is
+    /// handed to the outer run lifecycle.  This is intentionally a single
+    /// hook at the state-machine terminal boundary: cancellation and fatal
+    /// errors must release durable ownership just as reliably as the happy
+    /// path releases it with a successful receipt.
+    async fn on_loop_terminal(
+        &mut self,
+        _state: &AgenticLoopState,
+        _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) {
+    }
+
+    /// Process shutdown, distinct from user cancellation or turn completion.
+    fn execution_handoff_requested(&self) -> bool {
+        false
+    }
+
+    /// Persist a fresh settled boundary. Success is custody, not permission
+    /// for a recovery process to execute. Hosts without durable custody do not
+    /// opt into execution handoff.
+    async fn persist_execution_handoff(
+        &mut self,
+        _state: &AgenticLoopState,
+        _heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
+    ) -> Result<bool, astra_core::ClassifiedError> {
+        Ok(false)
+    }
+
     /// Publish and route tool calls only after the runtime has admitted them
     /// into the canonical execution shape. Implementations must not inspect
     /// the provider's raw tool-call JSON for execution side effects.
@@ -535,6 +639,23 @@ pub trait AgenticLoopHost: Send {
         _tool_calls: &[Value],
     ) -> AdmittedToolCallOutcome {
         AdmittedToolCallOutcome::default()
+    }
+
+    /// Execute the canonical invocation objects after deferred carriers have
+    /// been resolved. The default preserves the value-only hook for hosts
+    /// that do not own a delivery ledger; hosts with a typed edge lane may
+    /// use `CanonicalToolInvocation::activation()` to keep carrier proof
+    /// attached through dispatch.
+    async fn handle_admitted_tool_invocations(
+        &mut self,
+        state: &AgenticLoopState,
+        invocations: &[astra_turn_core::tool::deferred_activation::CanonicalToolInvocation],
+    ) -> AdmittedToolCallOutcome {
+        let tool_calls = invocations
+            .iter()
+            .map(|invocation| invocation.logical_target_call().clone())
+            .collect::<Vec<_>>();
+        self.handle_admitted_tool_calls(state, &tool_calls).await
     }
 
     /// Optional semantic judge for the current user turn.
@@ -1044,6 +1165,9 @@ fn build_introspect_snapshot_with_tool_admission(
             if state.stall.cache_waste_advisory_emitted {
                 corrections.push("cache_waste".to_string());
             }
+            if state.stall.observation_reuse_advisory_emitted {
+                corrections.push("observation_reuse".to_string());
+            }
             corrections
         },
     };
@@ -1287,8 +1411,14 @@ pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
 }
 
 pub(crate) fn introspect_estimated_input_tokens(state: &AgenticLoopState) -> u64 {
-    crate::prompts::estimate_tokens(&state.messages, state.pinned_tool_schema_tokens as usize, 0)
-        as u64
+    crate::prompts::estimate_tokens(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        )
+        .unwrap_or(0),
+    ) as u64
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -1349,6 +1479,9 @@ impl RequestConstraints {
 
 /// Skill-related state for the agentic loop.
 pub struct SkillState {
+    /// Delivered skill instructions and effective activation constraints.
+    /// Environment handles and current request authorization remain separate.
+    pub execution: SkillExecutionState,
     /// Unified skill registry for conditional activation via file paths.
     /// When set, edge tool file paths are recorded for conditional skill activation.
     pub registry_for_activation: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
@@ -1363,23 +1496,9 @@ pub struct SkillState {
     /// Optional skill executor for fork-context skills. When set, skills with
     /// `execution_context: Fork` are executed via this executor (sub-agent loop).
     pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
-    /// Effort level override from the most recently activated skill.
-    pub effort: Option<crate::skills::manifest::EffortLevel>,
-    /// Agent type hint from the most recently activated skill.
-    pub agent_type: Option<String>,
-    /// Tool guidance from the most recently activated skill.
-    /// This does not override request policy or prune prompt-visible schemas;
-    /// changing the schema set after activation would churn the provider
-    /// prompt-cache prefix. The inline skill result exposes the guidance to the
-    /// model while request constraints remain the authorization boundary.
-    pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.
     pub request_constraints: RequestConstraints,
-    /// Sandbox policy derived from the most recently activated skill's trust tier.
-    /// When set, tool execution should apply these restrictions (path boundaries,
-    /// env filtering, network control, timeouts).
-    pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
     pub quality_tracker: crate::skills::quality::SkillQualityTracker,
@@ -1389,23 +1508,11 @@ pub struct SkillState {
     pub quality_tracker_baseline: crate::skills::quality::SkillQualityTracker,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
-    /// Skills pinned by the user — always included in budget (never truncated).
-    pub pinned: std::collections::HashSet<String>,
-    /// Canonical skill names surfaced via `discover_skills` this session.
-    pub discovered: HashSet<String>,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
     /// Hosts should prepend this to the messages array when building the payload.
     pub listing_message: Option<Value>,
-    /// Skills invoked during this session, keyed by canonical name.
-    /// Used for same-session dedup and post-compaction re-injection.
-    pub invoked: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
-    /// Auto-route attempt ledger keyed by `(normalized skill, user-intent hash)`.
-    /// Success is already represented by `invoked`; this ledger exists for
-    /// invalid or failed auto-route decisions so the same hidden pre-route does
-    /// not retry every turn and create a "stuck before first LLM round" UX.
-    pub auto_route_attempts: HashSet<String>,
     /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
     /// Loaded from `.astra/hooks.json` or skill frontmatter.
     pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
@@ -1417,27 +1524,110 @@ pub struct SkillState {
 impl Default for SkillState {
     fn default() -> Self {
         Self {
+            execution: Default::default(),
             registry_for_activation: None,
             resolver: None,
             client_pipeline_skill_names: HashSet::new(),
             executor: None,
-            effort: None,
-            agent_type: None,
-            allowed_tools: None,
             request_constraints: Default::default(),
-            sandbox_policy: None,
             quality_tracker: Default::default(),
             quality_tracker_baseline: Default::default(),
             improvement_tracker: Default::default(),
-            pinned: HashSet::new(),
-            discovered: HashSet::new(),
             listing_message: None,
-            invoked: HashMap::new(),
-            auto_route_attempts: HashSet::new(),
             tool_event_hooks: Default::default(),
             session_event_hooks: Default::default(),
         }
     }
+}
+
+/// Skill facts that survive an unfinished execution. They do not grant current
+/// capability authority and restoring them must not replay skill activation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillExecutionState {
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub effort: Option<crate::skills::manifest::EffortLevel>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub agent_type: Option<String>,
+    /// Model guidance, never a replacement for current request authorization.
+    #[serde(
+        deserialize_with = "astra_turn_types::deserialize_required_option",
+        serialize_with = "serialize_optional_skill_set"
+    )]
+    pub allowed_tools: Option<HashSet<String>>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
+    #[serde(serialize_with = "serialize_skill_set")]
+    pub pinned: HashSet<String>,
+    #[serde(serialize_with = "serialize_skill_set")]
+    pub discovered: HashSet<String>,
+    /// Original delivered instructions and re-entry counters, not reloaded content.
+    #[serde(serialize_with = "serialize_invoked_skills")]
+    pub invoked: HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    /// Failed/invalid auto-route attempts must not restart after recovery.
+    #[serde(serialize_with = "serialize_skill_set")]
+    pub auto_route_attempts: HashSet<String>,
+}
+
+impl SkillExecutionState {
+    fn validate_continuation(&self) -> Result<(), &'static str> {
+        if self
+            .invoked
+            .iter()
+            .any(|(name, invocation)| name != &invocation.name)
+        {
+            return Err("invoked skill key differs from its canonical identity");
+        }
+        Ok(())
+    }
+
+    fn serialize_continuation<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        self.validate_continuation()
+            .map_err(serde::ser::Error::custom)?;
+        serde::Serialize::serialize(self, serializer)
+    }
+
+    fn deserialize_continuation<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let state = <Self as serde::Deserialize>::deserialize(deserializer)?;
+        state
+            .validate_continuation()
+            .map_err(serde::de::Error::custom)?;
+        Ok(state)
+    }
+}
+
+fn serialize_skill_set<S: serde::Serializer>(
+    values: &HashSet<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&values.iter().collect::<BTreeSet<_>>(), serializer)
+}
+
+fn serialize_optional_skill_set<S: serde::Serializer>(
+    values: &Option<HashSet<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &values
+            .as_ref()
+            .map(|values| values.iter().collect::<BTreeSet<_>>()),
+        serializer,
+    )
+}
+
+fn serialize_invoked_skills<S: serde::Serializer>(
+    values: &HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &values.iter().collect::<std::collections::BTreeMap<_, _>>(),
+        serializer,
+    )
 }
 
 /// Telemetry and observability state for the agentic loop.
@@ -1539,6 +1729,7 @@ pub struct ContextTracePersistenceContext {
 /// Stall and verdict tracking state for the agentic loop.
 #[derive(Default)]
 pub struct StallTrackingState {
+    pub(crate) verification_frontier: super::verification_frontier::VerificationFrontier,
     /// Exact policy set delivered to the next provider request and copied
     /// into its post-ingest RuntimeFeedbackFrame.
     pub active_policy_feedback: astra_turn_core::context_feedback::RuntimePolicyFeedbackSet,
@@ -1560,7 +1751,7 @@ pub struct StallTrackingState {
     /// across turns and product entrypoints.
     pub active_work_registry: Option<std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>>,
     /// Per-turn tool-call dedup signatures.
-    pub turn_sigs: Vec<BTreeSet<String>>,
+    pub turn_sigs: Vec<BTreeSet<astra_turn_core::stall::StallSignature>>,
     /// Per-turn tool name sets.
     pub turn_tool_names: Vec<HashSet<String>>,
     /// Stall events: `(description, turn_number)`.
@@ -1606,6 +1797,15 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub cache_waste_advisory_emitted: bool,
+    /// Whether a typed introspect/reflect request was repeated in a
+    /// contiguous observation-only tail without an intervening tool state
+    /// transition. One-shot per turn; this never suppresses observation
+    /// authority or reuses a potentially stale result.
+    pub observation_reuse_advisory_emitted: bool,
+    /// Index into `tool_call_records` at the current user-turn boundary.
+    /// Observation reuse is meaningful only within one turn; older records
+    /// remain available for audit but cannot seed a fresh guard decision.
+    pub observation_reuse_record_floor: usize,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -1625,6 +1825,12 @@ pub struct StallTrackingState {
 }
 
 impl StallTrackingState {
+    /// Start a fresh user-turn view without dropping the session audit ledger.
+    pub fn begin_fresh_user_turn(&mut self) {
+        self.observation_reuse_advisory_emitted = false;
+        self.observation_reuse_record_floor = self.tool_call_records.len();
+    }
+
     /// Whether *any* mid-loop advisory has already fired this turn. Guards
     /// use this to enforce the "one behavioral advisory per turn"
     /// invariant — stacking two guidance messages confuses the model and
@@ -1641,6 +1847,7 @@ impl StallTrackingState {
             || self.cache_waste_advisory_emitted
             || self.execution_escalation_advisory_emitted
             || self.work_evidence_advisory_emitted
+            || self.observation_reuse_advisory_emitted
     }
 
     /// Whether any advisory was already emitted. Guards use this only to avoid
@@ -1657,7 +1864,8 @@ impl StallTrackingState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppliedUserIntent {
     pub intent_id: String,
     pub delivery: astra_turn_types::UserIntentDelivery,
@@ -1666,10 +1874,23 @@ pub struct AppliedUserIntent {
     pub content: String,
 }
 
-#[derive(Default)]
-pub struct UserIntentState {
+/// Continuation for a durable run whose accepted/apply events live in its outbox.
+/// Pending acknowledgement payloads are a process-local copy of that outbox:
+/// the cursor advances only after acknowledgement, so recovery reads them again.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DurableUserIntentState {
     /// Durable event cursor for user-intent polling.
     user_intent_cursor: usize,
+    consecutive_apply_ack_failures: u32,
+    /// Transcript projection and stable identities of guidance already in the
+    /// checkpoint's canonical messages. Replaying the outbox must not add it twice.
+    applied_user_intents: Vec<AppliedUserIntent>,
+}
+
+#[derive(Default)]
+pub struct UserIntentState {
+    durable: DurableUserIntentState,
     /// Next time a best-effort empty/error intent poll is allowed.
     /// Due release acknowledgements may wake the poll independently.
     next_user_intent_poll_at: Option<tokio::time::Instant>,
@@ -1677,15 +1898,10 @@ pub struct UserIntentState {
     /// from polling so new input remains observable while a store write backs
     /// off.
     next_apply_ack_at: Option<tokio::time::Instant>,
-    consecutive_apply_ack_failures: u32,
-    /// Typed events already staged for the model but not yet durably marked as
-    /// applied. Retaining the payload lets the loop publish the corresponding
-    /// live event only after a later retry commits.
+    /// Accepted events waiting for durable acknowledgement. They become model
+    /// visible only after that acknowledgement commits. The durable cursor
+    /// remains behind these events, allowing recovery from the provider outbox.
     pending_apply_events: Vec<crate::turn::run_control::QueuedUserIntent>,
-    /// User messages that were appended to the prompt while this run was
-    /// already active. These must be persisted as transcript items after the
-    /// loop finishes, otherwise session history diverges from prompt history.
-    applied_user_intents: Vec<AppliedUserIntent>,
 }
 
 pub(crate) struct ObservedUserIntents {
@@ -1695,8 +1911,23 @@ pub(crate) struct ObservedUserIntents {
 }
 
 impl UserIntentState {
+    pub(crate) fn durable_continuation(&self) -> DurableUserIntentState {
+        self.durable.clone()
+    }
+
+    /// Only for a durable provider: its outbox replays unacknowledged inputs.
+    /// Process-local poll deadlines cannot survive a restart. Allow one immediate
+    /// poll/ack, retaining the failure count for subsequent bounded backoff.
+    #[cfg(test)]
+    pub(crate) fn from_durable_continuation(durable: DurableUserIntentState) -> Self {
+        Self {
+            durable,
+            ..Self::default()
+        }
+    }
+
     pub fn user_intent_cursor(&self) -> usize {
-        self.user_intent_cursor
+        self.durable.user_intent_cursor
     }
 
     pub(crate) fn should_poll_user_intents(&self, now: tokio::time::Instant) -> bool {
@@ -1716,11 +1947,12 @@ impl UserIntentState {
     }
 
     pub fn applied_user_intents(&self) -> &[AppliedUserIntent] {
-        &self.applied_user_intents
+        &self.durable.applied_user_intents
     }
 
     pub(crate) fn has_applied_user_intent(&self, intent_id: &str) -> bool {
-        self.applied_user_intents
+        self.durable
+            .applied_user_intents
             .iter()
             .any(|intent| intent.intent_id == intent_id)
     }
@@ -1728,7 +1960,7 @@ impl UserIntentState {
     pub fn record_applied_user_intents(&mut self, intents: &[AppliedUserIntent]) {
         for intent in intents {
             if !self.has_applied_user_intent(&intent.intent_id) {
-                self.applied_user_intents.push(intent.clone());
+                self.durable.applied_user_intents.push(intent.clone());
             }
         }
     }
@@ -1783,7 +2015,7 @@ impl UserIntentState {
                 true
             }
         });
-        self.consecutive_apply_ack_failures = 0;
+        self.durable.consecutive_apply_ack_failures = 0;
         self.next_apply_ack_at = None;
         acknowledged
     }
@@ -1796,8 +2028,15 @@ impl UserIntentState {
     }
 
     pub(crate) fn note_apply_ack_failure(&mut self, now: tokio::time::Instant) {
-        self.consecutive_apply_ack_failures = self.consecutive_apply_ack_failures.saturating_add(1);
-        let exponent = self.consecutive_apply_ack_failures.saturating_sub(1).min(5);
+        self.durable.consecutive_apply_ack_failures = self
+            .durable
+            .consecutive_apply_ack_failures
+            .saturating_add(1);
+        let exponent = self
+            .durable
+            .consecutive_apply_ack_failures
+            .saturating_sub(1)
+            .min(5);
         let delay = std::time::Duration::from_millis(500)
             .saturating_mul(1_u32 << exponent)
             .min(std::time::Duration::from_secs(10));
@@ -1844,11 +2083,11 @@ impl UserIntentState {
 
     #[cfg(test)]
     pub fn set_user_intent_cursor_for_test(&mut self, cursor: usize) {
-        self.user_intent_cursor = cursor;
+        self.durable.user_intent_cursor = cursor;
     }
 
     pub fn commit_observed_cursor(&mut self, next_cursor: usize) {
-        self.user_intent_cursor = self.user_intent_cursor.max(next_cursor);
+        self.durable.user_intent_cursor = self.durable.user_intent_cursor.max(next_cursor);
     }
 }
 
@@ -1897,185 +2136,6 @@ pub struct StopHookState {
     pub completion_settlement: CompletionSettlementState,
 }
 
-/// Recovery state for a textless provider response.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompletionSettlementState {
-    /// Host-internal canonical Work establishment repairs already attempted in
-    /// this user turn. Keeping the counter in typed loop state preserves the
-    /// bounded-once contract across transport failure and resume.
-    pub canonical_work_establishment_retries: u32,
-    /// Host-internal output-cap continuations already attempted in this user
-    /// turn. This is independent of provider prose and survives retry/resume.
-    pub output_cap_continuations: u8,
-    /// Number of same-turn recovery calls made after the provider returned a
-    /// successful response with neither tool calls nor user-visible text.
-    pub textless_response_retries: u32,
-    /// Number of bounded retries after a runtime/session retrospective tried
-    /// to settle without the live observation required for its claims.
-    pub runtime_evidence_retries: u32,
-    /// Number of bounded terminal rewrites after a tool failure remained
-    /// unresolved across multiple policy observations.  The retry is
-    /// synthesis-only: it calibrates claims against retained evidence rather
-    /// than reopening exploration or hiding the failed outcome.
-    pub outcome_reconciliation_retries: u32,
-    /// Number of bounded same-turn retries after a task whose typed profile
-    /// requires a workspace change attempted to finish without recording one.
-    /// This is deliberately separate from the read-only escalation advisory:
-    /// the latter guides exploration while this field protects the terminal
-    /// completion boundary.
-    pub workspace_mutation_retries: u32,
-    /// Number of bounded retries after an external or mixed mutation contract
-    /// attempted to finish without an executor-owned external delta receipt.
-    pub external_effect_retries: u32,
-    /// Number of bounded same-turn retries after the final successful
-    /// workspace mutation had no later successful observation.  A mutation is
-    /// progress, but it is not evidence that the resulting workspace is
-    /// coherent; the retry gives the agent one chance to inspect or validate
-    /// the state it actually created.
-    pub post_mutation_observation_retries: u32,
-    /// Number of bounded same-action retries after an admitted post-mutation
-    /// observation could not produce observation evidence because the
-    /// selected capability was unavailable. This is not repair authority:
-    /// the workspace is unchanged and the retry remains restricted to the
-    /// original observation obligation.
-    pub post_mutation_observation_failed_action_retries: u32,
-    /// A failed, executor-attested post-mutation observation may authorize
-    /// exactly one repair followed by exactly one final observation. This is
-    /// chain state, not an ordinary turn-budget renewal.
-    pub post_mutation_repair_retries: u32,
-    /// Exact normalized validator that proved the post-mutation result wrong.
-    /// A repair may be settled only by rerunning this same validator; a
-    /// generic workspace read cannot substitute for its failed assertion.
-    pub post_mutation_repair_validation_operation: Option<String>,
-    /// Number of bounded retries after an explicit verification contract was
-    /// not satisfied at the terminal boundary.  This is intentionally
-    /// separate from observation: reading the changed workspace is not a
-    /// passing verification receipt.
-    pub verification_retries: u32,
-    /// A failed, runtime-recognized canonical Work validation earns one
-    /// narrowly-scoped repair-and-revalidation cycle.  This is intentionally
-    /// separate from ordinary budget renewal: the repair must be followed by
-    /// the same canonical validation and then a truthful Work settlement.
-    pub canonical_validation_recovery_retries: u32,
-    /// A matching repair tool can fail before it establishes a successful
-    /// correction. Permit one outcome-aware retry of that repair while
-    /// preserving the independent request-shape correction budget on the
-    /// completion-action window. This never grants another repair cycle.
-    pub canonical_validation_recovery_failed_action_retries: u32,
-    /// Normalized identity of the failed validation that authorized the
-    /// bounded repair. The following revalidation must match this operation;
-    /// an unrelated build/test cannot erase the original failure.
-    pub canonical_validation_recovery_operation: Option<String>,
-    /// A single typed completion action that was already justified by the
-    /// user's structured intent and the executed-tool ledger.  This is not a
-    /// general budget extension: it is consumed once and is followed by a
-    /// text-only boundary.
-    pub completion_action_window: Option<CompletionActionWindow>,
-    /// Provider-declared success observed on a tool round whose typed
-    /// completion obligation still required a dependent action.  The host
-    /// only reports stop-after-success for the current round, so retain this
-    /// terminal template until that bounded action actually settles it.
-    pub deferred_success_completion: Option<RuntimeSuccessfulToolCompletion>,
-    /// The next LLM boundary is a bounded final-answer recovery call. Hosts
-    /// must advertise no tools and reject tool execution while this is set.
-    pub text_only: bool,
-    /// A foreground fanout reached a terminal group boundary but one or more
-    /// slot results are paginated. The carrier records every exact next byte
-    /// offset; finishing one short slot cannot silently discard another
-    /// slot's unread evidence.
-    pub foreground_fanout_pagination: Option<ForegroundFanoutPagination>,
-    /// A stalled/explicitly bounded run still owns a canonical Work attempt.
-    /// The next boundary may report that attempt's typed outcome, but may not
-    /// resume open-ended exploration. Server hosts project only the exact
-    /// settlement capability while this is set.
-    pub work_settlement_only: bool,
-    /// The next provider boundary reviews a just-completed Work graph. Strict-
-    /// history providers must reuse the preceding wire declaration for that
-    /// one request, while runtime admission remains narrowed to the current
-    /// lifecycle surface. This is presentation/cache state only and must never
-    /// authorize completion. Cleared when synthesis is accepted or a later
-    /// semantic user turn resets the review surface; durable Work state alone
-    /// decides whether a corrective tool reopened execution.
-    pub preserve_final_synthesis_wire_surface: bool,
-    /// Latest non-empty provider text observed in this user turn. This is
-    /// independent from the deferred mixed-response candidate so an
-    /// interruption can hand off the most recent model state instead of
-    /// repeating an older candidate after a later boundary response.
-    pub latest_provider_text: Option<String>,
-    pub deferred_candidate_text: Option<String>,
-    /// Source of the active wrap-up boundary, if any.
-    pub wrapup_origin: Option<BudgetWrapupOrigin>,
-}
-
-/// Exact bounded continuations still required before a terminal foreground
-/// fanout may enter synthesis. This is execution authority, not display state:
-/// admission must match both group and `(slot, offset)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForegroundFanoutPagination {
-    pub group_id: String,
-    pub target_count: u64,
-    pub pending_slots: BTreeMap<u64, u64>,
-}
-
-/// A narrow action that can finish an already-established obligation at the
-/// end of an agentic slice.  Ordinary exploration never creates this window.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub enum CompletionAction {
-    #[serde(rename = "required_workspace_mutation")]
-    RequiredWorkspaceMutation,
-    #[serde(rename = "required_external_effect")]
-    RequiredExternalEffect,
-    /// Spend one terminal boundary on a task-facing tool action when the
-    /// structured workspace intent is unknown or merely permits mutation.
-    /// Ordinary admission and safety policy still own executable authority;
-    /// this variant only prevents the terminal window from guessing that the
-    /// remaining action must be either a write or a read.
-    #[serde(rename = "completion_task_action")]
-    CompletionTaskAction,
-    #[serde(rename = "post_mutation_observation")]
-    PostMutationObservation,
-    #[serde(rename = "post_mutation_repair")]
-    PostMutationRepair,
-    #[serde(rename = "explicit_verification")]
-    ExplicitVerification { missing_labels: Vec<String> },
-    /// Re-run one canonical validator when the current durable Work attempt's
-    /// latest validation failed or was invalidated by a later mutation. This
-    /// is settlement authority, not a general execution-budget extension.
-    #[serde(rename = "canonical_work_validation")]
-    CanonicalWorkValidation,
-    /// Make one focused workspace change after a failed canonical Work
-    /// validation.  The next action is always canonical revalidation; this
-    /// never opens a general exploratory slice.
-    #[serde(rename = "canonical_work_repair")]
-    CanonicalWorkRepair,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletionActionWindow {
-    pub action: CompletionAction,
-    /// The first matching provider action consumes the only attempt.  The
-    /// following provider boundary is text-only, regardless of success.
-    pub attempts_remaining: u8,
-    /// A provider may make one non-executed, semantically unrelated request
-    /// and then correct it. This is separate from the single executable
-    /// action attempt: a rejection is not evidence that the action ran.
-    pub mismatch_corrections_remaining: u8,
-    pub consumed: bool,
-    /// Whether the consumed attempt matched the typed action.  A rejected or
-    /// unrelated call must never be treated as completion evidence.
-    pub matched: bool,
-}
-
-/// Why the runtime asked the provider to wrap up.  This is kept separate from
-/// the boolean capability gate so a later ignored tool request cannot be
-/// misreported as a token-rail overflow when the actual boundary was simply a
-/// bounded agentic slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BudgetWrapupOrigin {
-    RoundSlice,
-    TokenRail,
-}
-
 pub(crate) const WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT: &str = "I couldn't complete and verify the requested work in this run, so I'm not claiming it as finished.";
 
 /// Cancellation state for the agentic loop.
@@ -2106,21 +2166,24 @@ pub struct CancellationState {
 pub use crate::turn::run_control::{RunControlProvider, RunControlStatus};
 
 /// Error recovery state for the agentic loop.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorRecoveryState {
     /// Consecutive turns where the same error category dominated.
     /// Reset when a turn succeeds or a different error category appears.
     pub consecutive_same_error: u32,
     /// The error category from the last turn (for streak detection).
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub last_error_category: Option<astra_turn_core::error_recovery::ErrorCategory>,
 }
 
 /// Bounded, run-local adaptations learned from typed provider outcomes.
 ///
-/// These hints never change execution authority, budgets, or terminal state.
-/// They only let the next provider request avoid repeating a transport-level
-/// failure mode that was observed in the same loop.
-#[derive(Default)]
+/// These facts retain one-shot request adaptations and whether the loop has
+/// already consumed its bounded action-convergence recovery. Continuation must
+/// preserve them: resetting the consumed flag would grant recovery again.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderAdaptationState {
     /// The prior logical response reached the provider output cap before it
     /// produced a tool call, then produced that tool call in the one bounded
@@ -2136,6 +2199,183 @@ pub struct ProviderAdaptationState {
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
+
+/// The next logical loop entry, independent of tool-slot state and charged
+/// budget. Only the shared loop advances it; restoration never infers it from
+/// a recent record or repeats a completed preamble.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LoopEntry {
+    #[default]
+    BeforePreamble,
+    IterationBoundary {
+        next_index: u32,
+        harness_pause_recovery_count: u32,
+    },
+}
+
+impl LoopEntry {
+    fn iteration_index(&self) -> Option<u32> {
+        match self {
+            Self::BeforePreamble => None,
+            Self::IterationBoundary { next_index, .. } => Some(*next_index),
+        }
+    }
+
+    fn advance(&mut self) -> Result<(), astra_core::ClassifiedError> {
+        let Self::IterationBoundary { next_index, .. } = self else {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "loop preamble has not completed",
+            ));
+        };
+        *next_index = next_index.checked_add(1).ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "loop round identity exhausted",
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "harness")]
+    fn record_harness_pause(&mut self) -> u32 {
+        let Self::IterationBoundary {
+            harness_pause_recovery_count,
+            ..
+        } = self
+        else {
+            unreachable!("PostTurn belongs to an initialized loop");
+        };
+        *harness_pause_recovery_count = harness_pause_recovery_count.saturating_add(1);
+        *harness_pause_recovery_count
+    }
+}
+
+/// Original execution facts, captured only at a cooperative handoff boundary.
+/// Messages, granted/remaining budget, ledger and control obligations retain
+/// their existing checkpoint owners. This record must never infer fresh intent
+/// or replenish a consumed recovery permission.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OriginalLoopExecutionFacts {
+    pub loop_entry: LoopEntry,
+    pub context_compression_triggered: bool,
+    #[serde(
+        serialize_with = "serialize_pending_context",
+        deserialize_with = "deserialize_pending_context"
+    )]
+    pub pending_context: Vec<VolatileInjection>,
+    #[serde(
+        serialize_with = "SkillExecutionState::serialize_continuation",
+        deserialize_with = "SkillExecutionState::deserialize_continuation"
+    )]
+    pub skill_execution: SkillExecutionState,
+    #[serde(
+        serialize_with = "crate::turn::runtime_policy::RuntimePolicyEvaluationState::serialize_continuation",
+        deserialize_with = "crate::turn::runtime_policy::RuntimePolicyEvaluationState::deserialize_continuation"
+    )]
+    pub runtime_policy_evaluation: crate::turn::runtime_policy::RuntimePolicyEvaluationState,
+    #[serde(
+        serialize_with = "TurnGuard::serialize_continuation",
+        deserialize_with = "TurnGuard::deserialize_continuation"
+    )]
+    pub turn_guard: TurnGuard,
+    pub message: String,
+    pub user_intent: String,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub turn_intent: Option<astra_config::user_profile::TurnIntent>,
+    pub task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+    pub session_turn: u32,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub canonical_turn_chain_id: Option<String>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub root_user_query_event_id: Option<String>,
+    pub total_prompt: u64,
+    pub total_completion: u64,
+    pub total_cache_read: u64,
+    pub total_cache_creation: u64,
+    pub total_tool_calls: u32,
+    pub total_observation_tool_calls: u32,
+    pub has_any_usage: bool,
+    pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+    pub budget_is_explicit: bool,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub budget_policy: Option<crate::turn::runtime_policy::RuntimePolicy>,
+    pub current_round_index: u32,
+    pub llm_rounds_completed: u32,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub last_request_message_count: Option<usize>,
+    pub max_turn_input_tokens: u64,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub last_finish_reason: Option<String>,
+    pub final_text: String,
+    pub final_text_streamed: bool,
+    pub final_output_ready_notified: bool,
+    pub skill_produced_output: bool,
+    pub error_recovery: ErrorRecoveryState,
+    pub provider_adaptation: ProviderAdaptationState,
+}
+
+impl OriginalLoopExecutionFacts {
+    pub(crate) fn capture(state: &AgenticLoopState) -> Result<Self, &'static str> {
+        // Check before filtering: even telemetry may be part of an unresolved
+        // attempt lease. Only a settled delivery boundary can be handed off.
+        if state
+            .volatile_pending
+            .iter()
+            .any(|entry| entry.attempt_leased)
+        {
+            return Err("pending runtime context still belongs to an unresolved provider attempt");
+        }
+        let pending_context = state
+            .volatile_pending
+            .iter()
+            .filter(|entry| {
+                entry.kind.delivery_class()
+                    != astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_pending_context(&pending_context)?;
+        Ok(Self {
+            loop_entry: state.loop_entry.clone(),
+            context_compression_triggered: state.context_compression_triggered,
+            pending_context,
+            skill_execution: state.skills.execution.clone(),
+            runtime_policy_evaluation: state.stall.runtime_policy_evaluation.clone(),
+            turn_guard: state.turn_guard.clone(),
+            message: state.message.clone(),
+            user_intent: state.user_intent.clone(),
+            turn_intent: state.turn_intent.clone(),
+            task_profile: state.task_profile,
+            session_turn: state.session_turn,
+            canonical_turn_chain_id: state.canonical_turn_chain_id.clone(),
+            root_user_query_event_id: state.root_user_query_event_id.clone(),
+            total_prompt: state.total_prompt,
+            total_completion: state.total_completion,
+            total_cache_read: state.total_cache_read,
+            total_cache_creation: state.total_cache_creation,
+            total_tool_calls: state.total_tool_calls,
+            total_observation_tool_calls: state.total_observation_tool_calls,
+            has_any_usage: state.has_any_usage,
+            agentic_turn_budget: state.agentic_turn_budget,
+            budget_is_explicit: state.budget_is_explicit,
+            budget_policy: state.budget_policy.clone(),
+            current_round_index: state.current_round_index,
+            llm_rounds_completed: state.llm_rounds_completed,
+            last_request_message_count: state.last_request_message_count,
+            max_turn_input_tokens: state.max_turn_input_tokens,
+            last_finish_reason: state.last_finish_reason.clone(),
+            final_text: state.final_text.clone(),
+            final_text_streamed: state.final_text_streamed,
+            final_output_ready_notified: state.final_output_ready_notified,
+            skill_produced_output: state.skill_produced_output,
+            error_recovery: state.error_recovery.clone(),
+            provider_adaptation: state.provider_adaptation.clone(),
+        })
+    }
+}
 
 /// Cross-turn state managed by the runtime loop.
 ///
@@ -2154,7 +2394,8 @@ pub struct ProviderAdaptationState {
 /// [`AgenticLoopState::push_volatile_payload`]. The lane crosses edge
 /// boundaries as typed JSON and is attached at the dynamic wire tail, so
 /// `messages[]` only carries real user/assistant/tool conversation turns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolatileInjection {
     /// Classification — used by introspect to enumerate injections by
     /// type, and by downstream dedup/coalescing if needed.
@@ -2174,7 +2415,46 @@ pub struct VolatileInjection {
     /// projected again on retry. This bit is control-plane state, never wire
     /// provenance.
     #[doc(hidden)]
+    #[serde(skip)]
     pub attempt_leased: bool,
+}
+
+fn validate_pending_context(pending: &[VolatileInjection]) -> Result<(), &'static str> {
+    let mut singletons = Vec::new();
+    for entry in pending {
+        if entry.attempt_leased {
+            return Err("pending runtime context still belongs to an unresolved provider attempt");
+        }
+        if entry.kind.delivery_class()
+            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly
+            || volatile_payload_is_empty(&entry.payload)
+        {
+            return Err("runtime context continuation contains a non-deliverable item");
+        }
+        if entry.kind.is_singleton() {
+            if singletons.contains(&entry.kind) {
+                return Err("runtime context continuation repeats a singleton");
+            }
+            singletons.push(entry.kind);
+        }
+    }
+    Ok(())
+}
+
+fn serialize_pending_context<S: serde::Serializer>(
+    pending: &[VolatileInjection],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    validate_pending_context(pending).map_err(serde::ser::Error::custom)?;
+    serde::Serialize::serialize(pending, serializer)
+}
+
+fn deserialize_pending_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<VolatileInjection>, D::Error> {
+    let pending = <Vec<VolatileInjection> as serde::Deserialize>::deserialize(deserializer)?;
+    validate_pending_context(&pending).map_err(serde::de::Error::custom)?;
+    Ok(pending)
 }
 
 /// In-memory summary of one LLM round within the current session.
@@ -2258,6 +2538,10 @@ pub enum VolatileKind {
     /// mid-turn status/correction boundary sees the same canonical work units
     /// that the UI exposed when the input was accepted.
     ActiveWorkSnapshot,
+    /// Canonical durable Work graph projection. This is a singleton snapshot:
+    /// a newer repository read supersedes the prior value within the same
+    /// human turn instead of creating a second independent authority.
+    CanonicalWorkState,
     /// A provider response completed after newer durable user guidance was
     /// accepted. The stale response is not executable; this singleton tells
     /// the next request to re-evaluate from the applied control epoch.
@@ -2322,7 +2606,8 @@ impl VolatileKind {
                 | Self::BehaviorAdvisory
                 | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
-                | Self::ActiveWorkSnapshot,
+                | Self::ActiveWorkSnapshot
+                | Self::CanonicalWorkState,
         )
     }
 
@@ -2338,6 +2623,7 @@ impl VolatileKind {
             | Self::Mailbox
             | Self::BackgroundTaskNotification
             | Self::ActiveWorkSnapshot
+            | Self::CanonicalWorkState
             | Self::UserIntentBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry
@@ -2441,7 +2727,8 @@ pub struct CanonicalRewriteState {
 
 const TOOL_LEDGER_LIVE_WINDOW: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ToolLedgerResultClass {
     Succeeded,
     Failed,
@@ -2548,6 +2835,73 @@ pub struct ToolLedgerReceiptAccumulator {
     settled_recent_by_id: HashMap<String, (u64, ToolLedgerResultClass)>,
 }
 
+/// Accounting continuity from an owner-produced immutable checkpoint, not
+/// independent evidence that an invocation executed or a task was verified.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolLedgerHandoff {
+    receipt: astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt,
+    settled_recent: VecDeque<(u64, String, ToolLedgerResultClass)>,
+}
+
+impl ToolLedgerHandoff {
+    pub(crate) fn restore(
+        &self,
+        run_id: &str,
+        producer_generation: u64,
+    ) -> Result<ToolLedgerReceiptAccumulator, &'static str> {
+        let receipt = &self.receipt;
+        receipt.validate()?;
+        if receipt.run_id != run_id || receipt.owner_generation != producer_generation {
+            return Err("tool ledger handoff belongs to a different execution");
+        }
+        if !receipt.is_complete() || self.settled_recent.len() > TOOL_LEDGER_LIVE_WINDOW {
+            return Err("tool ledger handoff is incomplete or exceeds the replay window");
+        }
+        let mut recent_by_id = HashMap::with_capacity(self.settled_recent.len());
+        let mut previous = 0;
+        let mut counts =
+            astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts::default();
+        for (sequence, call_id, class) in &self.settled_recent {
+            if *sequence <= previous
+                || *sequence > receipt.watermark
+                || call_id.is_empty()
+                || call_id.trim() != call_id
+                || call_id.len() > 512
+                || recent_by_id
+                    .insert(call_id.clone(), (*sequence, *class))
+                    .is_some()
+            {
+                return Err("tool ledger handoff replay window is invalid");
+            }
+            previous = *sequence;
+            class.increment(&mut counts);
+        }
+        let total = receipt.result_classes;
+        if counts.succeeded > total.succeeded
+            || counts.failed > total.failed
+            || counts.rejected > total.rejected
+            || counts.reused > total.reused
+            || counts.suppressed > total.suppressed
+        {
+            return Err("tool ledger handoff replay classes exceed cumulative accounting");
+        }
+        Ok(ToolLedgerReceiptAccumulator {
+            attempted: receipt.attempted,
+            terminal: receipt.terminal,
+            next_sequence: receipt.watermark,
+            watermark: receipt.watermark,
+            result_classes: receipt.result_classes,
+            ledger_root: receipt.ledger_root.clone(),
+            consistent: true,
+            live: BTreeMap::new(),
+            live_by_id: HashMap::new(),
+            settled_recent: self.settled_recent.clone(),
+            settled_recent_by_id: recent_by_id,
+        })
+    }
+}
+
 impl Default for ToolLedgerReceiptAccumulator {
     fn default() -> Self {
         Self {
@@ -2567,6 +2921,29 @@ impl Default for ToolLedgerReceiptAccumulator {
 }
 
 impl ToolLedgerReceiptAccumulator {
+    pub(crate) fn handoff(
+        &self,
+        run_id: &str,
+        producer_generation: u64,
+    ) -> Result<ToolLedgerHandoff, &'static str> {
+        if !self.consistent
+            || !self.live.is_empty()
+            || !self.live_by_id.is_empty()
+            || self.next_sequence != self.watermark
+        {
+            return Err("tool ledger cannot checkpoint an unresolved execution frontier");
+        }
+        let handoff = ToolLedgerHandoff {
+            receipt: self.receipt(run_id, producer_generation),
+            settled_recent: self.settled_recent.clone(),
+        };
+        let restored = handoff.restore(run_id, producer_generation)?;
+        if restored.settled_recent_by_id != self.settled_recent_by_id {
+            return Err("tool ledger replay index is inconsistent");
+        }
+        Ok(handoff)
+    }
+
     fn register_attempt(&mut self, call_id: &str) -> Option<u64> {
         let call_id = call_id.trim();
         if call_id.is_empty() || call_id.len() > 512 {
@@ -2900,8 +3277,11 @@ pub struct AgenticLoopState {
     pub has_any_usage: bool,
 
     // ── Turn management ──
+    pub loop_entry: LoopEntry,
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Actual loop admission charges; renewal never resets this counter.
+    pub charged_iterations: u64,
     /// The `finish_reason` from the most recent LLM turn. `Some("length")`
     /// when the model hit its output token limit (prose truncated by the API);
     /// `Some("stop")` for natural completion; `None` on the first turn.
@@ -2999,7 +3379,10 @@ pub struct AgenticLoopState {
     /// This is prompt continuity, not an authorization grant. The runtime
     /// executor still intersects these names with the current advertised
     /// surface and live bindings before schema injection or execution.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed deferred selections retained across compaction and
+    /// resume. Unlike the name projection above, these records may prove a
+    /// stable carrier target only after the current schema digest matches.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// True when the prior (immediately preceding) turn produced assistant
     /// output (text or tool calls). Set by the agentic loop on every turn
     /// boundary (`has_any_usage` from the just-completed ingest).
@@ -3338,6 +3721,45 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Shared projection for all execution checkpoint producers. The enclosing
+    /// heavy checkpoint and paired budget own frontier and run identity.
+    pub fn run_execution_control_snapshot(
+        &self,
+    ) -> Option<astra_pipeline::step_protocol::RunExecutionControl> {
+        self.current_run_id.as_ref().filter(|id| !id.is_empty())?;
+        self.current_run_owner_generation?;
+        Some(astra_pipeline::step_protocol::RunExecutionControl::V2 {
+            completion_settlement: self.hooks.completion_settlement.clone(),
+            hook_obligations: astra_turn_types::StopHookObligations {
+                stop_hooks: self.hooks.stop_hooks.clone(),
+                stop_hook_runs: self.hooks.stop_hook_runs,
+                teammate_idle_hooks: self.hooks.teammate_idle_hooks.clone(),
+                teammate_idle_hook_runs: self.hooks.teammate_idle_hook_runs,
+            },
+            budget_wrapup_injected: self.budget_wrapup_injected,
+            budget_wrapup_ignored_rounds: self.budget_wrapup_ignored_rounds,
+        })
+    }
+
+    /// Run-scoped accounting facts shared by every execution checkpoint writer.
+    /// This snapshot alone never authorizes replay or ordinary execution.
+    pub fn run_execution_budget_snapshot(
+        &self,
+    ) -> Option<astra_pipeline::step_protocol::RunExecutionBudget> {
+        let run_id = self.current_run_id.as_ref().filter(|id| !id.is_empty())?;
+        Some(astra_pipeline::step_protocol::RunExecutionBudget::V1 {
+            run_id: run_id.clone(),
+            producer_owner_generation: self.current_run_owner_generation?,
+            charged_iterations: self.charged_iterations,
+            granted_iteration_boundary: self.max_turns as u64,
+            remaining_iterations: self.remaining_turns as u64,
+            effective_hard_turn_limit: self
+                .agentic_turn_budget
+                .hard_turn_limit
+                .and_then(|limit| std::num::NonZeroU64::new(limit.get() as u64)),
+        })
+    }
+
     /// A typed settlement or hard token-rail wrap-up owns the next provider
     /// boundary. Generic slice-pacing guidance must remain silent there so it
     /// cannot imply execution authority that the active boundary does not
@@ -4315,52 +4737,106 @@ pub(crate) fn set_harness_interruption(
     ));
 }
 
+/// Shutdown never runs normal terminal settlement. The lifecycle's existing
+/// bounded drain/abort owns disposal of this frozen future, including when a
+/// safe handoff cannot be confirmed.
+async fn freeze_for_execution_handoff<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> ! {
+    let settled = state.step_recorder.persistence_error().is_none()
+        && state
+            .step_recorder
+            .current_step()
+            .is_some_and(|step| step.execution.cursor.all_slots_done());
+    if settled && let Some(heavy) = super::finalization::build_current_heavy_checkpoint(state) {
+        match host.persist_execution_handoff(state, heavy).await {
+            Ok(true) => tracing::info!(
+                run_id = state.current_run_id.as_deref(),
+                "execution handoff persisted; freezing producer for shutdown"
+            ),
+            Ok(false) => tracing::warn!(
+                run_id = state.current_run_id.as_deref(),
+                "execution handoff not accepted; awaiting shutdown without exact recovery claim"
+            ),
+            Err(error) => tracing::warn!(
+                run_id = state.current_run_id.as_deref(),
+                error = %error,
+                "execution handoff not confirmed; awaiting shutdown"
+            ),
+        }
+    }
+    std::future::pending().await
+}
+
 pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
-    run_loop_preamble(host, state).await;
-
-    // ── Harness: SessionStart — Block prevents any turns ──
-    #[cfg(feature = "harness")]
-    match harness_at!(
-        &state.harness,
-        astra_harness::HookPoint::SessionStart,
-        state
-    ) {
-        astra_harness::HookVerdict::Block { reason } => {
-            tracing::warn!(reason = %reason, "harness blocked session at SessionStart");
-            set_harness_interruption(
-                state,
-                astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
-                &reason,
-            );
-            finalize_and_render(host, state).await;
-            return Ok(AgenticLoopOutcome::Completed);
-        }
-        astra_harness::HookVerdict::Pause { reason, .. } => {
-            tracing::info!(reason = %reason, "harness paused session at SessionStart");
-            set_harness_interruption(
-                state,
-                astra_turn_core::interruption::InterruptionKind::HarnessPaused,
-                &reason,
-            );
-            finalize_and_render(host, state).await;
-            return Ok(AgenticLoopOutcome::Completed);
-        }
-        astra_harness::HookVerdict::Continue => {}
+    if host.execution_handoff_requested() {
+        freeze_for_execution_handoff(host, state).await;
     }
-    #[cfg(not(feature = "harness"))]
-    harness_at!(
-        &state.harness,
-        astra_harness::HookPoint::SessionStart,
-        state
-    );
+    let before_preamble = matches!(state.loop_entry, LoopEntry::BeforePreamble);
+    if before_preamble {
+        run_loop_preamble(state).await;
+    }
+    super::lifecycle::configure_loop_host(host, state);
 
-    let mut turn_index = 0usize;
-    #[cfg(feature = "harness")]
-    let mut harness_pause_recovery_count: u32 = 0;
-    while turn_index < state.max_turns || state.remaining_turns == 0 {
+    if before_preamble {
+        // ── Harness: SessionStart — Block prevents any turns ──
+        #[cfg(feature = "harness")]
+        match harness_at!(
+            &state.harness,
+            astra_harness::HookPoint::SessionStart,
+            state
+        ) {
+            astra_harness::HookVerdict::Block { reason } => {
+                tracing::warn!(reason = %reason, "harness blocked session at SessionStart");
+                set_harness_interruption(
+                    state,
+                    astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
+                    &reason,
+                );
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Pause { reason, .. } => {
+                tracing::info!(reason = %reason, "harness paused session at SessionStart");
+                set_harness_interruption(
+                    state,
+                    astra_turn_core::interruption::InterruptionKind::HarnessPaused,
+                    &reason,
+                );
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Continue => {}
+        }
+        #[cfg(not(feature = "harness"))]
+        harness_at!(
+            &state.harness,
+            astra_harness::HookPoint::SessionStart,
+            state
+        );
+
+        state.loop_entry = LoopEntry::IterationBoundary {
+            next_index: 0,
+            harness_pause_recovery_count: 0,
+        };
+    }
+    loop {
+        let turn_index = state.loop_entry.iteration_index().ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "loop preamble has not completed",
+            )
+        })? as usize;
+        if turn_index >= state.max_turns && state.remaining_turns != 0 {
+            break;
+        }
+        if host.execution_handoff_requested() {
+            freeze_for_execution_handoff(host, state).await;
+        }
         state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
             quiet,
@@ -4393,7 +4869,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         {
             TurnExecutionControl::Proceed(phase) => *phase,
             TurnExecutionControl::ContinueLoop => {
-                turn_index += 1;
+                state.loop_entry.advance()?;
                 continue;
             }
             TurnExecutionControl::Return(outcome) => {
@@ -4581,7 +5057,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 reason,
                 recovery_threshold,
             } => {
-                harness_pause_recovery_count += 1;
+                let harness_pause_recovery_count = state.loop_entry.record_harness_pause();
                 if harness_pause_recovery_count > MAX_HARNESS_PAUSE_RECOVERIES {
                     tracing::warn!(
                         count = harness_pause_recovery_count,
@@ -4608,7 +5084,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             TurnToolPhaseControl::Return(outcome) => return Ok(outcome),
         }
 
-        turn_index += 1;
+        state.loop_entry.advance()?;
     }
     // Loop exhausted max_turns without explicit break — write final state.
     finalize_and_render(host, state).await;
@@ -4768,9 +5244,11 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
+        charged_iterations: 0,
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         budget_is_explicit: false,
         budget_policy: None,
+        loop_entry: Default::default(),
         current_round_index: 0,
         llm_rounds_completed: 0,
         last_request_message_count: None,
@@ -4806,7 +5284,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         user_intent: "test query".to_string(),
         has_prior_assistant_turn: false,
         recent_tools: Vec::new(),
-        activated_deferred_tool_names: Vec::new(),
+        deferred_tool_activations: Vec::new(),
         turn_intent: None,
         task_profile: TaskExecutionProfile::default(),
         last_turn_policy: TurnInteractionPolicy::default(),
@@ -4869,6 +5347,29 @@ pub(crate) mod tests {
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
+    #[test]
+    fn durable_user_intent_continuation_retains_backoff_without_process_deadlines() {
+        let now = tokio::time::Instant::now();
+        let mut original = UserIntentState::default();
+        original.commit_observed_cursor(12);
+        original.note_user_intent_poll_finished(now, std::time::Duration::from_secs(1));
+        original.note_apply_ack_failure(now);
+        original.note_apply_ack_failure(now);
+        let wire = serde_json::to_vec(&original.durable_continuation()).unwrap();
+        let mut restored =
+            UserIntentState::from_durable_continuation(serde_json::from_slice(&wire).unwrap());
+        assert_eq!(restored.user_intent_cursor(), 12);
+        assert!(restored.should_poll_user_intents(now));
+        assert_eq!(restored.durable.consecutive_apply_ack_failures, 2);
+        restored.note_apply_ack_failure(now);
+        assert_eq!(
+            restored.next_apply_ack_at,
+            Some(now + std::time::Duration::from_secs(2))
+        );
+        restored.acknowledge_apply_events(&[]);
+        assert_eq!(restored.durable.consecutive_apply_ack_failures, 0);
+    }
+
     fn complete_remote_tool_receipt(
         run_id: &str,
         attempted: u32,
@@ -4887,6 +5388,80 @@ pub(crate) mod tests {
             astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
             true,
         )
+    }
+
+    #[test]
+    fn execution_handoff_tool_accounting_continues_without_rehash_or_double_count() {
+        let mut empty_remote = ToolLedgerReceiptAccumulator::default();
+        empty_remote.absorb_remote(&complete_remote_tool_receipt("zero-tool-run", 0));
+        let restored_empty_remote = empty_remote
+            .handoff("same-run", 4)
+            .unwrap()
+            .restore("same-run", 4)
+            .unwrap();
+        assert_eq!(
+            restored_empty_remote.receipt("same-run", 5),
+            empty_remote.receipt("same-run", 5)
+        );
+        let mut original = ToolLedgerReceiptAccumulator::default();
+        for index in 0..(TOOL_LEDGER_LIVE_WINDOW + 10) {
+            let id = format!("call-{index}");
+            let sequence = original.register_attempt(&id).unwrap();
+            original.record_terminal(sequence, &id, ToolLedgerResultClass::Succeeded);
+        }
+        // Remote absorption legitimately leaves a gap after the recent window.
+        original.absorb_remote(&complete_remote_tool_receipt("remote-run", 3));
+        let encoded = serde_json::to_string(&original.handoff("same-run", 4).unwrap()).unwrap();
+        let snapshot: ToolLedgerHandoff = serde_json::from_str(&encoded).unwrap();
+        let mut restored = snapshot.restore("same-run", 4).unwrap();
+        assert_eq!(
+            restored.receipt("same-run", 5),
+            original.receipt("same-run", 5)
+        );
+        let before_replay = restored.receipt("same-run", 5);
+        let id = format!("call-{}", TOOL_LEDGER_LIVE_WINDOW + 9);
+        let sequence = restored.register_attempt(&id).unwrap();
+        restored.record_terminal(sequence, &id, ToolLedgerResultClass::Succeeded);
+        assert_eq!(restored.receipt("same-run", 5), before_replay);
+        for accumulator in [&mut original, &mut restored] {
+            let sequence = accumulator.register_attempt("next-call").unwrap();
+            accumulator.record_terminal(sequence, "next-call", ToolLedgerResultClass::Rejected);
+        }
+        assert_eq!(
+            restored.receipt("same-run", 5),
+            original.receipt("same-run", 5)
+        );
+        assert!(restored.receipt("same-run", 5).is_complete());
+    }
+
+    #[test]
+    fn execution_handoff_tool_accounting_rejects_unresolved_or_corrupt_state() {
+        let mut accumulator = ToolLedgerReceiptAccumulator::default();
+        let sequence = accumulator.register_attempt("pending").unwrap();
+        assert!(accumulator.handoff("run", 1).is_err());
+        accumulator.record_terminal(sequence, "pending", ToolLedgerResultClass::Failed);
+        let snapshot = accumulator.handoff("run", 1).unwrap();
+        assert!(snapshot.restore("other-run", 1).is_err());
+        assert!(snapshot.restore("run", 2).is_err());
+        let mut corrupt = snapshot.clone();
+        corrupt
+            .settled_recent
+            .push_back(corrupt.settled_recent[0].clone());
+        assert!(corrupt.restore("run", 1).is_err());
+        let mut corrupt = snapshot.clone();
+        corrupt.settled_recent[0].0 = 0;
+        assert!(corrupt.restore("run", 1).is_err());
+        let mut corrupt = snapshot.clone();
+        corrupt.settled_recent[0].2 = ToolLedgerResultClass::Succeeded;
+        assert!(corrupt.restore("run", 1).is_err());
+        let mut corrupt = snapshot.clone();
+        corrupt.receipt.terminal += 1;
+        assert!(corrupt.restore("run", 1).is_err());
+        let mut missing = serde_json::to_value(&snapshot).unwrap();
+        missing.as_object_mut().unwrap().remove("settled_recent");
+        assert!(serde_json::from_value::<ToolLedgerHandoff>(missing).is_err());
+        accumulator.record_terminal(sequence, "pending", ToolLedgerResultClass::Succeeded);
+        assert!(accumulator.handoff("run", 1).is_err());
     }
 
     #[test]
@@ -5502,6 +6077,9 @@ pub(crate) mod tests {
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
     pub(crate) struct MockHost {
+        handoff_requested: bool,
+        handoff_accepted: bool,
+        handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
         pub(crate) valid_tools: HashSet<String>,
@@ -5513,6 +6091,7 @@ pub(crate) mod tests {
         pub(crate) injected_schemas: Vec<Value>,
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) final_output_ready: Vec<String>,
+        pub(crate) final_policy_snapshots: Vec<serde_json::Value>,
         pub(crate) terminal_tool_records: Vec<ToolCallRecord>,
         pub(crate) terminal_tool_batches: Vec<Vec<ToolCallRecord>>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
@@ -5545,6 +6124,9 @@ pub(crate) mod tests {
     impl MockHost {
         pub(crate) fn new(results: Vec<HostTurnResult>) -> Self {
             Self {
+                handoff_requested: false,
+                handoff_accepted: false,
+                handoff_snapshots: Vec::new(),
                 turn_results: results,
                 current_turn: 0,
                 valid_tools: HashSet::new(),
@@ -5556,6 +6138,7 @@ pub(crate) mod tests {
                 injected_schemas: Vec::new(),
                 rendered_final_text: Vec::new(),
                 final_output_ready: Vec::new(),
+                final_policy_snapshots: Vec::new(),
                 terminal_tool_records: Vec::new(),
                 terminal_tool_batches: Vec::new(),
                 executed_messages: Vec::new(),
@@ -5686,6 +6269,18 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn execution_handoff_requested(&self) -> bool {
+            self.handoff_requested
+        }
+
+        async fn persist_execution_handoff(
+            &mut self,
+            _state: &AgenticLoopState,
+            heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
+        ) -> Result<bool, astra_core::ClassifiedError> {
+            self.handoff_snapshots.push(heavy);
+            Ok(self.handoff_accepted)
+        }
         async fn committed_work_synthesis_authorized(
             &mut self,
             _state: &AgenticLoopState,
@@ -5893,6 +6488,8 @@ pub(crate) mod tests {
 
         async fn on_final_output_ready(&mut self, state: &AgenticLoopState) {
             self.final_output_ready.push(state.final_text.clone());
+            self.final_policy_snapshots
+                .push(serde_json::to_value(&state.stall.runtime_policy_evaluation).unwrap());
         }
 
         async fn recover_missing_control_tool_result(
@@ -6288,6 +6885,40 @@ pub(crate) mod tests {
 
     // ── State builder ───────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn shutdown_handoff_freezes_before_charge_or_model_dispatch() {
+        for (has_step, accepted) in [(true, true), (true, false), (false, false)] {
+            let mut host = MockHost::new(Vec::new());
+            host.handoff_requested = true;
+            host.handoff_accepted = accepted;
+            let mut state = make_state();
+            state.current_run_id = Some("shutdown-run".to_string());
+            state.current_run_owner_generation = Some(3);
+            state.charged_iterations = 7;
+            if has_step {
+                state.step_recorder.begin_turn(0);
+            }
+            let remaining = state.remaining_turns;
+            let budget = state.run_execution_budget_snapshot();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    run_agentic_loop_impl(&mut host, &mut state),
+                )
+                .await
+                .is_err(),
+                "shutdown must freeze, not return completion"
+            );
+            assert_eq!(host.current_turn, 0);
+            assert_eq!(host.handoff_snapshots.len(), usize::from(has_step));
+            assert!(host.rendered_final_text.is_empty());
+            assert!(host.turn_completed_run_ids.is_empty());
+            assert_eq!(state.remaining_turns, remaining);
+            assert_eq!(state.charged_iterations, 7);
+            assert_eq!(state.run_execution_budget_snapshot(), budget);
+        }
+    }
+
     pub(crate) fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
@@ -6319,9 +6950,11 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            charged_iterations: 0,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             budget_is_explicit: false,
             budget_policy: None,
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -6359,7 +6992,7 @@ pub(crate) mod tests {
             user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_finish_reason: None,
@@ -6429,7 +7062,11 @@ pub(crate) mod tests {
             .stall
             .circuit_breaker
             .observe(astra_turn_core::loop_circuit_breaker::RoundSignal {
-                tool_signatures: std::iter::once("read_file:/tmp/test".to_string()).collect(),
+                tool_signatures: std::iter::once(astra_turn_core::stall::StallSignature::new(
+                    "read_file",
+                    b"/tmp/test",
+                ))
+                .collect(),
                 produced_mutation: false,
                 tool_count: 1,
             });
@@ -6492,6 +7129,7 @@ pub(crate) mod tests {
         let mut state = make_state();
         state.max_turns = 25;
         state.remaining_turns = 0;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(25);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_err());
         let err = outcome.unwrap_err();
@@ -6673,10 +7311,8 @@ pub(crate) mod tests {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 15,
-            hard_turn_limit: 15,
+            hard_turn_limit: std::num::NonZeroUsize::new(15),
             extension_turns: 0,
-            max_extensions: 0,
-            renewable_past_review_limit: false,
         };
         state.max_turns = 15;
         state.remaining_turns = 0;
@@ -7515,10 +8151,8 @@ pub(crate) mod tests {
         state.hooks.workspace_root_hint = Some("/workspace".into());
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7560,10 +8194,8 @@ pub(crate) mod tests {
         ));
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7616,10 +8248,8 @@ pub(crate) mod tests {
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7660,23 +8290,28 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn adaptive_budget_extends_exploratory_task_on_distinct_real_progress() {
+        let observed_read = |path: &str, output: &str| {
+            let mut result = make_edge_tool_with_args("read_file", json!({"path": path}), output);
+            let receipt =
+                astra_tools::workspace_observation::typed_workspace_observation_receipt_for(
+                    "read_file",
+                    &result.args,
+                    std::path::Path::new("/workspace"),
+                    false,
+                )
+                .expect("bound observer receipt");
+            result.tool_result_fields.as_mut().unwrap().extend(receipt);
+            result
+        };
         let mut host = MockHost::new(vec![
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/lib.rs"}),
-                    "module contents",
-                )],
+                vec![observed_read("src/lib.rs", "module contents")],
                 10,
                 5,
                 Some(20),
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/main.rs"}),
-                    "entry point contents",
-                )],
+                vec![observed_read("src/main.rs", "entry point contents")],
                 10,
                 5,
                 Some(20),
@@ -7692,10 +8327,8 @@ pub(crate) mod tests {
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 4,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7716,7 +8349,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_budget_renews_past_profile_review_limit_with_real_progress() {
+    async fn adaptive_budget_renews_with_headroom_and_real_progress() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_edge_tool_with_args(
@@ -7759,10 +8392,8 @@ pub(crate) mod tests {
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
-            hard_turn_limit: 2,
+            hard_turn_limit: std::num::NonZeroUsize::new(4),
             extension_turns: 2,
-            max_extensions: 1,
-            renewable_past_review_limit: true,
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7771,7 +8402,20 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 4);
-        assert_eq!(state.max_turns, 4);
+        assert_eq!(
+            state.agentic_turn_budget.hard_turn_limit,
+            std::num::NonZeroUsize::new(4)
+        );
+        assert_eq!(
+            state.max_turns, 5,
+            "one text-only closing allowance is reserved at the hard boundary"
+        );
+        // Finalization clears transient settlement state; inspect the request.
+        assert!(host.executed_volatile.last().unwrap().iter().any(|entry| {
+            entry.payload["signal"] == "agentic_execution_slice_complete"
+                && entry.payload["mode"] == "text_only"
+                && entry.payload["execution_authority"] == "none"
+        }));
         assert!(
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
@@ -9610,7 +10254,7 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let allowed = state.skills.allowed_tools.as_ref().unwrap();
+        let allowed = state.skills.execution.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
         assert!(allowed.contains("grep"));
         assert_eq!(allowed.len(), 2);
@@ -9620,7 +10264,7 @@ pub(crate) mod tests {
     async fn unrestricted_skill_clears_prior_overrides() {
         // Simulate: first skill sets tool hints, second skill is unrestricted.
         let mut state = make_state();
-        state.skills.allowed_tools = Some(["bash".into()].into_iter().collect());
+        state.skills.execution.allowed_tools = Some(["bash".into()].into_iter().collect());
 
         let resolver = StubSkillResolver::new();
         let turns = vec![
@@ -9636,7 +10280,7 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert!(state.skills.allowed_tools.is_none());
+        assert!(state.skills.execution.allowed_tools.is_none());
     }
 
     #[tokio::test]
@@ -9666,7 +10310,7 @@ pub(crate) mod tests {
             "skill allowlist restrictions must not leak after turn cleanup"
         );
         // The activated allowlist is still tracked on skill state.
-        let allowed = state.skills.allowed_tools.as_ref().unwrap();
+        let allowed = state.skills.execution.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
     }
 
@@ -9919,7 +10563,217 @@ pub(crate) mod tests {
     #[test]
     fn invoked_skills_defaults_to_empty() {
         let state = make_state();
-        assert!(state.skills.invoked.is_empty());
+        assert!(state.skills.execution.invoked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_entry_continuation_preserves_next_round_without_repeating_preamble() {
+        for restored_boundary in [false, true] {
+            let mut state = make_state();
+            state.max_turns = 10;
+            state.remaining_turns = 5;
+            state.charged_iterations = 3;
+            state.total_prompt = 123;
+            state.context_compression_triggered = true;
+            state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
+            state.skills.session_event_hooks =
+                crate::skills::hooks::SessionEventHookRegistry::new(vec![
+                    crate::skills::hooks::SessionEventHook {
+                        event: crate::skills::hooks::SessionEvent::SessionStart,
+                        action: crate::skills::hooks::HookAction::Shell {
+                            command: "printf '%s' '{\"context\":\"fresh preamble\"}'".into(),
+                        },
+                        timeout_secs: 10,
+                        is_async: false,
+                        condition: None,
+                        once: false,
+                        priority: 0,
+                    },
+                ]);
+            if restored_boundary {
+                state.loop_entry = LoopEntry::IterationBoundary {
+                    next_index: 7,
+                    harness_pause_recovery_count: 2,
+                };
+                state.current_round_index = 6;
+                state.push_volatile_payload(
+                    VolatileKind::SessionHookContext,
+                    json!({"context": "original pending context"}),
+                );
+            }
+            let wire =
+                serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+            let original: OriginalLoopExecutionFacts = serde_json::from_value(wire).unwrap();
+            state.loop_entry = original.loop_entry;
+            state.volatile_pending = original.pending_context;
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.current_round_index,
+                if restored_boundary { 7 } else { 0 }
+            );
+            assert_eq!(state.context_compression_triggered, restored_boundary);
+            assert_eq!(state.charged_iterations, 4);
+            assert_eq!(state.remaining_turns, 4);
+            assert_eq!(state.total_prompt, 133);
+            assert_eq!(
+                host.injected_schemas.len(),
+                1,
+                "a new host needs its skill schema in either entry mode"
+            );
+            let context = host.executed_volatile[0]
+                .iter()
+                .find(|entry| entry.kind == VolatileKind::SessionHookContext)
+                .unwrap();
+            assert_eq!(
+                context.payload["context"],
+                if restored_boundary {
+                    "original pending context"
+                } else {
+                    "fresh preamble"
+                }
+            );
+            assert!(
+                matches!(state.loop_entry, LoopEntry::BeforePreamble),
+                "returned loops start a fresh preamble when reused"
+            );
+        }
+        let mut boundary = LoopEntry::IterationBoundary {
+            next_index: 7,
+            harness_pause_recovery_count: 2,
+        };
+        boundary.advance().unwrap();
+        assert_eq!(boundary.iteration_index(), Some(8));
+        #[cfg(feature = "harness")]
+        {
+            assert_eq!(boundary.record_harness_pause(), 3);
+            assert_eq!(boundary.iteration_index(), Some(8));
+        }
+        let mut exhausted = LoopEntry::IterationBoundary {
+            next_index: u32::MAX,
+            harness_pause_recovery_count: 0,
+        };
+        assert!(exhausted.advance().is_err());
+        assert_eq!(exhausted.iteration_index(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn pending_context_continuation_preserves_delivery_not_attempt_leases() {
+        let mut state = make_state();
+        state.current_round_index = 3;
+        state.push_volatile_payload(VolatileKind::BudgetAdvisory, json!({"remaining": 8}));
+        state.current_round_index = 4;
+        state.push_volatile_payload(VolatileKind::BudgetAdvisory, json!({"remaining": 7}));
+        state.push_volatile_payload(
+            VolatileKind::FinalAnswerSettlement,
+            json!({"mode": "text_only"}),
+        );
+        state.push_volatile_payload(VolatileKind::SelfStatus, json!({"debug": "telemetry-only"}));
+        let leased = state.lease_volatile_pending().unwrap();
+        assert_eq!(leased.len(), 4);
+        assert!(OriginalLoopExecutionFacts::capture(&state).is_err());
+        state.restore_volatile_attempt_lease();
+        let original = OriginalLoopExecutionFacts::capture(&state).unwrap();
+        let wire = serde_json::to_value(&original).unwrap();
+        assert!(!wire.to_string().contains("attempt_leased"));
+        assert!(!wire.to_string().contains("telemetry-only"));
+        let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
+        let mut resumed = make_state();
+        resumed.volatile_pending = restored.pending_context;
+        assert_eq!(resumed.volatile_pending.len(), 3);
+        assert_eq!(resumed.volatile_pending[0].round_index, 3);
+        assert_eq!(resumed.volatile_pending[0].payload, json!({"remaining": 8}));
+        assert_eq!(resumed.volatile_pending[1].round_index, 4);
+        assert_eq!(resumed.volatile_pending[1].payload, json!({"remaining": 7}));
+        resumed.current_round_index = 5;
+        resumed.push_volatile_payload(
+            VolatileKind::FinalAnswerSettlement,
+            json!({"mode": "updated"}),
+        );
+        assert_eq!(resumed.volatile_pending.len(), 3);
+        assert_eq!(
+            resumed.volatile_pending[2].payload,
+            json!({"mode": "updated"})
+        );
+        assert_eq!(resumed.volatile_pending[2].round_index, 5);
+        resumed.lease_volatile_pending().unwrap();
+        resumed.commit_volatile_attempt_lease();
+        assert!(
+            OriginalLoopExecutionFacts::capture(&resumed)
+                .unwrap()
+                .pending_context
+                .is_empty()
+        );
+
+        let mut invalid = wire.clone();
+        invalid["pending_context"][0]["attempt_leased"] = json!(true);
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(invalid).is_err());
+        let mut invalid = wire.clone();
+        invalid["pending_context"]
+            .as_array_mut()
+            .unwrap()
+            .push(wire["pending_context"][2].clone());
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(invalid).is_err());
+        let mut invalid = wire;
+        invalid["pending_context"][0]["kind"] = json!("self_status");
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(invalid).is_err());
+        let mut only_telemetry = make_state();
+        only_telemetry.push_volatile(VolatileKind::SelfStatus, "leased telemetry");
+        only_telemetry.lease_volatile_pending().unwrap();
+        assert!(OriginalLoopExecutionFacts::capture(&only_telemetry).is_err());
+    }
+
+    #[tokio::test]
+    async fn skill_continuation_keeps_delivered_content_and_reentry_state() {
+        let mut state = make_state();
+        state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
+        let mut host = MockHost::new(vec![
+            skill_tool_call_result("original_call", r#"{"skill_name":"test-skill"}"#, 100, 50),
+            text_result("Loaded.", 80, 20, None),
+        ]);
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        let original = state.skills.execution.invoked["test-skill"].clone();
+        let wire =
+            serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+        let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+
+        let mut changed_resolver = StubSkillResolver::new();
+        changed_resolver.skills[0].2 =
+            "Changed resolver instructions must not replace delivered content.".into();
+        let mut resumed = make_state();
+        resumed.skills.execution = restored.skill_execution;
+        resumed.skills.resolver = Some(Arc::new(changed_resolver));
+        let mut host = MockHost::new(vec![
+            skill_tool_call_result("resumed_call", r#"{"skill_name":"test-skill"}"#, 100, 50),
+            text_result("Done.", 80, 20, None),
+        ]);
+        run_agentic_loop_with_host(&mut host, &mut resumed)
+            .await
+            .unwrap();
+        let invocation = &resumed.skills.execution.invoked["test-skill"];
+        assert_eq!(invocation.content, original.content);
+        assert_eq!(invocation.invoked_at_turn, original.invoked_at_turn);
+        assert_eq!(invocation.reentry_count, original.reentry_count + 1);
+
+        let mut bad = wire.clone();
+        bad["skill_execution"]["invoked"]["test-skill"]["name"] = json!("another-skill");
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(bad).is_err());
+        for field in wire["skill_execution"].as_object().unwrap().keys() {
+            let mut bad = wire.clone();
+            bad["skill_execution"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<OriginalLoopExecutionFacts>(bad).is_err(),
+                "missing {field}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9989,8 +10843,11 @@ pub(crate) mod tests {
         );
 
         // Skill should be tracked
-        assert!(state.skills.invoked.contains_key("test-skill"));
-        assert_eq!(state.skills.invoked["test-skill"].invoked_at_turn, 1);
+        assert!(state.skills.execution.invoked.contains_key("test-skill"));
+        assert_eq!(
+            state.skills.execution.invoked["test-skill"].invoked_at_turn,
+            1
+        );
     }
 
     #[tokio::test]
@@ -10044,7 +10901,7 @@ pub(crate) mod tests {
         );
 
         // Both tracked
-        assert_eq!(state.skills.invoked.len(), 2);
+        assert_eq!(state.skills.execution.invoked.len(), 2);
     }
 
     #[test]
@@ -10053,7 +10910,7 @@ pub(crate) mod tests {
         use astra_turn_core::cloud_attachments::AttachmentBuilder;
 
         let mut state = make_state();
-        state.skills.invoked.insert(
+        state.skills.execution.invoked.insert(
             "review-changes".into(),
             InvokedSkill {
                 name: "review-changes".into(),
@@ -10066,7 +10923,7 @@ pub(crate) mod tests {
 
         // Simulate post-compaction re-injection
         let mut builder = AttachmentBuilder::new();
-        let mut skills: Vec<_> = state.skills.invoked.values().collect();
+        let mut skills: Vec<_> = state.skills.execution.invoked.values().collect();
         skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
         for skill in skills {
             builder.add_skill(&skill.name, &skill.content);
@@ -10669,8 +11526,11 @@ pub(crate) mod tests {
         .with_interaction_mode(TurnInteractionMode::Auto);
         let mut state = make_state();
         state.max_turn_input_tokens = 0;
-        state.agentic_turn_budget =
-            astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(2, 2, 0, 0);
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+            2,
+            std::num::NonZeroUsize::new(2),
+            0,
+        );
         state.max_turns = 2;
         state.remaining_turns = 2;
         state
@@ -10726,8 +11586,11 @@ pub(crate) mod tests {
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
         ));
         state.max_turn_input_tokens = 0;
-        state.agentic_turn_budget =
-            astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(2, 2, 0, 0);
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+            2,
+            std::num::NonZeroUsize::new(2),
+            0,
+        );
         state.max_turns = 2;
         state.remaining_turns = 2;
         state
@@ -11302,6 +12165,11 @@ pub(crate) mod tests {
         assert_eq!(
             astra_core::session_env_overlay::get("ASTRA_TEST_HOOK_VAR").as_deref(),
             Some("session_active")
+        );
+        assert_eq!(
+            state.skills.session_event_hooks.capture_continuation(),
+            Err(crate::skills::hooks::HookContinuationError::EnvironmentReconstructionRequired),
+            "actual application, not a configured SetEnv action, creates the obligation",
         );
         // Cleanup
         astra_core::session_env_overlay::remove("ASTRA_TEST_HOOK_VAR");
@@ -12929,6 +13797,19 @@ mod parallel_execution_tests {
         assert_eq!(value[0]["payload"]["signal"], "policy_advisory");
         assert_eq!(value[0]["payload"]["evidence"], "second advisory");
         assert_eq!(value[0]["payload"]["authority"], "advisory_evidence_only");
+    }
+
+    #[test]
+    fn canonical_work_state_wire_kind_is_a_typed_singleton() {
+        assert!(VolatileKind::CanonicalWorkState.is_singleton());
+        assert_eq!(
+            VolatileKind::CanonicalWorkState.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+        );
+        assert!(VolatileKind::wire_kind_is_singleton("canonical_work_state"));
+        assert!(!VolatileKind::wire_kind_is_singleton(
+            "canonical_work_state:sha256:stale"
+        ));
     }
 
     #[test]

@@ -296,6 +296,92 @@ pub struct ExecutionTimeBudget {
     pub remaining_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionDeadlineAuthority {
+    pub deadline_unix_ms: u64,
+    monotonic_deadline: std::time::Instant,
+}
+
+impl ExecutionDeadlineAuthority {
+    pub fn from_budget_at(budget: ExecutionTimeBudget, now_unix_ms: u64) -> Result<Self, String> {
+        let deadline_unix_ms = budget
+            .remaining_seconds
+            .checked_mul(1_000)
+            .and_then(|duration| now_unix_ms.checked_add(duration))
+            .ok_or_else(|| "execution time budget exceeds supported deadline range".to_string())?;
+        let monotonic_deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(budget.remaining_seconds))
+            .ok_or_else(|| "execution time budget exceeds monotonic clock range".to_string())?;
+        Ok(Self {
+            deadline_unix_ms,
+            monotonic_deadline,
+        })
+    }
+
+    pub fn monotonic_deadline(self) -> std::time::Instant {
+        self.monotonic_deadline
+    }
+}
+
+/// Original execution restrictions, not a grant of permission to reconstruct a
+/// run. Stored with run admission; credentials and runtime routes are excluded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum DurableExecutionRestrictions {
+    #[serde(rename = "1")]
+    V1 {
+        #[serde(deserialize_with = "deserialize_required_option")]
+        allow_tools: Option<Vec<String>>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        enabled_tools: Option<Vec<String>>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        allow_skills: Option<Vec<String>>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        allow_skill_sources: Option<Vec<String>>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        execution_budget: Option<ExecutionBudget>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        execution_deadline_unix_ms: Option<u64>,
+    },
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+impl DurableExecutionRestrictions {
+    pub fn from_admitted_request(request: &ChatRequestData) -> Result<Self, String> {
+        if request.execution_time_budget.is_some() != request.admitted_execution_deadline.is_some()
+        {
+            return Err("execution time budget has no matching admitted deadline".into());
+        }
+        let execution_deadline_unix_ms = request
+            .admitted_execution_deadline
+            .map(|deadline| deadline.deadline_unix_ms);
+        Ok(Self::V1 {
+            allow_tools: request.allow_tools.clone(),
+            enabled_tools: request.enabled_tools.clone(),
+            allow_skills: request.allow_skills.clone(),
+            allow_skill_sources: request.allow_skill_sources.clone(),
+            execution_budget: request.execution_budget,
+            execution_deadline_unix_ms,
+        })
+    }
+
+    pub fn execution_deadline_unix_ms(&self) -> Option<u64> {
+        match self {
+            Self::V1 {
+                execution_deadline_unix_ms,
+                ..
+            } => *execution_deadline_unix_ms,
+        }
+    }
+}
+
 /// Request-scoped execution controls.
 ///
 /// Turn-intent classification policy for callers that explicitly need a
@@ -325,8 +411,9 @@ pub enum TurnIntentExecutionPolicy {
     #[default]
     Auto,
     /// Do not add a serial auxiliary model boundary. The primary agent makes
-    /// the semantic Work choice through visible typed tools; all resulting
-    /// lifecycle effects remain runtime-owned and deterministic.
+    /// the semantic Work choice through visible typed tools; explicit
+    /// `start_work` remains the documented no-classifier fallback. All
+    /// resulting lifecycle effects remain runtime-owned and deterministic.
     FixedDefault,
 }
 
@@ -813,6 +900,8 @@ pub struct ChatRequestData {
     pub agent_binding_owner_scope: Option<crate::AgentBindingOwnerScope>,
     pub execution_budget: Option<ExecutionBudget>,
     pub execution_time_budget: Option<ExecutionTimeBudget>,
+    /// Internal clock authority, never accepted from a client request.
+    pub admitted_execution_deadline: Option<ExecutionDeadlineAuthority>,
     pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
@@ -1333,6 +1422,679 @@ pub struct DurableRunRecord {
     pub events: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Result of one committed recovery ownership transition. The run contains
+/// the frontier read under the claim's write lock, not the discovery snapshot.
+/// This receipt does not replace current authorization before execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryClaim {
+    pub run: DurableRunRecord,
+    pub claimed_from_generation: u64,
+}
+
+/// The immutable checkpoint associated with one recovery ownership transition.
+/// Stored in the same event transaction that parks the recovered execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffRecovery {
+    pub checkpoint_id: String,
+    pub producer_generation: u64,
+    pub claimed_from_generation: u64,
+    pub recovered_generation: u64,
+}
+
+/// Checkpoint custody inherited atomically with a recovery ownership claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionHandoffClaim {
+    checkpoint_id: String,
+    producer_generation: u64,
+    claimed_from_generation: u64,
+    claimed_generation: u64,
+}
+
+impl ExecutionHandoffClaim {
+    fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "execution_handoff_claimed",
+            "idempotency_key": format!("execution-handoff-claim:{}:{}", self.checkpoint_id, self.claimed_generation),
+            "data": self,
+        })
+    }
+
+    fn from_event(event: &serde_json::Value) -> Option<Self> {
+        if event.get("event_type")?.as_str()? != "execution_handoff_claimed" {
+            return None;
+        }
+        let claim: Self = serde_json::from_value(event.get("data")?.clone()).ok()?;
+        (claim.event() == *event).then_some(claim)
+    }
+}
+
+fn execution_handoff_checkpoint_identity(run: &DurableRunRecord) -> Result<Option<String>, String> {
+    if run.checkpoint_version.as_deref() != Some("execution_handoff_v1") {
+        return Ok(None);
+    }
+    let Some(json) = run.checkpoint_json.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(DurableExecutionHandoff::V1 {
+        producer_run_id,
+        producer_owner_generation,
+        ..
+    }) = serde_json::from_str::<DurableExecutionHandoff<serde::de::IgnoredAny>>(json)
+    else {
+        tracing::warn!(run_id = %run.run_id, "invalid checkpoint envelope cannot establish recovery custody");
+        return Ok(None);
+    };
+    Ok((producer_run_id == run.run_id).then(|| {
+        format!(
+            "checkpoint:{}:execution_handoff:{producer_owner_generation}",
+            run.run_id
+        )
+    }))
+}
+
+fn execution_handoff_claim_event(
+    run: &DurableRunRecord,
+    checkpoint: &DurableRunCheckpointRecord,
+    tail: Option<&serde_json::Value>,
+    verified_adoption: Option<&ExecutionHandoffAdoption>,
+) -> Result<Option<serde_json::Value>, String> {
+    if checkpoint.user_id != run.user_id
+        || checkpoint.session_id != run.session_id
+        || checkpoint.run_id != run.run_id
+        || checkpoint.checkpoint_kind != "execution_handoff"
+        || checkpoint.checkpoint_version != "execution_handoff_v1"
+    {
+        return Ok(None);
+    }
+    let Ok(persisted) = serde_json::from_str::<DurableExecutionHandoff<serde_json::Value>>(
+        &checkpoint.checkpoint_json,
+    ) else {
+        tracing::warn!(run_id = %run.run_id, "invalid immutable checkpoint cannot establish recovery custody");
+        return Ok(None);
+    };
+    let Some(json) = run.checkpoint_json.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(current) = serde_json::from_str::<DurableExecutionHandoff<serde_json::Value>>(json)
+    else {
+        tracing::warn!(run_id = %run.run_id, "invalid current checkpoint cannot establish recovery custody");
+        return Ok(None);
+    };
+    let DurableExecutionHandoff::V1 {
+        producer_run_id,
+        producer_owner_generation,
+        ..
+    } = &persisted;
+    if persisted != current || producer_run_id != &run.run_id {
+        return Ok(None);
+    }
+    if *producer_owner_generation != run.run_generation {
+        let prior_claim = tail
+            .and_then(ExecutionHandoffClaim::from_event)
+            .is_some_and(|previous| {
+                previous.checkpoint_id == checkpoint.checkpoint_id
+                    && previous.producer_generation == *producer_owner_generation
+                    && previous.claimed_generation == run.run_generation
+                    && previous.claimed_from_generation.checked_add(1)
+                        == Some(previous.claimed_generation)
+            });
+        let prior_adoption = verified_adoption.is_some_and(|adoption| {
+            adoption.checkpoint_id == checkpoint.checkpoint_id
+                && adoption.producer_generation == *producer_owner_generation
+                && adoption.run_generation == run.run_generation
+                && tail.and_then(ExecutionHandoffAdoption::from_event).as_ref() == Some(adoption)
+        });
+        if !prior_claim && !prior_adoption {
+            return Ok(None);
+        }
+    }
+    Ok(Some(
+        ExecutionHandoffClaim {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            producer_generation: *producer_owner_generation,
+            claimed_from_generation: run.run_generation,
+            claimed_generation: run
+                .run_generation
+                .checked_add(1)
+                .ok_or_else(|| "run recovery generation exhausted".to_string())?,
+        }
+        .event(),
+    ))
+}
+
+/// A committed recovery transition, not a reconstructed execution or history.
+#[derive(Clone, Debug)]
+pub struct RecoveryReconciliation {
+    pub run: DurableRunRecord,
+    pub event_idx: i64,
+    pub event: serde_json::Value,
+}
+
+#[derive(Default)]
+struct StatusTransitionCommit {
+    applied: bool,
+    recovery: Option<RecoveryReconciliation>,
+}
+
+impl ExecutionHandoffRecovery {
+    fn idempotency_key(&self) -> String {
+        format!(
+            "execution-handoff-recovery:{}:{}",
+            self.checkpoint_id, self.recovered_generation
+        )
+    }
+
+    fn event(&self, previous_status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "run_interrupted_after_restart",
+            "idempotency_key": self.idempotency_key(),
+            "data": {
+                "previous_status": previous_status,
+                "reason_kind": "execution_process_restarted",
+                "checkpoint_available": true,
+                "resumable": true,
+                "resume_strategy": "session_continuation",
+                "releases_session_slot": true,
+                "execution_handoff_preserved": true,
+                "automatic_execution_reconstructed": false,
+                "execution_handoff_recovery": self,
+            }
+        })
+    }
+}
+
+fn execution_handoff_recovery_association(
+    claim: &RecoveryClaim,
+    current: &DurableRunRecord,
+    checkpoint: &DurableRunCheckpointRecord,
+    tail: Option<&serde_json::Value>,
+) -> Result<Option<ExecutionHandoffRecovery>, String> {
+    if current.user_id != claim.run.user_id
+        || current.session_id != claim.run.session_id
+        || current.run_id != claim.run.run_id
+        || current.owner_pod_id != claim.run.owner_pod_id
+        || current.run_generation != claim.run.run_generation
+        || claim.claimed_from_generation.checked_add(1) != Some(current.run_generation)
+        || current.checkpoint_json != claim.run.checkpoint_json
+        || current.checkpoint_version.as_deref() != Some("execution_handoff_v1")
+        || checkpoint.user_id != current.user_id
+        || checkpoint.session_id != current.session_id
+        || checkpoint.run_id != current.run_id
+        || checkpoint.checkpoint_kind != "execution_handoff"
+        || checkpoint.checkpoint_version != "execution_handoff_v1"
+    {
+        return Ok(None);
+    }
+    let Some(current_json) = current.checkpoint_json.as_deref() else {
+        return Ok(None);
+    };
+    let persisted: DurableExecutionHandoff<serde_json::Value> =
+        serde_json::from_str(&checkpoint.checkpoint_json).map_err(|error| error.to_string())?;
+    let current_payload: DurableExecutionHandoff<serde_json::Value> =
+        serde_json::from_str(current_json).map_err(|error| error.to_string())?;
+    let DurableExecutionHandoff::V1 {
+        producer_run_id,
+        producer_owner_generation,
+        ..
+    } = &persisted;
+    if persisted != current_payload || producer_run_id != &current.run_id {
+        return Ok(None);
+    }
+    if recovery_frontier_matches(claim, current) {
+        let expected = ExecutionHandoffClaim {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            producer_generation: *producer_owner_generation,
+            claimed_from_generation: claim.claimed_from_generation,
+            claimed_generation: current.run_generation,
+        };
+        if tail.and_then(ExecutionHandoffClaim::from_event).as_ref() != Some(&expected) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(ExecutionHandoffRecovery {
+        checkpoint_id: checkpoint.checkpoint_id.clone(),
+        producer_generation: *producer_owner_generation,
+        claimed_from_generation: claim.claimed_from_generation,
+        recovered_generation: current.run_generation,
+    }))
+}
+
+/// Locked inputs for canonical turn adoption. The caller must still validate
+/// the canonical reservation and atomically persist both adoption receipts.
+pub(crate) struct ClaimedExecutionHandoff {
+    pub run: DurableRunRecord,
+    pub checkpoint: DurableRunCheckpointRecord,
+    pub association: ExecutionHandoffRecovery,
+    pub prior_adoption: Option<ExecutionHandoffAdoption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutionHandoffAdoption {
+    pub checkpoint_id: String,
+    pub producer_generation: u64,
+    pub run_generation: u64,
+    pub key: astra_turn_types::SessionKeyV1,
+    pub receipt_idempotency_key: String,
+    pub source_reservation_id: String,
+    pub adopted_reservation_id: String,
+}
+
+impl ExecutionHandoffAdoption {
+    fn from_event(event: &serde_json::Value) -> Option<Self> {
+        if event.get("event_type")?.as_str()? != "execution_handoff_adopted" {
+            return None;
+        }
+        let adoption: Self = serde_json::from_value(event.get("data")?.clone()).ok()?;
+        (adoption.event() == *event).then_some(adoption)
+    }
+    pub(crate) fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "execution_handoff_adopted",
+            "idempotency_key": self.receipt_idempotency_key,
+            "data": self,
+        })
+    }
+}
+
+pub(crate) async fn append_execution_handoff_adoption_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    locked: &ClaimedExecutionHandoff,
+    adoption: &ExecutionHandoffAdoption,
+) -> Result<(), String> {
+    let run = &locked.run;
+    if locked.prior_adoption.is_some() {
+        return Err("adoption retry must reuse its committed receipt".into());
+    }
+    if adoption.checkpoint_id != locked.checkpoint.checkpoint_id
+        || adoption.producer_generation != locked.association.producer_generation
+        || adoption.run_generation != run.run_generation
+        || adoption.key.owner_user_id != run.user_id
+        || adoption.key.session_id != run.session_id
+    {
+        return Err("adoption event does not match locked execution custody".into());
+    }
+    let owner = run
+        .owner_pod_id
+        .as_deref()
+        .ok_or("adoption run has no execution owner")?;
+    let next_idx = run
+        .last_event_idx
+        .checked_add(1)
+        .ok_or("run event sequence exhausted")?;
+    let row = build_run_event_insert_row(
+        &run.user_id,
+        &run.run_id,
+        &run.session_id,
+        run.agent_id.as_deref(),
+        next_idx,
+        owner,
+        &adoption.event(),
+    )
+    .map_err(|error| error.to_string())?;
+    DatabaseRunStateStore::insert_run_event_rows_tx(
+        tx,
+        &run.run_id,
+        &[row],
+        "insert_execution_adoption_event",
+    )
+    .await?;
+    let changed = sqlx::query(
+        "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
+         WHERE user_id = ? AND run_id = ? AND owner_pod_id = ? AND run_generation = ?
+         AND last_event_idx = ? AND owner_lease_expires_at >= NOW(6)",
+    )
+    .bind(next_idx)
+    .bind(&run.user_id)
+    .bind(&run.run_id)
+    .bind(owner)
+    .bind(i64::try_from(run.run_generation).map_err(|error| error.to_string())?)
+    .bind(run.last_event_idx)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    if changed.rows_affected() != 1 {
+        return Err("execution authority changed before adoption commit".into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn lock_claimed_execution_handoff_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    claim: &RecoveryClaim,
+    owner_pod_id: &str,
+    checkpoint_id: &str,
+) -> Result<Option<ClaimedExecutionHandoff>, String> {
+    let Some(run) = load_run_metadata_for_exact_session_tx(
+        tx,
+        &claim.run.user_id,
+        &claim.run.session_id,
+        &claim.run.run_id,
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if run.status != STATUS_RUNNING
+        || run.waiting_for.is_some()
+        || claim.run.status != STATUS_RUNNING
+        || claim.run.waiting_for.is_some()
+        || owner_pod_id.is_empty()
+        || run.owner_pod_id.as_deref() != Some(owner_pod_id)
+        || lock_durable_lineage_cancellation_markers_tx(tx, &run)
+            .await?
+            .any()
+    {
+        return Ok(None);
+    }
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM agent_runs WHERE user_id = ? AND run_id = ?
+         AND owner_pod_id = ? AND run_generation = ? AND owner_lease_expires_at >= NOW(6) FOR UPDATE",
+    ).bind(&run.user_id).bind(&run.run_id).bind(owner_pod_id)
+        .bind(i64::try_from(claim.run.run_generation).map_err(|error| error.to_string())?)
+        .fetch_optional(&mut **tx).await.map_err(|error| error.to_string())?;
+    if live.is_none() {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+         checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+         FROM run_checkpoints WHERE user_id = ? AND session_id = ? AND run_id = ?
+         AND checkpoint_id = ? FOR UPDATE",
+    )
+    .bind(&run.user_id)
+    .bind(&run.session_id)
+    .bind(&run.run_id)
+    .bind(checkpoint_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(row) = row else { return Ok(None) };
+    let checkpoint =
+        decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+    ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
+        .fetch_optional(&mut **tx).await.map_err(|error| error.to_string())?;
+    let tail = payload
+        .map(|payload| serde_json::from_str::<serde_json::Value>(&payload))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let Some(association) =
+        execution_handoff_recovery_association(claim, &run, &checkpoint, tail.as_ref())?
+    else {
+        return Ok(None);
+    };
+    let prior_adoption = if recovery_frontier_matches(claim, &run) {
+        None
+    } else {
+        let Some(adoption) = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event) else {
+            return Ok(None);
+        };
+        if adoption.checkpoint_id != checkpoint.checkpoint_id
+            || adoption.producer_generation != association.producer_generation
+            || adoption.run_generation != run.run_generation
+            || adoption.key.owner_user_id != run.user_id
+            || adoption.key.session_id != run.session_id
+        {
+            return Ok(None);
+        }
+        Some(adoption)
+    };
+    Ok(Some(ClaimedExecutionHandoff {
+        run,
+        checkpoint,
+        association,
+        prior_adoption,
+    }))
+}
+
+async fn load_run_metadata_for_exact_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<DurableRunRecord>> {
+    match crate::storage::admit_session_scoped_run_write(
+        tx,
+        expected_session_id,
+        user_id,
+        run_id,
+        false,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) | Err(sqlx::Error::RowNotFound) => return Ok(None),
+        Err(source) => {
+            return Err(db_error("admit_session_scoped_run_write", run_id, source));
+        }
+    }
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(expected_session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
+    row.map(run_record_from_row).transpose()
+}
+
+/// Validate checkpoint custody before taking handoff/attachment locks.
+/// This proves a durable reference, never permission to execute its payload.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExecutionHandoffReferenceError {
+    #[error("{0}")]
+    Rejected(&'static str),
+    #[error("execution custody storage unavailable: {0}")]
+    Unavailable(String),
+}
+
+pub(crate) async fn lock_and_validate_execution_handoff_reference_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    checkpoint_id: &str,
+    producer_generation: u64,
+) -> Result<(), ExecutionHandoffReferenceError> {
+    let run = load_run_metadata_for_exact_session_tx(tx, user_id, session_id, run_id)
+        .await
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
+        .ok_or(ExecutionHandoffReferenceError::Rejected(
+            "handoff run does not belong to this session",
+        ))?;
+    if lock_durable_lineage_cancellation_markers_tx(tx, &run)
+        .await
+        .map_err(ExecutionHandoffReferenceError::Unavailable)?
+        .any()
+    {
+        return Err(ExecutionHandoffReferenceError::Rejected(
+            "cancelled execution cannot authorize checkpoint handoff",
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT checkpoint_json, checkpoint_kind, checkpoint_version FROM run_checkpoints
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND checkpoint_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(run_id)
+    .bind(checkpoint_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
+    .ok_or(ExecutionHandoffReferenceError::Rejected(
+        "checkpoint does not belong to this execution",
+    ))?;
+    let kind: String = row
+        .try_get("checkpoint_kind")
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    let version: String = row
+        .try_get("checkpoint_version")
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    let payload: String = row
+        .try_get("checkpoint_json")
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    let DurableExecutionHandoff::V1 {
+        producer_run_id,
+        producer_owner_generation,
+        ..
+    } = serde_json::from_str::<DurableExecutionHandoff<serde::de::IgnoredAny>>(&payload)
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    if kind != "execution_handoff"
+        || version != "execution_handoff_v1"
+        || producer_run_id != run_id
+        || producer_owner_generation != producer_generation
+    {
+        return Err(ExecutionHandoffReferenceError::Rejected(
+            "checkpoint producer does not match handoff reference",
+        ));
+    }
+    if run.run_generation == producer_generation {
+        return Ok(());
+    }
+    if run.status != STATUS_PAUSED || run.waiting_for.is_some() {
+        return Err(ExecutionHandoffReferenceError::Rejected(
+            "recovered checkpoint requires a quiescent execution",
+        ));
+    }
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+    ).bind(user_id).bind(run_id).bind(run.last_event_idx)
+        .fetch_optional(&mut **tx).await.map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    let event = payload
+        .map(|payload| serde_json::from_str::<serde_json::Value>(&payload))
+        .transpose()
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    let association = event
+        .as_ref()
+        .and_then(execution_handoff_recovery_from_event)
+        .ok_or(ExecutionHandoffReferenceError::Rejected(
+            "current execution tail has no recovery association",
+        ))?;
+    if association.checkpoint_id != checkpoint_id
+        || association.producer_generation != producer_generation
+        || association.recovered_generation != run.run_generation
+        || association.claimed_from_generation.checked_add(1) != Some(run.run_generation)
+    {
+        return Err(ExecutionHandoffReferenceError::Rejected(
+            "recovery association does not match handoff reference",
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_frontier_matches(claim: &RecoveryClaim, current: &DurableRunRecord) -> bool {
+    current.last_event_idx == claim.run.last_event_idx
+        && current.status == claim.run.status
+        && current.waiting_for == claim.run.waiting_for
+}
+
+fn execution_handoff_recovery_from_event(
+    event: &serde_json::Value,
+) -> Option<ExecutionHandoffRecovery> {
+    if event.get("event_type").and_then(serde_json::Value::as_str)
+        != Some("run_interrupted_after_restart")
+    {
+        return None;
+    }
+    let persisted: ExecutionHandoffRecovery = serde_json::from_value(
+        event
+            .get("data")?
+            .get("execution_handoff_recovery")?
+            .clone(),
+    )
+    .ok()?;
+    if event
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        != Some(persisted.idempotency_key().as_str())
+    {
+        return None;
+    }
+    Some(persisted)
+}
+
+fn replay_recovery_event(
+    association: &ExecutionHandoffRecovery,
+    current: &DurableRunRecord,
+    event: &serde_json::Value,
+) -> Option<RecoveryReconciliation> {
+    if current.status != STATUS_PAUSED
+        || current.waiting_for.is_some()
+        || execution_handoff_recovery_from_event(event).as_ref() != Some(association)
+    {
+        return None;
+    }
+    let mut run = current.clone();
+    run.events.clear();
+    Some(RecoveryReconciliation {
+        event_idx: run.last_event_idx,
+        run,
+        event: event.clone(),
+    })
+}
+
+/// Original trusted admission route, not permission to reconstruct execution.
+/// Offering and binding identities remain owned by the enclosing run-start event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum DurableAdmissionSource {
+    #[serde(rename = "1")]
+    V1 {
+        model_source: ModelAdmissionSource,
+        capability_source: RuntimeCapabilitySource,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAdmissionSource {
+    CatalogOffering,
+    ProviderAuthorizedRuntime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCapabilitySource {
+    ServerManaged,
+    RequestScoped,
+    AgentBindingRegistry,
+    /// An explicitly bound executor; credential lifetime is not implied.
+    BoundExecutor,
+}
+
+impl DurableRunRecord {
+    pub fn admission_source(&self) -> Result<Option<DurableAdmissionSource>, serde_json::Error> {
+        self.events
+            .iter()
+            .find(|event| event["event_type"] == "run_started")
+            .and_then(|event| event.get("data")?.get("admission_source"))
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+    }
+    /// Missing or unsupported restrictions never authorize reconstruction.
+    pub fn execution_restrictions(
+        &self,
+    ) -> Result<Option<DurableExecutionRestrictions>, serde_json::Error> {
+        self.events
+            .iter()
+            .find(|event| event["event_type"] == "run_started")
+            .and_then(|event| event.get("data")?.get("execution_restrictions"))
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+    }
 }
 
 /// Result of atomically claiming a caller-selected durable run identity.
@@ -2001,6 +2763,31 @@ pub struct DurableRunCheckpointRecord {
     pub idempotency_key: String,
     pub checkpoint_json: String,
     pub created_at: String,
+}
+
+/// Identity of the row committed by checkpoint persistence, without copying
+/// its potentially large execution payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunCheckpointReceipt {
+    pub checkpoint_id: String,
+    pub run_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub checkpoint_kind: String,
+    pub checkpoint_version: String,
+}
+
+impl From<&DurableRunCheckpointRecord> for RunCheckpointReceipt {
+    fn from(record: &DurableRunCheckpointRecord) -> Self {
+        Self {
+            checkpoint_id: record.checkpoint_id.clone(),
+            run_id: record.run_id.clone(),
+            user_id: record.user_id.clone(),
+            session_id: record.session_id.clone(),
+            checkpoint_kind: record.checkpoint_kind.clone(),
+            checkpoint_version: record.checkpoint_version.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3311,6 +4098,35 @@ pub struct RunStatusCasRequest<'a> {
     pub error_message: Option<&'a str>,
 }
 
+/// Explicit authority for a checkpoint write; no implicit owner fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointWriteAuthority {
+    ControlPlane,
+    ExecutionOwner { expected_owner_generation: u64 },
+}
+
+/// A producer's exact execution snapshot, not a grant to resume execution.
+/// The runtime owns validation of `T`; storage owns producer identity and fencing.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum DurableExecutionHandoff<T> {
+    #[serde(rename = "execution_handoff_v1")]
+    V1 {
+        producer_run_id: String,
+        producer_owner_generation: u64,
+        heavy: T,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RunCheckpointWriteRequest<'a> {
+    pub user_id: &'a str,
+    pub expected_session_id: &'a str,
+    pub run_id: &'a str,
+    pub checkpoint_json: &'a str,
+    pub authority: CheckpointWriteAuthority,
+}
+
 /// One generation-fenced semantic usage aggregate update.
 #[derive(Clone, Copy, Debug)]
 pub struct RunUsageOwnerUpdateRequest<'a> {
@@ -3999,14 +4815,17 @@ pub trait RunStateStore: Send + Sync {
         request: RunUsageOwnerUpdateRequest<'_>,
     ) -> Result<bool, String>;
 
+    /// Associate the exact checkpoint with a recovery claim in the status/event transaction.
+    async fn reconcile_execution_handoff(
+        &self,
+        claim: &RecoveryClaim,
+    ) -> Result<Option<RecoveryReconciliation>, String>;
+
     /// Save checkpoint JSON for crash recovery.
     async fn save_checkpoint(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String>;
+        request: RunCheckpointWriteRequest<'_>,
+    ) -> Result<Option<RunCheckpointReceipt>, String>;
 
     /// Load the newest checkpoint for a run, optionally filtered by kind.
     async fn load_latest_checkpoint(
@@ -4252,43 +5071,21 @@ pub trait RunStateStore: Send + Sync {
     /// Atomically claim a bounded batch of active runs for restart recovery.
     ///
     /// This includes waiting, running, and blocking paused runs
-    /// that need recovery classification. Shared durable stores must override
-    /// this operation so concurrent pods claim disjoint work and never return
-    /// rows protected by another live owner's lease. The fallback is intended
-    /// for process-local deterministic stores.
-    async fn claim_recoverable_active_runs(
-        &self,
-        limit: u32,
-    ) -> Result<Vec<DurableRunRecord>, String> {
-        let limit = limit.clamp(1, MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE) as usize;
-        let mut active = self.find_waiting_runs().await?;
-        active.extend(self.find_running_runs().await?);
-        active.extend(self.find_blocking_paused_runs().await?);
-        active.retain(|run| {
-            matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
-                || (run.status == STATUS_PAUSED && run.waiting_for.is_some())
-        });
-        active.sort_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
-                .then_with(|| left.user_id.cmp(&right.user_id))
-                .then_with(|| left.run_id.cmp(&right.run_id))
-        });
-        active.truncate(limit);
-        Ok(active)
-    }
+    /// that need recovery classification. Implementations must atomically
+    /// advance ownership and return the actual previous generation; discovery
+    /// alone is not a claim. Shared stores must respect other live owners.
+    async fn claim_recoverable_active_runs(&self, limit: u32)
+    -> Result<Vec<RecoveryClaim>, String>;
 
     /// Claim only active runs whose durable owner lease no longer protects
     /// them. Periodic recovery must use this stricter boundary: a store using
     /// the same pod id as a live executor is not proof that the executor died.
-    /// Process-local stores have no shared lease authority, so their fallback
-    /// is identical to startup recovery.
+    /// Each store must implement this boundary explicitly; it must not silently
+    /// inherit the wider startup policy.
     async fn claim_expired_recoverable_active_runs(
         &self,
         limit: u32,
-    ) -> Result<Vec<DurableRunRecord>, String> {
-        self.claim_recoverable_active_runs(limit).await
-    }
+    ) -> Result<Vec<RecoveryClaim>, String>;
 
     /// Return the interval at which the runtime should renew this store
     /// owner's active run leases. Stores without shared lease state can return
@@ -4394,6 +5191,165 @@ type RunActionFenceMap =
     std::collections::HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
 
 impl InMemoryRunStateStore {
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_run_status(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        expected_owner_generation: Option<u64>,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        recovery_claim: Option<&RecoveryClaim>,
+    ) -> Result<StatusTransitionCommit, String> {
+        if expected_statuses.is_empty() {
+            return Ok(StatusTransitionCommit::default());
+        }
+        let terminal_origin = cancelled_terminal_origin(status, events)?;
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
+        let updated = {
+            let action_fence = self.action_fence_for(user_id, run_id);
+            let _action_fence = action_fence.lock_owned().await;
+            let cancellation_requests = self.cancellation_requests.read().await;
+            let mut slots = self.execution_slots.write().await;
+            let mut runs = self.runs.write().await;
+            let lineage_markers = in_memory_lineage_cancellation_markers(
+                &runs,
+                &cancellation_requests,
+                user_id,
+                run_id,
+            )?;
+            let recovery_event = if let Some(claim) = recovery_claim {
+                let Some(current) = runs.get(run_id) else {
+                    return Ok(StatusTransitionCommit::default());
+                };
+                if current.owner_pod_id.as_deref() != self.execution_owner_pod_id()
+                    || !in_memory_action_owner_lease_is_active(current)?
+                    || !cancellation_markers_admit_transition(terminal_origin, lineage_markers)
+                {
+                    return Ok(StatusTransitionCommit::default());
+                }
+                let checkpoints = self.checkpoints.read().await;
+                let Some(identity) = execution_handoff_checkpoint_identity(current)? else {
+                    return Ok(StatusTransitionCommit::default());
+                };
+                let Some(checkpoint) = checkpoints
+                    .get(run_id)
+                    .and_then(|rows| rows.iter().find(|row| row.idempotency_key == identity))
+                else {
+                    return Ok(StatusTransitionCommit::default());
+                };
+                let Some(association) = execution_handoff_recovery_association(
+                    claim,
+                    current,
+                    checkpoint,
+                    current.events.last(),
+                )?
+                else {
+                    return Ok(StatusTransitionCommit::default());
+                };
+                if !recovery_frontier_matches(claim, current) {
+                    let recovery = current
+                        .events
+                        .last()
+                        .and_then(|event| replay_recovery_event(&association, current, event));
+                    return Ok(StatusTransitionCommit {
+                        applied: recovery.is_some(),
+                        recovery,
+                    });
+                }
+                Some(association.event(&current.status))
+            } else {
+                None
+            };
+            let events = recovery_event
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(events);
+            let admitted_session_id = runs
+                .get(run_id)
+                .filter(|run| {
+                    run.user_id == user_id
+                        && run.session_id == expected_session_id
+                        && expected_statuses.contains(&run.status.as_str())
+                        && expected_owner_generation
+                            .is_none_or(|generation| run.run_generation == generation)
+                        && cancellation_markers_admit_transition(terminal_origin, lineage_markers)
+                })
+                .map(|run| run.session_id.clone());
+            if let Some(session_id) = admitted_session_id.as_deref() {
+                reconcile_in_memory_execution_slot_for_session(
+                    &mut slots,
+                    &runs,
+                    user_id,
+                    session_id,
+                    durable_run_status_blocks_session(status, waiting_for),
+                )?;
+            }
+            if admitted_session_id.is_some() {
+                if let Some(run) = runs.get_mut(run_id) {
+                    let mut terminal_returns = terminal_user_intent_return_events(
+                        &run.events,
+                        transition_releases_user_intent_ownership(status, events),
+                    );
+                    terminal_returns.extend_from_slice(events);
+                    let new_events = new_idempotent_events(&run.events, &terminal_returns);
+                    if !events.is_empty()
+                        && new_events.is_empty()
+                        && !in_memory_transition_changes_state(
+                            run,
+                            status,
+                            waiting_for,
+                            error_message,
+                        )
+                    {
+                        return Ok(StatusTransitionCommit::default());
+                    }
+                    let latest_event_type = new_events.last().map(extract_event_type);
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
+                    if !new_events.is_empty() {
+                        run.events.extend(new_events);
+                        run.last_event_idx = run.events.len() as i64 - 1;
+                    }
+                    Some((run.clone(), latest_event_type, recovery_event))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((run, latest_event_type, recovery_event)) = updated {
+            self.sync_projection(&run, latest_event_type, None).await;
+            let recovery = recovery_event.map(|event| {
+                let mut metadata = run;
+                metadata.events.clear();
+                RecoveryReconciliation {
+                    event_idx: metadata.last_event_idx,
+                    run: metadata,
+                    event,
+                }
+            });
+            Ok(StatusTransitionCommit {
+                applied: true,
+                recovery,
+            })
+        } else {
+            Ok(StatusTransitionCommit::default())
+        }
+    }
+
     /// Maximum number of runs kept in memory. When exceeded, the oldest
     /// completed/failed runs are evicted on insert.
     pub const MAX_RUNS: usize = 10_000;
@@ -5406,7 +6362,28 @@ fn checkpoint_metadata(
     let object = value
         .as_object()
         .ok_or_else(|| "checkpoint payload must be a JSON object".to_string())?;
+    if object.get("version").and_then(serde_json::Value::as_str) == Some("execution_handoff_v1") {
+        let DurableExecutionHandoff::V1 {
+            producer_run_id,
+            producer_owner_generation,
+            ..
+        } = serde_json::from_value::<DurableExecutionHandoff<serde_json::Value>>(value)
+            .map_err(|error| error.to_string())?;
+        if producer_run_id != run_id {
+            return Err("execution handoff producer does not match run".to_string());
+        }
+        return Ok((
+            "execution_handoff".to_string(),
+            "execution_handoff_v1".to_string(),
+            format!("checkpoint:{run_id}:execution_handoff:{producer_owner_generation}"),
+        ));
+    }
     let checkpoint_kind = if object.contains_key("phase") {
+        if let Some(version) = object.get("version")
+            && version.as_str() != Some("phase_checkpoint_v1")
+        {
+            return Err("phase checkpoint version must be phase_checkpoint_v1".to_string());
+        }
         "phase".to_string()
     } else {
         validate_checkpoint_payload(object)?;
@@ -5434,6 +6411,58 @@ fn checkpoint_metadata(
             format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
         });
     Ok((checkpoint_kind, checkpoint_version, idempotency_key))
+}
+
+fn checkpoint_write_is_authorized(
+    authority: CheckpointWriteAuthority,
+    checkpoint_kind: &str,
+    checkpoint_json: &str,
+    current_version: Option<&str>,
+    current_json: Option<&str>,
+    previous_identity_json: Option<&str>,
+) -> Result<bool, String> {
+    if checkpoint_kind != "execution_handoff" {
+        return Ok(current_version != Some("execution_handoff_v1"));
+    }
+    let CheckpointWriteAuthority::ExecutionOwner {
+        expected_owner_generation,
+    } = authority
+    else {
+        return Ok(false);
+    };
+    let incoming: DurableExecutionHandoff<serde_json::Value> =
+        serde_json::from_str(checkpoint_json).map_err(|error| error.to_string())?;
+    let DurableExecutionHandoff::V1 {
+        producer_owner_generation,
+        ..
+    } = &incoming;
+    if *producer_owner_generation != expected_owner_generation {
+        return Ok(false);
+    }
+    if current_version == Some("execution_handoff_v1") {
+        let current: DurableExecutionHandoff<serde_json::Value> = serde_json::from_str(
+            current_json
+                .ok_or_else(|| "current execution handoff payload is missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let DurableExecutionHandoff::V1 {
+            producer_owner_generation: current_generation,
+            ..
+        } = &current;
+        if current_generation > producer_owner_generation
+            || (current_generation == producer_owner_generation && current != incoming)
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(previous) = previous_identity_json {
+        let previous: DurableExecutionHandoff<serde_json::Value> =
+            serde_json::from_str(previous).map_err(|error| error.to_string())?;
+        if previous != incoming {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_checkpoint_payload(
@@ -5615,6 +6644,26 @@ fn event_metadata_projection_patch_hash(
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
+    async fn reconcile_execution_handoff(
+        &self,
+        claim: &RecoveryClaim,
+    ) -> Result<Option<RecoveryReconciliation>, String> {
+        self.transition_run_status(
+            &claim.run.user_id,
+            &claim.run.session_id,
+            &claim.run.run_id,
+            &[claim.run.status.as_str()],
+            Some(claim.run.run_generation),
+            STATUS_PAUSED,
+            None,
+            None,
+            &[],
+            Some(claim),
+        )
+        .await
+        .map(|commit| commit.recovery)
+    }
+
     fn execution_owner_pod_id(&self) -> Option<&str> {
         self.execution_owner_pod_id.as_deref()
     }
@@ -7167,90 +8216,20 @@ impl RunStateStore for InMemoryRunStateStore {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<bool, String> {
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        let terminal_origin = cancelled_terminal_origin(status, events)?;
-        let terminal_error_code =
-            terminal_error_code_from_transition(status, error_message, events);
-        let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
-            let mut runs = self.runs.write().await;
-            let lineage_markers = in_memory_lineage_cancellation_markers(
-                &runs,
-                &cancellation_requests,
-                user_id,
-                run_id,
-            )?;
-            let admitted_session_id = runs
-                .get(run_id)
-                .filter(|run| {
-                    run.user_id == user_id
-                        && run.session_id == expected_session_id
-                        && expected_statuses.contains(&run.status.as_str())
-                        && expected_owner_generation
-                            .is_none_or(|generation| run.run_generation == generation)
-                        && cancellation_markers_admit_transition(terminal_origin, lineage_markers)
-                })
-                .map(|run| run.session_id.clone());
-            if let Some(session_id) = admitted_session_id.as_deref() {
-                reconcile_in_memory_execution_slot_for_session(
-                    &mut slots,
-                    &runs,
-                    user_id,
-                    session_id,
-                    durable_run_status_blocks_session(status, waiting_for),
-                )?;
-            }
-            if admitted_session_id.is_some() {
-                if let Some(run) = runs.get_mut(run_id) {
-                    let mut terminal_returns = terminal_user_intent_return_events(
-                        &run.events,
-                        transition_releases_user_intent_ownership(status, events),
-                    );
-                    terminal_returns.extend_from_slice(events);
-                    let new_events = new_idempotent_events(&run.events, &terminal_returns);
-                    if !events.is_empty()
-                        && new_events.is_empty()
-                        && !in_memory_transition_changes_state(
-                            run,
-                            status,
-                            waiting_for,
-                            error_message,
-                        )
-                    {
-                        return Ok(false);
-                    }
-                    let latest_event_type = new_events.last().map(extract_event_type);
-                    apply_in_memory_status_transition(
-                        &mut slots,
-                        run,
-                        status,
-                        waiting_for,
-                        error_message,
-                        terminal_error_code.as_deref(),
-                    )?;
-                    if !new_events.is_empty() {
-                        run.events.extend(new_events);
-                        run.last_event_idx = run.events.len() as i64 - 1;
-                    }
-                    Some((run.clone(), latest_event_type))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some((run, latest_event_type)) = updated {
-            self.sync_projection(&run, latest_event_type, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.transition_run_status(
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_statuses,
+            expected_owner_generation,
+            status,
+            waiting_for,
+            error_message,
+            events,
+            None,
+        )
+        .await
+        .map(|commit| commit.applied)
     }
 
     async fn update_run_usage(
@@ -7476,31 +8455,80 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn save_checkpoint(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String> {
+        request: RunCheckpointWriteRequest<'_>,
+    ) -> Result<Option<RunCheckpointReceipt>, String> {
+        let RunCheckpointWriteRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            checkpoint_json,
+            authority,
+        } = request;
+        let action_fence = self.action_fence_for(user_id, run_id);
+        let action_guard = action_fence.lock_owned().await;
+        let cancellation_requests = self.cancellation_requests.read().await;
+        let mut runs = self.runs.write().await;
+        let cancelled = match authority {
+            CheckpointWriteAuthority::ControlPlane => false,
+            CheckpointWriteAuthority::ExecutionOwner { .. } => {
+                let markers = in_memory_lineage_cancellation_markers(
+                    &runs,
+                    &cancellation_requests,
+                    user_id,
+                    run_id,
+                )?;
+                markers.direct || markers.ancestor
+            }
+        };
+        let mut checkpoints = self.checkpoints.write().await;
         let (run, checkpoint) = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            let mut runs = self.runs.write().await;
             let Some(run) = runs.get_mut(run_id) else {
-                return Ok(false);
+                return Ok(None);
             };
             if run.user_id != user_id || run.session_id != expected_session_id {
-                return Ok(false);
+                return Ok(None);
             }
             if durable_run_status_is_terminal(&run.status) {
-                return Ok(false);
+                return Ok(None);
+            }
+            if let CheckpointWriteAuthority::ExecutionOwner {
+                expected_owner_generation,
+            } = authority
+                && (run.run_generation != expected_owner_generation
+                    || run.owner_pod_id.as_deref() != self.execution_owner_pod_id()
+                    || run.status != STATUS_RUNNING
+                    || cancelled
+                    || !in_memory_action_owner_lease_is_active(run)?)
+            {
+                return Ok(None);
             }
             let (checkpoint_kind, checkpoint_version, idempotency_key) =
                 checkpoint_metadata(run_id, checkpoint_json)?;
+            let previous = checkpoints.get(run_id).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.idempotency_key == idempotency_key)
+            });
+            if !checkpoint_write_is_authorized(
+                authority,
+                &checkpoint_kind,
+                checkpoint_json,
+                run.checkpoint_version.as_deref(),
+                run.checkpoint_json.as_deref(),
+                previous.map(|entry| entry.checkpoint_json.as_str()),
+            )? {
+                return Ok(None);
+            }
+            if checkpoint_kind == "execution_handoff" && previous.is_some() {
+                return Ok(previous.map(RunCheckpointReceipt::from));
+            }
             run.checkpoint_json = Some(checkpoint_json.to_string());
             run.checkpoint_version = Some(checkpoint_version.clone());
             run.updated_at = chrono::Utc::now().to_rfc3339();
             let checkpoint = DurableRunCheckpointRecord {
-                checkpoint_id: uuid::Uuid::now_v7().to_string(),
+                checkpoint_id: previous
+                    .map(|entry| entry.checkpoint_id.clone())
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
                 run_id: run.run_id.clone(),
                 user_id: run.user_id.clone(),
                 session_id: run.session_id.clone(),
@@ -7509,23 +8537,29 @@ impl RunStateStore for InMemoryRunStateStore {
                 checkpoint_version,
                 idempotency_key,
                 checkpoint_json: checkpoint_json.to_string(),
-                created_at: chrono::Utc::now().to_rfc3339(),
+                created_at: previous
+                    .map(|entry| entry.created_at.clone())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
             };
             (run.clone(), checkpoint)
         };
-        let mut checkpoints = self.checkpoints.write().await;
         let entries = checkpoints.entry(run_id.to_string()).or_default();
         if let Some(existing) = entries
             .iter_mut()
             .find(|entry| entry.idempotency_key == checkpoint.idempotency_key)
         {
-            *existing = checkpoint.clone();
+            if checkpoint.checkpoint_kind != "execution_handoff" {
+                *existing = checkpoint.clone();
+            }
         } else {
             entries.push(checkpoint.clone());
         }
         drop(checkpoints);
+        drop(runs);
+        drop(cancellation_requests);
+        drop(action_guard);
         self.sync_projection(&run, None, Some(&checkpoint)).await;
-        Ok(true)
+        Ok(Some(RunCheckpointReceipt::from(&checkpoint)))
     }
 
     async fn load_latest_checkpoint(
@@ -8316,7 +9350,7 @@ impl RunStateStore for InMemoryRunStateStore {
     async fn claim_recoverable_active_runs(
         &self,
         limit: u32,
-    ) -> Result<Vec<DurableRunRecord>, String> {
+    ) -> Result<Vec<RecoveryClaim>, String> {
         let limit = limit.clamp(1, MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE) as usize;
         let mut candidates = {
             let runs = self.runs.read().await;
@@ -8330,6 +9364,7 @@ impl RunStateStore for InMemoryRunStateStore {
                         run.updated_at.clone(),
                         run.user_id.clone(),
                         run.run_id.clone(),
+                        run.run_generation,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -8342,7 +9377,7 @@ impl RunStateStore for InMemoryRunStateStore {
         // sweepers from creating a lock cycle.
         let mut fence_keys = candidates
             .iter()
-            .map(|(_, user_id, run_id)| (user_id.clone(), run_id.clone()))
+            .map(|(_, user_id, run_id, _)| (user_id.clone(), run_id.clone()))
             .collect::<Vec<_>>();
         fence_keys.sort();
         let mut fence_guards = Vec::with_capacity(fence_keys.len());
@@ -8351,19 +9386,68 @@ impl RunStateStore for InMemoryRunStateStore {
         }
 
         let mut runs = self.runs.write().await;
+        candidates.retain(|(_, user_id, run_id, generation)| {
+            runs.get(run_id).is_some_and(|run| {
+                run.user_id == *user_id
+                    && run.run_generation == *generation
+                    && (matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
+                        || (run.status == STATUS_PAUSED && run.waiting_for.is_some()))
+            })
+        });
+        // Preflight the entire locked batch before changing any run. Returning
+        // an error after advancing part of it would lose successful receipts.
+        for (_, _, _, generation) in &candidates {
+            generation
+                .checked_add(1)
+                .ok_or_else(|| "run recovery generation exhausted".to_string())?;
+        }
+        let checkpoints = self.checkpoints.read().await;
+        let mut claim_events = std::collections::HashMap::new();
+        for (_, _, run_id, _) in &candidates {
+            let run = &runs[run_id];
+            if let Some(identity) = execution_handoff_checkpoint_identity(run)?
+                && let Some(checkpoint) = checkpoints
+                    .get(run_id)
+                    .and_then(|rows| rows.iter().find(|row| row.idempotency_key == identity))
+                && let Some(event) =
+                    execution_handoff_claim_event(run, checkpoint, run.events.last(), None)?
+            {
+                run.last_event_idx
+                    .checked_add(1)
+                    .ok_or_else(|| "run recovery event sequence exhausted".to_string())?;
+                claim_events.insert(run_id.clone(), event);
+            }
+        }
         let mut claimed = Vec::with_capacity(candidates.len());
-        for (_, user_id, run_id) in candidates {
+        for (_, user_id, run_id, generation) in candidates {
             if let Some(run) = runs.get_mut(&run_id)
                 && run.user_id == user_id
+                && run.run_generation == generation
                 && (matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
                     || (run.status == STATUS_PAUSED && run.waiting_for.is_some()))
             {
-                run.run_generation = run.run_generation.saturating_add(1);
+                run.run_generation = generation + 1;
+                if let Some(event) = claim_events.remove(&run_id) {
+                    run.events.push(event);
+                    run.last_event_idx += 1;
+                }
                 run.updated_at = chrono::Utc::now().to_rfc3339();
-                claimed.push(run.clone());
+                claimed.push(RecoveryClaim {
+                    run: run.clone(),
+                    claimed_from_generation: generation,
+                });
             }
         }
         Ok(claimed)
+    }
+
+    async fn claim_expired_recoverable_active_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RecoveryClaim>, String> {
+        // The process-local store has no independent crash detector. Its
+        // explicit recovery caller owns the same generation-fenced transition.
+        self.claim_recoverable_active_runs(limit).await
     }
 
     async fn authorize_execution_boundary(
@@ -8828,6 +9912,309 @@ const RUN_STATUS_ACCOUNTING_SELECT_SQL: &str = "SELECT payload_json FROM agent_r
      ORDER BY event_idx DESC LIMIT 1";
 
 impl DatabaseRunStateStore {
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_run_status(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        expected_owner_generation: Option<u64>,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        recovery_claim: Option<&RecoveryClaim>,
+    ) -> Result<StatusTransitionCommit, String> {
+        if expected_statuses.is_empty() {
+            return Ok(StatusTransitionCommit::default());
+        }
+        let terminal_origin = cancelled_terminal_origin(status, events)?;
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
+
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error("transition_run_status_with_events_begin", run_id, source).to_string()
+        })?;
+
+        let Some(run) = self
+            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_missing",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(StatusTransitionCommit::default());
+        };
+        if expected_statuses.contains(&run.status.as_str())
+            && let Err(error) = ensure_terminal_status_immutable(&run, status)
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
+        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
+        if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_cancellation_authority",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(StatusTransitionCommit::default());
+        }
+        let recovery_event = if let Some(claim) = recovery_claim {
+            if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+                return Ok(StatusTransitionCommit::default());
+            }
+            let Some(identity) = execution_handoff_checkpoint_identity(&run)? else {
+                return Ok(StatusTransitionCommit::default());
+            };
+            let row = sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+                 checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints WHERE user_id = ? AND run_id = ?
+                 AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .bind(identity)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+            let Some(row) = row else {
+                return Ok(StatusTransitionCommit::default());
+            };
+            let checkpoint =
+                decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
+            let payload: Option<String> = sqlx::query_scalar(
+                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+            ).bind(user_id).bind(run_id).bind(run.last_event_idx)
+                .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
+            let event = payload
+                .map(|payload| serde_json::from_str::<serde_json::Value>(&payload))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let Some(association) =
+                execution_handoff_recovery_association(claim, &run, &checkpoint, event.as_ref())?
+            else {
+                return Ok(StatusTransitionCommit::default());
+            };
+            if !recovery_frontier_matches(claim, &run) {
+                let live: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM agent_runs WHERE user_id = ? AND run_id = ?
+                     AND owner_pod_id = ? AND run_generation = ?
+                     AND owner_lease_expires_at >= NOW(6) FOR UPDATE",
+                )
+                .bind(user_id)
+                .bind(run_id)
+                .bind(&self.owner_pod_id)
+                .bind(i64::try_from(claim.run.run_generation).map_err(|error| error.to_string())?)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| error.to_string())?;
+                if live.is_none() {
+                    return Ok(StatusTransitionCommit::default());
+                }
+                let recovery = event
+                    .as_ref()
+                    .and_then(|event| replay_recovery_event(&association, &run, event));
+                tx.commit().await.map_err(|error| error.to_string())?;
+                return Ok(StatusTransitionCommit {
+                    applied: recovery.is_some(),
+                    recovery,
+                });
+            }
+            Some(association.event(&run.status))
+        } else {
+            None
+        };
+        let events = recovery_event
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(events);
+        let agent_id = run.agent_id.clone();
+        let last_event_idx = run.last_event_idx;
+
+        let mut events_to_commit = self
+            .terminal_interaction_closure_events_tx(&mut tx, &run, status)
+            .await
+            .map_err(|error| error.to_string())?;
+        events_to_commit.extend(
+            self.terminal_user_intent_return_events_tx(
+                &mut tx,
+                user_id,
+                run_id,
+                transition_releases_user_intent_ownership(status, events),
+                "transition_run_status_with_events_load_intent_dispositions",
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        );
+        events_to_commit.extend_from_slice(events);
+
+        let mut event_rows = Vec::with_capacity(events_to_commit.len());
+        for (offset, event) in events_to_commit.iter().enumerate() {
+            match build_run_event_insert_row(
+                user_id,
+                run_id,
+                expected_session_id,
+                agent_id.as_deref(),
+                last_event_idx + 1 + offset as i64,
+                &self.owner_pod_id,
+                event,
+            ) {
+                Ok(row) => event_rows.push(row),
+                Err(error) => {
+                    tx.rollback().await.map_err(|source| {
+                        db_error(
+                            "transition_run_status_with_events_rollback_prepare_event",
+                            run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?;
+                    return Err(error.to_string());
+                }
+            }
+        }
+
+        let next_last_event_idx = last_event_idx + events_to_commit.len() as i64;
+        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        update.push_bind(status);
+        update.push(", waiting_for = ");
+        update.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            update.push(", error_message = ");
+            update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
+        }
+        update.push(", last_event_idx = ");
+        update.push_bind(next_last_event_idx);
+        update.push(", updated_at = NOW(6) WHERE user_id = ");
+        update.push_bind(user_id);
+        update.push(" AND session_id = ");
+        update.push_bind(expected_session_id);
+        update.push(" AND run_id = ");
+        update.push_bind(run_id);
+        update.push(" AND last_event_idx = ");
+        update.push_bind(last_event_idx);
+        if let Some(expected_owner_generation) = expected_owner_generation {
+            update.push(" AND owner_pod_id = ");
+            update.push_bind(&self.owner_pod_id);
+            update.push(" AND run_generation = ");
+            update.push_bind(expected_owner_generation as i64);
+            update.push(" AND owner_lease_expires_at >= NOW(6)");
+        }
+        update.push(" AND status IN (");
+        let mut separated = update.separated(", ");
+        for expected in expected_statuses {
+            separated.push_bind(*expected);
+        }
+        separated.push_unseparated(")");
+        if terminal_origin != Some(DurableCancellationOrigin::User) {
+            update.push(" AND cancellation_requested_at IS NULL");
+        }
+
+        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
+            db_error("transition_run_status_with_events_update", run_id, source).to_string()
+        })?;
+        if update_result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(StatusTransitionCommit::default());
+        }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_slot_blocked",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(StatusTransitionCommit::default());
+        }
+        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
+
+        if !event_rows.is_empty() {
+            let insert_result = Self::insert_run_event_rows_tx(
+                &mut tx,
+                run_id,
+                &event_rows,
+                "transition_run_status_with_events_insert_events",
+            )
+            .await;
+            if let Err(mut detail) = insert_result {
+                let rollback_error = tx.rollback().await.err();
+                if let Some(rollback_error) = rollback_error {
+                    detail.push_str(&format!(
+                        "; rollback after insert failure also failed: {rollback_error}"
+                    ));
+                }
+                return Err(detail);
+            }
+        }
+
+        let recovery = if let Some(event) = recovery_event {
+            let metadata = self
+                .load_run_metadata_for_exact_session_tx(
+                    &mut tx,
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "recovery metadata disappeared inside its transaction".to_owned())?;
+            Some(RecoveryReconciliation {
+                event_idx: metadata.last_event_idx,
+                run: metadata,
+                event,
+            })
+        } else {
+            None
+        };
+        tx.commit().await.map_err(|source| {
+            db_error("transition_run_status_with_events_commit", run_id, source).to_string()
+        })?;
+
+        self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
+            .await;
+        Ok(StatusTransitionCommit {
+            applied: true,
+            recovery,
+        })
+    }
+
     pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(45);
     pub const DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER: Duration = Duration::from_secs(120);
 
@@ -9676,12 +11063,15 @@ impl DatabaseRunStateStore {
         i64::try_from(self.lease_ttl.as_micros()).unwrap_or(i64::MAX)
     }
 
-    async fn lease_expires_at_from_database(&self) -> Result<chrono::NaiveDateTime, String> {
+    async fn lease_expires_at_from_database(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    ) -> Result<chrono::NaiveDateTime, String> {
         sqlx::query_scalar::<_, chrono::NaiveDateTime>(
             "SELECT CAST(DATE_ADD(NOW(6), INTERVAL ? MICROSECOND) AS DATETIME)",
         )
         .bind(self.lease_ttl_micros())
-        .fetch_one(self.pool.get())
+        .fetch_one(&mut **tx)
         .await
         .map_err(|source| db_error("load_database_lease_deadline", "active", source).to_string())
     }
@@ -10297,33 +11687,7 @@ impl DatabaseRunStateStore {
         expected_session_id: &str,
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunRecord>> {
-        match crate::storage::admit_session_scoped_run_write(
-            tx,
-            expected_session_id,
-            user_id,
-            run_id,
-            false,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) | Err(sqlx::Error::RowNotFound) => return Ok(None),
-            Err(source) => {
-                return Err(db_error("admit_session_scoped_run_write", run_id, source));
-            }
-        }
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
-        );
-        let row = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(expected_session_id)
-            .bind(run_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
-        row.map(run_record_from_row).transpose()
+        load_run_metadata_for_exact_session_tx(tx, user_id, expected_session_id, run_id).await
     }
 
     async fn load_run_projection_metadata_for_user(
@@ -11571,8 +12935,11 @@ impl DatabaseRunStateStore {
         &self,
         limit: u32,
         include_current_owner: bool,
-    ) -> Result<Vec<DurableRunRecord>, String> {
+    ) -> Result<Vec<RecoveryClaim>, String> {
         let limit = limit.clamp(1, MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE);
+        // A collision retry may discover other work, but must not take over
+        // a candidate just claimed by a concurrent same-pod invocation.
+        let mut scanned = std::collections::BTreeSet::new();
         for _ in 0..RUN_RECOVERY_CLAIM_COLLISION_RETRIES {
             let mut candidates = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
                 "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
@@ -11610,12 +12977,17 @@ impl DatabaseRunStateStore {
                     .push_bind(self.lease_ttl_micros())
                     .push(" MICROSECOND)");
             }
+            candidates.push(" )");
+            for (user_id, run_id) in &scanned {
+                candidates
+                    .push(" AND NOT (user_id = ")
+                    .push_bind(user_id)
+                    .push(" AND run_id = ")
+                    .push_bind(run_id)
+                    .push(")");
+            }
             candidates
-                .push(
-                    " )
-                     ORDER BY updated_at ASC, user_id ASC, run_id ASC
-                     LIMIT ",
-                )
+                .push(" ORDER BY updated_at ASC, user_id ASC, run_id ASC LIMIT ")
                 .push_bind(i64::from(limit));
             let candidates = candidates
                 .build()
@@ -11631,111 +13003,310 @@ impl DatabaseRunStateStore {
             if candidates.is_empty() {
                 return Ok(Vec::new());
             }
-
-            // Use the database clock for the lease fact. The exact returned
-            // timestamp is also a per-claim receipt so concurrent claimers
-            // sharing one pod id cannot both load the same claimed rows.
-            let claim_expires_at = self.lease_expires_at_from_database().await?;
-            let mut claim = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "UPDATE agent_runs
-                 SET owner_pod_id = ",
+            scanned.extend(
+                candidates
+                    .iter()
+                    .map(|run| (run.user_id.clone(), run.run_id.clone())),
             );
-            claim.push_bind(&self.owner_pod_id);
-            claim.push(", owner_lease_expires_at = ");
-            claim.push_bind(claim_expires_at);
-            claim.push(
-                ", run_generation = run_generation + 1, updated_at = NOW(6)
-                 WHERE (status IN (",
-            );
-            claim.push_bind(STATUS_WAITING);
-            claim.push(", ");
-            claim.push_bind(STATUS_RUNNING);
-            claim.push(") OR (status = ");
-            claim.push_bind(STATUS_PAUSED);
-            claim.push(
-                " AND waiting_for IS NOT NULL))
-                   AND (
-                       owner_pod_id IS NULL",
-            );
-            if include_current_owner {
-                claim
-                    .push(" OR owner_pod_id = ")
-                    .push_bind(&self.owner_pod_id);
-            }
-            claim.push(" OR owner_lease_expires_at IS NULL");
-            if include_current_owner {
-                claim.push(" OR owner_lease_expires_at < NOW(6)");
-            } else {
-                claim
-                    .push(" OR owner_lease_expires_at < DATE_SUB(NOW(6), INTERVAL ")
-                    .push_bind(self.lease_ttl_micros())
-                    .push(" MICROSECOND)");
-            }
-            claim.push(" ) AND (");
-            for (index, candidate) in candidates.iter().enumerate() {
-                if index > 0 {
-                    claim.push(" OR ");
-                }
-                claim.push("(user_id = ");
-                claim.push_bind(&candidate.user_id);
-                claim.push(" AND run_id = ");
-                claim.push_bind(&candidate.run_id);
-                claim.push(" AND run_generation = ");
-                claim.push_bind(candidate.run_generation as i64);
-                claim.push(")");
-            }
-            claim.push(")");
-            let claimed_count = claim
-                .build()
-                .execute(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("claim_recoverable_active_runs", "active", source).to_string()
-                })?
-                .rows_affected();
-            if claimed_count == 0 {
-                tokio::task::yield_now().await;
-                continue;
-            }
-
-            let mut claimed = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
-            claimed.push(AGENT_RUN_COLUMNS);
-            claimed.push(" FROM agent_runs WHERE owner_pod_id = ");
-            claimed.push_bind(&self.owner_pod_id);
-            claimed.push(" AND owner_lease_expires_at = ");
-            claimed.push_bind(claim_expires_at);
-            claimed.push(" AND (");
-            for (index, candidate) in candidates.iter().enumerate() {
-                if index > 0 {
-                    claimed.push(" OR ");
-                }
-                claimed.push("(user_id = ");
-                claimed.push_bind(&candidate.user_id);
-                claimed.push(" AND run_id = ");
-                claimed.push_bind(&candidate.run_id);
-                claimed.push(" AND run_generation = ");
-                claimed.push_bind(candidate.run_generation.saturating_add(1) as i64);
-                claimed.push(")");
-            }
-            claimed.push(") ORDER BY updated_at ASC, user_id ASC, run_id ASC");
-            let rows = claimed
-                .build()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_claimed_recoverable_active_runs", "active", source).to_string()
-                })?;
-            let records = rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
-            if !records.is_empty() {
-                return Ok(records);
+            let claimed = self
+                .claim_run_recovery_candidates(candidates, include_current_owner)
+                .await?;
+            if !claimed.is_empty() {
+                return Ok(claimed);
             }
             tokio::task::yield_now().await;
         }
         Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn claim_exact_recovery_candidate_for_test(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<RecoveryClaim, String> {
+        let candidate = self
+            .load_run(user_id, run_id)
+            .await?
+            .ok_or("recovery fixture run missing")?;
+        self.claim_run_recovery_candidates(vec![candidate], true)
+            .await?
+            .pop()
+            .ok_or_else(|| "recovery fixture was not claimed".into())
+    }
+
+    async fn claim_run_recovery_candidates(
+        &self,
+        candidates: Vec<DurableRunRecord>,
+        include_current_owner: bool,
+    ) -> Result<Vec<RecoveryClaim>, String> {
+        // Candidate discovery is only a hint. Hold the canonical write
+        // locks through the update and readback: a pod id and a database
+        // timestamp are not unique evidence that this invocation won a
+        // claim. In particular, two same-pod callers may share both.
+        let mut tx =
+            self.pool.get().begin().await.map_err(|source| {
+                db_error("begin_run_recovery_claim", "active", source).to_string()
+            })?;
+        let mut candidates = candidates;
+        candidates.sort_by(|left, right| {
+            (&left.user_id, &left.session_id, &left.run_id).cmp(&(
+                &right.user_id,
+                &right.session_id,
+                &right.run_id,
+            ))
+        });
+        let mut locked_candidates = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(current) = self
+                .load_run_metadata_for_exact_session_tx(
+                    &mut tx,
+                    &candidate.user_id,
+                    &candidate.session_id,
+                    &candidate.run_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if current.run_generation == candidate.run_generation {
+                // Validate before any update: never saturate or wrap an
+                // execution identity, including at the SQL i64 boundary.
+                i64::try_from(current.run_generation)
+                    .ok()
+                    .and_then(|generation| generation.checked_add(1))
+                    .ok_or_else(|| "run recovery generation exhausted".to_string())?;
+                locked_candidates.push(current);
+            }
+        }
+        let candidates = locked_candidates;
+        if candidates.is_empty() {
+            tx.rollback().await.map_err(|source| {
+                db_error("rollback_empty_run_recovery_claim", "active", source).to_string()
+            })?;
+            return Ok(Vec::new());
+        }
+        // The database clock determines lease expiry only, never which
+        // recovery invocation owns the returned rows.
+        let claim_expires_at = self.lease_expires_at_from_database(&mut tx).await?;
+        let mut claim = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "UPDATE agent_runs
+                 SET owner_pod_id = ",
+        );
+        claim.push_bind(&self.owner_pod_id);
+        claim.push(", owner_lease_expires_at = ");
+        claim.push_bind(claim_expires_at);
+        claim.push(
+            ", run_generation = run_generation + 1, updated_at = NOW(6)
+                 WHERE (status IN (",
+        );
+        claim.push_bind(STATUS_WAITING);
+        claim.push(", ");
+        claim.push_bind(STATUS_RUNNING);
+        claim.push(") OR (status = ");
+        claim.push_bind(STATUS_PAUSED);
+        claim.push(
+            " AND waiting_for IS NOT NULL))
+                   AND (
+                       owner_pod_id IS NULL",
+        );
+        if include_current_owner {
+            claim
+                .push(" OR owner_pod_id = ")
+                .push_bind(&self.owner_pod_id);
+        }
+        claim.push(" OR owner_lease_expires_at IS NULL");
+        if include_current_owner {
+            claim.push(" OR owner_lease_expires_at < NOW(6)");
+        } else {
+            claim
+                .push(" OR owner_lease_expires_at < DATE_SUB(NOW(6), INTERVAL ")
+                .push_bind(self.lease_ttl_micros())
+                .push(" MICROSECOND)");
+        }
+        claim.push(" ) AND (");
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index > 0 {
+                claim.push(" OR ");
+            }
+            claim.push("(user_id = ");
+            claim.push_bind(&candidate.user_id);
+            claim.push(" AND run_id = ");
+            claim.push_bind(&candidate.run_id);
+            claim.push(" AND run_generation = ");
+            claim.push_bind(candidate.run_generation as i64);
+            claim.push(")");
+        }
+        claim.push(")");
+        let claimed_count = claim
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("claim_recoverable_active_runs", "active", source).to_string()
+            })?
+            .rows_affected();
+        if claimed_count == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error("rollback_empty_run_recovery_claim", "active", source).to_string()
+            })?;
+            return Ok(Vec::new());
+        }
+
+        let mut claimed = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
+        claimed.push(AGENT_RUN_COLUMNS);
+        claimed.push(" FROM agent_runs WHERE (");
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index > 0 {
+                claimed.push(" OR ");
+            }
+            claimed.push("(user_id = ");
+            claimed.push_bind(&candidate.user_id);
+            claimed.push(" AND run_id = ");
+            claimed.push_bind(&candidate.run_id);
+            claimed.push(" AND run_generation = ");
+            // Checked above, while holding the run lock.
+            claimed.push_bind(candidate.run_generation as i64 + 1);
+            claimed.push(")");
+        }
+        claimed.push(") ORDER BY updated_at ASC, user_id ASC, run_id ASC");
+        let rows = claimed
+            .build()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("load_claimed_recoverable_active_runs", "active", source).to_string()
+            })?;
+        let records = rows
+            .into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        if records.len() as u64 != claimed_count {
+            return Err("run recovery claim readback did not match its update".to_string());
+        }
+        let mut records = records
+            .into_iter()
+            .map(|run| {
+                let previous = candidates
+                    .binary_search_by(|candidate| {
+                        (&candidate.user_id, &candidate.session_id, &candidate.run_id).cmp(&(
+                            &run.user_id,
+                            &run.session_id,
+                            &run.run_id,
+                        ))
+                    })
+                    .ok()
+                    .and_then(|index| candidates.get(index))
+                    .ok_or_else(|| "run recovery readback has no locked predecessor".to_string())?;
+                Ok(RecoveryClaim {
+                    claimed_from_generation: previous.run_generation,
+                    run,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for receipt in &mut records {
+            let run = &mut receipt.run;
+            let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
+                continue;
+            };
+            let row = sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+                 checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints WHERE user_id = ? AND run_id = ?
+                 AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
+            )
+            .bind(&run.user_id)
+            .bind(&run.run_id)
+            .bind(identity)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+            let Some(row) = row else { continue };
+            let checkpoint =
+                decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
+            let payload: Option<String> = sqlx::query_scalar(
+                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+            ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
+                .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
+            let tail = payload.and_then(|payload| match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(event) => Some(event),
+                Err(_) => {
+                    tracing::warn!(run_id = %run.run_id, "invalid event tail cannot establish recovery custody");
+                    None
+                }
+            });
+            let predecessor = candidates
+                .binary_search_by(|previous| {
+                    (&previous.user_id, &previous.session_id, &previous.run_id).cmp(&(
+                        &run.user_id,
+                        &run.session_id,
+                        &run.run_id,
+                    ))
+                })
+                .map_err(|_| "recovery predecessor disappeared")?;
+            let previous = &candidates[predecessor];
+            let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
+            let verified_adoption = if let Some(adoption) = adoption.as_ref() {
+                if crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
+                    &mut tx, previous, adoption,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                {
+                    Some(adoption)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(event) = execution_handoff_claim_event(
+                previous,
+                &checkpoint,
+                tail.as_ref(),
+                verified_adoption,
+            )?
+            else {
+                continue;
+            };
+            let next_idx = run
+                .last_event_idx
+                .checked_add(1)
+                .ok_or("run recovery event sequence exhausted")?;
+            let event_row = build_run_event_insert_row(
+                &run.user_id,
+                &run.run_id,
+                &run.session_id,
+                run.agent_id.as_deref(),
+                next_idx,
+                &self.owner_pod_id,
+                &event,
+            )
+            .map_err(|error| error.to_string())?;
+            Self::insert_run_event_rows_tx(
+                &mut tx,
+                &run.run_id,
+                &[event_row],
+                "insert_recovery_claim_event",
+            )
+            .await?;
+            let updated = sqlx::query(
+                "UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ? AND run_generation = ? AND last_event_idx = ?",
+            ).bind(next_idx).bind(&run.user_id).bind(&run.run_id)
+                .bind(i64::try_from(run.run_generation).map_err(|error| error.to_string())?)
+                .bind(run.last_event_idx).execute(&mut *tx).await.map_err(|error| error.to_string())?;
+            if updated.rows_affected() != 1 {
+                return Err("recovery claim event frontier changed under lock".into());
+            }
+            run.last_event_idx = next_idx;
+        }
+        tx.commit().await.map_err(|source| {
+            db_error("commit_run_recovery_claim", "active", source).to_string()
+        })?;
+        Ok(records)
     }
 
     /// Resolve an ambiguous orphan-cancellation COMMIT only from the exact
@@ -12349,6 +13920,26 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn reconcile_execution_handoff(
+        &self,
+        claim: &RecoveryClaim,
+    ) -> Result<Option<RecoveryReconciliation>, String> {
+        self.transition_run_status(
+            &claim.run.user_id,
+            &claim.run.session_id,
+            &claim.run.run_id,
+            &[claim.run.status.as_str()],
+            Some(claim.run.run_generation),
+            STATUS_PAUSED,
+            None,
+            None,
+            &[],
+            Some(claim),
+        )
+        .await
+        .map(|commit| commit.recovery)
+    }
+
     fn execution_owner_pod_id(&self) -> Option<&str> {
         Some(&self.owner_pod_id)
     }
@@ -14635,6 +16226,35 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(AtomicRunUserIntentApply::SettlementFenced);
         }
 
+        // A committed user-intent disposition starts a new canonical semantic
+        // turn. Supersede any abandoned Work-establishment carrier in this
+        // same transaction, before publishing `user_intent_applied`; otherwise
+        // a crash between the two commits could resurrect the old carrier and
+        // block or reinterpret the already-applied user turn.
+        let current_turn_chain_id = expected
+            .last()
+            .and_then(|(applied, _)| applied.get("data"))
+            .and_then(|data| data.get("intent_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|intent_id| !intent_id.trim().is_empty())
+            .ok_or_else(|| {
+                "validated user-intent apply batch lost its canonical intent identity".to_string()
+            })?;
+        let work_owner = crate::work::WorkOwnerId::parse(request.user_id.to_string())
+            .map_err(|error| format!("invalid Work owner at user-intent apply: {error}"))?;
+        let work_session =
+            crate::work::InternalSessionId::parse(request.expected_session_id.to_string())
+                .map_err(|error| format!("invalid Work session at user-intent apply: {error}"))?;
+        crate::work::cancel_pending_for_new_turn_tx(
+            &mut tx,
+            &work_owner,
+            &work_session,
+            current_turn_chain_id,
+            "new user turn superseded an unfinished Work establishment",
+        )
+        .await
+        .map_err(|error| format!("durable Work supersession failed: {error}"))?;
+
         let first_event_index = run
             .last_event_idx
             .checked_add(1)
@@ -15731,200 +17351,20 @@ impl RunStateStore for DatabaseRunStateStore {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<bool, String> {
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        let terminal_origin = cancelled_terminal_origin(status, events)?;
-        let terminal_error_code =
-            terminal_error_code_from_transition(status, error_message, events);
-
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("transition_run_status_with_events_begin", run_id, source).to_string()
-        })?;
-
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_missing",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(false);
-        };
-        if expected_statuses.contains(&run.status.as_str())
-            && let Err(error) = ensure_terminal_status_immutable(&run, status)
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_terminal_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Err(error);
-        }
-        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
-        if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_cancellation_authority",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(false);
-        }
-        let agent_id = run.agent_id.clone();
-        let last_event_idx = run.last_event_idx;
-
-        let mut events_to_commit = self
-            .terminal_interaction_closure_events_tx(&mut tx, &run, status)
-            .await
-            .map_err(|error| error.to_string())?;
-        events_to_commit.extend(
-            self.terminal_user_intent_return_events_tx(
-                &mut tx,
-                user_id,
-                run_id,
-                transition_releases_user_intent_ownership(status, events),
-                "transition_run_status_with_events_load_intent_dispositions",
-            )
-            .await
-            .map_err(|error| error.to_string())?,
-        );
-        events_to_commit.extend_from_slice(events);
-
-        let mut event_rows = Vec::with_capacity(events_to_commit.len());
-        for (offset, event) in events_to_commit.iter().enumerate() {
-            match build_run_event_insert_row(
-                user_id,
-                run_id,
-                expected_session_id,
-                agent_id.as_deref(),
-                last_event_idx + 1 + offset as i64,
-                &self.owner_pod_id,
-                event,
-            ) {
-                Ok(row) => event_rows.push(row),
-                Err(error) => {
-                    tx.rollback().await.map_err(|source| {
-                        db_error(
-                            "transition_run_status_with_events_rollback_prepare_event",
-                            run_id,
-                            source,
-                        )
-                        .to_string()
-                    })?;
-                    return Err(error.to_string());
-                }
-            }
-        }
-
-        let next_last_event_idx = last_event_idx + events_to_commit.len() as i64;
-        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
-        update.push_bind(status);
-        update.push(", waiting_for = ");
-        update.push_bind(waiting_for);
-        if let Some(error_message) = error_message {
-            update.push(", error_message = ");
-            update.push_bind(error_message);
-        }
-        if let Some(error_code) = terminal_error_code.as_deref() {
-            update.push(", error_code = ");
-            update.push_bind(error_code);
-        }
-        update.push(", last_event_idx = ");
-        update.push_bind(next_last_event_idx);
-        update.push(", updated_at = NOW(6) WHERE user_id = ");
-        update.push_bind(user_id);
-        update.push(" AND session_id = ");
-        update.push_bind(expected_session_id);
-        update.push(" AND run_id = ");
-        update.push_bind(run_id);
-        update.push(" AND last_event_idx = ");
-        update.push_bind(last_event_idx);
-        if let Some(expected_owner_generation) = expected_owner_generation {
-            update.push(" AND owner_pod_id = ");
-            update.push_bind(&self.owner_pod_id);
-            update.push(" AND run_generation = ");
-            update.push_bind(expected_owner_generation as i64);
-            update.push(" AND owner_lease_expires_at >= NOW(6)");
-        }
-        update.push(" AND status IN (");
-        let mut separated = update.separated(", ");
-        for expected in expected_statuses {
-            separated.push_bind(*expected);
-        }
-        separated.push_unseparated(")");
-        if terminal_origin != Some(DurableCancellationOrigin::User) {
-            update.push(" AND cancellation_requested_at IS NULL");
-        }
-
-        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
-            db_error("transition_run_status_with_events_update", run_id, source).to_string()
-        })?;
-        if update_result.rows_affected() == 0 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(false);
-        }
-        if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_slot_blocked",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(false);
-        }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
-
-        if !event_rows.is_empty() {
-            let insert_result = Self::insert_run_event_rows_tx(
-                &mut tx,
-                run_id,
-                &event_rows,
-                "transition_run_status_with_events_insert_events",
-            )
-            .await;
-            if let Err(mut detail) = insert_result {
-                let rollback_error = tx.rollback().await.err();
-                if let Some(rollback_error) = rollback_error {
-                    detail.push_str(&format!(
-                        "; rollback after insert failure also failed: {rollback_error}"
-                    ));
-                }
-                return Err(detail);
-            }
-        }
-
-        tx.commit().await.map_err(|source| {
-            db_error("transition_run_status_with_events_commit", run_id, source).to_string()
-        })?;
-
-        self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
-            .await;
-        Ok(true)
+        self.transition_run_status(
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_statuses,
+            expected_owner_generation,
+            status,
+            waiting_for,
+            error_message,
+            events,
+            None,
+        )
+        .await
+        .map(|commit| commit.applied)
     }
 
     async fn update_run_usage(
@@ -16411,14 +17851,27 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn save_checkpoint(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String> {
+        request: RunCheckpointWriteRequest<'_>,
+    ) -> Result<Option<RunCheckpointReceipt>, String> {
+        let RunCheckpointWriteRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            checkpoint_json,
+            authority,
+        } = request;
         let (checkpoint_kind, checkpoint_version, idempotency_key) =
             checkpoint_metadata(run_id, checkpoint_json)?;
-        let checkpoint_id = format!("ckpt-{}", uuid::Uuid::now_v7());
+        let expected_generation = match authority {
+            CheckpointWriteAuthority::ControlPlane => None,
+            CheckpointWriteAuthority::ExecutionOwner {
+                expected_owner_generation,
+            } => Some(
+                i64::try_from(expected_owner_generation)
+                    .map_err(|_| "checkpoint owner generation exceeds storage range".to_string())?,
+            ),
+        };
+        let mut checkpoint_id = format!("ckpt-{}", uuid::Uuid::now_v7());
         let created_at = chrono::Utc::now().naive_utc();
         let mut tx = self
             .pool
@@ -16434,9 +17887,72 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_save_checkpoint_missing", run_id, source).to_string()
             })?;
-            return Ok(false);
+            return Ok(None);
         };
-        sqlx::query(
+        if let CheckpointWriteAuthority::ExecutionOwner {
+            expected_owner_generation,
+        } = authority
+        {
+            let markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
+            if run.run_generation != expected_owner_generation
+                || run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+                || run.status != STATUS_RUNNING
+                || markers.direct
+                || markers.ancestor
+            {
+                tx.rollback().await.map_err(|source| {
+                    db_error("rollback_checkpoint_owner_conflict", run_id, source).to_string()
+                })?;
+                return Ok(None);
+            }
+        }
+        let identity_sql = if checkpoint_kind == "execution_handoff" {
+            "SELECT checkpoint_id, checkpoint_json FROM run_checkpoints
+                 WHERE user_id = ? AND run_id = ? AND checkpoint_kind = ? AND idempotency_key = ? FOR UPDATE"
+        } else {
+            "SELECT checkpoint_id FROM run_checkpoints
+                 WHERE user_id = ? AND run_id = ? AND checkpoint_kind = ? AND idempotency_key = ? FOR UPDATE"
+        };
+        let previous_identity = sqlx::query(identity_sql)
+            .bind(user_id)
+            .bind(run_id)
+            .bind(&checkpoint_kind)
+            .bind(&idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| db_error("load_checkpoint_identity", run_id, source).to_string())?;
+        let previous_identity_json: Option<String> = previous_identity
+            .as_ref()
+            .filter(|_| checkpoint_kind == "execution_handoff")
+            .map(|row| {
+                row.try_get("checkpoint_json")
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        if let Some(row) = &previous_identity {
+            checkpoint_id = row
+                .try_get("checkpoint_id")
+                .map_err(|error| error.to_string())?;
+        }
+        if !checkpoint_write_is_authorized(
+            authority,
+            &checkpoint_kind,
+            checkpoint_json,
+            run.checkpoint_version.as_deref(),
+            run.checkpoint_json.as_deref(),
+            previous_identity_json.as_deref(),
+        )? {
+            tx.rollback().await.map_err(|source| {
+                db_error("rollback_checkpoint_authority", run_id, source).to_string()
+            })?;
+            return Ok(None);
+        }
+        let insert_sql = if checkpoint_kind == "execution_handoff" {
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        } else {
             "INSERT INTO run_checkpoints
              (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
               checkpoint_version, idempotency_key, checkpoint_json, created_at)
@@ -16444,26 +17960,31 @@ impl RunStateStore for DatabaseRunStateStore {
              ON DUPLICATE KEY UPDATE
               checkpoint_json = VALUES(checkpoint_json),
               checkpoint_version = VALUES(checkpoint_version),
-              node_seq = VALUES(node_seq)",
-        )
-        .bind(&checkpoint_id)
-        .bind(run_id)
-        .bind(&run.user_id)
-        .bind(&run.session_id)
-        .bind(run.last_event_idx.max(0))
-        .bind(&checkpoint_kind)
-        .bind(&checkpoint_version)
-        .bind(&idempotency_key)
-        .bind(checkpoint_json)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error("insert_run_checkpoint", run_id, source).to_string())?;
+              node_seq = VALUES(node_seq)"
+        };
+        if previous_identity_json.is_none() || checkpoint_kind != "execution_handoff" {
+            sqlx::query(insert_sql)
+                .bind(&checkpoint_id)
+                .bind(run_id)
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(run.last_event_idx.max(0))
+                .bind(&checkpoint_kind)
+                .bind(&checkpoint_version)
+                .bind(&idempotency_key)
+                .bind(checkpoint_json)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|source| db_error("insert_run_checkpoint", run_id, source).to_string())?;
+        }
         let result = sqlx::query(
             "UPDATE agent_runs
              SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
              WHERE user_id = ? AND session_id = ? AND run_id = ?
-               AND status NOT IN (?, ?, ?, ?)",
+               AND status NOT IN (?, ?, ?, ?)
+               AND (? IS NULL OR (run_generation = ? AND owner_pod_id = ?
+                    AND owner_lease_expires_at >= NOW(6) AND status = ?))",
         )
         .bind(&checkpoint_version)
         .bind(checkpoint_json)
@@ -16474,6 +17995,10 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(STATUS_DELEGATED)
         .bind(STATUS_FAILED)
         .bind(STATUS_CANCELLED)
+        .bind(expected_generation)
+        .bind(expected_generation)
+        .bind(&self.owner_pod_id)
+        .bind(STATUS_RUNNING)
         .execute(&mut *tx)
         .await
         .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
@@ -16482,7 +18007,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_save_checkpoint", run_id, source).to_string()
             })?;
-            return Ok(false);
+            return Ok(None);
         }
         tx.commit()
             .await
@@ -16490,7 +18015,14 @@ impl RunStateStore for DatabaseRunStateStore {
         self.sync_projection_for_user(user_id, expected_session_id, run_id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(Some(RunCheckpointReceipt {
+            checkpoint_id,
+            user_id: user_id.to_owned(),
+            session_id: expected_session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            checkpoint_kind,
+            checkpoint_version,
+        }))
     }
 
     async fn load_latest_checkpoint(
@@ -19329,7 +20861,7 @@ impl RunStateStore for DatabaseRunStateStore {
     async fn claim_recoverable_active_runs(
         &self,
         limit: u32,
-    ) -> Result<Vec<DurableRunRecord>, String> {
+    ) -> Result<Vec<RecoveryClaim>, String> {
         self.claim_recoverable_active_runs_with_owner_policy(limit, true)
             .await
     }
@@ -19337,7 +20869,7 @@ impl RunStateStore for DatabaseRunStateStore {
     async fn claim_expired_recoverable_active_runs(
         &self,
         limit: u32,
-    ) -> Result<Vec<DurableRunRecord>, String> {
+    ) -> Result<Vec<RecoveryClaim>, String> {
         self.claim_recoverable_active_runs_with_owner_policy(limit, false)
             .await
     }
@@ -21980,6 +23512,12 @@ const EXTERNAL_EXECUTION_BOUNDARY_FIELDS: &[&str] = &[
     "route",
     "status",
     "success",
+    // A terminal projection must preserve the typed execution fact.  In
+    // particular, `false` is an authoritative pre-admission rejection and
+    // must not be collapsed into an ambiguous error payload at the client
+    // boundary (or during replay).
+    "executed",
+    "disposition",
     "duration_ms",
     "error_kind",
     "reason",
@@ -22673,6 +24211,13 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         let projected_arguments = projected.get("arguments").cloned();
         let projected_status = bounded_terminal_scalar(projected.get("status").cloned());
         let projected_success = bounded_terminal_scalar(projected.get("success").cloned());
+        let projected_disposition = bounded_terminal_scalar(projected.get("disposition").cloned());
+        // Explicit null means execution is unknown; absence means no fact
+        // was supplied. Preserve that distinction through size projection.
+        let projected_executed = projected
+            .get("executed")
+            .filter(|value| value.is_boolean() || value.is_null())
+            .cloned();
         let projected_duration_ms = bounded_terminal_scalar(projected.get("duration_ms").cloned());
         let projected_error_kind = bounded_terminal_scalar(projected.get("error_kind").cloned());
         let mut fallback = serde_json::json!({
@@ -22691,6 +24236,8 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
             ("arguments", projected_arguments),
             ("status", projected_status),
             ("success", projected_success),
+            ("executed", projected_executed),
+            ("disposition", projected_disposition),
             ("duration_ms", projected_duration_ms),
             ("error_kind", projected_error_kind),
         ] {
@@ -22799,8 +24346,10 @@ fn project_external_lifecycle_result(
         "transcript_location",
         "parent_run_id",
     ] {
-        if let Some(value) = bounded_terminal_scalar(parsed.get(key).cloned()) {
-            compact.insert(key.to_string(), value);
+        if let Some(value) = parsed.get(key) {
+            // Control identities must remain exact. The complete receipt
+            // budget below determines whether this projection is usable.
+            compact.insert(key.to_string(), value.clone());
         }
     }
     if encoded_json_len(&serde_json::Value::Object(compact.clone()))
@@ -26390,14 +27939,9 @@ mod tests {
 
         assert!(
             !store
-                .save_checkpoint(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#,
-                )
+                .save_checkpoint(RunCheckpointWriteRequest { user_id: &user_id, expected_session_id: &session_id, run_id: &run_id, checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#, authority: CheckpointWriteAuthority::ControlPlane })
                 .await
-                .expect("terminal checkpoint attempt should be a visible no-op")
+                .expect("terminal checkpoint attempt should be a visible no-op").is_some()
         );
         let loaded = store
             .load_run(&user_id, &run_id)
@@ -26653,11 +28197,11 @@ mod tests {
         assert!(claimed_b.len() <= 4);
         let ids_a = claimed_a
             .iter()
-            .map(|run| run.run_id.as_str())
+            .map(|claim| claim.run.run_id.as_str())
             .collect::<HashSet<_>>();
         let ids_b = claimed_b
             .iter()
-            .map(|run| run.run_id.as_str())
+            .map(|claim| claim.run.run_id.as_str())
             .collect::<HashSet<_>>();
         assert!(ids_a.is_disjoint(&ids_b), "pods must claim disjoint runs");
         assert_eq!(
@@ -26667,11 +28211,15 @@ mod tests {
         );
         assert!(!ids_a.contains(live_id.as_str()));
         assert!(!ids_b.contains(live_id.as_str()));
-        assert!(claimed_a.iter().all(|run| {
-            run.owner_pod_id.as_deref() == Some("claim-pod-a") && run.run_generation == 1
+        assert!(claimed_a.iter().all(|claim| {
+            claim.run.owner_pod_id.as_deref() == Some("claim-pod-a")
+                && claim.run.run_generation == 1
+                && claim.claimed_from_generation == 0
         }));
-        assert!(claimed_b.iter().all(|run| {
-            run.owner_pod_id.as_deref() == Some("claim-pod-b") && run.run_generation == 1
+        assert!(claimed_b.iter().all(|claim| {
+            claim.run.owner_pod_id.as_deref() == Some("claim-pod-b")
+                && claim.run.run_generation == 1
+                && claim.claimed_from_generation == 0
         }));
         let still_live = fixture_store
             .load_run(&user_id, &live_id)
@@ -26689,6 +28237,102 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup recovery claim slots");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_overlapping_same_pod_claims_recheck_generation_and_frontier() {
+        let _claim_test_guard = MATRIXONE_RECOVERY_CLAIM_IT_LOCK.lock().await;
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("claim-frontier-user-{nonce}");
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id(format!("claim-frontier-owner-{nonce}"));
+        let mut candidates = Vec::new();
+        for index in 0..4 {
+            let mut run = durable_run_record(&format!("claim-frontier-{nonce}-{index}"));
+            run.user_id = user_id.clone();
+            run.session_id = format!("claim-frontier-session-{nonce}-{index}");
+            insert_active_database_session_fixture(&pool, &user_id, &run.session_id).await;
+            store.insert_run(run.clone()).await.unwrap();
+            candidates.push(
+                store
+                    .load_run(&user_id, &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        // Discovery must not freeze the checkpoint frontier or terminal state.
+        let checkpoint = r#"{"phase":"Act","version":"phase_checkpoint_v1"}"#;
+        assert!(
+            store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &candidates[1].session_id,
+                    run_id: &candidates[1].run_id,
+                    checkpoint_json: checkpoint,
+                    authority: CheckpointWriteAuthority::ControlPlane,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&candidates[3].run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        // These are the same production transaction consumers used after
+        // discovery. Both batches observed the same old overlapping row, and
+        // each also contains a distinct row; no scheduler timing is assumed.
+        let (left, right) = tokio::join!(
+            store.claim_run_recovery_candidates(
+                vec![
+                    candidates[0].clone(),
+                    candidates[1].clone(),
+                    candidates[3].clone()
+                ],
+                true
+            ),
+            store.claim_run_recovery_candidates(
+                vec![
+                    candidates[1].clone(),
+                    candidates[2].clone(),
+                    candidates[3].clone()
+                ],
+                true
+            ),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        let left_ids = left
+            .iter()
+            .map(|claim| &claim.run.run_id)
+            .collect::<HashSet<_>>();
+        let right_ids = right
+            .iter()
+            .map(|claim| &claim.run.run_id)
+            .collect::<HashSet<_>>();
+        assert!(left_ids.is_disjoint(&right_ids));
+        assert_eq!(left.len() + right.len(), 3);
+        assert!(
+            left.iter()
+                .chain(&right)
+                .all(|claim| claim.run.run_generation == 1 && claim.claimed_from_generation == 0)
+        );
+        let refreshed = left
+            .iter()
+            .chain(&right)
+            .find(|claim| claim.run.run_id == candidates[1].run_id)
+            .unwrap();
+        assert_eq!(refreshed.run.checkpoint_json.as_deref(), Some(checkpoint));
+        assert!(!left_ids.contains(&candidates[3].run_id));
+        assert!(!right_ids.contains(&candidates[3].run_id));
+        for candidate in candidates {
+            cleanup_database_run_fixture(&pool, &user_id, &candidate.run_id).await;
+        }
     }
 
     #[tokio::test]
@@ -26750,7 +28394,7 @@ mod tests {
             .await
             .expect("periodic claim with a live lease");
         assert_eq!(protected.len(), 1);
-        assert_eq!(protected[0].run_id, sentinel_run_id);
+        assert_eq!(protected[0].run.run_id, sentinel_run_id);
         let still_owned = store
             .load_run(&user_id, &run_id)
             .await
@@ -26777,8 +28421,9 @@ mod tests {
             .await
             .expect("periodic claim after lease expiry");
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].run_id, run_id);
-        assert_eq!(reclaimed[0].run_generation, 1);
+        assert_eq!(reclaimed[0].run.run_id, run_id);
+        assert_eq!(reclaimed[0].run.run_generation, 1);
+        assert_eq!(reclaimed[0].claimed_from_generation, 0);
         assert!(
             !store
                 .renew_owner_lease(&user_id, &session_id, &run_id, 0, &[STATUS_RUNNING])
@@ -27005,6 +28650,609 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_execution_handoff_checkpoint_is_fenced_and_immutable() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("handoff-u-{}", Uuid::new_v4());
+        let session_id = format!("handoff-s-{}", Uuid::new_v4());
+        let run_id = format!("handoff-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.unwrap();
+        assert_checkpoint_receipt_retry(&store, &user_id, &session_id, &run_id).await;
+        let generation = store
+            .load_run(&user_id, &run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_generation;
+        let owner = CheckpointWriteAuthority::ExecutionOwner {
+            expected_owner_generation: generation,
+        };
+        let original = json!({
+            "version": "execution_handoff_v1", "producer_run_id": run_id,
+            "producer_owner_generation": generation, "heavy": {"cursor": 7}
+        });
+        let mut conflicting = original.clone();
+        conflicting["heavy"]["cursor"] = json!(8);
+        let mut receipt = None;
+        for (payload, authority, expected) in [
+            (
+                original.clone(),
+                CheckpointWriteAuthority::ControlPlane,
+                false,
+            ),
+            (original.clone(), owner, true),
+            (original.clone(), owner, true),
+            (conflicting, owner, false),
+            (
+                json!({"version":"checkpoint_v1"}),
+                CheckpointWriteAuthority::ControlPlane,
+                false,
+            ),
+            (
+                original.clone(),
+                CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: generation + 1,
+                },
+                false,
+            ),
+        ] {
+            let saved_receipt = store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    checkpoint_json: &payload.to_string(),
+                    authority,
+                })
+                .await
+                .unwrap();
+            assert_eq!(saved_receipt.is_some(), expected, "{payload}");
+            if saved_receipt.is_some() {
+                if let Some(prior) = &receipt {
+                    assert_eq!(saved_receipt.as_ref(), Some(prior));
+                }
+                receipt = saved_receipt;
+            }
+        }
+        // Losing the lease denies even an otherwise identical retry.
+        sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = '2000-01-01 00:00:00' WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert!(
+            !store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    checkpoint_json: &original.to_string(),
+                    authority: owner,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let saved = store
+            .load_latest_checkpoint(&user_id, &run_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt, Some(RunCheckpointReceipt::from(&saved)));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved.checkpoint_json).unwrap(),
+            original
+        );
+        let current = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(current.checkpoint_json.as_deref().unwrap())
+                .unwrap(),
+            original
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 2,
+            "one ordinary checkpoint and one immutable handoff"
+        );
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_turn_adoption_preserves_the_unfinished_turn() {
+        use crate::session_context_coordinator::{
+            AcquireWriterAndReserveTurnOutcome, AdoptExecutionTurnRequest,
+            DatabaseSessionContextCoordinator, SessionContextCoordinator,
+        };
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("adopt-u-{}", Uuid::new_v4());
+        let session_id = format!("adopt-s-{}", Uuid::new_v4());
+        let run_id = format!("adopt-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.unwrap();
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let key =
+            astra_turn_types::SessionKeyV1::owner_session("server", &user_id, &session_id, "main");
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user_id,
+            "adopter",
+            astra_turn_types::ActorKindV1::Cli,
+            astra_turn_types::SessionSurfaceV1::Cli,
+            None,
+            astra_turn_types::AuthorityEpochsV1::default(),
+        );
+        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(60),
+                "original-writer",
+                "original-turn",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("original authority not acquired")
+        };
+        let payload = serde_json::to_string(&DurableExecutionHandoff::V1 {
+            producer_run_id: run_id.clone(),
+            producer_owner_generation: 0,
+            heavy: json!({"reservation": reservation, "state":"preserved"}),
+        })
+        .unwrap();
+        let checkpoint = store
+            .save_checkpoint(RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: &payload,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.release_writer(&lease).await.unwrap();
+        let claim = store
+            .claim_exact_recovery_candidate_for_test(&user_id, &run_id)
+            .await
+            .unwrap();
+        // An old non-executable claim is not made executable by a later
+        // running row. Validate both halves of the claimed authority.
+        let mut non_executable_claim = claim.clone();
+        non_executable_claim.run.status = STATUS_WAITING.to_string();
+        assert!(
+            coordinator
+                .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                    claim: &non_executable_claim,
+                    owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                    checkpoint_id: &checkpoint.checkpoint_id,
+                    source: &reservation,
+                    actor: &actor,
+                    ttl: Duration::from_secs(60),
+                })
+                .await
+                .is_err()
+        );
+        let after_rejected_claim = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            after_rejected_claim.last_event_idx,
+            claim.run.last_event_idx
+        );
+        assert_eq!(after_rejected_claim.status, STATUS_RUNNING);
+        let adopted = coordinator
+            .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                claim: &claim,
+                owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                checkpoint_id: &checkpoint.checkpoint_id,
+                source: &reservation,
+                actor: &actor,
+                ttl: Duration::from_secs(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(RunCheckpointReceipt::from(adopted.checkpoint()), checkpoint);
+        assert_eq!(adopted.checkpoint().checkpoint_json, payload);
+        let adopted = adopted.receipt().clone();
+        assert_eq!(adopted.producer_generation, 0);
+        assert_eq!(adopted.run_id, run_id);
+        assert_eq!(
+            adopted.turn_reservation.reserved_turn,
+            reservation.reserved_turn
+        );
+        assert_eq!(
+            adopted.turn_reservation.expected_cursor,
+            reservation.expected_cursor
+        );
+        assert!(adopted.writer_lease.writer_epoch > lease.writer_epoch);
+        assert_ne!(
+            adopted.turn_reservation.reservation_id,
+            reservation.reservation_id
+        );
+        let retry = coordinator
+            .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                claim: &claim,
+                owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                checkpoint_id: &checkpoint.checkpoint_id,
+                source: &reservation,
+                actor: &actor,
+                ttl: Duration::from_secs(60),
+            })
+            .await
+            .expect("retry must return the existing live adopted authority");
+        assert_eq!(RunCheckpointReceipt::from(retry.checkpoint()), checkpoint);
+        let retry = retry.receipt();
+        assert_eq!(retry.producer_generation, adopted.producer_generation);
+        assert_eq!(retry.writer_lease, adopted.writer_lease);
+        assert_eq!(retry.turn_reservation, adopted.turn_reservation);
+        assert!(
+            coordinator
+                .renew_turn_authority(&lease, &reservation, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+        let renewed = coordinator
+            .renew_turn_authority(
+                &adopted.writer_lease,
+                &adopted.turn_reservation,
+                Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        let refreshed = coordinator
+            .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                claim: &claim,
+                owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                checkpoint_id: &checkpoint.checkpoint_id,
+                source: &reservation,
+                actor: &actor,
+                ttl: Duration::from_secs(60),
+            })
+            .await
+            .unwrap();
+        let refreshed = refreshed.receipt();
+        assert_eq!(refreshed.writer_lease, renewed.writer_lease);
+        assert_eq!(refreshed.turn_reservation, renewed.turn_reservation);
+        let current = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(current.status, STATUS_RUNNING);
+        assert_eq!(current.run_generation, claim.run.run_generation);
+        assert_eq!(current.checkpoint_json.as_deref(), Some(payload.as_str()));
+        assert_eq!(
+            current.events.last().unwrap()["event_type"],
+            "execution_handoff_adopted"
+        );
+        assert_eq!(
+            current.events.last().unwrap()["data"]["adopted_reservation_id"],
+            adopted.turn_reservation.reservation_id
+        );
+        let adoption: ExecutionHandoffAdoption =
+            serde_json::from_value(current.events.last().unwrap()["data"].clone()).unwrap();
+        // Corruption is isolated inside a rolled-back transaction. It must
+        // reject custody without turning this row into a batch-wide error.
+        let mut tx = pool.get().begin().await.unwrap();
+        let corrupted = sqlx::query(
+            "UPDATE session_context_operation_receipts SET receipt_json = ?
+             WHERE owner_user_id = ? AND session_id = ? AND operation_kind = 'adopt_execution_turn'",
+        ).bind("{").bind(&user_id).bind(&session_id).execute(&mut *tx).await.unwrap();
+        assert_eq!(corrupted.rows_affected(), 1);
+        assert!(
+            !crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
+                &mut tx, &current, &adoption,
+            )
+            .await
+            .expect("bad receipt content must not poison recovery of other runs")
+        );
+        tx.rollback().await.unwrap();
+        // A committed state change can leave the adoption event at the tail.
+        // Idempotency must not turn that old receipt into execution permission.
+        let mut wrong_producer = serde_json::to_value(&adopted).unwrap();
+        wrong_producer["producer_generation"] = serde_json::json!(adopted.producer_generation + 1);
+        let altered = sqlx::query(
+            "UPDATE session_context_operation_receipts SET receipt_json = ?
+             WHERE owner_user_id = ? AND session_id = ? AND operation_kind = 'adopt_execution_turn'",
+        ).bind(wrong_producer.to_string()).bind(&user_id).bind(&session_id)
+            .execute(pool.get()).await.unwrap();
+        assert_eq!(altered.rows_affected(), 1);
+        assert!(
+            coordinator
+                .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                    claim: &claim,
+                    owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                    checkpoint_id: &checkpoint.checkpoint_id,
+                    source: &reservation,
+                    actor: &actor,
+                    ttl: Duration::from_secs(60),
+                })
+                .await
+                .is_err(),
+            "retry cannot ignore producer-generation receipt corruption"
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        assert!(
+            !crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
+                &mut tx, &current, &adoption,
+            )
+            .await
+            .unwrap(),
+            "reclaim must reject the same mismatched provenance"
+        );
+        tx.rollback().await.unwrap();
+        sqlx::query(
+            "UPDATE session_context_operation_receipts SET receipt_json = ?
+             WHERE owner_user_id = ? AND session_id = ? AND operation_kind = 'adopt_execution_turn'",
+        ).bind(serde_json::to_string(&adopted).unwrap()).bind(&user_id).bind(&session_id)
+            .execute(pool.get()).await.unwrap();
+        for status in [STATUS_PAUSED, STATUS_WAITING, STATUS_COMPLETED] {
+            sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+                .bind(status)
+                .bind(&user_id)
+                .bind(&run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+            assert!(
+                coordinator
+                    .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                        claim: &claim,
+                        owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                        checkpoint_id: &checkpoint.checkpoint_id,
+                        source: &reservation,
+                        actor: &actor,
+                        ttl: Duration::from_secs(60),
+                    })
+                    .await
+                    .is_err(),
+                "cannot adopt a {status} run from an unchanged event tail"
+            );
+            assert_eq!(
+                store.load_run(&user_id, &run_id).await.unwrap().unwrap(),
+                before
+            );
+        }
+        // Restore only this test-owned fixture for the independent crash case.
+        sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+            .bind(STATUS_RUNNING)
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        // Simulate process loss and elapsed lease time without sleeping or
+        // releasing authority on behalf of the vanished process.
+        coordinator.expire_turn_authority_for_test(&key).await;
+        drop(coordinator);
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let next_claim = store
+            .claim_exact_recovery_candidate_for_test(&user_id, &run_id)
+            .await
+            .unwrap();
+        assert_eq!(next_claim.run.run_generation, claim.run.run_generation + 1);
+        let next = coordinator
+            .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                claim: &next_claim,
+                owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                checkpoint_id: &checkpoint.checkpoint_id,
+                source: &reservation,
+                actor: &actor,
+                ttl: Duration::from_secs(60),
+            })
+            .await
+            .expect("committed adoption must survive owner-process loss before new activity");
+        assert_eq!(RunCheckpointReceipt::from(next.checkpoint()), checkpoint);
+        let next = next.receipt();
+        assert_eq!(next.producer_generation, 0);
+        assert_eq!(next.run_id, run_id);
+        assert_eq!(next.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(
+            next.turn_reservation.reserved_turn,
+            reservation.reserved_turn
+        );
+        assert!(next.writer_lease.writer_epoch > adopted.writer_lease.writer_epoch);
+        assert!(
+            coordinator
+                .renew_turn_authority(
+                    &adopted.writer_lease,
+                    &adopted.turn_reservation,
+                    Duration::from_secs(60)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .renew_turn_authority(&lease, &reservation, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+        coordinator.expire_turn_authority_for_test(&key).await;
+        let third_claim = store
+            .claim_exact_recovery_candidate_for_test(&user_id, &run_id)
+            .await
+            .unwrap();
+        assert_eq!(third_claim.run.run_generation, 3);
+        let third = coordinator
+            .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                claim: &third_claim,
+                owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                checkpoint_id: &checkpoint.checkpoint_id,
+                source: &reservation,
+                actor: &actor,
+                ttl: Duration::from_secs(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.receipt().producer_generation, 0);
+        assert_eq!(third.receipt().run_generation, 3);
+        assert_eq!(third.checkpoint().checkpoint_json, payload);
+        assert!(
+            coordinator
+                .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
+                    claim: &next_claim,
+                    owner_pod_id: store.execution_owner_pod_id().unwrap(),
+                    checkpoint_id: &checkpoint.checkpoint_id,
+                    source: &reservation,
+                    actor: &actor,
+                    ttl: Duration::from_secs(60),
+                })
+                .await
+                .is_err(),
+            "an older claim cannot reuse a saved adoption result after reclaim"
+        );
+        coordinator
+            .release_writer(&third.receipt().writer_lease)
+            .await
+            .unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_checkpoint_custody_survives_repeated_recovery_claims() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("reclaim-u-{}", Uuid::new_v4());
+        let session_id = format!("reclaim-s-{}", Uuid::new_v4());
+        let run_id = format!("reclaim-r-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.unwrap();
+        let payload = json!({"version":"execution_handoff_v1", "producer_run_id":run_id,
+            "producer_owner_generation":0, "heavy":{"cursor":7}})
+        .to_string();
+        let receipt = store
+            .save_checkpoint(RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: &payload,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let mut last_claim = None;
+        for generation in 1..=3 {
+            let current = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+            let claim = store
+                .claim_run_recovery_candidates(vec![current], true)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(claim.run.run_generation, generation);
+            let persisted: String = sqlx::query_scalar(
+                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?",
+            ).bind(&user_id).bind(&run_id).bind(claim.run.last_event_idx)
+                .fetch_one(pool.get()).await.unwrap();
+            let proof =
+                ExecutionHandoffClaim::from_event(&serde_json::from_str(&persisted).unwrap())
+                    .unwrap();
+            assert_eq!(proof.checkpoint_id, receipt.checkpoint_id);
+            assert_eq!(proof.producer_generation, 0);
+            assert_eq!(proof.claimed_generation, generation);
+            last_claim = Some(claim);
+        }
+        let claim = last_claim.unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        let locked = lock_claimed_execution_handoff_tx(
+            &mut tx,
+            &claim,
+            store.execution_owner_pod_id().unwrap(),
+            &receipt.checkpoint_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(locked.run.run_generation, 3);
+        assert_eq!(locked.checkpoint.checkpoint_id, receipt.checkpoint_id);
+        assert_eq!(locked.association.producer_generation, 0);
+        tx.rollback().await.unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        assert!(
+            lock_claimed_execution_handoff_tx(
+                &mut tx,
+                &claim,
+                "different-owner",
+                &receipt.checkpoint_id,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.rollback().await.unwrap();
+        let recovered = store
+            .reconcile_execution_handoff(&claim)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.run.status, STATUS_PAUSED);
+        assert_eq!(recovered.run.run_generation, 3);
+        assert_eq!(
+            recovered.run.checkpoint_json.as_deref(),
+            Some(payload.as_str())
+        );
+        let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        let persisted: String = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?",
+        ).bind(&user_id).bind(&run_id).bind(recovered.event_idx)
+            .fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&persisted).unwrap(),
+            recovered.event
+        );
+        assert_eq!(before.last_event_idx, recovered.event_idx);
+        let retry = store
+            .reconcile_execution_handoff(&claim)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.event, recovered.event);
+        assert_eq!(retry.event_idx, recovered.event_idx);
+        assert_eq!(
+            store.load_run(&user_id, &run_id).await.unwrap().unwrap(),
+            before
+        );
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_checkpoint_waits_for_canonical_run_lock_before_child_row_on_matrixone() {
         let (store, pool) = setup_database_run_state_store_it().await;
         let user_id = format!("checkpoint-lock-u-{}", Uuid::new_v4());
@@ -27022,9 +29270,16 @@ mod tests {
             r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"canonical-lock"}"#;
         assert!(
             store
-                .save_checkpoint(&user_id, &session_id, &run_id, checkpoint)
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    checkpoint_json: checkpoint,
+                    authority: CheckpointWriteAuthority::ControlPlane
+                })
                 .await
                 .expect("create checkpoint child row")
+                .is_some()
         );
 
         let mut held = pool
@@ -27037,7 +29292,13 @@ mod tests {
             .await
             .expect("lock run canonically")
             .expect("checkpoint run exists");
-        let save = store.save_checkpoint(&user_id, &session_id, &run_id, checkpoint);
+        let save = store.save_checkpoint(RunCheckpointWriteRequest {
+            user_id: &user_id,
+            expected_session_id: &session_id,
+            run_id: &run_id,
+            checkpoint_json: checkpoint,
+            authority: CheckpointWriteAuthority::ControlPlane,
+        });
         tokio::pin!(save);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut save)
@@ -27067,6 +29328,7 @@ mod tests {
                 .await
                 .expect("checkpoint completes after canonical lock release")
                 .expect("checkpoint save succeeds")
+                .is_some()
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
@@ -28536,13 +30798,9 @@ mod tests {
         store.insert_run(run).await.expect("insert projection run");
         assert!(
             store
-                .save_checkpoint(
-                    &user_id,
-                    &session_id, &run_id,
-                    r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"projection-frontier"}"#,
-                )
+                .save_checkpoint(RunCheckpointWriteRequest { user_id: &user_id, expected_session_id: &session_id, run_id: &run_id, checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"projection-frontier"}"#, authority: CheckpointWriteAuthority::ControlPlane })
                 .await
-                .expect("save projection checkpoint")
+                .expect("save projection checkpoint").is_some()
         );
         let required = [
             approval_required_event("projection-frontier-a", "write_file", &session_id),
@@ -30237,6 +32495,472 @@ mod tests {
         assert_eq!(version, "phase_checkpoint_v1");
     }
 
+    #[tokio::test]
+    async fn recovery_claim_batch_isolates_invalid_checkpoint_content() {
+        let store = InMemoryRunStateStore::new();
+        for run_id in ["broken", "healthy", "cancelled"] {
+            let mut run = durable_run_record(run_id);
+            run.session_id = run_id.to_owned();
+            store.insert_run(run).await.unwrap();
+            let payload = json!({"version":"execution_handoff_v1", "producer_run_id":run_id,
+                "producer_owner_generation":0, "heavy":{"cursor":7}})
+            .to_string();
+            assert!(
+                store
+                    .save_checkpoint(RunCheckpointWriteRequest {
+                        user_id: "u1",
+                        expected_session_id: run_id,
+                        run_id,
+                        checkpoint_json: &payload,
+                        authority: CheckpointWriteAuthority::ExecutionOwner {
+                            expected_owner_generation: 0
+                        },
+                    })
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        // Corruption is injected below the public writer, which rejects malformed input.
+        store
+            .runs
+            .write()
+            .await
+            .get_mut("broken")
+            .unwrap()
+            .checkpoint_json = Some("{".into());
+        assert!(
+            store
+                .request_run_cancellation("u1", "cancelled")
+                .await
+                .unwrap()
+        );
+        let claims = store.claim_recoverable_active_runs(3).await.unwrap();
+        assert_eq!(claims.len(), 3);
+        for claim in &claims {
+            assert_eq!(claim.run.run_generation, 1);
+            let before = store
+                .load_run("u1", &claim.run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = store.reconcile_execution_handoff(claim).await.unwrap();
+            if claim.run.run_id == "healthy" {
+                assert_eq!(result.unwrap().run.status, STATUS_PAUSED);
+            } else {
+                assert!(result.is_none());
+                assert_eq!(
+                    store
+                        .load_run("u1", &claim.run.run_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+            }
+        }
+        assert!(
+            store
+                .is_run_cancellation_requested("u1", "cancelled")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_cannot_inherit_custody_across_new_activity() {
+        let store = InMemoryRunStateStore::new();
+        let run_id = "claim-with-intervening-activity";
+        store.insert_run(durable_run_record(run_id)).await.unwrap();
+        let payload = json!({"version":"execution_handoff_v1", "producer_run_id":run_id,
+            "producer_owner_generation":0, "heavy":{"cursor":7}})
+        .to_string();
+        store
+            .save_checkpoint(RunCheckpointWriteRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id,
+                checkpoint_json: &payload,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let original = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let activity = json!({"event_type":"tool_result", "data":{"result":"new activity"}});
+        store
+            .append_event("u1", "s1", run_id, activity.clone())
+            .await
+            .unwrap();
+        let latest = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(latest.run.run_generation, 2);
+        assert_eq!(latest.run.events.last(), Some(&activity));
+        let before = store.load_run("u1", run_id).await.unwrap().unwrap();
+        for claim in [&original, &latest] {
+            assert!(
+                store
+                    .reconcile_execution_handoff(claim)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(store.load_run("u1", run_id).await.unwrap().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_survives_repeated_claims_before_reconciliation() {
+        let store = InMemoryRunStateStore::new();
+        let run_id = "repeated-recovery";
+        store.insert_run(durable_run_record(run_id)).await.unwrap();
+        let payload = serde_json::to_string(&DurableExecutionHandoff::V1 {
+            producer_run_id: run_id.to_owned(),
+            producer_owner_generation: 0,
+            heavy: json!({"state": "preserved"}),
+        })
+        .unwrap();
+        let receipt = store
+            .save_checkpoint(RunCheckpointWriteRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id,
+                checkpoint_json: &payload,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        for generation in 1..=2 {
+            let abandoned = store
+                .claim_recoverable_active_runs(1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(abandoned.run.run_generation, generation);
+            // The process dies here: no reconciliation and no in-process receipt survives.
+        }
+        let claim = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let recovered = store
+            .reconcile_execution_handoff(&claim)
+            .await
+            .unwrap()
+            .expect("a persisted checkpoint must survive repeated recovery-process crashes");
+        assert_eq!(recovered.run.run_generation, 3);
+        assert_eq!(recovered.run.status, STATUS_PAUSED);
+        assert_eq!(
+            recovered.run.checkpoint_json.as_deref(),
+            Some(payload.as_str())
+        );
+        let association: ExecutionHandoffRecovery =
+            serde_json::from_value(recovered.event["data"]["execution_handoff_recovery"].clone())
+                .unwrap();
+        assert_eq!(association.checkpoint_id, receipt.checkpoint_id);
+        assert_eq!(association.producer_generation, 0);
+        assert_eq!(association.claimed_from_generation, 2);
+        assert_eq!(association.recovered_generation, 3);
+        let before = store.load_run("u1", run_id).await.unwrap().unwrap();
+        let retried = store
+            .reconcile_execution_handoff(&claim)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.event, recovered.event);
+        assert_eq!(retried.event_idx, recovered.event_idx);
+        assert_eq!(store.load_run("u1", run_id).await.unwrap().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn recovery_association_commits_only_for_the_current_uncancelled_claim() {
+        for invalidation in ["none", "cancel", "reclaim", "new_event"] {
+            let store = InMemoryRunStateStore::new();
+            let run_id = "recovery-association";
+            store.insert_run(durable_run_record(run_id)).await.unwrap();
+            let payload = serde_json::to_string(&DurableExecutionHandoff::V1 {
+                producer_run_id: run_id.to_owned(),
+                producer_owner_generation: 0,
+                heavy: json!({"state": "preserved"}),
+            })
+            .unwrap();
+            let receipt = store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id,
+                    checkpoint_json: &payload,
+                    authority: CheckpointWriteAuthority::ExecutionOwner {
+                        expected_owner_generation: 0,
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let claim = store
+                .claim_recoverable_active_runs(1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            match invalidation {
+                "cancel" => {
+                    assert!(store.request_run_cancellation("u1", run_id).await.unwrap());
+                }
+                "reclaim" => {
+                    store.claim_recoverable_active_runs(1).await.unwrap();
+                }
+                "new_event" => {
+                    store
+                        .append_event(
+                            "u1",
+                            "s1",
+                            run_id,
+                            json!({
+                                "event_type": "tool_result", "data": {"result": "new activity"}
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let before = store.load_run("u1", run_id).await.unwrap().unwrap();
+            let result = store.reconcile_execution_handoff(&claim).await.unwrap();
+            let after = store.load_run("u1", run_id).await.unwrap().unwrap();
+            if invalidation != "none" {
+                assert!(result.is_none());
+                assert_eq!(after, before);
+                continue;
+            }
+            let result = result.unwrap();
+            assert_eq!(result.run.status, STATUS_PAUSED);
+            assert_eq!(result.run.waiting_for, None);
+            assert!(
+                result.run.events.is_empty(),
+                "metadata is not a full history"
+            );
+            assert_eq!(result.event_idx, after.last_event_idx);
+            assert_eq!(after.events.last(), Some(&result.event));
+            let association: ExecutionHandoffRecovery =
+                serde_json::from_value(result.event["data"]["execution_handoff_recovery"].clone())
+                    .unwrap();
+            assert_eq!(association.checkpoint_id, receipt.checkpoint_id);
+            assert_eq!(association.producer_generation, 0);
+            assert_eq!(association.claimed_from_generation, 0);
+            assert_eq!(association.recovered_generation, 1);
+            let replay = store
+                .reconcile_execution_handoff(&claim)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replay.event, result.event);
+            assert_eq!(replay.event_idx, result.event_idx);
+            assert_eq!(store.load_run("u1", run_id).await.unwrap().unwrap(), after);
+            store
+                .append_event(
+                    "u1",
+                    "s1",
+                    run_id,
+                    json!({
+                        "event_type": "tool_result", "data": {"result": "activity after recovery"}
+                    }),
+                )
+                .await
+                .unwrap();
+            let before_retry = store.load_run("u1", run_id).await.unwrap().unwrap();
+            assert!(
+                store
+                    .reconcile_execution_handoff(&claim)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store.load_run("u1", run_id).await.unwrap().unwrap(),
+                before_retry
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_receipts_identify_the_persisted_row_on_retry() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("receipt"))
+            .await
+            .unwrap();
+        assert_checkpoint_receipt_retry(&store, "u1", "s1", "receipt").await;
+        assert_eq!(store.checkpoints.read().await["receipt"].len(), 1);
+    }
+
+    async fn assert_checkpoint_receipt_retry(
+        store: &dyn RunStateStore,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) {
+        let mut prior: Option<DurableRunCheckpointRecord> = None;
+        for cursor in [1, 2] {
+            let payload =
+                json!({"version":"checkpoint_v1", "last_batch_id":"same-batch", "cursor":cursor})
+                    .to_string();
+            let receipt = store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id,
+                    expected_session_id: session_id,
+                    run_id,
+                    checkpoint_json: &payload,
+                    authority: CheckpointWriteAuthority::ControlPlane,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let stored = store
+                .load_latest_checkpoint(user_id, run_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt, RunCheckpointReceipt::from(&stored));
+            assert_eq!(stored.checkpoint_json, payload);
+            if let Some(prior) = prior {
+                assert_eq!(stored.checkpoint_id, prior.checkpoint_id);
+                assert_eq!(stored.created_at, prior.created_at);
+            }
+            prior = Some(stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_handoff_checkpoint_is_owner_only_and_immutable() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("handoff"))
+            .await
+            .unwrap();
+        let original = json!({
+            "version": "execution_handoff_v1",
+            "producer_run_id": "handoff",
+            "producer_owner_generation": 0,
+            "heavy": {"cursor": 7}
+        });
+        let owner = CheckpointWriteAuthority::ExecutionOwner {
+            expected_owner_generation: 0,
+        };
+        for (payload, authority, expected) in [
+            (
+                original.clone(),
+                CheckpointWriteAuthority::ControlPlane,
+                false,
+            ),
+            (original.clone(), owner, true),
+            (original.clone(), owner, true),
+            (
+                {
+                    let mut v = original.clone();
+                    v["heavy"]["cursor"] = json!(8);
+                    v
+                },
+                owner,
+                false,
+            ),
+            (
+                {
+                    let mut v = original.clone();
+                    v["producer_owner_generation"] = json!(1);
+                    v
+                },
+                owner,
+                false,
+            ),
+            (
+                json!({"version":"checkpoint_v1"}),
+                CheckpointWriteAuthority::ControlPlane,
+                false,
+            ),
+            (json!({"version":"checkpoint_v1"}), owner, false),
+        ] {
+            assert_eq!(
+                store
+                    .save_checkpoint(RunCheckpointWriteRequest {
+                        user_id: "u1",
+                        expected_session_id: "s1",
+                        run_id: "handoff",
+                        checkpoint_json: &payload.to_string(),
+                        authority,
+                    })
+                    .await
+                    .unwrap()
+                    .is_some(),
+                expected,
+                "{payload}"
+            );
+        }
+        let stored = store
+            .load_latest_checkpoint("u1", "handoff", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored.checkpoint_json).unwrap(),
+            original
+        );
+        assert_eq!(stored.checkpoint_kind, "execution_handoff");
+        assert_eq!(store.checkpoints.read().await["handoff"].len(), 1);
+        // The current run snapshot is also authoritative when its historical
+        // record is unavailable. Missing history must not permit replacement.
+        store.checkpoints.write().await.remove("handoff");
+        let mut conflicting = original.clone();
+        conflicting["heavy"]["cursor"] = json!(9);
+        assert!(
+            !store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "handoff",
+                    checkpoint_json: &conflicting.to_string(),
+                    authority: owner,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for field in [
+            "version",
+            "producer_run_id",
+            "producer_owner_generation",
+            "heavy",
+        ] {
+            let mut invalid = original.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(
+                checkpoint_metadata("handoff", &invalid.to_string()).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut unknown = original;
+        unknown["version"] = json!("execution_handoff_v2");
+        unknown["phase"] = json!("shutdown");
+        assert!(checkpoint_metadata("handoff", &unknown.to_string()).is_err());
+    }
+
     #[test]
     fn compaction_events_are_projected_without_losing_typed_fields() {
         let client_ready = json!({
@@ -30427,12 +33151,16 @@ mod tests {
             .expect("summary preview");
         assert!(preview.len() <= EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
         assert!(preview.is_char_boundary(preview.len()));
-        assert!(
-            serde_json::to_vec(&transformed)
-                .expect("serialize transformed event")
-                .len()
-                < 16 * 1024
-        );
+        // The bounded preview is intentionally text, not a claim that the
+        // original structured result remains parseable.  The enclosing SSE
+        // event must nevertheless remain a complete JSON document after
+        // projection and serialization.
+        assert!(transformed["result"]["preview"].is_string());
+        let encoded_event = serde_json::to_vec(&transformed).expect("serialize transformed event");
+        assert!(encoded_event.len() < 16 * 1024);
+        let decoded_event: serde_json::Value =
+            serde_json::from_slice(&encoded_event).expect("projected event remains valid JSON");
+        assert_eq!(decoded_event, transformed);
     }
 
     #[test]
@@ -30636,8 +33364,9 @@ mod tests {
             "tool": "introspect",
             "result": {"snapshot": "available"},
             "arguments": {"scope": "current_run"},
-            "status": "completed",
-            "success": true,
+            "status": "rejected",
+            "success": false,
+            "executed": false,
             "duration_ms": 37,
             "executor": {
                 "kind": "server_local",
@@ -30651,8 +33380,9 @@ mod tests {
         assert_eq!(transformed["tool"], "introspect");
         assert_eq!(transformed["result"]["snapshot"], "available");
         assert_eq!(transformed["arguments"]["scope"], "current_run");
-        assert_eq!(transformed["status"], "completed");
-        assert_eq!(transformed["success"], true);
+        assert_eq!(transformed["status"], "rejected");
+        assert_eq!(transformed["success"], false);
+        assert_eq!(transformed["executed"], false);
         assert_eq!(transformed["duration_ms"], 37);
         assert_eq!(transformed["payload_truncated"], true);
         assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
@@ -31348,6 +34078,7 @@ mod tests {
                 hard_turn_limit: Some(18),
             }),
             execution_time_budget: None,
+            admitted_execution_deadline: None,
             execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
@@ -31428,6 +34159,7 @@ mod tests {
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
             execution_time_budget: None,
+            admitted_execution_deadline: None,
             execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
@@ -31542,6 +34274,7 @@ mod tests {
                         hard_turn_limit: Some(40),
                     }),
                     execution_time_budget: None,
+                    admitted_execution_deadline: None,
                     execution_policy: Default::default(),
                     full_llm_capture: false,
                     explain: false,
@@ -34898,6 +37631,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_claim_generation_exhaustion_does_not_modify_any_candidate() {
+        let store = InMemoryRunStateStore::new();
+        let mut first = durable_run_record("recovery-first");
+        first.run_generation = 7;
+        first.updated_at = "2026-01-01T00:00:00Z".into();
+        let mut exhausted = durable_run_record("recovery-exhausted");
+        exhausted.session_id = "s2".into();
+        exhausted.run_generation = u64::MAX;
+        exhausted.updated_at = "2026-01-02T00:00:00Z".into();
+        store.insert_run(first.clone()).await.unwrap();
+        store.insert_run(exhausted.clone()).await.unwrap();
+        let before = store.runs.read().await.clone();
+        assert!(store.claim_recoverable_active_runs(2).await.is_err());
+        assert_eq!(*store.runs.read().await, before);
+    }
+
+    #[tokio::test]
+    async fn overlapping_memory_recovery_claims_do_not_reclaim_the_same_candidate() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("overlapping-recovery"))
+            .await
+            .unwrap();
+        let held = store
+            .action_fence_for("u1", "overlapping-recovery")
+            .lock_owned()
+            .await;
+        let mut first = Box::pin(store.claim_recoverable_active_runs(1));
+        let mut second = Box::pin(store.claim_recoverable_active_runs(1));
+        // Poll to the actual held fence, not a timer or scheduler guess. Both
+        // callers have now observed the same pre-claim candidate generation.
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        drop(held);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.len() + second.len(), 1);
+        assert_eq!(
+            store
+                .load_run("u1", "overlapping-recovery")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_generation,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_claim_wins_action_fence_before_stale_orphan_cancellation() {
         let store = Arc::new(InMemoryRunStateStore::new());
         store
@@ -34936,7 +37719,8 @@ mod tests {
 
         let claimed = claim.await.unwrap();
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].run_generation, 1);
+        assert_eq!(claimed[0].run.run_generation, 1);
+        assert_eq!(claimed[0].claimed_from_generation, 0);
         assert!(!cancellation.await.unwrap());
         let run = store
             .load_run("u1", "orphan-claim-race")
@@ -35308,6 +38092,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_owner_checkpoint_rejects_stale_or_cancelled_authority() {
+        for case in [
+            "valid",
+            "generation",
+            "pod",
+            "expired",
+            "paused",
+            "cancel",
+            "ancestor_cancel",
+        ] {
+            let store = InMemoryRunStateStore::new()
+                .with_execution_owner("checkpoint-owner", Duration::from_secs(60));
+            let run_id = "checkpoint-owner-run";
+            let run = if case == "ancestor_cancel" {
+                store
+                    .insert_run(durable_run_record("checkpoint-parent"))
+                    .await
+                    .unwrap();
+                durable_child_run_record(run_id, "checkpoint-parent")
+            } else {
+                durable_run_record(run_id)
+            };
+            store.insert_run(run).await.unwrap();
+            let generation = store
+                .load_run("u1", run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run_generation;
+            {
+                let mut runs = store.runs.write().await;
+                let run = runs.get_mut(run_id).unwrap();
+                match case {
+                    "generation" => run.run_generation += 1,
+                    "pod" => run.owner_pod_id = Some("another-owner".into()),
+                    "expired" => run.owner_lease_expires_at = Some("2000-01-01T00:00:00Z".into()),
+                    "paused" => run.status = STATUS_PAUSED.into(),
+                    _ => {}
+                }
+            }
+            if case == "cancel" || case == "ancestor_cancel" {
+                let target = if case == "cancel" {
+                    run_id
+                } else {
+                    "checkpoint-parent"
+                };
+                assert!(store.request_run_cancellation("u1", target).await.unwrap());
+            }
+            let saved = store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id,
+                    checkpoint_json: r#"{"version":"checkpoint_v1","last_batch_id":"owner"}"#,
+                    authority: CheckpointWriteAuthority::ExecutionOwner {
+                        expected_owner_generation: generation,
+                    },
+                })
+                .await
+                .unwrap()
+                .is_some();
+            assert_eq!(saved, case == "valid", "{case}");
+            let run = store.load_run("u1", run_id).await.unwrap().unwrap();
+            let checkpoint = store
+                .load_latest_checkpoint("u1", run_id, None)
+                .await
+                .unwrap();
+            assert_eq!(run.checkpoint_json.is_some(), saved, "{case}");
+            assert_eq!(checkpoint.is_some(), saved, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commit_does_not_expose_half_updated_memory_state() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        store
+            .insert_run(durable_run_record("checkpoint-atomic"))
+            .await
+            .unwrap();
+        // Stall the second storage projection. A reader must not observe a
+        // new run checkpoint while its checkpoint record is still absent.
+        let checkpoint_guard = store.checkpoints.write().await;
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "checkpoint-atomic",
+                    checkpoint_json: r#"{"version":"checkpoint_v1","last_batch_id":"atomic"}"#,
+                    authority: CheckpointWriteAuthority::ControlPlane,
+                })
+                .await
+        });
+        let half_committed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = match store.runs.try_read() {
+                    Ok(runs) => runs["checkpoint-atomic"]
+                        .checkpoint_json
+                        .is_some()
+                        .then_some(true),
+                    Err(_) => Some(false),
+                };
+                if let Some(half_committed) = observed {
+                    break half_committed;
+                }
+                // Release our read guard before yielding; otherwise our own
+                // lock would queue the writer and counterfeit atomicity.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("checkpoint writer reached the storage boundary");
+        drop(checkpoint_guard);
+        assert!(writer.await.unwrap().unwrap().is_some());
+        assert!(
+            !half_committed,
+            "run checkpoint became visible before its record committed"
+        );
+        let run = store
+            .load_run("u1", "checkpoint-atomic")
+            .await
+            .unwrap()
+            .unwrap();
+        let checkpoint = store
+            .load_latest_checkpoint("u1", "checkpoint-atomic", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.checkpoint_json.as_deref(),
+            Some(checkpoint.checkpoint_json.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn save_checkpoint_rejects_terminal_run_without_mutation() {
         let store = InMemoryRunStateStore::new();
         store
@@ -35329,14 +38249,9 @@ mod tests {
             .unwrap();
 
         let saved = store
-            .save_checkpoint(
-                "u1",
-                "s1",
-                "terminal-checkpoint",
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#,
-            )
+            .save_checkpoint(RunCheckpointWriteRequest { user_id: "u1", expected_session_id: "s1", run_id: "terminal-checkpoint", checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#, authority: CheckpointWriteAuthority::ControlPlane })
             .await
-            .unwrap();
+            .unwrap().is_some();
 
         assert!(!saved);
         let loaded = store
@@ -35678,14 +38593,9 @@ mod tests {
         store.insert_run(record).await.expect("insert run");
 
         let saved_checkpoint = store
-            .save_checkpoint(
-                &user_id,
-                &session_id,
-                &run_id,
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#,
-            )
+            .save_checkpoint(RunCheckpointWriteRequest { user_id: &user_id, expected_session_id: &session_id, run_id: &run_id, checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#, authority: CheckpointWriteAuthority::ControlPlane })
             .await
-            .expect("save checkpoint before terminal transition");
+            .expect("save checkpoint before terminal transition").is_some();
         assert!(saved_checkpoint);
 
         let events = vec![
@@ -35809,14 +38719,9 @@ mod tests {
             .await
             .unwrap();
         let saved_checkpoint = store
-            .save_checkpoint(
-                "u1",
-                "s1",
-                "projection-repair",
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#,
-            )
+            .save_checkpoint(RunCheckpointWriteRequest { user_id: "u1", expected_session_id: "s1", run_id: "projection-repair", checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#, authority: CheckpointWriteAuthority::ControlPlane })
             .await
-            .unwrap();
+            .unwrap().is_some();
         assert!(saved_checkpoint);
 
         let events = vec![
@@ -35939,14 +38844,9 @@ mod tests {
         );
         assert!(
             !store
-                .save_checkpoint(
-                    "u2",
-                    "s1",
-                    "owner-bound",
-                    r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"wrong-owner"}"#,
-                )
+                .save_checkpoint(RunCheckpointWriteRequest { user_id: "u2", expected_session_id: "s1", run_id: "owner-bound", checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"wrong-owner"}"#, authority: CheckpointWriteAuthority::ControlPlane })
                 .await
-                .unwrap()
+                .unwrap().is_some()
         );
         assert!(
             !store

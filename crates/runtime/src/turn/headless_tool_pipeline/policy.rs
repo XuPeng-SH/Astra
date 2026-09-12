@@ -12,8 +12,8 @@ use astra_turn_core::headless_tool_assembly::{
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
-    journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_deferred_activation_hint, journal_record_duplicate_within_turn,
+    journal_record_blocked_tool, journal_record_cancelled_tool,
+    journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
     journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
     journal_record_unknown_tool,
 };
@@ -23,8 +23,7 @@ use astra_turn_core::headless_tool_stderr_lines::{
 };
 use astra_turn_core::tool::deferred_activation::{
     DirectDeferredCallAdmission, classify_direct_deferred_call,
-    deferred_tool_not_activatable_message, direct_deferred_call_activation_message,
-    tool_not_admitted_message,
+    deferred_tool_not_activatable_message, tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
@@ -165,7 +164,28 @@ fn normalize_validation_prefix(tool_name: &str, args: &Value) -> Option<String> 
     None
 }
 
-fn emit_blocked_tool_result(
+fn edge_callback_conflict_message(
+    tool_name: &str,
+    call_id: &str,
+    conflict: EdgeMatchConflict,
+) -> String {
+    let detail = match conflict {
+        EdgeMatchConflict::DuplicateIdentity => {
+            "more than one callback claimed the provider call identity"
+        }
+        EdgeMatchConflict::AlreadyConsumed => {
+            "the callback identity was already consumed by another provider slot"
+        }
+        EdgeMatchConflict::ToolNameMismatch => {
+            "the callback identity claimed a different tool name"
+        }
+    };
+    format!(
+        "Error: headless edge protocol — tool `{tool_name}` (call `{call_id}`) has contradictory callback evidence: {detail}. The call was not redispatched. Retry only after the edge/server execution boundary is repaired."
+    )
+}
+
+pub(super) fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
     step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     quiet: bool,
@@ -205,6 +225,14 @@ fn emit_blocked_tool_result(
             blocked.journal_reason,
             safe_args_preview(blocked.name, blocked.args),
             blocked.early_exit_ms,
+        ),
+        HeadlessShortCircuitJournalKind::Cancelled { error_kind } => journal_record_cancelled_tool(
+            blocked.id.to_string(),
+            blocked.name.to_string(),
+            &blocked.journal_reason,
+            safe_args_preview(blocked.name, blocked.args),
+            blocked.early_exit_ms,
+            error_kind,
         ),
     };
     tool_call_records.push(record);
@@ -398,7 +426,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         &mut self,
         item: HeadlessRoundToolIdx,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
-        let slot = self.resolve_slot(item);
+        let mut slot = self.resolve_slot(item);
+        if slot.synthetic_edge_index.is_none() {
+            super::inherit_external_effect_recovery_scope(
+                &slot.name,
+                &mut slot.args,
+                self.ctx.external_effect_recovery_paths,
+            );
+        }
 
         if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
@@ -408,15 +443,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // settled result is historical fact, so post-execution retry and
         // budget policy must not replace it with a synthetic skip.  A
         // signature-only match is intentionally insufficient authority.
-        let has_exact_edge_result = self
-            .exact_edge_indices
-            .get(&slot.id)
-            .copied()
-            .filter(|&index| index != usize::MAX)
-            .is_some_and(|index| {
-                !self.consumed_edge[index]
-                    && self.ctx.edge_tool_round[index].tool_name() == slot.name
-            });
+        let has_exact_edge_result = self.exact_edge_callback_index(&slot).is_some_and(|index| {
+            self.ctx.edge_tool_round[index].has_explicit_assistant_tool_call_id()
+                && !self.consumed_edge[index]
+        });
 
         if !has_exact_edge_result && self.executed_this_turn >= self.ctx.max_tools_per_turn {
             self.emit_turn_budget_stub(&slot);
@@ -432,6 +462,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.consecutive_empty_name = 0;
 
         let call_sig = tool_dedup_signature(&slot.name, &slot.args);
+        let health_identity =
+            astra_turn_core::tool_result_semantics::tool_health_identity(&slot.name, &slot.args);
         let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
         let scoped_call_sig = observation_scoped_signature(&slot.name, &call_sig, workspace_epoch);
         let idem_key = policy_idempotency_key(&slot.name, &slot.args, workspace_epoch);
@@ -481,7 +513,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if !has_exact_edge_result
             && let Some((repeat_count, remaining_secs)) =
-                should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &call_sig)
+                should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
                 nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
@@ -509,7 +541,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if !has_exact_edge_result
             && let Some(failure_count) =
-                should_block_from_outcome_memory(&self.ctx.turn_guard.health, &call_sig)
+                should_block_from_outcome_memory(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
                 outcome_memory_block_message(&slot.name, &slot.args, failure_count);
@@ -535,14 +567,57 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        let execution = resolve_headless_tool_execution(
+        let (execution, edge_match_outcome) = resolve_headless_tool_execution(
             slot,
             self.ctx.edge_tool_round,
             &mut self.consumed_edge,
-            self.ctx.by_sig,
         );
+        self.observe_resolved_edge(&execution);
 
-        if !self.ctx.valid_tool_names.contains(&execution.name) {
+        // An explicit callback identity is execution custody. If that
+        // identity is contradictory, treating it as an absent callback would
+        // route the same provider call through a second executor and could
+        // repeat an external side effect. Fail closed with one shared-loop
+        // terminal; only the typed Absent outcome may continue to runtime
+        // dispatch below.
+        if let Some(conflict) = edge_match_outcome.conflict() {
+            let err_msg = edge_callback_conflict_message(&execution.name, &execution.id, conflict);
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "edge_callback_conflict",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
+                    err_msg: err_msg.clone(),
+                    journal_reason: err_msg,
+                    early_exit_ms: 0,
+                    status_line: None,
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let resolved_deferred = self
+            .ctx
+            .deferred_activations_by_call_id
+            .get(&execution.id)
+            .is_some_and(|activation| activation.name == execution.name);
+        let resolved_runtime_control = self
+            .ctx
+            .runtime_control_calls_by_id
+            .get(&execution.id)
+            .is_some_and(|kind| kind.tool_name() == execution.name);
+        if !self.ctx.valid_tool_names.contains(&execution.name)
+            && !resolved_deferred
+            && !resolved_runtime_control
+        {
             let is_prompt_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
             let is_activatable_deferred = self.ctx.runtime_tool_executor.is_some_and(|exec| {
                 exec.current_activatable_tool_names_snapshot()
@@ -559,15 +634,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 is_prompt_deferred && is_activatable_deferred,
                 tool_runtime_ready,
             ) {
-                DirectDeferredCallAdmission::Activate { name } => {
-                    if let Some(exec) = self.ctx.runtime_tool_executor {
-                        exec.record_direct_deferred_call_activation(&name);
-                    }
-                    (
-                        direct_deferred_call_activation_message(&name),
-                        "direct_deferred_call_activated",
-                    )
-                }
+                DirectDeferredCallAdmission::Activate { name } => (
+                    format!(
+                        "Tool '{name}' is deferred. Call tool_search with query 'select:{name}', then invoke it through invoke_tool."
+                    ),
+                    "direct_deferred_call_requires_carrier",
+                ),
                 DirectDeferredCallAdmission::NotAdmitted => {
                     if astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
                         &execution.name,
@@ -646,23 +718,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
             if is_prompt_deferred {
-                let record = if skip_reason == "direct_deferred_call_activated" {
-                    journal_record_deferred_activation_hint(
-                        execution.id.clone(),
-                        execution.name.clone(),
-                        args_preview.clone(),
-                        &err_msg,
-                        execution.early_exit_ms,
-                    )
-                } else {
-                    journal_record_tool_not_admitted(
-                        execution.id.clone(),
-                        execution.name.clone(),
-                        args_preview.clone(),
-                        &err_msg,
-                        execution.early_exit_ms,
-                    )
-                };
+                let record = journal_record_tool_not_admitted(
+                    execution.id.clone(),
+                    execution.name.clone(),
+                    args_preview.clone(),
+                    &err_msg,
+                    execution.early_exit_ms,
+                );
                 self.ctx.tool_call_records.push(record);
             } else {
                 self.ctx.tool_call_records.push(journal_record_unknown_tool(
@@ -758,6 +820,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_validation_attempt(&validation_prefix);
         }
 
+        if execution.is_edge_tool {
+            if let Some(snapshot) = execution.edge_replay_snapshot() {
+                self.slot_settlements.insert(
+                    execution.id.clone(),
+                    SlotSettlement::PendingEdgeValidated {
+                        execution: snapshot,
+                        idem_key: idem_key.clone(),
+                    },
+                );
+            }
+        }
+
         HeadlessPipelineStage::Continue(ValidatedExecution {
             execution,
             idem_key,
@@ -783,9 +857,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
-        let call_sig = tool_dedup_signature(&execution.name, &execution.args);
-        let scoped_call_sig =
-            observation_scoped_signature(&execution.name, &call_sig, workspace_epoch);
+        let health_identity = astra_turn_core::tool_result_semantics::scoped_tool_health_identity(
+            &execution.name,
+            &execution.args,
+            READ_ONLY_TOOLS
+                .contains(&execution.name.as_str())
+                .then_some(workspace_epoch),
+        );
 
         if let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() {
             let cache_key = idem_key.cache_key();
@@ -794,7 +872,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .ctx
                 .turn_guard
                 .health
-                .cache_hits_for_signature(&scoped_call_sig);
+                .cache_hits_for_signature(&health_identity);
             if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                 let body = format!(
                     "⛔ Repeated cached read suppressed: this exact {} request has already \
@@ -823,7 +901,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
                 self.ctx
                     .turn_guard
-                    .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                    .record_cache_hit_for_signature(&health_identity);
                 self.ctx
                     .tool_call_records
                     .push(journal_record_cross_turn_cache_hit(
@@ -893,7 +971,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -919,7 +997,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .ctx
                 .turn_guard
                 .health
-                .cache_hits_for_signature(&scoped_call_sig);
+                .cache_hits_for_signature(&health_identity);
             let (body, reason_code) =
                 if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     (
@@ -973,7 +1051,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -1294,7 +1372,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
 fn should_block_from_outcome_memory(
     health: &astra_turn_core::tool_health::ToolHealthTracker,
-    call_sig: &str,
+    call_sig: &astra_pipeline::ToolHealthIdentity,
 ) -> Option<usize> {
     let history = health.outcome_history(call_sig)?;
     let recent: Vec<_> = history
@@ -1322,7 +1400,7 @@ fn should_block_from_outcome_memory(
 
 fn should_backoff_from_nonprogress(
     health: &astra_turn_core::tool_health::ToolHealthTracker,
-    call_sig: &str,
+    call_sig: &astra_pipeline::ToolHealthIdentity,
 ) -> Option<(usize, u64)> {
     use astra_turn_core::action_compensation::FailureCategory;
 

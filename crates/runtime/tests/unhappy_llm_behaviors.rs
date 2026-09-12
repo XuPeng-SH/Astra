@@ -19,7 +19,7 @@
 
 use astra_turn_core::rate_limit_cooldown::{CooldownReason, RateLimitAction, RateLimitCooldown};
 use astra_turn_core::response_guard::{PROMPT_LEAK_FALLBACK, apply_response_guards};
-use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+use astra_turn_core::stall::{SERVER_STALL_WINDOW, StallSignature, detect_server_stall};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -194,8 +194,8 @@ fn repetition_loop_advisory_preserves_other_quality_signals() {
 
 #[test]
 fn stall_detector_requires_exactly_window_identical_rounds() {
-    let sig_a = BTreeSet::from(["bash:{\"cmd\":\"ls\"}".to_string()]);
-    let sig_b = BTreeSet::from(["bash:{\"cmd\":\"pwd\"}".to_string()]);
+    let sig_a = BTreeSet::from([StallSignature::new("bash", br#"{"cmd":"ls"}"#)]);
+    let sig_b = BTreeSet::from([StallSignature::new("bash", br#"{"cmd":"pwd"}"#)]);
 
     // Exactly window-1 identical rounds at the tail → not yet a stall.
     let mut history = vec![sig_b.clone()];
