@@ -111,6 +111,12 @@ Scheduling pressure may decrease after healthy progress; once this bounded
 assessment starts, final coverage is checked against the remaining failure facts,
 not the scheduling stage or whether the proposal tool itself returned success.
 
+If the provider schema rejects this submission before dispatch, the runtime
+records that typed pre-dispatch stage separately from an executed tool failure.
+The same reconciliation boundary may receive one argument correction; that
+budget survives checkpoint recovery and cannot be reopened by handler failures,
+unknown tools, a different boundary, or another invalid submission.
+
 Admission binds the call to the current run, turn chain, Work subject and user
 intent. The model supplies only the interpretation; the handler binds scope and
 boundary from current invocation authority. Model-supplied control fields are

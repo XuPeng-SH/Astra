@@ -168,6 +168,8 @@ use astra_turn_core::file_edit_journal::FileEditJournal;
 mod tool_handlers;
 
 pub(super) const DEFAULT_MEMORY_PRODUCER_ID: &str = "server-run";
+pub(crate) const PRE_DISPATCH_REJECTION_FIELD: &str = "astra_pre_dispatch_rejection";
+const PROVIDER_SCHEMA_VALIDATION_REJECTION: &str = "provider_schema_validation";
 
 #[derive(Clone, Debug)]
 pub(super) struct WorkRuntimeBinding {
@@ -395,9 +397,10 @@ fn dispatch_control_for_replayed_result(
 
 impl GovernableRuntimeToolResult {
     fn confirmed(
-        finished: crate::server::tool_invocation_runtime::FinishedToolInvocation,
+        mut finished: crate::server::tool_invocation_runtime::FinishedToolInvocation,
         dispatch_control: RuntimeToolDispatchControl,
     ) -> Self {
+        strip_pre_dispatch_rejection_metadata(&mut finished.result);
         Self {
             result: finished.result,
             confirmed_invocation: finished.record,
@@ -406,7 +409,8 @@ impl GovernableRuntimeToolResult {
         }
     }
 
-    fn completed(result: astra_tools::ToolResult) -> Self {
+    fn completed(mut result: astra_tools::ToolResult) -> Self {
+        strip_pre_dispatch_rejection_metadata(&mut result);
         Self {
             confirmed_invocation: None,
             result,
@@ -416,15 +420,41 @@ impl GovernableRuntimeToolResult {
     }
 
     fn completed_with_dispatch_control(
-        result: astra_tools::ToolResult,
+        mut result: astra_tools::ToolResult,
         dispatch_control: RuntimeToolDispatchControl,
     ) -> Self {
+        strip_pre_dispatch_rejection_metadata(&mut result);
         Self {
             confirmed_invocation: None,
             result,
             pending: None,
             dispatch_control,
         }
+    }
+
+    fn schema_preflight_rejected(mut result: astra_tools::ToolResult) -> Self {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        metadata.insert(
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        );
+        metadata.insert("execution_started".to_string(), Value::Bool(false));
+        metadata.insert(
+            PRE_DISPATCH_REJECTION_FIELD.to_string(),
+            Value::String(PROVIDER_SCHEMA_VALIDATION_REJECTION.to_string()),
+        );
+        Self {
+            confirmed_invocation: None,
+            result,
+            pending: None,
+            dispatch_control: RuntimeToolDispatchControl::Continue,
+        }
+    }
+}
+
+fn strip_pre_dispatch_rejection_metadata(result: &mut astra_tools::ToolResult) {
+    if let Some(metadata) = result.metadata.as_mut() {
+        metadata.remove(PRE_DISPATCH_REJECTION_FIELD);
     }
 }
 
@@ -3329,7 +3359,7 @@ impl RuntimeToolExecutor {
         // canonical registry schema; dynamic calls use the exact schema
         // carried by the current authenticated provider/deferred contract.
         if let Some(result) = self.validate_request_arguments(&request) {
-            return GovernableRuntimeToolResult::completed(result);
+            return GovernableRuntimeToolResult::schema_preflight_rejected(result);
         }
 
         request.policy.admission_snapshot = Some(
@@ -3629,6 +3659,10 @@ impl RuntimeToolExecutor {
                 });
         let mut executed =
             execute_tool_route_before_completion_events(&route_context, request, route).await;
+        // This field is reserved for the runtime argument-preflight branch
+        // above. Tool handlers and callback results cannot claim that their
+        // own work was rejected before dispatch.
+        strip_pre_dispatch_rejection_metadata(&mut executed.result);
         // Provider protocol metadata is never durable authority. Extract the
         // one allowlisted acknowledgement into a typed value and remove it
         // from result metadata before any event or ledger persistence.
@@ -12005,6 +12039,13 @@ esac
             .await;
 
         assert_tool_invalid_args(&result);
+        let metadata = result.metadata.as_ref().expect("schema preflight metadata");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(
+            metadata[PRE_DISPATCH_REJECTION_FIELD],
+            PROVIDER_SCHEMA_VALIDATION_REJECTION
+        );
         assert_eq!(
             progress.started.load(std::sync::atomic::Ordering::Relaxed),
             0,
@@ -12021,6 +12062,23 @@ esac
             *progress.completed_success.lock().unwrap(),
             Vec::<bool>::new(),
             "preflight rejection is represented by its typed result, not execution events"
+        );
+    }
+
+    #[test]
+    fn completed_handler_results_cannot_claim_schema_preflight_rejection() {
+        let mut result = astra_tools::ToolResult::error("handler failed after dispatch".into());
+        result.metadata = Some(Map::from_iter([(
+            PRE_DISPATCH_REJECTION_FIELD.to_string(),
+            Value::String(PROVIDER_SCHEMA_VALIDATION_REJECTION.to_string()),
+        )]));
+        let completed = GovernableRuntimeToolResult::completed(result);
+        assert!(
+            !completed
+                .result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key(PRE_DISPATCH_REJECTION_FIELD))
         );
     }
 

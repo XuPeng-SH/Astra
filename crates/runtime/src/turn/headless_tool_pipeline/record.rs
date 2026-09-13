@@ -746,6 +746,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     fields,
                     rec.effective_disposition(),
                 ));
+                rec.pre_dispatch_rejection = match fields
+                    .get(crate::server::runtime_tool_executor::PRE_DISPATCH_REJECTION_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("provider_schema_validation") => Some(
+                        astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
+                    ),
+                    _ => None,
+                };
                 rec.exit_semantics = fields
                     .get("exit_semantics")
                     .and_then(serde_json::Value::as_str)

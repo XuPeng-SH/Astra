@@ -160,7 +160,11 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("search", RO, C.union(EX)),
     tool("find", RO, C.union(EX)),
     tool("tool_search", RO, C),
-    tool("worktree", MU, NONE),
+    // Worktree entry/exit changes the selected repository binding, and exit
+    // can permanently remove a worktree and branch. Keep every lifecycle call
+    // approval-gated; action-aware compensation policy refines removal to
+    // destructive and fails closed on unknown arguments.
+    tool("worktree", MU, A),
     // ── Code intelligence (LSP-derived, read-only) ───────────────────
     tool("symbols", RO, CI.union(EX)),
     tool("find_definition", RO, CI.union(EX)),

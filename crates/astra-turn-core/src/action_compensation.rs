@@ -623,6 +623,41 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
     }
 }
 
+fn worktree_action_profile(args: &Value) -> ActionCompensationProfile {
+    let action = string_arg(args, "action");
+    let exit_action = string_arg(args, "exit_action").unwrap_or("keep");
+    let discard_changes = args
+        .get("discard_changes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match action {
+        Some("enter") => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            "entering a worktree changes the active session workspace and branch binding; use the worktree lifecycle to restore it",
+        ),
+        Some("exit") if exit_action == "keep" && !discard_changes => {
+            ActionCompensationProfile::manual(
+                true,
+                ActionCategory::Write,
+                "exiting with keep changes the active session workspace binding; the worktree and branch remain available",
+            )
+        }
+        Some("exit") if exit_action == "remove" || discard_changes => {
+            ActionCompensationProfile::manual(
+                true,
+                ActionCategory::Destructive,
+                "removing a worktree may permanently discard its files and commits and delete its branch; no automatic compensation is registered",
+            )
+        }
+        _ => ActionCompensationProfile::manual(
+            false,
+            ActionCategory::Destructive,
+            "the worktree lifecycle action or scope is unknown; explicit approval is required before changing repository state",
+        ),
+    }
+}
+
 pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationProfile {
     let normalized_args = normalize_args(args);
     match tool_name {
@@ -689,6 +724,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             shell_action_profile(string_arg(&normalized_args, "command"))
         }
         "mo_query" => sql_action_profile(&normalized_args),
+        "worktree" => worktree_action_profile(&normalized_args),
         _ if tool_name.starts_with("mcp_") => ActionCompensationProfile::manual(
             false,
             ActionCategory::Execute,
@@ -1047,6 +1083,41 @@ mod tests {
     }
 
     #[test]
+    fn worktree_lifecycle_requires_approval_and_classifies_removal_as_destructive() {
+        let cases = [
+            (
+                json!({"action":"enter", "path":"/repo"}),
+                ActionCategory::Write,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"keep"}),
+                ActionCategory::Write,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"remove"}),
+                ActionCategory::Destructive,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+                ActionCategory::Destructive,
+            ),
+            (json!({"action":"unknown"}), ActionCategory::Destructive),
+        ];
+
+        for (args, expected_category) in cases {
+            let profile = tool_action_profile("worktree", &args);
+            assert_eq!(profile.category, expected_category, "{args}");
+            assert!(!profile.reversible, "{args}");
+            assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+            assert!(tool_requires_explicit_approval("worktree", &args), "{args}");
+            assert!(
+                explicit_approval_reason("worktree", &args).is_some(),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
     fn cloud_approval_required_tools_never_fall_back_to_read_profiles() {
         fn sample_args(tool_name: &str) -> Value {
             match tool_name {
@@ -1066,6 +1137,9 @@ mod tests {
                     json!({"path": "tmp.txt", "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b"})
                 }
                 "publish_artifact" => json!({"path": "tmp.txt"}),
+                "worktree" => {
+                    json!({"action":"exit", "exit_action":"remove", "discard_changes":true})
+                }
                 "rollback_database_snapshots" | "rollback_file_edits" => json!({}),
                 other => panic!("add sample args for {other}"),
             }

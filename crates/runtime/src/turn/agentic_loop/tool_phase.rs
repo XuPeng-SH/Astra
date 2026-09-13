@@ -2832,6 +2832,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     super::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
         state,
         evo_records_before,
+        reconciliation_boundary.as_deref(),
     );
 
     let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);

@@ -199,6 +199,10 @@ alias. Ordinary worktree Git commands remain shell operations. Generic Server
 executors cannot silently create a local session owner. Typed commit/stash tool
 journals and their automatic compensation are removed along with their producers;
 shell side effects retain the existing shell observation and recovery contract.
+Every worktree lifecycle action requires explicit user approval before local or
+Edge execution. In particular, `exit_action=remove` is destructive, and
+`discard_changes=true` records requested behavior but does not grant consent.
+A denied Cloud-to-Edge removal is not dispatched to the Edge provider.
 
 Schema selection remains deterministic for unchanged bindings and policy. The
 removed contracts change the tool prefix once during migration; ordinary calls

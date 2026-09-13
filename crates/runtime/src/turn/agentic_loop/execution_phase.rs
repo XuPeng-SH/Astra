@@ -1005,7 +1005,11 @@ pub(crate) fn completion_action_window_requires_followup(state: &AgenticLoopStat
 #[cfg(test)]
 pub(crate) fn advance_completion_action_window_after_tool_round(state: &mut AgenticLoopState) {
     let new_records_start = state.stall.tool_call_records.len().saturating_sub(1);
-    advance_completion_action_window_after_tool_round_from_record_index(state, new_records_start);
+    advance_completion_action_window_after_tool_round_from_record_index(
+        state,
+        new_records_start,
+        None,
+    );
 }
 
 /// Reconcile the completion window against the exact tool-record range added
@@ -1015,6 +1019,7 @@ pub(crate) fn advance_completion_action_window_after_tool_round(state: &mut Agen
 pub(crate) fn advance_completion_action_window_after_tool_round_from_record_index(
     state: &mut AgenticLoopState,
     new_records_start: usize,
+    current_reconciliation_boundary: Option<&str>,
 ) {
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
@@ -1023,6 +1028,7 @@ pub(crate) fn advance_completion_action_window_after_tool_round_from_record_inde
         state,
         active_work_attempt,
         new_records_start,
+        current_reconciliation_boundary,
     );
 }
 
@@ -1215,6 +1221,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state(
         state,
         active_work_attempt,
         new_records_start,
+        None,
     );
 }
 
@@ -1222,6 +1229,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
     new_records_start: usize,
+    current_reconciliation_boundary: Option<&str>,
 ) {
     let pending_action = match pending_completion_action_for_work_state(state, active_work_attempt)
     {
@@ -1270,6 +1278,85 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
     }
 
     let round_records = state.stall.tool_call_records.get(new_records_start..);
+    if let CompletionAction::OutcomeReconciliation { boundary_id } = &window.action
+        && window.consumed
+        && window.matched
+        && current_reconciliation_boundary == Some(boundary_id.as_str())
+        && state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_schema_corrections_remaining
+            > 0
+        && state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_assessment
+            .is_none()
+        && round_records.is_some_and(|records| {
+            let [record] = records else {
+                return false;
+            };
+            record.name == "submit_task_resolution"
+                && record.disposition
+                    == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                && record.error_kind == Some(astra_core::ErrorKind::ToolInvalidArgs)
+                && record.pre_dispatch_rejection
+                    == Some(
+                        astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
+                    )
+                && record.authoritative_args_full().is_some_and(|args| {
+                    serde_json::from_str::<serde_json::Value>(args)
+                        .ok()
+                        .and_then(|args| {
+                            args.get("boundary_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .as_deref()
+                        == Some(boundary_id.as_str())
+                })
+        })
+    {
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_schema_corrections_remaining = 0;
+        if let Some(window) = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+        {
+            window.consumed = false;
+            window.matched = false;
+            window.attempts_remaining = 1;
+        }
+        state.max_turns = state.max_turns.saturating_add(1);
+        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        state.final_text.clear();
+        state.final_text_streamed = false;
+        state.hooks.completion_settlement.latest_provider_text = None;
+        state.hooks.completion_settlement.deferred_candidate_text = None;
+        state.hooks.completion_settlement.text_only = false;
+        state.hooks.completion_settlement.work_settlement_only = false;
+        state.budget_wrapup_injected = false;
+        let action = window.action.clone();
+        state.push_volatile_payload(
+            super::host::VolatileKind::FinalAnswerSettlement,
+            serde_json::json!({
+                "schema": "outcome_reconciliation_required.v1",
+                "signal": "task_resolution_schema_preflight_correction_once",
+                "allowed_action": action,
+                "attempts_remaining": 1,
+                "schema_corrections_remaining": 0,
+                "action_hint": completion_action_hint_for_state(state, &window.action),
+                "execution_authority": "one_corrected_submission_for_same_boundary",
+                "instruction": "The previous submit_task_resolution call was rejected by argument-schema validation before dispatch. Preserve its exact tool error, correct only the invalid submission arguments, and submit once more against this same boundary_id. Do not make any other tool call or claim that the rejected submission executed.",
+                "authority": "executor_attested_schema_preflight_rejection",
+            }),
+        );
+        return;
+    }
     let failed_post_mutation_validation_operation =
         if matches!(window.action, CompletionAction::PostMutationObservation)
             && window.matched
@@ -2344,6 +2431,10 @@ fn enforce_outcome_reconciliation_before_text_completion(
     state
         .hooks
         .completion_settlement
+        .outcome_reconciliation_schema_corrections_remaining = 0;
+    state
+        .hooks
+        .completion_settlement
         .outcome_reconciliation_assessment = None;
     let mut current_boundary = current_boundary.filter(|_| {
         state.runtime_tool_executor.as_deref().is_some_and(
@@ -2355,6 +2446,10 @@ fn enforce_outcome_reconciliation_before_text_completion(
     state.hooks.completion_settlement.text_only = current_boundary.is_none();
     state.hooks.completion_settlement.work_settlement_only = false;
     if let Some(boundary_id) = current_boundary {
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_schema_corrections_remaining = 1;
         state.budget_wrapup_injected = false;
         state.hooks.completion_settlement.completion_action_window =
             Some(astra_turn_types::CompletionActionWindow {
@@ -8109,6 +8204,7 @@ mod tests {
                 &mut state,
                 active_work,
                 0,
+                None,
             );
             assert_eq!(
                 enforce_completion_action_window_before_text_completion(&mut state),
@@ -12085,7 +12181,7 @@ mod tests {
             .push(validation_record("pytest -q", "test_failure"));
 
         advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 0,
+            &mut state, true, 0, None,
         );
 
         assert_eq!(
@@ -12621,7 +12717,7 @@ mod tests {
             .push(executed_record("read_file", true, None));
         let remaining = state.remaining_turns;
 
-        advance_completion_action_window_after_tool_round_from_record_index(&mut state, 0);
+        advance_completion_action_window_after_tool_round_from_record_index(&mut state, 0, None);
 
         let window = state
             .hooks
@@ -13333,7 +13429,7 @@ mod tests {
         );
 
         advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 4,
+            &mut state, true, 4, None,
         );
 
         assert!(
@@ -13855,7 +13951,7 @@ mod tests {
         state.hooks.completion_settlement.work_settlement_only = true;
 
         advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 1,
+            &mut state, true, 1, None,
         );
 
         assert!(
@@ -16113,6 +16209,202 @@ mod tests {
             .unwrap()
             .conclusion = TaskResolutionConclusion::Unknown;
         assert!(!task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+    }
+
+    #[test]
+    fn schema_preflight_reopens_one_exact_task_resolution_submission() {
+        fn schema_rejection(call_id: &str, boundary_id: &str) -> ToolCallRecord {
+            let args = serde_json::json!({
+                "boundary_id": boundary_id,
+                "verification_target": "README.md first line",
+                "conclusion": "supported",
+                "failed_call_ids": ["failed-read"],
+                "evidence_call_ids": ["read-success"],
+                "rationale": "The later direct read resolves the requested target.",
+                "remaining_gaps": ["A short first gap.", "x".repeat(318)],
+            })
+            .to_string();
+            ToolCallRecord {
+                name: "submit_task_resolution".into(),
+                tool_call_id: Some(call_id.into()),
+                ok: false,
+                args_full: Some(args.clone()),
+                runtime_args_full: Some(args),
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                disposition: Some(ToolCallDisposition::Rejected),
+                pre_dispatch_rejection: Some(
+                    astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
+                ),
+                ..Default::default()
+            }
+        }
+
+        let mut state = make_state();
+        state.max_turns = 5;
+        state.remaining_turns = 1;
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: CompletionAction::OutcomeReconciliation {
+                    boundary_id: "boundary-a".into(),
+                },
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 0,
+                consumed: true,
+                matched: true,
+            });
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_schema_corrections_remaining = 1;
+        state
+            .stall
+            .tool_call_records
+            .push(schema_rejection("invalid-submit", "boundary-a"));
+
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut state,
+            false,
+            0,
+            Some("boundary-a"),
+        );
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("same task-resolution action remains available once");
+        assert!(!window.consumed);
+        assert!(!window.matched);
+        assert_eq!(window.attempts_remaining, 1);
+        assert_eq!(state.max_turns, 6);
+        assert_eq!(state.remaining_turns, 2);
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_schema_corrections_remaining,
+            0
+        );
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.payload["signal"] == "task_resolution_schema_preflight_correction_once"
+                && entry.payload["action_hint"]["carrier"]["tool"] == "invoke_tool"
+        }));
+
+        // The correction replaces only the failed pre-dispatch attempt. A
+        // second malformed call reaches the ordinary terminal path and earns
+        // neither another action attempt nor another turn.
+        let budget = (state.max_turns, state.remaining_turns);
+        state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+            .unwrap()
+            .consumed = true;
+        state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+            .unwrap()
+            .matched = true;
+        state
+            .stall
+            .tool_call_records
+            .push(schema_rejection("invalid-submit-again", "boundary-a"));
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut state,
+            false,
+            1,
+            Some("boundary-a"),
+        );
+        assert_eq!((state.max_turns, state.remaining_turns), budget);
+        assert!(state.hooks.completion_settlement.text_only);
+    }
+
+    #[test]
+    fn schema_preflight_correction_requires_exact_boundary_and_producer_stage() {
+        let make_reconciliation_state = || {
+            let mut state = make_state();
+            state.hooks.completion_settlement.completion_action_window =
+                Some(astra_turn_types::CompletionActionWindow {
+                    action: CompletionAction::OutcomeReconciliation {
+                        boundary_id: "boundary-a".into(),
+                    },
+                    attempts_remaining: 0,
+                    mismatch_corrections_remaining: 1,
+                    consumed: true,
+                    matched: true,
+                });
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_schema_corrections_remaining = 1;
+            let mut record = ToolCallRecord {
+                name: "submit_task_resolution".into(),
+                ok: false,
+                args_full: Some(r#"{"boundary_id":"boundary-a"}"#.into()),
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                disposition: Some(ToolCallDisposition::Rejected),
+                pre_dispatch_rejection: Some(
+                    astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
+                ),
+                ..Default::default()
+            };
+            record.runtime_args_full = record.args_full.clone();
+            state.stall.tool_call_records.push(record);
+            state
+        };
+
+        let mut wrong_boundary = make_reconciliation_state();
+        let original_budget = (wrong_boundary.max_turns, wrong_boundary.remaining_turns);
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut wrong_boundary,
+            false,
+            0,
+            Some("boundary-b"),
+        );
+        assert_eq!(
+            (wrong_boundary.max_turns, wrong_boundary.remaining_turns),
+            original_budget
+        );
+        assert!(wrong_boundary.hooks.completion_settlement.text_only);
+
+        let mut handler_error = make_reconciliation_state();
+        handler_error.stall.tool_call_records[0].pre_dispatch_rejection = None;
+        let original_budget = (handler_error.max_turns, handler_error.remaining_turns);
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut handler_error,
+            false,
+            0,
+            Some("boundary-a"),
+        );
+        assert_eq!(
+            (handler_error.max_turns, handler_error.remaining_turns),
+            original_budget,
+            "ToolInvalidArgs without the runtime preflight stage does not reopen dispatch"
+        );
+        assert!(handler_error.hooks.completion_settlement.text_only);
+
+        let mut mixed_tool_round = make_reconciliation_state();
+        mixed_tool_round
+            .stall
+            .tool_call_records
+            .push(executed_record("read_file", true, None));
+        let original_budget = (mixed_tool_round.max_turns, mixed_tool_round.remaining_turns);
+        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
+            &mut mixed_tool_round,
+            false,
+            0,
+            Some("boundary-a"),
+        );
+        assert_eq!(
+            (mixed_tool_round.max_turns, mixed_tool_round.remaining_turns),
+            original_budget,
+            "a malformed assessment bundled with another tool call earns no correction window"
+        );
+        assert!(mixed_tool_round.hooks.completion_settlement.text_only);
     }
 
     #[test]
