@@ -1304,17 +1304,6 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                     == Some(
                         astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
                     )
-                && record.authoritative_args_full().is_some_and(|args| {
-                    serde_json::from_str::<serde_json::Value>(args)
-                        .ok()
-                        .and_then(|args| {
-                            args.get("boundary_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .as_deref()
-                        == Some(boundary_id.as_str())
-                })
         })
     {
         state
@@ -1351,7 +1340,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 "schema_corrections_remaining": 0,
                 "action_hint": completion_action_hint_for_state(state, &window.action),
                 "execution_authority": "one_corrected_submission_for_same_boundary",
-                "instruction": "The previous submit_task_resolution call was rejected by argument-schema validation before dispatch. Preserve its exact tool error, correct only the invalid submission arguments, and submit once more against this same boundary_id. Do not make any other tool call or claim that the rejected submission executed.",
+                "instruction": "The previous submit_task_resolution call was rejected by argument-schema validation before dispatch. Preserve its exact tool error, correct only the invalid assessment arguments, and submit once more under this same active reconciliation boundary. Use invoke_tool with name submit_task_resolution. Omit scope and boundary fields because the runtime binds them. Do not make any other tool call or claim that the rejected submission executed.",
                 "authority": "executor_attested_schema_preflight_rejection",
             }),
         );
@@ -16212,10 +16201,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_preflight_reopens_one_exact_task_resolution_submission() {
-        fn schema_rejection(call_id: &str, boundary_id: &str) -> ToolCallRecord {
+    fn schema_preflight_reopens_one_exact_task_resolution_submission_without_boundary_fields() {
+        fn schema_rejection(call_id: &str) -> ToolCallRecord {
             let args = serde_json::json!({
-                "boundary_id": boundary_id,
                 "verification_target": "README.md first line",
                 "conclusion": "supported",
                 "failed_call_ids": ["failed-read"],
@@ -16259,7 +16247,18 @@ mod tests {
         state
             .stall
             .tool_call_records
-            .push(schema_rejection("invalid-submit", "boundary-a"));
+            .push(schema_rejection("invalid-submit"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                state.stall.tool_call_records[0]
+                    .authoritative_args_full()
+                    .unwrap()
+            )
+            .unwrap()
+            .get("boundary_id")
+            .is_none(),
+            "the model does not submit runtime-bound boundary fields"
+        );
 
         advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
             &mut state,
@@ -16312,7 +16311,7 @@ mod tests {
         state
             .stall
             .tool_call_records
-            .push(schema_rejection("invalid-submit-again", "boundary-a"));
+            .push(schema_rejection("invalid-submit-again"));
         advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
             &mut state,
             false,
@@ -16344,7 +16343,7 @@ mod tests {
             let mut record = ToolCallRecord {
                 name: "submit_task_resolution".into(),
                 ok: false,
-                args_full: Some(r#"{"boundary_id":"boundary-a"}"#.into()),
+                args_full: Some(r#"{"remaining_gaps":["gap"]}"#.into()),
                 error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
                 disposition: Some(ToolCallDisposition::Rejected),
                 pre_dispatch_rejection: Some(

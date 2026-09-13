@@ -8,11 +8,15 @@ prompt: |
   First run `astra_missing_reader_probe_827 README.md` once in Bash. If the
   command is unavailable, do not retry it or install anything; read the first
   line directly with read_file in a later turn.
-  At the final task-resolution boundary, submit the assessment. Deliberately
-  make its first submission invalid by setting remaining_gaps item 2 to an
-  explanatory string longer than 256 characters while keeping item 1 valid.
-  When the runtime returns the schema error, correct only that argument and
-  submit once more for the same boundary. Do not make any workspace changes.
+  At the final task-resolution boundary, submit the assessment through
+  invoke_tool with name submit_task_resolution. Use the exact assessment schema
+  supplied by the runtime; do not call submit_task_resolution as a top-level
+  tool or search for it. The runtime binds scope and boundary, so omit those
+  fields from the assessment arguments. Deliberately make the first submission
+  invalid by setting remaining_gaps item 2 to an explanatory string longer than
+  256 characters while keeping item 1 valid. When the runtime returns the
+  schema error, correct only that argument and submit once more under the same
+  active boundary. Do not make any workspace changes.
   In the final answer, report the
   observed first line and distinguish the failed command attempt from the
   successful direct read.
