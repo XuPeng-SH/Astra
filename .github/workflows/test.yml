@@ -81,7 +81,9 @@ jobs:
           - segment: edge-fs-tools
             filter: "test(/edge_tools::fs_tools::/)"
             command_timeout: 25m
-          - segment: edge-worktree
+          # Required branch-protection context; the retired Git tool shard
+          # now exercises the session worktree lifecycle.
+          - segment: edge-git-gix
             filter: "test(/edge_tools::worktree::/) or test(/edge_tools::tests::worktree_tests::/)"
             command_timeout: 25m
           - segment: edge-rest
