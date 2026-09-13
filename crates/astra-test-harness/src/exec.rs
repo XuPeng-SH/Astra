@@ -1364,15 +1364,11 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
     // routes a shim `/bin/sh -c "sleep 10"` script through the real executor
     // path.
     //
-    // `#[serial]`: this test is timing-sensitive. The 1-second case
-    // timeout races against `tokio::time::timeout` precision and
-    // process-spawn latency. Under heavy parallel test load
-    // (`cargo test --workspace` spawns 100+ test binaries) the
-    // child-process spawn was failing with EAGAIN/ENOMEM, producing
-    // exit_code=-1 instead of 124 and tripping the assertion. Running
-    // serial removes the contention on a path the test isn't actually
-    // exercising. (The other path-1/path-2 spawn-error handling stays
-    // covered by `external_executor_spawn_failure_returns_-1` etc.)
+    // `#[serial]`: leave enough startup time for the shim to publish its
+    // server-issued session/run identity under parallel test load. The child
+    // still sleeps for 10 seconds, so the 5-second case deadline exercises
+    // timeout cancellation. Spawn-error handling remains covered by
+    // `external_executor_spawn_failure_returns_-1` and related tests.
     #[tokio::test]
     #[serial_test::serial]
     async fn timeout_kills_subprocess_and_returns_posix_124() {
@@ -1417,7 +1413,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
-            timeout_seconds: 1,
+            timeout_seconds: 5,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1433,9 +1429,9 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         let elapsed = start.elapsed();
 
         // `kill_on_drop` + explicit timeout capped the elapsed wall
-        // time near the 1s budget. 3s slack for CI noise.
+        // time near the 5s budget. 2s slack for CI scheduling noise.
         assert!(
-            elapsed.as_secs() <= 3,
+            elapsed.as_secs() <= 7,
             "timeout didn't kill subprocess — elapsed {}s",
             elapsed.as_secs()
         );

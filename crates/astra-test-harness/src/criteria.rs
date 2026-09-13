@@ -570,6 +570,8 @@ fn default_cache_read_min_pairs() -> u32 {
 pub enum JournalToolDocument {
     Arguments,
     Result,
+    /// Bounded executor-authored outcome fields from the durable call record.
+    RuntimeMetadata,
 }
 
 /// One structural predicate applied to the same durable tool call that
@@ -998,11 +1000,19 @@ fn call_matches_predicate(
     let Some(predicate) = predicate else {
         return true;
     };
-    let document = match predicate.document {
+    let document = journal_tool_document(call, predicate.document);
+    document.and_then(|value| value.pointer(&predicate.path)) == Some(&predicate.equals)
+}
+
+fn journal_tool_document(
+    call: &crate::session_capture::JournalToolCall,
+    document: JournalToolDocument,
+) -> Option<&serde_json::Value> {
+    match document {
         JournalToolDocument::Arguments => call.arguments.as_ref(),
         JournalToolDocument::Result => call.result.as_ref(),
-    };
-    document.and_then(|value| value.pointer(&predicate.path)) == Some(&predicate.equals)
+        JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
+    }
 }
 
 fn call_matches_predicates(
@@ -1865,10 +1875,7 @@ fn evaluate_one(
                     else {
                         return true;
                     };
-                    let value = match document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    };
+                    let value = journal_tool_document(call, *document);
                     value.and_then(|value| value.pointer(path)) == Some(equals)
                 })
                 .count() as u32;
@@ -1962,10 +1969,7 @@ fn evaluate_one(
             };
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
-                let value = match document {
-                    JournalToolDocument::Arguments => call.arguments.as_ref(),
-                    JournalToolDocument::Result => call.result.as_ref(),
-                };
+                let value = journal_tool_document(call, *document);
                 value.and_then(|value| value.pointer(path)) == Some(equals)
             });
             CriterionResult {
@@ -1995,10 +1999,7 @@ fn evaluate_one(
                 .iter()
                 .filter(|call| call.name == *name && call.ok == Some(true))
                 .any(|call| {
-                    let value = match document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    };
+                    let value = journal_tool_document(call, *document);
                     value
                         .and_then(|value| value.pointer(path))
                         .and_then(serde_json::Value::as_str)
@@ -2841,10 +2842,7 @@ fn evaluate_one(
                 }
                 if call.name == *consumer && call_matches_predicate(&call, consumer_filter.as_ref())
                 {
-                    let consumer_document = match consumer_document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    };
+                    let consumer_document = journal_tool_document(&call, *consumer_document);
                     let matched_value = consumer_document.and_then(|document| {
                         produced.iter().find(|value| {
                             consumer_paths.iter().any(|path| {
@@ -2861,11 +2859,8 @@ fn evaluate_one(
                 }
                 if call.name == *producer && call_matches_predicate(&call, producer_filter.as_ref())
                 {
-                    let producer_value = match producer_document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    }
-                    .and_then(|document| document.pointer(producer_path));
+                    let producer_value = journal_tool_document(&call, *producer_document)
+                        .and_then(|document| document.pointer(producer_path));
                     if let Some(value) = producer_value.filter(|value| is_flow_scalar(value)) {
                         produced.push(value.clone());
                     }
@@ -2909,10 +2904,7 @@ fn evaluate_one(
                     continue;
                 }
                 if call.name == *consumer && call_matches_predicates(&call, consumer_filters) {
-                    let consumer_document = match consumer_document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    };
+                    let consumer_document = journal_tool_document(&call, *consumer_document);
                     let matched_value = consumer_document.and_then(|document| {
                         produced.iter().find(|(value, producer_turn)| {
                             let turn_separation_ok = min_turns_after_producer.is_none_or(|min| {
@@ -2936,11 +2928,8 @@ fn evaluate_one(
                     }
                 }
                 if call.name == *producer && call_matches_predicates(&call, producer_filters) {
-                    let producer_value = match producer_document {
-                        JournalToolDocument::Arguments => call.arguments.as_ref(),
-                        JournalToolDocument::Result => call.result.as_ref(),
-                    }
-                    .and_then(|document| document.pointer(producer_path));
+                    let producer_value = journal_tool_document(&call, *producer_document)
+                        .and_then(|document| document.pointer(producer_path));
                     if let Some(value) = producer_value.filter(|value| is_flow_scalar(value)) {
                         produced.push((value.clone(), call.turn));
                     }
@@ -5490,6 +5479,15 @@ mod tests {
                     "ok": true,
                     "args_full": r#"{"action":"get_results","group_id":"review"}"#,
                     "result_full": r#"{"fanout":{"terminal":3},"provenance":{"all_slots_delivered":true}}"#
+                }, {
+                    "tool_call_id": "schema-rejected-call",
+                    "name": "submit_task_resolution",
+                    "ok": false,
+                    "args_full": r#"{"remaining_gaps":["invalid"]}"#,
+                    "result_full": r#"{"error_kind":"tool_invalid_args"}"#,
+                    "error_kind": "tool_invalid_args",
+                    "disposition": "rejected",
+                    "pre_dispatch_rejection": "provider_schema_validation"
                 }]
             }),
         )]);
@@ -5515,6 +5513,12 @@ mod tests {
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
             },
+            Criterion::JournalToolJson {
+                name: "submit_task_resolution".into(),
+                document: JournalToolDocument::RuntimeMetadata,
+                path: "/pre_dispatch_rejection".into(),
+                equals: serde_json::json!("provider_schema_validation"),
+            },
         ];
         let results =
             evaluate_deterministic_with_session(&criteria, &outcome_with_tools(&[]), Some(&sess));
@@ -5536,6 +5540,21 @@ mod tests {
             Some(&sess),
         );
         assert!(!wrong[0].passed, "partial settlement must fail");
+
+        let wrong_stage = evaluate_deterministic_with_session(
+            &[Criterion::JournalToolJson {
+                name: "submit_task_resolution".into(),
+                document: JournalToolDocument::RuntimeMetadata,
+                path: "/pre_dispatch_rejection".into(),
+                equals: serde_json::json!("handler_error"),
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+        assert!(
+            !wrong_stage[0].passed,
+            "another rejection stage must not match"
+        );
     }
 
     #[test]
