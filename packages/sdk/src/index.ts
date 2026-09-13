@@ -31,7 +31,15 @@ export type {
   TurnCompleteEvent,
   StreamErrorEvent,
   WarningEvent,
-  ExplainEvent,
+  ExplainAnalyzeEventV1,
+  ExplainAnalyzeNodeKindV1,
+  ExplainAnalyzeOutcomeV1,
+  ExplainAnalyzeUsageV1,
+  ExplainAnalyzeContextSourceKindV1,
+  ExplainAnalyzeContextBudgetV1,
+  ExplainAnalyzeContextSourceV1,
+  ExplainAnalyzeContextAssemblyV1,
+  ExplainAnalyzeContextMetricsV1,
   PlanCreatedEvent,
   PlanRevisedEvent,
   PlanStepStartEvent,
@@ -278,6 +286,29 @@ export type {
   WorkRevisionAlignment,
 } from "./types";
 
+export {
+  explainAnalyzeFactFingerprint,
+  explainAnalyzeMaxConcurrency,
+  explainAnalyzeNodeIsActive,
+  formatMs,
+  formatUsageDetail,
+  formatUsage,
+  isExplainAnalyzeEventV1,
+  explainAnalyzeContextSections,
+  formatExplainAnalyzeContext,
+  explainAnalyzeTurnOutcome,
+  explainAnalyzeCoverageGapLabel,
+  reduceExplainAnalyzeEvents,
+  renderExplainAnalyzeHtml,
+} from "./explain-analyze";
+export { renderExplainAnalyzeText } from "./explain-analyze-text";
+export type {
+  ExplainAnalyzeGraphV1,
+  ExplainAnalyzeDiagnosticV1,
+  ExplainAnalyzeNodeV1,
+} from "./explain-analyze";
+export type { ExplainAnalyzeCoverageGapV1 } from "./types";
+
 export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {
   decodeWorkObservationReportV1,
@@ -434,3 +465,6 @@ export {
 } from "./http";
 export { AstraWebSocket } from "./websocket";
 export type { AstraWebSocketOptions, ToolApproval } from "./websocket";
+
+export { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
+export type { ExplainAnalyzeLayoutNodeV1, ExplainAnalyzeLayoutEdgeKindV1, ExplainAnalyzeLayoutEdgeV1, ExplainAnalyzeLayoutDomainV1, ExplainAnalyzeLayoutV1, ExplainAnalyzeLayoutOptionsV1 } from "./explain-analyze-layout";

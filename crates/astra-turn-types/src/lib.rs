@@ -13,10 +13,13 @@ pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod explain_analyze;
+mod explain_analyze_projection;
+mod explain_wire;
+pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
-mod phase_receipt;
 mod provider_canonical_transition;
 mod provider_contract;
 mod result_quality;
@@ -56,6 +59,20 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use explain_analyze::{
+    EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
+    ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
+    ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
+    ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
+    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
+    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+};
+pub use explain_analyze_projection::{
+    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
+    ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
+    ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
+};
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
     client_direct_execution_field,
@@ -67,10 +84,6 @@ pub use memory_ranking::{
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
-};
-pub use phase_receipt::{
-    TURN_PHASE_EVENT_TYPE, TURN_PHASE_SCHEMA_VERSION, TurnPhaseKindV1, TurnPhaseOutcomeV1,
-    TurnPhaseReceiptV1,
 };
 pub use provider_canonical_transition::{
     CanonicalPrefixIdentityV1, MAX_PROVIDER_CANONICAL_RECOVERY_BYTES,

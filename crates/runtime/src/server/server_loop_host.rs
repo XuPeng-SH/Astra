@@ -32,6 +32,7 @@ use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
 };
+use crate::server::tool_route_runtime::ToolRouteObserver;
 use crate::server::tool_route_selection::{
     ToolExecutionClass, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
     routing_decision_for_binding, runtime_binding_can_use_client_ledger,
@@ -3184,6 +3185,195 @@ enum WorkEstablishmentCarrierControl {
     DeferPending,
 }
 
+fn explain_analyze_call_id(event: &Value) -> Option<&str> {
+    event
+        .get("call_id")
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("request_id"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())
+}
+
+fn explain_analyze_tool_name(event: &Value) -> &str {
+    event
+        .pointer("/function/name")
+        .or_else(|| event.get("tool"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("tool")
+}
+
+fn bounded_explain_analyze_label(prefix: &str, name: &str) -> String {
+    const MAX_LABEL_BYTES: usize = 160;
+    let mut label = format!("{prefix} {name}");
+    if label.len() > MAX_LABEL_BYTES {
+        let mut boundary = MAX_LABEL_BYTES - '…'.len_utf8();
+        while !label.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        label.truncate(boundary);
+        label.push('…');
+    }
+    label
+}
+
+#[derive(Clone)]
+struct ExplainAnalyzeContext {
+    run_id: String,
+    turn_id: String,
+    root_node_id: String,
+    clock_domain_id: String,
+    started_at: Instant,
+    next_event_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ExplainAnalyzeNode {
+    node_id: String,
+    parent_node_id: Option<String>,
+    kind: astra_turn_types::ExplainAnalyzeNodeKindV1,
+    round_index: Option<u32>,
+    attempt_index: Option<u32>,
+    label: String,
+    started_at: Instant,
+    start_elapsed_ms: u64,
+}
+
+impl ExplainAnalyzeContext {
+    fn elapsed_ms_at(&self, instant: Instant) -> u64 {
+        u64::try_from(
+            instant
+                .saturating_duration_since(self.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    fn next_event_id(&self) -> String {
+        let sequence = self.next_event_id.fetch_add(1, Ordering::Relaxed);
+        format!("{}:{sequence}", self.clock_domain_id)
+    }
+
+    fn event(
+        &self,
+        node: &ExplainAnalyzeNode,
+        transition: astra_turn_types::ExplainAnalyzeTransitionV1,
+        instant: Instant,
+        duration_ms: Option<u64>,
+        outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+    ) -> Option<Value> {
+        self.event_with_context(node, transition, instant, duration_ms, outcome, usage, None)
+    }
+
+    fn event_with_context(
+        &self,
+        node: &ExplainAnalyzeNode,
+        transition: astra_turn_types::ExplainAnalyzeTransitionV1,
+        instant: Instant,
+        duration_ms: Option<u64>,
+        outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+    ) -> Option<Value> {
+        self.event_with_context_and_coverage(
+            node,
+            transition,
+            instant,
+            duration_ms,
+            outcome,
+            usage,
+            context_metrics,
+            Vec::new(),
+        )
+    }
+
+    fn event_with_context_and_coverage(
+        &self,
+        node: &ExplainAnalyzeNode,
+        transition: astra_turn_types::ExplainAnalyzeTransitionV1,
+        instant: Instant,
+        duration_ms: Option<u64>,
+        outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+        coverage_gaps: Vec<astra_turn_types::ExplainAnalyzeCoverageGapV1>,
+    ) -> Option<Value> {
+        let (start_elapsed_ms, duration_ms, outcome, usage) = match transition {
+            astra_turn_types::ExplainAnalyzeTransitionV1::Started => {
+                if duration_ms.is_some()
+                    || outcome.is_some()
+                    || usage.is_some()
+                    || context_metrics.is_some()
+                {
+                    return None;
+                }
+                (None, None, None, None)
+            }
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished => {
+                (Some(node.start_elapsed_ms), duration_ms, outcome, usage)
+            }
+        };
+        let fact = astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: self.next_event_id(),
+            run_id: self.run_id.clone(),
+            turn_id: self.turn_id.clone(),
+            node_id: node.node_id.clone(),
+            parent_node_id: node.parent_node_id.clone(),
+            dependency_node_ids: Vec::new(),
+            producer_id: "astra-server-loop".to_string(),
+            clock_domain_id: self.clock_domain_id.clone(),
+            kind: node.kind,
+            round_index: node.round_index,
+            attempt_index: node.attempt_index,
+            label: node.label.clone(),
+            transition,
+            elapsed_ms: self.elapsed_ms_at(instant),
+            start_elapsed_ms,
+            duration_ms,
+            outcome,
+            usage,
+            context: context_metrics,
+            coverage_gaps,
+        };
+        if !fact.is_valid() {
+            return None;
+        }
+        let mut event = serde_json::to_value(fact).ok()?;
+        event["type"] = Value::String(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE.to_string());
+        Some(event)
+    }
+}
+
+impl ExplainAnalyzeNode {
+    fn new(
+        context: &ExplainAnalyzeContext,
+        node_id: String,
+        parent_node_id: Option<String>,
+        kind: astra_turn_types::ExplainAnalyzeNodeKindV1,
+        label: impl Into<String>,
+        started_at: Instant,
+        round_index: Option<u32>,
+        attempt_index: Option<u32>,
+    ) -> Self {
+        Self {
+            node_id,
+            parent_node_id,
+            kind,
+            round_index,
+            attempt_index,
+            label: label.into(),
+            started_at,
+            start_elapsed_ms: context.elapsed_ms_at(started_at),
+        }
+    }
+}
+
 pub struct ServerAgenticLoopHost {
     execution_handoff: Option<ExecutionHandoffContext>,
     // ── LLM resolution ──
@@ -3417,6 +3607,17 @@ pub struct ServerAgenticLoopHost {
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
     emitted_events: Vec<Value>,
+    /// Clock and identity context for the current product-facing Explain
+    /// Analyze graph. Trace spans keep their own diagnostic lifecycle.
+    explain_analyze_context: Option<ExplainAnalyzeContext>,
+    explain_analyze_open_nodes: HashMap<String, ExplainAnalyzeNode>,
+    explain_analyze_tool_route_observer: Option<Arc<ExplainAnalyzeToolRouteObserver>>,
+    explain_analyze_admission_parents:
+        Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    explain_analyze_admission_nodes: HashMap<String, String>,
+    explain_analyze_tool_nodes: HashMap<String, String>,
+    pending_request_preparation_context:
+        Option<(u32, u32, astra_turn_types::ExplainAnalyzeContextMetricsV1)>,
     /// First event-lane contract violation observed during this host turn.
     ///
     /// Ordinary event producers are intentionally infallible at the call site,
@@ -3846,9 +4047,15 @@ struct AgentLiveMirror {
     sink: SharedAgentLiveEventSink,
 }
 
+const MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS: usize = 20_000;
+
 #[derive(Default)]
 struct HostEventGapState {
     dropped: AtomicU64,
+    recovery_lock: std::sync::Mutex<()>,
+    unacknowledged_explain_events: std::sync::Mutex<Vec<Value>>,
+    recoverable_explain_event_ids: std::sync::Mutex<Vec<String>>,
+    explain_recovery_overflowed: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -3857,12 +4064,221 @@ pub(crate) struct HostEventGapTracker(Arc<HostEventGapState>);
 
 impl HostEventGapTracker {
     pub(crate) fn record_drop(&self) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        drop(_guard);
         self.0.notify.notify_one();
     }
 
-    pub(crate) fn take(&self) -> u64 {
-        self.0.dropped.swap(0, Ordering::AcqRel)
+    pub(crate) fn track_explain_analyze_event(&self, event: Value) -> bool {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(event_id) = event.get("event_id").and_then(Value::as_str) else {
+            self.0
+                .explain_recovery_overflowed
+                .store(true, Ordering::Release);
+            return false;
+        };
+        let mut pending = self
+            .0
+            .unacknowledged_explain_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .iter()
+            .any(|value| value.get("event_id").and_then(Value::as_str) == Some(event_id))
+        {
+            return true;
+        }
+        if pending.len() >= MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
+            self.0
+                .explain_recovery_overflowed
+                .store(true, Ordering::Release);
+            return false;
+        }
+        pending.push(event);
+        true
+    }
+
+    pub(crate) fn record_explain_analyze_drop(&self, event: Value) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let event_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut pending = self
+            .0
+            .unacknowledged_explain_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pending
+            .iter()
+            .any(|value| value.get("event_id").and_then(Value::as_str) == event_id.as_deref())
+        {
+            if pending.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
+                pending.push(event);
+            } else {
+                self.0
+                    .explain_recovery_overflowed
+                    .store(true, Ordering::Release);
+            }
+        }
+        drop(pending);
+        if let Some(event_id) = event_id {
+            let mut recoverable = self
+                .0
+                .recoverable_explain_event_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !recoverable.iter().any(|pending| pending == &event_id) {
+                if recoverable.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
+                    recoverable.push(event_id);
+                } else {
+                    self.0
+                        .explain_recovery_overflowed
+                        .store(true, Ordering::Release);
+                }
+            }
+        } else {
+            self.0
+                .explain_recovery_overflowed
+                .store(true, Ordering::Release);
+        }
+        self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        drop(_guard);
+        self.0.notify.notify_one();
+    }
+
+    pub(crate) fn acknowledge_explain_analyze_delivery(&self, event_id: &str) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.0
+            .unacknowledged_explain_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|event| event.get("event_id").and_then(Value::as_str) != Some(event_id));
+    }
+
+    pub(crate) fn pending_recovery_snapshot(&self) -> (u64, Vec<Value>, bool) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = self
+            .0
+            .unacknowledged_explain_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_by_id: HashMap<&str, &Value> = pending
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id, event))
+            })
+            .collect();
+        let recoverable_ids = self
+            .0
+            .recoverable_explain_event_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut events = Vec::with_capacity(recoverable_ids.len());
+        for event_id in recoverable_ids {
+            if let Some(event) = pending_by_id.get(event_id.as_str()) {
+                events.push((*event).clone());
+            } else {
+                self.0
+                    .explain_recovery_overflowed
+                    .store(true, Ordering::Release);
+            }
+        }
+        let dropped = self.0.dropped.load(Ordering::Acquire);
+        // Overflow is sticky for the whole run. Draining retained facts must
+        // never make a later gap marker claim full recovery.
+        let complete = !self.0.explain_recovery_overflowed.load(Ordering::Acquire);
+        (dropped, events, complete)
+    }
+
+    pub(crate) fn acknowledge_recovery_batch(&self, dropped: u64, explain_events: &[Value]) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut recoverable = self
+            .0
+            .recoverable_explain_event_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = self
+            .0
+            .unacknowledged_explain_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let acknowledged_ids: HashSet<&str> = explain_events
+            .iter()
+            .filter_map(|event| event.get("event_id").and_then(Value::as_str))
+            .collect();
+        recoverable.retain(|id| !acknowledged_ids.contains(id.as_str()));
+        pending.retain(|event| {
+            !event
+                .get("event_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| acknowledged_ids.contains(id))
+        });
+        let mut current = self.0.dropped.load(Ordering::Acquire);
+        loop {
+            let acknowledged_drops = current.min(dropped);
+            match self.0.dropped.compare_exchange_weak(
+                current,
+                current - acknowledged_drops,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn take_recovery_snapshot(&self) -> (u64, Vec<Value>, bool) {
+        let _guard = self
+            .0
+            .recovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dropped = self.0.dropped.swap(0, Ordering::AcqRel);
+        let events = std::mem::take(
+            &mut *self
+                .0
+                .unacknowledged_explain_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.0
+            .recoverable_explain_event_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let complete = !self.0.explain_recovery_overflowed.load(Ordering::Acquire);
+        (dropped, events, complete)
     }
 
     pub(crate) async fn notified(&self) {
@@ -4009,9 +4425,504 @@ enum EdgeApprovalWait {
     FailedClosed(String),
 }
 
+#[derive(Clone)]
 struct ServerEventSender {
     tx: tokio::sync::mpsc::Sender<Value>,
     gap: HostEventGapTracker,
+    committed_live_detached: bool,
+}
+
+impl ServerEventSender {
+    fn try_send_explain_analyze(&self, event: Value) -> bool {
+        if !self.gap.track_explain_analyze_event(event.clone()) {
+            self.gap.record_explain_analyze_drop(event);
+            return false;
+        }
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                self.gap.record_explain_analyze_drop(event);
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                self.gap.record_explain_analyze_drop(event);
+                false
+            }
+        }
+    }
+}
+
+struct ExplainAnalyzeProviderAttemptSpan {
+    node: ExplainAnalyzeNode,
+    start_event: Option<Value>,
+    start_sent_live: bool,
+    terminal_event: Option<Value>,
+    terminal_sent_live: bool,
+    usage_presence: crate::turn::token_usage::TokenUsagePresence,
+}
+
+#[derive(Clone)]
+struct ExplainAnalyzeToolRouteParent {
+    node_id: String,
+    parent_node_id: Option<String>,
+    round_index: Option<u32>,
+    started_at: Instant,
+}
+
+struct ExplainAnalyzeToolRouteSpan {
+    node: ExplainAnalyzeNode,
+    start_event: Option<Value>,
+    start_sent_live: bool,
+    admission_terminal_event: Option<Value>,
+    admission_terminal_sent_live: bool,
+    terminal_event: Option<Value>,
+    terminal_sent_live: bool,
+}
+
+/// Adds product-facing tool facts at the canonical runtime route boundary.
+/// Runtime work-surface events use the lifecycle fanout lane, which does not
+/// re-enter this host. The observer therefore shares the host's Explain
+/// context and live sender, retaining any fact that live delivery cannot
+/// carry so the host can reconcile it into the normal replay buffer.
+struct ExplainAnalyzeToolRouteObserver {
+    context: Option<ExplainAnalyzeContext>,
+    sender: Option<ServerEventSender>,
+    admission_parents: Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    spans: std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteSpan>>,
+}
+
+impl ExplainAnalyzeToolRouteObserver {
+    fn new(
+        context: Option<ExplainAnalyzeContext>,
+        sender: Option<ServerEventSender>,
+        admission_parents: Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    ) -> Self {
+        Self {
+            context,
+            sender,
+            admission_parents,
+            spans: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn drain_spans(&self) -> HashMap<String, ExplainAnalyzeToolRouteSpan> {
+        std::mem::take(
+            &mut *self
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
+    fn note_dispatch_started(
+        &self,
+        boundary: &crate::server::tool_route_boundary::ToolRouteBoundary,
+        started_at: Instant,
+    ) {
+        let Some(call_id) = boundary.tool_call_id() else {
+            return;
+        };
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        let mut spans = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if spans.contains_key(call_id) {
+            return;
+        }
+        let parent = self
+            .admission_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(call_id)
+            .cloned();
+        let parent_node_id = parent
+            .as_ref()
+            // Admission is a sibling stage under the tool batch. The measured
+            // ToolCall starts after that stage resolves, so it must retain
+            // the admission node's parent rather than become its child.
+            .and_then(|parent| parent.parent_node_id.clone())
+            .or_else(|| Some(context.root_node_id.clone()));
+        let round_index = parent.as_ref().and_then(|parent| parent.round_index);
+        let (admission_terminal_event, admission_terminal_sent_live) = parent
+            .as_ref()
+            .map(|parent| {
+                let admission_node = ExplainAnalyzeNode::new(
+                    context,
+                    parent.node_id.clone(),
+                    parent.parent_node_id.clone(),
+                    astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
+                    bounded_explain_analyze_label("Waiting to dispatch", boundary.tool_name()),
+                    parent.started_at,
+                    parent.round_index,
+                    None,
+                );
+                let event = context.event(
+                    &admission_node,
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    started_at,
+                    Some(
+                        u64::try_from(
+                            started_at
+                                .saturating_duration_since(parent.started_at)
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX),
+                    ),
+                    Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved),
+                    None,
+                );
+                let sent_live = self.sender.as_ref().is_some_and(|sender| {
+                    event
+                        .clone()
+                        .is_some_and(|event| sender.try_send_explain_analyze(event))
+                });
+                (event, sent_live)
+            })
+            .unwrap_or((None, false));
+        if parent.is_some()
+            && let Ok(mut parents) = self.admission_parents.lock()
+        {
+            parents.remove(call_id);
+        }
+        let node = ExplainAnalyzeNode::new(
+            context,
+            format!("{}/tool/{}", context.root_node_id, context.next_event_id()),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall,
+            bounded_explain_analyze_label("Run", boundary.tool_name()),
+            started_at,
+            round_index,
+            None,
+        );
+        let start_event = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            started_at,
+            None,
+            None,
+            None,
+        );
+        let start_sent_live = self.sender.as_ref().is_some_and(|sender| {
+            start_event
+                .clone()
+                .is_some_and(|event| sender.try_send_explain_analyze(event))
+        });
+        spans.insert(
+            call_id.to_string(),
+            ExplainAnalyzeToolRouteSpan {
+                node,
+                start_event,
+                start_sent_live,
+                admission_terminal_event,
+                admission_terminal_sent_live,
+                terminal_event: None,
+                terminal_sent_live: false,
+            },
+        );
+    }
+
+    fn note_dispatch_finished(
+        &self,
+        boundary: &crate::server::tool_route_boundary::ToolRouteBoundary,
+        result: &astra_tools::ToolResult,
+        finished_at: Instant,
+    ) {
+        let Some(call_id) = boundary.tool_call_id() else {
+            return;
+        };
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        let mut spans = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(span) = spans.get_mut(call_id) else {
+            return;
+        };
+        if span.terminal_event.is_some() {
+            return;
+        }
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(span.node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        span.terminal_event = context.event(
+            &span.node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(if result.is_error {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+            } else {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+            }),
+            None,
+        );
+        // If the start was lost to bounded delivery, retain both facts for
+        // host reconciliation so consumers never observe finish-before-start.
+        if span.start_sent_live
+            && let Some(sender) = self.sender.as_ref()
+        {
+            span.terminal_sent_live = span
+                .terminal_event
+                .clone()
+                .is_some_and(|event| sender.try_send_explain_analyze(event));
+        }
+    }
+}
+
+/// Adds product-facing attempt facts at the real HTTP dispatch and response
+/// boundaries while leaving durable inference observation as the sole attempt
+/// authority. Live facts share the ordered host event lane; callers without a
+/// live lane publish the same facts through the ordinary host emitter.
+struct ExplainAnalyzeProviderAttemptObserver<'a> {
+    inner: &'a dyn crate::turn::llm::client::ProviderAttemptObserver,
+    context: Option<ExplainAnalyzeContext>,
+    sender: Option<ServerEventSender>,
+    model_round_node_id: Option<String>,
+    model_round_index: u32,
+    spans: std::sync::Mutex<HashMap<u32, ExplainAnalyzeProviderAttemptSpan>>,
+}
+
+impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
+    fn new(
+        inner: &'a dyn crate::turn::llm::client::ProviderAttemptObserver,
+        context: Option<ExplainAnalyzeContext>,
+        sender: Option<ServerEventSender>,
+        model_round_node_id: Option<String>,
+        model_round_index: u32,
+    ) -> Self {
+        Self {
+            inner,
+            context,
+            sender,
+            model_round_node_id,
+            model_round_index,
+            spans: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn drain_spans(&self) -> HashMap<u32, ExplainAnalyzeProviderAttemptSpan> {
+        std::mem::take(
+            &mut *self
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+#[async_trait]
+impl crate::turn::llm::client::ProviderAttemptObserver
+    for ExplainAnalyzeProviderAttemptObserver<'_>
+{
+    async fn begin_attempt(
+        &self,
+        wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
+    ) -> Result<u32, astra_core::ClassifiedError> {
+        self.inner.begin_attempt(wire).await
+    }
+
+    async fn finish_attempt(
+        &self,
+        attempt_index: u32,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let finished_at = Instant::now();
+        if let Some(context) = &self.context {
+            let mut spans = self
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(span) = spans.get_mut(&attempt_index) {
+                let outcome = match terminal.status {
+                    astra_services::InferenceTerminalStatus::Succeeded => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+                    }
+                    astra_services::InferenceTerminalStatus::Failed => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+                    }
+                    astra_services::InferenceTerminalStatus::Cancelled => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+                    }
+                    astra_services::InferenceTerminalStatus::DeliveryUnknown => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+                    }
+                };
+                let duration_ms = u64::try_from(
+                    finished_at
+                        .saturating_duration_since(span.node.started_at)
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                span.terminal_event = context.event(
+                    &span.node,
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    finished_at,
+                    Some(duration_ms),
+                    Some(outcome),
+                    explain_analyze_token_usage(terminal, span.usage_presence),
+                );
+                // If the start was lost to backpressure, the terminal event
+                // still reconstructs the interval. Publish the pair together
+                // later so healthy consumers never receive finish-before-start.
+                if span.start_sent_live
+                    && let Some(sender) = self.sender.as_ref()
+                {
+                    span.terminal_sent_live = span
+                        .terminal_event
+                        .clone()
+                        .is_some_and(|event| sender.try_send_explain_analyze(event));
+                }
+            }
+        }
+        // Explain owns the response fact before durable ledger reconciliation
+        // begins. The ledger's bounded settlement future may be cancelled or
+        // time out; that must not erase a provider terminal already observed.
+        self.inner.finish_attempt(attempt_index, terminal).await
+    }
+
+    fn note_usage_presence(
+        &self,
+        attempt_index: u32,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner.note_usage_presence(attempt_index, presence);
+        if let Some(span) = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&attempt_index)
+        {
+            span.usage_presence.merge(presence);
+        }
+    }
+
+    fn note_dispatch_started(&self, attempt_index: u32) {
+        self.inner.note_dispatch_started(attempt_index);
+        let (Some(context), Some(parent_node_id)) =
+            (&self.context, self.model_round_node_id.as_ref())
+        else {
+            return;
+        };
+        let started_at = Instant::now();
+        let node = ExplainAnalyzeNode::new(
+            context,
+            format!("{parent_node_id}/physical/{attempt_index}"),
+            Some(parent_node_id.clone()),
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            "Model request",
+            started_at,
+            Some(self.model_round_index),
+            Some(attempt_index),
+        );
+        let mut spans = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if spans.contains_key(&attempt_index) {
+            return;
+        }
+        let start_event = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            started_at,
+            None,
+            None,
+            None,
+        );
+        let start_sent_live = self.sender.as_ref().is_some_and(|sender| {
+            start_event
+                .clone()
+                .is_some_and(|event| sender.try_send_explain_analyze(event))
+        });
+        spans.insert(
+            attempt_index,
+            ExplainAnalyzeProviderAttemptSpan {
+                node,
+                start_event,
+                start_sent_live,
+                terminal_event: None,
+                terminal_sent_live: false,
+                usage_presence: crate::turn::token_usage::TokenUsagePresence::default(),
+            },
+        );
+    }
+}
+
+fn explain_analyze_token_usage(
+    terminal: &astra_services::InferenceInvocationTerminal,
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) -> Option<astra_turn_types::ExplainAnalyzeTokenUsageV1> {
+    use astra_services::InferenceUsageStatus;
+    let usage = &terminal.usage;
+    let basis = match terminal.usage_status {
+        InferenceUsageStatus::ProviderExact => {
+            astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact
+        }
+        InferenceUsageStatus::ProviderPartial => {
+            astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial
+        }
+        InferenceUsageStatus::Unavailable => return None,
+    };
+    let measured = |value: u64, observed: bool| observed.then_some(value);
+    let usage = astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+        basis,
+        fresh_input_tokens: measured(usage.input.fresh_input_tokens, presence.fresh_input_tokens),
+        cache_read_tokens: measured(usage.input.cache_read_tokens, presence.cache_read_tokens),
+        cache_creation_tokens: measured(
+            usage.input.cache_creation_tokens,
+            presence.cache_creation_tokens,
+        ),
+        output_tokens: measured(usage.output_tokens, presence.output_tokens),
+    };
+    usage.is_valid().then_some(usage)
+}
+
+fn explain_analyze_context_budget(
+    status: crate::turn::wire_assembly::WireBudgetStatus,
+    visible_tool_count: usize,
+) -> Option<astra_turn_types::ExplainAnalyzeContextMetricsV1> {
+    let token_count = |value: usize| u64::try_from(value).ok();
+    let budget = astra_turn_types::ExplainAnalyzeContextBudgetV1 {
+        basis: astra_turn_types::ExplainAnalyzeContextBudgetBasisV1::PreProviderEstimate,
+        estimated_input_tokens: token_count(status.estimated_input_tokens)?,
+        estimated_system_tokens: token_count(status.estimated_system_tokens)?,
+        tool_schema_tokens: token_count(status.tool_schema_tokens)?,
+        requested_output_tokens: token_count(status.requested_output_tokens)?,
+        reserved_protocol_tokens: token_count(status.reserved_protocol_tokens)?,
+        effective_input_limit_tokens: token_count(status.effective_input_limit)?,
+        model_context_limit_tokens: token_count(status.model_limit)?,
+        visible_tool_count: u32::try_from(visible_tool_count).ok()?,
+    };
+    budget
+        .is_valid()
+        .then_some(astra_turn_types::ExplainAnalyzeContextMetricsV1 {
+            budget: Some(budget),
+            assembly: None,
+        })
+}
+
+fn explain_analyze_outcome_for_error(
+    error: &astra_core::ClassifiedError,
+) -> astra_turn_types::ExplainAnalyzeOutcomeV1 {
+    match error.kind {
+        astra_core::ErrorKind::Cancelled => astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
+        astra_core::ErrorKind::ProviderDeadline
+        | astra_core::ErrorKind::StreamTransport
+        | astra_core::ErrorKind::StreamIdle => {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+        }
+        _ => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+    }
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -4799,6 +5710,13 @@ impl ServerAgenticLoopHostBuilder {
             pending_tool_call_admission: None,
             admitted_tool_side_effects_enabled: true,
             emitted_events: Vec::new(),
+            explain_analyze_context: None,
+            explain_analyze_open_nodes: HashMap::new(),
+            explain_analyze_tool_route_observer: None,
+            explain_analyze_admission_parents: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            explain_analyze_admission_nodes: HashMap::new(),
+            explain_analyze_tool_nodes: HashMap::new(),
+            pending_request_preparation_context: None,
             event_protocol_fault: None,
             event_tx: None,
             streaming_turn_started: false,
@@ -8956,9 +9874,30 @@ impl ServerAgenticLoopHost {
         recorded_attempts: &mut HashSet<u32>,
         outcome: TurnPhaseOutcome,
     ) {
+        self.complete_request_preparation_phase_with_context(
+            state,
+            started_at,
+            attempt_index,
+            recorded_attempts,
+            outcome,
+            None,
+        );
+    }
+
+    fn complete_request_preparation_phase_with_context(
+        &mut self,
+        state: &mut AgenticLoopState,
+        started_at: Instant,
+        attempt_index: u32,
+        recorded_attempts: &mut HashSet<u32>,
+        outcome: TurnPhaseOutcome,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+    ) {
         if !recorded_attempts.insert(attempt_index) {
             return;
         }
+        self.pending_request_preparation_context =
+            context_metrics.map(|context| (state.current_round_index, attempt_index, context));
         complete_turn_phase(
             self,
             state,
@@ -8972,6 +9911,7 @@ impl ServerAgenticLoopHost {
                 state.current_round_index, attempt_index
             ),
         );
+        self.pending_request_preparation_context = None;
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -9439,6 +10379,449 @@ impl ServerAgenticLoopHost {
         Err(message)
     }
 
+    fn start_explain_analyze_node(&mut self, node: ExplainAnalyzeNode) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        if self.explain_analyze_open_nodes.contains_key(&node.node_id) {
+            return;
+        }
+        let start_event = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            node.started_at,
+            None,
+            None,
+            None,
+        );
+        self.explain_analyze_open_nodes
+            .insert(node.node_id.clone(), node);
+        if let Some(event) = start_event {
+            self.emit_progress_event(event);
+        }
+    }
+
+    fn start_explain_analyze_tool_admission(&mut self, tool_call: &Value, round_index: u32) {
+        let Some(call_id) = explain_analyze_call_id(tool_call) else {
+            return;
+        };
+        if self.explain_analyze_admission_nodes.contains_key(call_id) {
+            return;
+        }
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let tool_name = explain_analyze_tool_name(tool_call);
+        let label = bounded_explain_analyze_label("Waiting to dispatch", tool_name);
+        let parent_node_id = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ToolBatch
+                    && node.round_index == Some(round_index)
+            })
+            .max_by_key(|(_, node)| node.started_at)
+            .map(|(node_id, _)| node_id.clone())
+            .or_else(|| Some(context.root_node_id.clone()));
+        let node_id = format!(
+            "{}/admission/{}",
+            context.root_node_id,
+            context.next_event_id()
+        );
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
+            label,
+            Instant::now(),
+            Some(round_index),
+            None,
+        );
+        self.explain_analyze_admission_nodes
+            .insert(call_id.to_string(), node_id);
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.insert(
+                call_id.to_string(),
+                ExplainAnalyzeToolRouteParent {
+                    node_id: self
+                        .explain_analyze_admission_nodes
+                        .get(call_id)
+                        .cloned()
+                        .expect("admission node was just inserted"),
+                    parent_node_id: node.parent_node_id.clone(),
+                    round_index: Some(round_index),
+                    started_at: node.started_at,
+                },
+            );
+        }
+        self.start_explain_analyze_node(node);
+    }
+
+    /// Start measured tool work only after the runtime's dispatch boundary.
+    /// Provider admission, scheduler queueing, and approval are represented by
+    /// their own nodes and never inflate the tool execution interval.
+    fn start_explain_analyze_tool_call(&mut self, event: &Value) {
+        if !matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("tool_transport_started" | "tool_request")
+        ) {
+            return;
+        }
+        let Some(call_id) = explain_analyze_call_id(event) else {
+            return;
+        };
+        if self.explain_analyze_tool_nodes.contains_key(call_id) {
+            return;
+        }
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let started_at = Instant::now();
+        let admission_node_id = self.explain_analyze_admission_nodes.remove(call_id);
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.remove(call_id);
+        }
+        let (parent_node_id, round_index) = admission_node_id
+            .as_deref()
+            .and_then(|node_id| self.explain_analyze_open_nodes.get(node_id))
+            .map(|node| (node.parent_node_id.clone(), node.round_index))
+            .unwrap_or_else(|| (Some(context.root_node_id.clone()), None));
+        if let Some(node_id) = admission_node_id {
+            self.finish_explain_analyze_timed_node(
+                &node_id,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved,
+                started_at,
+            );
+        }
+
+        let tool_name = explain_analyze_tool_name(event);
+        let label = bounded_explain_analyze_label("Run", tool_name);
+        let node_id = format!("{}/tool/{}", context.root_node_id, context.next_event_id());
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall,
+            label,
+            started_at,
+            round_index,
+            None,
+        );
+        self.explain_analyze_tool_nodes
+            .insert(call_id.to_string(), node_id);
+        self.start_explain_analyze_node(node);
+    }
+
+    fn start_explain_analyze_approval_wait(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Option<String> {
+        let context = self.explain_analyze_context.clone()?;
+        let admission_node_id = self.explain_analyze_admission_nodes.get(call_id).cloned();
+        let (parent_node_id, round_index) = admission_node_id
+            .as_deref()
+            .and_then(|node_id| self.explain_analyze_open_nodes.get(node_id))
+            .map(|node| (Some(node.node_id.clone()), node.round_index))
+            .unwrap_or_else(|| (Some(context.root_node_id.clone()), None));
+        let node_id = format!("{}/wait/{}", context.root_node_id, context.next_event_id());
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Wait,
+            bounded_explain_analyze_label("Waiting for approval to run", tool_name),
+            Instant::now(),
+            round_index,
+            None,
+        );
+        self.start_explain_analyze_node(node);
+        Some(node_id)
+    }
+
+    fn finish_explain_analyze_timed_node(
+        &mut self,
+        node_id: &str,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        finished_at: Instant,
+    ) {
+        let Some(node) = self.explain_analyze_open_nodes.get(node_id) else {
+            return;
+        };
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.finish_explain_analyze_node_at(node_id, duration_ms, outcome, None, finished_at, None);
+    }
+
+    fn finish_explain_analyze_tool_call(&mut self, event: &Value) {
+        if event.get("type").and_then(Value::as_str) != Some("tool_call_end") {
+            return;
+        }
+        let Some(call_id) = explain_analyze_call_id(event).map(str::to_string) else {
+            return;
+        };
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let disposition = event
+            .get("disposition")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let outcome = match disposition {
+            "reused" => astra_turn_types::ExplainAnalyzeOutcomeV1::Reused,
+            "suppressed" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
+            "deferred" => astra_turn_types::ExplainAnalyzeOutcomeV1::Deferred,
+            _ => match status {
+                "completed" | "succeeded" | "success" | "ok" => {
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+                }
+                "rejected" => astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected,
+                "blocked" => astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked,
+                "waiting" => astra_turn_types::ExplainAnalyzeOutcomeV1::Waiting,
+                "skipped" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
+                _ if event.get("success").and_then(Value::as_bool) == Some(true) => {
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+                }
+                _ => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+            },
+        };
+        let finished_at = Instant::now();
+        if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.remove(&call_id);
+            }
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+        if let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+    }
+
+    fn start_explain_analyze_context_assembly(
+        &mut self,
+        state: &AgenticLoopState,
+        started_at: Instant,
+    ) -> Option<String> {
+        let context = self.explain_analyze_context.clone()?;
+        let node_id = format!(
+            "{}/context_assembly/{}",
+            context.root_node_id, state.current_round_index
+        );
+        let preparation_node_id = Self::explain_phase_node(
+            &context,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            0,
+            started_at,
+        )
+        .node_id;
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            Some(preparation_node_id),
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ContextAssembly,
+            "Assemble context sources",
+            started_at,
+            Some(state.current_round_index),
+            None,
+        );
+        self.start_explain_analyze_node(node);
+        Some(node_id)
+    }
+
+    fn finish_explain_analyze_context_assembly(
+        &mut self,
+        node_id: &str,
+        finished_at: Instant,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        assembly: Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1>,
+    ) {
+        let Some(node) = self.explain_analyze_open_nodes.get(node_id) else {
+            return;
+        };
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let context_metrics =
+            assembly.map(
+                |assembly| astra_turn_types::ExplainAnalyzeContextMetricsV1 {
+                    budget: None,
+                    assembly: Some(assembly),
+                },
+            );
+        self.finish_explain_analyze_node_at(
+            node_id,
+            duration_ms,
+            outcome,
+            None,
+            finished_at,
+            context_metrics,
+        );
+    }
+
+    fn finish_explain_analyze_node_at(
+        &mut self,
+        node_id: &str,
+        duration_ms: u64,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+        finished_at: Instant,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+    ) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let node = self
+            .explain_analyze_open_nodes
+            .remove(node_id)
+            .unwrap_or_else(|| {
+                let started_at = finished_at
+                    .checked_sub(Duration::from_millis(duration_ms))
+                    .unwrap_or(finished_at);
+                let mut node = ExplainAnalyzeNode::new(
+                    &context,
+                    node_id.to_string(),
+                    Some(context.root_node_id.clone()),
+                    astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
+                    "Measured execution stage",
+                    started_at,
+                    None,
+                    None,
+                );
+                node.start_elapsed_ms = context
+                    .elapsed_ms_at(finished_at)
+                    .saturating_sub(duration_ms);
+                let start_event = context.event(
+                    &node,
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+                    started_at,
+                    None,
+                    None,
+                    None,
+                );
+                if let Some(event) = start_event {
+                    self.emit_progress_event(event);
+                }
+                node
+            });
+        if let Some(event) = context.event_with_context(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(outcome),
+            usage,
+            context_metrics,
+        ) {
+            self.emit_progress_event(event);
+        }
+    }
+
+    fn publish_explain_analyze_provider_attempt_spans(
+        &mut self,
+        spans: HashMap<u32, ExplainAnalyzeProviderAttemptSpan>,
+    ) {
+        let mut ordered = spans.into_iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(attempt, _)| *attempt);
+        for (_, span) in ordered {
+            if !span.start_sent_live
+                && let Some(event) = span.start_event
+            {
+                self.emit_progress_event(event);
+            }
+            if !span.terminal_sent_live
+                && let Some(event) = span.terminal_event
+            {
+                self.emit_progress_event(event);
+            }
+        }
+    }
+
+    fn publish_explain_analyze_tool_route_spans(&mut self) {
+        let Some(observer) = self.explain_analyze_tool_route_observer.as_ref() else {
+            return;
+        };
+        let mut spans = observer.drain_spans().into_iter().collect::<Vec<_>>();
+        spans.sort_by_key(|(_, span)| span.node.started_at);
+        for (call_id, span) in spans {
+            // The route observer closes dispatch admission at the same
+            // instant it starts the measured tool node. Keep the host's
+            // legacy admission map in sync for cancellation/terminal cleanup.
+            if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
+                self.explain_analyze_open_nodes.remove(&node_id);
+            }
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.remove(&call_id);
+            }
+            if !span.admission_terminal_sent_live
+                && let Some(event) = span.admission_terminal_event
+            {
+                self.emit_progress_event(event);
+            }
+            if !span.start_sent_live
+                && let Some(event) = span.start_event
+            {
+                self.emit_progress_event(event);
+            }
+            if !span.terminal_sent_live
+                && let Some(event) = span.terminal_event
+            {
+                self.emit_progress_event(event);
+            }
+        }
+    }
+
+    fn explain_phase_node(
+        context: &ExplainAnalyzeContext,
+        phase: TurnPhaseKind,
+        round_index: u32,
+        attempt_index: u32,
+        started_at: Instant,
+    ) -> ExplainAnalyzeNode {
+        let (kind, label) = match phase {
+            TurnPhaseKind::SemanticAdmission => (
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
+                "Understand requested outcome",
+            ),
+            TurnPhaseKind::RequestPreparation => (
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
+                "Prepare model request",
+            ),
+            TurnPhaseKind::ModelInference => (
+                astra_turn_types::ExplainAnalyzeNodeKindV1::ModelRound,
+                "Generate model response",
+            ),
+            TurnPhaseKind::ToolExecution => (
+                astra_turn_types::ExplainAnalyzeNodeKindV1::ToolBatch,
+                "Execute selected tools",
+            ),
+        };
+        let node_id = format!(
+            "{}/stage/{}/{round_index}/{attempt_index}",
+            context.root_node_id,
+            phase.as_str(),
+        );
+        ExplainAnalyzeNode::new(
+            context,
+            node_id,
+            Some(context.root_node_id.clone()),
+            kind,
+            label,
+            started_at,
+            Some(round_index),
+            Some(attempt_index),
+        )
+    }
+
     fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
         // Streaming deltas are already delivered on the live lane. Retaining
         // every tiny text/reasoning fragment in the bounded settlement buffer
@@ -9484,6 +10867,8 @@ impl ServerAgenticLoopHost {
     }
 
     fn emit_validated_progress_event(&mut self, mut event: Value) {
+        self.start_explain_analyze_tool_call(&event);
+        self.finish_explain_analyze_tool_call(&event);
         if let Some(object) = event.as_object_mut() {
             // Settlement authority is lifecycle-owned. Never trust or expose
             // a producer-supplied copy of its private durable watermark.
@@ -9492,6 +10877,13 @@ impl ServerAgenticLoopHost {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
         let streaming_turn = self.streaming_turn_started;
+        if event.get("type").and_then(Value::as_str) == Some("explain_analyze") {
+            if let Some(sender) = &self.event_tx {
+                sender.try_send_explain_analyze(event.clone());
+            }
+            self.retain_emitted_event(event, streaming_turn);
+            return;
+        }
         // In Edge mode a generic provider request without a committed Server
         // route cannot enter the client execution lane: the committed
         // `tool_request` is its sole execution trigger.  A generic request
@@ -9516,7 +10908,11 @@ impl ServerAgenticLoopHost {
             };
             if disconnected {
                 tracing::debug!(target: "sse_channel", "stream fanout disconnected; detaching live delivery while durable run continues");
-                self.event_tx = None;
+                // Keep the recovery ledger reachable for subsequent Explain
+                // facts even after the live receiver has gone away.
+                if self.explain_analyze_context.is_none() {
+                    self.event_tx = None;
+                }
             }
         }
         self.retain_emitted_event(event, streaming_turn);
@@ -9548,12 +10944,30 @@ impl ServerAgenticLoopHost {
     /// delivery preference to suppress it. Tool cards may be owned by the
     /// client in Edge mode, but canonical session state is owned by the
     /// server and must reach the durable live lane in every topology.
+    fn detach_committed_live_observer(&mut self) {
+        if self.explain_analyze_context.is_some() {
+            // Stop repeated bounded sends to a stalled observer, but keep the
+            // structural recovery ledger reachable until turn settlement.
+            if let Some(sender) = self.event_tx.as_mut() {
+                sender.committed_live_detached = true;
+            }
+        } else {
+            self.event_tx = None;
+        }
+    }
+
     async fn emit_committed_lifecycle_projection(&mut self, mut event: Value) {
         if self.validate_progress_event_lane(&event).is_err() {
             return;
         }
+        self.start_explain_analyze_tool_call(&event);
+        self.finish_explain_analyze_tool_call(&event);
         self.attach_execution_metadata_to_tool_event(&mut event);
-        let sender = self.event_tx.as_ref().map(|sender| sender.tx.clone());
+        let sender = self
+            .event_tx
+            .as_ref()
+            .filter(|sender| !sender.committed_live_detached)
+            .map(|sender| sender.tx.clone());
         let streaming_turn = self.streaming_turn_started;
         // Retention is the authority boundary.  A slow observer must never be
         // able to prevent the committed terminal from entering the replay
@@ -9583,7 +10997,7 @@ impl ServerAgenticLoopHost {
             };
             if !delivered {
                 tracing::debug!(target: "sse_channel", "stream fanout stalled, cancelled, or disconnected; retaining committed lifecycle projection for turn settlement");
-                self.event_tx = None;
+                self.detach_committed_live_observer();
             }
         }
     }
@@ -9594,10 +11008,17 @@ impl ServerAgenticLoopHost {
         }
         self.attach_execution_metadata_to_tool_event(&mut event);
         let streaming_turn = self.streaming_turn_started;
-        if let Some(sender) = self.event_tx.as_ref().map(|sender| sender.tx.clone()) {
+        if let Some(sender) = self
+            .event_tx
+            .as_ref()
+            .filter(|sender| !sender.committed_live_detached)
+            .map(|sender| sender.tx.clone())
+        {
             match sender.try_send(event.clone()) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.event_tx = None,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.detach_committed_live_observer()
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     tracing::warn!(target: "sse_channel", event_type = ?event.get("type"), "control projection retained for replay without blocking run execution");
                 }
@@ -9683,6 +11104,11 @@ impl ServerAgenticLoopHost {
         let Some(sink) = self.interaction_sink.clone() else {
             return Err("committed tool request has no durable projection owner".to_string());
         };
+        // Durable commit is the dispatch custody boundary. Start Explain's
+        // measured tool interval before projection can await a slow or failed
+        // client delivery, so the eventual callback/result still settles the
+        // same node even when projection itself errors.
+        self.start_explain_analyze_tool_call(&event);
         sink.deliver_committed_tool_request(event.clone()).await?;
         self.mirror_agent_live_event(&event);
         self.retain_emitted_event(event, true);
@@ -10065,7 +11491,11 @@ impl ServerAgenticLoopHost {
         self.progress_rx = None;
         self.progress_filter = None;
         self.streaming_turn_started = true;
-        self.event_tx = Some(ServerEventSender { tx, gap });
+        self.event_tx = Some(ServerEventSender {
+            tx,
+            gap,
+            committed_live_detached: false,
+        });
     }
 
     pub(crate) fn set_interaction_sink(&mut self, sink: Arc<dyn HostInteractionSink>) {
@@ -10709,7 +12139,7 @@ impl ServerAgenticLoopHost {
             .map(std::borrow::Cow::into_owned)
     }
 
-    fn emit_admitted_tool_call_events(&mut self, tool_calls: &[Value]) {
+    fn emit_admitted_tool_call_events(&mut self, round_index: u32, tool_calls: &[Value]) {
         let mut round_seen = std::collections::HashSet::new();
         for tool_call in tool_calls {
             let key = tool_call
@@ -10721,6 +12151,7 @@ impl ServerAgenticLoopHost {
             if !round_seen.insert(key.clone()) {
                 continue;
             }
+            self.start_explain_analyze_tool_admission(tool_call, round_index);
             #[cfg(feature = "e2e-hooks")]
             {
                 let mut shared =
@@ -12039,10 +13470,29 @@ impl ServerAgenticLoopHost {
                     control = AdmittedToolCallControl::FailedClosed;
                     break 'batches;
                 }
-                match self
+                let approval_wait_node =
+                    self.start_explain_analyze_approval_wait(&request_id, &tool_name);
+                let approval_result = self
                     .wait_edge_approval_or_guidance(action_context, tc, effective_approval_wait)
-                    .await
-                {
+                    .await;
+                let wait_outcome = match &approval_result {
+                    EdgeApprovalWait::Allowed => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved
+                    }
+                    EdgeApprovalWait::Denied(_) => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
+                    }
+                    EdgeApprovalWait::Superseded | EdgeApprovalWait::Cancelled => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+                    }
+                    EdgeApprovalWait::FailedClosed(_) => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+                    }
+                };
+                if let Some(node_id) = approval_wait_node {
+                    self.finish_explain_analyze_timed_node(&node_id, wait_outcome, Instant::now());
+                }
+                match approval_result {
                     EdgeApprovalWait::Allowed => {
                         if let Err(error) = self
                             .resolve_completed_edge_approval(&request_id, &tool_name, true, None)
@@ -14599,7 +16049,6 @@ impl ServerAgenticLoopHost {
             finish_reason: result.lifecycle_finish_reason().map(str::to_string),
             session_id: None,
             run_id: None,
-            explain_turns: Vec::new(),
             error_message: None,
             system_prompt_tokens: None,
             system_prompt_breakdown: None,
@@ -15134,46 +16583,300 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         false
     }
 
-    fn on_turn_phase(&mut self, receipt: TurnPhaseReceipt) {
-        let phase = match receipt.phase {
-            TurnPhaseKind::SemanticAdmission => {
-                astra_server_types::TurnPhaseKindV1::TurnIntentAdmission
+    fn on_turn_started(&mut self, state: &AgenticLoopState) {
+        let Some(run_id) = state.current_run_id.clone() else {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_tool_route_observer(None);
             }
-            TurnPhaseKind::RequestPreparation => {
-                astra_server_types::TurnPhaseKindV1::RequestPreparation
+            self.explain_analyze_tool_route_observer = None;
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.clear();
             }
-            TurnPhaseKind::ModelInference => astra_server_types::TurnPhaseKindV1::ModelInference,
-            TurnPhaseKind::ToolExecution => astra_server_types::TurnPhaseKindV1::ToolExecution,
+            self.explain_analyze_context = None;
+            self.explain_analyze_open_nodes.clear();
+            self.explain_analyze_admission_nodes.clear();
+            self.explain_analyze_tool_nodes.clear();
+            return;
         };
-        let outcome = match receipt.outcome {
-            TurnPhaseOutcome::Decided => astra_server_types::TurnPhaseOutcomeV1::Decided,
-            TurnPhaseOutcome::FixedDefault => astra_server_types::TurnPhaseOutcomeV1::FixedDefault,
-            TurnPhaseOutcome::Delegated => astra_server_types::TurnPhaseOutcomeV1::Delegated,
-            TurnPhaseOutcome::Unavailable => astra_server_types::TurnPhaseOutcomeV1::Unavailable,
-            TurnPhaseOutcome::Succeeded => astra_server_types::TurnPhaseOutcomeV1::Succeeded,
-            TurnPhaseOutcome::Failed => astra_server_types::TurnPhaseOutcomeV1::Failed,
+        let started_at = Instant::now();
+        let clock_domain_id = uuid::Uuid::new_v4().to_string();
+        let turn_id = format!("turn-{}", state.session_turn);
+        let root_node_id = format!("{turn_id}/segment/{clock_domain_id}");
+        let context = ExplainAnalyzeContext {
+            run_id,
+            turn_id,
+            root_node_id: root_node_id.clone(),
+            clock_domain_id,
+            started_at,
+            next_event_id: Arc::new(AtomicU64::new(1)),
         };
-        let phase = astra_server_types::TurnPhaseReceiptV1 {
-            schema_version: astra_server_types::TURN_PHASE_SCHEMA_VERSION,
+        self.explain_analyze_open_nodes.clear();
+        self.explain_analyze_admission_nodes.clear();
+        self.explain_analyze_tool_nodes.clear();
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.clear();
+        }
+        self.explain_analyze_context = Some(context.clone());
+        let tool_route_observer = Arc::new(ExplainAnalyzeToolRouteObserver::new(
+            Some(context.clone()),
+            self.event_tx.clone(),
+            Arc::clone(&self.explain_analyze_admission_parents),
+        ));
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            executor.set_tool_route_observer(Some(
+                Arc::clone(&tool_route_observer) as Arc<dyn ToolRouteObserver>
+            ));
+        }
+        self.explain_analyze_tool_route_observer = Some(tool_route_observer);
+        self.start_explain_analyze_node(ExplainAnalyzeNode::new(
+            &context,
+            root_node_id,
+            None,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            "User turn",
+            started_at,
+            None,
+            None,
+        ));
+    }
+
+    fn on_turn_terminal(
+        &mut self,
+        state: &AgenticLoopState,
+        result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_tool_route_observer(None);
+            }
+            return;
+        };
+        self.publish_explain_analyze_tool_route_spans();
+        let outcome = match result {
+            Ok(AgenticLoopOutcome::Completed) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Completed
+            }
+            Ok(AgenticLoopOutcome::Delegated) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Delegated
+            }
+            Ok(AgenticLoopOutcome::ControlRejected(_)) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
+            }
+            Ok(AgenticLoopOutcome::Error(_)) => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+            Ok(AgenticLoopOutcome::Cancelled) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+            }
+            Ok(AgenticLoopOutcome::Waiting(_)) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Waiting
+            }
+            Err(error) if error.kind == astra_core::ErrorKind::Cancelled => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+            }
+            Err(error)
+                if matches!(
+                    error.kind,
+                    astra_core::ErrorKind::ProviderDeadline
+                        | astra_core::ErrorKind::StreamTransport
+                        | astra_core::ErrorKind::StreamIdle
+                ) =>
+            {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+            }
+            Err(_) => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+        };
+        let finished_at = Instant::now();
+        let unfinished_context_assemblies = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ContextAssembly
+            })
+            .map(|(node_id, node)| (node_id.clone(), node.parent_node_id.clone()))
+            .collect::<Vec<_>>();
+        let mut unfinished_preparation_parents = HashSet::new();
+        for (node_id, parent_node_id) in unfinished_context_assemblies {
+            // Cancellation or an early preparation error can leave this
+            // measurement open. Close it with the terminal outcome and no
+            // context payload; never attach a source breakdown from a partial
+            // assembly or invent a successful span.
+            self.finish_explain_analyze_context_assembly(&node_id, finished_at, outcome, None);
+            if let Some(parent_node_id) = parent_node_id {
+                unfinished_preparation_parents.insert(parent_node_id);
+            }
+        }
+        for parent_node_id in unfinished_preparation_parents {
+            let Some(parent) = self.explain_analyze_open_nodes.get(&parent_node_id) else {
+                continue;
+            };
+            if parent.kind != astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation {
+                continue;
+            }
+            let duration_ms = u64::try_from(
+                finished_at
+                    .saturating_duration_since(parent.started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            self.finish_explain_analyze_node_at(
+                &parent_node_id,
+                duration_ms,
+                outcome,
+                None,
+                finished_at,
+                None,
+            );
+        }
+        let unfinished_settlements = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Settlement)
+            .map(|(node_id, node)| (node_id.clone(), node.started_at))
+            .collect::<Vec<_>>();
+        for (node_id, started_at) in unfinished_settlements {
+            let duration_ms = u64::try_from(
+                finished_at
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            self.finish_explain_analyze_node_at(
+                &node_id,
+                duration_ms,
+                outcome,
+                None,
+                finished_at,
+                None,
+            );
+        }
+        let unfinished_admissions = self
+            .explain_analyze_admission_nodes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for node_id in unfinished_admissions {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+        let unfinished_tools = self
+            .explain_analyze_tool_nodes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for node_id in unfinished_tools {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+        let root = self
+            .explain_analyze_open_nodes
+            .remove(&context.root_node_id)
+            .unwrap_or_else(|| {
+                ExplainAnalyzeNode::new(
+                    &context,
+                    context.root_node_id.clone(),
+                    None,
+                    astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+                    "User turn",
+                    context.started_at,
+                    None,
+                    None,
+                )
+            });
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(root.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ProviderRetryBackoff,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
+        ];
+        if let Some(event) = context.event_with_context_and_coverage(
+            &root,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(outcome),
+            None,
+            None,
+            coverage_gaps,
+        ) {
+            self.emit_progress_event(event);
+        }
+        self.explain_analyze_admission_nodes.clear();
+        self.explain_analyze_tool_nodes.clear();
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            executor.set_tool_route_observer(None);
+        }
+        self.explain_analyze_tool_route_observer = None;
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.clear();
+        }
+    }
+
+    fn on_turn_phase_started(
+        &mut self,
+        _state: &AgenticLoopState,
+        phase: TurnPhaseKind,
+        round_index: u32,
+        attempt_index: u32,
+        started_at: Instant,
+    ) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        self.start_explain_analyze_node(Self::explain_phase_node(
+            &context,
             phase,
-            round_index: receipt.round_index,
-            attempt_index: receipt.attempt_index,
-            outcome,
-            duration_ms: receipt.duration_ms,
+            round_index,
+            attempt_index,
+            started_at,
+        ));
+    }
+
+    fn on_turn_phase(&mut self, receipt: TurnPhaseReceipt) {
+        self.publish_explain_analyze_tool_route_spans();
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
         };
-        debug_assert!(phase.is_valid());
-        // A phase receipt is a small observational event. It cannot affect
-        // lifecycle control and is safe to coalesce on the normal progress
-        // lane; the lifecycle trace remains the durable timing authority.
-        self.emit_progress_event(json!({
-            "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-            "schema_version": phase.schema_version,
-            "phase": phase.phase,
-            "round_index": phase.round_index,
-            "attempt_index": phase.attempt_index,
-            "outcome": phase.outcome,
-            "duration_ms": phase.duration_ms,
-        }));
+        let node = Self::explain_phase_node(
+            &context,
+            receipt.phase,
+            receipt.round_index,
+            receipt.attempt_index,
+            receipt.started_at,
+        );
+        let node_id = node.node_id.clone();
+        self.start_explain_analyze_node(node);
+        let outcome = match receipt.outcome {
+            TurnPhaseOutcome::Decided | TurnPhaseOutcome::FixedDefault => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved
+            }
+            TurnPhaseOutcome::Delegated => astra_turn_types::ExplainAnalyzeOutcomeV1::Delegated,
+            TurnPhaseOutcome::Unavailable => astra_turn_types::ExplainAnalyzeOutcomeV1::Unavailable,
+            TurnPhaseOutcome::Succeeded => astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded,
+            TurnPhaseOutcome::Failed => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+        };
+        let context_metrics = if receipt.phase == TurnPhaseKind::RequestPreparation {
+            self.pending_request_preparation_context
+                .as_ref()
+                .filter(|(round, attempt, _)| {
+                    *round == receipt.round_index && *attempt == receipt.attempt_index
+                })
+                .map(|(_, _, context)| context.clone())
+        } else {
+            None
+        };
+        self.finish_explain_analyze_node_at(
+            &node_id,
+            receipt.duration_ms,
+            outcome,
+            None,
+            receipt.finished_at,
+            context_metrics,
+        );
     }
 
     fn owns_model_inference_timing(&self) -> bool {
@@ -15412,6 +17115,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
+        if let Some(context) = self.explain_analyze_context.clone() {
+            let node_id = format!("{}/settlement", context.root_node_id);
+            self.start_explain_analyze_node(ExplainAnalyzeNode::new(
+                &context,
+                node_id,
+                Some(context.root_node_id.clone()),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Settlement,
+                "Deliver final answer",
+                Instant::now(),
+                None,
+                None,
+            ));
+        }
         self.emit_progress_event(json!({ "type": "assistant_output_settled" }));
     }
 
@@ -15591,6 +17307,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // request admission) without attributing auxiliary semantic latency
         // to request preparation.
         let mut request_preparation_recorded_attempts = HashSet::new();
+        self.on_turn_phase_started(
+            state,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            0,
+            turn_started,
+        );
 
         // ── Test hook: mock LLM rounds ──────────────────────────────────
         #[cfg(feature = "e2e-hooks")]
@@ -15869,6 +17592,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
+        let context_assembly_node_id =
+            self.start_explain_analyze_context_assembly(state, Instant::now());
         let (prompt_memory_recall, initial_session_memory_entry) = self
             .memory_context_for_turn(
                 state.session_turn,
@@ -15899,6 +17624,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
                 self.complete_request_preparation_phase(
                     state,
                     turn_started,
@@ -15917,8 +17650,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             breakdown: system_prompt_breakdown,
             tier,
             tool_schemas: pipeline_tool_schemas,
+            explain_analyze_context_assembly: initial_context_assembly,
             manifest_trace,
         } = turn_pipeline;
+        let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
@@ -16005,6 +17740,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             Ok(rerun) => rerun,
             Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
                 self.complete_request_preparation_phase(
                     state,
                     turn_started,
@@ -16017,6 +17760,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         if let Some(rerun) = rerun {
             debug_assert_eq!(rerun.tier, tier);
+            final_context_assembly = crate::turn::llm::context::final_explain_analyze_context_assembly(
+                final_context_assembly,
+                Some(rerun.explain_analyze_context_assembly),
+            );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
             final_system_prompt_breakdown = rerun.breakdown;
@@ -16111,7 +17858,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
         let mut durable_canonical_cursor = state.messages.len();
-        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = self
+        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
                 final_volatile_preamble,
@@ -16122,7 +17869,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 max_output_tokens,
                 compaction_boundary_hit,
-            )?;
+            ) {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
+            }
+        };
         // ── 3. Call LLM ─────────────────────────────────────────────────
         // A text-only settlement keeps the provider-visible schema prefix.
         // Marker/uncached protocols also receive their native no-tool choice;
@@ -16183,6 +17950,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     max_output_tokens,
                 )
             };
+        if let Some(node_id) = context_assembly_node_id.as_deref() {
+            self.finish_explain_analyze_context_assembly(
+                node_id,
+                Instant::now(),
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded,
+                final_context_assembly,
+            );
+        }
         if let Some(boundary) = final_wire_compaction_boundary {
             // Keep the emergency final-wire boundary visible in the same
             // manifest that records the measured payload.  The boundary is
@@ -16336,12 +18111,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 Instant::now()
             };
+            if attempt_in_round > 0 {
+                self.on_turn_phase_started(
+                    state,
+                    TurnPhaseKind::RequestPreparation,
+                    state.current_round_index,
+                    attempt_in_round,
+                    request_attempt_started_at,
+                );
+            }
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             // Admission and dispatch must consume the same already-assembled
             // projection.  Runtime authority (including the immutable
             // execution deadline) was added before the final wire budget was
             // measured; projecting it again here would create a second,
             // unbudgeted request shape.
+            let attempt_wire_budget_status =
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            let attempt_context_metrics =
+                explain_analyze_context_budget(attempt_wire_budget_status, final_tools.len());
             let admission_estimated_tokens = crate::prompts::estimate_wire_input_tokens(
                 &llm_messages,
                 state.pinned_tool_schema_tokens as usize,
@@ -16368,19 +18156,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         llm_main_error_outcome(&error),
                         admission_estimated_tokens as u64,
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
             }
             let prompt_round = next_provider_request_round(state);
-            let attempt_wire_budget_status =
-                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::wire_assembly::set_manifest_wire_budget(
                     trace,
@@ -16415,22 +18202,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "durable inference admission failed: Server execution has no durable run authority",
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -16438,12 +18227,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let durable_ledger = match self.required_inference_ledger(Some(run_authority)) {
                 Ok(ledger) => ledger,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -16455,12 +18245,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "durable inference admission failed: Server execution has no durable run identity",
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -16492,12 +18283,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Ok(invocation) => invocation,
                 Err(failure) => {
                     attempt_in_round = failure.logical_attempt;
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(failure.error);
                 }
@@ -16508,12 +18300,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ) {
                 Ok(admitted_attempt) => admitted_attempt,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         requested_logical_attempt,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
@@ -16537,12 +18330,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ) {
                 Ok(budget) => budget,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
@@ -16565,6 +18359,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "provider canonical transition cursor exceeds canonical history",
                     );
+                    self.complete_request_preparation_phase_with_context(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
+                    );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
                 }
@@ -16578,6 +18380,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             astra_core::ErrorKind::ContractViolation,
                             "provider request does not preserve its staged canonical append suffix",
                         );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
+                        );
                         durable_invocation.finish_error(&error).await?;
                         return Err(error);
                     }
@@ -16585,6 +18395,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ContractViolation,
                             "provider canonical transition has no admitted durable base",
+                        );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
                         );
                         durable_invocation.finish_error(&error).await?;
                         return Err(error);
@@ -16611,6 +18429,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                     "failed to plan a bounded provider canonical transition: {source}"
                                 ),
                             );
+                            self.complete_request_preparation_phase_with_context(
+                                state,
+                                request_attempt_started_at,
+                                attempt_in_round,
+                                &mut request_preparation_recorded_attempts,
+                                TurnPhaseOutcome::Failed,
+                                attempt_context_metrics.clone(),
+                            );
                             durable_invocation.finish_error(&error).await?;
                             return Err(error);
                         }
@@ -16633,6 +18459,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
             {
+                self.complete_request_preparation_phase_with_context(
+                    state,
+                    request_attempt_started_at,
+                    attempt_in_round,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                    attempt_context_metrics.clone(),
+                );
                 durable_invocation.finish_error(&error).await?;
                 return Err(error);
             }
@@ -16660,12 +18494,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }) {
                     Ok(plan) => plan,
                     Err(error) => {
-                        self.complete_request_preparation_phase(
+                        self.complete_request_preparation_phase_with_context(
                             state,
                             request_attempt_started_at,
                             attempt_in_round,
                             &mut request_preparation_recorded_attempts,
                             TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
                         );
                         // Durable admission already owns this authoritative
                         // attempt. If attempt-keyed artifact planning fails
@@ -16686,12 +18521,38 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
             let llm_round_start = std::time::Instant::now();
-            self.complete_request_preparation_phase(
+            self.on_turn_phase_started(
+                state,
+                TurnPhaseKind::ModelInference,
+                state.current_round_index,
+                attempt_in_round,
+                llm_round_start,
+            );
+            let explain_analyze_context = self.explain_analyze_context.clone();
+            let model_round_node_id = explain_analyze_context.as_ref().map(|context| {
+                Self::explain_phase_node(
+                    context,
+                    TurnPhaseKind::ModelInference,
+                    state.current_round_index,
+                    attempt_in_round,
+                    llm_round_start,
+                )
+                .node_id
+            });
+            let explain_provider_attempt_observer = ExplainAnalyzeProviderAttemptObserver::new(
+                durable_invocation.attempt_observer(),
+                explain_analyze_context,
+                self.event_tx.clone(),
+                model_round_node_id,
+                state.current_round_index,
+            );
+            self.complete_request_preparation_phase_with_context(
                 state,
                 request_attempt_started_at,
                 attempt_in_round,
                 &mut request_preparation_recorded_attempts,
                 TurnPhaseOutcome::Succeeded,
+                attempt_context_metrics,
             );
             if state.messaging.progress_emitter.is_none() {
                 self.emit_progress_event(json!({
@@ -16881,7 +18742,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 call,
                                 llm_cancel,
                                 Some(&mut on_stream_update),
-                                Some(durable_invocation.attempt_observer()),
+                                Some(&explain_provider_attempt_observer),
                                 budget,
                             )
                             .await
@@ -16891,7 +18752,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 call,
                                 llm_cancel,
                                 Some(&mut on_stream_update),
-                                Some(durable_invocation.attempt_observer()),
+                                Some(&explain_provider_attempt_observer),
                                 budget,
                             )
                             .await
@@ -16901,7 +18762,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 call,
                                 llm_cancel,
                                 Some(&mut on_stream_update),
-                                Some(durable_invocation.attempt_observer()),
+                                Some(&explain_provider_attempt_observer),
                             )
                             .await
                         }
@@ -16915,7 +18776,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 call,
                                 llm_cancel,
                                 Some(&mut on_stream_update),
-                                Some(durable_invocation.attempt_observer()),
+                                Some(&explain_provider_attempt_observer),
                             )
                             .await
                         }
@@ -16966,6 +18827,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "duration_ms": llm_round_start.elapsed().as_millis() as u64,
                 }));
             }
+            self.publish_explain_analyze_provider_attempt_spans(
+                explain_provider_attempt_observer.drain_spans(),
+            );
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
             match (
                 durable_invocation.admitted_canonical_transition_id(),
@@ -18064,7 +19928,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 control: AdmittedToolCallControl::FailedClosed,
             };
         }
-        self.emit_admitted_tool_call_events(tool_calls);
+        self.emit_admitted_tool_call_events(state.current_round_index, tool_calls);
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let externally_dispatchable = tool_calls
             .iter()
@@ -22093,6 +23957,7 @@ mod tests {
     #[derive(Default)]
     struct InMemoryInteractionSink {
         committed: std::sync::Mutex<Vec<Value>>,
+        fail_projection: bool,
     }
 
     #[async_trait::async_trait]
@@ -22113,6 +23978,9 @@ mod tests {
 
         async fn deliver_committed_tool_request(&self, event: Value) -> Result<(), String> {
             self.committed.lock().expect("interaction sink").push(event);
+            if self.fail_projection {
+                return Err("simulated live projection failure after durable commit".to_string());
+            }
             Ok(())
         }
 
@@ -27663,6 +29531,12 @@ mod tests {
                 ("cache_creation_tokens".to_string(), json!(0)),
                 ("total_tokens".to_string(), json!(150)),
             ]),
+            usage_presence: crate::turn::token_usage::TokenUsagePresence {
+                fresh_input_tokens: true,
+                cache_read_tokens: true,
+                cache_creation_tokens: true,
+                output_tokens: true,
+            },
             model_used: "gpt-4".to_string(),
             duration_ms: 500,
             finish_reason: Some("stop".to_string()),
@@ -29314,7 +31188,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_admission_receipt_has_one_versioned_public_event_shape() {
+    fn explain_analyze_streams_meaningful_stages_as_typed_graph_facts() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -29322,31 +31196,475 @@ mod tests {
             "s".to_string(),
         )
         .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-1".to_string());
+        let started_at = Instant::now();
+        host.on_turn_started(&state);
+        host.on_turn_phase_started(&state, TurnPhaseKind::SemanticAdmission, 0, 0, started_at);
+        std::thread::sleep(Duration::from_millis(5));
+        let finished_at = Instant::now();
 
         host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
             phase: crate::turn::agentic_loop::host::TurnPhaseKind::SemanticAdmission,
             round_index: 0,
             attempt_index: 0,
-            duration_ms: 5_021,
+            started_at,
+            finished_at,
+            duration_ms: u64::try_from(
+                finished_at
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap(),
             outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Decided,
         });
 
+        let events = host.take_emitted_events();
+        assert_eq!(events.len(), 3, "root, live stage start, and stage finish");
+        assert_eq!(events[0]["type"], "explain_analyze");
+        assert_eq!(events[0]["kind"], "turn");
+        assert_eq!(events[0]["transition"], "started");
+        assert_eq!(events[0]["label"], "User turn");
+        assert_eq!(events[1]["type"], "explain_analyze");
+        assert_eq!(events[1]["kind"], "admission");
+        assert_eq!(events[1]["round_index"], 0);
+        assert_eq!(events[1]["attempt_index"], 0);
+        assert_eq!(events[1]["transition"], "started");
+        assert_eq!(events[2]["node_id"], events[1]["node_id"]);
+        assert_eq!(events[2]["transition"], "finished");
+        assert_eq!(events[2]["outcome"], "resolved");
+        assert!(events[2]["duration_ms"].as_u64().unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_tracks_tool_calls_and_final_settlement_with_explicit_coverage() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-explain-tools".to_string(),
+            "s-explain-tools".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-explain-tools".to_string());
+        let workspace = tempfile::tempdir().expect("runtime tool workspace");
+        std::fs::write(workspace.path().join("public.txt"), "public output")
+            .expect("runtime tool input");
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "u-explain-tools".to_string(),
+            "s-explain-tools".to_string(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        );
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        host.on_turn_started(&state);
+
+        let batch_started = Instant::now();
+        host.on_turn_phase_started(&state, TurnPhaseKind::ToolExecution, 0, 0, batch_started);
+        host.emit_admitted_tool_call_events(
+            0,
+            &[json!({
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "private arguments"}
+            })],
+        );
+        let tool_result = state
+            .runtime_tool_executor
+            .as_ref()
+            .expect("runtime tool executor")
+            .execute_with_metadata(
+                "read_file",
+                &json!({
+                    "path": "public.txt",
+                    "_tool_call_id": "call-1",
+                    "_run_id": "run-explain-tools",
+                }),
+            )
+            .await;
+        assert!(
+            !tool_result.is_error,
+            "real runtime tool route: {tool_result:?}"
+        );
+        let batch_finished = Instant::now();
+        host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
+            phase: TurnPhaseKind::ToolExecution,
+            round_index: 0,
+            attempt_index: 0,
+            started_at: batch_started,
+            finished_at: batch_finished,
+            duration_ms: u64::try_from(
+                batch_finished
+                    .saturating_duration_since(batch_started)
+                    .as_millis(),
+            )
+            .unwrap(),
+            outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
+        });
+        host.on_final_output_ready(&state).await;
+        host.on_turn_terminal(&state, &Ok(AgenticLoopOutcome::Completed));
+
+        let explain_facts = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| event["type"] == "explain_analyze")
+            .collect::<Vec<_>>();
+        let tool_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_call" && event["transition"] == "started")
+            .expect("tool call start fact");
+        let batch_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_batch" && event["transition"] == "started")
+            .expect("tool batch start fact");
+        let tool_finish = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_call" && event["transition"] == "finished")
+            .expect("tool call terminal fact");
+        let admission_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "started")
+            .expect("dispatch wait start fact");
+        let admission_finish = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
+            .expect("dispatch wait finish fact");
+        assert_eq!(tool_start["label"], "Run read_file");
+        assert_eq!(tool_start["parent_node_id"], batch_start["node_id"]);
+        assert_eq!(admission_start["label"], "Waiting to dispatch read_file");
+        assert_eq!(admission_finish["outcome"], "resolved");
+        assert_eq!(tool_finish["outcome"], "succeeded");
+        assert!(tool_finish["duration_ms"].as_u64().is_some());
+        assert!(tool_finish.get("output").is_none());
+        assert!(!tool_finish.to_string().contains("private"));
+
+        let settlement = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "settlement" && event["transition"] == "finished")
+            .expect("answer settlement node");
+        assert_eq!(settlement["label"], "Deliver final answer");
+        assert_eq!(settlement["transition"], "finished");
+        let turn_terminal = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
+            .expect("turn terminal fact");
         assert_eq!(
-            host.take_emitted_events(),
-            vec![json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": astra_server_types::TURN_PHASE_SCHEMA_VERSION,
-                "phase": "turn_intent_admission",
-                "round_index": 0,
-                "attempt_index": 0,
-                "outcome": "decided",
-                "duration_ms": 5_021,
-            })]
+            turn_terminal["coverage_gaps"],
+            json!([
+                "approval_wait_intervals",
+                "child_run_intervals",
+                "first_token_latency",
+                "provider_retry_backoff",
+                "tool_io_wait_intervals",
+                "user_input_wait_intervals"
+            ])
         );
     }
 
     #[test]
-    fn post_response_work_admission_receipt_is_projected_with_distinct_attempt() {
+    fn explain_preparation_budget_uses_each_attempts_effective_output_cap() {
+        let final_status = crate::turn::wire_assembly::WireBudgetStatus {
+            estimated_input_tokens: 1_200,
+            estimated_system_tokens: 480,
+            tool_schema_tokens: 120,
+            requested_output_tokens: 256,
+            reserved_protocol_tokens: 32,
+            effective_input_limit: 7_000,
+            model_limit: 8_192,
+        };
+        let first_metrics =
+            explain_analyze_context_budget(final_status.with_requested_output_tokens(256), 3)
+                .expect("first request metrics");
+        let retry_metrics =
+            explain_analyze_context_budget(final_status.with_requested_output_tokens(512), 3)
+                .expect("retry request metrics");
+
+        assert_eq!(
+            first_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .requested_output_tokens,
+            256
+        );
+        assert_eq!(
+            retry_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .requested_output_tokens,
+            512
+        );
+        assert_eq!(
+            retry_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .estimated_input_tokens,
+            1_200
+        );
+        assert_eq!(retry_metrics.budget.as_ref().unwrap().visible_tool_count, 3);
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-context-budget".to_string(),
+            "s-context-budget".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-context-budget".to_string());
+        host.on_turn_started(&state);
+        let mut recorded_attempts = HashSet::new();
+        for (attempt_index, context_metrics) in [(0, first_metrics), (1, retry_metrics)] {
+            let started_at = Instant::now();
+            host.on_turn_phase_started(
+                &state,
+                TurnPhaseKind::RequestPreparation,
+                0,
+                attempt_index,
+                started_at,
+            );
+            host.complete_request_preparation_phase_with_context(
+                &mut state,
+                started_at,
+                attempt_index,
+                &mut recorded_attempts,
+                TurnPhaseOutcome::Succeeded,
+                Some(context_metrics),
+            );
+        }
+
+        let terminals = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| {
+                event["type"] == "explain_analyze"
+                    && event["kind"] == "preparation"
+                    && event["transition"] == "finished"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(
+            terminals[0]["context"]["budget"]["requested_output_tokens"],
+            256
+        );
+        assert_eq!(
+            terminals[1]["context"]["budget"]["requested_output_tokens"],
+            512
+        );
+        assert_eq!(terminals[1]["context"]["budget"]["visible_tool_count"], 3);
+    }
+
+    #[test]
+    fn failed_or_cancelled_context_assembly_closes_without_partial_metrics() {
+        for (suffix, error_kind, expected_outcome) in [
+            ("cancel", astra_core::ErrorKind::Cancelled, "cancelled"),
+            (
+                "failure",
+                astra_core::ErrorKind::ContractViolation,
+                "failed",
+            ),
+        ] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                format!("u-context-{suffix}"),
+                format!("s-context-{suffix}"),
+            )
+            .build();
+            let mut state = create_test_state();
+            state.current_run_id = Some(format!("run-context-{suffix}"));
+            host.on_turn_started(&state);
+            let started_at = Instant::now();
+            let expected_parent_node_id = ServerAgenticLoopHost::explain_phase_node(
+                host.explain_analyze_context
+                    .as_ref()
+                    .expect("Explain Analyze context should be active"),
+                TurnPhaseKind::RequestPreparation,
+                state.current_round_index,
+                0,
+                started_at,
+            )
+            .node_id;
+            host.on_turn_phase_started(
+                &state,
+                TurnPhaseKind::RequestPreparation,
+                state.current_round_index,
+                0,
+                started_at,
+            );
+            let node_id = host
+                .start_explain_analyze_context_assembly(&state, started_at)
+                .expect("Explain Analyze context should be active");
+
+            let error = astra_core::ClassifiedError::new(error_kind, "test early exit");
+            host.on_turn_terminal(&state, &Err(error));
+
+            let events = host.take_emitted_events();
+            let terminal = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == node_id
+                        && event["transition"] == "finished"
+                })
+                .expect("context assembly terminal");
+            let assembly_start = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == node_id
+                        && event["transition"] == "started"
+                })
+                .expect("context assembly start");
+            assert_eq!(assembly_start["parent_node_id"], expected_parent_node_id);
+            assert_eq!(terminal["kind"], "context_assembly");
+            assert_eq!(terminal["outcome"], expected_outcome);
+            assert!(terminal.get("context").is_none());
+            assert!(
+                events.iter().any(|event| {
+                    event["node_id"] == node_id && event["transition"] == "started"
+                })
+            );
+            let preparation_terminal = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == expected_parent_node_id
+                        && event["transition"] == "finished"
+                })
+                .expect("failed or cancelled preparation terminal");
+            assert_eq!(preparation_terminal["outcome"], expected_outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_host_boundaries_survive_full_and_closed_live_lanes() {
+        for (disconnected, emitter) in [false, true]
+            .into_iter()
+            .flat_map(|closed| ["progress", "lifecycle", "control"].map(|kind| (closed, kind)))
+        {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .build();
+            let mut state = create_test_state();
+            state.current_run_id = Some("run-recovery".to_string());
+            let gap = HostEventGapTracker::default();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(json!({"type": "text_delta", "content": "prefix"}))
+                .unwrap();
+            let _receiver = if disconnected {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            host.set_event_tx_with_gap(tx, gap.clone());
+            host.on_turn_started(&state);
+            // Generic progress after disconnect must not detach the ledger
+            // before the next structural Explain boundary.
+            match emitter {
+                "lifecycle" => {
+                    host.emit_committed_lifecycle_projection(
+                        json!({"type": "tool_call_end", "tool_call_id": "call-1"}),
+                    )
+                    .await;
+                    assert!(host.event_tx.as_ref().unwrap().committed_live_detached);
+                    // Subsequent committed sends must not wait on the stalled
+                    // observer again, while the Explain ledger stays alive.
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        host.emit_committed_lifecycle_projection(
+                            json!({"type": "tool_call_end", "tool_call_id": "call-2"}),
+                        ),
+                    )
+                    .await
+                    .expect("detached observer must not stall execution");
+                }
+                "control" => host.emit_committed_control_projection(json!({"type": "run_paused"})),
+                _ => host.emit_progress_event(json!({"type": "text_delta", "content": "next"})),
+            }
+            let now = Instant::now();
+            host.on_turn_phase_started(&state, TurnPhaseKind::SemanticAdmission, 0, 0, now);
+            host.on_turn_phase(TurnPhaseReceipt {
+                phase: TurnPhaseKind::SemanticAdmission,
+                round_index: 0,
+                attempt_index: 0,
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                outcome: TurnPhaseOutcome::Decided,
+            });
+            let (_, recovered, complete) = gap.pending_recovery_snapshot();
+            assert!(complete);
+            assert_eq!(recovered.len(), 3, "all structural facts must survive");
+            assert_eq!(recovered[0]["kind"], "turn");
+            assert_eq!(recovered[1]["transition"], "started");
+            assert_eq!(recovered[2]["transition"], "finished");
+            assert_eq!(recovered[1]["node_id"], recovered[2]["node_id"]);
+        }
+    }
+
+    #[test]
+    fn explain_usage_preserves_reported_zero_and_marks_missing_lanes_unknown() {
+        let terminal = astra_services::InferenceInvocationTerminal {
+            status: astra_services::InferenceTerminalStatus::Succeeded,
+            usage: astra_services::InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(18, 0, 0),
+                output_tokens: 0,
+            },
+            usage_status: astra_services::InferenceUsageStatus::ProviderPartial,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        let usage = explain_analyze_token_usage(
+            &terminal,
+            crate::turn::token_usage::TokenUsagePresence {
+                fresh_input_tokens: true,
+                cache_read_tokens: true,
+                output_tokens: true,
+                ..Default::default()
+            },
+        )
+        .expect("reported lanes should be attached to the attempt");
+
+        assert_eq!(usage.fresh_input_tokens, Some(18));
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_creation_tokens, None);
+        assert_eq!(usage.output_tokens, Some(0));
+        assert_eq!(
+            crate::turn::llm::client::provider_usage_status_from_presence(
+                crate::turn::token_usage::TokenUsagePresence {
+                    fresh_input_tokens: true,
+                    output_tokens: true,
+                    ..Default::default()
+                }
+            ),
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+        assert_eq!(
+            crate::turn::llm::client::provider_usage_status_from_presence(
+                crate::turn::token_usage::TokenUsagePresence {
+                    fresh_input_tokens: true,
+                    ..Default::default()
+                }
+            ),
+            astra_services::InferenceUsageStatus::ProviderPartial
+        );
+    }
+
+    #[test]
+    fn post_response_work_admission_is_projected_into_the_typed_graph() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -29355,8 +31673,10 @@ mod tests {
         )
         .build();
         let mut state = create_test_state();
+        state.current_run_id = Some("run-work-phase".to_string());
         state.turn_event_buffer =
             Some(astra_services::session_journal::TurnEventBuffer::begin_turn(None, 3));
+        host.on_turn_started(&state);
         host.completed_work_admission_phase = Some((
             Instant::now(),
             3,
@@ -29367,19 +31687,17 @@ mod tests {
         host.flush_completed_work_admission_phase(&mut state);
 
         let events = host.take_emitted_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": astra_server_types::TURN_PHASE_SCHEMA_VERSION,
-                "phase": "turn_intent_admission",
-                "round_index": 3,
-                "attempt_index": 1,
-                "outcome": "decided",
-                "duration_ms": events[0]["duration_ms"],
-            })
-        );
+        assert_eq!(events.len(), 3, "root plus one typed stage span");
+        assert_eq!(events[0]["kind"], "turn");
+        assert_eq!(events[0]["transition"], "started");
+        assert_eq!(events[1]["type"], "explain_analyze");
+        assert_eq!(events[1]["kind"], "admission");
+        assert_eq!(events[1]["round_index"], 3);
+        assert_eq!(events[1]["attempt_index"], 1);
+        assert_eq!(events[1]["transition"], "started");
+        assert_eq!(events[2]["node_id"], events[1]["node_id"]);
+        assert_eq!(events[2]["transition"], "finished");
+        assert_eq!(events[2]["outcome"], "resolved");
         let trace_events = state
             .turn_event_buffer
             .as_mut()
@@ -29412,6 +31730,8 @@ mod tests {
         )))
         .build();
         let mut state = create_test_state();
+        state.current_run_id = Some("run-phase-resolution".to_string());
+        host.on_turn_started(&state);
 
         assert!(
             host.execute_turn(&mut state).await.is_err(),
@@ -29422,11 +31742,12 @@ mod tests {
             .into_iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str)
-                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+                    == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+                    && event.get("kind").and_then(Value::as_str) == Some("preparation")
+                    && event.get("transition").and_then(Value::as_str) == Some("finished")
             })
             .collect();
         assert_eq!(phases.len(), 1);
-        assert_eq!(phases[0]["phase"], "request_preparation");
         assert_eq!(phases[0]["outcome"], "failed");
     }
 
@@ -30776,6 +33097,17 @@ mod tests {
         .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
+        let mut explain_state = create_test_state();
+        explain_state.current_run_id = Some("test-run".to_string());
+        host.on_turn_started(&explain_state);
+        let explain_batch_started = Instant::now();
+        host.on_turn_phase_started(
+            &explain_state,
+            TurnPhaseKind::ToolExecution,
+            0,
+            0,
+            explain_batch_started,
+        );
         let interaction_sink = install_in_memory_interaction_sink(&mut host);
         host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register bash as a valid tool so the edge ledger delivery path admits it.
@@ -30816,9 +33148,10 @@ mod tests {
             ),
             "the second mutating command must enter the approval protocol"
         );
+        host.emit_admitted_tool_call_events(0, &tool_calls);
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(35)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
                 test_approval_key("u-batch", "s-batch", "w1"),
@@ -30830,7 +33163,7 @@ mod tests {
             );
             drop(guard);
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
                 tool_callback_key("u-batch", "s-batch", "w1"),
@@ -30903,6 +33236,60 @@ mod tests {
         assert_eq!(results.results[1].request_id, "w2");
         assert_eq!(results.results[0].status, "ok");
         assert_eq!(results.results[1].status, "ok");
+
+        let explain_batch_finished = Instant::now();
+        host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
+            phase: TurnPhaseKind::ToolExecution,
+            round_index: 0,
+            attempt_index: 0,
+            started_at: explain_batch_started,
+            finished_at: explain_batch_finished,
+            duration_ms: u64::try_from(
+                explain_batch_finished
+                    .saturating_duration_since(explain_batch_started)
+                    .as_millis(),
+            )
+            .unwrap(),
+            outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
+        });
+        host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+
+        let explain_facts = host
+            .emitted_events
+            .iter()
+            .filter(|event| event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+            .collect::<Vec<_>>();
+        let tool_intervals = explain_facts
+            .iter()
+            .filter(|event| event["kind"] == "tool_call" && event["transition"] == "finished")
+            .map(|event| {
+                (
+                    event["start_elapsed_ms"]
+                        .as_u64()
+                        .expect("tool start offset"),
+                    event["elapsed_ms"].as_u64().expect("tool end offset"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_intervals.len(), 2, "both dispatched tools are timed");
+        assert!(tool_intervals[0].1 <= tool_intervals[1].0);
+        let approval_waits = explain_facts
+            .iter()
+            .filter(|event| {
+                event["kind"] == "wait"
+                    && event["transition"] == "finished"
+                    && event["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("Waiting for approval"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(approval_waits.len(), 2);
+        assert!(
+            approval_waits
+                .iter()
+                .any(|event| event["duration_ms"].as_u64().is_some_and(|ms| ms >= 20)),
+            "the delayed approval must remain visible as a wait interval"
+        );
     }
 
     #[tokio::test]
@@ -30989,94 +33376,130 @@ mod tests {
 
     #[tokio::test]
     async fn auto_interaction_mode_delivers_edge_mutation_without_approval_wait() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-auto-edge".to_string(),
-            "s-auto-edge".to_string(),
-        )
-        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
-        .build();
-        let sink = install_in_memory_interaction_sink(&mut host);
-        host.install_runtime_tool_schemas(
-            vec![json!({
+        for fail_projection in [false, true] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-auto-edge".to_string(),
+                "s-auto-edge".to_string(),
+            )
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
+            .build();
+            let sink = Arc::new(InMemoryInteractionSink {
+                fail_projection,
+                ..Default::default()
+            });
+            host.set_interaction_sink(sink.clone());
+            let mut explain_state = create_test_state();
+            explain_state.current_run_id = Some("run-auto-edge".to_string());
+            host.on_turn_started(&explain_state);
+            host.install_runtime_tool_schemas(
+                vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                Default::default(),
+            );
+            let call = json!({
+                "id": "auto-write",
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "description": "Write file contents",
-                    "parameters": {"type": "object", "properties": {}}
+                    "arguments": r#"{"path":"auto.txt","content":"ok"}"#,
                 }
-            })],
-            Default::default(),
-        );
-        let call = json!({
-            "id": "auto-write",
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "arguments": r#"{"path":"auto.txt","content":"ok"}"#,
-            }
-        });
-        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
-            &astra_services::multi_agent::EdgeDispatchIdentity::new(
-                "u-auto-edge",
-                "s-auto-edge",
-                "run-auto-edge",
-                "chain-auto-edge",
-                "auto-write",
-            ),
-        );
-        let ledger = host.edge_callback_ledger.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            ledger.lock().await.insert(
-                callback_key,
-                json!({
-                    "body": {
-                        "request_id": "auto-write",
-                        "edge_agent_id": "edge-1",
-                        "status": "ok",
-                        "output": "wrote-auto"
-                    }
-                }),
+            });
+            host.emit_admitted_tool_call_events(0, std::slice::from_ref(&call));
+            let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+                &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    "u-auto-edge",
+                    "s-auto-edge",
+                    "run-auto-edge",
+                    "chain-auto-edge",
+                    "auto-write",
+                ),
             );
-        });
+            let ledger = host.edge_callback_ledger.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ledger.lock().await.insert(
+                    callback_key,
+                    json!({
+                        "body": {
+                            "request_id": "auto-write",
+                            "edge_agent_id": "edge-1",
+                            "status": "completed",
+                            "output": "wrote-auto"
+                        }
+                    }),
+                );
+            });
 
-        let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            host.deliver_edge_tools_via_ledger(
-                "run-auto-edge",
-                "chain-auto-edge",
-                &[call],
-                &context,
-            ),
-        )
-        .await
-        .expect("auto mode must not wait for a human approval");
+            let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                host.deliver_edge_tools_via_ledger(
+                    "run-auto-edge",
+                    "chain-auto-edge",
+                    &[call],
+                    &context,
+                ),
+            )
+            .await
+            .expect("auto mode must not wait for a human approval");
 
-        assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
-        assert_eq!(outcome.results.len(), 1);
-        assert_eq!(outcome.results[0].status, "ok");
-        let committed = sink.committed.lock().expect("committed interactions");
-        assert!(
-            committed.iter().all(|event| {
-                !matches!(
-                    event.get("type").and_then(Value::as_str),
-                    Some("approval_required" | "approval_batch_required")
-                )
-            }),
-            "auto mode must not publish an unresolved approval request"
-        );
-        assert_eq!(
-            committed
+            assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+            assert_eq!(outcome.results.len(), 1);
+            assert_eq!(outcome.results[0].status, "completed");
+            host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+            let tool_terminal = host
+                .emitted_events
                 .iter()
-                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
-                .count(),
-            1,
-            "auto mode still uses the guarded tool-request boundary"
-        );
+                .filter(|event| {
+                    event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE
+                        && event["kind"] == "tool_call"
+                        && event["transition"] == "finished"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tool_terminal.len(),
+                1,
+                "durable callback must retain tool timing even when live projection fails: {fail_projection}"
+            );
+            assert_eq!(tool_terminal[0]["outcome"], "succeeded");
+            assert!(tool_terminal[0]["duration_ms"].as_u64().is_some());
+            assert!(
+                host.emitted_events
+                    .iter()
+                    .any(|event| event["kind"] == "admission"
+                        && event["transition"] == "finished"
+                        && event["outcome"] == "resolved")
+            );
+            let committed = sink.committed.lock().expect("committed interactions");
+            assert!(
+                committed.iter().all(|event| {
+                    !matches!(
+                        event.get("type").and_then(Value::as_str),
+                        Some("approval_required" | "approval_batch_required")
+                    )
+                }),
+                "auto mode must not publish an unresolved approval request"
+            );
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(
+                        |event| event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    )
+                    .count(),
+                1,
+                "auto mode still uses the guarded tool-request boundary"
+            );
+        }
     }
 
     #[tokio::test]
@@ -39779,6 +42202,7 @@ mod tests {
             .push(json!({"role": "user", "content": "capture this failed turn"}));
         state.message = "capture this failed turn".to_string();
         state.user_intent = state.message.clone();
+        host.on_turn_started(&state);
 
         let error = match host.execute_turn(&mut state).await {
             Ok(_) => panic!("execute turn should fail"),
@@ -39787,27 +42211,145 @@ mod tests {
         assert_eq!(error.kind, astra_core::ErrorKind::ServerError);
         let emitted_events = host.take_emitted_events();
         assert_root_llm_progress_pairs(&emitted_events, 1);
-        let phase_outcomes: Vec<_> = emitted_events
-            .into_iter()
+        let phase_events: Vec<_> = emitted_events
+            .iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str)
-                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+                    == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+                    && event.get("transition").and_then(Value::as_str) == Some("finished")
+                    && event.get("kind").and_then(Value::as_str) != Some("turn")
             })
+            .collect();
+        let root_node_id = emitted_events
+            .iter()
+            .find(|event| {
+                event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE
+                    && event["kind"] == "turn"
+                    && event["transition"] == "started"
+            })
+            .and_then(|event| event["node_id"].as_str())
+            .expect("Explain Analyze turn root");
+
+        let context_assembly = phase_events
+            .iter()
+            .find(|event| event["kind"] == "context_assembly")
+            .expect("source assembly phase");
+        assert_eq!(context_assembly["outcome"], "succeeded");
+        let context_parent_id = context_assembly["parent_node_id"]
+            .as_str()
+            .expect("context assembly parent");
+
+        let preparations: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "preparation")
+            .collect();
+        assert!(
+            !preparations.is_empty(),
+            "the pre-provider boundary must be recorded"
+        );
+        assert!(
+            preparations.iter().all(|event| {
+                event["outcome"] == "succeeded"
+                    && event["parent_node_id"].as_str() == Some(root_node_id)
+            }),
+            "every preparation phase must complete under the Explain Analyze turn root: {preparations:?}"
+        );
+        assert!(
+            preparations
+                .iter()
+                .any(|event| event["node_id"].as_str() == Some(context_parent_id)),
+            "context assembly must attach to its recorded preparation phase"
+        );
+
+        let model_rounds: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "model_round")
+            .collect();
+        assert!(
+            !model_rounds.is_empty(),
+            "the model boundary must retain the provider failure"
+        );
+        assert!(
+            model_rounds.iter().all(|event| {
+                event["outcome"] == "failed"
+                    && event["parent_node_id"].as_str() == Some(root_node_id)
+            }),
+            "every model round must retain its failed outcome under the turn root: {model_rounds:?}"
+        );
+        let model_round_ids: HashSet<&str> = model_rounds
+            .iter()
+            .map(|event| event["node_id"].as_str().expect("model round node id"))
+            .collect();
+        assert_eq!(
+            model_round_ids.len(),
+            model_rounds.len(),
+            "model round identities must remain unique across retries"
+        );
+
+        let provider_attempts: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "provider_attempt")
+            .collect();
+        assert!(
+            !provider_attempts.is_empty(),
+            "at least one physical provider attempt must be recorded"
+        );
+        assert!(
+            provider_attempts
+                .iter()
+                .all(|event| event["outcome"] == "failed"),
+            "every physical retry must retain a failed provider-attempt outcome: {provider_attempts:?}"
+        );
+        let attempt_ids: HashSet<&str> = provider_attempts
+            .iter()
+            .map(|event| event["node_id"].as_str().expect("provider attempt node id"))
+            .collect();
+        let attempt_keys: HashSet<(&str, u64)> = provider_attempts
+            .iter()
             .map(|event| {
                 (
-                    event["phase"].as_str().unwrap_or_default().to_string(),
-                    event["outcome"].as_str().unwrap_or_default().to_string(),
+                    event["parent_node_id"]
+                        .as_str()
+                        .expect("provider attempt parent"),
+                    event["attempt_index"]
+                        .as_u64()
+                        .expect("provider attempt index"),
                 )
             })
             .collect();
         assert_eq!(
-            phase_outcomes,
-            vec![
-                ("request_preparation".to_string(), "succeeded".to_string()),
-                ("model_inference".to_string(), "failed".to_string()),
-            ],
-            "a provider failure must retain both the completed pre-provider boundary and the failed model boundary"
+            attempt_ids.len(),
+            provider_attempts.len(),
+            "physical provider attempts must have unique node identities"
         );
+        assert_eq!(
+            attempt_keys.len(),
+            provider_attempts.len(),
+            "physical provider attempts must have unique model-round/index identities"
+        );
+        for attempt in &provider_attempts {
+            let node_id = attempt["node_id"]
+                .as_str()
+                .expect("provider attempt node id");
+            let attempt_index = attempt["attempt_index"]
+                .as_u64()
+                .expect("provider attempt index");
+            assert!(
+                node_id.ends_with(&format!("/physical/{attempt_index}")),
+                "physical attempt identity must include its durable index: {node_id}"
+            );
+            let parent_node_id = attempt["parent_node_id"]
+                .as_str()
+                .expect("provider attempt parent");
+            let parent_model_round = model_rounds
+                .iter()
+                .find(|round| round["node_id"].as_str() == Some(parent_node_id))
+                .expect("provider attempt must attach to a model round");
+            assert_eq!(
+                attempt["round_index"], parent_model_round["round_index"],
+                "provider attempt and model round must share the recorded round index"
+            );
+        }
 
         state
             .turn_event_buffer
@@ -40485,7 +43027,11 @@ mod tests {
             .expect("approval follows the accepted progress prefix");
         assert_eq!(approval["type"], "approval_required");
         assert_eq!(approval["request_id"], "approval-after-burst");
-        assert_eq!(gap.take(), 4, "overflow is one coalesced repair boundary");
+        assert_eq!(
+            gap.take_recovery_snapshot().0,
+            4,
+            "overflow is one coalesced repair boundary"
+        );
         assert_eq!(
             host.emitted_events.len(),
             1,
@@ -40788,7 +43334,46 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(25), gap.notified())
             .await
             .expect("a terminal progress drop must wake the bridge immediately");
-        assert_eq!(gap.take(), 1);
+        assert_eq!(gap.take_recovery_snapshot().0, 1);
+    }
+
+    #[test]
+    fn explain_gap_recovery_acknowledges_a_prefix_and_keeps_overflow_truth() {
+        let gap = HostEventGapTracker::default();
+        gap.record_explain_analyze_drop(json!({ "event_id": "first" }));
+        gap.record_explain_analyze_drop(json!({ "event_id": "second" }));
+        let (dropped, events, complete) = gap.pending_recovery_snapshot();
+        assert_eq!(dropped, 2);
+        assert!(complete);
+        assert_eq!(events.len(), 2);
+
+        gap.acknowledge_recovery_batch(1, &events[..1]);
+        let (dropped, events, complete) = gap.pending_recovery_snapshot();
+        assert_eq!(dropped, 1);
+        assert!(complete);
+        assert_eq!(events, vec![json!({ "event_id": "second" })]);
+        gap.acknowledge_recovery_batch(1, &events);
+
+        for event_id in 0..=MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
+            gap.record_explain_analyze_drop(json!({ "event_id": format!("event-{event_id}") }));
+        }
+        let (dropped, events, complete) = gap.take_recovery_snapshot();
+        assert_eq!(
+            dropped as usize,
+            MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS + 1
+        );
+        assert_eq!(events.len(), MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS);
+        assert!(
+            !complete,
+            "overflow remains incomplete after draining retained facts"
+        );
+
+        let (_, events, complete) = gap.pending_recovery_snapshot();
+        assert!(events.is_empty());
+        assert!(
+            !complete,
+            "draining cannot make the run appear fully recovered"
+        );
     }
 
     #[test]

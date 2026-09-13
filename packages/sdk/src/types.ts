@@ -29,7 +29,7 @@ export type StreamEventType =
   | "turn_complete"
   | "error"
   | "warning"
-  | "explain"
+  | "explain_analyze"
   | "plan_created"
   | "plan_revised"
   | "plan_step_start"
@@ -310,9 +310,114 @@ export type WarningEvent = {
   claims_failed?: number;
 };
 
-export type ExplainEvent = {
-  type: "explain";
-  content: string;
+export type ExplainAnalyzeNodeKindV1 =
+  | "run"
+  | "turn"
+  | "admission"
+  | "preparation"
+  | "context_assembly"
+  | "model_round"
+  | "provider_attempt"
+  | "tool_batch"
+  | "tool_call"
+  | "wait"
+  | "child_run"
+  | "settlement";
+
+export type ExplainAnalyzeOutcomeV1 =
+  | "completed"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "blocked"
+  | "waiting"
+  | "rejected"
+  | "reused"
+  | "suppressed"
+  | "deferred"
+  | "resolved"
+  | "fallback"
+  | "unavailable"
+  | "delegated";
+
+export type ExplainAnalyzeCoverageGapV1 =
+  | "approval_wait_intervals"
+  | "user_input_wait_intervals"
+  | "provider_retry_backoff"
+  | "first_token_latency"
+  | "child_run_intervals"
+  | "tool_io_wait_intervals";
+
+export type ExplainAnalyzeUsageV1 = {
+  basis: "provider_exact" | "provider_partial" | "runtime_estimated";
+  fresh_input_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  output_tokens?: number;
+};
+
+export type ExplainAnalyzeContextSourceKindV1 =
+  | "identity" | "self_model" | "project_context" | "deferred_tools"
+  | "available_skills" | "memory" | "working_memory" | "history" | "constraints"
+  | "skills" | "runtime_identity" | "runtime_volatile" | "emergent_skills"
+  | "emergent_memory" | "emergent_summary";
+
+export type ExplainAnalyzeContextBudgetV1 = {
+  basis: "pre_provider_estimate";
+  estimated_input_tokens: number;
+  estimated_system_tokens: number;
+  tool_schema_tokens: number;
+  requested_output_tokens: number;
+  reserved_protocol_tokens: number;
+  effective_input_limit_tokens: number;
+  model_context_limit_tokens: number;
+  visible_tool_count: number;
+};
+
+export type ExplainAnalyzeContextSourceV1 = {
+  kind: ExplainAnalyzeContextSourceKindV1;
+  section_count: number;
+  estimated_tokens: number;
+};
+
+export type ExplainAnalyzeContextAssemblyV1 = {
+  basis: "runtime_text_estimate";
+  sources: ExplainAnalyzeContextSourceV1[];
+};
+
+/** Assembly observations and final request estimates have different scopes.
+ * Neither is provider-billed usage; their values must not be summed together. */
+export type ExplainAnalyzeContextMetricsV1 = {
+  budget?: ExplainAnalyzeContextBudgetV1;
+  assembly?: ExplainAnalyzeContextAssemblyV1;
+};
+
+/** One versioned, bounded execution fact. Missing token lanes are unavailable,
+ * not zero; indexes are explicit and are never parsed from labels. */
+export type ExplainAnalyzeEventV1 = {
+  type: "explain_analyze";
+  schema_version: 1;
+  event_id: string;
+  run_id: string;
+  turn_id: string;
+  node_id: string;
+  parent_node_id?: string;
+  dependency_node_ids?: string[];
+  producer_id: string;
+  clock_domain_id: string;
+  kind: ExplainAnalyzeNodeKindV1;
+  round_index?: number;
+  attempt_index?: number;
+  label: string;
+  transition: "started" | "finished";
+  elapsed_ms: number;
+  start_elapsed_ms?: number;
+  duration_ms?: number;
+  outcome?: ExplainAnalyzeOutcomeV1;
+  usage?: ExplainAnalyzeUsageV1;
+  context?: ExplainAnalyzeContextMetricsV1;
+  coverage_gaps?: ExplainAnalyzeCoverageGapV1[];
 };
 
 export type PlanCreatedEvent = {
@@ -431,6 +536,8 @@ export type StreamGapEvent = {
   run_id: string;
   dropped_event_count: number;
   repair: "refresh_run_snapshot";
+  /** True when the bounded host lane replayed every dropped graph fact first. */
+  explain_analyze_recovered?: boolean;
 };
 
 export type AgentCompletedEvent = {
@@ -682,7 +789,7 @@ export type StreamEvent = (
   | TurnCompleteEvent
   | StreamErrorEvent
   | WarningEvent
-  | ExplainEvent
+  | ExplainAnalyzeEventV1
   | PlanCreatedEvent
   | PlanRevisedEvent
   | PlanStepStartEvent
