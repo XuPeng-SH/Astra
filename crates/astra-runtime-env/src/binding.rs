@@ -490,6 +490,7 @@ impl RunBinding {
             providers,
         );
         apply_policy_tool_allowlist(&policy, &mut tool_surface);
+        tool_surface.prefer_local_command_tools();
         Self {
             workspace,
             executor,

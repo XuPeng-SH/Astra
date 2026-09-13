@@ -736,6 +736,29 @@ pub fn validate_execute_bash_command_in_workspace_from(
     workspace_root: &Path,
     execution_dir: &Path,
 ) -> Result<(), String> {
+    validate_execute_bash_command_with_risks(
+        command,
+        analyze_command_risks_in_workspace_from(command, workspace_root, execution_dir),
+    )
+}
+
+pub fn validate_prepared_bash_command(
+    command: &str,
+    workdir: &PreparedBashWorkdir,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    let risks = astra_sandbox::analyze_command_risks_with_resolver(command, &|path| {
+        workdir.inspection().target_is_inside(path)
+    });
+    #[cfg(not(unix))]
+    let risks = analyze_command_risks_in_workspace_from(command, workdir.path(), workdir.path());
+    validate_execute_bash_command_with_risks(command, risks)
+}
+
+fn validate_execute_bash_command_with_risks(
+    command: &str,
+    risks: Vec<CommandRisk>,
+) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
@@ -781,7 +804,7 @@ pub fn validate_execute_bash_command_in_workspace_from(
         return Err("Error: socat/telnet networking in bash is blocked".into());
     }
 
-    for risk in analyze_command_risks_in_workspace_from(command, workspace_root, execution_dir) {
+    for risk in risks {
         match &risk {
             // Allowed here only — still constrained by local rules + permission layer.
             CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
@@ -828,27 +851,12 @@ impl PreparedBashWorkdir {
         &self.identity
     }
 
-    /// Return a host-side path that dereferences through the pinned directory
-    /// handle. Policy analysis and inferred source capture must use this path,
-    /// so they inspect the same directory inode that the child will enter.
-    pub fn inspection_path(&self) -> Result<PathBuf, String> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-
-            let fd = self.directory.as_raw_fd();
-            for base in ["/proc/self/fd", "/dev/fd"] {
-                let path = PathBuf::from(base).join(fd.to_string());
-                if path.exists() {
-                    return Ok(path);
-                }
-            }
-            Err("Error: this platform cannot expose the pinned bash workdir for policy inspection; no command was run".to_string())
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(self.path.clone())
-        }
+    #[cfg(unix)]
+    pub fn inspection(&self) -> astra_sandbox::PinnedWorkspaceInspection {
+        astra_sandbox::PinnedWorkspaceInspection::new(
+            self.workspace_directory.clone(),
+            self.directory.clone(),
+        )
     }
 
     /// Pin this prepared identity into the shared process-isolation executor.
@@ -889,42 +897,7 @@ impl PreparedBashWorkdir {
 }
 
 #[cfg(unix)]
-fn open_directory_beneath(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut current = root.try_clone()?;
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            if component == std::path::Component::CurDir {
-                continue;
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "workdir path is not relative and normalized",
-            ));
-        };
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "workdir component contains NUL",
-            )
-        })?;
-        let fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            )
-        };
-        if fd == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        current = unsafe { std::fs::File::from_raw_fd(fd) };
-    }
-    Ok(current)
-}
+use astra_sandbox::open_directory_beneath;
 
 /// Resolve one Bash invocation's execution directory without changing the
 /// workspace authority boundary. The directory must already exist and its
@@ -1040,21 +1013,30 @@ pub fn attach_bash_workdir_evidence(
     workdir: &PreparedBashWorkdir,
     args: &Value,
 ) {
+    let _ = workspace_root;
     let requested = args.get("workdir").and_then(Value::as_str).unwrap_or(".");
+    #[cfg(not(unix))]
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let effective_path = workdir
-        .inspection_path()
+    #[cfg(unix)]
+    let relative = workdir
+        .inspection()
+        .working_directory_relative()
         .ok()
-        .and_then(|path| path.canonicalize().ok())
-        .unwrap_or_else(|| workdir.path().to_path_buf());
-    let relative = effective_path
+        .map(|path| path.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(unix))]
+    let relative = workdir
+        .path()
         .strip_prefix(&canonical_root)
         .ok()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| ".".to_string());
+        .map(|path| {
+            if path.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                path.to_string_lossy().replace('\\', "/")
+            }
+        });
     result
         .metadata
         .get_or_insert_with(serde_json::Map::new)
@@ -1271,7 +1253,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         .is_some();
     let coordination_unsettled = _observation_lease
         .as_ref()
-        .is_some_and(|lease| !lease.integrity_valid());
+        .is_some_and(|lease| !lease.coordination_integrity_valid());
     if coordination_unsettled {
         crate::workspace_observation::mark_workspace_observation_unsettled(&ctx.workspace_root);
     }
@@ -1288,9 +1270,9 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         // The pre-execution check cannot authorize a receipt after a slow
         // fingerprint capture: binding/lease integrity must still hold at the
         // exact mint boundary.
-        let coordination_integrity_valid_at_mint = !coordination_unsettled
+        let receipt_authority_valid_at_mint = !coordination_unsettled
             && _observation_lease.as_ref().is_none_or(
-                crate::workspace_observation::WorkspaceObservationLease::integrity_valid,
+                crate::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
             );
         let verification_receipt_valid = explicit_verification
             && !result.is_error
@@ -1300,7 +1282,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 .and_then(|fields| fields.get("exit_code"))
                 .and_then(Value::as_i64)
                 == Some(0)
-            && coordination_integrity_valid_at_mint
+            && receipt_authority_valid_at_mint
             && scope_settled
             && !scope_quarantined
             && after_captured
@@ -1335,7 +1317,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 );
             }
         }
-        if !coordination_unsettled && scope_settled && workspace_changed {
+        if receipt_authority_valid_at_mint && scope_settled && workspace_changed {
             if let Some(ownership) = scope_ownership {
                 if ownership.is_authoritative() {
                     result
@@ -1460,10 +1442,6 @@ async fn execute_bash_inner(
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
-    let inspection_dir = match workdir.inspection_path() {
-        Ok(path) => path,
-        Err(reason) => return ToolResult::error(reason),
-    };
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c,
         _ => {
@@ -1488,19 +1466,19 @@ async fn execute_bash_inner(
     let detachable_requested = ctx.detach_shell_handle.is_some()
         && crate::workspace_observation::bash_command_is_detachable_safe(command);
 
-    if let Err(reason) =
-        validate_execute_bash_command_in_workspace_from(command, workspace_root, &inspection_dir)
-    {
+    if let Err(reason) = validate_prepared_bash_command(command, workdir) {
         return ToolResult::error(reason);
     }
 
     let explicit_source_artifacts = args
         .get(crate::source_preimage::SOURCE_ARTIFACTS_FIELD)
         .is_some();
-    let mut source_preimages = match crate::source_preimage::prepare(
+    let mut source_preimages = match crate::source_preimage::prepare_with_inspection(
         workspace_root,
         args,
         &format!("{}:{}", ctx.user_id, ctx.session_id),
+        #[cfg(unix)]
+        workdir.inspection(),
     ) {
         Ok(plan) => plan,
         Err(reason) => return ToolResult::error(format!("Error: {reason}")),
@@ -1511,13 +1489,26 @@ async fn execute_bash_inner(
     // detached command has no terminal receipt path yet, so it remains
     // outside this best-effort lane.
     if source_preimages.is_none() && !explicit_source_artifacts && !detachable_requested {
-        source_preimages = crate::source_preimage::prepare_inferred(
-            workspace_root,
-            &inspection_dir,
-            command,
-            &format!("{}:{}", ctx.user_id, ctx.session_id),
-        )
-        .unwrap_or(None);
+        #[cfg(unix)]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred_with_inspection(
+                workspace_root,
+                workdir.inspection(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
+        #[cfg(not(unix))]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred(
+                workspace_root,
+                workdir.path(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
     }
     // A detached process outlives this call. Until the background registry can
     // carry the prepared receipt through terminal completion, fail closed
@@ -1925,10 +1916,6 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
-    let inspection_dir = match workdir.inspection_path() {
-        Ok(path) => path,
-        Err(reason) => return ToolResult::error(reason),
-    };
     let with_workdir_evidence = |mut result: ToolResult| {
         attach_bash_workdir_evidence(&mut result, workspace_root, workdir, args);
         result
@@ -1942,9 +1929,7 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
             );
         }
     };
-    if let Err(reason) =
-        validate_execute_bash_command_in_workspace_from(command, workspace_root, &inspection_dir)
-    {
+    if let Err(reason) = validate_prepared_bash_command(command, workdir) {
         return ToolResult::error(reason);
     }
 
@@ -3321,7 +3306,7 @@ async fn load_gitignored_search_paths(
     // A parent checkout is not part of the selected workspace's search
     // contract. Only an exact root-local repository may contribute VCS ignore
     // rules; this structural preflight also supports linked worktrees.
-    let Ok(exact_command) = crate::git_gix::exact_git_command(workspace_root) else {
+    let Ok(exact_command) = crate::git_gix::prepare_bound_git_command(workspace_root) else {
         return Ok(std::collections::HashSet::new());
     };
     let mut cmd = exact_command.into_tokio();
@@ -6286,6 +6271,47 @@ printf 'probe.txt:1:needle\n'
             "python3 worker.py",
             None
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn weak_attribution_quarantine_does_not_disable_later_bash_calls() {
+        let dir = tempdir().expect("workspace");
+        let initialized = std::process::Command::new("git")
+            .args(["init", dir.path().to_str().expect("workspace path")])
+            .output()
+            .expect("initialize repository");
+        assert!(initialized.status.success());
+
+        let ctx = crate::ToolContext::test(dir.path());
+        let first = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": format!(
+                    "cd '{}' && git status --short && echo STAT && git diff --stat && echo CACHED && git diff --cached --stat && echo CHECK && git diff --check",
+                    dir.path().display()
+                )
+            }),
+        )
+        .await;
+        assert!(!first.is_error, "first command failed: {}", first.output);
+        assert_eq!(
+            crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
+            Some(true),
+            "the compound command should exercise weak-ownership quarantine on macOS"
+        );
+        assert_eq!(
+            crate::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
+            Some(false),
+            "weak receipt provenance is not a terminal ownership failure"
+        );
+
+        let second = execute_bash(
+            &ctx,
+            &serde_json::json!({ "command": "git diff --stat", "timeout": 1 }),
+        )
+        .await;
+        assert!(!second.is_error, "second command failed: {}", second.output);
     }
 
     #[test]

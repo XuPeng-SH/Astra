@@ -581,12 +581,18 @@ impl ToolExecutor for DefaultToolExecutor {
                 )),
             }
         };
-        let coordination_integrity_valid = _workspace_mutation_lease
-            .as_ref()
-            .is_none_or(crate::workspace_observation::WorkspaceObservationLease::integrity_valid)
-            && _recursive_writer_epoch
-                .as_ref()
-                .is_none_or(crate::workspace_observation::WorkspaceWriterGuard::integrity_valid);
+        let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
+            crate::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
+        ) && _recursive_writer_epoch.as_ref().is_none_or(
+            crate::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid,
+        );
+        let receipt_authority_valid = coordination_integrity_valid
+            && _workspace_mutation_lease.as_ref().is_none_or(
+                crate::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+            && _recursive_writer_epoch.as_ref().is_none_or(
+                crate::workspace_observation::WorkspaceWriterGuard::receipt_authority_valid,
+            );
         if nested_run_script_callback && let Some(fields) = result.metadata.as_mut() {
             // The callback is re-entrant under its opaque parent. It may
             // return ordinary output to Python, but only the parent can check
@@ -644,7 +650,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 args,
                 &self.ctx.workspace_root,
                 result.is_error,
-                coordination_integrity_valid
+                receipt_authority_valid
                     && !nested_run_script_callback
                     && result
                         .metadata
@@ -667,9 +673,9 @@ impl ToolExecutor for DefaultToolExecutor {
             &self.ctx.workspace_root,
             result.is_error,
             desired_state.as_ref(),
-            coordination_integrity_valid && !nested_run_script_callback,
+            receipt_authority_valid && !nested_run_script_callback,
             targeted_observer,
-            coordination_integrity_valid && _workspace_mutation_lease.is_some(),
+            receipt_authority_valid && _workspace_mutation_lease.is_some(),
         ) {
             Ok(projection) => {
                 if let Some(receipt) = projection.convergence_receipt {
@@ -986,6 +992,7 @@ impl DefaultToolExecutor {
             // ── Git operations (gix-based) ───────────────────────────
             // Consolidated git tool — single entry point for all git operations.
             "git" => outcome_to_result(crate::git_gix::git_dispatch(pr, args)),
+            "worktree" => ToolResult::error("Error: worktree lifecycle requires an explicitly bound CLI or User Runner session owner; no operation was run".to_string()),
 
             // ── GitHub API ───────────────────────────────────────────
             "github" => match crate::github_tool_contract::github_action_from_args(args) {
@@ -1234,6 +1241,7 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
         | "notebook_edit"
         | "rollback_file_edits"
         | "rollback_git_worktrees"
+        | "worktree"
         | "rename_symbol" => true,
         "lsp" => args.get("dry_run").and_then(Value::as_bool) == Some(false),
         "git" => crate::git_tool_contract::git_action_from_args(args)
@@ -1270,7 +1278,7 @@ fn validate_host_owned_write_boundary(
     workspace_root: &Path,
     protected: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    if matches!(name, "run_script" | "git") {
+    if matches!(name, "run_script" | "git" | "worktree") {
         return Err(format!(
             "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
         ));

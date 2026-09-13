@@ -168,6 +168,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // Consolidated git tool; action-aware classification below fails closed
     // when args are absent.
     tool("git", MU, A),
+    tool("worktree", MU, NONE),
     // ── Code intelligence (LSP-derived, read-only) ───────────────────
     tool("symbols", RO, CI.union(EX)),
     tool("find_definition", RO, CI.union(EX)),
@@ -425,7 +426,7 @@ impl ToolRegistry {
         let category = self.category(name);
         if flags.contains(ToolFlags::CODE_INTEL) {
             ToolDisplayCategory::Code
-        } else if flags.contains(ToolFlags::GIT_READ) || name == "git" {
+        } else if flags.contains(ToolFlags::GIT_READ) || matches!(name, "git" | "worktree") {
             ToolDisplayCategory::Git
         } else if flags.contains(ToolFlags::MATRIXONE) {
             ToolDisplayCategory::Mo

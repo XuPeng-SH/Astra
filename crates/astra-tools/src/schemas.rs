@@ -1626,6 +1626,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "worktree",
+                "description": "Enter or exit a session-scoped Git worktree. Enter changes this session's working workspace; exit restores it. Use bash for ordinary git commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["enter", "exit"]},
+                        "branch": {"type": "string", "description": "New branch name; required for enter."},
+                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep."},
+                        "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git",
                 "description": "Git operations: status, diff, log, show, blame, commit, stash, push, and worktree. Pass action as the first parameter.",
                 "parameters": {

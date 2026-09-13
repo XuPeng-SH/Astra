@@ -205,8 +205,23 @@ impl WorkspaceWriterGuard {
     /// A top-level opaque writer may only publish owner facts while the
     /// stable namespace and the bound workspace still name the generation
     /// admitted before execution.
+    pub fn coordination_integrity_valid(&self) -> bool {
+        self.lease.coordination_integrity_valid()
+    }
+
+    /// Whether this writer can publish durable workspace evidence. A clean
+    /// coordination generation is not enough after attribution was
+    /// quarantined: later writers may run under the lock, but cannot claim
+    /// changes that may include an escaped earlier descendant.
+    pub fn receipt_authority_valid(&self) -> bool {
+        self.lease.receipt_authority_valid()
+    }
+
+    /// Backwards-compatible spelling for callers that use integrity as a
+    /// receipt gate. Coordination-only checks should call
+    /// `coordination_integrity_valid` explicitly.
     pub fn integrity_valid(&self) -> bool {
-        self.lease.integrity_valid()
+        self.receipt_authority_valid()
     }
 }
 
@@ -303,14 +318,44 @@ pub fn mark_workspace_observation_unsettled(workspace_root: &Path) -> bool {
     mark_workspace_observation_quarantine(workspace_root, true)
 }
 
-fn mark_workspace_observation_quarantine(workspace_root: &Path, ownership_unsettled: bool) -> bool {
-    let Some(key) = workspace_binding_key(workspace_root) else {
+/// Retain the admitted observation state across root renames or retargeting.
+/// This handle carries attribution state only; it does not acquire a writer lease.
+pub struct WorkspaceAttributionState {
+    state: Arc<WriterEpochState>,
+    aliases: Vec<PathBuf>,
+}
+impl WorkspaceAttributionState {
+    pub fn capture(root: &Path) -> Option<Self> {
+        let mut aliases = vec![workspace_binding_key(root)?];
+        if let Some(key) = workspace_lexical_key(root)
+            && !aliases.contains(&key)
+        {
+            aliases.push(key);
+        }
+        Some(Self {
+            state: writer_epoch_state(root)?,
+            aliases,
+        })
+    }
+    pub fn quarantine(&self) {
+        quarantine_observation_state(&self.state, self.aliases.clone(), false);
+    }
+    pub fn mark_unsettled(&self) {
+        quarantine_observation_state(&self.state, self.aliases.clone(), true);
+    }
+}
+fn mark_workspace_observation_quarantine(root: &Path, unsettled: bool) -> bool {
+    let Some(handle) = WorkspaceAttributionState::capture(root) else {
         return false;
     };
-    let lexical_key = workspace_lexical_key(workspace_root);
-    let Some(state) = writer_epoch_state(workspace_root) else {
-        return false;
-    };
+    quarantine_observation_state(&handle.state, handle.aliases, unsettled);
+    true
+}
+fn quarantine_observation_state(
+    state: &Arc<WriterEpochState>,
+    mut aliases: Vec<PathBuf>,
+    ownership_unsettled: bool,
+) {
     state
         .quarantined
         .store(true, std::sync::atomic::Ordering::Release);
@@ -322,12 +367,6 @@ fn mark_workspace_observation_quarantine(workspace_root: &Path, ownership_unsett
     state
         .epoch
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let mut aliases = vec![key];
-    if let Some(key) = lexical_key
-        && !aliases.iter().any(|alias| alias == &key)
-    {
-        aliases.push(key);
-    }
     // Preserve every alias that was registered while the invocation still
     // held the state. This closes the symlink/rebind race: a terminal path
     // lookup must quarantine the pre-existing state, not create a new clean
@@ -338,7 +377,7 @@ fn mark_workspace_observation_quarantine(workspace_root: &Path, ownership_unsett
         for (alias, weak) in map.iter() {
             if weak
                 .upgrade()
-                .is_some_and(|candidate| Arc::ptr_eq(&candidate, &state))
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, state))
                 && !aliases.iter().any(|existing| existing == alias)
             {
                 aliases.push(alias.clone());
@@ -351,7 +390,6 @@ fn mark_workspace_observation_quarantine(workspace_root: &Path, ownership_unsett
     for alias in aliases {
         quarantined.insert(alias, state.clone());
     }
-    true
 }
 
 /// A settled foreground process group is sufficient to close the current
@@ -445,18 +483,38 @@ pub struct WorkspaceObservationLease {
 impl WorkspaceObservationLease {
     /// Verify that the external coordination paths, kernel event history, and
     /// bound workspace components still name the generation admitted before
-    /// execution.
-    pub fn integrity_valid(&self) -> bool {
+    /// execution. Sticky attribution quarantine is deliberately not part of
+    /// this predicate: quarantine means receipts are unsafe, not that the
+    /// exclusive coordination lock stopped serializing admitted work.
+    pub fn coordination_integrity_valid(&self) -> bool {
         self.binding_identity.is_unchanged()
             && self.tamper_watch.is_untampered()
-            && !self
-                .writer_state
-                .quarantined
-                .load(std::sync::atomic::Ordering::Acquire)
             && self
                 .locks
                 .iter()
                 .all(CrossProcessFileLock::path_identity_is_unchanged)
+    }
+
+    /// Whether this lease may mint mutation, observation, verification, or
+    /// convergence receipts. Quarantine is sticky and cannot be cleared by a
+    /// later successful command.
+    pub fn receipt_authority_valid(&self) -> bool {
+        self.coordination_integrity_valid()
+            && !self
+                .writer_state
+                .quarantined
+                .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .writer_state
+                .ownership_unsettled
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Backwards-compatible spelling for existing receipt gates. Use
+    /// `coordination_integrity_valid` when deciding whether an admitted
+    /// command lost its serialization/binding authority.
+    pub fn integrity_valid(&self) -> bool {
+        self.receipt_authority_valid()
     }
 }
 
@@ -2102,7 +2160,7 @@ async fn acquire_workspace_lease_async(
     let deadline = tokio::time::Instant::now() + max_wait;
     let writer_state = writer_epoch_state(workspace_root)?;
     if writer_state
-        .quarantined
+        .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire)
     {
         return None;
@@ -2215,10 +2273,10 @@ async fn acquire_workspace_lease_async(
     // The control-plane fence ran on the blocking worker above; do not park
     // a Tokio runtime worker on an inotify acknowledgement.
     let tamper_untampered = true;
-    let quarantined = writer_state
-        .quarantined
+    let ownership_unsettled = writer_state
+        .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire);
-    if !binding_unchanged || !tamper_untampered || quarantined {
+    if !binding_unchanged || !tamper_untampered || ownership_unsettled {
         gate.store(false, std::sync::atomic::Ordering::Release);
         return None;
     }
@@ -2261,7 +2319,7 @@ fn acquire_workspace_lease_sync(
     let deadline = Instant::now() + max_wait;
     let writer_state = writer_epoch_state(workspace_root)?;
     if writer_state
-        .quarantined
+        .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire)
     {
         return None;
@@ -2332,10 +2390,10 @@ fn acquire_workspace_lease_sync(
     };
     let binding_unchanged = binding_identity.is_unchanged();
     let tamper_untampered = tamper_watch.is_untampered();
-    let quarantined = writer_state
-        .quarantined
+    let ownership_unsettled = writer_state
+        .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire);
-    if !binding_unchanged || !tamper_untampered || quarantined {
+    if !binding_unchanged || !tamper_untampered || ownership_unsettled {
         gate.store(false, std::sync::atomic::Ordering::Release);
         return None;
     }
@@ -2430,10 +2488,20 @@ pub struct ExternalEffectObservationLease {
 }
 
 impl ExternalEffectObservationLease {
-    pub fn integrity_valid(&self) -> bool {
+    pub fn coordination_integrity_valid(&self) -> bool {
         self.leases
             .iter()
-            .all(WorkspaceObservationLease::integrity_valid)
+            .all(WorkspaceObservationLease::coordination_integrity_valid)
+    }
+
+    pub fn receipt_authority_valid(&self) -> bool {
+        self.leases
+            .iter()
+            .all(WorkspaceObservationLease::receipt_authority_valid)
+    }
+
+    pub fn integrity_valid(&self) -> bool {
+        self.receipt_authority_valid()
     }
 }
 
@@ -4636,6 +4704,39 @@ mod tests {
 
     /// Re-exec fixture for proving that the workspace observation lease is a
     /// process boundary, not merely a mutex inside one Astra process.
+    #[cfg(unix)]
+    #[test]
+    fn captured_attribution_quarantines_original_state_after_two_root_retarget() {
+        let container = tempfile::tempdir().unwrap();
+        let a = container.path().join("a");
+        let b = container.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let original = WorkspaceAttributionState::capture(&a).unwrap();
+        let other = WorkspaceAttributionState::capture(&b).unwrap();
+        std::fs::rename(&a, container.path().join("moved-a")).unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        original.quarantine();
+        assert!(
+            original
+                .state
+                .quarantined
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !other
+                .state
+                .quarantined
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !original
+                .state
+                .ownership_unsettled
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
     #[test]
     fn cross_process_workspace_observation_lease_helper() {
         let Some(root) = std::env::var_os(CROSS_PROCESS_LEASE_HELPER_ENV) else {
@@ -5632,6 +5733,10 @@ mod tests {
             WorkspaceFingerprint::capture(temp.path()).is_none(),
             "an unowned descendant must make later observations fail closed"
         );
+        assert!(
+            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1)).is_none(),
+            "a writer whose descendants may still run must block later work admission"
+        );
     }
 
     #[test]
@@ -5650,6 +5755,17 @@ mod tests {
             WorkspaceFingerprint::capture(temp.path()).is_none(),
             "later calls must not receive a potentially misattributed fingerprint"
         );
+        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
+            .expect("attribution quarantine must not disable workspace coordination");
+        assert!(
+            lease.coordination_integrity_valid(),
+            "the workspace lock remains a valid serialization authority"
+        );
+        assert!(
+            !lease.receipt_authority_valid(),
+            "quarantine revokes receipts even when a later lease is healthy"
+        );
+        drop(lease);
         assert!(!quarantine_after_weak_receipt(
             temp.path(),
             Some(INVOCATION_CGROUP_OWNERSHIP)

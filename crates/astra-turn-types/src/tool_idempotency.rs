@@ -51,6 +51,7 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
 
         // Consolidated `git` tool: read-only subcommands are safe to retry;
         // mutating/unknown actions are conservative.
+        "worktree" => ToolIdempotency::NonIdempotent,
         "git" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
             Some(
                 "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"

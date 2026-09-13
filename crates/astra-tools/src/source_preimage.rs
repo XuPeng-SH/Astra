@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ pub struct SourcePreimageEntry {
     pub status: Option<String>,
     #[serde(default)]
     pub post_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub struct SourcePreimageReceipt {
 #[derive(Debug, Clone)]
 pub struct PreparedSourcePreimages {
     root: PathBuf,
+    #[cfg(unix)]
+    inspection: astra_sandbox::PinnedWorkspaceInspection,
     store_root: PathBuf,
     receipt_path: PathBuf,
     mode: SourcePreimageMode,
@@ -90,9 +94,41 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(not(unix))]
 fn hash_file(path: &Path) -> Result<(Vec<u8>, String), String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("cannot read source artifact {}: {error}", path.display()))?;
+    let hash = hash_bytes(&bytes);
+    Ok((bytes, hash))
+}
+
+fn hash_opened_source(
+    mut file: fs::File,
+    relative: &str,
+    limit: u64,
+) -> Result<(Vec<u8>, String), String> {
+    let before = file
+        .metadata()
+        .map_err(|error| format!("cannot stat source artifact `{relative}`: {error}"))?;
+    if before.len() > limit {
+        return Err("source_artifacts exceeds the total byte limit".into());
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read source artifact `{relative}`: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err("source_artifacts exceeds the total byte limit".into());
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot restat source artifact `{relative}`: {error}"))?;
+    if metadata_fingerprint(&before) != metadata_fingerprint(&after) {
+        return Err(format!(
+            "source artifact `{relative}` changed while being preserved; command was not run"
+        ));
+    }
     let hash = hash_bytes(&bytes);
     Ok((bytes, hash))
 }
@@ -237,6 +273,48 @@ pub fn prepare(
     args: &Value,
     scope: &str,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
+    if validate_source_artifact_args(args)?.is_none() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    let inspection =
+        astra_sandbox::PinnedWorkspaceInspection::from_paths(workspace_root, workspace_root)
+            .map_err(|error| format!("cannot pin source artifact workspace: {error}"))?;
+    prepare_with_inspection(
+        workspace_root,
+        args,
+        scope,
+        #[cfg(unix)]
+        inspection,
+    )
+}
+
+pub fn prepare_with_inspection(
+    workspace_root: &Path,
+    args: &Value,
+    scope: &str,
+    #[cfg(unix)] inspection: astra_sandbox::PinnedWorkspaceInspection,
+) -> Result<Option<PreparedSourcePreimages>, String> {
+    prepare_sources(
+        workspace_root,
+        args,
+        scope,
+        #[cfg(unix)]
+        inspection,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+fn prepare_sources(
+    workspace_root: &Path,
+    args: &Value,
+    scope: &str,
+    #[cfg(unix)] inspection: astra_sandbox::PinnedWorkspaceInspection,
+    #[cfg(unix)] mut opened: Option<
+        std::collections::HashMap<String, astra_sandbox::OpenedWorkspaceFile>,
+    >,
+) -> Result<Option<PreparedSourcePreimages>, String> {
     let Some(raw_paths) = validate_source_artifact_args(args)? else {
         return Ok(None);
     };
@@ -258,33 +336,60 @@ pub fn prepare(
 
     for raw in raw_paths {
         let (relative, candidate) = relative_artifact_path(&root, &raw)?;
-        let link_metadata = fs::symlink_metadata(&candidate)
-            .map_err(|error| format!("cannot inspect source artifact `{relative}`: {error}"))?;
-        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-            return Err(format!(
-                "source_artifacts entry `{relative}` must be an existing regular file (symlinks and directories are not allowed)"
-            ));
-        }
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve source artifact `{relative}`: {error}"))?;
-        if !canonical.starts_with(&root) {
-            return Err(format!(
-                "source_artifacts entry `{relative}` escapes the workspace root"
-            ));
-        }
-        let before = metadata_fingerprint(
-            &fs::metadata(&canonical)
-                .map_err(|error| format!("cannot stat source artifact `{relative}`: {error}"))?,
-        );
-        let (bytes, sha256) = hash_file(&canonical)?;
-        let after_metadata = fs::metadata(&canonical)
-            .map_err(|error| format!("cannot restat source artifact `{relative}`: {error}"))?;
-        if before != metadata_fingerprint(&after_metadata) {
-            return Err(format!(
-                "source artifact `{relative}` changed while being preserved; command was not run"
-            ));
-        }
+        #[cfg(unix)]
+        let (bytes, sha256, parent_identity) = {
+            let source = if let Some(opened) = opened.as_mut() {
+                opened
+                    .remove(&relative)
+                    .ok_or_else(|| format!("inferred source `{relative}` has no retained handle"))?
+            } else {
+                inspection
+                    .open_source(Path::new(&relative), true)
+                    .map_err(|error| {
+                        format!("cannot inspect source artifact `{relative}`: {error}")
+                    })?
+            };
+            let (bytes, hash) = hash_opened_source(
+                source.file,
+                &relative,
+                MAX_SOURCE_ARTIFACT_BYTES.saturating_sub(total_bytes),
+            )?;
+            (bytes, hash, Some(source.parent_identity))
+        };
+        #[cfg(not(unix))]
+        let (bytes, sha256) = {
+            let link_metadata = fs::symlink_metadata(&candidate)
+                .map_err(|error| format!("cannot inspect source artifact `{relative}`: {error}"))?;
+            if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+                return Err(format!(
+                    "source_artifacts entry `{relative}` must be an existing regular file (symlinks and directories are not allowed)"
+                ));
+            }
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|error| format!("cannot resolve source artifact `{relative}`: {error}"))?;
+            if !canonical.starts_with(&root) {
+                return Err(format!(
+                    "source_artifacts entry `{relative}` escapes the workspace root"
+                ));
+            }
+            let before =
+                metadata_fingerprint(&fs::metadata(&canonical).map_err(|error| {
+                    format!("cannot stat source artifact `{relative}`: {error}")
+                })?);
+            let (bytes, sha256) = hash_file(&canonical)?;
+            let after_metadata = fs::metadata(&canonical)
+                .map_err(|error| format!("cannot restat source artifact `{relative}`: {error}"))?;
+            if before != metadata_fingerprint(&after_metadata) {
+                return Err(format!(
+                    "source artifact `{relative}` changed while being preserved; command was not run"
+                ));
+            }
+            (bytes, sha256)
+        };
+        #[cfg(not(unix))]
+        let parent_identity = None;
+        let _ = candidate;
         let bytes_len = bytes.len() as u64;
         total_bytes = total_bytes
             .checked_add(bytes_len)
@@ -303,6 +408,7 @@ pub fn prepare(
             blob_id,
             status: Some("captured".into()),
             post_sha256: None,
+            parent_identity,
         });
     }
 
@@ -317,6 +423,8 @@ pub fn prepare(
     atomic_write(&receipt_path, &manifest)?;
     Ok(Some(PreparedSourcePreimages {
         root,
+        #[cfg(unix)]
+        inspection,
         store_root,
         receipt_path,
         mode: SourcePreimageMode::Declared,
@@ -340,12 +448,85 @@ pub fn prepare_inferred(
     command: &str,
     scope: &str,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
-    let paths = infer_source_artifacts(workspace_root, execution_dir, command);
+    #[cfg(unix)]
+    {
+        let inspection =
+            astra_sandbox::PinnedWorkspaceInspection::from_paths(workspace_root, execution_dir)
+                .map_err(|error| error.to_string())?;
+        prepare_inferred_with_inspection(workspace_root, inspection, command, scope)
+    }
+    #[cfg(not(unix))]
+    {
+        let paths = infer_source_artifacts(workspace_root, execution_dir, command);
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let args = json!({SOURCE_ARTIFACTS_FIELD: paths});
+        let Some(mut plan) = prepare(workspace_root, &args, scope)? else {
+            return Ok(None);
+        };
+        plan.mode = SourcePreimageMode::Inferred;
+        Ok(Some(plan))
+    }
+}
+
+#[cfg(unix)]
+pub fn prepare_inferred_with_inspection(
+    workspace_root: &Path,
+    inspection: astra_sandbox::PinnedWorkspaceInspection,
+    command: &str,
+    scope: &str,
+) -> Result<Option<PreparedSourcePreimages>, String> {
+    let opened = std::cell::RefCell::new(std::collections::HashMap::new());
+    let paths = infer_source_artifacts_with(
+        command,
+        |token| {
+            if !is_inferable_operand(token) {
+                return None;
+            }
+            let source = inspection.open_source(Path::new(token), false).ok()?;
+            let relative = source.workspace_relative.to_str()?.replace('\\', "/");
+            opened
+                .borrow_mut()
+                .entry(relative.clone())
+                .or_insert(source);
+            Some(relative)
+        },
+        |relative| {
+            let siblings = {
+                let opened = opened.borrow();
+                let Some(source) = opened.get(relative) else {
+                    return Vec::new();
+                };
+                inspection
+                    .regular_siblings(Path::new(relative), &source.file, 256)
+                    .unwrap_or_default()
+            };
+            siblings
+                .into_iter()
+                .filter_map(|source| {
+                    let relative = source.workspace_relative.to_str()?.to_string();
+                    opened
+                        .borrow_mut()
+                        .entry(relative.clone())
+                        .or_insert(source);
+                    Some(relative)
+                })
+                .collect()
+        },
+    );
     if paths.is_empty() {
         return Ok(None);
     }
     let args = json!({SOURCE_ARTIFACTS_FIELD: paths});
-    let Some(mut plan) = prepare(workspace_root, &args, scope)? else {
+    let Some(mut plan) = prepare_sources(
+        workspace_root,
+        &args,
+        scope,
+        inspection,
+        Some(opened.into_inner()),
+    )?
+    else {
         return Ok(None);
     };
     plan.mode = SourcePreimageMode::Inferred;
@@ -504,16 +685,20 @@ fn command_has_unquoted_output_redirect(command: &str) -> bool {
     false
 }
 
-fn inferred_operand_path(root: &Path, execution_dir: &Path, token: &str) -> Option<String> {
-    if token.is_empty()
+fn is_inferable_operand(token: &str) -> bool {
+    !(token.is_empty()
         || token.starts_with('-')
         || token == "."
         || token == ".."
         || token.contains('*')
         || token.contains('?')
         || token.contains('[')
-        || token.contains('=')
-    {
+        || token.contains('='))
+}
+
+#[cfg(any(test, not(unix)))]
+fn inferred_operand_path(root: &Path, execution_dir: &Path, token: &str) -> Option<String> {
+    if !is_inferable_operand(token) {
         return None;
     }
     let raw = Path::new(token);
@@ -548,6 +733,7 @@ fn inferred_operand_path(root: &Path, execution_dir: &Path, token: &str) -> Opti
 /// file; treating an exact operand as only one inode is an incomplete
 /// preimage. This is purely a best-effort advisory expansion, so ambiguous or
 /// over-large sibling sets are ignored rather than blocking the command.
+#[cfg(any(test, not(unix)))]
 fn inferred_companion_paths(root: &Path, relative: &str) -> Vec<String> {
     let path = Path::new(relative);
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -588,7 +774,20 @@ fn inferred_companion_paths(root: &Path, relative: &str) -> Vec<String> {
     companions
 }
 
+#[cfg(any(test, not(unix)))]
 fn infer_source_artifacts(root: &Path, execution_dir: &Path, command: &str) -> Vec<String> {
+    infer_source_artifacts_with(
+        command,
+        |token| inferred_operand_path(root, execution_dir, token),
+        |relative| inferred_companion_paths(root, relative),
+    )
+}
+
+fn infer_source_artifacts_with(
+    command: &str,
+    mut operand: impl FnMut(&str) -> Option<String>,
+    mut companions_for: impl FnMut(&str) -> Vec<String>,
+) -> Vec<String> {
     let segments = split_command_segments(command);
     let words_by_segment: Vec<Vec<String>> = segments
         .iter()
@@ -612,10 +811,10 @@ fn infer_source_artifacts(root: &Path, execution_dir: &Path, command: &str) -> V
             continue;
         };
         for token in words.iter().skip(1) {
-            let Some(path) = inferred_operand_path(root, execution_dir, token) else {
+            let Some(path) = operand(token) else {
                 continue;
             };
-            let companions = inferred_companion_paths(root, &path);
+            let companions = companions_for(&path);
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -661,6 +860,9 @@ pub fn restore_receipt(
         return Err("source receipt belongs to a different owner/session".into());
     }
     PreparedSourcePreimages {
+        #[cfg(unix)]
+        inspection: astra_sandbox::PinnedWorkspaceInspection::from_paths(&root, &root)
+            .map_err(|error| error.to_string())?,
         root,
         store_root,
         receipt_path,
@@ -771,23 +973,52 @@ impl PreparedSourcePreimages {
     pub fn finish(&mut self) -> Map<String, Value> {
         let mut statuses = Vec::with_capacity(self.receipt.entries.len());
         for entry in &mut self.receipt.entries {
-            let path = self.root.join(Path::new(&entry.path));
-            let status = match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                    SourcePreimageStatus::Modified
-                }
+            #[cfg(unix)]
+            let status = match self.inspection.open_source(Path::new(&entry.path), true) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     SourcePreimageStatus::Deleted
                 }
                 Err(_) => SourcePreimageStatus::Modified,
-                Ok(_) => match hash_file(&path) {
-                    Ok((_, hash)) if hash == entry.sha256 => SourcePreimageStatus::Unchanged,
-                    Ok((_, hash)) => {
-                        entry.post_sha256 = Some(hash);
+                Ok(source)
+                    if entry
+                        .parent_identity
+                        .as_deref()
+                        .is_some_and(|expected| expected != source.parent_identity) =>
+                {
+                    SourcePreimageStatus::Modified
+                }
+                Ok(source) => {
+                    match hash_opened_source(source.file, &entry.path, MAX_SOURCE_ARTIFACT_BYTES) {
+                        Ok((_, hash)) if hash == entry.sha256 => SourcePreimageStatus::Unchanged,
+                        Ok((_, hash)) => {
+                            entry.post_sha256 = Some(hash);
+                            SourcePreimageStatus::Modified
+                        }
+                        Err(_) => SourcePreimageStatus::Modified,
+                    }
+                }
+            };
+            #[cfg(not(unix))]
+            let status = {
+                let path = self.root.join(Path::new(&entry.path));
+                let status = match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                         SourcePreimageStatus::Modified
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        SourcePreimageStatus::Deleted
+                    }
                     Err(_) => SourcePreimageStatus::Modified,
-                },
+                    Ok(_) => match hash_file(&path) {
+                        Ok((_, hash)) if hash == entry.sha256 => SourcePreimageStatus::Unchanged,
+                        Ok((_, hash)) => {
+                            entry.post_sha256 = Some(hash);
+                            SourcePreimageStatus::Modified
+                        }
+                        Err(_) => SourcePreimageStatus::Modified,
+                    },
+                };
+                status
             };
             entry.status = Some(status.as_str().to_string());
             statuses.push(json!({
@@ -829,6 +1060,14 @@ impl PreparedSourcePreimages {
     /// current file still matches the recorded post-image. A third-party edit
     /// after the command therefore fails closed instead of being overwritten.
     pub fn restore(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if !self
+            .inspection
+            .matches_root_path(&self.root)
+            .unwrap_or(false)
+        {
+            return Err("restore conflict: workspace binding changed".into());
+        }
         for entry in &self.receipt.entries {
             let Some(status) = entry.status.as_deref() else {
                 continue;
@@ -848,25 +1087,58 @@ impl PreparedSourcePreimages {
                 .join(blob_hash);
             let bytes = fs::read(&blob)
                 .map_err(|error| format!("cannot read source preimage blob: {error}"))?;
-            let path = self.root.join(Path::new(&entry.path));
-            if let Some(expected_post) = entry.post_sha256.as_deref() {
-                let current = hash_file(&path).map(|(_, hash)| hash).map_err(|_| {
-                    format!("restore conflict: `{}` is no longer readable", entry.path)
-                })?;
-                if current != expected_post {
+            #[cfg(unix)]
+            {
+                use std::io::{Seek, SeekFrom};
+                let mut file = self
+                    .inspection
+                    .open_for_restore(
+                        Path::new(&entry.path),
+                        entry.post_sha256.is_none(),
+                        entry.parent_identity.as_deref(),
+                    )
+                    .map_err(|error| format!("restore conflict: `{}`: {error}", entry.path))?;
+                if let Some(expected_post) = entry.post_sha256.as_deref() {
+                    let (_, current) = hash_opened_source(
+                        file.try_clone().map_err(|error| error.to_string())?,
+                        &entry.path,
+                        MAX_SOURCE_ARTIFACT_BYTES,
+                    )?;
+                    if current != expected_post {
+                        return Err(format!(
+                            "restore conflict: `{}` changed after the command",
+                            entry.path
+                        ));
+                    }
+                }
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| error.to_string())?;
+                file.set_len(0).map_err(|error| error.to_string())?;
+                file.write_all(&bytes)
+                    .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let path = self.root.join(Path::new(&entry.path));
+                if let Some(expected_post) = entry.post_sha256.as_deref() {
+                    let current = hash_file(&path).map(|(_, hash)| hash).map_err(|_| {
+                        format!("restore conflict: `{}` is no longer readable", entry.path)
+                    })?;
+                    if current != expected_post {
+                        return Err(format!(
+                            "restore conflict: `{}` changed after the command",
+                            entry.path
+                        ));
+                    }
+                } else if path.exists() {
                     return Err(format!(
-                        "restore conflict: `{}` changed after the command",
+                        "restore conflict: `{}` has no recorded post-image",
                         entry.path
                     ));
                 }
-            } else if path.exists() {
-                return Err(format!(
-                    "restore conflict: `{}` has no recorded post-image",
-                    entry.path
-                ));
+                fs::write(&path, bytes)
+                    .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
             }
-            fs::write(&path, bytes)
-                .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
         }
         Ok(())
     }
@@ -890,6 +1162,78 @@ mod tests {
         let result = f(&store);
         unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
         result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn inferred_capture_keeps_prepared_directory_and_refuses_replaced_parent_restore() {
+        with_store(|_| {
+            let workspace = tempfile::tempdir().unwrap();
+            let nested = workspace.path().join("nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("input"), b"original").unwrap();
+            fs::write(nested.join("input-wal"), b"sidecar").unwrap();
+            let inspection =
+                astra_sandbox::PinnedWorkspaceInspection::from_paths(workspace.path(), &nested)
+                    .unwrap();
+            fs::rename(&nested, workspace.path().join("retained")).unwrap();
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("input"), b"foreign").unwrap();
+            let mut plan = prepare_inferred_with_inspection(
+                workspace.path(),
+                inspection,
+                "custom-transform input",
+                "test:pinned-source",
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                plan.receipt
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == "retained/input"
+                        && entry.sha256 == hash_bytes(b"original"))
+            );
+            assert!(
+                plan.receipt
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == "retained/input-wal")
+            );
+            fs::rename(
+                workspace.path().join("retained"),
+                workspace.path().join("original-parent"),
+            )
+            .unwrap();
+            fs::create_dir(workspace.path().join("retained")).unwrap();
+            fs::write(workspace.path().join("retained/input"), b"replacement").unwrap();
+            plan.finish();
+            assert!(plan.restore().is_err());
+            assert_eq!(
+                fs::read(workspace.path().join("retained/input")).unwrap(),
+                b"replacement"
+            );
+            assert_eq!(fs::read(nested.join("input")).unwrap(), b"foreign");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn oversized_source_is_rejected_before_allocating_its_content() {
+        with_store(|_| {
+            let workspace = tempfile::tempdir().unwrap();
+            let file = fs::File::create(workspace.path().join("large")).unwrap();
+            file.set_len(MAX_SOURCE_ARTIFACT_BYTES + 1).unwrap();
+            let error = prepare(
+                workspace.path(),
+                &json!({"source_artifacts": ["large"]}),
+                "test:bounded-source",
+            )
+            .unwrap_err();
+            assert!(error.contains("byte limit"), "{error}");
+        });
     }
 
     #[test]

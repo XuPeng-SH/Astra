@@ -119,6 +119,23 @@ impl GitAction {
     }
 }
 
+/// Translate the dedicated session lifecycle request only after its own
+/// schema/admission checks. The outer tool identity remains `worktree`.
+pub fn worktree_lifecycle_git_args(args: &Value) -> Result<Value, String> {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| matches!(*action, "enter" | "exit"))
+        .ok_or_else(|| "worktree requires action=enter or action=exit".to_string())?;
+    let mut mapped = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "worktree arguments must be an object".to_string())?;
+    mapped.insert("action".to_string(), Value::String("worktree".to_string()));
+    mapped.insert("sub_action".to_string(), Value::String(action.to_string()));
+    Ok(Value::Object(mapped))
+}
+
 pub fn git_missing_action_message() -> String {
     format!(
         "missing required parameter `action` for `git`. Retry the same `git` tool with action set to one of: {GIT_ACTIONS_DISPLAY}."
@@ -216,6 +233,19 @@ pub fn git_worktree_sub_action_from_args(args: &Value) -> Result<GitWorktreeSubA
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lifecycle_mapping_cannot_dispatch_ordinary_git_actions() {
+        for action in ["push", "commit", "remove", "list", ""] {
+            assert!(worktree_lifecycle_git_args(&json!({"action": action})).is_err());
+        }
+        let mapped = worktree_lifecycle_git_args(
+            &json!({"action":"enter", "branch":"task", "sub_action":"remove"}),
+        )
+        .unwrap();
+        assert_eq!(mapped["action"], "worktree");
+        assert_eq!(mapped["sub_action"], "enter");
+    }
 
     #[test]
     fn action_contract_matches_schema_order() {

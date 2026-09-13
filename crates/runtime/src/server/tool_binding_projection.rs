@@ -947,7 +947,11 @@ mod tests {
             None,
         ));
 
-        for expected in ["ask_user", "read_file", "write_file", "bash", "git"] {
+        assert!(
+            !names.contains("git"),
+            "ordinary Git must use the admitted Bash offer"
+        );
+        for expected in ["ask_user", "read_file", "write_file", "bash"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible for a read-write server sandbox runtime"
@@ -997,6 +1001,10 @@ mod tests {
             None,
         ));
 
+        assert!(
+            !names.contains("git"),
+            "ordinary Git must use the admitted Bash offer"
+        );
         for expected in [
             "ask_user",
             "tool_search",
@@ -1004,7 +1012,6 @@ mod tests {
             "read_file",
             "write_file",
             "bash",
-            "git",
         ] {
             assert!(
                 names.contains(expected),
@@ -1139,6 +1146,10 @@ mod tests {
             None,
         ));
 
+        assert!(
+            !names.contains("git"),
+            "ordinary Git must use the admitted Bash offer"
+        );
         for expected in [
             "ask_user",
             "session",
@@ -1148,7 +1159,6 @@ mod tests {
             "bash",
             "read_file",
             "write_file",
-            "git",
         ] {
             assert!(
                 names.contains(expected),
@@ -1571,7 +1581,11 @@ mod tests {
             Some(&runtime),
         ));
 
-        for expected in ["bash", "read_file", "write_file", "git"] {
+        assert!(
+            !names.contains("git"),
+            "ordinary Git must use the admitted Bash offer"
+        );
+        for expected in ["bash", "read_file", "write_file"] {
             assert!(
                 names.contains(expected),
                 "{expected} must remain visible when the runtime is ready and isolated even if it does not support long sessions"

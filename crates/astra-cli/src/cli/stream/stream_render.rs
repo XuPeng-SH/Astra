@@ -2897,7 +2897,7 @@ impl<'a> CliSseStreamHost<'a> {
         Self::bash_boundary_violation(
             tool,
             args,
-            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use structured mutation tools (write_file, git(action=...), rollback-aware editors), run project-native build/test commands through visible tools after this transaction, or keep bash read-only inside this transaction.",
+            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use admitted rollback-aware structured mutation tools, run project-native build/test commands through visible tools after this transaction, or keep bash read-only inside this transaction.",
         )
     }
 

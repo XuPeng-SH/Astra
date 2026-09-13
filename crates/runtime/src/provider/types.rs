@@ -77,7 +77,7 @@ impl ToolCategory {
             | "list_dir"
             | "grep"
             | "glob" => Some(Self::FileSystem),
-            "git" | "git_clone" => Some(Self::VersionControl),
+            "git" | "git_clone" | "worktree" => Some(Self::VersionControl),
             "web_search" | "web_fetch" | "github" | "tool_search" => Some(Self::ExternalApi),
             "ask_user"
             | "notify"

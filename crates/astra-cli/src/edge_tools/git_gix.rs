@@ -9,14 +9,15 @@ use super::ToolExecutor;
 
 // Standalone git operations live in astra-tools; the CLI layer re-exports only
 // the API it intentionally wraps or dispatches.
+use astra_tools::git_gix::GitProcessError;
 pub use astra_tools::git_gix::{
     GitCommitRollbackEntry, GitCommitRollbackJournal, GitStashRollbackEntry,
-    GitStashRollbackJournal, blame, commit_with_metadata, contributors, diff, file_history,
+    GitStashRollbackJournal, blame, commit_with_metadata, contributors, file_history,
     git_worktree_is_clean, head_first_parent_tail, head_short, log, log_search, push,
-    revert_commit_with_metadata, short_commit_sha, show, stash, stash_with_metadata, status,
+    revert_commit_with_metadata, short_commit_sha, stash, stash_with_metadata,
 };
 #[cfg(test)]
-use astra_tools::git_gix::{commit, current_branch};
+use astra_tools::git_gix::{commit, current_branch, diff, show, status};
 
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
@@ -566,14 +567,17 @@ impl ToolExecutor {
 /// - `path` (required): file path relative to project root
 /// - `ref` (optional): restore from a specific commit/ref (default: HEAD)
 pub fn checkout_file(project_root: &Path, args: &Value) -> String {
+    checkout_file_with_metadata(project_root, args).output
+}
+fn checkout_file_with_metadata(project_root: &Path, args: &Value) -> super::ToolExecutionOutcome {
     let file_path = match args.get("path").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => p,
-        _ => return "Error: 'path' is required".to_string(),
+        _ => return super::ToolExecutionOutcome::error("Error: 'path' is required".to_string()),
     };
 
     // Security: reject path traversal
     if file_path.contains("..") {
-        return "Error: path traversal not allowed".to_string();
+        return super::ToolExecutionOutcome::error("Error: path traversal not allowed".to_string());
     }
 
     let git_ref = args.get("ref").and_then(Value::as_str).unwrap_or("HEAD");
@@ -586,37 +590,47 @@ pub fn checkout_file(project_root: &Path, args: &Value) -> String {
         || git_ref.contains("$(")
         || git_ref.contains("${")
     {
-        return "Error: invalid ref".to_string();
+        return super::ToolExecutionOutcome::error("Error: invalid ref".to_string());
     }
 
-    let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
-        command
-            .args(["checkout", git_ref, "--", file_path])
-            .output()
-            .map_err(|error| error.to_string())
-    });
+    let out = astra_tools::git_gix::prepare_bound_git_command(project_root)
+        .map_err(GitProcessError::RepositoryBinding)
+        .and_then(|mut command| {
+            command
+                .args(["checkout", git_ref, "--", file_path])
+                .output()
+                .map_err(GitProcessError::Execution)
+        });
 
     match out {
         Ok(o) if o.status.success() => {
-            format!("✓ Restored {file_path} from {git_ref}")
+            super::ToolExecutionOutcome::ok(format!("✓ Restored {file_path} from {git_ref}"))
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            format!("Error: git checkout failed: {}", stderr.trim())
+            GitProcessError::Exit(stderr.trim().to_string()).into_outcome("git checkout")
         }
-        Err(e) => format!("Error: git checkout failed: {e}"),
+        Err(e) => e.into_outcome("git checkout"),
     }
 }
 
 impl ToolExecutor {
     pub(crate) fn checkout_file(&self, args: &Value) -> String {
+        self.checkout_file_with_metadata(args).output
+    }
+    pub(crate) fn checkout_file_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
         let file_arg = match args.get("path").and_then(Value::as_str) {
             Some(path) if !path.is_empty() => path,
-            _ => return crate::edge_tools::git_gix::checkout_file(&self.project_root, args),
+            _ => {
+                return crate::edge_tools::git_gix::checkout_file_with_metadata(
+                    &self.project_root,
+                    args,
+                );
+            }
         };
         let path = match self.resolve_checked(file_arg) {
             Ok(path) => path,
-            Err(error) => return error,
+            Err(error) => return super::ToolExecutionOutcome::error(error),
         };
 
         let turn_idx = self
@@ -630,8 +644,9 @@ impl ToolExecutor {
                 .record_before(&path, &journal_call_id, turn_idx),
         }
 
-        let output = crate::edge_tools::git_gix::checkout_file(&self.project_root, args);
-        if output.starts_with("Error:") {
+        let output =
+            crate::edge_tools::git_gix::checkout_file_with_metadata(&self.project_root, args);
+        if output.is_error {
             return output;
         }
 
@@ -748,9 +763,11 @@ pub(crate) fn worktree_add_with_metadata(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let mut cmd = match astra_tools::git_gix::exact_git_command(project_root) {
+    let mut cmd = match astra_tools::git_gix::prepare_bound_git_command(project_root) {
         Ok(command) => command,
-        Err(error) => return super::ToolExecutionOutcome::error(error),
+        Err(error) => {
+            return GitProcessError::RepositoryBinding(error).into_outcome("git worktree add");
+        }
     };
     cmd.arg("worktree").arg("add");
 
@@ -802,25 +819,28 @@ pub(crate) fn worktree_add_with_metadata(
                 stderr.trim()
             ))
         }
-        Err(e) => {
-            super::ToolExecutionOutcome::error(format!("Error: git worktree add failed: {e}"))
-        }
+        Err(e) => GitProcessError::Execution(e).into_outcome("git worktree add"),
     }
 }
 
 pub(crate) fn worktree_list(project_root: &Path) -> String {
-    let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
-        command
-            .args(["worktree", "list", "--porcelain"])
-            .output()
-            .map_err(|error| error.to_string())
-    });
+    worktree_list_with_metadata(project_root).output
+}
+pub(crate) fn worktree_list_with_metadata(project_root: &Path) -> super::ToolExecutionOutcome {
+    let out = astra_tools::git_gix::prepare_bound_git_command(project_root)
+        .map_err(GitProcessError::RepositoryBinding)
+        .and_then(|mut command| {
+            command
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .map_err(GitProcessError::Execution)
+        });
 
     match out {
         Ok(o) if o.status.success() => {
             let raw = String::from_utf8_lossy(&o.stdout);
             if raw.trim().is_empty() {
-                return "No worktrees found".to_string();
+                return super::ToolExecutionOutcome::ok("No worktrees found".to_string());
             }
 
             // Parse porcelain output into structured display
@@ -864,13 +884,13 @@ pub(crate) fn worktree_list(project_root: &Path) -> String {
                 ));
             }
 
-            result
+            super::ToolExecutionOutcome::ok(result)
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            format!("Error: git worktree list failed: {}", stderr.trim())
+            GitProcessError::Exit(stderr.trim().to_string()).into_outcome("git worktree list")
         }
-        Err(e) => format!("Error: git worktree list failed: {e}"),
+        Err(e) => e.into_outcome("git worktree list"),
     }
 }
 
@@ -885,9 +905,19 @@ fn format_worktree_entry(path: &str, branch: &str, head: &str, bare: bool) -> St
 }
 
 pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
+    worktree_remove_with_metadata(project_root, args).output
+}
+pub(crate) fn worktree_remove_with_metadata(
+    project_root: &Path,
+    args: &Value,
+) -> super::ToolExecutionOutcome {
     let path = match args.get("path").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => p,
-        _ => return "Error: 'path' is required for remove".to_string(),
+        _ => {
+            return super::ToolExecutionOutcome::error(
+                "Error: 'path' is required for remove".to_string(),
+            );
+        }
     };
 
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
@@ -900,13 +930,23 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
     // First, get the branch name before removal (for optional branch deletion)
     let branch_name = if delete_branch {
-        let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
-            command
-                .args(["worktree", "list", "--porcelain"])
-                .output()
-                .map_err(|error| error.to_string())
-        });
-        out.ok().and_then(|o| {
+        let out = astra_tools::git_gix::prepare_bound_git_command(project_root)
+            .map_err(GitProcessError::RepositoryBinding)
+            .and_then(|mut command| {
+                command
+                    .args(["worktree", "list", "--porcelain"])
+                    .output()
+                    .map_err(GitProcessError::Execution)
+            });
+        let o = match out {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                return GitProcessError::Exit(String::from_utf8_lossy(&o.stderr).into_owned())
+                    .into_outcome("worktree branch lookup");
+            }
+            Err(e) => return e.into_outcome("worktree branch lookup"),
+        };
+        (|| {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let mut found_path = false;
             for line in stdout.lines() {
@@ -921,15 +961,17 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
                 }
             }
             None
-        })
+        })()
     } else {
         None
     };
 
     // Remove worktree
-    let mut cmd = match astra_tools::git_gix::exact_git_command(project_root) {
+    let mut cmd = match astra_tools::git_gix::prepare_bound_git_command(project_root) {
         Ok(command) => command,
-        Err(error) => return error,
+        Err(error) => {
+            return GitProcessError::RepositoryBinding(error).into_outcome("git worktree remove");
+        }
     };
     cmd.arg("worktree").arg("remove");
     if force {
@@ -943,14 +985,14 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
             // Optionally delete the branch
             if let Some(ref branch) = branch_name {
-                let del = astra_tools::git_gix::exact_git_command(project_root).and_then(
-                    |mut command| {
+                let del = astra_tools::git_gix::prepare_bound_git_command(project_root)
+                    .map_err(GitProcessError::RepositoryBinding)
+                    .and_then(|mut command| {
                         command
                             .args(["branch", "-D", branch])
                             .output()
-                            .map_err(|error| error.to_string())
-                    },
-                );
+                            .map_err(GitProcessError::Execution)
+                    });
                 match del {
                     Ok(d) if d.status.success() => {
                         msg.push_str(&format!("\n  ✓ Branch '{branch}' deleted"));
@@ -961,13 +1003,13 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
                 }
             }
 
-            msg
+            super::ToolExecutionOutcome::ok(msg)
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            format!("Error: git worktree remove failed: {}", stderr.trim())
+            GitProcessError::Exit(stderr.trim().to_string()).into_outcome("git worktree remove")
         }
-        Err(e) => format!("Error: git worktree remove failed: {e}"),
+        Err(e) => GitProcessError::Execution(e).into_outcome("git worktree remove"),
     }
 }
 

@@ -625,11 +625,19 @@ enum ServerWorkspaceAuthority {
 }
 
 impl ServerWorkspaceAuthority {
-    fn integrity_valid(&self) -> bool {
+    fn coordination_integrity_valid(&self) -> bool {
         match self {
             Self::None => true,
-            Self::BoundWorkspace(lease) => lease.integrity_valid(),
-            Self::OpaqueWriter(guard) => guard.integrity_valid(),
+            Self::BoundWorkspace(lease) => lease.coordination_integrity_valid(),
+            Self::OpaqueWriter(guard) => guard.coordination_integrity_valid(),
+        }
+    }
+
+    fn receipt_authority_valid(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::BoundWorkspace(lease) => lease.receipt_authority_valid(),
+            Self::OpaqueWriter(guard) => guard.receipt_authority_valid(),
         }
     }
 }
@@ -4288,7 +4296,8 @@ impl RuntimeToolExecutor {
             }
         };
 
-        let coordination_integrity_valid = workspace_authority.integrity_valid();
+        let coordination_integrity_valid = workspace_authority.coordination_integrity_valid();
+        let receipt_authority_valid = workspace_authority.receipt_authority_valid();
         if nested_run_script_callback && let Some(fields) = result.metadata.as_mut() {
             // A nested tool may return output to its authenticated Python
             // caller, but only the top-level script owner can validate the
@@ -4344,7 +4353,7 @@ impl RuntimeToolExecutor {
                 args,
                 &self.workspace_root,
                 result.is_error,
-                coordination_integrity_valid
+                receipt_authority_valid
                     && !nested_run_script_callback
                     && result
                         .metadata
@@ -4367,9 +4376,9 @@ impl RuntimeToolExecutor {
             &self.workspace_root,
             result.is_error,
             desired_state.as_ref(),
-            coordination_integrity_valid && !nested_run_script_callback,
+            receipt_authority_valid && !nested_run_script_callback,
             targeted_observer,
-            coordination_integrity_valid
+            receipt_authority_valid
                 && matches!(
                     &workspace_authority,
                     ServerWorkspaceAuthority::BoundWorkspace(_)
@@ -8626,14 +8635,14 @@ esac
             .expect("coordination witness");
         std::fs::remove_file(&witness).expect("revoke admitted witness generation");
 
-        assert!(!authority.integrity_valid());
+        assert!(!authority.receipt_authority_valid());
         assert!(
             astra_tools::workspace_observation::typed_workspace_tool_receipt_for_applied(
                 "write_file",
                 &json!({"path": "answer.txt", "content": "committed"}),
                 workspace.path(),
                 false,
-                authority.integrity_valid(),
+                authority.receipt_authority_valid(),
             )
             .is_none(),
             "a server commit in a revoked generation must issue zero durable receipt"

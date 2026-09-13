@@ -428,6 +428,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 50,
     },
     ToolMeta {
+        name: "worktree",
+        description: "Enter or exit the session worktree; ordinary Git commands use Bash.",
+        triggers: &["worktree", "workspace branch", "工作树"],
+        intents: &[IntentType::Git],
+        scope: Scope::LocalGit,
+        requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 100,
+    },
+    ToolMeta {
         name: "github",
         description: "GitHub operations: list_prs, get_pr, ci_status, repo_stats, list_issues, get_issue, create_issue. Pass action parameter.",
         triggers: &[

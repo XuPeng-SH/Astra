@@ -1904,6 +1904,28 @@ impl ToolExecutor {
             .collect()
     }
 
+    /// Project the complete request-eligible pool before separating visible
+    /// and deferred schemas. Per-round injection is not capability authority.
+    pub(crate) fn local_command_surface_names(&self, eligible: &[Value]) -> HashSet<String> {
+        let registry = runtime_env_builtin_registry();
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(eligible);
+        let binding = astra_runtime_env::RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::local_filesystem(
+                self.project_root.display().to_string(),
+                astra_runtime_env::WorkspaceAuthority::ReadWrite,
+            ),
+            astra_runtime_env::ExecutorBinding::local_cli(),
+            astra_runtime_env::RuntimeBinding::host_process("local-host"),
+            astra_runtime_env::PolicyIntent::local_developer()
+                .with_allowed_tools(names.iter().cloned()),
+            registry,
+        );
+        names
+            .into_iter()
+            .filter(|name| registry.get(name).is_none() || binding.tool_surface.contains(name))
+            .collect()
+    }
+
     fn runtime_available_tool_schemas(&self) -> Vec<Value> {
         let mut schemas = local_tool_schemas();
         schemas.extend(self.provider_owned_schemas_snapshot("shared_tool_executor_surface"));
@@ -1973,13 +1995,7 @@ impl ToolExecutor {
         }
         let binding = self.runtime_environment_binding_for_tool(name, registry);
         astra_runtime_env::CapabilityResolver
-            .check_tool_call_for_surface(
-                registry,
-                name,
-                args,
-                &binding.capabilities,
-                &binding.tool_surface,
-            )
+            .check_tool_call(registry, name, args, &binding.capabilities)
             .err()
     }
 
@@ -4476,6 +4492,11 @@ impl ToolExecutor {
                         return cancelled_tool_execution_outcome("git", false);
                     }
                     let mut outcome = self.commit_with_metadata(args);
+                    if !_workspace_mutation_lease.receipt_authority_valid()
+                        && let Some(fields) = outcome.tool_result_fields.as_mut()
+                    {
+                        fields.remove("workspace_mutation_applied");
+                    }
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
@@ -4500,6 +4521,11 @@ impl ToolExecutor {
                         return cancelled_tool_execution_outcome("git", false);
                     }
                     let mut outcome = self.revert_commit_with_metadata(args);
+                    if !_workspace_mutation_lease.receipt_authority_valid()
+                        && let Some(fields) = outcome.tool_result_fields.as_mut()
+                    {
+                        fields.remove("workspace_mutation_applied");
+                    }
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
@@ -4542,6 +4568,11 @@ impl ToolExecutor {
                             return cancelled_tool_execution_outcome("git", false);
                         }
                         let mut outcome = self.stash_with_metadata(args);
+                        if !_workspace_mutation_lease.receipt_authority_valid()
+                            && let Some(fields) = outcome.tool_result_fields.as_mut()
+                        {
+                            fields.remove("workspace_mutation_applied");
+                        }
                         outcome.output = self.finalize_tool_output(outcome.output, name);
                         self.record_output_size(outcome.output.len());
                         return outcome;
@@ -4587,6 +4618,11 @@ impl ToolExecutor {
                             return cancelled_tool_execution_outcome("git", false);
                         }
                         let mut outcome = self.worktree_with_metadata(args);
+                        if !_workspace_mutation_lease.receipt_authority_valid()
+                            && let Some(fields) = outcome.tool_result_fields.as_mut()
+                        {
+                            fields.remove("workspace_mutation_applied");
+                        }
                         outcome.output = self.finalize_tool_output(outcome.output, name);
                         self.record_output_size(outcome.output.len());
                         return outcome;
@@ -4663,7 +4699,16 @@ impl ToolExecutor {
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
         }
-        if name == "git"
+        let lifecycle_args = if name == "worktree" {
+            match astra_tools::git_tool_contract::worktree_lifecycle_git_args(args) {
+                Ok(mapped) => Some(mapped),
+                Err(error) => return EdgeToolRun::error(format!("Error: {error}")),
+            }
+        } else {
+            None
+        };
+        let args = lifecycle_args.as_ref().unwrap_or(args);
+        if matches!(name, "git" | "worktree")
             && let Err(error) = astra_tools::git_gix::validate_git_request(&self.project_root, args)
         {
             return EdgeToolRun::failure_evidence(error.message, error.evidence);
@@ -4784,10 +4829,17 @@ impl ToolExecutor {
             )
             .await;
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
-            astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
+            astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
             .as_ref()
-            .is_none_or(astra_tools::workspace_observation::WorkspaceWriterGuard::integrity_valid);
+            .is_none_or(astra_tools::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid);
+        let receipt_authority_valid = coordination_integrity_valid
+            && _workspace_mutation_lease.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+            && _recursive_writer_epoch.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceWriterGuard::receipt_authority_valid,
+            );
         if nested_run_script_callback && let Some(fields) = tool_result_fields.as_mut() {
             fields.remove("workspace_mutation_applied");
             astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(
@@ -4812,7 +4864,7 @@ impl ToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
         }
-        let writer_applied_by_owner = coordination_integrity_valid
+        let writer_applied_by_owner = receipt_authority_valid
             && !nested_run_script_callback
             && tool_result_fields
                 .as_ref()
@@ -4822,13 +4874,14 @@ impl ToolExecutor {
         let writer_applied_by_fingerprint = if writer_applied_by_owner {
             false
         } else {
-            writer_fingerprint_before
-                .zip(
-                    astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                        &self.project_root,
-                    ),
-                )
-                .is_some_and(|(before, after)| before.changed_from(Some(after)))
+            receipt_authority_valid
+                && writer_fingerprint_before
+                    .zip(
+                        astra_tools::workspace_observation::WorkspaceFingerprint::capture(
+                            &self.project_root,
+                        ),
+                    )
+                    .is_some_and(|(before, after)| before.changed_from(Some(after)))
         };
         // Redact before constructing EdgeToolRun.  This is deliberately
         // before status classification, event emission, callback posting, and
@@ -4896,9 +4949,9 @@ impl ToolExecutor {
             &self.project_root,
             is_error,
             desired_state.as_ref(),
-            coordination_integrity_valid && !nested_run_script_callback,
+            receipt_authority_valid && !nested_run_script_callback,
             targeted_observer,
-            coordination_integrity_valid && _workspace_mutation_lease.is_some(),
+            receipt_authority_valid && _workspace_mutation_lease.is_some(),
         ) {
             Ok(projection) => {
                 if let Some(receipt) = projection.convergence_receipt {
@@ -5073,6 +5126,12 @@ impl ToolExecutor {
                     *tool_result_fields = result.metadata.clone();
                     result.output
                 }
+                "worktree" => {
+                    let outcome = self.worktree_with_metadata(args);
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
+                }
                 "git" => {
                     let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
                         Ok(action) => action,
@@ -5080,25 +5139,41 @@ impl ToolExecutor {
                     };
                     match action {
                         astra_tools::git_tool_contract::GitAction::Status => {
-                            git_gix::status(&self.project_root, args)
+                            let result = astra_tools::git_gix::status_with_metadata(
+                                &self.project_root,
+                                args,
+                            );
+                            *source_is_error = Some(result.is_error);
+                            *tool_result_fields = result.tool_result_fields;
+                            result.output
                         }
-                        astra_tools::git_tool_contract::GitAction::Diff => git_gix::diff(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        astra_tools::git_tool_contract::GitAction::Diff => {
+                            let result = astra_tools::git_gix::diff_with_metadata(
+                                &self.project_root,
+                                args,
+                                self.get_budget_pressure(),
+                                self.aggregate_output_bytes
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                            *source_is_error = Some(result.is_error);
+                            *tool_result_fields = result.tool_result_fields;
+                            result.output
+                        }
                         astra_tools::git_tool_contract::GitAction::Log => {
                             git_gix::log(&self.project_root, args)
                         }
-                        astra_tools::git_tool_contract::GitAction::Show => git_gix::show(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        astra_tools::git_tool_contract::GitAction::Show => {
+                            let result = astra_tools::git_gix::show_with_metadata(
+                                &self.project_root,
+                                args,
+                                self.get_budget_pressure(),
+                                self.aggregate_output_bytes
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                            *source_is_error = Some(result.is_error);
+                            *tool_result_fields = result.tool_result_fields;
+                            result.output
+                        }
                         astra_tools::git_tool_contract::GitAction::Blame => {
                             git_gix::blame(&self.project_root, args)
                         }
@@ -5117,7 +5192,10 @@ impl ToolExecutor {
                         }
                         astra_tools::git_tool_contract::GitAction::Stash => self.stash(args),
                         astra_tools::git_tool_contract::GitAction::CheckoutFile => {
-                            self.checkout_file(args)
+                            let result = self.checkout_file_with_metadata(args);
+                            *source_is_error = Some(result.is_error);
+                            *tool_result_fields = result.tool_result_fields;
+                            result.output
                         }
                         astra_tools::git_tool_contract::GitAction::Worktree => self.worktree(args),
                         astra_tools::git_tool_contract::GitAction::Push => {
@@ -9103,6 +9181,53 @@ mod tests {
             vec!["session".to_string()]
         );
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn complete_cli_pool_removes_duplicate_commands_before_deferred_selection() {
+        let executor = test_executor();
+        let pool = vec![
+            function_schema("bash"),
+            function_schema("git"),
+            function_schema("github"),
+            function_schema("worktree"),
+        ];
+        let names = executor.local_command_surface_names(&pool);
+        assert!(names.contains("bash"));
+        assert!(names.contains("worktree"));
+        assert!(!names.contains("git"));
+        assert!(!names.contains("github"));
+        let git_only = executor.local_command_surface_names(&[function_schema("git")]);
+        assert!(git_only.contains("git"));
+        assert!(!git_only.contains("bash"));
+        assert_eq!(names, executor.local_command_surface_names(&pool));
+    }
+
+    #[tokio::test]
+    async fn server_git_only_admission_executes_without_granting_bash() {
+        let (dir, executor) = temp_executor();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        executor.set_current_tool_surface(&[], HashSet::new());
+        executor
+            .accept_server_tool_surface_admission("git")
+            .unwrap();
+        let result = executor
+            .execute_with_metadata("git", &serde_json::json!({"action":"status"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let denied = executor
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command":"touch should-not-exist"}),
+            )
+            .await;
+        assert!(denied.is_error);
+        assert!(!dir.path().join("should-not-exist").exists());
     }
 
     #[test]

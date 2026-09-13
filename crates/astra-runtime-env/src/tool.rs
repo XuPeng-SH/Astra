@@ -537,6 +537,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // explicit ToolSearch selection exposes the typed Git contract only
         // when its audit and branch-protection semantics are actually needed.
         git_read("git", ToolLoadPolicy::Deferred),
+        git_write("worktree", ToolLoadPolicy::Deferred),
         git_clone("git_clone", ToolLoadPolicy::Internal),
         lsp("lsp", ToolLoadPolicy::Deferred),
         lsp("find_definition", ToolLoadPolicy::Internal),
@@ -605,6 +606,53 @@ pub struct AvailableToolSurface {
 }
 
 impl AvailableToolSurface {
+    /// Choose ordinary local commands only after the policy tool allowlist is
+    /// applied. A VersionControl-only request must keep its typed interface.
+    pub(crate) fn prefer_local_command_tools(&mut self) {
+        // An admitted local shell is the ordinary Git command interface.
+        // Make this once from selected offers, so discovery and admission
+        // agree without changing a provider's underlying capabilities.
+        let shell_provider = self
+            .admissions
+            .iter()
+            .find(|entry| entry.tool_name == "bash" && entry.visible)
+            .and_then(|entry| {
+                Some((
+                    entry.selected_provider_type?,
+                    entry.selected_provider_id.clone()?,
+                ))
+            });
+        if let Some((provider_type, provider_id)) = shell_provider
+            && matches!(
+                provider_type,
+                CapacityProviderType::CliLocal
+                    | CapacityProviderType::EdgeCapacity
+                    | CapacityProviderType::Sandbox
+                    | CapacityProviderType::OrchestratorManagedRuntime
+            )
+        {
+            for tool_name in ["git", "github"] {
+                if let Some(entry) = self.admissions.iter_mut().find(|entry| {
+                    entry.tool_name == tool_name
+                        && entry.visible
+                        && entry.selected_provider_type == Some(provider_type)
+                        && entry.selected_provider_id.as_deref() == Some(provider_id.as_str())
+                }) {
+                    let reason =
+                        ToolUnavailableReason::PolicyDenied("local_commands_use_bash".to_string());
+                    entry.visible = false;
+                    entry.hidden_reason = Some(reason.clone());
+                    self.tool_names.retain(|name| name != tool_name);
+                    self.denials.push(ToolDenial {
+                        tool_name: tool_name.to_string(),
+                        reason,
+                    });
+                }
+            }
+            self.denials.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        }
+    }
+
     pub fn contains(&self, tool_name: &str) -> bool {
         self.tool_names.iter().any(|name| name == tool_name)
     }
@@ -822,18 +870,11 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> Vec<Value> {
-        let provider_conflicts = provider_conflicting_tools(registry, capabilities, providers);
+        let surface = self.available_tool_surface_for_providers(registry, capabilities, providers);
         let prompt_schema_conflicts =
             astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
         self.filter_tool_schemas_impl(registry, schemas, capabilities, |tool_name| {
-            if provider_conflicts.contains_key(tool_name)
-                || prompt_schema_conflicts.contains(tool_name)
-            {
-                return false;
-            }
-            providers
-                .iter()
-                .any(|provider| provider.declares_tool(tool_name))
+            !prompt_schema_conflicts.contains(tool_name) && surface.contains(tool_name)
         })
     }
 
@@ -1480,7 +1521,9 @@ fn dynamic_tool_spec(name: &str) -> Option<ToolSpec> {
 fn git_action_requires_write(args: &Value) -> bool {
     matches!(
         args.get("action").and_then(Value::as_str),
-        Some("commit" | "stash" | "revert_commit" | "push" | "clone")
+        Some(
+            "commit" | "stash" | "revert_commit" | "push" | "clone" | "checkout_file" | "worktree"
+        )
     )
 }
 
@@ -1851,7 +1894,7 @@ mod tests {
             "write_file",
             "web_fetch",
             "web_search",
-            "git",
+            "worktree",
             "git_clone",
             "find_definition",
             "background_shell",
@@ -1899,6 +1942,55 @@ mod tests {
             Err(ToolUnavailableReason::ExecutorUnavailable(
                 "control_plane_required".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn local_command_preference_requires_same_actually_admitted_provider() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        assert!(binding.tool_surface.contains("bash"));
+        assert!(binding.tool_surface.contains("worktree"));
+        for tool in ["git", "github"] {
+            assert!(!binding.tool_surface.contains(tool));
+            assert!(
+                CapabilityResolver
+                    .check_tool_call_for_surface(
+                        &registry,
+                        tool,
+                        &serde_json::json!({"action":"status"}),
+                        &binding.capabilities,
+                        &binding.tool_surface
+                    )
+                    .is_err()
+            );
+        }
+        let mut surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &local_cli_providers(&registry),
+        );
+        // An independently bound Git offer is not replaced by another runtime's Bash.
+        surface
+            .admissions
+            .iter_mut()
+            .find(|a| a.tool_name == "git")
+            .unwrap()
+            .selected_provider_id = Some("other-runtime".into());
+        surface
+            .admissions
+            .iter_mut()
+            .find(|a| a.tool_name == "github")
+            .unwrap()
+            .selected_provider_type = Some(CapacityProviderType::ServerService);
+        surface.prefer_local_command_tools();
+        assert!(surface.contains("git"));
+        assert!(surface.contains("github"));
+        let frozen = serde_json::to_vec(&binding.tool_surface).unwrap();
+        assert_eq!(
+            frozen,
+            serde_json::to_vec(&RunBinding::local_developer("/repo", &registry).tool_surface)
+                .unwrap()
         );
     }
 
@@ -1955,7 +2047,8 @@ mod tests {
 
         assert!(binding.tool_surface.contains("bash"));
         assert!(binding.tool_surface.contains("write_file"));
-        assert!(binding.tool_surface.contains("git"));
+        assert!(!binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("bash"));
     }
 
     #[test]
@@ -2175,7 +2268,8 @@ mod tests {
         );
 
         assert!(binding.tool_surface.contains("read_file"));
-        assert!(binding.tool_surface.contains("git"));
+        assert!(!binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("bash"));
         assert!(!binding.tool_surface.contains("write_file"));
         assert_eq!(
             CapabilityResolver.check_tool_call(
@@ -2388,7 +2482,7 @@ mod tests {
             binding.runtime.launch_driver,
             crate::RuntimeLaunchDriver::Kubernetes
         );
-        for tool in ["read_file", "list_dir", "grep", "glob", "git", "bash"] {
+        for tool in ["read_file", "list_dir", "grep", "glob", "bash"] {
             assert!(
                 binding.tool_surface.contains(tool),
                 "{tool} should be visible for read-only snapshot with runtime"
@@ -2429,7 +2523,8 @@ mod tests {
             &registry,
         );
 
-        assert!(binding.tool_surface.contains("git"));
+        assert!(!binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("bash"));
         assert!(!binding.tool_surface.contains("git_clone"));
         assert!(!binding.tool_surface.contains("web_fetch"));
         assert!(!binding.tool_surface.contains("web_search"));

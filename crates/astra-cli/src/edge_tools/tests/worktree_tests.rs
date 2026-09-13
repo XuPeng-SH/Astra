@@ -239,3 +239,62 @@ async fn git_worktree_enter_records_rollback_handle() {
     }));
     assert!(!cleanup.starts_with("Error:"), "cleanup failed: {cleanup}");
 }
+
+#[tokio::test]
+async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+    let entered = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"session-lifecycle"}),
+        )
+        .await;
+    assert!(!entered.is_error, "{entered:?}");
+    let session = exe.get_worktree_session().expect("session switched");
+    assert!(session.worktree_path.join("tracked.txt").exists());
+    // A dirty linked worktree must not be deleted through an incomplete or ignored status query.
+    std::fs::write(session.worktree_path.join("tracked.txt"), "changed\n").unwrap();
+    let denied = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"exit", "exit_action":"remove"}),
+        )
+        .await;
+    assert!(denied.is_error, "{denied:?}");
+    assert!(exe.in_worktree_session());
+    let exited = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+        )
+        .await;
+    assert!(!exited.is_error, "{exited:?}");
+    assert!(!exe.in_worktree_session());
+    assert!(!session.worktree_path.exists());
+    let invalid = exe
+        .execute_with_metadata("worktree", &json!({"action":"push", "branch":"main"}))
+        .await;
+    assert!(invalid.is_error);
+}
+
+#[tokio::test]
+async fn git_output_limit_preserves_executed_failure_at_shared_and_edge_boundaries() {
+    let dir = init_temp_git_repo();
+    std::fs::write(dir.path().join("tracked.txt"), "x".repeat(17 * 1024 * 1024)).unwrap();
+    let args = json!({"action":"diff"});
+    let shared = astra_tools::git_gix::git_dispatch(dir.path(), &args);
+    let exe = ToolExecutor::new(dir.path());
+    let edge = exe.execute_with_metadata("git", &args).await;
+    for result in [shared, edge] {
+        assert!(result.is_error, "{result:?}");
+        let fields = result
+            .tool_result_fields
+            .expect("producer fields preserved");
+        assert_eq!(fields["error_kind"], "resource_limit");
+        assert_eq!(fields["disposition"], "executed");
+        assert_eq!(fields["execution_phase"], "output limit");
+        assert_eq!(fields["process_started"], true);
+        assert_eq!(fields["recovery_evidence"]["retryable"], false);
+    }
+}

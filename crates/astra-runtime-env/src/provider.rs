@@ -594,6 +594,11 @@ fn runtime_workspace_provider_declares_tool(
         // Terminal rendering is an access-surface affordance, not generic
         // workspace executor capacity.
         "display_sixel" => matches!(provider_type, CapacityProviderType::CliLocal),
+        // Only these providers carry the CLI session-worktree owner.
+        "worktree" => matches!(
+            provider_type,
+            CapacityProviderType::CliLocal | CapacityProviderType::EdgeCapacity
+        ),
         // PowerShell is platform capacity. User text such as "Windows" must not
         // expose it; only a provider/runtime that advertises Windows may.
         "powershell" => {

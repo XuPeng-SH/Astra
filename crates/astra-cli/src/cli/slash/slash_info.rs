@@ -571,17 +571,17 @@ fn build_review_prompt(arg: &str) -> String {
     format!(
         "Review target: {target_line}\n\
 \n\
-Step 1: Fetch the diff.\n\
-- HEAD → `git(action=\"show\", revision=\"HEAD\")` (or parallel with `revision=\"HEAD~1\"` for last 2 commits)\n\
-- WORKING_TREE → `git(action=\"diff\")`\n\
-- Range/rev → `git(action=\"show\", revision=\"<rev>\")` or `git(action=\"diff\", ref=\"...\")`\n\
+Step 1: Fetch the diff through admitted tools; use Bash for these Git commands when available.\n\
+- HEAD → `git show HEAD` (use `git show HEAD~1` for the preceding commit)\n\
+- WORKING_TREE → `git diff HEAD`\n\
+- Range/rev → `git show <rev>` or `git diff <range>`\n\
 \n\
 Step 2: Review the diff. Write findings. Stop.\n\
 \n\
 Hard constraints:\n\
 - Do NOT call `read_file` on any file. The diff is sufficient.\n\
 - Exception: if a specific line is ambiguous, use `read_file` with `start_line`/`end_line` for ≤15 lines max. At most 2 such calls total.\n\
-- Do NOT call `grep`, `glob`, or `bash` unless the diff references an external file not shown.\n\
+- Use Bash for the requested Git diff reads. Do NOT call `grep`, `glob`, or unrelated Bash commands unless the diff references an external file not shown.\n\
 - Do NOT re-fetch the same commit twice.\n\
 \n\
 Output:\n\
@@ -2635,7 +2635,7 @@ mod tests {
     fn build_review_prompt_defaults_to_head() {
         let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
-        assert!(prompt.contains("git(action=\"show\""));
+        assert!(prompt.contains("git show HEAD"));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 
@@ -2643,7 +2643,7 @@ mod tests {
     fn build_review_prompt_supports_working_tree() {
         let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
-        assert!(prompt.contains("git(action=\"diff\")"));
+        assert!(prompt.contains("git diff HEAD"));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 

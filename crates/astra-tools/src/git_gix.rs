@@ -1,11 +1,8 @@
 #![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
-//! Pure-Rust git implementations using the `gix` crate.
-//!
-//! Replaces shell `git` subprocess calls with in-process operations for:
-//! - status, diff, log, show, blame, file_history
-//!
-//! Benefits: no subprocess overhead, no shell injection risk, no `git` binary dependency.
+//! Shared repository operations: native gix readers and bounded Git subprocesses.
+//! Model-facing ordinary local commands use Bash when that capability is admitted;
+//! narrower Git providers and session worktree owners reuse these primitives.
 
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -21,66 +18,100 @@ const SHOW_LIMIT: usize = 16_000;
 /// Prevents 67s+ hangs on large merge commits (observed in session 0ac7696c).
 const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run a git command with a timeout, returning None if it times out or fails.
-/// Uses `try_wait` polling with explicit child-kill on timeout to avoid
-/// leaked threads / zombie processes.
-fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    use std::io::Read;
-    use std::process::Stdio;
+#[derive(Debug)]
+pub enum GitProcessError {
+    RepositoryBinding(String),
+    Execution(astra_sandbox::SyncProcessError),
+    Exit(String),
+}
 
-    let mut command = exact_git_command(project_root).ok()?;
-    let mut child = command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    // Drain stdout/stderr on background threads to prevent pipe deadlock:
-    // if the parent doesn't read, the pipe buffer fills and git blocks forever,
-    // causing the 60s timeout to fire even on fast commands with large output.
-    let stdout_handle = {
-        let mut stdout = child.stdout.take()?;
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let stderr_handle = {
-        let mut stderr = child.stderr.take()?;
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
-    };
-
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().ok().flatten() {
-            let stdout = stdout_handle.join().unwrap_or_default();
-            let stderr = stderr_handle.join().unwrap_or_default();
-            return Some(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
+impl std::fmt::Display for GitProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepositoryBinding(reason) => {
+                write!(f, "repository binding failed; no command was run: {reason}")
+            }
+            Self::Execution(error) => write!(f, "{error}"),
+            Self::Exit(error) => write!(f, "{error}"),
         }
-        if start.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            eprintln!(
-                "  ⚠️ git {} timed out after {}s",
-                args.first().unwrap_or(&""),
-                GIT_SUBPROCESS_TIMEOUT.as_secs()
-            );
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+impl GitProcessError {
+    pub fn into_outcome(self, context: &str) -> ToolExecutionOutcome {
+        use astra_core::ErrorKind;
+        let (kind, started, phase) = match &self {
+            Self::RepositoryBinding(_) => (ErrorKind::ToolBinding, false, "repository binding"),
+            Self::Execution(error) => (
+                match error.phase {
+                    "timeout" => ErrorKind::ToolTimeout,
+                    "output limit" => ErrorKind::ResourceLimit,
+                    "repository binding" => ErrorKind::ToolBinding,
+                    _ => ErrorKind::Unknown,
+                },
+                error.started,
+                error.phase,
+            ),
+            Self::Exit(_) => (ErrorKind::Unknown, true, "exit"),
+        };
+        let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
+        if started {
+            evidence.retryable = false;
+            evidence.recovery_actions =
+                vec![astra_core::ToolRecoveryAction::InspectStructuredFailure];
+        }
+        let mut result = ToolExecutionOutcome::error_with_evidence(
+            format!("Error: {context}: {self}"),
+            evidence,
+        );
+        let fields = result.tool_result_fields.as_mut().expect("failure fields");
+        fields.insert(
+            "disposition".into(),
+            Value::String(if started { "executed" } else { "rejected" }.into()),
+        );
+        fields.insert("process_started".into(), Value::Bool(started));
+        fields.insert("execution_phase".into(), Value::String(phase.into()));
+        result
+    }
+}
+
+#[derive(Default)]
+struct GitReadExecution {
+    failure: Option<GitProcessError>,
+}
+impl GitReadExecution {
+    fn render(&mut self, error: GitProcessError) -> String {
+        let output = match &error {
+            GitProcessError::Exit(message) => message.clone(),
+            _ => format!("Error: git command failed: {error}"),
+        };
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+        output
+    }
+    fn finish(self, output: String) -> ToolExecutionOutcome {
+        match self.failure {
+            Some(error) => {
+                let mut result = error.into_outcome("git");
+                result.output = output;
+                result
+            }
+            None => git_read_outcome(output),
+        }
+    }
+}
+
+/// Run Git through the same bounded invocation owner used by every sync helper.
+fn run_git_with_timeout(
+    project_root: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, GitProcessError> {
+    prepare_bound_git_command(project_root)
+        .map_err(GitProcessError::RepositoryBinding)?
+        .args(args)
+        .output()
+        .map_err(GitProcessError::Execution)
 }
 
 /// Outcome of a tool execution with optional metadata fields.
@@ -133,6 +164,27 @@ impl ToolExecutionOutcome {
         }
     }
 
+    /// A later subcommand can fail to start after an earlier step ran.
+    pub fn after_prior_execution(mut self) -> Self {
+        if self.is_error {
+            let fields = self.tool_result_fields.get_or_insert_with(Default::default);
+            fields.insert("disposition".into(), Value::String("executed".into()));
+            fields.insert("process_started".into(), Value::Bool(true));
+            if let Some(evidence) = fields
+                .get_mut("recovery_evidence")
+                .and_then(Value::as_object_mut)
+            {
+                evidence.insert("retryable".into(), Value::Bool(false));
+                evidence.insert(
+                    "recovery_actions".into(),
+                    serde_json::json!(["inspect_structured_failure"]),
+                );
+            }
+            self.output.push_str(" An earlier step of this tool already executed; inspect the resulting state before retrying.");
+        }
+        self
+    }
+
     /// Mark a successful git operation whose owner has actually changed the
     /// bound repository/worktree.  This is consumed by the executor to mint
     /// the same typed mutation receipt as structured file writers.
@@ -151,6 +203,18 @@ impl ToolExecutionOutcome {
 pub struct GitRequestValidationError {
     pub message: String,
     pub evidence: astra_core::ToolFailureEvidence,
+}
+
+/// Convert a Git read helper's stable text contract into the typed tool result.
+/// These helpers predate `ToolExecutionOutcome` and render execution failures
+/// with an `Error:` prefix; the dispatcher must preserve that failure state
+/// instead of marking every returned string successful.
+fn git_read_outcome(output: String) -> ToolExecutionOutcome {
+    if output.starts_with("Error:") {
+        ToolExecutionOutcome::error(output)
+    } else {
+        ToolExecutionOutcome::ok(output)
+    }
 }
 
 impl GitRequestValidationError {
@@ -563,7 +627,7 @@ fn validate_push_target(value: Option<&str>, param_name: &str) -> Result<String,
 }
 
 fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
-    exact_git_command(project_root)
+    prepare_bound_git_command(project_root)
         .ok()?
         .args(["rev-parse", "--verify", commit_ref])
         .output()
@@ -580,7 +644,7 @@ pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<S
     if count == 0 {
         return Some(Vec::new());
     }
-    exact_git_command(project_root)
+    prepare_bound_git_command(project_root)
         .ok()?
         .args([
             "rev-list",
@@ -603,7 +667,7 @@ pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<S
 }
 
 pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
-    let output = exact_git_command(project_root)?
+    let output = prepare_bound_git_command(project_root)?
         .args(["status", "--porcelain"])
         .output()
         .map_err(|error| format!("Error: git status failed: {error}"))?;
@@ -617,7 +681,7 @@ pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
 }
 
 fn abort_git_revert(project_root: &Path) -> Result<bool, String> {
-    let output = exact_git_command(project_root)?
+    let output = prepare_bound_git_command(project_root)?
         .args(["revert", "--abort"])
         .output()
         .map_err(|error| format!("Error: git revert --abort failed: {error}"))?;
@@ -857,148 +921,148 @@ pub fn validate_exact_repository_binding(
     })
 }
 
-/// Construct a Git subprocess pinned to the exact bound repository root.
+/// Git command bound to identities acquired and revalidated before launch.
 ///
-/// The worktree and root-local `.git` entry are pinned before repository
-/// validation. Clearing repository-location overrides and executing from those
-/// same handles prevents a later rename/replacement from changing the admitted
-/// identity or falling through to a parent repository.
-pub struct ExactGitCommand {
-    command: std::process::Command,
+/// This is a startup check, not an immutable filesystem view: Git opens real
+/// metadata paths after exec. Concurrent replacement in that window is governed
+/// by the selected provider's isolation. A detected post-start change is an
+/// error with possible effects, never evidence of a successful mutation.
+pub struct BoundGitCommand {
+    root: std::path::PathBuf,
+    git_path: std::path::PathBuf,
+    args: Vec<String>,
+    observation: Option<crate::workspace_observation::WorkspaceAttributionState>,
     #[cfg(unix)]
-    _git_dir: std::fs::File,
-    #[cfg(unix)]
-    _worktree: std::fs::File,
+    binding: std::sync::Arc<GitBinding>,
 }
 
-pub struct ExactTokioGitCommand {
+pub struct BoundTokioGitCommand {
     command: tokio::process::Command,
     #[cfg(unix)]
-    _git_dir: std::fs::File,
-    #[cfg(unix)]
-    _worktree: std::fs::File,
+    _binding: std::sync::Arc<GitBinding>,
+}
+
+#[cfg(unix)]
+struct GitIdentity {
+    path: std::ffi::CString,
+    file: std::fs::File,
+    stat: libc::stat,
+}
+#[cfg(unix)]
+struct GitBinding {
+    identities: Vec<GitIdentity>,
 }
 
 #[cfg(unix)]
 fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
+    let root = std::fs::File::open("/")?;
+    astra_sandbox::open_directory_beneath(
+        &root,
+        path.strip_prefix("/").map_err(std::io::Error::other)?,
+    )
 }
 
 #[cfg(unix)]
-fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected a regular .git file",
+fn open_git_entry(
+    worktree: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            worktree.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(std::io::Error::other(
+            ".git must be a regular file or directory",
         ));
     }
     Ok(file)
 }
 
 #[cfg(unix)]
-fn fd_root() -> Result<&'static Path, String> {
-    ["/proc/self/fd", "/dev/fd"]
-        .into_iter()
-        .map(Path::new)
-        .find(|path| path.exists())
-        .ok_or_else(|| "Error: platform cannot expose pinned git handles".to_string())
-}
-
-#[cfg(unix)]
-fn fd_path(file: &std::fs::File) -> Result<std::path::PathBuf, String> {
-    use std::os::fd::AsRawFd;
-
-    Ok(fd_root()?.join(file.as_raw_fd().to_string()))
-}
-
-#[cfg(unix)]
 fn parse_linked_git_dir(
-    mut dot_git: std::fs::File,
-    pinned_worktree_path: &Path,
+    dot_git: &std::fs::File,
+    worktree_path: &Path,
 ) -> Result<std::path::PathBuf, String> {
     use std::io::Read;
     use std::os::unix::ffi::OsStringExt;
-
-    const MAX_GITDIR_FILE_BYTES: u64 = 64 * 1024;
-    let len = dot_git
-        .metadata()
-        .map_err(|error| format!("Error: cannot inspect bound .git file: {error}"))?
-        .len();
-    if len > MAX_GITDIR_FILE_BYTES {
-        return Err("Error: bound .git file exceeds the 64 KiB limit".to_string());
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    let mut bytes = Vec::new();
     dot_git
+        .take(65537)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("Error: cannot read bound .git file: {error}"))?;
-    let Some(path) = bytes.strip_prefix(b"gitdir:") else {
-        return Err("Error: bound .git file has no gitdir directive".to_string());
-    };
-    let path = path
-        .strip_prefix(b" ")
-        .unwrap_or(path)
-        .strip_suffix(b"\n")
-        .unwrap_or(path);
+        .map_err(|e| format!("cannot read .git: {e}"))?;
+    if bytes.len() > 65536 {
+        return Err("bound .git file exceeds 64 KiB".into());
+    }
+    let path = bytes
+        .strip_prefix(b"gitdir: ")
+        .ok_or("bound .git file has no gitdir directive")?;
+    let path = path.strip_suffix(b"\n").unwrap_or(path);
     let path = path.strip_suffix(b"\r").unwrap_or(path);
-    if path.is_empty() || path.contains(&0) || path.contains(&b'\n') || path.contains(&b'\r') {
-        return Err("Error: bound .git file has an invalid gitdir path".to_string());
+    if path.is_empty() || path.iter().any(|c| matches!(c, 0 | b'\n' | b'\r')) {
+        return Err("invalid gitdir path".into());
     }
     let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
-    Ok(if path.is_absolute() {
+    // Canonicalization is a label-resolution step; acquisition below walks all
+    // resulting directory components without following symbolic links.
+    let path = if path.is_absolute() {
         path
     } else {
-        pinned_worktree_path.join(path)
-    })
-}
-
-#[cfg(unix)]
-fn pin_exact_repository(canonical_root: &Path) -> Result<(std::fs::File, std::fs::File), String> {
-    // The selected worktree inode is the first authority. Every subsequent
-    // lookup is relative to its descriptor path, so replacing or renaming the
-    // caller-visible pathname cannot redirect the admitted repository.
-    let worktree = open_directory_no_follow(canonical_root)
-        .map_err(|error| format!("Error: cannot pin bound git working tree: {error}"))?;
-    let pinned_worktree_path = fd_path(&worktree)?;
-    let dot_git_path = pinned_worktree_path.join(".git");
-
-    let git_dir = match open_directory_no_follow(&dot_git_path) {
-        Ok(git_dir) => git_dir,
-        Err(directory_error) => {
-            let dot_git = open_regular_file_no_follow(&dot_git_path).map_err(|file_error| {
-                format!(
-                    "Error: bound project root has no exact .git authority ({directory_error}; {file_error})"
-                )
-            })?;
-            let linked_git_dir = parse_linked_git_dir(dot_git, &pinned_worktree_path)?;
-            open_directory_no_follow(&linked_git_dir).map_err(|error| {
-                format!("Error: cannot pin linked-worktree git metadata: {error}")
-            })?
-        }
+        worktree_path.join(path)
     };
-    Ok((git_dir, worktree))
+    path.canonicalize()
+        .map_err(|e| format!("cannot resolve linked git metadata: {e}"))
 }
 
 #[cfg(unix)]
-fn configure_pinned_git_command(
-    command: &mut std::process::Command,
-    git_dir: &std::fs::File,
-    worktree: &std::fs::File,
-    force_worktree: bool,
-) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
+impl GitIdentity {
+    fn new(path: &Path, file: std::fs::File) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            path,
+            file,
+            stat: unsafe { stat.assume_init() },
+        })
+    }
+    // Async-signal-safe: no allocation, locks or Rust filesystem wrappers.
+    fn unchanged(&self) -> bool {
+        let mut current = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::lstat(self.path.as_ptr(), current.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let current = unsafe { current.assume_init() };
+        current.st_dev == self.stat.st_dev
+            && current.st_ino == self.stat.st_ino
+            && current.st_mode == self.stat.st_mode
+            && (current.st_mode & libc::S_IFMT != libc::S_IFREG
+                || (current.st_size == self.stat.st_size
+                    && current.st_mtime == self.stat.st_mtime
+                    && current.st_mtime_nsec == self.stat.st_mtime_nsec))
+    }
+}
+#[cfg(unix)]
+impl GitBinding {
+    fn unchanged(&self) -> bool {
+        self.identities.iter().all(GitIdentity::unchanged)
+    }
+}
 
+fn clear_git_location(command: &mut std::process::Command) {
     for variable in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1010,206 +1074,258 @@ fn configure_pinned_git_command(
     ] {
         command.env_remove(variable);
     }
-    let child_git_dir = git_dir
-        .try_clone()
-        .map_err(|error| format!("Error: cannot clone bound git metadata handle: {error}"))?;
-    command.env("GIT_DIR", fd_path(&child_git_dir)?);
-    if force_worktree {
-        // The child starts in the pinned worktree inode. An explicit lexical
-        // worktree prevents a later core.worktree edit from redirecting the
-        // already-admitted command.
-        command.env("GIT_WORK_TREE", ".");
-    }
     command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0");
-    let child_worktree = worktree
-        .try_clone()
-        .map_err(|error| format!("Error: cannot clone bound git worktree handle: {error}"))?;
-    unsafe {
-        command.pre_exec(move || {
-            // Keep the metadata descriptor close-on-exec in the parent. Only
-            // the forked child clears its private copy immediately before
-            // exec, avoiding a process-wide inheritable-FD window in a
-            // multi-threaded runtime.
-            let flags = libc::fcntl(child_git_dir.as_raw_fd(), libc::F_GETFD);
-            if flags == -1
-                || libc::fcntl(
-                    child_git_dir.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags & !libc::FD_CLOEXEC,
-                ) == -1
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fchdir(child_worktree.as_raw_fd()) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+}
+
+impl BoundGitCommand {
+    pub fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        // All existing tool argument contracts are UTF-8. Preserve invalid OS
+        // paths as a rejected command, never silently execute a lossy spelling.
+        self.args
+            .push(arg.as_ref().to_str().unwrap_or("\0").to_owned());
+        self
     }
-    Ok(())
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+    fn configure(
+        &self,
+        command: &mut std::process::Command,
+        force_worktree: bool,
+    ) -> std::io::Result<()> {
+        clear_git_location(command);
+        command.env("GIT_DIR", &self.git_path);
+        if force_worktree {
+            command.env("GIT_WORK_TREE", ".");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let binding = self.binding.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    if !binding.unchanged() {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    if libc::fchdir(binding.identities[0].file.as_raw_fd()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        command.current_dir(&self.root);
+        Ok(())
+    }
+    pub fn output(&mut self) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
+        let result = astra_sandbox::run_sync_process(
+            "git",
+            &self.args,
+            GIT_SUBPROCESS_TIMEOUT,
+            16 * 1024 * 1024,
+            |cmd| self.configure(cmd, true),
+        );
+        let (started, ownership) = match &result {
+            Ok(out) => (true, out.ownership),
+            Err(err) => (err.started, err.ownership),
+        };
+        if started && let Some(observation) = &self.observation {
+            #[cfg(unix)]
+            if ownership.is_none() {
+                observation.mark_unsettled();
+            }
+            if !ownership.is_some_and(|owner| owner.is_authoritative()) {
+                observation.quarantine();
+            }
+        }
+        #[cfg(unix)]
+        if started && !self.binding.unchanged() {
+            if let Some(observation) = &self.observation {
+                observation.quarantine();
+            }
+            return Err(astra_sandbox::SyncProcessError { phase: "repository binding", detail: "repository identity changed during execution; effects may have occurred; no mutation receipt is valid".into(), started: true, ownership });
+        }
+        result.map(|out| out.output)
+    }
+    pub fn status(&mut self) -> Result<std::process::ExitStatus, astra_sandbox::SyncProcessError> {
+        self.output().map(|out| out.status)
+    }
+    pub fn into_tokio(self) -> BoundTokioGitCommand {
+        let mut command = std::process::Command::new("git");
+        command.args(&self.args);
+        // Configuration only installs inherited settings and pre-exec checks.
+        self.configure(&mut command, true)
+            .expect("Git command configuration is infallible");
+        BoundTokioGitCommand {
+            command: command.into(),
+            #[cfg(unix)]
+            _binding: self.binding,
+        }
+    }
+}
+impl Deref for BoundTokioGitCommand {
+    type Target = tokio::process::Command;
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+impl DerefMut for BoundTokioGitCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
 }
 
 #[cfg(unix)]
-fn same_file_identity(left: &std::fs::File, right: &std::fs::File) -> std::io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let left = left.metadata()?;
-    let right = right.metadata()?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
-}
-
-#[cfg(unix)]
-fn validate_pinned_repository(
-    git_dir: &std::fs::File,
-    worktree: &std::fs::File,
-) -> Result<(), String> {
-    use std::os::unix::ffi::OsStringExt;
-
-    // Ask Git to interpret the pinned metadata without forcing a worktree.
-    // Its reported top-level must resolve to the already-pinned worktree
-    // inode; this rejects bare repositories, foreign linked metadata, and a
-    // core.worktree redirect without reopening either admitted authority.
-    let mut command = std::process::Command::new("git");
-    configure_pinned_git_command(&mut command, git_dir, worktree, false)?;
-    let output = command
-        .args([
-            "rev-parse",
-            "--is-inside-work-tree",
-            "--is-bare-repository",
-            "--show-toplevel",
-        ])
-        .output()
-        .map_err(|error| format!("Error: cannot validate pinned git repository: {error}"))?;
+fn prepare_bound_git_command_with_pin_hook(
+    project_root: &Path,
+    after_pin_before_validation: impl FnOnce(),
+) -> Result<BoundGitCommand, String> {
+    let root = project_root
+        .canonicalize()
+        .map_err(|e| format!("Error: cannot resolve bound git repo: {e}"))?;
+    let worktree = open_directory_no_follow(&root)
+        .map_err(|e| format!("Error: cannot acquire bound git working tree: {e}"))?;
+    let dot_git = open_git_entry(&worktree, c".git")
+        .map_err(|e| format!("Error: bound project root has no exact .git authority: {e}"))?;
+    let git_path = if dot_git.metadata().map_err(|e| e.to_string())?.is_dir() {
+        root.join(".git")
+    } else {
+        parse_linked_git_dir(&dot_git, &root)?
+    };
+    let git_dir = open_directory_no_follow(&git_path)
+        .map_err(|e| format!("Error: cannot acquire git metadata: {e}"))?;
+    let mut identities = vec![
+        GitIdentity::new(&root, worktree),
+        GitIdentity::new(&root.join(".git"), dot_git),
+        GitIdentity::new(&git_path, git_dir),
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("Error: cannot record git identities: {e}"))?;
+    // Linked repositories also rely on a shared metadata directory. Acquire
+    // its canonical identity before validating Git's original configuration.
+    match open_git_entry(&identities[2].file, c"commondir") {
+        Ok(file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            (&file)
+                .take(65537)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("Error: cannot read common git directory: {e}"))?;
+            if bytes.len() > 65536 {
+                return Err("Error: common git directory file exceeds 64 KiB".into());
+            }
+            let common = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+            let common = git_path
+                .join(common.trim())
+                .canonicalize()
+                .map_err(|e| format!("Error: cannot resolve common git directory: {e}"))?;
+            identities.push(
+                GitIdentity::new(&git_path.join("commondir"), file).map_err(|e| e.to_string())?,
+            );
+            identities.push(
+                GitIdentity::new(
+                    &common,
+                    open_directory_no_follow(&common).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Error: cannot acquire common git directory: {error}"
+            ));
+        }
+    }
+    let observation = crate::workspace_observation::WorkspaceAttributionState::capture(&root);
+    let command = BoundGitCommand {
+        root,
+        git_path,
+        args: Vec::new(),
+        observation,
+        binding: std::sync::Arc::new(GitBinding { identities }),
+    };
+    after_pin_before_validation();
+    if !command.binding.unchanged() {
+        return Err("Error: repository binding changed before launch; no command was run".into());
+    }
+    // Preserve core.worktree/bare validation before forcing GIT_WORK_TREE.
+    let args = [
+        "rev-parse",
+        "--is-inside-work-tree",
+        "--is-bare-repository",
+        "--show-toplevel",
+    ]
+    .map(str::to_owned);
+    let output =
+        astra_sandbox::run_sync_process("git", &args, GIT_SUBPROCESS_TIMEOUT, 65536, |cmd| {
+            command.configure(cmd, false)
+        })
+        .map_err(|e| format!("Error: cannot validate bound git repository: {e}"))?
+        .output;
     if !output.status.success() {
         return Err(format!(
-            "Error: pinned git repository validation failed: {}",
+            "Error: bound git repository validation failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut lines = output.stdout.splitn(3, |byte| *byte == b'\n');
-    if lines.next() != Some(b"true".as_slice()) || lines.next() != Some(b"false".as_slice()) {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(top) = text
+        .strip_prefix("true\nfalse\n")
+        .and_then(|s| s.strip_suffix('\n'))
+    else {
+        return Err("Error: bound git metadata does not describe a working-tree repository".into());
+    };
+    let reported = open_directory_no_follow(Path::new(top))
+        .map_err(|e| format!("Error: cannot acquire repository-reported working tree: {e}"))?;
+    use std::os::unix::fs::MetadataExt;
+    let expected = command.binding.identities[0]
+        .file
+        .metadata()
+        .map_err(|e| e.to_string())?;
+    let reported = reported.metadata().map_err(|e| e.to_string())?;
+    if reported.dev() != expected.dev()
+        || reported.ino() != expected.ino()
+        || !command.binding.unchanged()
+    {
         return Err(
-            "Error: bound git metadata does not describe a working-tree repository".to_string(),
+            "Error: bound git working tree escapes or changed from selected project root".into(),
         );
     }
-    let Some(top_level) = lines.next() else {
-        return Err("Error: pinned git repository omitted its worktree identity".to_string());
-    };
-    let top_level = top_level.strip_suffix(b"\n").unwrap_or(top_level);
-    if top_level.is_empty() {
-        return Err("Error: pinned git repository has no working tree".to_string());
-    }
-    let top_level = std::path::PathBuf::from(std::ffi::OsString::from_vec(top_level.to_vec()));
-    let reported = open_directory_no_follow(&top_level)
-        .map_err(|error| format!("Error: cannot pin repository-reported working tree: {error}"))?;
-    if !same_file_identity(worktree, &reported)
-        .map_err(|error| format!("Error: cannot compare pinned git identities: {error}"))?
-    {
-        return Err(format!(
-            "Error: bound git working tree escapes the selected project root ({})",
-            top_level.display()
-        ));
-    }
-    Ok(())
+    Ok(command)
 }
 
-impl Deref for ExactGitCommand {
-    type Target = std::process::Command;
-
-    fn deref(&self) -> &Self::Target {
-        &self.command
-    }
-}
-
-impl DerefMut for ExactGitCommand {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.command
-    }
-}
-
-impl ExactGitCommand {
-    #[must_use]
-    pub fn into_tokio(self) -> ExactTokioGitCommand {
-        ExactTokioGitCommand {
-            command: tokio::process::Command::from(self.command),
-            #[cfg(unix)]
-            _git_dir: self._git_dir,
-            #[cfg(unix)]
-            _worktree: self._worktree,
-        }
-    }
-}
-
-impl Deref for ExactTokioGitCommand {
-    type Target = tokio::process::Command;
-
-    fn deref(&self) -> &Self::Target {
-        &self.command
-    }
-}
-
-impl DerefMut for ExactTokioGitCommand {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.command
-    }
-}
-
-#[cfg(unix)]
-fn exact_git_command_with_pin_hook(
-    project_root: &Path,
-    after_pin_before_validation: impl FnOnce(),
-) -> Result<ExactGitCommand, String> {
-    let canonical_root = project_root
-        .canonicalize()
-        .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
-    let (git_dir, worktree) = pin_exact_repository(&canonical_root)?;
-    after_pin_before_validation();
-    validate_pinned_repository(&git_dir, &worktree)?;
-
-    let mut command = std::process::Command::new("git");
-    configure_pinned_git_command(&mut command, &git_dir, &worktree, true)?;
-    Ok(ExactGitCommand {
-        command,
-        _git_dir: git_dir,
-        _worktree: worktree,
-    })
-}
-
-pub fn exact_git_command(project_root: &Path) -> Result<ExactGitCommand, String> {
+pub fn prepare_bound_git_command(project_root: &Path) -> Result<BoundGitCommand, String> {
     #[cfg(unix)]
     {
-        exact_git_command_with_pin_hook(project_root, || {})
+        prepare_bound_git_command_with_pin_hook(project_root, || {})
     }
     #[cfg(not(unix))]
     {
-        let canonical_root = project_root
+        let root = project_root
             .canonicalize()
-            .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
-        let repo = open_repo(&canonical_root)?;
-        let canonical_git_dir = repo
+            .map_err(|e| format!("Error: cannot resolve bound git repo: {e}"))?;
+        let repo = open_repo(&root)?;
+        let git_path = repo
             .path()
             .canonicalize()
-            .map_err(|error| format!("Error: cannot resolve bound git metadata: {error}"))?;
-        let mut command = std::process::Command::new("git");
-        for variable in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_INDEX_FILE",
-            "GIT_CEILING_DIRECTORIES",
-        ] {
-            command.env_remove(variable);
-        }
-        command.current_dir(&canonical_root);
-        command.env("GIT_DIR", canonical_git_dir);
-        command.env("GIT_WORK_TREE", &canonical_root);
-        if let Some(parent) = canonical_root.parent() {
-            command.env("GIT_CEILING_DIRECTORIES", parent);
-        }
-        command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0");
-        Ok(ExactGitCommand { command })
+            .map_err(|e| format!("Error: cannot resolve bound git metadata: {e}"))?;
+        Ok(BoundGitCommand {
+            observation: crate::workspace_observation::WorkspaceAttributionState::capture(&root),
+            root,
+            git_path,
+            args: Vec::new(),
+        })
     }
 }
 
@@ -1248,6 +1364,53 @@ fn format_author_date(sig: &gix::actor::SignatureRef<'_>) -> String {
 // ─── status ─────────────────────────────────────────────────────────────
 
 pub fn status(project_root: &Path, args: &Value) -> String {
+    status_with_metadata(project_root, args).output
+}
+pub fn status_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    let mut execution = GitReadExecution::default();
+    let output = status_impl(project_root, args, &mut execution);
+    execution.finish(output)
+}
+pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
+    diff_with_metadata(project_root, args, pressure, aggregate_bytes).output
+}
+pub fn diff_with_metadata(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+) -> ToolExecutionOutcome {
+    let mut execution = GitReadExecution::default();
+    let output = diff_impl(
+        project_root,
+        args,
+        pressure,
+        aggregate_bytes,
+        &mut execution,
+    );
+    execution.finish(output)
+}
+pub fn show(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
+    show_with_metadata(project_root, args, pressure, aggregate_bytes).output
+}
+pub fn show_with_metadata(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+) -> ToolExecutionOutcome {
+    let mut execution = GitReadExecution::default();
+    let output = show_impl(
+        project_root,
+        args,
+        pressure,
+        aggregate_bytes,
+        &mut execution,
+    );
+    execution.finish(output)
+}
+
+fn status_impl(project_root: &Path, args: &Value, execution: &mut GitReadExecution) -> String {
     let repo = match open_repo(project_root) {
         Ok(repo) => repo,
         Err(error) => return error,
@@ -1259,9 +1422,9 @@ pub fn status(project_root: &Path, args: &Value) -> String {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if stat_only {
-            return diff_stat_cli(project_root, args, SHOW_LIMIT);
+            return diff_stat_cli(project_root, args, SHOW_LIMIT, execution);
         }
-        return diff(project_root, args, 0.0, 0);
+        return diff_impl(project_root, args, 0.0, 0, execution);
     }
 
     let mut out = String::new();
@@ -1405,7 +1568,13 @@ pub fn log(project_root: &Path, args: &Value) -> String {
 ///
 /// Range syntax (`A..B`) is rejected with a helpful error suggesting
 /// `git(action=diff)` instead.
-pub fn show(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
+fn show_impl(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+    execution: &mut GitReadExecution,
+) -> String {
     let mut limit = pressure_scaled_limit(SHOW_LIMIT, pressure);
     // Further reduce limit when aggregate output is already high
     if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
@@ -1509,21 +1678,23 @@ pub fn show(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
             cli_args.push(f);
         }
         // Use timeout to prevent 67s+ hangs on large merge commits
-        let cli_out = run_git_with_timeout(project_root, &cli_args);
-        if let Some(output) = cli_out {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !stdout.is_empty() {
-                    out.push('\n');
-                    out.push_str(&stdout);
-                    out.push('\n');
-                    return truncate_show_at(out, limit);
-                }
-                // Empty output with file filter means the file wasn't changed.
-                // Fall through to gix to at least show the commit header.
-            }
+        let output = match run_git_with_timeout(project_root, &cli_args) {
+            Ok(output) => output,
+            Err(error) => return execution.render(error),
+        };
+        if !output.status.success() {
+            return execution.render(GitProcessError::Exit(format_git_cli_failure(
+                &cli_args, &output,
+            )));
         }
-        // CLI failed, timed out, or empty — fall through to gix (best effort)
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            out.push('\n');
+            out.push_str(&stdout);
+            out.push('\n');
+            return truncate_show_at(out, limit);
+        }
+        // A successful empty diff may still show the native commit header.
     }
 
     // Diff: use tree changes API
@@ -1868,11 +2039,26 @@ fn validate_diff_path_exists(project_root: &Path, path_filter: &str) -> Result<(
     if joined.exists() {
         return Ok(());
     }
-    // Path may have been deleted but still tracked — ask git's index.
-    if let Some(out) = run_git_with_timeout(
-        project_root,
-        &["ls-files", "--error-unmatch", "--", path_filter],
-    ) && out.status.success()
+    // Inspect the already-selected repository's index directly. This is a
+    // structural path check, not a subprocess whose execution error can be
+    // mistaken for a missing argument. Native pathspec preserves Git patterns.
+    let repo = open_repo(project_root)?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|error| format!("Error: cannot read git index: {error}"))?;
+    let mut pathspec = repo
+        .pathspec(
+            false,
+            [path_filter.as_bytes().as_bstr()],
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )
+        .map_err(|error| format!("Error: cannot match git index path: {error}"))?;
+    if index
+        .entries()
+        .iter()
+        .any(|entry| pathspec.is_included(entry.path(&index), Some(false)))
     {
         return Ok(());
     }
@@ -1921,7 +2107,12 @@ fn normalized_diff_range(base_ref: &str, tip_ref: Option<&str>) -> Result<String
 }
 
 /// `git diff … --stat` via the real `git` CLI (same sources as full diff, no bash).
-fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
+fn diff_stat_cli(
+    project_root: &Path,
+    args: &Value,
+    limit: usize,
+    execution: &mut GitReadExecution,
+) -> String {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
     let base_ref = args.get("base_ref").and_then(Value::as_str);
@@ -1958,10 +2149,16 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     }
 
     let cmd_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-    diff_via_git_cli_or_error(project_root, &cmd_refs, limit)
+    diff_via_git_cli_or_error(project_root, &cmd_refs, limit, execution)
 }
 
-pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
+fn diff_impl(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+    execution: &mut GitReadExecution,
+) -> String {
     let repo = match open_repo(project_root) {
         Ok(repo) => repo,
         Err(error) => return error,
@@ -1977,7 +2174,7 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if stat_only {
-        return diff_stat_cli(project_root, args, limit);
+        return diff_stat_cli(project_root, args, limit, execution);
     }
 
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
@@ -1999,7 +2196,7 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
             cli_args.push("--");
             cli_args.extend(path_filters.iter().copied());
         }
-        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
+        return diff_via_git_cli_or_error(project_root, &cli_args, limit, execution);
     }
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
@@ -2028,7 +2225,7 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
                 cli_args.push("--");
                 cli_args.extend(path_filters.iter().copied());
             }
-            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
+            return diff_via_git_cli_or_error(project_root, &cli_args, limit, execution);
         }
         // gix's tree fallback cannot apply pathspec filtering. Preserve the
         // requested scope by using the CLI result directly whenever filters
@@ -2036,7 +2233,7 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         if !path_filters.is_empty() {
             let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color", "--"];
             cli_args.extend(path_filters.iter().copied());
-            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
+            return diff_via_git_cli_or_error(project_root, &cli_args, limit, execution);
         }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
@@ -2047,18 +2244,16 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         if !path_filters.is_empty() {
             cli_args.push("--");
             cli_args.extend(path_filters.iter().copied());
-            let result = diff_via_git_cli_or_error(project_root, &cli_args, limit);
+            let result = diff_via_git_cli_or_error(project_root, &cli_args, limit, execution);
             return if result == "No changes" {
                 "No staged changes".to_string()
             } else {
                 result
             };
         }
-        let result = match diff_via_git_cli_result(project_root, &cli_args, limit)
-            .output_or_else(|| diff_index_to_head(&repo, limit))
-        {
+        let result = match diff_via_git_cli_result(project_root, &cli_args, limit) {
             Ok(r) => r,
-            Err(error) => return error,
+            Err(error) => return execution.render(error),
         };
         if result == "No changes" {
             return "No staged changes".to_string();
@@ -2072,65 +2267,41 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     if !path_filters.is_empty() {
         cli_args.push("--");
         cli_args.extend(path_filters.iter().copied());
-        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
+        return diff_via_git_cli_or_error(project_root, &cli_args, limit, execution);
     }
-    match diff_via_git_cli_result(project_root, &cli_args, limit)
-        .output_or_else(|| diff_worktree(&repo, limit))
-    {
+    match diff_via_git_cli_result(project_root, &cli_args, limit) {
         Ok(result) => result,
-        Err(error) => error,
+        Err(error) => execution.render(error),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GitCliDiffResult {
-    Output(String),
-    Failed(String),
-    Unavailable,
-}
-
-impl GitCliDiffResult {
-    /// Returns `Ok(output)` for `Output`, `Err(error)` for `Failed`.
-    /// For `Unavailable`, calls `fallback` and returns `Ok(fallback_result)`.
-    fn output_or_else<F: FnOnce() -> String>(self, fallback: F) -> Result<String, String> {
-        match self {
-            Self::Output(s) => Ok(s),
-            Self::Failed(e) => Err(e),
-            Self::Unavailable => Ok(fallback()),
-        }
-    }
-}
-
-fn diff_via_git_cli_or_error(project_root: &Path, args: &[&str], limit: usize) -> String {
+fn diff_via_git_cli_or_error(
+    project_root: &Path,
+    args: &[&str],
+    limit: usize,
+    execution: &mut GitReadExecution,
+) -> String {
     match diff_via_git_cli_result(project_root, args, limit) {
-        GitCliDiffResult::Output(result) => result,
-        GitCliDiffResult::Failed(error) => error,
-        GitCliDiffResult::Unavailable => {
-            format!("Error: git {} failed to start or timed out", args.join(" "))
-        }
+        Ok(result) => result,
+        Err(error) => execution.render(error),
     }
 }
 
-fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
-    match diff_via_git_cli_result(project_root, args, limit) {
-        GitCliDiffResult::Output(result) => Some(result),
-        GitCliDiffResult::Failed(_) | GitCliDiffResult::Unavailable => None,
-    }
-}
-
-fn diff_via_git_cli_result(project_root: &Path, args: &[&str], limit: usize) -> GitCliDiffResult {
+fn diff_via_git_cli_result(
+    project_root: &Path,
+    args: &[&str],
+    limit: usize,
+) -> Result<String, GitProcessError> {
     // Use timeout to prevent hangs on large diffs
-    let Some(out) = run_git_with_timeout(project_root, args) else {
-        return GitCliDiffResult::Unavailable;
-    };
+    let out = run_git_with_timeout(project_root, args)?;
     if !out.status.success() {
-        return GitCliDiffResult::Failed(format_git_cli_failure(args, &out));
+        return Err(GitProcessError::Exit(format_git_cli_failure(args, &out)));
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if stdout.trim().is_empty() {
-        return GitCliDiffResult::Output("No changes".to_string());
+        return Ok("No changes".to_string());
     }
-    GitCliDiffResult::Output(truncate_diff_at(stdout, limit.min(tool_output_limit())))
+    Ok(truncate_diff_at(stdout, limit.min(tool_output_limit())))
 }
 
 fn format_git_cli_failure(args: &[&str], out: &std::process::Output) -> String {
@@ -2235,177 +2406,6 @@ fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str, limit: usize) ->
 
     if let Err(e) = result {
         out.push_str(&format!("\n[diff error: {e}]\n"));
-    }
-
-    if out.is_empty() {
-        "No changes".to_string()
-    } else {
-        out.push_str(&format!(
-            "\n{count} file(s) changed (summary only — use `git diff` for full patch)"
-        ));
-        truncate_diff_at(out, limit)
-    }
-}
-
-/// Diff staged (index) changes against HEAD.
-fn diff_index_to_head(repo: &gix::Repository, limit: usize) -> String {
-    let head_tree = match resolve_tree(repo, "HEAD") {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-
-    // Get the index and convert to a tree for comparison
-    let index = match repo.index() {
-        Ok(i) => i,
-        Err(e) => return format!("Error reading index: {e}"),
-    };
-
-    // Build changes by comparing HEAD tree entries with index entries
-    let mut out = String::new();
-    let mut count = 0u32;
-
-    for entry in index.entries() {
-        let path = entry.path(&index);
-        let path_str = path.to_string();
-
-        // Check if HEAD has this file and whether it differs
-        let head_entry = head_tree.lookup_entry_by_path(&path_str);
-        let in_head: Option<gix::ObjectId> = match &head_entry {
-            Ok(Some(he)) => Some(he.object_id()),
-            _ => None,
-        };
-
-        let idx_oid = entry.id;
-
-        match in_head {
-            Some(head_oid) if head_oid == idx_oid => continue, // unchanged
-            Some(_head_oid) => {
-                out.push_str(&format!(
-                    "diff --git a/{path_str} b/{path_str}\n--- a/{path_str}\n+++ b/{path_str}\n"
-                ));
-                out.push_str("# modified (staged)\n\n");
-                count += 1;
-            }
-            None => {
-                out.push_str(&format!(
-                    "diff --git a/{path_str} b/{path_str}\n--- /dev/null\n+++ b/{path_str}\n"
-                ));
-                out.push_str("# new file (staged)\n\n");
-                count += 1;
-            }
-        }
-
-        if out.len() > limit {
-            out.push_str("[truncated]\n");
-            break;
-        }
-    }
-
-    // Detect staged deletions: files in HEAD tree but absent from index
-    {
-        fn collect_tree_paths(
-            tree: &gix::Tree<'_>,
-            prefix: &str,
-            paths: &mut std::collections::HashSet<String>,
-        ) {
-            for e in tree.iter().flatten() {
-                let name = e.filename().to_string();
-                let full = if prefix.is_empty() {
-                    name
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                if e.mode().is_tree() {
-                    if let Ok(obj) = e.object()
-                        && let Ok(sub) = obj.try_into_tree()
-                    {
-                        collect_tree_paths(&sub, &full, paths);
-                    }
-                } else {
-                    paths.insert(full);
-                }
-            }
-        }
-
-        let mut head_paths = std::collections::HashSet::new();
-        collect_tree_paths(&head_tree, "", &mut head_paths);
-
-        let index_paths: std::collections::HashSet<String> = index
-            .entries()
-            .iter()
-            .map(|e| e.path(&index).to_string())
-            .collect();
-
-        for deleted_path in head_paths.difference(&index_paths) {
-            out.push_str(&format!(
-                "diff --git a/{deleted_path} b/{deleted_path}\n--- a/{deleted_path}\n+++ /dev/null\n"
-            ));
-            out.push_str("# deleted (staged)\n\n");
-            count += 1;
-            if out.len() > limit {
-                out.push_str("[truncated]\n");
-                break;
-            }
-        }
-    }
-
-    if out.is_empty() {
-        "No staged changes".to_string()
-    } else {
-        out.push_str(&format!("\n{count} file(s) staged"));
-        truncate_diff_at(out, limit)
-    }
-}
-
-/// Diff worktree (unstaged) changes.
-fn diff_worktree(repo: &gix::Repository, limit: usize) -> String {
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let iter = match platform.into_index_worktree_iter(Vec::<BString>::new()) {
-        Ok(i) => i,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    use gix::status::index_worktree::iter::Summary;
-    let mut out = String::new();
-    let mut count = 0;
-
-    for entry in iter {
-        match entry {
-            Ok(item) => {
-                let path = item.rela_path().to_string();
-                let summary = match item.summary() {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                let status_str = match summary {
-                    Summary::Modified => "modified",
-                    Summary::Added | Summary::IntentToAdd => "new file",
-                    Summary::Removed => "deleted",
-                    Summary::Renamed => "renamed",
-                    Summary::TypeChange => "typechange",
-                    _ => "changed",
-                };
-
-                out.push_str(&format!(
-                    "diff --git a/{path} b/{path}\n# {status_str}: {path}\n\n"
-                ));
-                count += 1;
-
-                if out.len() > limit {
-                    out.push_str("[truncated]\n");
-                    break;
-                }
-            }
-            Err(e) => {
-                out.push_str(&format!("Error: {e}\n"));
-                break;
-            }
-        }
     }
 
     if out.is_empty() {
@@ -2996,6 +2996,7 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
         );
     }
 
+    let mut prior_execution = false;
     // Stage files
     let files: Vec<&str> = args
         .get("files")
@@ -3006,44 +3007,48 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
 
     if files.is_empty() && !stage_all {
         // Default: stage all changes
-        let add_out = exact_git_command(project_root).and_then(|mut command| {
-            command
-                .args(["add", "-A"])
-                .output()
-                .map_err(|e| e.to_string())
-        });
+        let add_out = prepare_bound_git_command(project_root)
+            .map_err(GitProcessError::RepositoryBinding)
+            .and_then(|mut command| {
+                command
+                    .args(["add", "-A"])
+                    .output()
+                    .map_err(GitProcessError::Execution)
+            });
         match add_out {
             Err(e) => {
-                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
+                return e.into_outcome("git add");
             }
             Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: git add -A failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                return GitProcessError::Exit(String::from_utf8_lossy(&out.stderr).into_owned())
+                    .into_outcome("git add -A");
             }
-            Ok(_) => {}
+            Ok(_) => {
+                prior_execution = true;
+            }
         }
     } else if !files.is_empty() {
         // Stage specific files
-        let add_out = exact_git_command(project_root).and_then(|mut command| {
-            command
-                .arg("add")
-                .args(&files)
-                .output()
-                .map_err(|e| e.to_string())
-        });
+        let add_out = prepare_bound_git_command(project_root)
+            .map_err(GitProcessError::RepositoryBinding)
+            .and_then(|mut command| {
+                command
+                    .arg("add")
+                    .args(&files)
+                    .output()
+                    .map_err(GitProcessError::Execution)
+            });
         match add_out {
             Err(e) => {
-                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
+                return e.into_outcome("git add");
             }
             Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: git add failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                return GitProcessError::Exit(String::from_utf8_lossy(&out.stderr).into_owned())
+                    .into_outcome("git add");
             }
-            Ok(_) => {}
+            Ok(_) => {
+                prior_execution = true;
+            }
         }
     }
 
@@ -3052,12 +3057,14 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
     if stage_all && files.is_empty() {
         commit_args.insert(1, "-a");
     }
-    let commit_out = exact_git_command(project_root).and_then(|mut command| {
-        command
-            .args(&commit_args)
-            .output()
-            .map_err(|e| e.to_string())
-    });
+    let commit_out = prepare_bound_git_command(project_root)
+        .map_err(GitProcessError::RepositoryBinding)
+        .and_then(|mut command| {
+            command
+                .args(&commit_args)
+                .output()
+                .map_err(GitProcessError::Execution)
+        });
 
     match commit_out {
         Ok(out) if out.status.success() => {
@@ -3096,10 +3103,17 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
             if stderr.contains("nothing to commit") {
                 ToolExecutionOutcome::ok("Nothing to commit — working tree clean".to_string())
             } else {
-                ToolExecutionOutcome::error(format!("Error: git commit failed: {}", stderr.trim()))
+                GitProcessError::Exit(stderr.trim().to_string()).into_outcome("git commit")
             }
         }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git commit failed: {e}")),
+        Err(e) => {
+            let outcome = e.into_outcome("git commit");
+            if prior_execution {
+                outcome.after_prior_execution()
+            } else {
+                outcome
+            }
+        }
     }
 }
 
@@ -3131,12 +3145,14 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
         }
     };
 
-    match exact_git_command(project_root).and_then(|mut command| {
-        command
-            .args(["revert", "--no-edit", target_commit_sha.as_str()])
-            .output()
-            .map_err(|error| error.to_string())
-    }) {
+    match prepare_bound_git_command(project_root)
+        .map_err(GitProcessError::RepositoryBinding)
+        .and_then(|mut command| {
+            command
+                .args(["revert", "--no-edit", target_commit_sha.as_str()])
+                .output()
+                .map_err(GitProcessError::Execution)
+        }) {
         Ok(out) if out.status.success() => {
             let revert_commit_sha = resolve_commit_ref(project_root, "HEAD");
             let revert_short_sha = revert_commit_sha
@@ -3190,9 +3206,9 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
                     message.push_str(&format!(" ({error})"));
                 }
             }
-            ToolExecutionOutcome::error(message)
+            GitProcessError::Exit(message).into_outcome("git revert")
         }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git revert failed: {e}")),
+        Err(e) => e.into_outcome("git revert"),
     }
 }
 
@@ -3217,13 +3233,13 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
     };
     let action_name = action.as_str();
 
-    let mut cmd = match exact_git_command(project_root) {
+    let mut cmd = match prepare_bound_git_command(project_root) {
         Ok(command) => command,
-        Err(error) => return ToolExecutionOutcome::error(error),
+        Err(error) => return GitProcessError::RepositoryBinding(error).into_outcome("git stash"),
     };
     let before_stash_oid = matches!(action, crate::git_tool_contract::GitStashSubAction::Push)
         .then(|| {
-            exact_git_command(project_root)
+            prepare_bound_git_command(project_root)
                 .ok()?
                 .args(["rev-parse", "--verify", "refs/stash"])
                 .output()
@@ -3281,7 +3297,7 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                 };
                 let mut tool_result_fields = None;
                 if matches!(action, crate::git_tool_contract::GitStashSubAction::Push) {
-                    let after_stash_oid = exact_git_command(project_root)
+                    let after_stash_oid = prepare_bound_git_command(project_root)
                         .ok()
                         .and_then(|mut command| {
                             command
@@ -3321,18 +3337,11 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                 outcome
             } else {
                 let err = stderr.trim();
-                if err.contains("No local changes") || err.contains("No stash entries") {
-                    // `err.to_string()` may or may not begin with "Error"; pass through
-                    // the gix error verbatim and flag as failure explicitly.
-                    ToolExecutionOutcome::error(err.to_string())
-                } else {
-                    ToolExecutionOutcome::error(format!(
-                        "Error: git stash {action_name} failed: {err}"
-                    ))
-                }
+                GitProcessError::Exit(err.to_string())
+                    .into_outcome(&format!("git stash {action_name}"))
             }
         }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git stash failed: {e}")),
+        Err(e) => GitProcessError::Execution(e).into_outcome("git stash"),
     }
 }
 
@@ -3365,9 +3374,9 @@ pub fn push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOut
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let mut cmd = match exact_git_command(project_root) {
+    let mut cmd = match prepare_bound_git_command(project_root) {
         Ok(command) => command,
-        Err(error) => return ToolExecutionOutcome::error(error),
+        Err(error) => return GitProcessError::RepositoryBinding(error).into_outcome("git push"),
     };
     cmd.arg("push");
 
@@ -3399,10 +3408,10 @@ pub fn push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOut
                 }
             } else {
                 let err = stderr.trim();
-                ToolExecutionOutcome::error(format!("Error: git push failed: {err}"))
+                GitProcessError::Exit(err.to_string()).into_outcome("git push")
             }
         }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git push failed: {e}")),
+        Err(e) => GitProcessError::Execution(e).into_outcome("git push"),
     }
 }
 
@@ -3429,29 +3438,19 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
         return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
     }
     match action {
-        crate::git_tool_contract::GitAction::Status => {
-            ToolExecutionOutcome::ok(status(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Diff => {
-            ToolExecutionOutcome::ok(diff(project_root, args, 0.0, 0))
-        }
-        crate::git_tool_contract::GitAction::Log => {
-            ToolExecutionOutcome::ok(log(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Show => {
-            ToolExecutionOutcome::ok(show(project_root, args, 0.0, 0))
-        }
-        crate::git_tool_contract::GitAction::Blame => {
-            ToolExecutionOutcome::ok(blame(project_root, args))
-        }
+        crate::git_tool_contract::GitAction::Status => status_with_metadata(project_root, args),
+        crate::git_tool_contract::GitAction::Diff => diff_with_metadata(project_root, args, 0.0, 0),
+        crate::git_tool_contract::GitAction::Log => git_read_outcome(log(project_root, args)),
+        crate::git_tool_contract::GitAction::Show => show_with_metadata(project_root, args, 0.0, 0),
+        crate::git_tool_contract::GitAction::Blame => git_read_outcome(blame(project_root, args)),
         crate::git_tool_contract::GitAction::FileHistory => {
-            ToolExecutionOutcome::ok(file_history(project_root, args))
+            git_read_outcome(file_history(project_root, args))
         }
         crate::git_tool_contract::GitAction::LogSearch => {
-            ToolExecutionOutcome::ok(log_search(project_root, args))
+            git_read_outcome(log_search(project_root, args))
         }
         crate::git_tool_contract::GitAction::Contributors => {
-            ToolExecutionOutcome::ok(contributors(project_root, args))
+            git_read_outcome(contributors(project_root, args))
         }
         crate::git_tool_contract::GitAction::Commit => commit_with_metadata(project_root, args),
         crate::git_tool_contract::GitAction::RevertCommit => {
@@ -3478,6 +3477,35 @@ mod tests {
     }
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn process_failure_metadata_keeps_local_phase_and_possible_effects() {
+        for (phase, kind) in [
+            ("timeout", "tool_timeout"),
+            ("output limit", "resource_limit"),
+            ("repository binding", "tool_binding"),
+        ] {
+            let outcome = GitProcessError::Execution(astra_sandbox::SyncProcessError {
+                phase,
+                detail: "fixture".into(),
+                started: true,
+                ownership: None,
+            })
+            .into_outcome("git");
+            assert!(outcome.is_error);
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], kind);
+            assert_eq!(fields["disposition"], "executed");
+            assert_eq!(fields["process_started"], true);
+            assert_eq!(fields["recovery_evidence"]["retryable"], false);
+        }
+        let outcome =
+            GitProcessError::RepositoryBinding("missing metadata".into()).into_outcome("git");
+        assert_eq!(
+            outcome.tool_result_fields.unwrap()["disposition"],
+            "rejected"
+        );
+    }
 
     #[test]
     fn reject_path_traversal_blocks_empty_and_parent_walk() {
@@ -3709,7 +3737,8 @@ mod tests {
 
         validate_exact_repository_binding(&linked).expect("linked worktree is exact authority");
         assert!(!status(&linked, &json!({})).starts_with("Error:"));
-        let mut command = exact_git_command(&linked).expect("pin linked-worktree authority");
+        let mut command =
+            prepare_bound_git_command(&linked).expect("pin linked-worktree authority");
         let output = command
             .args(["rev-parse", "HEAD"])
             .output()
@@ -3741,7 +3770,7 @@ mod tests {
         let error = validate_exact_repository_binding(&repo)
             .expect_err("core.worktree must not redirect authority outside the selected root");
         assert!(error.message.contains("not a git repository"));
-        assert!(exact_git_command(&repo).is_err());
+        assert!(prepare_bound_git_command(&repo).is_err());
     }
 
     #[test]
@@ -3750,36 +3779,47 @@ mod tests {
         run_git(bare.path(), &["init", "--bare"]);
 
         assert!(validate_exact_repository_binding(bare.path()).is_err());
-        assert!(exact_git_command(bare.path()).is_err());
+        assert!(prepare_bound_git_command(bare.path()).is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn exact_git_command_validates_and_executes_pinned_metadata_after_dot_git_replacement() {
+    fn bound_git_command_rejects_observed_metadata_replacement_before_launch() {
         let repo = init_temp_repo();
-        let expected_head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
-        let original_git = repo.path().join(".git-original");
-        let mut command = exact_git_command_with_pin_hook(repo.path(), || {
-            // This hook runs after both authority FDs are pinned but before
-            // repository validation. Replacing the caller-visible metadata
-            // here deterministically exercises the former validation→pin
-            // race: validation and execution must both retain the old inode.
-            std::fs::rename(repo.path().join(".git"), &original_git).unwrap();
+        let result = prepare_bound_git_command_with_pin_hook(repo.path(), || {
+            std::fs::rename(repo.path().join(".git"), repo.path().join(".git-original")).unwrap();
             run_git(repo.path(), &["init"]);
-        })
-        .expect("construct command from pinned authority");
-        command.args(["rev-parse", "HEAD"]);
+        });
+        assert!(result.is_err());
+        let mut command = prepare_bound_git_command(repo.path()).unwrap();
+        std::fs::rename(repo.path().join(".git"), repo.path().join(".git-replaced")).unwrap();
+        run_git(repo.path(), &["init"]);
+        let error = command
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap_err();
+        assert!(!error.started);
+    }
 
-        let output = command.output().expect("run pinned git command");
-        assert!(
-            output.status.success(),
-            "pinned git command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    #[cfg(unix)]
+    #[test]
+    fn bound_git_runtime_replacement_reports_possible_effects_without_receipt() {
+        let repo = init_temp_repo();
+        let mut command = prepare_bound_git_command(repo.path()).unwrap();
+        let failure = command
+            .args([
+                "-c",
+                "alias.astra-test-rebind=!mv .git .git-moved",
+                "astra-test-rebind",
+            ])
+            .output()
+            .unwrap_err();
+        assert!(failure.started);
+        assert_eq!(failure.phase, "repository binding");
+        assert!(repo.path().join(".git-moved").exists());
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            expected_head,
-            "execution must retain the repository admitted before `.git` replacement"
+            crate::workspace_observation::workspace_observation_is_quarantined(repo.path()),
+            Some(true)
         );
     }
 
@@ -4226,6 +4266,29 @@ mod tests {
         assert!(
             !result.contains("No changes"),
             "stat_only invalid refs are not an empty diff: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_dispatch_marks_read_helper_failure_as_error() {
+        let repo = init_temp_repo();
+        let result = super::git_dispatch(
+            repo.path(),
+            &json!({
+                "action": "diff",
+                "stat_only": true,
+                "ref": "__astra_missing_ref__..HEAD"
+            }),
+        );
+
+        assert!(
+            result.is_error,
+            "Git read failure was reported as success: {result:?}"
+        );
+        assert!(
+            result.output.starts_with("Error:"),
+            "expected a diagnostic error result: {}",
+            result.output
         );
     }
 
@@ -5338,15 +5401,28 @@ mod tests {
     // ─── git CLI fallback behavior tests ────────────────────────────────────
 
     #[test]
-    fn diff_via_git_cli_returns_none_for_bad_args() {
+    fn diff_via_git_cli_preserves_failure_for_bad_args() {
         let root = repo_root();
-        // Invalid ref should make git fail → returns None
-        let result = diff_via_git_cli(
+        // Invalid ref must retain the command failure.
+        let result = diff_via_git_cli_result(
             &root,
             &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"],
             8000,
         );
-        assert!(result.is_none(), "bad ref should return None for fallback");
+        assert!(result.is_err(), "bad ref must preserve failure");
+    }
+
+    #[test]
+    fn git_binding_failure_preserves_cause_and_does_not_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let failure = run_git_with_timeout(root.path(), &["diff", "--stat"])
+            .expect_err("a directory without an exact repository must fail before launch");
+        assert!(matches!(failure, GitProcessError::RepositoryBinding(_)));
+        assert!(failure.to_string().contains("no command was run"));
+        let result = diff_via_git_cli_result(root.path(), &["diff", "--stat"], 8000);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("repository binding failed"), "{error}");
+        assert!(!error.contains("timed out"), "{error}");
     }
 
     #[test]
@@ -5358,7 +5434,8 @@ mod tests {
             8000,
         );
         match result {
-            GitCliDiffResult::Failed(error) => {
+            Err(error) => {
+                let error = error.to_string();
                 assert!(error.starts_with("Error: git diff "), "{error}");
                 assert!(
                     error.contains("not_a_valid_ref_xyzzy"),
@@ -5373,44 +5450,26 @@ mod tests {
     fn diff_via_git_cli_returns_no_changes_for_empty_diff() {
         let root = repo_root();
         // HEAD vs HEAD has no diff
-        let result = diff_via_git_cli(
+        let result = diff_via_git_cli_result(
             &root,
             &["diff", "HEAD", "HEAD", "--no-ext-diff", "--no-color"],
             8000,
         );
         assert_eq!(
-            result,
-            Some("No changes".to_string()),
+            result.unwrap(),
+            "No changes",
             "HEAD vs HEAD should be empty diff"
         );
     }
 
     #[test]
-    fn gix_worktree_fallback_annotates_summary_only() {
-        // diff_worktree output (when it has entries) should tell the user
-        // that it's summary-only so the LLM knows to call bash git diff.
-        let root = repo_root();
-        let repo = open_repo(&root).expect("repo should open");
-        let result = diff_worktree(&repo, 100_000);
-        if result != "No changes" {
-            assert!(
-                result.contains("summary only"),
-                "gix fallback should annotate summary-only output: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn diff_via_git_cli_returns_none_for_nonexistent_dir() {
-        let result = diff_via_git_cli(
+    fn diff_via_git_cli_preserves_failure_for_nonexistent_dir() {
+        let result = diff_via_git_cli_result(
             Path::new("/nonexistent_dir_xyz"),
             &["diff", "--no-ext-diff"],
             8000,
         );
-        assert!(
-            result.is_none(),
-            "nonexistent dir should return None for fallback"
-        );
+        assert!(result.is_err(), "nonexistent dir must preserve failure");
     }
 
     // ── Git Worktree Tests ──────────────────────────────────────────────

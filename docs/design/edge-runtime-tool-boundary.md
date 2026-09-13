@@ -115,6 +115,30 @@ coordination authority inside the tool-writable workspace.
 - Platforms without an equivalent trusted namespace and tamper watch fail
   closed before launching a local command.
 
+Receipt attribution and execution coordination are independent. A completed
+foreground process group may be too weak to authorize future fingerprint-based
+receipts: an escaped descendant could write later. That uncertainty quarantines
+receipt attribution, but does not by itself revoke a healthy coordination lease
+or prevent the next command. Unsettled execution ownership and a replaced or
+tampered binding still prevent admission. Every receipt-producing path must
+check receipt authority independently of the coordination check used to launch.
+
+### Prepared directory inspection
+
+Prepared Unix Bash invocations inspect targets through the same retained
+workspace and working-directory handles used for execution. Directory acquisition
+walks each component without following symlinks. Target inspection resolves
+symlinks with bounded traversal and checks directory ancestry by identity; it
+does not assume that an existing `/dev/fd` entry supports child-path lookup.
+The OS sandbox remains responsible for execution-time filesystem confinement.
+
+Source preimages read retained regular-file handles with a bounded byte budget.
+They retain the captured parent identity in the receipt: replacing a parent must
+not turn another file into a valid post-image or restore destination. Restore
+checks the workspace binding and opens targets relative to retained directories.
+Working-directory names are verified display labels, not IO authority; an
+unavailable label is reported as unknown rather than silently as the root.
+
 ## Result boundary
 
 Tool output crossing runtime boundaries must be enveloped:
@@ -155,3 +179,47 @@ authority; it only changes transport for an already-admitted operation.
 - MCP API tools cannot impersonate local executor tools.
 - Cloud workspace runtime cannot be assumed online from workspace existence.
 - Tool output is quality-checked before model reuse.
+
+### Local command and Git lifecycle interface
+
+After applying the request's tool allowlist and selecting provider offers, an
+actually admitted Bash offer replaces the duplicate model-facing `git` and
+`github` tools from that same local runtime. Ordinary repository and GitHub CLI
+operations use `git` and `gh` through Bash. Bash preserves the requested command;
+its ordinary output budget does not inject Git-specific truncation pipelines.
+An independently selected Server
+GitHub API remains owner-scoped; it never inherits host credentials. A request
+that allows Git but excludes Bash keeps its typed Git interface and gains no
+Shell authority. Discovery and execution consume the same frozen admission
+surface. Surface selection is deterministic for unchanged bindings and policy;
+this change does not rewrite the existing prompt prefix on each tool call.
+
+The deferred `worktree(action=enter|exit)` tool owns session workspace switching
+on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
+owner under the workspace writer lease. Ordinary worktree Git commands remain
+Bash operations. Generic Server executors cannot silently create a local
+session owner. The legacy typed Git action union remains available only where
+its separate capability is the admitted interface.
+
+Internal Git/worktree helpers use one `BoundGitCommand` and the shared bounded
+synchronous invocation runner. The Unix builder acquires directory and `.git`
+identities with nofollow/openat, validates original repository configuration
+without masking `core.worktree`, and rechecks acquired identities immediately
+before launch. It sets a real absolute `GIT_DIR` and changes directory through
+the acquired workspace FD. This replaces the former `ExactGitCommand` contract:
+it does **not** promise an immutable dual-root filesystem view throughout Git
+execution. A replacement between the last check and Git's path open, or an ABA
+replacement, cannot always be detected; the selected provider's existing
+isolation governs that window. Non-Unix retains its existing canonical-path
+binding without claiming Unix descriptor guarantees.
+
+All synchronous Git commands, including validation and worktree inspection,
+share a timeout, fair nonblocking output collection and a 16 MiB output budget
+(validation uses 64 KiB). They retain invocation-owner cleanup and never parse
+truncated output as a complete result. Errors preserve whether failure occurred
+before launch or after possible effects. A detected runtime binding change
+invalidates attribution on the **captured original observation state**. Weak
+scope ownership quarantines receipt attribution without disabling a settled
+call's successor. This shared process owner does not itself grant the full Bash
+filesystem/network sandbox to legacy typed helpers: existing provider admission,
+managed-filesystem denial, mutation leases and isolation remain their owners.
