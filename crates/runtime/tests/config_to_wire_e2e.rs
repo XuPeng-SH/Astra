@@ -91,18 +91,18 @@ pinned_tools = ["-grep"]
 
 #[test]
 #[serial_test::serial]
-fn user_pinned_tools_adds_github_to_wire() {
+fn user_pinned_tools_adds_web_fetch_to_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
-pinned_tools = ["github"]
+pinned_tools = ["web_fetch"]
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
             let always_load = names(&surface.always_load_schemas());
             assert!(
-                always_load.iter().any(|n| n == "github"),
-                "github must be always_load per user config: got {always_load:?}"
+                always_load.iter().any(|n| n == "web_fetch"),
+                "web_fetch must be always_load per user config: got {always_load:?}"
             );
             // Default always-load tools still there.
             assert!(always_load.iter().any(|n| n == "bash"));
@@ -135,10 +135,8 @@ fn missing_toml_defaults_are_in_wire() {
                 "missing default {must}"
             );
         }
-        // Workflow-sized tools are intentionally deferred by default.
-        assert!(!always_load.iter().any(|n| n == "git"));
         assert!(always_load.iter().any(|n| n == "memory"));
-        assert!(!always_load.iter().any(|n| n == "github"));
+        // Workflow-sized tools are intentionally deferred by default.
         assert!(!always_load.iter().any(|n| n == "web_fetch"));
     });
 }
@@ -152,16 +150,37 @@ fn malformed_toml_falls_back_to_defaults_silently() {
     with_user_runtime_toml(
         r#"
 [tool_surface
-pinned_tools = ["github
+pinned_tools = ["web_fetch
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
             let always_load = names(&surface.always_load_schemas());
             assert!(
-                !always_load.iter().any(|n| n == "github"),
-                "malformed TOML must NOT silently always-load github; fallback to defaults"
+                !always_load.iter().any(|n| n == "web_fetch"),
+                "malformed TOML must NOT silently always-load web_fetch; fallback to defaults"
             );
             assert!(always_load.iter().any(|n| n == "bash"));
+        },
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn user_pinned_tools_cannot_restore_removed_repository_tools() {
+    with_user_runtime_toml(
+        r#"
+[tool_surface]
+pinned_tools = ["git", "github"]
+"#,
+        |config| {
+            assert_eq!(config.tool_surface.pinned_tools, ["git", "github"]);
+            let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
+            let always_load = names(&surface.always_load_schemas());
+            for removed in ["git", "github"] {
+                assert!(!always_load.iter().any(|name| name == removed));
+                assert!(!surface.deferred().iter().any(|entry| entry.name == removed));
+            }
+            assert!(always_load.iter().any(|name| name == "bash"));
         },
     );
 }
