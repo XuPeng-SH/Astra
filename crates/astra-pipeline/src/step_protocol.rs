@@ -2303,18 +2303,6 @@ mod tests {
             ("grep", None),
             ("glob", None),
             ("list_dir", None),
-            ("git", Some(json!({"action": "status"}))),
-            ("git", Some(json!({"action": "log"}))),
-            ("git", Some(json!({"action": "diff"}))),
-            (
-                "git",
-                Some(json!({"action": "blame", "path": "src/main.rs"})),
-            ),
-            ("github", Some(json!({"action": "list_prs"}))),
-            (
-                "github",
-                Some(json!({"action": "ci_status", "pr_number": 1})),
-            ),
             ("mo_query", None),
         ] {
             assert_eq!(
@@ -2322,6 +2310,20 @@ mod tests {
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {tool}"
             );
+        }
+
+        // Retired tool names must not regain automatic read retries from old arguments.
+        for tool in ["git", "github"] {
+            for args in [
+                None,
+                Some(json!({"action": "status"})),
+                Some(json!({"action": "list_prs"})),
+            ] {
+                assert_eq!(
+                    classify_tool_idempotency(tool, args.as_ref()),
+                    ToolIdempotency::NonIdempotent
+                );
+            }
         }
 
         // memory is action-sensitive
