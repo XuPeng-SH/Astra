@@ -526,26 +526,6 @@ pub fn head_short(project_root: &Path) -> String {
     }
 }
 
-// ─── status ─────────────────────────────────────────────────────────────
-
-// ─── log ────────────────────────────────────────────────────────────────
-
-// ─── show ───────────────────────────────────────────────────────────────
-
-// ─── blame ──────────────────────────────────────────────────────────────
-
-// ─── diff ───────────────────────────────────────────────────────────────
-
-// ─── file_history ───────────────────────────────────────────────────────
-
-// ─── log_search (lexical commit-message search) ─────────────────────────
-
-// ─── contributors ───────────────────────────────────────────────────────
-
-// ─── Git Mutation Tools ─────────────────────────────────────────────────────
-// These use git subprocess (not gix) because gix's write operations are
-// complex and the git binary is universally available. Read tools stay pure-Rust.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,8 +635,6 @@ mod tests {
         );
     }
 
-    // ─── diff enhanced tests ────────────────────────────────────────────
-
     // --- Bug #3: show should reject range syntax with helpful message ---
 
     // --- Bug #5: diff .. branch must validate with reject_shell_meta ---
@@ -665,21 +643,9 @@ mod tests {
 
     // Supplementary: triple-dot range works
 
-    // ─── show enhanced tests ────────────────────────────────────────────
-
-    // ─── blame enhanced tests ───────────────────────────────────────────
-
-    // ─── status enhanced tests ──────────────────────────────────────────
-
-    // ─── log enhanced tests ─────────────────────────────────────────────
-
     // ─── Diff with actual content verification ──────────────────────────────
 
     // ─── Edge cases ─────────────────────────────────────────────────────────
-
-    // ─── log_search tests ───────────────────────────────────────────────
-
-    // ─── contributors tests ─────────────────────────────────────────────
 
     // ─── Score function unit tests ──────────────────────────────────────────
 
