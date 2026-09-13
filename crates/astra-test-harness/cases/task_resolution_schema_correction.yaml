@@ -8,17 +8,18 @@ prompt: |
   First run `astra_missing_reader_probe_827 README.md` once in Bash. If the
   command is unavailable, do not retry it or install anything; read the first
   line directly with read_file in a later turn.
-  At the final task-resolution boundary, submit the assessment through
-  invoke_tool with name submit_task_resolution. Use the exact assessment schema
-  supplied by the runtime; do not call submit_task_resolution as a top-level
-  tool or search for it. The runtime binds scope and boundary, so omit those
-  fields from the assessment arguments. Deliberately make the first submission
+  Before the runtime explicitly emits its typed
+  outcome_reconciliation_required.v1 boundary and supplies the task-resolution
+  schema, gather evidence only; do not attempt a task-resolution submission
+  early. At that boundary, use the supplied carrier call_shape for
+  submit_task_resolution directly. Put the target's flat arguments object under
+  invoke_tool's arguments field, copy the evidence call IDs from the runtime
+  hint, and omit scope and boundary because the runtime binds them. Do not run
+  tool_search in this boundary; its runtime hint supplies the exact schema and
+  invocation authority. Deliberately make this first boundary submission
   invalid by setting remaining_gaps item 2 to a string longer than 256
-  characters while keeping item 1 schema-valid. For item 2, use exactly
-  the 257-character string "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx". When the runtime returns the
-  schema error, change only the remaining_gaps field to [] because the direct
-  read resolves the request, then submit once more under the same active
-  boundary. Do not make any workspace changes.
+  characters while keeping item 1 schema-valid. For item 2, use exactly the
+  257-character string "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx". Wait for the runtime's explicit one-time schema-correction instruction, change only the remaining_gaps field to [] because the direct read resolves the request, and submit once more under the same active boundary. Do not make any workspace changes.
   In the final answer, report the
   observed first line and distinguish the failed command attempt from the
   successful direct read.
@@ -55,7 +56,7 @@ criteria:
   - type: journal_tool_json
     name: submit_task_resolution
     document: arguments
-    path: /assessment/remaining_gaps/1
+    path: /remaining_gaps/1
     equals: "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   - type: journal_tool_json
     name: submit_task_resolution
@@ -79,6 +80,6 @@ criteria:
     equals: []
   - type: turn_rounds_between
     min: 4
-    max: 10
+    max: 12
   - type: text_not_contains
     needle: "The bounded completion action was not executed"

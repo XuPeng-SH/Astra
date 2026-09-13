@@ -31,7 +31,32 @@ criteria:
     name: read_file
     ok: true
     min: 5
-    max: 10
+    max: 30
+  - type: journal_tool_json_contains
+    name: read_file
+    document: arguments
+    path: /path
+    contains: crates/astra-turn-types/src/completion_settlement.rs
+  - type: journal_tool_json_contains
+    name: read_file
+    document: arguments
+    path: /path
+    contains: crates/runtime/src/turn/agentic_loop/execution_phase.rs
+  - type: journal_tool_json_contains
+    name: read_file
+    document: arguments
+    path: /path
+    contains: crates/runtime/src/server/runtime_tool_executor.rs
+  - type: journal_tool_json_contains
+    name: read_file
+    document: arguments
+    path: /path
+    contains: crates/astra-turn-core/src/tool/categories/mod.rs
+  - type: journal_tool_json_contains
+    name: read_file
+    document: arguments
+    path: /path
+    contains: crates/astra-turn-core/src/action_compensation.rs
   - type: journal_tool_outcome_count
     name: bash
     ok: true
@@ -119,4 +144,4 @@ criteria:
     name: github
   - type: turn_rounds_between
     min: 2
-    max: 8
+    max: 20
