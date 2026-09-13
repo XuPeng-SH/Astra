@@ -1417,18 +1417,7 @@ fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFam
     }
 }
 
-fn tool_action_is(args: &str, expected: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()
-        .is_some_and(|value| {
-            value.get("action").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-}
-
 fn is_diff_like_tool_call(name: &str, args: &str) -> bool {
-    if name == "git_diff" || (name == "git" && tool_action_is(args, "diff")) {
-        return true;
-    }
     if name != "bash" {
         return false;
     }
@@ -2651,10 +2640,7 @@ fn is_positive_validation_segment(segment: &str) -> bool {
             }
             true
         }
-        "git" => matches!(
-            words.next(),
-            Some("status" | "diff" | "show" | "log" | "ls-files" | "branch" | "remote")
-        ),
+
         "openssl" => matches!(words.next(), Some("x509" | "verify" | "s_client")),
         "nginx" => words.next() == Some("-t"),
         "systemctl" => matches!(words.next(), Some("status" | "is-active" | "is-enabled")),
@@ -5198,12 +5184,42 @@ mod tests {
     #[test]
     fn high_cost_low_yield_downgrades_expensive_exploration_churn() {
         let records = vec![
-            record_in_round("git", 0, Some("b-0")),
-            record_in_round("git", 0, Some("b-0")),
-            record_in_round("git", 1, Some("b-1")),
-            record_in_round("git", 1, Some("b-1")),
-            record_in_round("git", 2, Some("b-2")),
-            record_in_round("git", 2, Some("b-2")),
+            record_in_round_with_args(
+                "bash",
+                0,
+                Some("b-0"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                0,
+                Some("b-0"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                1,
+                Some("b-1"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                1,
+                Some("b-1"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                2,
+                Some("b-2"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                2,
+                Some("b-2"),
+                serde_json::json!({"command":"git diff"}),
+            ),
         ];
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
@@ -5258,12 +5274,42 @@ mod tests {
     #[test]
     fn high_cost_low_yield_confidence_recalibrates_after_late_quality_penalties() {
         let mut records = vec![
-            record_in_round("git", 0, Some("b-0")),
-            record_in_round("git", 0, Some("b-0")),
-            record_in_round("git", 1, Some("b-1")),
-            record_in_round("git", 1, Some("b-1")),
-            record_in_round("git", 2, Some("b-2")),
-            record_in_round("git", 2, Some("b-2")),
+            record_in_round_with_args(
+                "bash",
+                0,
+                Some("b-0"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                0,
+                Some("b-0"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                1,
+                Some("b-1"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                1,
+                Some("b-1"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                2,
+                Some("b-2"),
+                serde_json::json!({"command":"git diff"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                2,
+                Some("b-2"),
+                serde_json::json!({"command":"git diff"}),
+            ),
         ];
         records[0].result_class = Some("test_failure".to_string());
 
@@ -5526,12 +5572,22 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_churn_flags_repeated_git_action_diff_rounds() {
-        let mut records = vec![record_in_round("git", 0, None)];
+    fn exploration_family_churn_flags_repeated_shell_diff_rounds() {
+        let mut records = vec![record_in_round_with_args(
+            "bash",
+            0,
+            None,
+            serde_json::json!({"command":"git diff"}),
+        )];
         for round in 1..4 {
             let batch = format!("b-{round}-0");
             for _ in 0..5 {
-                records.push(record_in_round("git", round, Some(batch.as_str())));
+                records.push(record_in_round_with_args(
+                    "bash",
+                    round,
+                    Some(batch.as_str()),
+                    serde_json::json!({"command":"git diff"}),
+                ));
             }
         }
 
@@ -5568,7 +5624,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_churn_flags_bash_and_structured_diff_rounds() {
+    fn exploration_family_churn_flags_equivalent_shell_diff_rounds() {
         let records = vec![
             record_in_round_with_args(
                 "bash",
@@ -5577,10 +5633,10 @@ mod tests {
                 serde_json::json!({"command": "git diff -- src/"}),
             ),
             record_in_round_with_args(
-                "git_diff",
+                "bash",
                 0,
                 Some("b-0"),
-                serde_json::json!({"path": "src", "ref": "HEAD"}),
+                serde_json::json!({"command": "git diff -- src"}),
             ),
             record_in_round_with_args(
                 "bash",
@@ -5589,10 +5645,10 @@ mod tests {
                 serde_json::json!({"command": "git --no-pager diff -- src/"}),
             ),
             record_in_round_with_args(
-                "git_diff",
+                "bash",
                 1,
                 Some("b-1"),
-                serde_json::json!({"path": "src", "ref": "HEAD"}),
+                serde_json::json!({"command": "git diff -- src"}),
             ),
             record_in_round_with_args(
                 "bash",
@@ -5601,10 +5657,10 @@ mod tests {
                 serde_json::json!({"command": "git diff -- src/"}),
             ),
             record_in_round_with_args(
-                "git_diff",
+                "bash",
                 2,
                 Some("b-2"),
-                serde_json::json!({"path": "src", "ref": "HEAD"}),
+                serde_json::json!({"command": "git diff -- src"}),
             ),
         ];
 

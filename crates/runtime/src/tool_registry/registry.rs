@@ -523,12 +523,12 @@ mod tests {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
-            sample_schema("github"),
+            sample_schema("web_search"),
             sample_schema("tool_search"),
             sample_schema("skill"),
         ];
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["github".into()],
+            pinned_tools: vec!["web_search".into()],
         };
 
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
@@ -538,7 +538,7 @@ mod tests {
             .map(|(name, _)| name.clone())
             .collect();
 
-        assert!(always_load_names.iter().any(|name| name == "github"));
+        assert!(always_load_names.iter().any(|name| name == "web_search"));
         assert!(
             always_load_names.iter().any(|name| name == "grep"),
             "default always_load declarations must stay in the resolved runtime surface"

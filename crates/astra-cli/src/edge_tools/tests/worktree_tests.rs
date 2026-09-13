@@ -1,4 +1,4 @@
-use super::{ToolExecutor, detect_git_remote_repos, extract_github_owner_repo, test_executor};
+use super::ToolExecutor;
 use serde_json::json;
 
 fn init_temp_git_repo() -> tempfile::TempDir {
@@ -34,85 +34,9 @@ fn init_temp_git_repo() -> tempfile::TempDir {
 
 // ── extract_github_owner_repo edge cases ──
 
-#[test]
-fn extract_github_owner_repo_parsing() {
-    // HTTPS without .git suffix
-    let line = "origin\thttps://github.com/MatrixOrigin/Memoria (fetch)";
-    assert_eq!(
-        extract_github_owner_repo(line),
-        Some("MatrixOrigin/Memoria".to_string())
-    );
-
-    // SSH without .git
-    let ssh = "upstream\tgit@github.com:org/repo (push)";
-    assert_eq!(extract_github_owner_repo(ssh), Some("org/repo".to_string()));
-
-    // Malformed / non-GitHub URLs
-    assert_eq!(extract_github_owner_repo("origin"), None);
-    assert_eq!(extract_github_owner_repo(""), None);
-    assert_eq!(
-        extract_github_owner_repo("origin\thttps://not-github.com/a/b.git (fetch)"),
-        None
-    );
-}
-
 // ── detect_git_remote_repos ──
 
-#[test]
-fn detect_git_remote_repos_basics() {
-    // From current repo — should find at least one remote
-    let repos = detect_git_remote_repos(std::path::Path::new("."));
-    for repo in &repos {
-        assert!(repo.contains('/'), "repo should be owner/name: {repo}");
-        assert_eq!(repo, &repo.to_lowercase(), "should be lowercased: {repo}");
-    }
-    // No duplicates (same remote appears for fetch and push)
-    let mut seen = std::collections::HashSet::new();
-    for repo in &repos {
-        assert!(
-            seen.insert(repo.as_str()),
-            "duplicate preferred repo: {repo}"
-        );
-    }
-
-    // Nonexistent dir → empty
-    assert!(detect_git_remote_repos(std::path::Path::new("/nonexistent/path")).is_empty());
-}
-
 // ── add_preferred_repo / get_preferred_repos ──
-
-#[test]
-fn add_preferred_repo_deduplicates_and_normalizes() {
-    let exec = test_executor();
-    exec.add_preferred_repo("MatrixOrigin/Memoria");
-    exec.add_preferred_repo("MatrixOrigin/Memoria");
-    exec.add_preferred_repo("matrixorigin/memoria"); // same after lowercasing
-    let repos = exec.get_preferred_repos();
-    let memoria_count = repos
-        .iter()
-        .filter(|r| r == &"matrixorigin/memoria")
-        .count();
-    assert_eq!(
-        memoria_count, 1,
-        "should deduplicate case-insensitively: {repos:?}"
-    );
-    // also: normalized to lowercase
-    assert!(
-        repos.contains(&"matrixorigin/memoria".to_string()),
-        "should lowercase: {repos:?}"
-    );
-}
-
-#[test]
-fn preferred_repos_initialized_from_git_remote() {
-    // test_executor uses "." as root; if in a git repo, should have remotes
-    let exec = test_executor();
-    let repos = exec.get_preferred_repos();
-    // Can't assert specific content, but structure should be valid
-    for repo in &repos {
-        assert!(repo.contains('/'), "malformed: {repo}");
-    }
-}
 
 // ── Worktree session tests ────────────────────────────────────────────────
 
@@ -157,53 +81,14 @@ fn git_worktree_error_paths() {
     let exe = ToolExecutor::new(dir.path());
 
     // enter without branch
-    let result = exe.worktree(&json!({"action": "worktree", "sub_action": "enter"}));
+    let result = exe.worktree(&json!({"action": "enter"}));
     assert!(result.contains("Error"));
     assert!(result.contains("branch"));
 
     // exit when not in session
-    let result = exe.worktree(&json!({"action": "worktree", "sub_action": "exit"}));
+    let result = exe.worktree(&json!({"action": "exit"}));
     assert!(result.contains("Error"));
     assert!(result.contains("Not in a worktree session"));
-}
-
-#[tokio::test]
-async fn git_worktree_public_contract_dispatches_sub_action() {
-    let dir = init_temp_git_repo();
-    let exe = ToolExecutor::new(dir.path());
-
-    let outcome = exe
-        .execute_with_metadata(
-            "git",
-            &json!({
-                "action": "worktree",
-                "sub_action": "list",
-            }),
-        )
-        .await;
-
-    assert!(
-        !outcome.is_error,
-        "public worktree list failed: {outcome:?}"
-    );
-    assert!(outcome.output.contains("Git Worktrees:"), "{outcome:?}");
-    assert!(!outcome.output.contains("unknown worktree action"));
-}
-
-#[test]
-fn git_worktree_public_contract_reports_sub_action_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-
-    let missing = exe.worktree(&json!({"action": "worktree"}));
-    assert!(missing.contains("requires non-empty string field `sub_action`"));
-
-    let unknown = exe.worktree(&json!({
-        "action": "worktree",
-        "sub_action": "teleport",
-    }));
-    assert!(unknown.contains("unknown git worktree sub_action 'teleport'"));
-    assert!(!unknown.contains("unknown worktree action 'worktree'"));
 }
 
 #[tokio::test]
@@ -214,8 +99,7 @@ async fn git_worktree_enter_records_rollback_handle() {
         .store(7, std::sync::atomic::Ordering::Relaxed);
 
     let outcome = exe.worktree_with_metadata(&json!({
-        "action": "worktree",
-        "sub_action": "enter",
+        "action": "enter",
         "branch": "session-demo",
     }));
     assert!(
@@ -232,8 +116,7 @@ async fn git_worktree_enter_records_rollback_handle() {
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 
     let cleanup = exe.worktree(&json!({
-        "action": "worktree",
-        "sub_action": "exit",
+        "action": "exit",
         "exit_action": "remove",
         "discard_changes": true,
     }));
@@ -276,25 +159,4 @@ async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
         .execute_with_metadata("worktree", &json!({"action":"push", "branch":"main"}))
         .await;
     assert!(invalid.is_error);
-}
-
-#[tokio::test]
-async fn git_output_limit_preserves_executed_failure_at_shared_and_edge_boundaries() {
-    let dir = init_temp_git_repo();
-    std::fs::write(dir.path().join("tracked.txt"), "x".repeat(17 * 1024 * 1024)).unwrap();
-    let args = json!({"action":"diff"});
-    let shared = astra_tools::git_gix::git_dispatch(dir.path(), &args);
-    let exe = ToolExecutor::new(dir.path());
-    let edge = exe.execute_with_metadata("git", &args).await;
-    for result in [shared, edge] {
-        assert!(result.is_error, "{result:?}");
-        let fields = result
-            .tool_result_fields
-            .expect("producer fields preserved");
-        assert_eq!(fields["error_kind"], "resource_limit");
-        assert_eq!(fields["disposition"], "executed");
-        assert_eq!(fields["execution_phase"], "output limit");
-        assert_eq!(fields["process_started"], true);
-        assert_eq!(fields["recovery_evidence"]["retryable"], false);
-    }
 }

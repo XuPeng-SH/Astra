@@ -28033,35 +28033,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edge_owned_github_schema_does_not_require_server_github_authority() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-            false, false,
-        ))
-        .with_server_service_tool_catalog_enabled(false)
-        .with_static_tool_catalog_admissible(false)
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .build();
-
-        assert!(
-            !host
-                .capabilities
-                .has(astra_turn_core::capability::Capability::GitHubAuth)
-        );
-        host.merge_allowlisted_edge_tool_schemas(&["github".to_string()]);
-
-        assert!(
-            host.valid_tool_names().contains("github"),
-            "the Edge declaration owns both its schema and credential binding"
-        );
-    }
-
     fn schema_names(tools: &[Value]) -> HashSet<String> {
         tools
             .iter()
@@ -29197,8 +29168,8 @@ mod tests {
             );
         }
         assert!(
-            schema_names(&host.deferred_tool_schemas).contains("git"),
-            "git remains reachable through deferred discovery without taxing the resident prefix"
+            !schema_names(&host.deferred_tool_schemas).contains("git"),
+            "admitted Bash replaces duplicate Git in the deferred catalog as well"
         );
         assert!(!names.contains("git"));
     }
@@ -29433,8 +29404,8 @@ mod tests {
             );
         }
         assert!(
-            schema_names(&host.deferred_tool_schemas).contains("git"),
-            "git remains reachable through deferred discovery on an online edge"
+            !schema_names(&host.deferred_tool_schemas).contains("git"),
+            "admitted Bash replaces duplicate Git in the deferred catalog as well"
         );
         assert!(!names.contains("git"));
         assert!(
@@ -29537,8 +29508,8 @@ mod tests {
             "deferred discovery must retain the complete glob capability"
         );
         assert!(
-            schema_names(&host.deferred_tool_schemas).contains("git"),
-            "git remains reachable through deferred discovery for read-only orchestrator runs"
+            !schema_names(&host.deferred_tool_schemas).contains("git"),
+            "admitted Bash replaces duplicate Git in the deferred catalog as well"
         );
         assert!(!names.contains("git"));
         for hidden in ["write_file", "str_replace", "run_script"] {
@@ -37923,8 +37894,111 @@ mod tests {
     }
 
     #[test]
+    fn restored_repository_tool_carriers_cannot_restore_removed_builtins() {
+        for name in ["git", "github"] {
+            // Model an old persisted selection without installing its old schema
+            // into the current provider inventory.
+            let activation: astra_turn_types::DeferredToolActivation =
+                serde_json::from_value(json!({
+                    "name": name,
+                    "schema_digest": format!("sha256:{}", "a".repeat(64)),
+                    "descriptor": {
+                        "identity": {
+                            "provider_binding": "edge-1",
+                            "native_tool_id": name
+                        },
+                        "descriptor_version": format!("sha256:{}", "b".repeat(64))
+                    }
+                }))
+                .expect("valid legacy activation shape");
+            let persisted = serde_json::to_vec(&vec![activation.clone()]).unwrap();
+            let restored = astra_pipeline::step_restore::RestoredSession {
+                conversation_cursor: None,
+                messages: Vec::new(),
+                budget_remaining_tokens: 0,
+                budget_remaining_rounds: 0,
+                run_execution_budget: None,
+                run_execution_control: None,
+                blocked_tools: Vec::new(),
+                recent_tools: vec![name.to_string()],
+                deferred_tool_activations: serde_json::from_slice(&persisted).unwrap(),
+                resume_turn: 0,
+                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+                completed_tool_results: HashMap::new(),
+                interruption: None,
+                approval_overrides: None,
+                consecutive_context_window_errors: 0,
+                compaction_state: None,
+                pipeline_state: None,
+                workspace_observation_quarantine: None,
+                cache_restore_report: Default::default(),
+            };
+            let mut state = create_test_state();
+            state.skills.request_constraints.allowed_tools = Some(
+                [name.to_string(), "tool_search".to_string()]
+                    .into_iter()
+                    .collect(),
+            );
+            crate::server::run::lifecycle::restore_step_checkpoint_runtime_state(
+                restored,
+                "2026-09-14",
+                &mut state,
+            );
+            assert_eq!(state.deferred_tool_activations, vec![activation]);
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-stale-repository".to_string(),
+                "s-stale-repository".to_string(),
+            )
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .build();
+            let visible = host.visible_turn_tools(&mut state);
+            assert!(!schema_names(&visible).contains(name));
+            assert!(!schema_names(&visible).contains("bash"));
+            assert!(
+                !schema_names(&host.current_discovery_deferred_tool_contract_schemas(&state))
+                    .contains(name),
+            );
+            assert!(
+                !host.deferred_activation_descriptor_is_current(
+                    &state.deferred_tool_activations[0],
+                ),
+                "legacy descriptor must not become a current provider offer",
+            );
+            let carrier = json!({
+                "id": format!("restored-{name}"),
+                "type": "function",
+                "function": {
+                    "name": "invoke_tool",
+                    "arguments": json!({
+                        "name": name,
+                        "arguments": {"action": "status"}
+                    }).to_string()
+                }
+            });
+            let admission = host.resolve_deferred_tool_admission(
+                &state,
+                crate::turn::agentic::tool_interception::admit_tool_calls(
+                    std::slice::from_ref(&carrier),
+                    Some("tool_calls"),
+                ),
+            );
+            assert!(
+                admission.admitted.is_empty(),
+                "retired carrier cannot dispatch"
+            );
+            assert_eq!(admission.rejected.len(), 1);
+            let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+            assert_eq!(rejection["status"], "rejected");
+            assert_eq!(rejection["error_kind"], "deferred_tool_activation_invalid");
+        }
+    }
+
+    #[test]
     #[serial_test::serial(session_journal_dir)]
-    fn production_compaction_checkpoint_restore_retains_deferred_git_carrier() {
+    fn production_compaction_checkpoint_restore_retains_narrow_deferred_carrier() {
         // This composition test polls the same deeply-composed production loop
         // as `astra serve`. Run it on the shared production-sized stack instead
         // of inheriting libtest's ~2 MiB stack, so the test is deterministic and
@@ -38004,15 +38078,15 @@ mod tests {
             response_with_tool_call(
                 "call-search-git",
                 "tool_search",
-                json!({"query": "select:git"}),
+                json!({"query": "select:glob"}),
             ),
             text_response("git selected for the next request"),
             response_with_tool_call(
                 "call-git-status",
                 astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
                 json!({
-                    "name": "git",
-                    "arguments": {"action": "status", "stat_only": true}
+                    "name": "glob",
+                    "arguments": {"pattern":"*", "stat_only": true}
                 }),
             ),
             text_response("repository status inspected"),
@@ -38044,6 +38118,7 @@ mod tests {
         .with_admitted_model_execution(Some(admitted_execution(gateway_url.clone())))
         .build();
         let mut first_state = create_durable_execution_test_state(SESSION_ID);
+        first_state.skills.request_constraints.allowed_tools = Some(["glob".to_string(), "tool_search".to_string()].into_iter().collect());
         first_state.current_run_owner_generation = Some(run_authority.owner_generation);
         first_state.context_manifest_user_id = Some(USER_ID.to_string());
         first_state.permission_context =
@@ -38098,7 +38173,7 @@ mod tests {
             first_state
                 .deferred_tool_activations
                 .iter()
-                .filter(|activation| activation.name == "git" && activation.descriptor.is_some())
+                .filter(|activation| activation.name == "glob" && activation.descriptor.is_some())
                 .count(),
             1,
             "production tool_search must freeze one provider-bound activation; records={:?}",
@@ -38159,6 +38234,7 @@ mod tests {
         assert!(complete_tool_pairs(&committed_messages));
 
         let mut restored_state = create_durable_execution_test_state(SESSION_ID);
+        restored_state.skills.request_constraints.allowed_tools = Some(["glob".to_string(), "tool_search".to_string()].into_iter().collect());
         restored_state.current_run_owner_generation = Some(run_authority.owner_generation);
         restored_state.messages = committed_messages;
         crate::server::run::lifecycle::restore_step_checkpoint_runtime_state(
@@ -38234,7 +38310,7 @@ mod tests {
                 .stall
                 .tool_call_records
                 .iter()
-                .filter(|record| record.name == "git" && record.was_executed())
+                .filter(|record| record.name == "glob" && record.was_executed())
                 .count(),
             1,
             "the restored descriptor must dispatch git exactly once"
@@ -38270,8 +38346,12 @@ mod tests {
                 "selection/restore must not mutate the resident tools[] declaration"
             );
             assert!(
-                !schema_names(request["tools"].as_array().unwrap()).contains("git"),
-                "carrier mode must not re-inject git into tools[]"
+                !schema_names(request["tools"].as_array().unwrap()).contains("bash"),
+                "Glob-only requests must not acquire Bash authority"
+            );
+            assert!(
+                !schema_names(request["tools"].as_array().unwrap()).contains("glob"),
+                "carrier mode must not re-inject glob into tools[]"
             );
             assert!(
                 serde_json::to_vec(request).unwrap().len() < CONTEXT_WINDOW as usize * 4,

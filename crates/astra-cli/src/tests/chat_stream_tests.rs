@@ -295,8 +295,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -435,8 +434,7 @@ async fn stream_chat_sse_simple_text_response() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -551,8 +549,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -669,8 +666,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             file_journal: None,
             file_state: None,
             database_snapshot_journal: None,
-            git_stash_journal: None,
-            git_commit_journal: None,
+
             git_worktree_journal: None,
             session_state_journal: None,
             bg_task_commands: None,
@@ -800,8 +796,7 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
             file_journal: None,
             file_state: None,
             database_snapshot_journal: None,
-            git_stash_journal: None,
-            git_commit_journal: None,
+
             git_worktree_journal: None,
             session_state_journal: None,
             bg_task_commands: None,
@@ -914,8 +909,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1019,8 +1013,7 @@ async fn stream_chat_sse_api_error_propagated() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1138,8 +1131,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1306,8 +1298,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1474,8 +1465,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1632,8 +1622,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,
@@ -1797,8 +1786,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         file_journal: None,
         file_state: None,
         database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
+
         git_worktree_journal: None,
         session_state_journal: None,
         bg_task_commands: None,

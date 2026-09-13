@@ -181,8 +181,7 @@ impl<'a> CompactCtx<'a> {
             file_journal: None,
             file_state: None,
             database_snapshot_journal: None,
-            git_stash_journal: None,
-            git_commit_journal: None,
+
             git_worktree_journal: None,
             session_state_journal: None,
             bg_task_commands: None,

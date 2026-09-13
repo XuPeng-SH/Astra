@@ -140,7 +140,7 @@ pub fn build_recovery_message_with_evidence(
                 .recovery_actions
                 .contains(&astra_core::ToolRecoveryAction::SelectAvailableCapability)
         {
-            return "⚠ Bash workspace verification is unavailable for this workspace generation. Do NOT retry bash mode=verify or merely change its command: use a typed observer such as read_file, list_dir, or git_diff for the changed artifact instead.".to_string();
+            return "⚠ Bash workspace verification is unavailable for this workspace generation. Do NOT retry bash mode=verify or merely change its command: use a typed observer such as read_file or list_dir for the changed artifact instead.".to_string();
         }
         match evidence.cause {
             astra_core::ToolFailureCause::InvalidArguments => {

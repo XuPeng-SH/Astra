@@ -185,8 +185,7 @@ fn build_turn_stream_params<'a>(
         file_journal: Some(state.file_journal.clone()),
         file_state: Some(state.file_state.clone()),
         database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
-        git_stash_journal: Some(state.git_stash_journal.clone()),
-        git_commit_journal: Some(state.git_commit_journal.clone()),
+
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
         bg_task_commands: Some(state.bg_task_commands.clone()),

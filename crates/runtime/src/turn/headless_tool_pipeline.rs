@@ -2809,8 +2809,8 @@ mod tests {
                 true,
             ),
             (
-                "git",
-                json!({ "action": "commit", "message": "save changes" }),
+                "worktree",
+                json!({ "action": "enter", "name": "review" }),
                 false,
                 true,
             ),
@@ -4246,20 +4246,13 @@ mod tests {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
         let dir = tempfile::TempDir::new().unwrap();
-        init_git_repo(dir.path());
-        std::fs::write(dir.path().join("tracked.txt"), "hello\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
-        let args = json!({"action": "commit", "message": "initial"});
+        let args = json!({"path": "tracked.txt", "content": "hello\n"});
         let permitted = PermittedExecution {
             execution: HeadlessResolvedExecution {
-                id: "call-git".into(),
-                name: "git".into(),
+                id: "call-write".into(),
+                name: "write_file".into(),
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
@@ -4272,7 +4265,7 @@ mod tests {
                 edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("git", &args),
+            idem_key: IdempotencyKey::semantic("write_file", &args),
             pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
@@ -4285,75 +4278,18 @@ mod tests {
             .tool_result_fields
             .as_ref()
             .expect("alternate execution provider metadata");
-        assert!(result_fields["commit_sha"].as_str().is_some());
-        pipeline.record_execution(executed).await;
         assert!(
-            pipeline.ctx.tool_results[0]
-                .to_string()
-                .contains("\"commit_sha\""),
-            "got: {}",
-            pipeline.ctx.tool_results[0]
+            !result_fields.is_empty(),
+            "producer metadata must be exercised"
         );
-    }
-
-    #[tokio::test]
-    async fn git_validation_rejection_reaches_journal_as_typed_non_execution() {
-        let mut harness = PipelineHarness::new();
-        harness.edge_tool_round.clear();
-        let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
-        let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
-        let args = json!({"action": "diff", "path": "missing.rs"});
-        let permitted = PermittedExecution {
-            execution: HeadlessResolvedExecution {
-                id: "call-git-invalid".into(),
-                name: "git".into(),
-                args: args.clone(),
-                result_str: "Error: headless edge protocol: no matching edge result".into(),
-                tool_result_fields: None,
-                authoritative_is_error: None,
-                pending_runtime_completion: None,
-                confirmed_invocation: None,
-                edge_duration_ms: 0,
-                is_edge_tool: false,
-                edge_result_missing: true,
-                edge_terminal_authority: false,
-                early_exit_ms: 0,
-            },
-            idem_key: IdempotencyKey::semantic("git", &args),
-            pre_tool_context: None,
-            resolved_provider_policy: None,
-            permission_grant: None,
-        };
-
-        let executed = pipeline.execute_execution(permitted).await;
-        assert!(executed.is_err);
-        assert_eq!(
-            executed.error_kind,
-            Some(astra_core::ErrorKind::ToolInvalidArgs)
-        );
+        let expected_fields = result_fields.clone();
         pipeline.record_execution(executed).await;
-
-        let record = pipeline
-            .ctx
-            .tool_call_records
-            .last()
-            .expect("journal record");
-        assert_eq!(
-            record.error_kind,
-            Some(astra_core::ErrorKind::ToolInvalidArgs)
-        );
-        assert_eq!(
-            record.effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Rejected
-        );
-        let summary = astra_services::session_journal::ToolOutcomeSummary::from_records(
-            pipeline.ctx.tool_call_records,
-        );
-        assert_eq!(summary.requested, 1);
-        assert_eq!(summary.executed, 0);
-        assert_eq!(summary.rejected, 1);
-        assert!(summary.is_consistent());
+        let recorded = pipeline.ctx.tool_results[0]
+            .as_object()
+            .expect("recorded result");
+        for (key, value) in expected_fields {
+            assert_eq!(recorded.get(&key), Some(&value), "producer field {key}");
+        }
     }
 
     #[tokio::test]
@@ -4773,12 +4709,12 @@ mod tests {
     #[tokio::test]
     async fn validator_prompt_deferred_but_not_activatable_avoids_select_retry_loop() {
         let mut harness = PipelineHarness::new();
-        push_unknown_server_tool_call(&mut harness, "github");
+        push_unknown_server_tool_call(&mut harness, "agent_fanout");
         begin_recorded_turn(&mut harness, 1);
 
         let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
-        harness.deferred_tool_names = HashSet::from(["github".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["agent_fanout".to_string()]);
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         server_exec.set_current_activatable_tool_names(HashSet::new());
@@ -4795,7 +4731,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            !body.contains("select:github"),
+            !body.contains("select:agent_fanout"),
             "a capability without an owner-scoped runtime must not invite a search retry: {body}"
         );
         assert!(
@@ -5455,15 +5391,16 @@ mod tests {
     #[tokio::test]
     async fn unbound_server_execution_is_rejected_before_side_effects() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("github".to_string());
+        harness.valid_tool_names.insert("agent_fanout".to_string());
         harness.tool_calls.push(json!({
-            "id": "call-github-0",
+            "id": "call-agent_fanout-0",
             "type": "function",
             "function": {
-                "name": "github",
+                "name": "agent_fanout",
                 "arguments": serde_json::to_string(&json!({
-                    "action": "search",
-                    "query": "astra"
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{"id": "review", "description": "Review", "prompt": "Review this change"}]
                 })).unwrap()
             }
         }));
@@ -5632,10 +5569,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_dedup_does_not_block_git_action_diff_path_after_stat_only() {
+    async fn semantic_dedup_does_not_block_shell_git_diff_path_after_stat_only() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
-        harness.valid_tool_names.insert("git".to_string());
+        harness.valid_tool_names.insert("bash".to_string());
 
         let dir = tempfile::TempDir::new().unwrap();
         init_git_repo(dir.path());
@@ -5657,7 +5594,7 @@ mod tests {
         harness.tool_calls.push(json!({
             "id": "call-git-diff-stat",
             "type": "function",
-            "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"stat_only\":true}" }
+            "function": { "name": "bash", "arguments": "{\"command\":\"git diff --stat\"}" }
         }));
         {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
@@ -5678,7 +5615,7 @@ mod tests {
         harness.tool_calls.push(json!({
             "id": "call-git-diff-path",
             "type": "function",
-            "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"path\":\"tracked.txt\"}" }
+            "function": { "name": "bash", "arguments": "{\"command\":\"git diff -- tracked.txt\"}" }
         }));
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {

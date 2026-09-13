@@ -8,8 +8,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "powershell" => "PowerShell",
         "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",
-        "git" => "Git",
-        "github" => "GitHub",
+
         "tool_search" => "Activating tools",
         "lsp" => "LSP",
         "web_search" => "Searching web",
@@ -156,8 +155,8 @@ mod tests {
     #[test]
     fn ok_line_summary_only() {
         assert_eq!(
-            headless_stderr_tool_ok_line("git", "5ms", None, Some("3 files")),
-            "  ✓ Git  3 files (5ms)"
+            headless_stderr_tool_ok_line("glob", "5ms", None, Some("3 files")),
+            "  ✓ Globbing  3 files (5ms)"
         );
     }
 

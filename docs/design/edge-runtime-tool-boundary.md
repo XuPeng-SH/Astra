@@ -182,24 +182,28 @@ authority; it only changes transport for an already-admitted operation.
 
 ### Local command and Git lifecycle interface
 
-After applying the request's tool allowlist and selecting provider offers, an
-actually admitted Bash offer replaces the duplicate model-facing `git` and
-`github` tools from that same local runtime. Ordinary repository and GitHub CLI
-operations use `git` and `gh` through Bash. Bash preserves the requested command;
-its ordinary output budget does not inject Git-specific truncation pipelines.
-An independently selected Server
-GitHub API remains owner-scoped; it never inherits host credentials. A request
-that allows Git but excludes Bash keeps its typed Git interface and gains no
-Shell authority. Discovery and execution consume the same frozen admission
-surface. Surface selection is deterministic for unchanged bindings and policy;
-this change does not rewrite the existing prompt prefix on each tool call.
+The standalone `git` and `github` tools are removed from all built-in schemas,
+registries and executors, including Server and Git-only request paths. Repository
+and GitHub CLI operations use `git` and `gh` through an explicitly admitted shell.
+Removing the tools does not grant shell authority: old allowlists, direct calls,
+deferred selections and checkpoint carriers cannot restore the removed contracts
+or translate them into shell commands. A Server-only request without a selected
+shell provider no longer has these generic repository/GitHub operations. Shell
+execution uses that provider's existing credential and isolation boundary; Server
+credentials are never implicitly copied into a local shell.
 
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
 on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
-owner under the workspace writer lease. Ordinary worktree Git commands remain
-Bash operations. Generic Server executors cannot silently create a local
-session owner. The legacy typed Git action union remains available only where
-its separate capability is the admitted interface.
+owner under the workspace writer lease. It has no legacy `git(action=worktree)`
+alias. Ordinary worktree Git commands remain shell operations. Generic Server
+executors cannot silently create a local session owner. Typed commit/stash tool
+journals and their automatic compensation are removed along with their producers;
+shell side effects retain the existing shell observation and recovery contract.
+
+Schema selection remains deterministic for unchanged bindings and policy. The
+removed contracts change the tool prefix once during migration; ordinary calls
+do not rewrite that prefix. Discovery and execution still enforce the selected
+provider's current schema and authorization.
 
 Internal Git/worktree helpers use one `BoundGitCommand` and the shared bounded
 synchronous invocation runner. The Unix builder acquires directory and `.git`
@@ -223,3 +227,9 @@ scope ownership quarantines receipt attribution without disabling a settled
 call's successor. This shared process owner does not itself grant the full Bash
 filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
+
+The optional asynchronous `check-ignore` adapter retains startup binding checks;
+it does not inherit synchronous invocation ownership or post-execution binding
+validation. Its input/output exchange runs concurrently under one five-second
+deadline after spawn, and cancellation drops the kill-on-drop direct child.
+Synchronous repository validation precedes that exchange.

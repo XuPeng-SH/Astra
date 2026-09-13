@@ -134,14 +134,7 @@ pub(crate) struct SessionState {
     /// bounded database rollback support across turns.
     pub database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
-    /// Session-scoped git stash rollback journal — shared with ToolExecutors for
-    /// bounded repo-state rollback support across turns.
-    pub git_stash_journal:
-        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
-    /// Session-scoped git commit rollback journal — shared with ToolExecutors for
-    /// bounded committed-history rollback support across turns.
-    pub git_commit_journal:
-        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
+
     /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
     /// bounded clean worktree cleanup across turns.
     pub git_worktree_journal:
@@ -469,12 +462,7 @@ impl Default for SessionState {
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
-            git_stash_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::edge_tools::GitStashRollbackJournal::default(),
-            )),
-            git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::edge_tools::GitCommitRollbackJournal::default(),
-            )),
+
             git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::GitWorktreeRollbackJournal::default(),
             )),

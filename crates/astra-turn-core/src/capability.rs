@@ -21,7 +21,6 @@ pub enum Capability {
     /// Skill registry/tool support.
     SkillsCatalog,
     /// GitHub auth / API access via `github`.
-    GitHubAuth,
     /// Language-server-backed code intelligence via `lsp`.
     LSPServer,
     /// Server-owned plan lifecycle tools.
@@ -43,7 +42,7 @@ impl Capability {
             Capability::MemoryService => "memory_service",
             Capability::Database => "database",
             Capability::SkillsCatalog => "skills_catalog",
-            Capability::GitHubAuth => "github_auth",
+
             Capability::LSPServer => "lsp_server",
             Capability::PlanLifecycle => "plan_lifecycle",
             Capability::LocalBackgroundTasks => "local_background_tasks",
@@ -62,7 +61,7 @@ impl Capability {
     pub fn is_executor_gated(self) -> bool {
         matches!(
             self,
-            Capability::AgentSpawner | Capability::GitHubAuth | Capability::LocalBackgroundTasks
+            Capability::AgentSpawner | Capability::LocalBackgroundTasks
         )
     }
 }
@@ -84,7 +83,6 @@ impl CapabilitySet {
             .with(Capability::MemoryService)
             .with(Capability::Database)
             .with(Capability::SkillsCatalog)
-            .with(Capability::GitHubAuth)
             .with(Capability::LSPServer)
             .with(Capability::PlanLifecycle)
             .with(Capability::ReflectService)
@@ -159,7 +157,6 @@ mod tests {
             Capability::MemoryService,
             Capability::Database,
             Capability::SkillsCatalog,
-            Capability::GitHubAuth,
             Capability::LSPServer,
             Capability::PlanLifecycle,
             Capability::ReflectService,

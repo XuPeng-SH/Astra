@@ -1,6 +1,6 @@
 //! Default tool executor — the shared implementation used by CLI, server, and edge.
 //!
-//! Routes tool calls to the appropriate module (fs_ops, shell_ops, git_gix, etc.)
+//! Routes tool calls to the appropriate module (fs_ops, shell_ops, etc.)
 //! and returns [`ToolResult`]. Consumers wrap this with their own context
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::github::GitHubClient;
 use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
 /// Tools the server runtime may safely route straight through the shared
@@ -31,8 +30,6 @@ pub const SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "grep",
     "glob",
     "symbols",
-    "git",
-    "github",
 ];
 
 pub fn is_server_direct_default_executor_tool(name: &str) -> bool {
@@ -83,15 +80,6 @@ fn structured_status_is_error(status: &str) -> bool {
     )
 }
 
-fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
-    ToolResult {
-        output: outcome.output,
-        metadata: outcome.tool_result_fields,
-        is_error: outcome.is_error,
-        exit_semantics: None,
-    }
-}
-
 // ─── DefaultToolExecutor ────────────────────────────────────────────────────
 
 /// Per-tool execution timeout. Prevents synchronous tools (tree-sitter, etc.)
@@ -104,7 +92,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 
 /// Default tool executor with the full shared tool set.
 ///
-/// Covers file ops, shell, git (via gix), GitHub API, code intelligence,
+/// Covers file ops, shell, code intelligence,
 /// and utility tools. CLI-specific tools (ask_user, MCP,
 /// LSP subprocess, interactive shell) are handled by wrapping executors.
 #[derive(Clone)]
@@ -112,16 +100,12 @@ pub struct DefaultToolExecutor {
     ctx: ToolContext,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
-    github_client: Option<Arc<GitHubClient>>,
+
     bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
     convergence_tracker: crate::workspace_observation::DesiredStateConvergenceTracker,
     convergence_authority: Arc<str>,
     bash_cache_ttl: std::time::Duration,
-    /// Tracks whether the HTTP client was successfully built.
-    /// When `false`, GitHub tools and other HTTP-dependent tools will report
-    /// a diagnostic error explaining why HTTP is unavailable.
-    http_client_available: bool,
     filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
 }
 
@@ -213,13 +197,12 @@ impl DefaultToolExecutor {
             ctx,
             approval_gate: None,
             progress_callback: None,
-            github_client: None,
+
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
             convergence_tracker: Default::default(),
             convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
-            http_client_available: true,
             filesystem_write_boundary: None,
         }
     }
@@ -235,10 +218,10 @@ impl DefaultToolExecutor {
     /// Build a ready-to-use executor from workspace parameters.
     ///
     /// Handles the local/edge setup recipe: HTTP client, `ToolContext`,
-    /// sandbox, and optional credentials discovered from this user's host.
+    /// and sandbox.
     ///
     /// If the HTTP client cannot be built, a warning is logged and the
-    /// executor is created without HTTP support (GitHub tools etc. will
+    /// executor is created without HTTP support (HTTP-dependent tools will
     /// report errors rather than crashing the runtime).
     pub fn for_workspace(
         workspace: &Path,
@@ -247,7 +230,7 @@ impl DefaultToolExecutor {
         user_agent: &str,
         timeout: std::time::Duration,
     ) -> Self {
-        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout, true)
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
     }
 
     /// Build a multi-tenant Server executor without reading process-level or
@@ -260,7 +243,7 @@ impl DefaultToolExecutor {
         user_agent: &str,
         timeout: std::time::Duration,
     ) -> Self {
-        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout, false)
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
     }
 
     fn for_workspace_inner(
@@ -269,21 +252,20 @@ impl DefaultToolExecutor {
         session_id: impl Into<String>,
         user_agent: &str,
         timeout: std::time::Duration,
-        discover_host_credentials: bool,
     ) -> Self {
-        let (http_client, http_client_available) = match reqwest::Client::builder()
+        let http_client = match reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(user_agent.to_string())
             .no_proxy()
             .build()
         {
-            Ok(client) => (client, true),
+            Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "failed to build HTTP client for tool executor — HTTP-dependent tools will be unavailable"
                 );
-                (reqwest::Client::new(), false)
+                None
             }
         };
 
@@ -293,29 +275,15 @@ impl DefaultToolExecutor {
             user_id: user_id.into(),
             session_id: session_id.into(),
             sandbox: crate::SandboxConfig::standard(workspace),
-            http_client: Some(http_client.clone()),
+            http_client,
             logger: Arc::new(crate::TracingLogger),
             cancel_token: None,
             detach_shell_handle: None,
         };
 
-        let mut executor = Self::new(ctx);
-        executor.http_client_available = http_client_available;
-        if discover_host_credentials {
-            let tokens = crate::github::resolve_github_tokens();
-            if !tokens.is_empty() {
-                let preferred_repos = crate::github::detect_github_remote_repos(workspace);
-                let github = GitHubClient::from_tokens(http_client, tokens, preferred_repos);
-                executor = executor.with_github_client(github);
-            }
-        }
-        executor
+        Self::new(ctx)
     }
 
-    pub fn with_github_client(mut self, client: GitHubClient) -> Self {
-        self.github_client = Some(Arc::new(client));
-        self
-    }
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
@@ -807,7 +775,7 @@ impl ToolExecutor for DefaultToolExecutor {
             return crate::cancelled_tool_result(name, false);
         }
         // Execute against a shallow clone whose context carries the caller's
-        // token.  Shared caches/generation and the GitHub client remain
+        // token.  Shared caches and generation remain
         // shared, while Bash/run_script and all generic dispatch paths now
         // observe the actual caller-owned cancellation boundary rather than
         // an unrelated context token (or no token at all).
@@ -928,7 +896,6 @@ impl DefaultToolExecutor {
         bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
     ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
-        let pr = &self.ctx.project_root;
 
         match name {
             // ── File operations ──────────────────────────────────────
@@ -989,16 +956,10 @@ impl DefaultToolExecutor {
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
-            // ── Git operations (gix-based) ───────────────────────────
-            // Consolidated git tool — single entry point for all git operations.
-            "git" => outcome_to_result(crate::git_gix::git_dispatch(pr, args)),
+
             "worktree" => ToolResult::error("Error: worktree lifecycle requires an explicitly bound CLI or User Runner session owner; no operation was run".to_string()),
 
-            // ── GitHub API ───────────────────────────────────────────
-            "github" => match crate::github_tool_contract::github_action_from_args(args) {
-                Ok(action) => self.dispatch_github_action(action, args).await,
-                Err(error) => ToolResult::error(format!("Error: {error}")),
-            },
+
 
             // ── Code intelligence (tree-sitter) ──────────────────────
             "symbols" => self.dispatch_symbols(args),
@@ -1118,50 +1079,6 @@ impl DefaultToolExecutor {
         }
     }
 
-    /// Dispatch the consolidated GitHub tool via the optional GitHubClient.
-    async fn dispatch_github_action(
-        &self,
-        action: crate::github_tool_contract::GithubAction,
-        args: &Value,
-    ) -> ToolResult {
-        let client = match &self.github_client {
-            Some(c) => c,
-            None => {
-                if !self.http_client_available {
-                    return ToolResult::error(format!(
-                        "Error: github(action='{}') failed — HTTP client could not be built.\n\n\
-                         This is a system configuration issue (proxy, TLS, network). \
-                         Check server logs for 'failed to build HTTP client' errors.\n\n\
-                         GitHub integration requires a working HTTP client. \
-                         Once the infrastructure issue is resolved, this tool will function normally.",
-                        action.as_str()
-                    ));
-                }
-                return ToolResult::error(format!(
-                    "Error: github(action='{}') failed — no GitHub token is configured.\n\n\
-                     To fix, do ONE of:\n\
-                     1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
-                     2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
-                     If you are running in CI, ensure the token is injected into the runtime.\n\
-                     After authentication, restart the session to enable GitHub integration.",
-                    action.as_str()
-                ));
-            }
-        };
-        let output = match action {
-            crate::github_tool_contract::GithubAction::ListPrs => client.list_prs(args).await,
-            crate::github_tool_contract::GithubAction::GetPr => client.get_pr(args).await,
-            crate::github_tool_contract::GithubAction::CiStatus => client.ci_status(args).await,
-            crate::github_tool_contract::GithubAction::RepoStats => client.repo_stats(args).await,
-            crate::github_tool_contract::GithubAction::ListIssues => client.list_issues(args).await,
-            crate::github_tool_contract::GithubAction::GetIssue => client.get_issue(args).await,
-            crate::github_tool_contract::GithubAction::CreateIssue => {
-                client.create_issue(args).await
-            }
-        };
-        string_to_result(output)
-    }
-
     /// Dispatch the `symbols` tool: read a file, detect language, extract symbols.
     fn dispatch_symbols(&self, args: &Value) -> ToolResult {
         let path_str = match args.get("path").and_then(|v| v.as_str()) {
@@ -1244,30 +1161,7 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
         | "worktree"
         | "rename_symbol" => true,
         "lsp" => args.get("dry_run").and_then(Value::as_bool) == Some(false),
-        "git" => crate::git_tool_contract::git_action_from_args(args)
-            .ok()
-            .is_some_and(|action| match action {
-                crate::git_tool_contract::GitAction::Commit
-                | crate::git_tool_contract::GitAction::RevertCommit
-                | crate::git_tool_contract::GitAction::Push => true,
-                crate::git_tool_contract::GitAction::Stash => {
-                    crate::git_tool_contract::git_stash_sub_action_from_args(args)
-                        .is_ok_and(|action| action.mutates_workspace())
-                }
-                crate::git_tool_contract::GitAction::Worktree => {
-                    crate::git_tool_contract::git_worktree_sub_action_from_args(args)
-                        .map_or(true, |action| action.mutates_workspace())
-                }
-                crate::git_tool_contract::GitAction::CheckoutFile => true,
-                crate::git_tool_contract::GitAction::Status
-                | crate::git_tool_contract::GitAction::Diff
-                | crate::git_tool_contract::GitAction::Log
-                | crate::git_tool_contract::GitAction::Show
-                | crate::git_tool_contract::GitAction::Blame
-                | crate::git_tool_contract::GitAction::FileHistory
-                | crate::git_tool_contract::GitAction::LogSearch
-                | crate::git_tool_contract::GitAction::Contributors => false,
-            }),
+
         _ => false,
     }
 }
@@ -1278,7 +1172,7 @@ fn validate_host_owned_write_boundary(
     workspace_root: &Path,
     protected: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    if matches!(name, "run_script" | "git" | "worktree") {
+    if matches!(name, "run_script" | "worktree") {
         return Err(format!(
             "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
         ));
@@ -1313,6 +1207,41 @@ fn validate_host_owned_write_boundary(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn removed_repository_tools_are_unknown_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = DefaultToolExecutor::for_server_workspace(
+            dir.path(),
+            "test-user",
+            "test-session",
+            "test",
+            std::time::Duration::from_secs(1),
+        );
+        for name in ["git", "github"] {
+            assert!(
+                !crate::schemas::all_tool_schemas()
+                    .iter()
+                    .any(|s| s["function"]["name"] == name)
+            );
+            assert!(!SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES.contains(&name));
+            let result = executor
+                .execute(
+                    name,
+                    &serde_json::json!({"action":"commit", "message":"must not run"}),
+                )
+                .await;
+            assert!(result.is_error, "{name}: {result:?}");
+            assert!(
+                result
+                    .output
+                    .contains("not available in DefaultToolExecutor"),
+                "{name}: {}",
+                result.output
+            );
+        }
+        assert!(!dir.path().join(".git").exists());
+    }
+
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1325,25 +1254,6 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
-    }
-
-    #[test]
-    fn git_nested_read_actions_do_not_claim_workspace_mutation() {
-        for args in [
-            serde_json::json!({"action": "stash", "sub_action": "list"}),
-            serde_json::json!({"action": "worktree", "sub_action": "list"}),
-        ] {
-            assert!(!is_workspace_mutation_tool("git", &args), "{args}");
-        }
-
-        for args in [
-            serde_json::json!({"action": "stash", "sub_action": "push"}),
-            serde_json::json!({"action": "worktree", "sub_action": "enter"}),
-            serde_json::json!({"action": "worktree", "sub_action": "add"}),
-            serde_json::json!({"action": "worktree", "sub_action": "remove"}),
-        ] {
-            assert!(is_workspace_mutation_tool("git", &args), "{args}");
-        }
     }
 
     #[test]
@@ -1399,43 +1309,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_boundary_rejects_git_hook_before_it_can_write() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let tmp = TempDir::new().unwrap();
-        init_git_repo(tmp.path());
-        let protected = tmp.path().join(".moi/runtime/task-1");
-        std::fs::create_dir_all(&protected).unwrap();
-        let sentinel = protected.join("owned.txt");
-        let hook = tmp.path().join(".git/hooks/pre-commit");
-        std::fs::write(
-            &hook,
-            format!("#!/bin/sh\nprintf owned > '{}'\n", sentinel.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(tmp.path().join("tracked.txt"), "content").unwrap();
-        let exec = DefaultToolExecutor::new(ToolContext::test(tmp.path()))
-            .with_filesystem_write_boundary(vec![protected]);
-
-        let result = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "must not run"}),
-            )
-            .await;
-
-        assert!(result.is_error, "structured git must fail closed");
-        assert!(
-            result.output.contains("managed filesystem boundary"),
-            "unexpected error: {}",
-            result.output
-        );
-        assert!(!sentinel.exists(), "the pre-commit hook must not execute");
-    }
-
     #[test]
     fn run_script_schema_matches_process_scope_capability() {
         let (_tmp, exec) = test_executor();
@@ -1488,22 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_tenant_server_executor_never_discovers_host_github_credentials() {
-        let workspace = TempDir::new().expect("temporary workspace");
-        let executor = DefaultToolExecutor::for_server_workspace(
-            workspace.path(),
-            "owner-a",
-            "session-a",
-            "astra-server-test",
-            std::time::Duration::from_secs(1),
-        );
-        assert!(
-            executor.github_client.is_none(),
-            "server construction must require a later owner-scoped credential binding"
-        );
-    }
-
-    #[test]
     fn server_direct_default_executor_tools_are_read_or_self_contained() {
         for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
             assert!(
@@ -1525,81 +1382,6 @@ mod tests {
                 "server-specific tool `{wrapped}` must keep a dedicated handler"
             );
         }
-    }
-
-    fn init_git_repo(dir: &Path) {
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
-
-    struct DenyInvocationApprovalGate;
-
-    #[async_trait::async_trait]
-    impl ToolApprovalGate for DenyInvocationApprovalGate {
-        async fn request_approval(
-            &self,
-            _request_id: &str,
-            _tool_name: &str,
-            _args: &Value,
-        ) -> crate::ApprovalDecision {
-            crate::ApprovalDecision::Denied {
-                reason: Some("test denied".to_string()),
-            }
-        }
-
-        fn requires_approval(&self, _tool_name: &str) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_invocation_approval_blocks_git_mutating_action() {
-        let (_tmp, mut exec) = test_executor();
-        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
-
-        let result = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "ship"}),
-            )
-            .await;
-
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("The user REJECTED this tool call"),
-            "mutating git actions must ask approval before execution: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_invocation_approval_skips_git_read_only_action() {
-        let (tmp, mut exec) = test_executor();
-        init_git_repo(tmp.path());
-        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
-
-        let result = exec
-            .execute("git", &serde_json::json!({"action": "diff"}))
-            .await;
-
-        assert!(
-            !result.output.contains("The user REJECTED this tool call"),
-            "read-only git actions must not request approval: {}",
-            result.output
-        );
     }
 
     #[tokio::test]
@@ -1902,39 +1684,6 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.output.contains("hello"));
-    }
-
-    #[test]
-    fn outcome_to_result_uses_explicit_error_flag_not_output_prefix() {
-        let outcome = crate::git_gix::ToolExecutionOutcome::error("fatal: git failed".to_string());
-
-        let result = outcome_to_result(outcome);
-
-        assert!(
-            result.is_error,
-            "non-Error-prefixed git outcome errors must stay errors"
-        );
-        assert_eq!(result.output, "fatal: git failed");
-    }
-
-    #[test]
-    fn ok_outcome_with_error_prefixed_output_is_not_misclassified() {
-        // Regression: a successful tool result whose output happens to begin
-        // with the literal text "Error" (e.g. log lines, diff hunks quoting a
-        // compiler error, or a benign status like "Error code 0 (no change)")
-        // MUST NOT be flagged as a failure. The error bit is load-bearing for
-        // retry logic, hallucination detection, and UI badging.
-        let outcome = crate::git_gix::ToolExecutionOutcome::ok(
-            "Error code 0 (no change)\nAll fine.".to_string(),
-        );
-
-        let result = outcome_to_result(outcome);
-
-        assert!(
-            !result.is_error,
-            "ok() outcomes must stay successful even when output starts with 'Error'"
-        );
-        assert!(result.output.starts_with("Error code 0"));
     }
 
     #[test]
@@ -2425,117 +2174,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_bash_cache_invalidates_after_git_commit() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "initial\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(
-            !initial.is_error,
-            "initial commit failed: {}",
-            initial.output
-        );
-
-        let args = serde_json::json!({"command": "git log --oneline -1"});
-        let first = exec.execute("bash", &args).await;
-        assert!(!first.is_error, "first log failed: {}", first.output);
-        assert!(first.output.contains("initial"), "got: {}", first.output);
-
-        std::fs::write(&tracked, "changed\n").unwrap();
-        let change = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "change tracked"}),
-            )
-            .await;
-        assert!(!change.is_error, "change commit failed: {}", change.output);
-
-        let second = exec.execute("bash", &args).await;
-        assert!(!second.is_error, "second log failed: {}", second.output);
-        assert!(
-            second.output.contains("change tracked"),
-            "git commit must invalidate cached git log output: {}",
-            second.output
-        );
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_invalidates_after_git_stash_drop() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "initial\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(
-            !initial.is_error,
-            "initial commit failed: {}",
-            initial.output
-        );
-
-        std::fs::write(&tracked, "stashed\n").unwrap();
-        let push = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "stash", "sub_action": "push", "message": "save tracked"}),
-            )
-            .await;
-        assert!(!push.is_error, "stash push failed: {}", push.output);
-
-        let args = serde_json::json!({"command": "git stash list"});
-        let cached_source = exec.execute("bash", &args).await;
-        assert!(
-            cached_source.output.contains("save tracked"),
-            "expected stash list to include pushed stash: {}",
-            cached_source.output
-        );
-
-        let drop = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "stash", "sub_action": "drop"}),
-            )
-            .await;
-        assert!(!drop.is_error, "stash drop failed: {}", drop.output);
-
-        let after_drop = exec.execute("bash", &args).await;
-        assert_ne!(
-            after_drop
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "git stash drop changes refs/stash, so cached git stash list must be invalidated"
-        );
-        assert!(
-            !after_drop.output.contains("save tracked"),
-            "fresh stash list should not include dropped stash: {}",
-            after_drop.output
-        );
-    }
-
     /// Regression guard: a failed bash run (non-zero exit, sandbox
     /// block, permission denied, timeout, cancellation) MUST NOT be
     /// cached — otherwise after the user fixes the underlying
@@ -2728,45 +2366,6 @@ mod tests {
                 .and_then(|metadata| metadata.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_github_without_client_gives_actionable_guidance() {
-        let (_tmp, exec) = test_executor();
-        let result = exec
-            .execute("github", &serde_json::json!({"action": "list_prs"}))
-            .await;
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("github(action='list_prs')"),
-            "error should describe the consolidated action surface: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("github_"),
-            "error must not leak helper-style tool names: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("no GitHub token is configured"),
-            "error must describe the problem, not the internal API: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("gh auth login"),
-            "error must suggest a concrete fix action: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("restart the session"),
-            "error must explain how to enable the feature: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("Workaround"),
-            "error must not suggest bypassing the system architecture: {}",
-            result.output
         );
     }
 
@@ -3024,54 +2623,6 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.output.contains("Unsupported scheme"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_git_revert_commit() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "original\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(!initial.is_error, "got: {}", initial.output);
-
-        std::fs::write(&tracked, "changed\n").unwrap();
-        let committed = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "change tracked"}),
-            )
-            .await;
-        assert!(!committed.is_error, "got: {}", committed.output);
-        let commit_sha = committed
-            .metadata
-            .as_ref()
-            .and_then(|fields| fields.get("commit_sha"))
-            .and_then(Value::as_str)
-            .expect("commit_sha metadata");
-
-        let reverted = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "revert_commit", "commit_sha": commit_sha}),
-            )
-            .await;
-        assert!(!reverted.is_error, "got: {}", reverted.output);
-        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "original\n");
-        assert_eq!(
-            reverted
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("reverted_commit_sha"))
-                .and_then(Value::as_str),
-            Some(commit_sha)
-        );
     }
 
     /// P1-J: execute() must truncate output exceeding MAX_TOOL_OUTPUT_BYTES.

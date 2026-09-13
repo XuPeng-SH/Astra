@@ -202,7 +202,7 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
         "agent_fanout",
         "agent",
         "glob",
-        "git",
+        "worktree",
         "inspect_work_plan",
         "propose_work_plan",
         "inspect_work_criteria",
@@ -935,12 +935,12 @@ fn surface_snapshot_exposes_visible_tools_and_tier_counts() {
 #[test]
 fn config_always_load_tools_additive_appends_to_defaults() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["github".into(), "memory".into()],
+        pinned_tools: vec!["web_search".into(), "memory".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
     let always_load = names(&surface.always_load_schemas());
-    assert!(always_load.iter().any(|n| n == "github"));
+    assert!(always_load.iter().any(|n| n == "web_search"));
     assert!(always_load.iter().any(|n| n == "memory"));
     // Defaults still there
     assert!(always_load.iter().any(|n| n == "bash"));
@@ -952,7 +952,7 @@ fn config_can_defer_a_default_and_repin_it_in_declaration_order() {
     let cfg = ToolSurfaceConfig {
         pinned_tools: vec![
             "-grep".into(),
-            "github".into(),
+            "web_search".into(),
             "grep".into(),
             "-bash".into(),
         ],
@@ -966,7 +966,7 @@ fn config_can_defer_a_default_and_repin_it_in_declaration_order() {
         .collect();
 
     assert!(always_load.contains(&"grep".to_string()));
-    assert!(always_load.contains(&"github".to_string()));
+    assert!(always_load.contains(&"web_search".to_string()));
     assert!(!always_load.contains(&"bash".to_string()));
     assert!(deferred.contains("bash"));
 }
@@ -1019,15 +1019,15 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
             "-".into(),
             "--foo".into(),
             "  ".into(),
-            " github".into(),
+            " web_search".into(),
         ],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
     assert!(!always_load.iter().any(|n| n == "foo"));
-    assert!(always_load.iter().any(|n| n == "github"));
+    assert!(always_load.iter().any(|n| n == "web_search"));
     assert!(
-        !always_load.iter().any(|n| n == " github"),
+        !always_load.iter().any(|n| n == " web_search"),
         "stored tool names must stay canonical"
     );
     // Defaults survive all this malformed input.
@@ -1039,12 +1039,20 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
 #[test]
 fn unknown_tool_name_in_config_is_ignored_not_panic() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
+        pinned_tools: vec![
+            "not_a_real_tool".into(),
+            "-also_not_real".into(),
+            "git".into(),
+            "github".into(),
+        ],
     };
     // Should not panic; unknown names simply do nothing.
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
-    assert!(!always_load.iter().any(|n| n == "not_a_real_tool"));
+    for name in ["not_a_real_tool", "git", "github"] {
+        assert!(!always_load.iter().any(|n| n == name));
+        assert!(!surface.deferred().iter().any(|entry| entry.name == name));
+    }
     assert!(always_load.iter().any(|n| n == "grep"));
     // Defaults preserved.
     assert!(always_load.iter().any(|n| n == "bash"));

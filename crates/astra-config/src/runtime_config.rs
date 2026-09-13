@@ -364,7 +364,7 @@ impl Default for RuntimeConfig {
 ///
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
 /// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
-/// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
+/// - A plain name (e.g. `"web_search"`) *adds* that tool to the pinned set.
 /// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
 ///   the pinned set (it lands in deferred instead). `tool_search` is the
 ///   activation protocol floor and cannot be removed.
@@ -382,7 +382,7 @@ impl Default for RuntimeConfig {
 /// Example `runtime.toml`:
 /// ```toml
 /// [tool_surface]
-/// pinned_tools = ["github", "memory", "-grep"]
+/// pinned_tools = ["web_search", "memory", "-grep"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceConfig {

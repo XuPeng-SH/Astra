@@ -269,7 +269,7 @@ mod tests {
         assert!(!caps.is_empty());
         assert!(caps.contains(&ToolCapability::Named("bash".into())));
         assert!(caps.contains(&ToolCapability::Named("read_file".into())));
-        assert!(caps.contains(&ToolCapability::Named("git".into())));
+        assert!(caps.contains(&ToolCapability::Named("worktree".into())));
         assert!(!caps.contains(&ToolCapability::Named("memory".into())));
     }
 

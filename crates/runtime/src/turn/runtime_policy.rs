@@ -2633,7 +2633,7 @@ mod tests {
                 .is_none_or(|feedback| !feedback_requires_convergence(feedback)),
             "one directory inspection remains allowed"
         );
-        records.push(executed("git", r#"{"action":"show","ref":"HEAD"}"#, 4));
+        records.push(executed("read_file", r#"{"path":"src/followup.rs"}"#, 4));
         let ignored = evaluate_tool_boundary(&mut state, subject, &records, 4)
             .unwrap()
             .expect("second observation advances guidance");
@@ -2702,8 +2702,8 @@ mod tests {
     fn typed_tool_categories_separate_common_observations_from_actions() {
         for record in [
             executed("list_dir", r#"{"path":"src"}"#, 1),
-            executed("git", r#"{"action":"status"}"#, 1),
-            executed("git", r#"{"action":"log","max_count":5}"#, 1),
+            executed("bash", r#"{"command":"git status --short"}"#, 1),
+            executed("bash", r#"{"command":"git log -5 --oneline"}"#, 1),
             executed("bash", r#"{"command":"head -n 20 src/lib.rs"}"#, 1),
             executed("introspect", r#"{"facet":"overview"}"#, 1),
         ] {
@@ -2868,8 +2868,8 @@ mod tests {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
         let mut records = vec![
-            executed("git_diff", r#"{"path":"src/a.rs"}"#, 1),
-            executed("git_diff", r#"{"path":"src/b.rs"}"#, 1),
+            executed("bash", r#"{"command":"git diff -- src/a.rs"}"#, 1),
+            executed("bash", r#"{"command":"git diff -- src/b.rs"}"#, 1),
             executed("bash", r#"{"command":"rg first src"}"#, 2),
         ];
         let _ = evaluate_tool_boundary_with_thresholds(

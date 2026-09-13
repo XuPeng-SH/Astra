@@ -55,7 +55,6 @@ pub(crate) enum ToolExecutionClass {
 /// orchestrator-managed runtimes advertise and execute their own adapters.
 pub(crate) const SERVER_LOCAL_RUNTIME_TOOL_NAMES: &[&str] = &[
     "bash",
-    "git",
     "glob",
     "grep",
     "list_dir",
@@ -604,7 +603,7 @@ mod tests {
     #[test]
     fn external_github_capability_follows_an_admitted_edge_executor() {
         let req = make_request(
-            "github",
+            "glob",
             WorkspaceBindingKind::EdgeWorkspace,
             ToolTransportKind::EdgeWs,
         );

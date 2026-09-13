@@ -655,108 +655,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Write,
             compress_context_compensation_summary(),
         ),
-        "git" => match string_arg(&normalized_args, "action")
-            .map(|action| action.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some(
-                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
-                | "contributors",
-            ) => ActionCompensationProfile::read(true),
-            Some("commit") => ActionCompensationProfile::compensated(
-                false,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRevertCommit,
-                "call `git` with action=`revert_commit` and the returned commit_sha to create an explicit compensating revert commit".to_string(),
-            ),
-            Some("revert_commit") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git revert_commit creates a new compensating commit; undo it by reverting the new revert commit if needed",
-            ),
-            Some("checkout_file") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Destructive,
-                true,
-                CompensationKind::RestoreOrDeleteFile,
-                restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
-            ),
-            Some("stash") => match string_arg(&normalized_args, "sub_action")
-                .map(|action| action.to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("list") => ActionCompensationProfile::read(true),
-                Some("push" | "save") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitApplyStash,
-                    "re-apply the captured stash with `git` using action=`stash`, sub_action=`apply`, and the returned stash_ref"
-                        .to_string(),
-                ),
-                Some("apply") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git stash apply mutates the working tree; capture a fresh stash or commit first if you may need to undo it",
-                ),
-                Some("pop" | "drop") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git stash pop/drop mutates the stash stack and working tree; no automatic rollback is registered",
-                ),
-                _ => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git stash action is unknown or not yet modeled for automatic rollback",
-                ),
-            },
-            Some("worktree") => match string_arg(&normalized_args, "sub_action")
-                .map(|action| action.to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("list" | "ls") => ActionCompensationProfile::read(true),
-                Some("enter") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitRestoreWorktree,
-                    "leave the worktree with `git` action=`worktree`, sub_action=`exit`; remove the recorded worktree path manually only after confirming it is clean".to_string(),
-                ),
-                Some("add" | "create") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitRestoreWorktree,
-                    "remove the recorded clean worktree with `git` action=`worktree`, sub_action=`remove` and the recorded path; if it has changed, inspect it before removal".to_string(),
-                ),
-                Some("exit") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
-                ),
-                Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
-                ),
-                _ => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git worktree action is unknown or not yet modeled for automatic rollback",
-                ),
-            },
-            Some("push") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git push mutates remote refs; coordinate with the remote branch owner or push a corrective commit/ref update if it must be undone",
-            ),
-            _ => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git action is unknown or not yet modeled for automatic rollback",
-            ),
-        },
+
         "notebook_edit" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
@@ -1049,171 +948,6 @@ mod tests {
     // ── git compensation ──
 
     #[test]
-    fn git_action_commit_compensation() {
-        // bash git commit
-        let p = tool_action_profile("bash", &json!({"command": "git commit -m 'x'"}));
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
-
-        // consolidated git commit action
-        let p = tool_action_profile("git", &json!({"action": "commit", "message": "x"}));
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`revert_commit`")
-        );
-    }
-
-    #[test]
-    fn git_action_worktree_compensation() {
-        // list: read-only
-        let p = tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Read);
-        assert_eq!(p.compensation_kind, None);
-
-        // enter: reversible via GitRestoreWorktree
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`worktree`")
-        );
-
-        // add: same compensation
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "add", "branch": "demo"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-    }
-
-    #[test]
-    fn git_irreversible_and_file_compensation() {
-        // revert commit: manual (irreversible)
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "revert_commit", "commit_sha": "abc123"}),
-        );
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(!p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
-
-        // stash push: reversible via GitApplyStash
-        let p = tool_action_profile("git", &json!({"action": "stash", "sub_action": "push"}));
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitApplyStash));
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("stash_ref")
-        );
-
-        // checkout file: destructive but bounded + reversible
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "checkout_file", "path": "src/lib.rs"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Destructive);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::RestoreOrDeleteFile)
-        );
-    }
-
-    #[test]
-    fn git_action_commit_has_compensation_summary() {
-        let profile = tool_action_profile("git", &json!({"action": "commit", "message": "x"}));
-        assert!(!profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRevertCommit)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`revert_commit`")
-        );
-    }
-
-    #[test]
-    fn git_action_revert_commit_is_manual() {
-        let profile = tool_action_profile(
-            "git",
-            &json!({"action": "revert_commit", "commit_sha": "abc123"}),
-        );
-        assert!(!profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
-    }
-
-    #[test]
-    fn git_action_worktree_list_is_read_only() {
-        let profile =
-            tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Read);
-        assert_eq!(profile.compensation_kind, None);
-    }
-
-    #[test]
-    fn git_action_worktree_enter_is_compensated() {
-        let profile = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
-        );
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`worktree`")
-        );
-    }
-
-    #[test]
     fn rename_symbol_uses_file_rollback_hint() {
         let profile = tool_action_profile(
             "rename_symbol",
@@ -1296,14 +1030,7 @@ mod tests {
             "adjust_config",
             &json!({"path": "memory.retrieval_top_k", "value": 6})
         ));
-        assert!(tool_requires_explicit_approval(
-            "git",
-            &json!({"action": "commit", "message": "ship it"})
-        ));
-        assert!(tool_requires_explicit_approval(
-            "github",
-            &json!({"action": "create_issue", "owner": "o", "repo": "r", "title": "t"})
-        ));
+
         assert!(tool_requires_explicit_approval(
             "bash",
             &json!({"command": "rm -rf tmp"})
@@ -1312,11 +1039,6 @@ mod tests {
 
     #[test]
     fn explicit_approval_reason_describes_boundary_gap() {
-        let git_action_commit_reason =
-            explicit_approval_reason("git", &json!({"action": "commit", "message": "x"}))
-                .expect("git commit should require explicit approval");
-        assert!(git_action_commit_reason.contains("unbounded"));
-
         let bash_reason = explicit_approval_reason("bash", &json!({"command": "rm -rf tmp"}))
             .expect("destructive bash should require explicit approval");
         assert!(bash_reason.contains("rollback"));
@@ -1336,10 +1058,7 @@ mod tests {
                 "edit_file" | "str_replace" => {
                     json!({"path": "tmp.txt", "old_str": "a", "new_str": "b"})
                 }
-                "git" => json!({"action": "push", "remote": "origin", "branch": "main"}),
-                "github" => {
-                    json!({"action": "create_issue", "owner": "o", "repo": "r", "title": "t"})
-                }
+
                 "multi_edit" => {
                     json!({"path": "tmp.txt", "edits": [{"old_str": "a", "new_str": "b"}]})
                 }

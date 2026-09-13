@@ -1255,35 +1255,7 @@ fn git_safety_violations_for_request(tool_name: &str, args: &Value) -> Vec<GitSa
             .unwrap_or_default();
     }
 
-    structured_git_command_hint(tool_name, args)
-        .map(|command| validate_git_command(&command))
-        .unwrap_or_default()
-}
-
-fn structured_git_command_hint(tool_name: &str, args: &Value) -> Option<String> {
-    if tool_name != "git" {
-        return None;
-    }
-    let action = args.get("action").and_then(Value::as_str)?;
-    if action != "push"
-        || !args
-            .get("force_with_lease")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return None;
-    }
-
-    let mut command = String::from("git push --force-with-lease");
-    if let Some(remote) = args.get("remote").and_then(Value::as_str) {
-        command.push(' ');
-        command.push_str(remote);
-    }
-    if let Some(branch) = args.get("branch").and_then(Value::as_str) {
-        command.push(' ');
-        command.push_str(branch);
-    }
-    Some(command)
+    Vec::new()
 }
 
 fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
@@ -2508,15 +2480,12 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                allow_rules: vec![crate::permission::types::PermissionRule::parse("git")],
+                allow_rules: vec![crate::permission::types::PermissionRule::parse("bash")],
                 ..Default::default()
             },
         );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({"action": "commit", "message": "ship it"}),
-            &ctx,
-        );
+        let envelope =
+            evaluate_permission("bash", &serde_json::json!({"command": "rm -rf tmp"}), &ctx);
         assert!(matches!(
             envelope.decision,
             HardDecision::NeedExternal { .. }
@@ -2984,90 +2953,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_git_force_push_feature_branch_is_soft_in_auto_mode() {
-        let ctx = crate::permission::types::PermissionSyncContext::root(
-            crate::permission::types::PermissionMode::Auto,
-        );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "feature/my-branch",
-                "force_with_lease": true
-            }),
-            &ctx,
-        );
-
-        assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
-    }
-
-    #[test]
-    fn structured_git_force_push_feature_branch_is_allowed_in_bypass_mode() {
-        let ctx = crate::permission::types::PermissionSyncContext::root(
-            crate::permission::types::PermissionMode::Bypass,
-        );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "feature/my-branch",
-                "force_with_lease": true
-            }),
-            &ctx,
-        );
-
-        assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
-    }
-
-    #[test]
-    fn structured_git_force_push_protected_branch_requires_approval_in_auto_mode() {
-        let ctx = crate::permission::types::PermissionSyncContext::root(
-            crate::permission::types::PermissionMode::Auto,
-        );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "main",
-                "force_with_lease": true
-            }),
-            &ctx,
-        );
-
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
-        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
-    }
-
-    #[test]
-    fn structured_git_force_push_protected_branch_is_advisory_in_bypass_mode() {
-        let ctx = crate::permission::types::PermissionSyncContext::root(
-            crate::permission::types::PermissionMode::Bypass,
-        );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "main",
-                "force_with_lease": true
-            }),
-            &ctx,
-        );
-
-        assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
-    }
-
-    #[test]
     fn git_worktree_destructive_bash_is_advisory_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -3168,35 +3053,6 @@ mod tests {
                 .contains("broad session override cannot bypass git safety")),
             "ignored prefix override should stay visible in trace: {:?}",
             envelope.trace
-        );
-    }
-
-    #[test]
-    fn structured_git_force_push_respects_auto_allowlist() {
-        let ctx = crate::permission::types::PermissionSyncContext::new(
-            crate::permission::types::InheritedPermissions {
-                mode: crate::permission::types::PermissionMode::Auto,
-                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
-                ..Default::default()
-            },
-        );
-        let envelope = evaluate_permission(
-            "git",
-            &serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "feature/my-branch",
-                "force_with_lease": true
-            }),
-            &ctx,
-        );
-
-        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
-        assert_eq!(
-            envelope.source,
-            DecisionSource::Mode {
-                mode: "agent policy allowlist".to_string()
-            }
         );
     }
 

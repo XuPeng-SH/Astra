@@ -877,19 +877,13 @@ impl TurnGuard {
                     tool_list.join(", ")
                 ));
                 for (tool_name, _) in &cache_wasteful {
-                    match *tool_name {
-                        "read_file" => injections.push(
+                    if *tool_name == "read_file" {
+                        injections.push(
                             "For repeated read_file cache hits, reuse the earlier file output. \
                              If you need a different slice, switch to start_line/end_line, \
                              outline=true, grep, or glob instead of rereading the same file."
                                 .to_string(),
-                        ),
-                        "git" => injections.push(
-                            "For repeated git cache hits, reuse the earlier output until the \
-                             worktree changes, or narrow with a specific path or commit."
-                                .to_string(),
-                        ),
-                        _ => {}
+                        );
                     }
                 }
                 cache_warning_emitted = true;

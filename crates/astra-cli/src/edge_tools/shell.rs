@@ -6876,6 +6876,7 @@ mod tests {
             fields[astra_tools::workspace_observation::SCOPE_FIELD],
             astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -6883,6 +6884,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
     }
 
     #[test]
@@ -6905,6 +6923,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -6912,6 +6931,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 
@@ -6984,6 +7020,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -6991,9 +7028,27 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_helper_crash_marks_terminal_ownership_unsettled() {
         let dir = tempfile::tempdir().unwrap();
@@ -7275,6 +7330,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -7282,6 +7338,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 

@@ -846,14 +846,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                         mem_latency_ms,
                     );
                 }
-
-                if !projection.contents.is_empty() {
-                    for repo in &projection.preferred_repos {
-                        ctx.executor.add_preferred_repo(repo);
-                    }
-                    // Send "useful" feedback for retrieved memories (fire-and-forget)
-                    ctx.executor.memory_feedback_useful(projection.feedback_ids);
-                }
             }
         }
     }
@@ -1025,24 +1017,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         })
         .cloned()
         .collect();
-    let mut eligible_surface_schemas = ctx
+    let eligible_surface_schemas = ctx
         .executor
         .runtime_bound_tool_schemas(eligible_surface_schemas);
-    let mut eligible_provider_schemas = ctx
+    let eligible_provider_schemas = ctx
         .executor
         .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
-    let complete_eligible: Vec<Value> = eligible_surface_schemas
-        .iter()
-        .chain(eligible_provider_schemas.iter())
-        .cloned()
-        .collect();
-    let admitted_names = ctx.executor.local_command_surface_names(&complete_eligible);
-    let admitted =
-        |schema: &Value| tool_schema_name(schema).is_none_or(|name| admitted_names.contains(name));
-    eligible_surface_schemas.retain(admitted);
-    eligible_provider_schemas.retain(admitted);
-    turn_schemas
-        .retain(|schema| tool_schema_name(schema) == Some("invoke_tool") || admitted(schema));
     attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
     // Sync the executor guard from the final payload, after capability
     // restrictions and interaction-mode filtering have all been applied. The

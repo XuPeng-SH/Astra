@@ -5,7 +5,6 @@ use crate::cli::tool_result_status::{
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::{JournalEvent, ToolCallDisposition};
-use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
@@ -650,8 +649,8 @@ fn normalized_server_tool_completion_status(state: &ServerToolCallState, event: 
 
 // CLI formatting utilities
 use crate::cli::cli_config::cli_formatting::{
-    colorize_diff_summary, colorize_git_diff_stat_summary, compact_unified_diff_preview,
-    extract_cli_diff_block, format_byte_size, format_duration_suffix, shorten_path, truncate_line,
+    colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
+    format_duration_suffix, truncate_line,
 };
 
 // Effects module types
@@ -1006,7 +1005,7 @@ impl RenderPolicy {
 ///
 /// Mirrors the headless round's `InMemoryIdempotencyCache` + `call_counts`, but
 /// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
-/// (read_file, grep, git(action=log), …) get their output stored and replayed on repeat.
+/// (read_file, list_dir, …) get their output stored and replayed on repeat.
 /// All tools get a hard call-count limit to prevent runaway repetition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EdgeToolCacheValidation {
@@ -1018,10 +1017,6 @@ enum EdgeToolCacheValidation {
     DirectoryMtime {
         path: PathBuf,
         timestamp_ms: u128,
-    },
-    GitHeadClean {
-        project_root: PathBuf,
-        head_short: String,
     },
 }
 
@@ -1116,27 +1111,6 @@ fn dedup_signature_is_cacheable_read(signature: &str) -> bool {
         .is_some_and(|args| edge_tool_is_cacheable_read(tool, &args))
 }
 
-fn git_action_supports_batch_transaction_boundary(args: &Value) -> bool {
-    matches!(
-        args.get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("status"),
-        "status"
-            | "diff"
-            | "log"
-            | "show"
-            | "blame"
-            | "file_history"
-            | "log_search"
-            | "contributors"
-            | "commit"
-            | "stash"
-            | "checkout_file"
-            | "worktree"
-            | "revert_commit"
-    )
-}
-
 fn path_mtime_ms(path: &Path) -> u128 {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -1172,13 +1146,6 @@ impl EdgeToolCacheValidation {
                     && file_content_sha256(path).as_ref() == Some(content_sha256)
             }
             Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
-            Self::GitHeadClean {
-                project_root,
-                head_short: cached_head,
-            } => {
-                git_worktree_is_clean(project_root).unwrap_or(false)
-                    && head_short(project_root) == *cached_head
-            }
         }
     }
 }
@@ -1495,8 +1462,7 @@ struct ActiveBatchTransaction {
     turn_index: u32,
     file_checkpoint: u64,
     database_checkpoint: u64,
-    stash_checkpoint: u64,
-    commit_checkpoint: u64,
+
     worktree_checkpoint: u64,
     session_state_checkpoint: u64,
 }
@@ -1512,8 +1478,7 @@ struct ActiveTurnRollback {
     turn_index: u32,
     file_checkpoint: u64,
     database_checkpoint: u64,
-    stash_checkpoint: u64,
-    commit_checkpoint: u64,
+
     worktree_checkpoint: u64,
     session_state_checkpoint: u64,
 }
@@ -1674,8 +1639,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .load(std::sync::atomic::Ordering::Acquire),
             file_checkpoint: ctx.executor.file_journal_checkpoint(),
             database_checkpoint: ctx.executor.database_snapshot_journal_checkpoint(),
-            stash_checkpoint: ctx.executor.git_stash_journal_checkpoint(),
-            commit_checkpoint: ctx.executor.git_commit_journal_checkpoint(),
+
             worktree_checkpoint: ctx.executor.git_worktree_journal_checkpoint(),
             session_state_checkpoint: ctx.executor.session_state_journal_checkpoint(),
         });
@@ -1975,16 +1939,7 @@ impl<'a> CliSseStreamHost<'a> {
                 (timestamp_ms > 0)
                     .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
             }
-            "git" if edge_tool_is_cacheable_read(tool, args) => {
-                if !git_worktree_is_clean(&self.executor.project_root).unwrap_or(false) {
-                    return None;
-                }
-                let cached_head = head_short(&self.executor.project_root);
-                (!cached_head.is_empty()).then_some(EdgeToolCacheValidation::GitHeadClean {
-                    project_root: self.executor.project_root.clone(),
-                    head_short: cached_head,
-                })
-            }
+
             _ => None,
         }
     }
@@ -2383,8 +2338,7 @@ impl<'a> CliSseStreamHost<'a> {
         turn_index: u32,
         file_checkpoint: u64,
         database_checkpoint: u64,
-        stash_checkpoint: u64,
-        commit_checkpoint: u64,
+
         worktree_checkpoint: u64,
         session_state_checkpoint: u64,
     ) -> Option<Value> {
@@ -2396,14 +2350,7 @@ impl<'a> CliSseStreamHost<'a> {
             .executor
             .database_snapshot_journal_checkpoint()
             .saturating_sub(database_checkpoint);
-        let stash_entries_added = self
-            .executor
-            .git_stash_journal_checkpoint()
-            .saturating_sub(stash_checkpoint);
-        let commit_entries_added = self
-            .executor
-            .git_commit_journal_checkpoint()
-            .saturating_sub(commit_checkpoint);
+
         let worktree_entries_added = self
             .executor
             .git_worktree_journal_checkpoint()
@@ -2414,8 +2361,6 @@ impl<'a> CliSseStreamHost<'a> {
             .saturating_sub(session_state_checkpoint);
         if file_entries_added == 0
             && database_entries_added == 0
-            && stash_entries_added == 0
-            && commit_entries_added == 0
             && worktree_entries_added == 0
             && session_state_entries_added == 0
         {
@@ -2429,8 +2374,8 @@ impl<'a> CliSseStreamHost<'a> {
                 "turn_index": turn_index,
                 "file_after_sequence": file_checkpoint,
                 "database_after_sequence": database_checkpoint,
-                "stash_after_sequence": stash_checkpoint,
-                "commit_after_sequence": commit_checkpoint,
+
+
                 "worktree_after_sequence": worktree_checkpoint,
                 "session_state_after_sequence": session_state_checkpoint,
             }))
@@ -2520,9 +2465,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .map(str::trim)
                 .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
         }
-        if tool == "git" {
-            return git_action_supports_batch_transaction_boundary(args);
-        }
+
         is_tool_concurrency_safe(tool, Some(args))
             || matches!(
                 tool,
@@ -2608,8 +2551,6 @@ impl<'a> CliSseStreamHost<'a> {
             active.turn_index,
             active.file_checkpoint,
             active.database_checkpoint,
-            active.stash_checkpoint,
-            active.commit_checkpoint,
             active.worktree_checkpoint,
             active.session_state_checkpoint,
         )
@@ -2621,8 +2562,6 @@ impl<'a> CliSseStreamHost<'a> {
             active.turn_index,
             active.file_checkpoint,
             active.database_checkpoint,
-            active.stash_checkpoint,
-            active.commit_checkpoint,
             active.worktree_checkpoint,
             active.session_state_checkpoint,
         )
@@ -2673,16 +2612,15 @@ impl<'a> CliSseStreamHost<'a> {
     fn execution_boundary_checkpoints(
         file_checkpoint: u64,
         database_checkpoint: u64,
-        stash_checkpoint: u64,
-        commit_checkpoint: u64,
+
         worktree_checkpoint: u64,
         session_state_checkpoint: u64,
     ) -> Value {
         serde_json::json!({
             "file_checkpoint": file_checkpoint,
             "database_checkpoint": database_checkpoint,
-            "stash_checkpoint": stash_checkpoint,
-            "commit_checkpoint": commit_checkpoint,
+
+
             "worktree_checkpoint": worktree_checkpoint,
             "session_state_checkpoint": session_state_checkpoint,
         })
@@ -2794,8 +2732,6 @@ impl<'a> CliSseStreamHost<'a> {
             Self::execution_boundary_checkpoints(
                 active.file_checkpoint,
                 active.database_checkpoint,
-                active.stash_checkpoint,
-                active.commit_checkpoint,
                 active.worktree_checkpoint,
                 active.session_state_checkpoint,
             ),
@@ -2838,8 +2774,6 @@ impl<'a> CliSseStreamHost<'a> {
             Self::execution_boundary_checkpoints(
                 active.file_checkpoint,
                 active.database_checkpoint,
-                active.stash_checkpoint,
-                active.commit_checkpoint,
                 active.worktree_checkpoint,
                 active.session_state_checkpoint,
             ),
@@ -3117,8 +3051,7 @@ impl<'a> CliSseStreamHost<'a> {
                         .load(std::sync::atomic::Ordering::Acquire),
                     file_checkpoint: self.executor.file_journal_checkpoint(),
                     database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
-                    stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
-                    commit_checkpoint: self.executor.git_commit_journal_checkpoint(),
+
                     worktree_checkpoint: self.executor.git_worktree_journal_checkpoint(),
                     session_state_checkpoint: self.executor.session_state_journal_checkpoint(),
                 };
@@ -6725,11 +6658,8 @@ struct ToolOutputSummary {
 fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning: bool) -> String {
     let is_edit_diff = matches!(summary.kind, ToolOutputSummaryKind::Diff)
         && matches!(tool, "write_file" | "str_replace" | "multi_edit");
-    let is_git_diff_stat = matches!(summary.kind, ToolOutputSummaryKind::Diff) && tool == "git";
     let rendered = if is_edit_diff {
         colorize_diff_summary(&summary.text)
-    } else if is_git_diff_stat {
-        colorize_git_diff_stat_summary(&summary.text)
     } else {
         match summary.kind {
             ToolOutputSummaryKind::Diff => summary.text.clone(),
@@ -6751,7 +6681,7 @@ fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning
         // preview indent would start the background after four blank columns
         // and break that contract.
         .map(|line| {
-            if is_edit_diff || is_git_diff_stat {
+            if is_edit_diff {
                 line.to_string()
             } else {
                 format!("    {line}")
@@ -7360,45 +7290,7 @@ impl StreamRenderState {
                     format_byte_size(byte_size)
                 )))
             }
-            "git" => {
-                // Ignore diff file headers (`+++ b/…`, `--- a/…`) so counts match real hunks.
-                let additions = output
-                    .lines()
-                    .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-                    .count();
-                let deletions = output
-                    .lines()
-                    .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-                    .count();
-                let files: Vec<&str> = output
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("+++ b/"))
-                    .filter(|f| !f.is_empty() && *f != "/dev/null")
-                    .take(5)
-                    .collect();
-                let total_files = output
-                    .lines()
-                    .filter(|l| l.starts_with("+++ b/") && !l.contains("/dev/null"))
-                    .count();
-                let stat = if additions > 0 || deletions > 0 {
-                    format!("+{additions} -{deletions}")
-                } else {
-                    format!("{line_count} lines")
-                };
-                if files.is_empty() {
-                    Some(diff_summary(stat))
-                } else {
-                    let mut summary = format!("{stat} in {total_files} file(s)");
-                    for f in &files {
-                        summary.push_str(&format!("\n      {}", shorten_path(f, 50)));
-                    }
-                    let remaining = total_files.saturating_sub(5);
-                    if remaining > 0 {
-                        summary.push_str(&format!("\n      … +{remaining} more"));
-                    }
-                    Some(diff_summary(summary))
-                }
-            }
+
             "grep" | "search" => {
                 let head = output.trim_start();
                 if str_starts_with_any_prefix(head, SEARCH_NO_MATCH_SENTINELS) {
@@ -7943,11 +7835,7 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
                 return s;
             }
         }
-        "github" => {
-            if let Some(s) = style_first_matching_prefix(description, &["GitHub: "]) {
-                return s;
-            }
-        }
+
         "get_agent_info" => {
             if let Some(s) = style_first_matching_prefix(description, &["Getting agent info: "]) {
                 return s;
@@ -8252,16 +8140,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "list_dir" => format!("Listing: {preview}"),
         "grep" => format!("Grep: {preview}"),
         "glob" => format!("Glob: {preview}"),
-        "git" => format!("Git {preview}"),
-        other_git if other_git.starts_with("git_") => {
-            let action = &other_git[4..]; // strip "git_" prefix
-            let action_display = action.replace('_', " ");
-            if preview.is_empty() {
-                format!("Git {action_display}")
-            } else {
-                format!("Git {action_display} {preview}")
-            }
-        }
+
         "find_definition" => format!("Find definition of {preview}"),
         "find_references" => format!("Find references to {preview}"),
         "symbol_search" => format!("Search symbol {preview}"),
@@ -8275,7 +8154,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "lsp" => format!("LSP: {preview}"),
         "web_fetch" => format!("Fetching: {preview}"),
         "web_search" => format!("Searching web: \"{preview}\""),
-        "github" => format!("GitHub: {preview}"),
+
         "session" => format!("Session: {preview}"),
         "agent" => {
             if is_agent_control_preview(preview) {
@@ -11902,37 +11781,6 @@ mod tests {
         );
     }
 
-    fn init_temp_git_repo() -> tempfile::TempDir {
-        let dir = tempdir().expect("temp repo");
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir.path())
-            .output()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git config user.name");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git config user.email");
-        std::fs::write(dir.path().join("tracked.txt"), "committed\n").expect("seed tracked file");
-        std::process::Command::new("git")
-            .args(["add", "tracked.txt"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git commit");
-        dir
-    }
-
     fn boundary_events(session_id: &str) -> Vec<JournalEvent> {
         session_journal::read_journal(session_id)
             .expect("read journal")
@@ -12327,56 +12175,6 @@ mod tests {
     }
 
     #[test]
-    fn format_git_and_github_previews() {
-        // git
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("revert abc123")),
-            "Git revert abc123"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("stash push")),
-            "Git stash push"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("history src/main.rs")),
-            "Git history src/main.rs"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("log search \"auth\"")),
-            "Git log search \"auth\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("contributors src/ since 30 days ago")),
-            "Git contributors src/ since 30 days ago"
-        );
-        // additional git tools
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("checkout HEAD~1 -- src/lib.rs")),
-            "Git checkout HEAD~1 -- src/lib.rs"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("git", Some("worktree add feature/ui")),
-            "Git worktree add feature/ui"
-        );
-        // github
-        assert_eq!(
-            format_tool_display_from_preview("github", Some("get_issue matrixorigin/Astra#147")),
-            "GitHub: get_issue matrixorigin/Astra#147"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("github", Some("list_issues matrixorigin/Astra")),
-            "GitHub: list_issues matrixorigin/Astra"
-        );
-        assert_eq!(
-            format_tool_display_from_preview(
-                "github",
-                Some("create_issue matrixorigin/Astra: \"Fix renderer drift\"")
-            ),
-            "GitHub: create_issue matrixorigin/Astra: \"Fix renderer drift\""
-        );
-    }
-
-    #[test]
     fn format_utility_and_meta_previews() {
         // utility
         assert_eq!(
@@ -12663,28 +12461,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_git_diff_stat_has_its_own_neutral_row_geometry() {
-        let summary = ToolOutputSummary {
-            kind: ToolOutputSummaryKind::Diff,
-            text: "+21 -18 in 1 file(s)\n      pkg/frontend/plan_cache.go".into(),
-        };
-
-        let rendered = format_terminal_tool_summary("git", &summary, false);
-        let plain = crate::cli::theme::strip_ansi(&rendered);
-        let rows = plain.lines().collect::<Vec<_>>();
-        assert_eq!(rows[0], "    +21 -18 in 1 file(s)");
-        assert_eq!(rows[1], "          pkg/frontend/plan_cache.go");
-        assert!(
-            rendered
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .contains("\x1b[K"),
-            "git diff stat must erase through the physical terminal edge: {rendered:?}"
-        );
-    }
-
-    #[test]
     fn output_summary_basics() {
         let r = StreamRenderState::new();
         // skill: collapses preview lines
@@ -12772,20 +12548,6 @@ mod tests {
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "no matches");
-
-        // git(action=diff)
-        let s = r
-            .format_output_summary(
-                "git",
-                "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
-                "completed",
-            )
-            .expect("summary");
-        assert_eq!(s.kind, ToolOutputSummaryKind::Diff);
-        assert!(s.text.contains("+1"));
-        assert!(s.text.contains("-1"));
-        assert!(s.text.contains("src/a.rs"));
-        assert!(!s.text.contains('\x1b'));
 
         // str_replace
         let s = r.format_output_summary("str_replace", "<<<ASTRA_UNIFIED_DIFF>>>\n--- a/src/hello.py\n+++ b/src/hello.py\n@@ -1,2 +1,3 @@\n-print(\"old\")\n+print(\"new\")\n+print(\"more\")\n<<<END_ASTRA_UNIFIED_DIFF>>>", "completed").expect("summary");
@@ -13375,14 +13137,6 @@ mod tests {
             "glob",
             &serde_json::json!({"pattern": "*.rs"})
         ));
-        assert!(edge_tool_is_cacheable_read(
-            "git",
-            &serde_json::json!({"action": "log"})
-        ));
-        assert!(!edge_tool_is_cacheable_read(
-            "git",
-            &serde_json::json!({"action": "commit", "message": "ship"})
-        ));
         assert!(!edge_tool_is_cacheable_read(
             "bash",
             &serde_json::json!({"command": "ls"})
@@ -13395,22 +13149,6 @@ mod tests {
         assert_eq!(sig1, sig2);
         let sig3 = tool_dedup_signature("read_file", &args);
         assert_ne!(sig1, sig3);
-    }
-
-    #[test]
-    fn batch_transaction_boundary_is_git_action_aware() {
-        assert!(CliSseStreamHost::batch_transaction_boundary_supported(
-            "git",
-            &serde_json::json!({"action": "status"})
-        ));
-        assert!(CliSseStreamHost::batch_transaction_boundary_supported(
-            "git",
-            &serde_json::json!({"action": "commit", "message": "ship"})
-        ));
-        assert!(!CliSseStreamHost::batch_transaction_boundary_supported(
-            "git",
-            &serde_json::json!({"action": "push"})
-        ));
     }
 
     #[test]
@@ -13743,207 +13481,6 @@ mod tests {
         );
         assert_eq!(
             rollback_fields["transaction_rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_reapplies_git_stash_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = init_temp_git_repo();
-        let tracked = temp.path().join("tracked.txt");
-        std::fs::write(&tracked, "working tree\n").expect("modify tracked file");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(7, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "git".to_string(),
-                    args: serde_json::json!({
-                        "action": "stash",
-                        "sub_action": "push",
-                        "message": "txn stash",
-                        "transaction_id": "tx-stash",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-stash",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&tracked).expect("restored working tree"),
-            "working tree\n"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["git_stashes"]["restored"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_reverts_git_commit_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = init_temp_git_repo();
-        let tracked = temp.path().join("tracked.txt");
-        std::fs::write(&tracked, "committed in txn\n").expect("modify tracked file");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(8, std::sync::atomic::Ordering::Relaxed);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "git".to_string(),
-                    args: serde_json::json!({
-                        "action": "commit",
-                        "message": "txn commit",
-                        "transaction_id": "tx-commit",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-commit",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&tracked).expect("restored tracked file"),
-            "committed\n"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["git_commits"]["reverted"]
                 .as_array()
                 .map(|entries| entries.len()),
             Some(1)
@@ -15246,138 +14783,6 @@ mod tests {
             .await;
         assert!(reread.output.contains("omega"), "{}", reread.output);
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn edge_tool_cache_reuses_git_action_show_when_head_is_unchanged() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = init_temp_git_repo();
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let first = host
-            .execute_tool(
-                "cache-git-1",
-                "git",
-                &serde_json::json!({"action": "show", "revision": "HEAD", "stat_only": true}),
-            )
-            .await;
-        let second = host
-            .execute_tool(
-                "cache-git-2",
-                "git",
-                &serde_json::json!({"action": "show", "revision": "HEAD", "stat_only": true}),
-            )
-            .await;
-
-        assert_eq!(first.output, second.output);
-        assert_eq!(
-            second.duration_ms, 0,
-            "second git(action=show) should be served from cache"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn edge_tool_cache_invalidates_git_action_status_after_worktree_change() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = init_temp_git_repo();
-        let tracked = temp.path().join("tracked.txt");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let first = host
-            .execute_tool(
-                "cache-git-status-1",
-                "git",
-                &serde_json::json!({"action": "status"}),
-            )
-            .await;
-        assert!(
-            !first.output.contains("tracked.txt"),
-            "expected clean repo output without dirty entries: {}",
-            first.output
-        );
-
-        std::fs::write(&tracked, "modified\n").expect("modify tracked file");
-
-        let second = host
-            .execute_tool(
-                "cache-git-status-2",
-                "git",
-                &serde_json::json!({"action": "status"}),
-            )
-            .await;
-        assert!(
-            second.output.contains("tracked.txt"),
-            "stale git cache should not hide worktree changes: {}",
-            second.output
-        );
     }
 
     #[serial_test::serial]

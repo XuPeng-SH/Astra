@@ -660,7 +660,7 @@ impl Scenario {
     /// Get suggested tool labels for this scenario.
     pub fn suggested_tools(&self) -> Vec<&'static str> {
         match self {
-            Scenario::CodeReview => vec!["read_file", "grep", "github"],
+            Scenario::CodeReview => vec!["read_file", "grep"],
             Scenario::Debugging => vec!["bash", "read_file", "grep", "glob"],
             Scenario::Exploration => vec!["glob", "grep", "read_file", "tool_search"],
             Scenario::Planning => vec!["read_file", "write_file", "mo_query"],

@@ -4090,12 +4090,7 @@ fn structured_targets_are_bound(
     if matches!(name, "apply_patch" | "rollback_git_worktrees") {
         return false;
     }
-    // The git executor is already bound to the project/workspace root.  Its
-    // mutating actions (commit/revert/stash apply, etc.) have no per-file
-    // operand, so the root binding is the owner-side target contract.
-    if name == "git" {
-        return true;
-    }
+
     let object = match args.as_object() {
         Some(object) => object,
         None => return false,
@@ -4375,8 +4370,6 @@ pub fn is_typed_workspace_observer(name: &str) -> bool {
             | "find_definition"
             | "find_references"
             | "lsp"
-            | "git_diff"
-            | "git_status"
             | "inspect_file"
     )
 }
@@ -4407,7 +4400,7 @@ pub fn explicit_workspace_verification_unavailable_evidence() -> astra_core::Too
     )
 }
 
-pub const EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE: &str = "Error: verify-mode could not capture a bounded workspace observation. This verification cannot produce a completion receipt for the current workspace generation; use a typed observer such as read_file, list_dir, or git_diff for the changed artifact instead.";
+pub const EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE: &str = "Error: verify-mode could not capture a bounded workspace observation. This verification cannot produce a completion receipt for the current workspace generation; use a typed observer such as read_file or list_dir for the changed artifact instead.";
 
 pub fn typed_workspace_observation_receipt() -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
@@ -5509,8 +5502,8 @@ mod tests {
                 false,
                 true,
             )
-            .is_some(),
-            "mutating git actions are bound to the owner project root"
+            .is_none(),
+            "removed tools cannot mint mutation evidence"
         );
         assert!(
             typed_workspace_tool_receipt_for_applied(

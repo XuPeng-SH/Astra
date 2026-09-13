@@ -478,7 +478,6 @@ enum RuntimeEnvironmentDenial {
     WorkspaceUnavailable(String),
     RuntimeCapabilityMissing(String),
     RuntimeSurfaceDenied(String),
-    CredentialBindingUnavailable(String),
     PolicyDenied(String),
 }
 
@@ -521,7 +520,7 @@ impl RuntimeEnvironmentDenial {
             Self::WorkspaceUnavailable(reason) => {
                 ToolUnavailableReason::WorkspaceUnavailable(reason.clone())
             }
-            Self::RuntimeCapabilityMissing(reason) | Self::CredentialBindingUnavailable(reason) => {
+            Self::RuntimeCapabilityMissing(reason) => {
                 ToolUnavailableReason::RuntimeCapabilityMissing(reason.clone())
             }
             Self::SchemaConflict(reason)
@@ -1627,7 +1626,13 @@ impl RuntimeToolExecutor {
         });
 
         let Some(mut searchable_names) = self.current_searchable_tool_names() else {
-            return pool;
+            return crate::server::tool_binding_projection::capability_filter_tool_schemas_for_binding_with_context(
+                pool,
+                self.execution_binding.workspace(),
+                self.execution_binding.executor(),
+                self.execution_binding.runtime(),
+                self.tool_admission_context(),
+            );
         };
         let activatable_names = self.current_activatable_tool_names_snapshot();
         searchable_names.extend(activatable_names.clone());
@@ -2367,19 +2372,6 @@ impl RuntimeToolExecutor {
             return call_denial;
         }
 
-        if name == "git"
-            && astra_tools::git_tool_contract::git_action_from_args(args)
-                == Ok(astra_tools::git_tool_contract::GitAction::Push)
-            && matches!(
-                self.execution_binding.executor().kind,
-                ExecutorBindingKind::ServerLocal
-            )
-        {
-            return Some(RuntimeEnvironmentDenial::CredentialBindingUnavailable(
-                "owner_scoped_git_credentials".to_string(),
-            ));
-        }
-
         None
     }
 
@@ -2472,7 +2464,6 @@ impl RuntimeToolExecutor {
             Capability::MemoryService
             | Capability::Database
             | Capability::SkillsCatalog
-            | Capability::GitHubAuth
             | Capability::LSPServer
             | Capability::PlanLifecycle
             | Capability::LocalBackgroundTasks
@@ -2505,7 +2496,6 @@ impl RuntimeToolExecutor {
             | Capability::MemoryService
             | Capability::Database
             | Capability::SkillsCatalog
-            | Capability::GitHubAuth
             | Capability::LSPServer
             | Capability::PlanLifecycle
             | Capability::LocalBackgroundTasks => true,
@@ -3274,46 +3264,6 @@ impl RuntimeToolExecutor {
             durable_dispatch_admission,
         ))
         .await
-    }
-
-    /// Execute a git compensation through the same durable admission and
-    /// settlement boundary as a model-authored external effect. Compensation
-    /// is not a privileged escape hatch: replaying the same logical rollback
-    /// returns the ledger result instead of dispatching another revert.
-    pub(crate) async fn execute_git_revert_compensation(
-        &self,
-        run_id: &str,
-        turn_chain_id: &str,
-        invocation_id: &str,
-        commit_sha: &str,
-        durable_dispatch_admission: crate::server::tool_invocation_runtime::DurableDispatchAdmission,
-    ) -> astra_tools::ToolResult {
-        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
-            source:
-                crate::server::tool_execution_binding::ToolPermissionGrantSource::ImplicitPolicy,
-            reason: Some("durable git rollback compensation".to_string()),
-            updates_hash: None,
-        };
-        let deferred = self
-            .execute_invocation_before_governance(
-                run_id,
-                turn_chain_id,
-                invocation_id,
-                "git",
-                &serde_json::json!({
-                    "action": "revert_commit",
-                    "commit_sha": commit_sha,
-                }),
-                None,
-                Some(&grant),
-                Some(durable_dispatch_admission),
-                None,
-            )
-            .await;
-        let governed = govern_runtime_tool_result(deferred.result, false);
-        self.finish_governed_tool_result(governed, deferred.pending)
-            .await
-            .result
     }
 
     async fn execute_request_with_metadata(
@@ -4649,12 +4599,7 @@ fn runtime_environment_denial_ux(
             "change_policy_or_workspace_authority",
             true,
         ),
-        RuntimeEnvironmentDenial::CredentialBindingUnavailable(_) => (
-            "credential_binding_unavailable",
-            "Connect this owner's GitHub account or bind a connected Edge executor; Astra Server never falls back to host Git credentials.",
-            "bind_owner_scoped_git_provider",
-            true,
-        ),
+
         RuntimeEnvironmentDenial::PolicyDenied(_) => (
             "policy_denied",
             "Adjust policy or choose an allowed action.",
@@ -4958,6 +4903,21 @@ fn tool_result_from_provider_payload(
 #[cfg(test)]
 #[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
+    #[tokio::test]
+    async fn removed_repository_tools_have_no_server_handler() {
+        let (executor, _dir) = test_executor();
+        for name in ["git", "github"] {
+            assert!(!executor.tool_engine.contains(name));
+            let result = executor
+                .execute_with_metadata(
+                    name,
+                    &json!({"action":"create_issue", "title":"must not run"}),
+                )
+                .await;
+            assert!(result.is_error, "{name}: {result:?}");
+        }
+    }
+
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
@@ -6051,7 +6011,7 @@ mod tests {
     }
 
     #[test]
-    fn action_sensitive_runtime_env_admission_blocks_read_only_write_actions() {
+    fn runtime_env_admission_blocks_writes_in_read_only_workspace() {
         let (mut exec, dir) = test_executor();
         exec.set_execution_bindings(
             WorkspaceBinding {
@@ -6064,126 +6024,34 @@ mod tests {
         );
 
         assert!(
-            exec.tool_runtime_ready("git"),
-            "read-only git inspection should remain visible with a read-only workspace provider"
+            exec.tool_runtime_ready("read_file"),
+            "file inspection should remain visible with a read-only workspace provider"
         );
         assert!(
-            exec.executor_readiness_preflight_result("git", &json!({"action": "status"}))
+            exec.executor_readiness_preflight_result("read_file", &json!({"path": "README.md"}))
                 .is_none(),
-            "read-only git actions should pass runtime-env admission"
+            "read-only file calls should pass runtime-env admission"
         );
 
         let blocked = exec
             .executor_readiness_preflight_result(
-                "git",
-                &json!({"action": "commit", "message": "no"}),
+                "write_file",
+                &json!({"path": "README.md", "content": "no"}),
             )
-            .expect("git commit must be blocked before execution on read-only workspace");
+            .expect("file writes must be blocked before execution on read-only workspace");
         assert!(blocked.is_error, "{blocked:?}");
         let value: Value = serde_json::from_str(&blocked.output).unwrap();
         assert_eq!(value["status"], "failed");
         assert_eq!(
             value["runtime_env_reason"],
-            json!({"PolicyDenied": "filesystem_write"})
-        );
-    }
-
-    #[test]
-    fn server_git_push_requires_an_owner_scoped_credential_binding() {
-        let (mut exec, dir) = test_executor();
-        exec.set_execution_bindings(
-            WorkspaceBinding::server_sandbox(dir.path()),
-            ExecutorBinding::server_local(),
-        );
-
-        assert!(
-            exec.executor_readiness_preflight_result("git", &json!({"action": "status"}))
-                .is_none(),
-            "server workspaces must retain credential-free Git inspection"
-        );
-        let blocked = exec
-            .executor_readiness_preflight_result(
-                "git",
-                &json!({"action": "push", "remote": "origin", "branch": "feature"}),
-            )
-            .expect("server push must fail before a process can inherit host credentials");
-        let value: Value = serde_json::from_str(&blocked.output).unwrap();
-        assert_eq!(value["reason_kind"], "credential_binding_unavailable");
-        assert_eq!(value["provider_action"], "bind_owner_scoped_git_provider");
-        assert_eq!(value["resumable"], true);
-        assert!(
-            value["user_action"]
-                .as_str()
-                .is_some_and(|message| message.contains("never falls back to host Git credentials")),
-            "{}",
-            blocked.output
-        );
-
-        exec.set_execution_bindings(
-            WorkspaceBinding::edge_workspace(
-                "Owner edge workspace",
-                dir.path().display().to_string(),
-                WorkspaceAuthority::ReadWrite,
-            ),
-            ExecutorBinding::edge_agent(
-                "edge-owner",
-                "Owner edge",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-        );
-        assert!(
-            exec.runtime_environment_tool_denial(
-                "git",
-                &json!({"action": "push", "remote": "origin", "branch": "feature"}),
-            )
-            .is_none(),
-            "an owner-controlled Edge executor keeps its local credential authority"
-        );
-    }
-
-    #[test]
-    fn owner_admitted_edge_github_does_not_borrow_server_capabilities() {
-        let (mut exec, dir) = test_executor();
-        exec = exec.with_edge_admitted_tools(&["github".to_string()]);
-        exec.set_execution_bindings(
-            WorkspaceBinding::edge_workspace(
-                "Owner edge workspace",
-                dir.path().display().to_string(),
-                WorkspaceAuthority::ReadWrite,
-            ),
-            ExecutorBinding::edge_agent(
-                "edge-owner",
-                "Owner edge",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-        );
-        assert!(
-            matches!(
-                exec.executor_tool_readiness_for_call("github", &json!({"action": "get_pr"})),
-                ExecutorToolReadiness::Ready
-            ),
-            "the owner-controlled Edge credential is its own provider authority"
-        );
-
-        exec.set_execution_bindings(
-            WorkspaceBinding::server_sandbox(dir.path()),
-            ExecutorBinding::server_local(),
-        );
-        assert!(
-            !matches!(
-                exec.executor_tool_readiness_for_call("github", &json!({"action": "get_pr"})),
-                ExecutorToolReadiness::Ready
-            ),
-            "a stale Edge schema must never authorize Server-local GitHub execution"
+            json!({"PolicyDenied": "runtime surface denies this tool for the selected provider binding"})
         );
     }
 
     #[test]
     fn owner_admitted_edge_tool_follows_current_provider_readiness() {
         let (mut exec, dir) = test_executor();
-        exec = exec.with_edge_admitted_tools(&["github".to_string()]);
+        exec = exec.with_edge_admitted_tools(&["read_file".to_string()]);
         let workspace = WorkspaceBinding::edge_workspace(
             "Owner edge workspace",
             dir.path().display().to_string(),
@@ -6202,7 +6070,7 @@ mod tests {
             );
 
             let readiness =
-                exec.executor_tool_readiness_for_call("github", &json!({"action": "get_pr"}));
+                exec.executor_tool_readiness_for_call("read_file", &json!({"path": "README.md"}));
             assert!(
                 matches!(
                     readiness,
@@ -6213,7 +6081,7 @@ mod tests {
                 "stale Edge admission must not override {status:?} provider readiness: {readiness:?}"
             );
             assert!(
-                !exec.has_runtime_binding("github"),
+                !exec.has_runtime_binding("read_file"),
                 "an unavailable Edge provider must be absent from deferred activation"
             );
         }
@@ -6229,7 +6097,7 @@ mod tests {
         );
         assert!(
             matches!(
-                exec.executor_tool_readiness_for_call("github", &json!({"action": "get_pr"})),
+                exec.executor_tool_readiness_for_call("read_file", &json!({"path": "README.md"})),
                 ExecutorToolReadiness::Ready
             ),
             "degraded is an executable provider state and must remain usable"
@@ -7270,55 +7138,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine write errors should still receive execution metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn github_executes_from_tool_engine_registry() {
-        let (mut exec, _dir) = test_executor();
-        assert!(
-            exec.tool_engine.contains("github"),
-            "consolidated github should be registered in ToolEngine for server-local execution"
-        );
-
-        let unavailable = exec
-            .execute_with_metadata("github", &json!({"action": "list_prs"}))
-            .await;
-        assert!(unavailable.is_error, "{unavailable:?}");
-        assert!(
-            unavailable.output.contains("provider"),
-            "a credential-backed optional tool must fail closed without declared capacity: {unavailable:?}"
-        );
-
-        exec = exec.with_tool_execution_service(
-            ToolExecutionService::builder()
-                .initial_provider_capabilities(HashMap::from([(
-                    crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID
-                        .to_string(),
-                    HashSet::from([
-                        astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string(),
-                        astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER.to_string(),
-                    ]),
-                )]))
-                .build(),
-        );
-        exec.set_current_selected_tool_offers(HashMap::from([(
-            "github".to_string(),
-            SelectedToolOfferSnapshot::new_with_route(
-                "github",
-                crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
-                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime,
-            ),
-        )]));
-        let result = exec.execute_with_metadata("github", &json!({})).await;
-
-        assert_tool_invalid_args(&result);
-        assert!(
-            result
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
-            "ToolEngine github errors should still receive execution metadata"
         );
     }
 
@@ -8690,13 +8509,12 @@ esac
         assert_eq!(rx.recv().await, Some(Value::Object(event)));
     }
 
-    fn all_capabilities_for_admission_tests() -> [Capability; 11] {
+    fn all_capabilities_for_admission_tests() -> [Capability; 10] {
         [
             Capability::AgentSpawner,
             Capability::MemoryService,
             Capability::Database,
             Capability::SkillsCatalog,
-            Capability::GitHubAuth,
             Capability::LSPServer,
             Capability::PlanLifecycle,
             Capability::LocalBackgroundTasks,
@@ -12563,8 +12381,8 @@ esac
         );
         assert!(
             server_sandbox_tool_path_mismatch(
-                "git",
-                &json!({"action": "file_history", "file": "/workspace/astra/src/lib.rs"}),
+                "read_file",
+                &json!({"path": "/workspace/astra/src/lib.rs"}),
                 workspace_root,
                 &workspace,
             )
@@ -12886,75 +12704,6 @@ esac
     // ── Git operations ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn git_status_in_non_git_dir_returns_error() {
-        let (exec, _dir) = test_executor();
-        let result = exec.execute("git", &json!({"action": "status"})).await;
-        assert!(result.contains("Error:") || result.contains("fatal"));
-    }
-
-    #[tokio::test]
-    async fn git_executes_from_tool_engine_registry() {
-        let (exec, _dir) = test_executor();
-        assert!(
-            exec.tool_engine.contains("git"),
-            "consolidated git should be registered in ToolEngine for server-local execution"
-        );
-
-        let result = exec
-            .execute_with_metadata("git", &json!({"action": "status"}))
-            .await;
-
-        assert!(
-            result.output.contains("Error:") || result.output.contains("fatal"),
-            "{result:?}"
-        );
-        assert!(
-            result
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
-            "ToolEngine git errors should still receive execution metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn git_log_caps_at_100() {
-        let (exec, dir) = test_executor();
-        // Initialize a git repo
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        // Request 999 — should be capped at 100
-        let result = exec
-            .execute("git", &json!({"action": "log", "n": 999}))
-            .await;
-        assert!(result.contains("initial"));
-    }
-
-    #[tokio::test]
     async fn git_helper_aliases_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
         for name in [
@@ -12999,36 +12748,6 @@ esac
         assert_eq!(
             parsed.get("retryable").and_then(Value::as_bool),
             Some(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn consolidated_git_stash_is_available_in_server_mode() {
-        let (exec, dir) = test_executor();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
-        let stash_list = exec
-            .execute("git", &json!({"action": "stash", "sub_action": "list"}))
-            .await;
-        assert!(
-            stash_list.contains("No stashes found")
-                || stash_list.contains("stash@")
-                || stash_list.is_empty(),
-            "{stash_list}"
         );
     }
 
@@ -13495,37 +13214,6 @@ esac
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(!is_plan_mode_blocked_tool("task_list", &json!({})));
-
-        assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "commit"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "revert_commit"})
-        ));
-        assert!(is_plan_mode_blocked_tool("git", &json!({"action": "push"})));
-        assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "push"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "list"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "status"})
-        ));
-
-        assert!(is_plan_mode_blocked_tool(
-            "github",
-            &json!({"action": "create_issue"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "github",
-            &json!({"action": "list_prs"})
-        ));
     }
 
     #[tokio::test]

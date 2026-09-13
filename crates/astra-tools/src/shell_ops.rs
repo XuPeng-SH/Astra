@@ -3317,24 +3317,13 @@ async fn load_gitignored_search_paths(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return Ok(std::collections::HashSet::new()),
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload = format!("{}\n", candidates.join("\n"));
-        if let Err(error) = stdin.write_all(payload.as_bytes()).await
-            && error.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            return Err(format!("Error: failed to write gitignore query: {error}"));
-        }
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
-        .await
-        .map_err(|_| "Error: git check-ignore timed out.".to_string())?
-        .map_err(|e| format!("Error: git check-ignore failed: {e}"))?;
+    let payload = format!("{}\n", candidates.join("\n"));
+    let output = exchange_gitignore_io(child, payload.as_bytes(), Duration::from_secs(5)).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let exit_code = exit_code_from_status(&output.status);
@@ -3351,6 +3340,36 @@ async fn load_gitignored_search_paths(
     } else {
         format!("Error: git check-ignore failed: {detail}")
     })
+}
+
+// The timeout covers both sides of the exchange, including a blocked stdin.
+// No detached tasks: cancellation drops the kill-on-drop child with its IO.
+async fn exchange_gitignore_io(
+    mut child: tokio::process::Child,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let stdin = child.stdin.take();
+    tokio::time::timeout(timeout, async move {
+        let write = async move {
+            if let Some(mut stdin) = stdin
+                && let Err(error) = stdin.write_all(payload).await
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(format!("Error: failed to write gitignore query: {error}"));
+            }
+            Ok(())
+        };
+        let read = async move {
+            child
+                .wait_with_output()
+                .await
+                .map_err(|error| format!("Error: git check-ignore failed: {error}"))
+        };
+        tokio::try_join!(write, read).map(|(_, output)| output)
+    })
+    .await
+    .map_err(|_| "Error: git check-ignore timed out.".to_string())?
 }
 
 fn build_search_regex(request: &GrepRequest<'_>, multiline: bool) -> Result<regex::Regex, String> {
@@ -5846,6 +5865,99 @@ printf 'probe.txt:1:needle\n'
 
         assert!(!result.is_error, "grep should succeed: {}", result.output);
         assert_eq!(result.output.lines().collect::<Vec<_>>(), vec!["shown.rs"]);
+    }
+
+    #[cfg(unix)]
+    fn gitignore_io_child(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn assert_gitignore_child_exited(pid: u32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if unsafe { libc::kill(pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled child {pid} remains alive"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitignore_io_drains_output_while_writing_large_input() {
+        let child = gitignore_io_child("head -c 262144 /dev/zero; wc -c");
+        let output = exchange_gitignore_io(child, &vec![b'x'; 262144], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(&output.stdout[..262144], vec![0; 262144]);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout[262144..]).trim(),
+            "262144"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitignore_io_timeout_covers_blocked_stdin_and_kills_child() {
+        let child = gitignore_io_child("exec sleep 30");
+        let pid = child.id().unwrap();
+        let error =
+            exchange_gitignore_io(child, &vec![b'x'; 1024 * 1024], Duration::from_millis(100))
+                .await
+                .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert_gitignore_child_exited(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitignore_io_cancellation_kills_child() {
+        let child = gitignore_io_child("exec sleep 30");
+        let pid = child.id().unwrap();
+        let payload = vec![b'x'; 1024 * 1024];
+        {
+            let exchange = exchange_gitignore_io(child, &payload, Duration::from_secs(30));
+            tokio::pin!(exchange);
+            tokio::select! {
+                result = &mut exchange => panic!("exchange ended before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+        assert_gitignore_child_exited(pid).await;
+    }
+
+    #[tokio::test]
+    async fn gitignore_query_handles_large_candidate_set() {
+        let dir = tempdir().unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(dir.path().join(".gitignore"), "ignored-*\n").unwrap();
+        let paths: Vec<_> = (0..20000).map(|i| format!("ignored-{i:08}.txt")).collect();
+        let ignored = load_gitignored_search_paths(dir.path(), &paths)
+            .await
+            .unwrap();
+        assert_eq!(ignored, paths.into_iter().collect());
     }
 
     #[tokio::test]

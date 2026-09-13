@@ -117,7 +117,7 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
         // Workspace mutation
         "str_replace" | "write_file" | "apply_patch" | "write" | "edit" => ToolFamily::Write,
         // Version control
-        "git" | "git_commit" | "git_push" | "git_diff" | "git_log" | "git_blame" => ToolFamily::Git,
+        "worktree" => ToolFamily::Git,
         // Shell execution
         "bash" | "shell" | "run_command" | "exec" => ToolFamily::Shell,
         // Everything else
@@ -128,10 +128,7 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
 fn is_workspace_mutation_tool(tool_name: &str, family: ToolFamily) -> bool {
     match family {
         ToolFamily::Write => true,
-        ToolFamily::Git => matches!(
-            tool_name,
-            "git_commit" | "git_push" | "git_merge" | "git_rebase" | "git_checkout" | "git_reset"
-        ),
+        ToolFamily::Git => tool_name == "worktree",
         _ => false,
     }
 }
@@ -1094,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_git_tools_do_not_count_as_workspace_mutations() {
+    fn removed_git_tools_do_not_count_as_workspace_mutations() {
         let samples = [
             ToolCallSample {
                 name: "git_diff",
@@ -1119,7 +1116,10 @@ mod tests {
             },
         ];
         let metrics = TurnMetrics::from_samples(&samples, 1, 100);
-        assert_eq!(metrics.tool_calls_by_family.get(&ToolFamily::Git), Some(&3));
+        assert_eq!(
+            metrics.tool_calls_by_family.get(&ToolFamily::Other),
+            Some(&3)
+        );
         assert_eq!(
             metrics.mutation_count, 0,
             "read-only git inspection must not fabricate workspace progress"
@@ -1127,17 +1127,17 @@ mod tests {
     }
 
     #[test]
-    fn mutating_git_tools_count_as_workspace_mutations() {
+    fn worktree_lifecycle_counts_as_workspace_mutations() {
         let samples = [
             ToolCallSample {
-                name: "git_commit",
+                name: "worktree",
                 ok: true,
                 round: Some(2),
                 file_path: None,
                 error: None,
             },
             ToolCallSample {
-                name: "git_push",
+                name: "worktree",
                 ok: true,
                 round: Some(2),
                 file_path: None,

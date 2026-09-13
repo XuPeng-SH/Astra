@@ -147,17 +147,6 @@ impl GitWorktreeRollbackJournal {
     }
 }
 
-/// Extract owner/repo from git remote URLs in the given directory.
-/// Returns lowercased "owner/repo" strings for all GitHub remotes.
-pub(super) fn detect_git_remote_repos(project_root: &Path) -> Vec<String> {
-    astra_tools::github::detect_github_remote_repos(project_root)
-}
-
-/// Parse owner/repo from a GitHub remote URL (SSH or HTTPS).
-pub(super) fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
-    astra_tools::github::extract_github_owner_repo(remote_line)
-}
-
 /// Count uncommitted changes and new commits in a worktree since a baseline commit.
 /// Returns (changed_files, commits). Used by `exit_worktree` to warn before discarding work.
 fn count_worktree_changes(
@@ -588,7 +577,7 @@ impl ToolExecutor {
         }
 
         // Get current HEAD commit for later diffing
-        let original_head = super::git_gix::head_short(&self.project_root);
+        let original_head = astra_tools::git_gix::head_short(&self.project_root);
 
         // Generate worktree path as sibling directory
         let repo_name = self
@@ -765,13 +754,8 @@ impl ToolExecutor {
     }
 
     pub(crate) fn worktree_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
-        let action = match astra_tools::git_tool_contract::git_worktree_sub_action_from_args(args) {
-            Ok(action) => action,
-            Err(error) => return super::ToolExecutionOutcome::error(format!("Error: {error}")),
-        };
-
-        match action {
-            astra_tools::git_tool_contract::GitWorktreeSubAction::Enter => {
+        match args.get("action").and_then(Value::as_str) {
+            Some("enter") => {
                 let branch = match args.get("branch").and_then(Value::as_str) {
                     Some(b) if !b.is_empty() => b,
                     _ => {
@@ -821,7 +805,7 @@ impl ToolExecutor {
                     Err(e) => e.into_outcome(),
                 }
             }
-            astra_tools::git_tool_contract::GitWorktreeSubAction::Exit => {
+            Some("exit") => {
                 let exit_action = args
                     .get("exit_action")
                     .and_then(Value::as_str)
@@ -849,60 +833,13 @@ impl ToolExecutor {
                     Err(e) => e.into_outcome(),
                 }
             }
-            astra_tools::git_tool_contract::GitWorktreeSubAction::Add => {
-                let outcome = super::git_gix::worktree_add_with_metadata(&self.project_root, args);
-                if let Some(fields) = outcome.tool_result_fields.as_ref()
-                    && let Some(worktree_path) = fields.get("worktree_path").and_then(Value::as_str)
-                {
-                    self.record_git_worktree_rollback(
-                        PathBuf::from(worktree_path),
-                        fields
-                            .get("branch")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        self.project_root.clone(),
-                        fields
-                            .get("original_head_commit")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                        fields
-                            .get("delete_branch_on_rollback")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        false,
-                    );
-                }
-                outcome
-            }
-            astra_tools::git_tool_contract::GitWorktreeSubAction::List => {
-                super::git_gix::worktree_list_with_metadata(&self.project_root)
-            }
-            astra_tools::git_tool_contract::GitWorktreeSubAction::Remove => {
-                let normalized_path = args
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(|path| self.normalize_worktree_path(Path::new(path)));
-                let mut outcome =
-                    super::git_gix::worktree_remove_with_metadata(&self.project_root, args);
-                if !outcome.is_error
-                    && let Some(worktree_path) = normalized_path.as_ref()
-                {
-                    self.remove_git_worktree_rollback(worktree_path);
-                    if let Some(original_root) =
-                        self.maybe_restore_session_after_manual_worktree_removal(worktree_path)
-                    {
-                        outcome
-                            .output
-                            .push_str(&format!("\n  Session restored to {original_root}"));
-                    }
-                }
-                outcome
-            }
+            _ => super::ToolExecutionOutcome::error(
+                "Error: worktree requires action=enter or action=exit".to_string(),
+            ),
         }
     }
 
-    /// Execute git(action=worktree) with enter/exit session management.
+    /// Execute the session worktree lifecycle.
     pub(super) fn worktree(&self, args: &Value) -> String {
         self.worktree_with_metadata(args).output
     }

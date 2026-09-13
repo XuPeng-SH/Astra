@@ -276,8 +276,37 @@ mod tests {
             "output limit"
         );
         let start = Instant::now();
-        assert!(run("sleep 30 & wait", 1024).is_err());
+        assert_eq!(run("sleep 30 & wait", 1024).unwrap_err().phase, "timeout");
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(run("sleep 30 & exit 0", 1024).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn output_completion_deadline_stops_inherited_pipe_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late-write");
+        let start = Instant::now();
+        let error = run_sync_process(
+            "sh",
+            &[
+                "-c".into(),
+                "(sleep 1; printf leaked > late-write) & exit 0".into(),
+            ],
+            Duration::from_secs(5),
+            1024,
+            |command| {
+                command.current_dir(dir.path());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.phase, "output completion");
+        assert!(error.started);
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(start.elapsed() < Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !marker.exists(),
+            "descendant must not perform its delayed write after cleanup"
+        );
     }
 }

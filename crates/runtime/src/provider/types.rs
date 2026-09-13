@@ -41,9 +41,9 @@ pub enum ToolCategory {
     /// File read / write / list / search (`read_file`, `write_file`,
     /// `glob`, `grep`).
     FileSystem,
-    /// Git operations (`git` tool).
+    /// Repository lifecycle operations.
     VersionControl,
-    /// External API calls (`web_fetch`, `web_search`, `github`).
+    /// External API calls (`web_fetch`, `web_search`).
     ExternalApi,
     /// Session-level state management (`memory`, `session`, `task`).
     StateManagement,
@@ -77,8 +77,8 @@ impl ToolCategory {
             | "list_dir"
             | "grep"
             | "glob" => Some(Self::FileSystem),
-            "git" | "git_clone" | "worktree" => Some(Self::VersionControl),
-            "web_search" | "web_fetch" | "github" | "tool_search" => Some(Self::ExternalApi),
+            "git_clone" | "worktree" => Some(Self::VersionControl),
+            "web_search" | "web_fetch" | "tool_search" => Some(Self::ExternalApi),
             "ask_user"
             | "notify"
             | "enter_plan_mode"

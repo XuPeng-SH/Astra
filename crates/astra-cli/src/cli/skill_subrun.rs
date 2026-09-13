@@ -1534,27 +1534,12 @@ fn attach_subrun_tool_surface(
         })
         .cloned()
         .collect();
-    let mut eligible_surface_schemas = context
+    let eligible_surface_schemas = context
         .executor
         .runtime_bound_tool_schemas(eligible_surface_schemas);
-    let mut eligible_provider_schemas = context
+    let eligible_provider_schemas = context
         .executor
         .runtime_bound_provider_owned_schemas_excluding(context.restricted_tools);
-    let complete_eligible: Vec<Value> = eligible_surface_schemas
-        .iter()
-        .chain(eligible_provider_schemas.iter())
-        .cloned()
-        .collect();
-    let admitted_names = context
-        .executor
-        .local_command_surface_names(&complete_eligible);
-    let admitted = |schema: &Value| {
-        astra_turn_core::tool::schema::tool_schema_name(schema)
-            .is_none_or(|name| admitted_names.contains(name))
-    };
-    eligible_surface_schemas.retain(admitted);
-    eligible_provider_schemas.retain(admitted);
-    schemas_to_use.retain(admitted);
     schemas_to_use = context.executor.runtime_bound_tool_schemas(schemas_to_use);
     astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
         payload,

@@ -663,7 +663,7 @@ fn planning_section() -> &'static str {
      3. **Discover before reading**; Never guess paths.\n\
      4. **Read progressively**: structure/search, then targeted ranges.\n\
      5. **Preserve sole evidence**: checksum ≠ backup; use the current tool schema or its explicit selection protocol for any source-artifact contract; make the boundary observable before observe → transform → validate.\n\
-     6. **Never batch writes**: write_file/str_replace/bash/git execute sequentially.\n\
+     6. **Never batch writes**: write_file/str_replace/bash/worktree execute sequentially.\n\
      7. **Build/test only AFTER your writes**; not for exploration/review/Q&A.\n\
      8. **Converge on evidence**: once targeted reads establish the affected set, and the task requires and authorizes a change, make the smallest safe mutation; for read-only work, summarize or change approach when reads add no new evidence.\n\
      9. **Acceptance**: preserve quantifiers/positions; don't infer order; test named items independently; no partial claims; derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only; exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\

@@ -1019,7 +1019,8 @@ mod tests {
         assert!(server.declares_tool("web_fetch"));
         assert!(server.declares_tool("web_search"));
         assert!(server.declares_tool("memory"));
-        assert!(server.declares_tool("github"));
+        assert!(!server.declares_tool("github"));
+        assert!(!server.declares_tool("git"));
         assert!(!server.declares_tool("bash"));
 
         assert!(control.declares_tool("ask_user"));
@@ -1035,7 +1036,8 @@ mod tests {
         assert!(cli.declares_tool("web_fetch"));
         assert!(cli.declares_tool("web_search"));
         assert!(cli.declares_tool("read_file"));
-        assert!(cli.declares_tool("github"));
+        assert!(!cli.declares_tool("github"));
+        assert!(!cli.declares_tool("git"));
         assert_eq!(
             cli.declares_tool("powershell"),
             RuntimePlatform::current().supports_powershell()

@@ -1289,7 +1289,7 @@ struct ServerRollbackBoundary {
     agentic_step: u32,
     file_checkpoint: Option<u64>,
     database_checkpoint: Option<u64>,
-    git_mutations: bool,
+
     session_state_checkpoint: Option<u64>,
 }
 
@@ -1324,25 +1324,7 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
     )
 }
 
-fn git_args_are_rollback_mutator(args: &Value) -> bool {
-    matches!(
-        args.get("action").and_then(Value::as_str),
-        Some("commit" | "revert_commit")
-    )
-}
-
-fn tool_call_is_git_mutator(tool_call: &Value) -> bool {
-    tool_call_name(tool_call) == Some("git")
-        && git_args_are_rollback_mutator(&tool_call_arguments_value(tool_call))
-}
-
 fn tool_record_is_server_mutator(record: &ToolCallRecord) -> bool {
-    if record.name == "git" {
-        return record
-            .authoritative_args_full()
-            .and_then(|args| serde_json::from_str::<Value>(args).ok())
-            .is_some_and(|args| git_args_are_rollback_mutator(&args));
-    }
     is_server_mutator_tool_name(&record.name)
 }
 
@@ -1359,10 +1341,6 @@ fn server_database_mutator_in_round(tool_calls: &[Value]) -> bool {
     tool_calls
         .iter()
         .any(|tool_call| matches!(tool_call_name(tool_call), Some("mo_query")))
-}
-
-fn server_git_mutator_in_round(tool_calls: &[Value]) -> bool {
-    tool_calls.iter().any(tool_call_is_git_mutator)
 }
 
 fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
@@ -1440,9 +1418,7 @@ fn server_boundary_surfaces(boundary: &ServerRollbackBoundary) -> Vec<&'static s
     if boundary.database_checkpoint.is_some() {
         surfaces.push("database_snapshots");
     }
-    if boundary.git_mutations {
-        surfaces.push("git_mutations");
-    }
+
     if boundary.session_state_checkpoint.is_some() {
         surfaces.push("session_state");
     }
@@ -1500,7 +1476,7 @@ fn server_boundary_commit_detail(
     executed_requests: usize,
     file_entries_added: u64,
     database_entries_added: u64,
-    git_mutations_recorded: u64,
+
     session_state_entries_added: u64,
 ) -> Value {
     let surfaces = server_boundary_surfaces(boundary);
@@ -1543,12 +1519,7 @@ fn server_boundary_commit_detail(
             Value::Number(serde_json::Number::from(database_entries_added)),
         );
     }
-    if boundary.git_mutations {
-        detail.insert(
-            "git_mutations_recorded".to_string(),
-            Value::Number(serde_json::Number::from(git_mutations_recorded)),
-        );
-    }
+
     if boundary.session_state_checkpoint.is_some() {
         detail.insert(
             "session_state_entries_recorded".to_string(),
@@ -1572,14 +1543,10 @@ fn combine_server_rollback_outputs(
     turn_index: u32,
     file_edits: Option<Value>,
     database_snapshots: Option<Value>,
-    git_mutations: Option<Value>,
+
     session_state: Option<Value>,
 ) -> Option<Value> {
-    if file_edits.is_none()
-        && database_snapshots.is_none()
-        && git_mutations.is_none()
-        && session_state.is_none()
-    {
+    if file_edits.is_none() && database_snapshots.is_none() && session_state.is_none() {
         return None;
     }
 
@@ -1606,16 +1573,7 @@ fn combine_server_rollback_outputs(
         }
         rollback.insert("database_snapshots".to_string(), database_snapshots);
     }
-    if let Some(git_mutations) = git_mutations {
-        success &= git_mutations
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if let Some(summary) = git_mutations.get("summary").and_then(Value::as_str) {
-            summaries.push(summary.to_string());
-        }
-        rollback.insert("git_mutations".to_string(), git_mutations);
-    }
+
     if let Some(session_state) = session_state {
         success &= session_state
             .get("success")
@@ -1638,127 +1596,6 @@ fn combine_server_rollback_outputs(
     Some(Value::Object(rollback))
 }
 
-fn server_git_mutation_targets(tool_results: &[Value]) -> Vec<String> {
-    tool_results
-        .iter()
-        .filter_map(|tool_result| {
-            let tool_name = tool_result.get("name").and_then(Value::as_str)?;
-            match tool_name {
-                "git" => tool_result
-                    .get("commit_sha")
-                    .or_else(|| tool_result.get("revert_commit_sha"))
-                    .and_then(Value::as_str),
-                _ => None,
-            }
-            .map(ToString::to_string)
-        })
-        .collect()
-}
-
-async fn rollback_server_git_mutations(
-    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
-    targets: &[String],
-    active: &ServerRollbackBoundary,
-    authority: Option<&ServerRollbackInvocationAuthority>,
-) -> Option<Value> {
-    if targets.is_empty() {
-        return None;
-    }
-
-    let mut reverted = Vec::new();
-    let mut failed = Vec::new();
-    for commit_sha in targets.iter().rev() {
-        let mut entry = serde_json::Map::from_iter([(
-            "commit_sha".to_string(),
-            Value::String(commit_sha.clone()),
-        )]);
-        let Some(authority) = authority else {
-            entry.insert(
-                "error".to_string(),
-                Value::String(
-                    "git rollback refused: exact run, turn-chain, and owner authority is missing"
-                        .to_string(),
-                ),
-            );
-            failed.push(Value::Object(entry));
-            continue;
-        };
-        let result = executor
-            .execute_git_revert_compensation(
-                &authority.run_id,
-                &authority.turn_chain_id,
-                &rollback_git_invocation_id(active, commit_sha),
-                commit_sha,
-                authority.durable_dispatch_admission,
-            )
-            .await;
-        if let Some(metadata) = result.metadata {
-            entry.extend(metadata);
-        }
-        if result.is_error {
-            entry.insert("error".to_string(), Value::String(result.output));
-            failed.push(Value::Object(entry));
-        } else {
-            entry.insert("result".to_string(), Value::String(result.output));
-            reverted.push(Value::Object(entry));
-        }
-    }
-
-    let success = !reverted.is_empty() && failed.is_empty();
-    let summary = if failed.is_empty() {
-        format!(
-            "Created {} compensating git revert commit{} during turn rollback",
-            reverted.len(),
-            if reverted.len() == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "Created {} compensating git revert commit{} during turn rollback with {} failure{}",
-            reverted.len(),
-            if reverted.len() == 1 { "" } else { "s" },
-            failed.len(),
-            if failed.len() == 1 { "" } else { "s" }
-        )
-    };
-
-    Some(serde_json::json!({
-        "success": success,
-        "reverted": reverted,
-        "failed": failed,
-        "summary": summary,
-    }))
-}
-
-#[derive(Clone, Debug)]
-struct ServerRollbackInvocationAuthority {
-    run_id: String,
-    turn_chain_id: String,
-    durable_dispatch_admission: crate::server::tool_invocation_runtime::DurableDispatchAdmission,
-}
-
-impl ServerRollbackInvocationAuthority {
-    fn from_state(state: &AgenticLoopState) -> Option<Self> {
-        Some(Self {
-            run_id: state.current_run_id.clone()?,
-            turn_chain_id: state.canonical_turn_chain_id.clone()?,
-            durable_dispatch_admission:
-                crate::server::tool_invocation_runtime::DurableDispatchAdmission {
-                    expected_control_epoch: i64::try_from(state.user_intents.user_intent_cursor())
-                        .ok()?,
-                    expected_owner_generation: state.current_run_owner_generation?,
-                },
-        })
-    }
-}
-
-fn rollback_git_invocation_id(active: &ServerRollbackBoundary, commit_sha: &str) -> String {
-    let digest = Sha256::digest(format!(
-        "git-revert\0{}\0{}\0{}",
-        active.session_turn, active.agentic_step, commit_sha
-    ));
-    format!("rollback-git-{digest:x}")
-}
-
 fn open_server_rollback_boundary(
     session_id: Option<&str>,
     executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
@@ -1768,10 +1605,9 @@ fn open_server_rollback_boundary(
 ) -> Option<ServerRollbackBoundary> {
     let has_file_mutator = server_file_mutator_in_round(tool_calls);
     let has_database_mutator = server_database_mutator_in_round(tool_calls);
-    let has_git_mutator = server_git_mutator_in_round(tool_calls);
+
     let has_session_state_mutator = server_session_state_mutator_in_round(tool_calls);
-    if !has_file_mutator && !has_database_mutator && !has_git_mutator && !has_session_state_mutator
-    {
+    if !has_file_mutator && !has_database_mutator && !has_session_state_mutator {
         return None;
     }
 
@@ -1783,7 +1619,7 @@ fn open_server_rollback_boundary(
         database_checkpoint: has_database_mutator.then(|| {
             tool_database_snapshots::journal_checkpoint(executor.database_snapshot_journal.as_ref())
         }),
-        git_mutations: has_git_mutator,
+
         session_state_checkpoint: has_session_state_mutator.then(|| {
             tool_session_state_rollback::journal_checkpoint(executor.session_state_journal.as_ref())
         }),
@@ -1802,13 +1638,11 @@ fn open_server_rollback_boundary(
     Some(active)
 }
 
-async fn finalize_server_rollback_boundary_with_authority(
+async fn finalize_server_rollback_boundary(
     session_id: Option<&str>,
     executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     active: &ServerRollbackBoundary,
     new_records: &[ToolCallRecord],
-    new_tool_results: &[Value],
-    authority: Option<&ServerRollbackInvocationAuthority>,
 ) {
     let file_entries_added = active.file_checkpoint.map_or(0, |checkpoint| {
         tool_file_runtime::file_journal_checkpoint(executor.file_journal.as_ref())
@@ -1822,12 +1656,6 @@ async fn finalize_server_rollback_boundary_with_authority(
         tool_session_state_rollback::journal_checkpoint(executor.session_state_journal.as_ref())
             .saturating_sub(checkpoint)
     });
-    let git_mutation_targets = if active.git_mutations {
-        server_git_mutation_targets(new_tool_results)
-    } else {
-        Vec::new()
-    };
-    let git_mutations_recorded = git_mutation_targets.len() as u64;
 
     // **Rollback scoping rule**: Only a *mutator* failure triggers rollback. A
     // read-only tool (grep, read_file, glob, …) failing inside the same
@@ -1874,8 +1702,7 @@ async fn finalize_server_rollback_boundary_with_authority(
             } else {
                 None
             };
-        let git_mutation_rollback =
-            rollback_server_git_mutations(executor, &git_mutation_targets, active, authority).await;
+
         let session_state_rollback = if let Some(session_state_checkpoint) =
             active.session_state_checkpoint
         {
@@ -1911,7 +1738,6 @@ async fn finalize_server_rollback_boundary_with_authority(
             active.session_turn,
             file_rollback,
             database_snapshot_rollback,
-            git_mutation_rollback,
             session_state_rollback,
         );
         if let Some(session_id) = session_id {
@@ -1940,32 +1766,12 @@ async fn finalize_server_rollback_boundary_with_authority(
                 new_records.len(),
                 file_entries_added,
                 database_entries_added,
-                git_mutations_recorded,
                 session_state_entries_added,
             )),
         );
         event.agentic_step = Some(active.agentic_step);
         append_session_journal_event(executor.journal_user_id(), session_id, event);
     }
-}
-
-#[cfg(test)]
-async fn finalize_server_rollback_boundary(
-    session_id: Option<&str>,
-    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
-    active: &ServerRollbackBoundary,
-    new_records: &[ToolCallRecord],
-    new_tool_results: &[Value],
-) {
-    finalize_server_rollback_boundary_with_authority(
-        session_id,
-        executor,
-        active,
-        new_records,
-        new_tool_results,
-        None,
-    )
-    .await;
 }
 
 /// Close every exact provider attempt rejected by a text-only boundary before
@@ -2917,19 +2723,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
     persist_tool_output_batch_for_round(state, &round_tool_calls, &new_tool_results).await;
 
-    let rollback_invocation_authority = ServerRollbackInvocationAuthority::from_state(state);
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
         state.runtime_tool_executor.as_deref(),
     ) {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
-        finalize_server_rollback_boundary_with_authority(
+        finalize_server_rollback_boundary(
             state.current_session_id.as_deref(),
             executor,
             active,
             new_records,
-            &new_tool_results,
-            rollback_invocation_authority.as_ref(),
         )
         .await;
     }
@@ -5928,7 +5731,6 @@ esac
             &executor,
             &active,
             &[tool_record("write_file", true)],
-            &[],
         )
         .await;
 
@@ -6035,7 +5837,6 @@ esac
                 tool_record("write_file", true),
                 tool_record("str_replace", false),
             ],
-            &[],
         )
         .await;
 
@@ -6102,7 +5903,6 @@ esac
                 tool_record("write_file", true),
                 tool_record("multi_edit", false),
             ],
-            &[],
         )
         .await;
 
@@ -6129,241 +5929,6 @@ esac
         assert!(!dir.path().join("turn.txt").exists());
 
         cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_git_boundary_without_exact_authority_refuses_compensation() {
-        let journal_dir = tempfile::TempDir::new().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-git-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::fs::write(dir.path().join("tracked.txt"), "before").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::fs::write(dir.path().join("tracked.txt"), "after").unwrap();
-
-        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_turn_index(8);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            8,
-            8,
-            &[json!({"function": {"name": "git", "arguments": "{\"action\":\"commit\",\"message\":\"turn commit\"}"}})],
-        )
-        .expect("boundary should open for git action commit");
-
-        let commit_result = executor
-            .execute_with_metadata(
-                "git",
-                &json!({"action": "commit", "message": "turn commit"}),
-            )
-            .await;
-        assert!(!commit_result.is_error, "got: {}", commit_result.output);
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record_with_args(
-                    "git",
-                    json!({"action": "commit", "message": "turn commit"}),
-                    true,
-                ),
-                // A second mutator in the same round fails → rollback MUST fire.
-                tool_record_with_args(
-                    "git",
-                    json!({"action": "revert_commit", "commit_sha": "HEAD"}),
-                    false,
-                ),
-            ],
-            &[tool_result_row("git", commit_result)],
-        )
-        .await;
-
-        let events = read_boundary_events(&session_id);
-        let boundary_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::ExecutionBoundaryOpened
-                        | JournalEventType::ExecutionBoundaryAborted
-                )
-            })
-            .collect();
-        assert_eq!(boundary_events.len(), 2);
-        let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("git"));
-        assert_eq!(
-            boundary["rollback"]["git_mutations"]["failed"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
-            "after"
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn durable_git_compensation_replay_creates_one_revert_commit() {
-        let session_id = format!("server-git-replay-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        for args in [
-            vec!["init"],
-            vec!["config", "user.email", "test@test.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        std::fs::write(dir.path().join("tracked.txt"), "before").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        std::fs::write(dir.path().join("tracked.txt"), "after").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "-m", "mutation"]] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let commit_sha = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
-        let commit_sha = commit_sha.trim();
-
-        let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
-            astra_services::runs::InMemoryRunStateStore::new(),
-        ));
-        run_engine
-            .start_run("rollback-run", "test-user", &session_id)
-            .await
-            .unwrap();
-        run_engine
-            .append_events_batch(
-                "test-user",
-                &session_id,
-                "rollback-run",
-                &[json!({"event_type": "agent_progress"})],
-            )
-            .await
-            .unwrap();
-        let ledger =
-            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
-                run_engine,
-            )
-            .unwrap();
-        let mut executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_invocation_ledger(ledger);
-        let active = ServerRollbackBoundary {
-            session_turn: 3,
-            agentic_step: 4,
-            file_checkpoint: None,
-            database_checkpoint: None,
-            git_mutations: true,
-            session_state_checkpoint: None,
-        };
-        let authority = ServerRollbackInvocationAuthority {
-            run_id: "rollback-run".to_string(),
-            turn_chain_id: "rollback-chain".to_string(),
-            durable_dispatch_admission:
-                crate::server::tool_invocation_runtime::DurableDispatchAdmission {
-                    expected_control_epoch: 0,
-                    expected_owner_generation: 0,
-                },
-        };
-
-        let first = rollback_server_git_mutations(
-            &executor,
-            &[commit_sha.to_string()],
-            &active,
-            Some(&authority),
-        )
-        .await
-        .unwrap();
-        let replay = rollback_server_git_mutations(
-            &executor,
-            &[commit_sha.to_string()],
-            &active,
-            Some(&authority),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first["reverted"].as_array().map(Vec::len), Some(1));
-        assert_eq!(replay["reverted"].as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
-            "before"
-        );
-        let commit_count = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-list", "--count", "HEAD"])
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
-        assert_eq!(
-            commit_count.trim(),
-            "3",
-            "replay must not create a second revert"
-        );
     }
 
     // --------------------------------------------------------------------------
@@ -6398,43 +5963,6 @@ esac
                 "{name} should not be a mutator"
             );
         }
-    }
-
-    #[test]
-    fn server_git_mutator_detection_uses_consolidated_git_action() {
-        assert!(server_git_mutator_in_round(&[json!({
-            "function": {
-                "name": "git",
-                "arguments": "{\"action\":\"commit\",\"message\":\"save\"}"
-            }
-        })]));
-        assert!(server_git_mutator_in_round(&[json!({
-            "function": {
-                "name": "git",
-                "arguments": "{\"action\":\"revert_commit\",\"commit_sha\":\"abc123\"}"
-            }
-        })]));
-        assert!(!server_git_mutator_in_round(&[json!({
-            "function": {
-                "name": "git",
-                "arguments": "{\"action\":\"diff\",\"path\":\"tracked.txt\"}"
-            }
-        })]));
-    }
-
-    #[test]
-    fn server_git_failure_record_uses_args_full_for_mutator_scope() {
-        assert!(tool_record_is_server_mutator(&tool_record_with_args(
-            "git",
-            json!({"action": "commit", "message": "save"}),
-            false,
-        )));
-        assert!(!tool_record_is_server_mutator(&tool_record_with_args(
-            "git",
-            json!({"action": "diff", "path": "tracked.txt"}),
-            false,
-        )));
-        assert!(!tool_record_is_server_mutator(&tool_record("git", false)));
     }
 
     /// The round contains a successful `write_file` alongside a failing
@@ -6484,7 +6012,6 @@ esac
                 // Read-only grep failure must NOT trigger rollback.
                 tool_record("grep", false),
             ],
-            &[],
         )
         .await;
 
@@ -6545,7 +6072,6 @@ esac
                 tool_record("read_file", false),
                 tool_record_with_args("git", json!({"action": "diff"}), false),
             ],
-            &[],
         )
         .await;
 
