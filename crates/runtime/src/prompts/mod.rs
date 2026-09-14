@@ -71,8 +71,8 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("Reuse history"),
-            "should include history awareness"
+            p.contains("check history first"),
+            "should check existing evidence before rereading"
         );
         assert!(
             p.contains("Plan, Batch, Execute"),
