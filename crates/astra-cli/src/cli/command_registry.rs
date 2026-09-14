@@ -545,7 +545,7 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
     // ── Observability ─────────────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
-        "Cycle explain: off → on (API) → verbose (+stderr)",
+        "Cycle explain: off → on (tree) → verbose (tree + diagnostics)",
         CommandGroup::Observability,
     )
     .with_tui_route(TuiCommandRoute::Native),

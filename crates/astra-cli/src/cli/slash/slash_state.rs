@@ -845,8 +845,17 @@ pub(crate) async fn handle_state_command(
                 ExplainMode::Verbose => "verbose".green().to_string(),
             };
             eprintln!("  Explain mode: {}", s);
-            if matches!(state.explain, ExplainMode::On) {
-                eprintln!("{}", "  (verbose: selector + skill lines on stderr)".dim());
+            match state.explain {
+                ExplainMode::On => eprintln!(
+                    "{}",
+                    "  (on: measured execution tree and concise runtime facts)".dim()
+                ),
+                ExplainMode::Verbose => eprintln!(
+                    "{}",
+                    "  (verbose: tree plus context, dependency, and coverage diagnostics on stderr)"
+                        .dim()
+                ),
+                ExplainMode::Off => {}
             }
             let explain_val = match state.explain {
                 ExplainMode::Off => "off",
