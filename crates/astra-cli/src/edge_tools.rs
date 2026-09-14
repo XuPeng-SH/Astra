@@ -3684,6 +3684,13 @@ impl ToolExecutor {
 
     fn handle_introspect(&self, args: &Value) -> String {
         if args.get("artifact").is_some() {
+            let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+            if !request.source_policy.allows_edge_local_artifacts() {
+                return format!(
+                    "Error: source_policy={} does not allow CLI/Edge-local artifact recovery",
+                    request.source_policy.as_str()
+                );
+            }
             let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) else {
                 return "Error: introspect artifact recovery requires an active session"
                     .to_string();
@@ -3697,6 +3704,11 @@ impl ToolExecutor {
                     );
                 }
             };
+            if let Some(result) =
+                crate::explain_analyze_artifact::resolve_request(&session_dir, args)
+            {
+                return result.unwrap_or_else(|error| format!("Error: {error}"));
+            }
             return astra_turn_core::tool_result_storage::resolve_session_tool_result_artifact_request(
                 &session_dir,
                 args,
@@ -3764,7 +3776,32 @@ impl ToolExecutor {
             }
         }
 
-        astra_turn_core::introspect::render_introspect_request(&snap, &request)
+        let rendered = astra_turn_core::introspect::render_introspect_request(&snap, &request);
+        if request.format.is_json()
+            || !matches!(
+                request.facet,
+                astra_core::ObservationFacet::Session | astra_core::ObservationFacet::Overview
+            )
+        {
+            return rendered;
+        }
+        if !request.source_policy.allows_edge_local_artifacts() {
+            return rendered;
+        }
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return rendered;
+        };
+        let store = astra_services::local_session_artifact_store();
+        let Ok(session_dir) = store.session_dir(&session_id) else {
+            return rendered;
+        };
+        match crate::explain_analyze_artifact::latest_notice(&session_dir) {
+            Ok(Some(notice)) => format!("{rendered}\n\n{notice}"),
+            Ok(None) => rendered,
+            Err(error) => {
+                format!("{rendered}\n\nExplain Analyze artifact status unavailable: {error}")
+            }
+        }
     }
 
     /// Render `introspect facet=session_memory`. Answers the

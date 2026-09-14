@@ -250,7 +250,14 @@ Use these as:
 
 ### `/explain`
 
-Cycle through explanation modes: off → on (API) → verbose (+stderr).
+Cycle through explanation modes: off → on → verbose.
+
+- `on` shows the measured execution tree and concise timing, wait, overlap,
+  and provider-usage facts.
+- `verbose` keeps the same tree and adds diagnostic context-budget,
+  context-source, dependency, and coverage details in the Explain surface
+  (stderr in line mode). It still uses the public redaction boundary; it does
+  not expose prompts, credentials, or raw trace payloads.
 
 ### `/verbose` _(removed)_
 

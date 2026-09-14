@@ -57,6 +57,24 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         current_session_id,
     } = ctx;
 
+    let explain_artifact_handle = if explain != ExplainMode::Off {
+        current_session_id.and_then(|session_id| {
+            match crate::explain_analyze_artifact::persist(
+                session_id,
+                explain_analyze_events,
+                explain_analyze_degraded,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!("failed to persist Explain Analyze artifact: {error}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+
     if explain != ExplainMode::Off && !quiet {
         eprintln!(
             "{}",
@@ -66,6 +84,9 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                 explain_analyze_degraded,
             )
         );
+        if let Some(handle) = explain_artifact_handle {
+            eprintln!("Explain Analyze artifact · {handle}");
+        }
     }
     if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
         print_verdict_report(verdict_events, explain == ExplainMode::Verbose);

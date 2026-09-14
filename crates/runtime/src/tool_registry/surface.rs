@@ -429,7 +429,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "offset",
                 "max_bytes",
             ][..],
-            "Read bounded live runtime/session observations or a retained result artifact. Use reflect for persisted causal history.",
+            "Read bounded session observations or artifacts; use artifact, offset, and max_bytes for Explain snapshots. Use reflect for history.",
         ),
         "reflect" => (
             &["question"][..],
