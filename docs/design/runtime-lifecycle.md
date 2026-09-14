@@ -144,6 +144,12 @@ partial/unknown report, not another unrestricted execution loop.
 
 ## Tasks
 
+Reply-only plan drafting is an informational outcome, not a request to change
+the workspace or establish durable Work. Quoted goals remain data. Explicit
+execution, saving, tracking, or graph edits retain their effects even when the
+requested response is a plan or JSON. A request to establish tracked Work without
+execution may defer activation; merely returning a plan does not establish Work.
+
 Work admission counts user acceptance units, not execution phases. Observation,
 verification, reporting, and settlement for one result belong to that task;
 a separately requested report deliverable may itself be a task. Initial tasks
@@ -164,7 +170,13 @@ The immutable establishment decision retains these triggers beyond establishment
 completion. Scheduling, including settlement's automatic successor allocation,
 must apply due mutations before selecting another task or declaring completion.
 Accepted proposals mark applied mutations, so recovery replays the same operation
-and item identities without repeating semantic admission.
+and item identities without repeating semantic admission. Settlement and resume
+receipts publish the durable graph revision and canonical task states, including
+retired declarations, even when a mutation committed before replay. A failed
+post-commit receipt read resumes through `run_next_work_item`; its receipt must
+restore the board even when the graph is already complete. These receipts read
+one canonical snapshot after settlement or task allocation so the live board
+observes cancellation and replacement together with successor assignment.
 Initial-candidate references are not aliases for arbitrary later replacements;
 conflicting retirement/prerequisite lifetimes are rejected before establishment.
 

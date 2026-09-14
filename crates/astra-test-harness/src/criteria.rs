@@ -20,6 +20,8 @@ use crate::pipeline_analysis::analyze_pipeline_health;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
+mod work_replacement;
+
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,10 @@ pub enum Criterion {
         /// are relative RFC 6901 pointers, just like `node_id_path`.
         #[serde(default)]
         node_required_string_paths: Vec<String>,
+        /// Nodes already declared by the case's input context. They may be
+        /// edge endpoints but must not be redeclared among output nodes.
+        #[serde(default)]
+        existing_node_ids: Vec<String>,
         edges_path: String,
         predecessor_path: String,
         successor_path: String,
@@ -373,6 +379,18 @@ pub enum Criterion {
         min_distinct_items: usize,
     },
 
+    /// Verify cancel/add execution against canonical identities, without
+    /// guessing which initial item a natural-language request meant to cancel.
+    /// Counts are exact; the optional timing bound is a minimum.
+    JournalWorkReplacementLifecycle {
+        initial_items: usize,
+        cancelled_items: usize,
+        added_items: usize,
+        delivered_items: usize,
+        #[serde(default)]
+        cancellation_after_deliveries: usize,
+    },
+
     /// Proves a successful canonical graph patch was committed after Work was
     /// established. The requested mutation dimensions are read from typed tool
     /// arguments and the accepted receipt, never from model prose or item
@@ -618,6 +636,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalToolPrecedence { .. }
         | Criterion::JournalTurnToolHidden { .. }
         | Criterion::JournalWorkItemExecutionFromStart { .. }
+        | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::ForkCacheOutcome { .. }
         | Criterion::HardJudger { .. }
@@ -768,6 +787,61 @@ pub fn evaluate_deterministic_with_session(
         .collect()
 }
 
+/// A declaration can suppress automatic retry before its evidence is loaded.
+/// This is not permission to pass: acceptance additionally needs a passing
+/// branch and a real terminal outcome below.
+pub(crate) fn has_exit_code_expectation(criteria: &[Criterion], code: i32) -> bool {
+    code > 0
+        && criteria.iter().any(|criterion| match criterion {
+            Criterion::ExitCode { code: expected } => *expected == code,
+            Criterion::AllOf { criteria } | Criterion::AnyOf { criteria } => {
+                has_exit_code_expectation(criteria, code)
+            }
+            _ => false,
+        })
+}
+
+/// Permit an explicitly expected negative terminal without treating it as
+/// successful task completion. An unused ExitCode leaf in a failed alternative
+/// is not a witness. Executor/protocol failures and outer timeouts remain fatal.
+pub(crate) fn accepts_negative_terminal(
+    criteria: &[Criterion],
+    outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
+) -> bool {
+    let terminal_present = match (
+        outcome.final_state.as_deref(),
+        outcome.interruption_kind.as_deref(),
+    ) {
+        (Some("completed"), None) => true,
+        (Some("interrupted"), Some(kind)) => !kind.trim().is_empty() && kind != "timeout",
+        _ => false,
+    };
+    if outcome.exit_code <= 0
+        || outcome
+            .run_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        || !terminal_present
+    {
+        return false;
+    }
+    fn witness(c: &Criterion, outcome: &RunOutcome, session: Option<&SessionCapture>) -> bool {
+        match c {
+            Criterion::ExitCode { code } => *code == outcome.exit_code,
+            Criterion::AllOf { criteria } => {
+                evaluate_one(c, outcome, session).passed
+                    && criteria.iter().any(|c| witness(c, outcome, session))
+            }
+            Criterion::AnyOf { criteria } => criteria
+                .iter()
+                .any(|c| evaluate_one(c, outcome, session).passed && witness(c, outcome, session)),
+            _ => false,
+        }
+    }
+    criteria.iter().any(|c| witness(c, outcome, session))
+}
+
 /// Whether any criterion in the tree requires a loaded session capture.
 pub fn requires_session_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(criterion_requires_session_capture)
@@ -800,6 +874,7 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::JournalToolSequence { .. }
         | Criterion::JournalToolPrecedence { .. }
         | Criterion::JournalWorkItemExecutionFromStart { .. }
+        | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::JournalArtifactConsumed { .. }
         | Criterion::JournalToolValueFlow { .. }
@@ -992,22 +1067,34 @@ fn required_relative_string<'a>(
         .ok_or_else(|| format!("{label} pointer {path:?} is not a non-empty string"))
 }
 
+fn validate_existing_dag_nodes(ids: &[String]) -> Result<BTreeSet<String>, String> {
+    let mut unique = BTreeSet::new();
+    for id in ids {
+        if id.trim().is_empty() || !unique.insert(id.clone()) {
+            return Err(format!(
+                "existing DAG node id is empty or duplicated: {id:?}"
+            ));
+        }
+    }
+    Ok(unique)
+}
+
 fn validate_text_json_dag(
     document: &serde_json::Value,
     nodes_path: &str,
     node_id_path: &str,
     node_required_string_paths: &[String],
-    edges_path: &str,
-    predecessor_path: &str,
-    successor_path: &str,
+    existing_node_ids: &[String],
+    edge_paths: [&str; 3],
 ) -> Result<(usize, usize), String> {
+    let [edges_path, predecessor_path, successor_path] = edge_paths;
     let nodes = required_json_array(document, nodes_path, "nodes")?;
     let edges = required_json_array(document, edges_path, "edges")?;
-    if nodes.is_empty() {
+    if nodes.is_empty() && existing_node_ids.is_empty() {
         return Err("nodes array is empty".into());
     }
 
-    let mut node_ids = BTreeSet::new();
+    let mut node_ids = validate_existing_dag_nodes(existing_node_ids)?;
     for (index, node) in nodes.iter().enumerate() {
         let id = required_relative_string(node, node_id_path, &format!("nodes[{index}]"))?;
         for path in node_required_string_paths {
@@ -1347,6 +1434,7 @@ fn evaluate_one(
             nodes_path,
             node_id_path,
             node_required_string_paths,
+            existing_node_ids,
             edges_path,
             predecessor_path,
             successor_path,
@@ -1357,9 +1445,8 @@ fn evaluate_one(
                     nodes_path,
                     node_id_path,
                     node_required_string_paths,
-                    edges_path,
-                    predecessor_path,
-                    successor_path,
+                    existing_node_ids,
+                    [edges_path, predecessor_path, successor_path],
                 )
             });
             CriterionResult {
@@ -2315,6 +2402,33 @@ fn evaluate_one(
                 score: None,
             }
         }
+        Criterion::JournalWorkReplacementLifecycle {
+            initial_items,
+            cancelled_items,
+            added_items,
+            delivered_items,
+            cancellation_after_deliveries,
+        } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "journal_work_replacement_lifecycle");
+            };
+            let result = work_replacement::verify(
+                session,
+                *initial_items,
+                *cancelled_items,
+                *added_items,
+                *delivered_items,
+                *cancellation_after_deliveries,
+            );
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: result.is_ok(),
+                detail: result.unwrap_or_else(|error| error),
+                full_detail: None,
+                score: None,
+            }
+        }
         Criterion::JournalWorkGraphPatch {
             require_addition,
             require_active_revision,
@@ -2406,41 +2520,63 @@ fn evaluate_one(
                     }
                     continue;
                 }
-                if call.name == "settle_work_item" && call.ok != Some(false) {
-                    if let Some(result) = call.result.as_ref()
-                        && result.get("status").and_then(serde_json::Value::as_str)
-                            == Some("recorded")
-                        && result
-                            .pointer("/settlement_transition/delivery_status")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("delivered")
-                        && let Some(item_id) = result
-                            .pointer("/next_task/item_id")
-                            .and_then(serde_json::Value::as_str)
-                    {
-                        deferred_successor_ids.insert(item_id.to_owned());
-                    }
-                    continue;
+                if call.name == "settle_work_item"
+                    && call.ok != Some(false)
+                    && let Some(result) = call.result.as_ref()
+                    && result.get("status").and_then(serde_json::Value::as_str) == Some("recorded")
+                    && result
+                        .pointer("/settlement_transition/delivery_status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("delivered")
+                    && let Some(item_id) = result
+                        .pointer("/next_task/item_id")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    deferred_successor_ids.insert(item_id.to_owned());
                 }
-                if call.name == "inspect_work_plan" && work_established && call.ok != Some(false) {
+                // A settlement may itself publish a committed deferred
+                // patch. Require the same Work and a newer graph revision,
+                // just as for a later canonical inspection.
+                if (call.name == "inspect_work_plan" || call.name == "settle_work_item")
+                    && work_established
+                    && call.ok != Some(false)
+                {
                     let Some(result) = call.result.as_ref() else {
                         continue;
                     };
+                    if call.name == "settle_work_item"
+                        && result.get("status").and_then(serde_json::Value::as_str)
+                            != Some("recorded")
+                    {
+                        continue;
+                    }
                     let observed_work_id = result
-                        .pointer("/basis/work_id")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/work_id"
+                        } else {
+                            "/basis/work_id"
+                        })
                         .and_then(serde_json::Value::as_str);
                     let same_work = work_id
                         .as_deref()
                         .zip(observed_work_id)
                         .is_some_and(|(expected, observed)| expected == observed);
                     let graph_revision = result
-                        .pointer("/basis/graph_revision")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/graph_revision"
+                        } else {
+                            "/basis/graph_revision"
+                        })
                         .and_then(serde_json::Value::as_u64);
                     let is_post_establishment_snapshot = initial_graph_revision
                         .zip(graph_revision)
                         .is_some_and(|(initial, observed)| observed > initial);
                     let Some(tasks) = result
-                        .pointer("/items/entries")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/tasks"
+                        } else {
+                            "/items/entries"
+                        })
                         .and_then(serde_json::Value::as_array)
                     else {
                         continue;
@@ -3925,6 +4061,26 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
+        Criterion::JournalWorkReplacementLifecycle {
+            initial_items,
+            cancelled_items,
+            added_items,
+            delivered_items,
+            cancellation_after_deliveries,
+        } => {
+            if *initial_items == 0
+                || *cancelled_items == 0
+                || *added_items == 0
+                || initial_items
+                    .checked_sub(*cancelled_items)
+                    .and_then(|remaining| remaining.checked_add(*added_items))
+                    != Some(*delivered_items)
+                || *cancellation_after_deliveries > *delivered_items
+            {
+                return Err("JournalWorkReplacementLifecycle requires consistent positive initial/cancel/add counts and a reachable delivery bound".into());
+            }
+            Ok(())
+        }
         Criterion::JournalWorkGraphPatch {
             require_addition,
             require_active_revision,
@@ -4281,6 +4437,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             nodes_path,
             node_id_path,
             node_required_string_paths,
+            existing_node_ids,
             edges_path,
             predecessor_path,
             successor_path,
@@ -4294,6 +4451,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             ] {
                 validate_json_pointer(label, path)?;
             }
+            validate_existing_dag_nodes(existing_node_ids)?;
             let mut unique_required_paths = BTreeSet::new();
             for path in node_required_string_paths {
                 validate_json_pointer("TextJsonDag.node_required_string_paths[]", path)?;
@@ -4525,6 +4683,7 @@ mod tests {
                     nodes_path: "/nodes".into(),
                     node_id_path: "/id".into(),
                     node_required_string_paths: vec![],
+                    existing_node_ids: vec![],
                     edges_path: "/edges".into(),
                     predecessor_path: "/from".into(),
                     successor_path: "/to".into(),
@@ -4547,6 +4706,7 @@ mod tests {
             nodes_path: "/nodes".into(),
             node_id_path: "/id".into(),
             node_required_string_paths: vec!["/result".into()],
+            existing_node_ids: vec![],
             edges_path: "/edges".into(),
             predecessor_path: "/from".into(),
             successor_path: "/to".into(),
@@ -4561,6 +4721,58 @@ mod tests {
             out.text = text.into();
             let result = evaluate_deterministic(std::slice::from_ref(&criterion), &out);
             assert!(!result[0].passed, "{text}");
+        }
+    }
+
+    #[test]
+    fn text_json_dag_includes_context_nodes_without_allowing_redeclaration_or_cycles() {
+        let criterion = Criterion::TextJsonDag {
+            nodes_path: "/nodes".into(),
+            node_id_path: "/id".into(),
+            node_required_string_paths: vec!["/result".into()],
+            existing_node_ids: vec!["root".into()],
+            edges_path: "/edges".into(),
+            predecessor_path: "/from".into(),
+            successor_path: "/to".into(),
+        };
+        validate_criterion(&criterion).unwrap();
+        for (document, expected, detail) in [
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"verify","to":"root"}]}),
+                true,
+                "2 nodes",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"root","to":"verify"},{"from":"verify","to":"root"}]}),
+                false,
+                "cycle",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"root","result":"replacement"}],
+                "edges":[]}),
+                false,
+                "duplicate node",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"verify","to":"unknown"}]}),
+                false,
+                "undeclared endpoint",
+            ),
+        ] {
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.text = document.to_string();
+            let results = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            assert_eq!(results[0].passed, expected, "{results:?}");
+            assert!(results[0].detail.contains(detail), "{results:?}");
+        }
+        for ids in [vec!["root", "root"], vec![" "]] {
+            let mut raw = serde_json::to_value(&criterion).unwrap();
+            raw["existing_node_ids"] = serde_json::json!(ids);
+            let invalid: Criterion = serde_json::from_value(raw).unwrap();
+            assert!(validate_criterion(&invalid).is_err());
         }
     }
 
@@ -8307,6 +8519,39 @@ mod tests {
             Some(&capture),
         );
         assert!(result[0].passed, "{}", result[0].detail);
+
+        let mut receipt_capture = capture.clone();
+        let calls = receipt_capture.events[0].raw["tool_calls"]
+            .as_array_mut()
+            .unwrap();
+        let inspected = calls.pop().unwrap();
+        calls[1]["result"]["task_board_update"] = serde_json::json!({
+            "kind": "upsert", "work_id": "work-1", "graph_revision": 3,
+            "tasks": inspected["result"]["items"]["entries"]
+        });
+        let checked = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&receipt_capture),
+        );
+        assert!(checked[0].passed, "{}", checked[0].detail);
+        for (field, invalid) in [
+            ("work_id", serde_json::json!("other-work")),
+            ("graph_revision", serde_json::json!(2)),
+        ] {
+            let mut invalid_capture = receipt_capture.clone();
+            invalid_capture.events[0].raw["tool_calls"][1]["result"]["task_board_update"][field] =
+                invalid;
+            let checked = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&invalid_capture),
+            );
+            assert!(
+                !checked[0].passed,
+                "invalid settlement {field} must not prove mutation"
+            );
+        }
 
         let unrelated_work = mk_session(&[(
             "turn",

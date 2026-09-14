@@ -847,6 +847,9 @@ dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@echo "Stopping API server before dropping the database..."
+	@$(MAKE) dev-api-stop
+	@sleep 2
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
@@ -1132,8 +1135,12 @@ test-no-sticky-control:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib do_not_require_sticky_pod -- --nocapture
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test edge_5_5_http_e2e without_sticky_ledger -- --nocapture
 
+.PHONY: test-mcp-fixture
+test-mcp-fixture:
+	@CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin mock_mcp_server
+
 .PHONY: test-workspace
-test-workspace: sweep
+test-workspace: sweep test-mcp-fixture
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."

@@ -10,8 +10,8 @@ use tokio::sync::Semaphore;
 use crate::case::Case;
 use crate::classify::{FailureClass, classify};
 use crate::criteria::{
-    Criterion, CriterionSeverity, evaluate_deterministic_with_session,
-    requires_durable_run_binding, requires_session_capture,
+    Criterion, CriterionSeverity, accepts_negative_terminal, evaluate_deterministic_with_session,
+    has_exit_code_expectation, requires_durable_run_binding, requires_session_capture,
 };
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
@@ -21,6 +21,20 @@ use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, StepResult, Sui
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
 use crate::session_identity::is_valid_server_session_id;
+
+fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCapture) {
+    if session.journal_tool_calls().is_empty() {
+        return;
+    }
+    const LABEL: &str = "\n[durable-tool-evidence json]\n";
+    // Allocate within the final prompt's budget, so its second bounding step
+    // cannot cut this JSON envelope or discard middle verification calls.
+    let stderr = crate::judger::truncate_for_judger(&outcome.stderr, 2_000);
+    let available = crate::judger::JUDGER_STDERR_CAP
+        .saturating_sub(stderr.chars().count() + LABEL.chars().count());
+    let evidence = session.render_tool_evidence(available);
+    outcome.stderr = format!("{stderr}{LABEL}{evidence}");
+}
 
 /// Render the assistant responses in the order in which they were produced.
 ///
@@ -689,7 +703,9 @@ impl<'a> SuiteRunner<'a> {
                     }
                 }
                 let mut step_lifecycle_ok = true;
-                if step_outcome.exit_code != 0 {
+                if step_outcome.exit_code != 0
+                    && !accepts_negative_terminal(&step.criteria, &step_outcome, None)
+                {
                     step_lifecycle_ok = false;
                     lifecycle_errors.push(format!(
                         "step {idx} did not reach a successful terminal outcome (exit_code={})",
@@ -772,7 +788,11 @@ impl<'a> SuiteRunner<'a> {
         // produced no session, turn, or tool evidence. Once a server-owned
         // session exists, retrying would abandon its durable side effects and
         // health/cleanup obligations; fail closed and retain that attempt.
-        if self.suite_cfg.retry_on_429 && case.steps.is_empty() && is_rate_limited(&outcome) {
+        if self.suite_cfg.retry_on_429
+            && case.steps.is_empty()
+            && is_rate_limited(&outcome)
+            && !has_exit_code_expectation(&case.criteria, outcome.exit_code)
+        {
             let has_first_attempt_evidence = outcome.session_id.is_some()
                 || outcome.run_id.is_some()
                 || outcome.tool_calls_count > 0
@@ -822,12 +842,6 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        if outcome.exit_code != 0 {
-            lifecycle_errors.push(format!(
-                "root turn did not reach a successful terminal outcome (exit_code={})",
-                outcome.exit_code
-            ));
-        }
         if case.steps.is_empty() {
             match outcome.session_id.as_deref() {
                 Some(session_id) if !is_valid_server_session_id(session_id) => {
@@ -951,6 +965,27 @@ impl<'a> SuiteRunner<'a> {
             session =
                 Some(capture.scoped_to_invocation(&invocation_run_ids, invocation_started_at));
         }
+        // Judge the root invocation, not the merged first-nonzero code. A
+        // root expectation cannot authorize a failed step, or vice versa.
+        let root = &attempts.last().expect("root attempt recorded").outcome;
+        if root.exit_code != 0 {
+            let root_session = session.as_ref().map(|capture| {
+                capture.clone().scoped_to_invocation(
+                    &root.run_id.iter().cloned().collect::<Vec<_>>(),
+                    invocation_started_at,
+                )
+            });
+            if !accepts_negative_terminal(&case.criteria, root, root_session.as_ref()) {
+                let error = format!(
+                    "root turn did not reach a successful terminal outcome or an explicitly expected negative terminal (exit_code={})",
+                    root.exit_code
+                );
+                outcome
+                    .stderr
+                    .push_str(&format!("\n[astra-test] lifecycle: {error}"));
+                lifecycle_errors.push(error);
+            }
+        }
         let mut judger_outcome = outcome.clone();
         // Keep the report/deterministic surface as the aggregate text, but
         // make multi-turn semantic judging position-aware.  Without this,
@@ -958,16 +993,7 @@ impl<'a> SuiteRunner<'a> {
         // paragraph and a judge may score the wrong turn.
         judger_outcome.text = render_ordered_judger_transcript(&outcome, &attempts, &step_results);
         if let Some(session) = &session {
-            // Preserve complete moderate-sized receipts here; the judger owns
-            // the final 8k head+tail prompt bound, which keeps both the start
-            // contract and terminal tail of larger fanout results visible.
-            let evidence = session.render_tool_evidence(16_000);
-            if !evidence.is_empty() {
-                judger_outcome
-                    .stderr
-                    .push_str("\n[durable-tool-evidence jsonl]\n");
-                judger_outcome.stderr.push_str(&evidence);
-            }
+            attach_durable_judger_evidence(&mut judger_outcome, session);
         }
 
         let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
@@ -1568,6 +1594,52 @@ mod tests {
                 .stderr
                 .contains("retry refused after first attempt produced session")
         );
+    }
+
+    #[test]
+    fn empty_durable_evidence_preserves_the_ordinary_stderr_budget() {
+        let mut outcome = outcome_ok("model", "answer", &[]);
+        outcome.stderr = "ordinary diagnostic\n".repeat(3000);
+        let before = outcome.stderr.clone();
+        attach_durable_judger_evidence(&mut outcome, &SessionCapture::default());
+        assert_eq!(outcome.stderr, before);
+    }
+
+    #[test]
+    fn durable_evidence_survives_the_final_judger_prompt_budget() {
+        let mut original = outcome_ok("model", "verified", &[]);
+        original.stderr = "ordinary diagnostic\n".repeat(3000);
+        let before = original.stderr.clone();
+        let session = SessionCapture {
+            events: vec![crate::session_capture::JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({"tool_calls": [
+                    {"tool_call_id":"large", "name":"bash", "ok":true,
+                     "args_full":{"command":"fetch"}, "result_full":"html".repeat(10000)},
+                    {"tool_call_id":"middle", "name":"bash", "ok":true,
+                     "args_full":{"command":"verify first"}, "result_full":"first extraction verified"},
+                    {"tool_call_id":"last", "name":"bash", "ok":true,
+                     "args_full":{"command":"verify second"}, "result_full":"second extraction verified"}
+                ]}),
+            }],
+            ..Default::default()
+        };
+        let mut judged = original.clone();
+        attach_durable_judger_evidence(&mut judged, &session);
+        assert!(judged.stderr.chars().count() <= crate::judger::JUDGER_STDERR_CAP);
+        let (_, projection) = judged
+            .stderr
+            .split_once("[durable-tool-evidence json]\n")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(projection).unwrap();
+        assert_eq!(parsed["rendered_calls"], 3);
+        assert_eq!(parsed["calls"][1]["result"], "first extraction verified");
+        assert_eq!(parsed["calls"][2]["result"], "second extraction verified");
+        let prompt = crate::judger::build_judger_prompt("Was extraction verified?", &judged);
+        assert!(prompt.contains(&judged.stderr));
+        assert!(prompt.contains(projection));
+        assert_eq!(prompt.matches("chars elided").count(), 1);
+        assert_eq!(original.stderr, before);
     }
 
     fn outcome_ok(model: &str, text: &str, tools: &[&str]) -> RunOutcome {
@@ -2693,6 +2765,221 @@ mod tests {
                 .contains("lifecycle: root turn did not reach")
         );
         assert!(!report.runs[0].steps[0].passed);
+    }
+
+    fn negative_outcome(text: &str) -> RunOutcome {
+        outcome_ok("m", text, &[])
+            .with_exit_code(5)
+            .with_final_state("interrupted")
+            .with_interruption_kind("execution_incomplete")
+    }
+
+    async fn run_negative_fixture(
+        case: Case,
+        root: RunOutcome,
+        step: Option<RunOutcome>,
+    ) -> CaseRunReport {
+        let exec = FakeExecutor::new();
+        exec.seed(&case.name, "m", root);
+        if let Some(mut step) = step {
+            step.run_id = Some("run-step".into());
+            exec.seed(&format!("{}__step0", case.name), "m", step);
+        }
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        runner.run_all(&[case]).await.runs.remove(0)
+    }
+
+    #[tokio::test]
+    async fn explicit_negative_terminal_preserves_outcome_and_checks_interruption() {
+        for (kind, expected_pass) in [("execution_incomplete", true), ("budget_exhausted", false)] {
+            let case = case_with(
+                "expected-negative",
+                vec![
+                    Criterion::ExitCode { code: 5 },
+                    Criterion::FinalState {
+                        expect: "interrupted".into(),
+                    },
+                    Criterion::InterruptionKind {
+                        expect: kind.into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "NOT_VERIFIED".into(),
+                    },
+                ],
+            );
+            let report = run_negative_fixture(case, negative_outcome("NOT_VERIFIED"), None).await;
+            assert_eq!(report.is_passed(), expected_pass, "{kind}");
+            assert_eq!(
+                report.outcome.exit_code, 5,
+                "negative test success is not task success"
+            );
+            assert_eq!(report.outcome.final_state.as_deref(), Some("interrupted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_terminal_requires_a_passing_exit_code_witness() {
+        for (leaf_passes, expected_pass) in [(false, false), (true, true)] {
+            let case = case_with(
+                "negative-witness",
+                vec![Criterion::AnyOf {
+                    criteria: vec![
+                        Criterion::AllOf {
+                            criteria: vec![
+                                Criterion::ExitCode { code: 5 },
+                                Criterion::TextContains {
+                                    needle: if leaf_passes { "present" } else { "absent" }.into(),
+                                },
+                            ],
+                        },
+                        Criterion::TextContains {
+                            needle: "present".into(),
+                        },
+                    ],
+                }],
+            );
+            let report = run_negative_fixture(case, negative_outcome("present"), None).await;
+            assert_eq!(report.is_passed(), expected_pass);
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_codes_cannot_legalize_protocol_failures_or_outer_timeouts() {
+        for outcome in [
+            negative_outcome("bad protocol").with_exit_code(-1),
+            negative_outcome("outer timeout")
+                .with_exit_code(124)
+                .with_interruption_kind("timeout"),
+            RunOutcome {
+                final_state: None,
+                ..negative_outcome("missing terminal")
+            },
+            RunOutcome {
+                run_id: None,
+                ..negative_outcome("missing identity")
+            },
+        ] {
+            let case = case_with(
+                "invalid-negative",
+                vec![Criterion::ExitCode {
+                    code: outcome.exit_code,
+                }],
+            );
+            assert!(!run_negative_fixture(case, outcome, None).await.is_passed());
+        }
+    }
+
+    #[tokio::test]
+    async fn root_and_step_negative_expectations_do_not_authorize_each_other() {
+        for (root_code, step_expected, expected_pass) in
+            [(0, true, true), (5, true, true), (5, false, false)]
+        {
+            let mut case = case_with("separate-negative", vec![Criterion::ExitCode { code: 5 }]);
+            case.steps = vec![crate::case::CaseStep {
+                prompt: "explicit continuation".into(),
+                criteria: if step_expected {
+                    vec![Criterion::ExitCode { code: 5 }]
+                } else {
+                    vec![]
+                },
+                timeout_seconds: None,
+            }];
+            let root = if root_code == 0 {
+                outcome_ok("m", "root", &[])
+            } else {
+                negative_outcome("root")
+            };
+            let report = run_negative_fixture(case, root, Some(negative_outcome("step"))).await;
+            assert_eq!(
+                report.is_passed(),
+                expected_pass,
+                "root={root_code} step_expected={step_expected}"
+            );
+        }
+        // Only a later step supplies this branch's text. It cannot retroactively
+        // authorize the root's negative result through the aggregate outcome.
+        let mut case = case_with(
+            "root-witness",
+            vec![Criterion::AnyOf {
+                criteria: vec![
+                    Criterion::ExitCode { code: 0 },
+                    Criterion::AllOf {
+                        criteria: vec![
+                            Criterion::ExitCode { code: 5 },
+                            Criterion::TextContains {
+                                needle: "step only".into(),
+                            },
+                        ],
+                    },
+                ],
+            }],
+        );
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "continue".into(),
+            criteria: vec![Criterion::ExitCode { code: 5 }],
+            timeout_seconds: None,
+        }];
+        let report = run_negative_fixture(
+            case,
+            negative_outcome("root"),
+            Some(negative_outcome("step only")),
+        )
+        .await;
+        assert!(!report.is_passed());
+        assert!(report.steps[0].passed);
+        assert!(report.outcome.stderr.contains("root turn did not reach"));
+    }
+
+    #[tokio::test]
+    async fn expected_negative_rate_limit_is_not_automatically_retried() {
+        let exec = SequenceExecutor {
+            outcomes: std::sync::Mutex::new(vec![
+                negative_outcome("limited").with_interruption_kind("rate_limit"),
+            ]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig {
+                retry_on_429: true,
+                ..Default::default()
+            },
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let report = runner
+            .run_all(&[case_with(
+                "expected-limit",
+                vec![Criterion::ExitCode { code: 5 }],
+            )])
+            .await;
+        assert!(report.runs[0].is_passed());
+        assert_eq!(exec.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

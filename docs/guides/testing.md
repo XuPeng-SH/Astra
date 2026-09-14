@@ -31,6 +31,78 @@ cargo test --manifest-path Cargo.toml -q
 cargo check --manifest-path Cargo.toml
 ```
 
+MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
+`make test-offline` builds this fixture before the workspace tests. For direct
+`cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run
+`cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
+target triple, and profile. Test processes do not run nested Cargo builds.
+
+Live `astra-test` quality judging invokes `astra session judge --model MODEL
+--message RUBRIC_AND_EVIDENCE`. This is one tool-free `VerificationJudge`
+completion through the existing authenticated Offering and durable inference
+owners. Each judgment, quorum vote, and bounded format repair creates its own
+session; its real usage is separate from the measured agent session. The CLI
+closes the evaluation session after a completed response or client-error rejection.
+Uncertain gateway and transport failures retain the session identity for diagnosis without
+automatically retrying. Session closure is not inference cancellation. The
+Server owns the provider deadline (`--timeout-seconds`, 1–120 seconds); the
+harness subprocess watchdog allows an additional 60 seconds for transport and
+session bookkeeping. Failed subprocess stdout and stderr are retained as
+bounded diagnostic data in report details, never interpreted as a valid score.
+Truncated, filtered, or unknown completion endings are rejected even if their
+text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
+
+Live quality judging uses a bounded projection of the durable tool
+journal. It preserves canonical run, turn, round, batch, and parallel metadata
+when present; missing identity stays unknown and cannot prove batching. It
+reserves room for call identities and statuses before sharing the
+remaining budget across arguments and results, so a large early response does
+not hide later verification. Truncated fields report their original and omitted
+character counts; if even the call identities exceed the budget, the envelope
+reports omitted calls. The projection fits the final judge prompt's existing
+budget. Raw reports and deterministic checks retain the original evidence.
+An inconclusive quality judgment caused by omitted evidence is not proof that
+the agent's claimed result is false, and a passing exit code is not a substitute
+for inspecting quality failures.
+
+Live agent cases require exit 0 by default. A negative test can explicitly
+expect a nonzero terminal code using `exit_code`, together with the expected
+`final_state`, `interruption_kind`, and evidence assertions. Passing means the
+negative behavior matched the test; the report retains the actual interrupted
+state and nonzero code. Only a passing composite branch containing a matching
+`exit_code` can authorize it. Root and follow-up expectations apply to their
+own invocations, not another turn's accumulated output. Protocol failures,
+missing terminal identity, and outer harness timeouts cannot be accepted this
+way. An explicitly expected nonzero code suppresses automatic rate-limit retry;
+session identity, durable evidence, and subsystem-health checks still apply.
+
+Capability probes distinguish a disabled optional capability from an enabled
+capability without owner credentials. A child allowlist cannot enable a parent
+capability: the disabled GitHub case expects admission rejection before a child
+runs. A separate discovery-only case requires a real child and its causally
+attributed discovery result. Validate the complete allowlist, not just selected
+array positions; parent discovery of the delegation tool is a separate call.
+User-required exact replies and requested observations remain quality criteria,
+even when capability enforcement itself succeeds.
+
+The Work planning and observation cases make their explicit no-tools constraint
+and core semantic requirements hard checks. `text_json_dag.existing_node_ids`
+can supply nodes already declared in the input: output nodes cannot redeclare
+them, and output edges referencing them participate in the same cycle check.
+This field supplies identities only, not existing edges. The DAG check covers
+the supplied output edges, so a context with prior dependencies requires those
+edges too before claiming the entire combined graph is acyclic.
+
+`journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
+delivered item counts using canonical Work and branch identities. It allows any
+unexecuted initial item to be cancelled, requires fresh addition identities, and
+checks that the remaining initial items and additions each have a delivered
+settlement. Replays of the same execution do not count twice. Its optional
+`cancellation_after_deliveries` minimum requires causal evidence that the target
+remained unstarted until the preceding deliveries; a late snapshot alone is not
+proof of deferred cancellation. Natural requests with unspecified cancellation
+targets and requests for an explicit deferred replacement use separate cases.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).

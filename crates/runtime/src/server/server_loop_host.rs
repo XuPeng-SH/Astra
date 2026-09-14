@@ -612,6 +612,21 @@ fn primary_explicit_fanout_start(provider_tool_calls: &[Value]) -> bool {
         })
 }
 
+/// A one-slot fanout is a valid explicit delegation carrier even though it
+/// does not create parallel execution.  The semantic admission sidecar uses
+/// `primary` for ordinary one-child requests and recommends `agent.spawn`, but
+/// an explicit provider request for the fixed fanout contract must remain
+/// executable.  Requiring the exact typed shape here keeps malformed calls on
+/// the normal schema-validation path instead of weakening the topology gate.
+fn single_child_fanout_start(arguments: &Value) -> bool {
+    arguments.get("action").and_then(Value::as_str) == Some("start")
+        && arguments.get("target_count").and_then(Value::as_u64) == Some(1)
+        && arguments
+            .get("slots")
+            .and_then(Value::as_array)
+            .is_some_and(|slots| slots.len() == 1)
+}
+
 /// A valid root `agent_fanout.start` is itself the typed parallel execution
 /// carrier.  The optional Work classifier runs before the primary response
 /// and can conservatively call the same request durable Work; that prediction
@@ -6483,11 +6498,13 @@ impl ServerAgenticLoopHost {
     }
 
     /// Build the deferred catalog used by discovery and schema-addressed
-    /// carrier admission. Before semantic topology settles this remains
-    /// policy-neutral; after it settles, the typed action projection must
-    /// match the executable offer so discovery cannot advertise a call that
-    /// the terminal gate is certain to reject. Runtime admission remains the
-    /// independent forged/stale-call fence.
+    /// carrier admission. This projection is deliberately policy-neutral for
+    /// the duration of a provider request: the semantic topology vote may
+    /// settle after `tool_search` has returned a schema digest, and changing
+    /// an action enum in the same turn would make the selected carrier appear
+    /// stale before it reaches execution. The terminal admission gate still
+    /// enforces the typed topology and capability decision; discovery must
+    /// remain a stable evidence source rather than an authorization grant.
     fn current_discovery_deferred_tool_contract_schemas(
         &self,
         state: &AgenticLoopState,
@@ -6497,41 +6514,13 @@ impl ServerAgenticLoopHost {
         restricted.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
-        let topology = self
-            .work_admission_topology_authoritative
-            .then_some(self.work_admission_execution_topology);
         let deferred_candidates = self
             .deferred_tool_schemas
             .iter()
             .filter(|schema| {
                 tool_schema_name(schema).is_some_and(|name| !restricted.contains(name))
             })
-            .filter_map(|schema| {
-                let mut schema = schema.clone();
-                let name = tool_schema_name(&schema).map(str::to_string);
-                match (topology, name.as_deref()) {
-                    // Once the semantic judge has admitted a fixed parallel
-                    // group, direct single-agent creation is not an
-                    // executable offer. Keep get_result/send_message visible
-                    // for already-created children, but do not advertise a
-                    // spawn shape that the terminal gate must reject.
-                    (
-                        Some(astra_services::WorkExecutionTopology::ParallelSubruns),
-                        Some("agent"),
-                    ) if !remove_tool_action_branches(&mut schema, &["spawn", "run_chain"]) => {
-                        return None;
-                    }
-                    // In a primary topology, a new fanout group is likewise
-                    // not an executable offer. Unresolved topology remains
-                    // policy-neutral until the typed decision settles.
-                    (
-                        Some(astra_services::WorkExecutionTopology::Primary),
-                        Some("agent_fanout"),
-                    ) if !remove_tool_action_branch(&mut schema, "start") => return None,
-                    _ => {}
-                }
-                Some(schema)
-            })
+            .cloned()
             .collect();
         self.runtime_ready_turn_tools(deferred_candidates, state)
     }
@@ -9166,6 +9155,7 @@ impl ServerAgenticLoopHost {
                 if name == Some("agent_fanout")
                     && arguments.get("action").and_then(Value::as_str) == Some("start")
                     && !parallel_fanout_admitted
+                    && (!single_child_fanout_start(&arguments) || direct_agent_batch_count > 0)
                 {
                     admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
                         invocation: call,
@@ -9208,10 +9198,6 @@ impl ServerAgenticLoopHost {
             return admission;
         }
         let work_is_required = self.work_lifecycle_is_required(state);
-        let parallel_subruns_requested = matches!(
-            self.work_admission_execution_topology,
-            astra_services::WorkExecutionTopology::ParallelSubruns
-        );
         let parallel_topology_admitted = self.work_admission_topology_authoritative
             && self.work_admission_execution_topology
                 == astra_services::WorkExecutionTopology::ParallelSubruns;
@@ -9428,13 +9414,7 @@ impl ServerAgenticLoopHost {
                 )),
                 "agent"
                     if matches!(action, Some("spawn" | "run_chain"))
-                        && parallel_topology_admitted =>
-                {
-                    Some(direct_parallel_rejection)
-                }
-                "agent"
-                    if matches!(action, Some("spawn" | "run_chain"))
-                        && (parallel_subruns_requested
+                        && (parallel_topology_admitted
                             || direct_parallel_batch
                             || fanout_start_in_batch) =>
                 {
@@ -9450,7 +9430,11 @@ impl ServerAgenticLoopHost {
                         "Delegated execution must use canonical Work tracking. Establish it with start_work, then call run_next_work_item; the server owns task selection and worker identity.",
                     ))
                 }
-                "agent_fanout" if action == Some("start") && !parallel_topology_admitted => {
+                "agent_fanout"
+                    if action == Some("start")
+                        && !parallel_topology_admitted
+                        && !single_child_fanout_start(&arguments) =>
+                {
                     if self.pending_work_admission.is_some() {
                         Some((
                             "parallel_topology_not_admitted",
@@ -25396,6 +25380,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_reflect_requires_selected_carrier_and_retains_validation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-reflect".into(),
+            "s-reflect".into(),
+        )
+        .with_server_sandbox_workspace(dir.path())
+        .build();
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(runtime_tool_executor_with_agent_context(
+            dir.path(),
+        )));
+        state.sticky_tool_schemas = host.visible_turn_tools(&mut state);
+        let before = state.sticky_tool_schemas.clone();
+        let args = json!({"facet":"overview","depth":"diagnostic","horizon":"session"});
+        let direct = json!({"id":"direct-reflect","type":"function","function":{
+            "name":"reflect","arguments":args.to_string()
+        }});
+        assert!(
+            host.admit_terminal_tool_calls(&state, &[direct], Some("tool_calls"))
+                .is_empty()
+        );
+        let rejected = host.pending_tool_call_admission.take().unwrap();
+        assert!(rejected.rejected[0].result.contains("tool_invalid_args"));
+
+        let carrier = |arguments: Value| {
+            json!({"id":"typed-reflect","type":"function","function":{
+                "name":"invoke_tool","arguments":json!({"name":"reflect","arguments":arguments}).to_string()
+            }})
+        };
+        let admit = |host: &ServerAgenticLoopHost, state: &AgenticLoopState, arguments: Value| {
+            host.resolve_deferred_tool_admission(
+                state,
+                crate::turn::agentic::tool_interception::admit_tool_calls(
+                    &[carrier(arguments)],
+                    Some("tool_calls"),
+                ),
+            )
+        };
+        assert!(
+            admit(&host, &state, args.clone()).admitted.is_empty(),
+            "a carrier without selection cannot grant the full contract"
+        );
+        let contracts = host.current_deferred_tool_contract_schemas(&state);
+        let selected =
+            astra_tools::tool_search::tool_search(&contracts, &json!({"query":"select:reflect"}));
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&selected);
+        assert_eq!(state.deferred_tool_activations.len(), 1);
+        let activations = state.deferred_tool_activations.clone();
+        host.bind_deferred_tool_activations(&mut state, &activations);
+        let admitted = admit(&host, &state, args.clone());
+        assert_eq!(
+            admitted.admitted.len(),
+            1,
+            "selected reflection must be admitted"
+        );
+        let target = admitted.admitted[0].logical_target_call();
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(target),
+            Some("reflect")
+        );
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_arguments_value(target),
+            args
+        );
+        let invalid = admit(&host, &state, json!({"depth":"invented"}));
+        assert_eq!(invalid.admitted.len(), 1);
+        let invalid_target = invalid.admitted[0].logical_target_call();
+        assert!(matches!(
+            crate::server::tool_local_execution::validate_local_tool_arguments(
+                "reflect",
+                &astra_turn_core::tool::args::shape::tool_call_arguments_value(invalid_target),
+            ),
+            crate::server::tool_local_execution::LocalToolPreflight::ShortCircuit(_)
+        ));
+        assert!(matches!(
+            crate::server::tool_local_execution::validate_local_tool_arguments("reflect", &args),
+            crate::server::tool_local_execution::LocalToolPreflight::Continue
+        ));
+        assert_eq!(
+            host.visible_turn_tools(&mut state),
+            before,
+            "selecting full reflection must preserve resident tools[] identity"
+        );
+    }
+
+    #[tokio::test]
     async fn edge_declared_deferred_runtime_tool_activates_without_widening_provider_inventory() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
@@ -26121,6 +26195,10 @@ mod tests {
         });
         let direct_parallel_calls = [direct_agent_call, fanout_call];
 
+        // A serial admission permits one child. An authoritative parallel
+        // admission must still use the complete fanout execution carrier.
+        direct_parallel_bound.work_admission_execution_topology =
+            astra_services::WorkExecutionTopology::Primary;
         let single_child_admission = AgenticLoopHost::admit_tool_calls(
             &mut direct_parallel_bound,
             &direct_parallel_calls[..1],
@@ -26131,9 +26209,23 @@ mod tests {
         assert_eq!(
             single_child_admission.admitted[0].logical_target_call()["function"]["name"],
             "agent",
-            "a fallible semantic topology prediction must not replace an explicit typed single-child carrier"
+            "serial admission must preserve an explicit single-child carrier"
         );
 
+        let single_child_terminal = direct_parallel_bound.admit_terminal_tool_calls(
+            &create_test_state(),
+            &direct_parallel_calls[..1],
+            Some("tool_calls"),
+        );
+        assert_eq!(
+            single_child_terminal.len(),
+            1,
+            "an admitted one-child carrier must survive terminal lifecycle projection"
+        );
+        assert_eq!(single_child_terminal[0]["function"]["name"], "agent");
+
+        direct_parallel_bound.work_admission_execution_topology =
+            astra_services::WorkExecutionTopology::ParallelSubruns;
         let direct_parallel_terminal = direct_parallel_bound.admit_terminal_tool_calls(
             &create_test_state(),
             &direct_parallel_calls,
@@ -28716,7 +28808,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result.output).expect("search result");
         let selection = &parsed["matches"][0];
         assert!(
-            !selection["parameters"]["properties"]["action"]["enum"]
+            selection["parameters"]["properties"]["action"]["enum"]
                 .as_array()
                 .expect("fanout action enum")
                 .iter()
@@ -28729,23 +28821,9 @@ mod tests {
                 .iter()
                 .any(|action| action == "get_results")
         );
-        assert!(
-            selection["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("get_results:")),
-            "discovery description must be projected from retained actions"
-        );
-        assert!(
-            !selection["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("start:")
-        );
-
-        // Discovery and the executable offer share the settled typed primary
-        // topology.  The search result must not advertise a start action that
-        // the terminal gate is certain to reject.  A forged start is still
-        // rejected independently below.
+        // Discovery preserves the selected schema digest across topology
+        // settlement. It grants no authorization: parallel starts in primary
+        // topology still fail the terminal gate below.
         let unauthorized = json!({
             "id": "fanout-primary",
             "type": "function",
@@ -28818,17 +28896,19 @@ mod tests {
         let settled_fanout = settled
             .iter()
             .find(|schema| tool_schema_name(schema) == Some("agent_fanout"))
-            .expect("settled discovery catalog keeps read-only fanout actions");
+            .expect("settled discovery catalog keeps the stable fanout contract");
         let settled_actions =
             settled_fanout["function"]["parameters"]["properties"]["action"]["enum"]
                 .as_array()
                 .expect("settled action enum");
-        assert!(!settled_actions.iter().any(|action| action == "start"));
-        assert!(settled_actions.iter().any(|action| action == "get_results"));
         assert!(
-            settled_fanout["function"]["parameters"]["x-astra-discovery-summary"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("get_results:"))
+            settled_actions.iter().any(|action| action == "start"),
+            "settlement must not invalidate an already selected discovery schema"
+        );
+        assert!(settled_actions.iter().any(|action| action == "get_results"));
+        assert_eq!(
+            settled_fanout, unresolved_fanout,
+            "topology settlement must preserve the complete discovery schema and its digest"
         );
         assert!(!schema_names(&wire).is_empty());
         assert_eq!(schema_names(&wire), wire_names);
@@ -35580,6 +35660,16 @@ mod tests {
             }
         });
         assert!(primary_explicit_fanout_start(std::slice::from_ref(&fanout)));
+        assert!(single_child_fanout_start(&json!({
+            "action": "start",
+            "target_count": 1,
+            "slots": [{"description": "child", "prompt": "inspect"}]
+        })));
+        assert!(!single_child_fanout_start(&json!({
+            "action": "start",
+            "target_count": 2,
+            "slots": [{"description": "child", "prompt": "inspect"}]
+        })));
         assert!(!primary_explicit_fanout_start(&[
             fanout,
             json!({"function": {"name": "start_work", "arguments": "{}"}}),
@@ -36301,6 +36391,21 @@ mod tests {
                 .get("start")
                 .is_none()
         );
+        let primary_discovery = host.current_discovery_deferred_tool_contract_schemas(&state);
+        let primary_discovery_fanout = primary_discovery
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent_fanout"))
+            .expect("primary topology keeps fanout discoverable for stable selection evidence");
+        let primary_discovery_actions =
+            primary_discovery_fanout["function"]["parameters"]["properties"]["action"]["enum"]
+                .as_array()
+                .expect("discovery action enum");
+        assert!(
+            primary_discovery_actions
+                .iter()
+                .any(|action| action == "start"),
+            "topology changes must not rewrite the same-turn tool_search digest"
+        );
         let stabilized = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
             &primary_tools,
             &unresolved_tools,
@@ -36373,8 +36478,7 @@ mod tests {
         let agent_actions = agent["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("agent action enum");
-        assert!(!agent_actions.iter().any(|action| action == "spawn"));
-        assert!(!agent_actions.iter().any(|action| action == "run_chain"));
+        assert!(agent_actions.iter().any(|action| action == "spawn"));
         assert!(agent_actions.iter().any(|action| action == "get_result"));
 
         let fanout = discovery
@@ -36398,10 +36502,10 @@ mod tests {
                 .is_some_and(|description| description.contains("get_result:"))
         );
         assert!(
-            !selected_agent["description"]
+            selected_agent["description"]
                 .as_str()
-                .unwrap_or_default()
-                .contains("spawn:")
+                .is_some_and(|description| description.contains("spawn:")),
+            "discovery retains the stable spawn declaration; terminal admission enforces authoritative topology"
         );
     }
 
