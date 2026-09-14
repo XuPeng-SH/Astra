@@ -2676,12 +2676,11 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     SlashResult::Handled
 }
 
-/// `/model set <name>` — apply immediately.  Also used as the
-/// fallback for `/model <name>` shorthand.
+/// Apply a direct `/model <name>` selection immediately.
 fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
     if name.is_empty() {
-        ctx.show_error("Model name cannot be empty — try `/model list`.".into());
+        ctx.show_error("Model name cannot be empty — choose one with `/model`.".into());
         return;
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
@@ -2722,13 +2721,13 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         Some(arg.trim().to_string())
     };
     let Some(name) = target else {
-        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+        ctx.show_error("No active model — choose one with `/model` or run `/model <name>`.".into());
         return SlashResult::Handled;
     };
 
     // Prefer the cached pricing the session already carries so
-    // `/model info` is instant — live refetch happens via
-    // `/model list` when the user explicitly asks.
+    // `/model info` is instant — live refetch happens when the user
+    // explicitly opens the `/model` picker.
     let pricing = &ctx.state.cached_pricing;
     let prompt_usd = if pricing.prompt > 0.0 {
         format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
@@ -3345,6 +3344,7 @@ mod routing_tests {
         context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
         keyboard_shortcut_pairs, memory_command_route, skill_command_route,
     };
+    use crate::cli::command_registry;
     use crate::cli::session::session_state::SessionState;
     use crate::tui::context_panel::{
         ContextSnapshot,
@@ -3408,7 +3408,20 @@ mod routing_tests {
     }
 
     #[test]
-    fn model_catalog_request_matches_only_picker_forms() {
+    fn hidden_model_list_alias_remains_a_typed_picker_dispatch() {
+        let model = command_registry::resolve_command_meta("/model").expect("model command");
+        assert!(
+            model.subcommands.iter().any(|(name, _)| *name == "list"),
+            "the shared command parser must retain the typed `/model list` alias"
+        );
+        assert!(
+            model
+                .visible_tui_subcommands()
+                .iter()
+                .all(|(name, _)| *name != "list"),
+            "the redundant picker alias must stay out of TUI completion"
+        );
+
         assert!(is_model_picker_request("/model"));
         assert!(is_model_picker_request("/model list"));
         assert!(!is_model_picker_request("/model info"));
