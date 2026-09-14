@@ -101,6 +101,9 @@ one evidence-linked `submit_task_resolution` proposal through the existing
 not added to resident tools. The proposal identifies the verification target,
 failed and later evidence calls, `supported`/`partial`/`unknown`, rationale, and
 remaining gaps. This is a model assessment, not a verification receipt.
+The wire contract bounds the target and each gap to 256 characters, rationale to
+1024 characters, and each evidence list to 32 call IDs; runtime validation uses
+the same character-count limits as the provider schema.
 Candidate existence does not establish semantic relevance. Same-round sibling
 results are not later evidence, and exact-operation recovery needs no proposal.
 The transient hint supplies bounded, source-owned execution IDs and typed
@@ -166,6 +169,10 @@ as happening later. Do not duplicate a requested mutation in the initial tasks.
 Semantic admission rejections identify the field path, violated rule and
 observed size or index without copying field contents into the diagnostic.
 These diagnostics do not relax validation or change the repair policy.
+An optimistic Work-context mismatch is a retryable non-execution rejection:
+the proposed graph mutation has not started and carries no possible side
+effect. Refreshing the canonical context may safely retry without leaving an
+unresolved execution failure in the turn outcome.
 
 Task identities are not execution-order authority. Admission retains explicit
 `after_initial_tasks` prerequisites as dependency edges; omitted prerequisites
@@ -182,7 +189,10 @@ retired declarations, even when a mutation committed before replay. A failed
 post-commit receipt read resumes through `run_next_work_item`; its receipt must
 restore the board even when the graph is already complete. These receipts read
 one canonical snapshot after settlement or task allocation so the live board
-observes cancellation and replacement together with successor assignment.
+observes cancellation and replacement together with successor assignment. The
+`start_work` result separately reports declared task count and any already
+applied admission graph changes, so a server-applied addition or revision is
+visible as a completed change and is not proposed again by the model.
 Initial-candidate references are not aliases for arbitrary later replacements;
 conflicting retirement/prerequisite lifetimes are rejected before establishment.
 

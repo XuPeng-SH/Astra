@@ -407,7 +407,7 @@ pub struct AgentToolContext {
     pub transcript_location: AgentTranscriptLocation,
 }
 
-fn disabled_requested_optional_tools<'a>(
+fn unavailable_requested_tools<'a>(
     requested: impl IntoIterator<Item = &'a String>,
     enabled_tools: Option<&HashSet<String>>,
 ) -> Vec<String> {
@@ -419,10 +419,10 @@ fn disabled_requested_optional_tools<'a>(
         .into_iter()
         .map(|name| name.trim().to_ascii_lowercase())
         .filter(|name| {
-            registry
-                .get(name)
-                .is_some_and(astra_runtime_env::ToolSpec::requires_explicit_user_enablement)
-                && !enabled_tools.contains(name)
+            !enabled_tools.contains(name)
+                && registry
+                    .get(name)
+                    .is_none_or(astra_runtime_env::ToolSpec::requires_explicit_user_enablement)
         })
         .collect::<Vec<_>>();
     disabled.sort();
@@ -430,12 +430,12 @@ fn disabled_requested_optional_tools<'a>(
     disabled
 }
 
-fn render_disabled_delegation_capabilities(disabled: &[String]) -> String {
+fn render_unavailable_delegation_capabilities(unavailable: &[String]) -> String {
     render_agent_tool_error(
         None,
         &format!(
-            "Delegation requested product-optional capabilities that are not enabled for the current request: {}. Enable them on the parent request or delegate only currently executable capabilities.",
-            disabled.join(", ")
+            "Delegation requested capabilities that are unavailable or not enabled for the current request: {}. Add supported product-optional capabilities to the parent request or remove unsupported names.",
+            unavailable.join(", ")
         ),
     )
 }
@@ -1225,10 +1225,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .into_iter()
                 .flatten(),
         );
-    let disabled =
-        disabled_requested_optional_tools(requested_optional_tools, ctx.enabled_tools.as_ref());
-    if !disabled.is_empty() {
-        return render_disabled_delegation_capabilities(&disabled);
+    let unavailable =
+        unavailable_requested_tools(requested_optional_tools, ctx.enabled_tools.as_ref());
+    if !unavailable.is_empty() {
+        return render_unavailable_delegation_capabilities(&unavailable);
     }
     if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
         let same_start = existing.group_id == group_id
@@ -2299,12 +2299,12 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         }
     };
 
-    let disabled = disabled_requested_optional_tools(
+    let unavailable = unavailable_requested_tools(
         input.allowed_tools.as_deref().unwrap_or_default(),
         ctx.enabled_tools.as_ref(),
     );
-    if !disabled.is_empty() {
-        return render_disabled_delegation_capabilities(&disabled);
+    if !unavailable.is_empty() {
+        return render_unavailable_delegation_capabilities(&unavailable);
     }
 
     // Structured concurrency is the public default. The spawner waits for the
@@ -4451,6 +4451,32 @@ mod tests {
 
         let value: Value = serde_json::from_str(&result).expect("structured rejection");
         assert_eq!(value["status"], "failed");
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert_eq!(executor.spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_rejects_unregistered_name_under_explicit_parent_surface() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner.clone(), Some("deepseek-v4-flash"));
+        ctx.enabled_tools = Some(HashSet::new());
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Use an unavailable capability",
+                "prompt": "Report whether the requested capability is available.",
+                "allowed_tools": ["tool_search", "unregistered_capability"]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let value: Value = serde_json::from_str(&result).expect("structured rejection");
+        assert_eq!(value["status"], "failed");
+        assert!(value["error"].as_str().is_some_and(|error| {
+            error.contains("unregistered_capability") && error.contains("unavailable")
+        }));
         assert!(spawner.list_all_agents().await.is_empty());
         assert_eq!(executor.spawn_count(), 0);
     }

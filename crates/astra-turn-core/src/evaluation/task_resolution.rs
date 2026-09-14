@@ -187,11 +187,12 @@ pub fn validate_assessment_header(
     if current_boundary.trim().is_empty() || assessment.boundary_id != current_boundary {
         return Err(Error::WrongBoundary);
     }
-    // This is a compact explanation of a bounded evidence set, not another
-    // transcript channel. Reject oversized submissions; never truncate IDs or
-    // structured evidence into a different claim.
-    if assessment.verification_target.len() > 1024
-        || assessment.rationale.len() > 4096
+    // Keep runtime validation identical to the provider-facing JSON schema.
+    // JSON Schema maxLength counts Unicode characters, so byte length would
+    // reject some valid non-ASCII assessments before the evidence check.
+    // Never truncate IDs or structured evidence into a different claim.
+    if assessment.verification_target.chars().count() > 256
+        || assessment.rationale.chars().count() > 1024
         || assessment.failed_call_ids.len() > 32
         || assessment.evidence_call_ids.len() > 32
         || assessment.remaining_gaps.len() > 32
@@ -200,7 +201,10 @@ pub fn validate_assessment_header(
             .iter()
             .chain(&assessment.evidence_call_ids)
             .any(|id| id.len() > 256)
-        || assessment.remaining_gaps.iter().any(|gap| gap.len() > 1024)
+        || assessment
+            .remaining_gaps
+            .iter()
+            .any(|gap| gap.chars().count() > 256)
     {
         return Err(Error::TooLarge);
     }
@@ -545,12 +549,50 @@ mod tests {
             Err(AssessmentEvidenceError::WrongBoundary)
         );
         let mut assessment = claim();
-        assessment.rationale = "x".repeat(4097);
+        assessment.rationale = "x".repeat(1025);
         assert_eq!(
             validate_assessment_evidence(&assessment, "current-intent", &records),
             Err(AssessmentEvidenceError::TooLarge)
         );
-        assert_eq!(assessment.rationale.len(), 4097);
+        assert_eq!(assessment.rationale.len(), 1025);
+    }
+
+    #[test]
+    fn assessment_bounds_match_the_provider_tool_schema_in_characters() {
+        for (field, mutate) in [
+            (
+                "verification_target",
+                Box::new(|assessment: &mut TaskResolutionAssessment| {
+                    assessment.verification_target = "x".repeat(257);
+                }) as Box<dyn Fn(&mut TaskResolutionAssessment)>,
+            ),
+            (
+                "rationale",
+                Box::new(|assessment: &mut TaskResolutionAssessment| {
+                    assessment.rationale = "x".repeat(1025);
+                }),
+            ),
+            (
+                "remaining_gaps",
+                Box::new(|assessment: &mut TaskResolutionAssessment| {
+                    assessment.remaining_gaps = vec!["x".repeat(257)];
+                }),
+            ),
+            (
+                "remaining_gaps_unicode",
+                Box::new(|assessment: &mut TaskResolutionAssessment| {
+                    assessment.remaining_gaps = vec!["界".repeat(257)];
+                }),
+            ),
+        ] {
+            let mut assessment = claim();
+            mutate(&mut assessment);
+            assert_eq!(
+                validate_assessment_header(&assessment, "current-intent", "boundary-1"),
+                Err(AssessmentEvidenceError::TooLarge),
+                "provider schema bound must also hold for {field}"
+            );
+        }
     }
 
     #[test]

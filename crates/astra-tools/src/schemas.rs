@@ -659,7 +659,7 @@ pub fn submit_task_resolution_schema() -> Value {
     json!({
         "type": "function", "function": {
             "name": "submit_task_resolution",
-            "description": "Submit an evidence-linked model assessment only when the runtime requests reconciliation. Name exact failed and later supporting call IDs for the same verification target; retain unknowns and remaining gaps. Submission is not verification success and never replaces required checks.",
+            "description": "Submit an evidence-linked model assessment only when the runtime requests reconciliation. Name exact failed and later supporting call IDs for the same verification target; retain unknowns and remaining gaps. Keep verification_target within 256 characters, rationale within 1024 characters, and each remaining gap within 256 characters. For a supported conclusion, remaining_gaps must be empty. Submission is not verification success and never replaces required checks.",
             "parameters": {
                 "type": "object", "additionalProperties": false,
                 "required": ["verification_target", "failed_call_ids", "evidence_call_ids", "conclusion", "rationale", "remaining_gaps"],

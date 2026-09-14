@@ -1622,12 +1622,17 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 )))
         && completion_action_window_is_batchable(state, &next_action)
     {
-        if active_work_attempt || matches!(window.action, CompletionAction::PostMutationRepair) {
+        if active_work_attempt
+            || matches!(window.action, CompletionAction::PostMutationRepair)
+            || matches!(next_action, CompletionAction::PostMutationObservation)
+        {
             // The initial settlement reserve accounts for one completion
             // action plus the canonical Work settlement. A successful
             // mutation can reveal exactly one dependent observation edge
-            // only after its outcome is recorded, so reserve that one typed
-            // boundary here. This is not an exploratory budget extension.
+            // only after its outcome is recorded, including in an ordinary
+            // turn whose bounded recovery just spent its mutation round.
+            // Reserve the newly exposed typed boundary here; this is not an
+            // exploratory budget extension.
             state.max_turns = state.max_turns.saturating_add(1);
             state.remaining_turns = state.remaining_turns.saturating_add(1);
         }
@@ -7000,7 +7005,7 @@ pub(crate) fn completion_action_hint_for_state(
             "name": "submit_task_resolution",
             "arguments_schema": astra_tools::schemas::submit_task_resolution_schema()["function"]["parameters"],
             "call_shape": "invoke_tool({\"name\":\"submit_task_resolution\",\"arguments\": <assessment object matching arguments_schema>})",
-            "instruction": "Invoke this carrier directly; no tool_search or schema loading is needed in this window. Runtime binds scope and boundary; do not supply them. Copy execution call_id values exactly from the evidence below, never substitute a command or description. Candidates are observations, not proof of relevance. For supported, remaining_gaps must be the empty array [], not a string such as None.",
+            "instruction": "Invoke this carrier directly; no tool_search or schema loading is needed in this window. Runtime binds scope and boundary; do not supply them. The schema has no top-level call_id field, so do not add one; put exact execution IDs only in failed_call_ids or evidence_call_ids. Copy execution call_id values exactly from the evidence below, never substitute a command or description. Candidates are observations, not proof of relevance. Keep verification_target to 256 characters, rationale to 1024 characters, and each remaining_gaps item to 256 characters (maximum 32 items). For supported, remaining_gaps must be the empty array [], not a string such as None.",
         });
         hint["execution_evidence"] = state
             .stall
@@ -10442,6 +10447,13 @@ mod tests {
         let action = CompletionAction::OutcomeReconciliation {
             boundary_id: "boundary-1".into(),
         };
+        let hint = completion_action_hint_for_state(&state, &action);
+        let instruction = hint["carrier"]["instruction"]
+            .as_str()
+            .expect("assessment guidance");
+        assert!(instruction.contains("no top-level call_id field"));
+        assert!(instruction.contains("failed_call_ids or evidence_call_ids"));
+        assert!(instruction.contains("each remaining_gaps item to 256 characters"));
         let call = |name: &str| {
             serde_json::json!({
                 "id": "assessment-call", "type": "function",
@@ -12388,6 +12400,7 @@ mod tests {
     #[test]
     fn required_mutation_window_advances_to_observation_after_success() {
         let mut state = make_state();
+        let budget_before = (state.max_turns, state.remaining_turns);
         state
             .hooks
             .completion_settlement
@@ -12424,6 +12437,11 @@ mod tests {
         assert_eq!(window.mismatch_corrections_remaining, 0);
         assert!(!window.consumed);
         assert!(!window.matched);
+        assert_eq!(
+            (state.max_turns, state.remaining_turns),
+            (budget_before.0 + 1, budget_before.1 + 1),
+            "ordinary bounded mutation recovery must reserve its dependent observation round"
+        );
         assert_eq!(
             state
                 .hooks
