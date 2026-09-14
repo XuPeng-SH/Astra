@@ -1705,8 +1705,20 @@ pub(crate) struct ChatWidget {
     active_cell_id: Option<u64>,
     /// Mutable canonical Explain projection is independent of active answer/tool cells.
     explain_analyze_projection: Option<astra_turn_types::ExplainAnalyzeGraphV1>,
+    /// Redacted typed facts retained long enough to publish the completed
+    /// Explain Analyze snapshot as a session artifact.
+    explain_analyze_events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+    /// Whether the current turn has an Explain capture that still needs to be
+    /// committed. A later user submit also closes the previous transcript
+    /// boundary, so an empty projection after a successful turn must be a
+    /// no-op rather than a new unavailable capture.
+    explain_analyze_capture_pending: bool,
     /// Transport coverage for the active Explain Analyze projection.
     explain_analyze_delivery_degraded: bool,
+    /// Whether Explain Analyze detail rows are expanded for the current UI
+    /// mode. The measured graph itself is identical for `on` and `verbose`;
+    /// only the presentation detail level changes.
+    explain_analyze_verbose: bool,
     /// Identity of the non-Task ToolCell in `active_cell`. Tool completion
     /// must match this id; a late completion for some other tool must never
     /// finalize the currently visible command by name or position alone.
@@ -1780,7 +1792,10 @@ impl ChatWidget {
             active_cell: None,
             active_cell_id: None,
             explain_analyze_projection: None,
+            explain_analyze_events: Vec::new(),
+            explain_analyze_capture_pending: false,
             explain_analyze_delivery_degraded: false,
+            explain_analyze_verbose: false,
             active_tool_use_id: None,
             parked_tools: std::collections::HashMap::new(),
             parked_tool_order: Vec::new(),
@@ -2472,6 +2487,10 @@ impl ChatWidget {
         &self.session_id
     }
 
+    pub(crate) fn set_explain_verbose(&mut self, verbose: bool) {
+        self.explain_analyze_verbose = verbose;
+    }
+
     pub(crate) fn explain_analyze_live_lines(
         &self,
         width: u16,
@@ -2487,6 +2506,7 @@ impl ChatWidget {
                 width,
                 rows,
                 self.explain_analyze_delivery_degraded,
+                self.explain_analyze_verbose,
             ))
         } else if self.explain_analyze_delivery_degraded {
             Some(ExplainAnalyzeCell::live_lines(
@@ -2494,6 +2514,7 @@ impl ChatWidget {
                 width,
                 rows,
                 true,
+                self.explain_analyze_verbose,
             ))
         } else {
             None
@@ -2501,8 +2522,32 @@ impl ChatWidget {
     }
 
     fn commit_explain_analyze_projection(&mut self) {
+        let capture_pending = std::mem::take(&mut self.explain_analyze_capture_pending);
         let delivery_degraded = std::mem::take(&mut self.explain_analyze_delivery_degraded);
+        if !capture_pending
+            && self.explain_analyze_projection.is_none()
+            && self.explain_analyze_events.is_empty()
+            && !delivery_degraded
+        {
+            return;
+        }
         let Some(mut graph) = self.explain_analyze_projection.take() else {
+            let events = std::mem::take(&mut self.explain_analyze_events);
+            let run_id = events.first().map(|event| event.run_id.as_str());
+            let turn_id = events.first().map(|event| event.turn_id.as_str());
+            let reason = if delivery_degraded {
+                "Explain Analyze stream delivery was interrupted before a graph could be completed"
+            } else {
+                "no Explain Analyze runtime facts were captured"
+            };
+            if let Err(error) = crate::explain_analyze_artifact::mark_unavailable(
+                &self.session_id,
+                run_id,
+                turn_id,
+                reason,
+            ) {
+                tracing::warn!("failed to record unavailable Explain Analyze artifact: {error}");
+            }
             if delivery_degraded {
                 self.commit_cell(Box::new(SystemCell::warning(
                     "Explain Analyze · incomplete · stream delivery was interrupted before runtime facts could be recovered.",
@@ -2510,9 +2555,19 @@ impl ChatWidget {
             }
             return;
         };
+        let events = std::mem::take(&mut self.explain_analyze_events);
+        if let Err(error) =
+            crate::explain_analyze_artifact::persist(&self.session_id, &events, delivery_degraded)
+        {
+            tracing::warn!("failed to persist Explain Analyze artifact: {error}");
+        }
         graph.finish_ingest();
         if !graph.nodes().is_empty() {
-            self.commit_cell(Box::new(ExplainAnalyzeCell::new(graph, delivery_degraded)));
+            self.commit_cell(Box::new(ExplainAnalyzeCell::new(
+                graph,
+                delivery_degraded,
+                self.explain_analyze_verbose,
+            )));
         }
     }
 
@@ -2736,7 +2791,10 @@ impl ChatWidget {
             WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
             WireEvent::SystemInfo(msg) => self.on_system_info(msg),
             WireEvent::ExplainAnalyze(fact) => self.on_explain_analyze(fact),
-            WireEvent::ExplainAnalyzeGap => self.explain_analyze_delivery_degraded = true,
+            WireEvent::ExplainAnalyzeGap => {
+                self.explain_analyze_capture_pending = true;
+                self.explain_analyze_delivery_degraded = true;
+            }
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
                 self.commit_system(SystemCell::info(event.summary));
@@ -4055,6 +4113,8 @@ impl ChatWidget {
 
     fn on_explain_analyze(&mut self, fact: astra_turn_types::ExplainAnalyzeEventV1) {
         if fact.is_valid() {
+            self.explain_analyze_capture_pending = true;
+            self.explain_analyze_events.push(fact.clone());
             self.explain_analyze_projection
                 .get_or_insert_with(Default::default)
                 .apply(fact);
@@ -4552,7 +4612,8 @@ fn cell_from_persist(ev: TurnEvent) -> Option<Box<dyn HistoryCell>> {
             }
             graph.finish_ingest();
             (!graph.nodes().is_empty()).then(|| {
-                Box::new(ExplainAnalyzeCell::new(graph, delivery_degraded)) as Box<dyn HistoryCell>
+                Box::new(ExplainAnalyzeCell::new(graph, delivery_degraded, false))
+                    as Box<dyn HistoryCell>
             })
         }
     }
@@ -4572,6 +4633,7 @@ mod tests {
         AgentProjectionConfidence, AgentProjectionSource, AgentRunStatus,
     };
     use crate::tui::history_cell::tool::ToolStatus;
+    use astra_services::SessionArtifactStore;
 
     fn fresh() -> ChatWidget {
         // A local widget has no durable transcript until the runtime commits
@@ -4603,6 +4665,17 @@ mod tests {
             context: None,
             coverage_gaps: Vec::new(),
         }
+    }
+
+    fn explain_turn_finish() -> astra_turn_types::ExplainAnalyzeEventV1 {
+        let mut event = explain_turn_start();
+        event.event_id = "clock-1:turn-finish".into();
+        event.transition = astra_turn_types::ExplainAnalyzeTransitionV1::Finished;
+        event.elapsed_ms = 15;
+        event.start_elapsed_ms = Some(0);
+        event.duration_ms = Some(15);
+        event.outcome = Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed);
+        event
     }
 
     fn history_cell_text(cell: &dyn HistoryCell, width: u16) -> String {
@@ -4694,6 +4767,45 @@ mod tests {
         let warning = history_cell_text(widget.history[0].as_ref(), 100);
         assert!(warning.contains("incomplete"), "{warning}");
         assert!(widget.history[1].as_any_ref().is::<TurnSummaryCell>());
+    }
+
+    #[test]
+    fn completed_explain_artifact_survives_the_next_user_submit() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "3f2a5b5d-9c0a-4bf4-a2aa-5d4f6a7b8c90";
+        let mut widget = ChatWidget::new(session_id);
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(
+            explain_turn_start(),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(
+            explain_turn_finish(),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = store.session_dir(session_id).expect("session directory");
+        let handle = crate::explain_analyze_artifact::artifact_handle("run-1", "turn-1");
+        let before = crate::explain_analyze_artifact::latest_notice(&session_dir)
+            .expect("latest artifact notice")
+            .expect("completed artifact notice");
+        assert!(before.contains(&handle), "{before}");
+        assert!(before.contains("status=complete"), "{before}");
+
+        widget.handle_event(AppEvent::User(UserEvent::Submit("next turn".into())));
+
+        let after = crate::explain_analyze_artifact::latest_notice(&session_dir)
+            .expect("latest artifact notice after submit")
+            .expect("completed artifact remains discoverable");
+        assert!(after.contains(&handle), "{after}");
+        assert!(after.contains("status=complete"), "{after}");
+        let page = crate::explain_analyze_artifact::resolve_request(
+            &session_dir,
+            &serde_json::json!({"artifact": handle, "offset": 0}),
+        )
+        .expect("Explain artifact handle recognized")
+        .expect("artifact remains readable");
+        assert!(page.contains("explain_analyze"), "{page}");
     }
 
     #[test]

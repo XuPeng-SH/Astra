@@ -615,6 +615,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ExplainMode::On => "on",
                 ExplainMode::Verbose => "verbose",
             };
+            ctx.chat_widget
+                .set_explain_verbose(matches!(ctx.state.explain, ExplainMode::Verbose));
             ctx.show_response(format!("Explain mode: {label}"));
             SlashResult::Handled
         }

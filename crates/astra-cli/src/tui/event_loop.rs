@@ -5143,6 +5143,7 @@ pub(crate) async fn run_tui_session(
         }
         _ => chat_widget::ChatWidget::new(String::new()),
     };
+    chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
 
     if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
         use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -5877,6 +5878,10 @@ pub(crate) async fn run_tui_session(
                                             state.explain != crate::ExplainMode::Off,
                                         )
                                         .await;
+                                        chat_widget.set_explain_verbose(matches!(
+                                            state.explain,
+                                            crate::ExplainMode::Verbose
+                                        ));
                                         rebind_workbench_observers(
                                             Some(new_sid),
                                             &task_board,

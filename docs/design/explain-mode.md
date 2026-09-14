@@ -1,7 +1,7 @@
 # Explain Analyze
 
 > Status: target product contract.
-> Last updated: 2026-09-13.
+> Last updated: 2026-09-14.
 
 Explain Analyze makes one run/turn understandable while it is running and
 after it has finished. It owns the graph projection, metric definitions, and
@@ -127,6 +127,12 @@ missing measurements. Live updates redraw in place at a bounded rate rather
 than append a stream of reports. A timeline may be offered as an optional view.
 Color supplements status symbols and text; respect `NO_COLOR`.
 
+The `on` mode keeps this tree concise while retaining measured timing, overlap,
+wait, and provider-usage facts. `verbose` keeps the same rows and adds the
+request-budget basis, context-source estimates, dependencies, and coverage
+diagnostics. A mode change changes presentation detail, never the measured
+facts or their parent/dependency relationships.
+
 An independent `astra explain analyze <run-id>` entrypoint is the target for
 opening an existing execution without reopening its chat. `--follow` attaches
 to live facts with durable cursor recovery. Text output is stable and usable in
@@ -237,6 +243,116 @@ Render the measured overlap as a lower bound and name the unmeasured boundaries.
   render without reverse-engineering event prose.
 - **HTML:** export a standalone graph report from the same snapshot, with no
   remote scripts, fonts, or data requests.
+
+## Report artifacts and agent analysis
+
+An Artifact is a typed document reference, not a synonym for a string or a
+filesystem path. Its contract separates four things:
+
+| Field | Meaning | Current Explain Analyze value |
+| --- | --- | --- |
+| `artifact_schema_version` | Version of the artifact envelope | `1` |
+| `artifact_type` | What the document means | `explain_analyze_snapshot` |
+| `content_type` | How the document is encoded | `application/json` |
+| `storage` | Where the runtime keeps the bytes | `local_session` |
+| `representation` | Which canonical/derived form is addressed | `canonical` |
+| `status` | Whether the snapshot is usable | `in_progress`, `complete`, `partial`, or `unavailable` |
+| `size_bytes`, `checksum_sha256` | Bounded integrity metadata for a readable snapshot | present for `complete`/`partial` |
+
+The long-term contract has four independently evolvable layers:
+
+| Layer | Question it answers | Examples |
+| --- | --- | --- |
+| Envelope | What is this and who may use it? | type, status, session scope, redaction, retention, capabilities |
+| Payload | Which facts or bytes are represented? | Explain events, a derived tree, HTML, a trace bundle, a user file |
+| Representation | How should a consumer read or render it? | canonical JSON, text, Markdown, HTML, binary |
+| Locator | Where can an authorized reader obtain it? | opaque session handle, database ID, local adapter, signed object fetch |
+
+`artifact_type` identifies the semantic document contract; `content_type` and
+`representation` identify its encoding and presentation form. A derived
+representation carries provenance back to the canonical artifact and never
+becomes a second source of execution facts. A capture can therefore expose a
+canonical JSON artifact, a Markdown/HTML view, and a trace or debug bundle as
+separate typed references without making the renderer or agent understand
+storage-specific URLs.
+
+The envelope is designed for more than the current four states. A backend may
+later add `expired`, `deleted`, or `quarantined`, but a consumer must treat an
+unknown status as unavailable and must not fall back to an older pointer. The
+same rule applies to unknown artifact types, representations, storage backends,
+and capabilities: fail closed, preserve the metadata for an authorized
+diagnostic surface, and never reinterpret it as a text document. A future
+multi-artifact host will index artifacts for one turn by type and
+representation; the `latest` pointer is only a discovery aid and is never the
+artifact identity. The current CLI publishes one canonical snapshot.
+
+The current implementation persists one canonical JSON snapshot containing the
+bounded, redacted versioned event set, run/turn identity, event schema version,
+artifact envelope version, and delivery status. The latest pointer records its
+byte size and SHA-256 digest. Plain text, Markdown, and HTML are representations derived
+from that snapshot; they are not separate sources of Explain facts. The tree,
+timeline, text export, and HTML report must therefore agree on node identity,
+timing basis, and coverage. Saving a Markdown or HTML rendering alone does not
+make a report available to a later agent turn.
+
+This CLI path uses the local session artifact store intentionally. It does not
+claim that the server-side database artifact API or a Web download endpoint
+already serves Explain snapshots; those are host adapters for a later phase.
+
+The current implementation intentionally exposes one capability,
+`read_window`, through the CLI's bounded reader. Future capabilities such as
+`download`, `render`, or `cite` must be granted by the host and represented in
+the envelope; a content type alone never grants them. Binary artifacts require
+a byte/range reader or an authorized download capability rather than being
+decoded as UTF-8. Streaming artifacts use a cursor and expiry contract instead
+of pretending that a partial stream is a completed snapshot.
+
+The model-facing value is an opaque, session-scoped handle. The current local
+reader supports UTF-8 JSON windows with `offset` and a bounded `max_bytes`
+(64 KiB maximum), and returns a continuation offset. It never exposes the
+physical path. A failed write publishes an `unavailable` status for that run
+and turn; if the index itself cannot be written, the stale pointer is removed
+where possible, and the current CLI process suppresses that session's older
+pointer while reporting the publication failure. If the process is restarted
+while both index writes and cleanup are unavailable, no local mechanism can
+persist a new failure marker; that host limitation must be surfaced rather
+than presented as a valid current report.
+
+Future storage backends fit the same reference contract. A trusted local-path
+backend may be used by a host adapter for files it owns; an S3-compatible
+backend would use a tenant/session-scoped object key, checksum, retention
+metadata, and an authorized server-side reader or short-lived signed fetch.
+Neither a raw local path nor an arbitrary `s3://` URL is accepted as an agent
+authority. Storage location is an implementation detail behind the handle,
+while type, media type, status, size, checksum, and permitted read operations
+remain explicit metadata.
+
+Future storage adapters must also define quotas, retention, cleanup, concurrent
+publication, and audit behavior. A local file can disappear, an object store
+can return a stale version, and a signed URL can expire between pages; each
+case is an explicit unavailable/expired result with no silent fallback. Those
+adapters must check tenant, user, session, and run ownership before resolving a
+locator. The current CLI boundary is the active session, local host, and
+`source_policy` check described above.
+Derived artifacts retain their parent identity and checksum, while trace and
+debug artifacts keep their own authorization and redaction policy. This keeps
+large files, provider captures, screenshots, exports, and future multimodal
+payloads on the same reference model without widening Explain Analyze into a
+raw trace or file browser.
+
+The current CLI advertises the latest handle in the text `session` and
+`overview` introspect views when local recovery is permitted. Other facets and
+the structured observation JSON keep their observation schema and do not append
+an edge-local pointer. A host that offers a remote artifact backend can expose
+the same typed reference through its own structured observation contract.
+The next turn receives only a short artifact handle through `introspect`. An
+agent that is explicitly asked to analyze the previous explain report reads
+that handle through the bounded artifact window API, then cites the recorded
+node and event identities in its answer. The entire event set is never added
+to the prompt automatically. Missing, partial, or unavailable
+artifacts are reported as such, and an Explain artifact never grants access to
+raw prompts, chain-of-thought, credentials, tool arguments, tool output, or
+trace payloads.
 
 ## Correctness and failure behavior
 

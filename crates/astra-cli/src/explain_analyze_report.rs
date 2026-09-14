@@ -72,20 +72,23 @@ pub(crate) fn render(
         );
     }
 
+    append_tree(&graph, &clocks, &mut lines, verbose);
+
     if !coverage_gaps.is_empty() {
         let labels = coverage_gaps
             .iter()
             .map(|gap| gap.label())
             .collect::<Vec<_>>()
             .join(" · ");
-        lines.push(format!("  Not timed separately · {labels}"));
+        lines.push(format!(
+            "  Coverage · timing dimensions unavailable: {labels}"
+        ));
     }
 
     if let Some(summary) = provider_usage_summary(&graph) {
         lines.push(format!("  {summary}"));
     }
 
-    append_tree(&graph, &clocks, &mut lines, verbose);
     append_diagnostics(&graph, &mut lines);
     lines.join("\n")
 }
@@ -173,7 +176,7 @@ fn append_tree(
             if verbose && let Some(context) = &node.context {
                 if let Some(budget) = &context.budget {
                     lines.push(format!(
-                        "{}Request estimate · {} input / {} effective limit · {} system · {} tool schemas · {} requested output · {} protocol reserve · {} model context · {} visible tools",
+                        "{}Request budget · pre-provider estimate · {} input / {} effective limit · {} system · {} tool schemas · {} requested output · {} protocol reserve · {} model context · {} visible tools",
                         detail_prefix(&ancestor_has_sibling, last),
                         format_tokens(budget.estimated_input_tokens),
                         format_tokens(budget.effective_input_limit_tokens),
@@ -196,6 +199,24 @@ fn append_tree(
                         ));
                     }
                 }
+            }
+            if verbose && !node.dependency_node_ids.is_empty() {
+                let dependencies = node
+                    .dependency_indices
+                    .iter()
+                    .map(|index| {
+                        index
+                            .and_then(|index| graph.nodes().get(index))
+                            .map(|dependency| safe_label(&dependency.label))
+                            .unwrap_or_else(|| "unrecorded stage".to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                lines.push(format!(
+                    "{}Dependencies · {}",
+                    detail_prefix(&ancestor_has_sibling, last),
+                    dependencies
+                ));
             }
 
             let mut children = graph.children(index).to_vec();
@@ -323,12 +344,12 @@ fn tree_prefix(ancestors: &[bool], last: bool) -> String {
 }
 
 fn detail_prefix(ancestors: &[bool], last: bool) -> String {
-    let mut prefix = String::from("  ");
-    for has_sibling in ancestors {
-        prefix.push_str(if *has_sibling { "│  " } else { "   " });
+    let mut prefix = tree_prefix(ancestors, last);
+    if let Some(index) = prefix.rfind("├─ ") {
+        prefix.replace_range(index.., "·  ");
+    } else if let Some(index) = prefix.rfind("└─ ") {
+        prefix.replace_range(index.., "·  ");
     }
-    prefix.push_str(if last { "   " } else { "│  " });
-    prefix.push_str("   ");
     prefix
 }
 
@@ -678,7 +699,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            output.contains("Not timed separately · child-run timing · tool I/O wait breakdown"),
+            output.contains("Coverage · timing dimensions unavailable: child-run timing · tool I/O wait breakdown"),
             "{output}"
         );
     }
