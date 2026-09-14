@@ -509,6 +509,12 @@ pub enum Criterion {
         max_identity_transitions_per_run: u32,
     },
 
+    /// Checks token-weighted reuse of the runtime-estimated stable system/tool
+    /// prefix against provider-reported cache reads. It only counts feedback
+    /// observations with `provider-prefix-v1`; total request cache reads may
+    /// include a growing or provider-evicted conversation history.
+    ProviderStablePrefixCacheCoverage { min: f64, min_observations: u32 },
+
     /// Internal hard gate injected when a case declares
     /// `required_cache_scope`. It proves the requested reuse boundary from
     /// durable provider usage rather than trusting model metadata or a soft
@@ -690,6 +696,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalToolCalled { optional: true, .. }
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. } => CriterionSeverity::Quality,
+        Criterion::ProviderStablePrefixCacheCoverage { .. } => CriterionSeverity::Quality,
     }
 }
 
@@ -895,6 +902,7 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::PipelineAvgCacheHitRatio { .. }
         | Criterion::ProviderPromptCacheReadRatio { .. }
         | Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
+        | Criterion::ProviderStablePrefixCacheCoverage { .. }
         | Criterion::PromptCacheReuseScope { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_session_capture(criteria)
@@ -3273,6 +3281,39 @@ fn evaluate_one(
                 }
             },
         },
+        Criterion::ProviderStablePrefixCacheCoverage {
+            min,
+            min_observations,
+        } => match session {
+            None => missing_required_session(c, "provider stable-prefix cache coverage"),
+            Some(capture) => {
+                let report = analyze_pipeline_health(capture);
+                let enough_observations =
+                    report.provider_prefix_cache_observations >= *min_observations;
+                let coverage_ok = report
+                    .stable_prefix_cache_coverage
+                    .is_some_and(|coverage| coverage >= *min || (coverage - *min).abs() <= 1e-12);
+                let evidence_valid = report.invalid_events == 0;
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: evidence_valid && enough_observations && coverage_ok,
+                    detail: format!(
+                        "provider_stable_prefix_cache_coverage={:.2}% (read={}, eligible={}, provider-prefix observations={}, eligible observations={}, invalid events={}), expected >= {:.2}% and observations >= {}",
+                        report.stable_prefix_cache_coverage.unwrap_or_default() * 100.0,
+                        report.stable_prefix_cache_read_tokens,
+                        report.stable_prefix_cache_eligible_tokens,
+                        report.provider_prefix_cache_observations,
+                        report.stable_prefix_cache_observations,
+                        report.invalid_events,
+                        min * 100.0,
+                        min_observations,
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            }
+        },
         Criterion::PipelineAlertCount {
             rule,
             max,
@@ -4017,6 +4058,22 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             if *min_pairs == 0 {
                 return Err(
                     "ProviderPromptCacheReadNonregressionRatio.min_pairs must be >= 1".into(),
+                );
+            }
+            Ok(())
+        }
+        Criterion::ProviderStablePrefixCacheCoverage {
+            min,
+            min_observations,
+        } => {
+            if !min.is_finite() || *min < 0.0 || *min > 1.0 {
+                return Err(format!(
+                    "ProviderStablePrefixCacheCoverage.min must be finite in [0.0, 1.0]; got {min}"
+                ));
+            }
+            if *min_observations == 0 {
+                return Err(
+                    "ProviderStablePrefixCacheCoverage.min_observations must be >= 1".into(),
                 );
             }
             Ok(())
@@ -5113,6 +5170,18 @@ mod tests {
         pipeline_feedback_event_for_run("run-1", round, cache_identity, prompt, cache_read)
     }
 
+    fn provider_prefix_cache_event(
+        round: u32,
+        fresh: u64,
+        cache_read: u64,
+        eligible_prefix: u64,
+    ) -> serde_json::Value {
+        let mut event = pipeline_feedback_event(round, "prefix-a", fresh, cache_read);
+        event["metadata"]["runtime_feedback"]["context"]["estimated_cache_eligible_tokens"] =
+            serde_json::json!(eligible_prefix);
+        event
+    }
+
     fn pipeline_feedback_event_for_run(
         run_id: &str,
         round: u32,
@@ -5123,7 +5192,7 @@ mod tests {
         let cache_identity = astra_turn_types::PromptCacheIdentityV1::from_prefixes(
             &[serde_json::json!(cache_identity)],
             &[],
-            "openai-stable-prefix-v1",
+            "provider-prefix-v1",
         )
         .expect("valid cache identity fixture");
         serde_json::json!({
@@ -6310,6 +6379,60 @@ mod tests {
     }
 
     #[test]
+    fn stable_prefix_coverage_ignores_total_cache_read_variation_from_history() {
+        let sess = mk_session(&[
+            (
+                "pipeline_feedback",
+                provider_prefix_cache_event(1, 500, 27_136, 8_150),
+            ),
+            (
+                "pipeline_feedback",
+                provider_prefix_cache_event(2, 25_000, 8_448, 8_150),
+            ),
+        ]);
+        let results = evaluate_deterministic_with_session(
+            &[
+                Criterion::ProviderStablePrefixCacheCoverage {
+                    min: 0.95,
+                    min_observations: 2,
+                },
+                Criterion::ProviderPromptCacheReadNonregressionRatio {
+                    min: 0.95,
+                    min_pairs: 1,
+                    max_identity_transitions_per_run: 0,
+                },
+            ],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(results[0].passed, "{:?}", results[0]);
+        assert_eq!(results[0].severity, CriterionSeverity::Quality);
+        assert!(results[0].detail.contains("provider-prefix observations=2"));
+        assert!(!results[1].passed, "the raw count metric remains available");
+        assert!(results[1].detail.contains("worst=31.13%"));
+    }
+
+    #[test]
+    fn stable_prefix_coverage_requires_multiple_measured_prefix_observations() {
+        let sess = mk_session(&[(
+            "pipeline_feedback",
+            provider_prefix_cache_event(1, 100, 9_000, 9_000),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderStablePrefixCacheCoverage {
+                min: 0.95,
+                min_observations: 2,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(!result[0].passed);
+        assert!(result[0].detail.contains("observations=1"));
+    }
+
+    #[test]
     fn cache_read_nonregression_uses_only_its_unambiguous_discriminator() {
         let value = serde_json::json!({
             "type": "provider_prompt_cache_read_nonregression_ratio",
@@ -6330,6 +6453,26 @@ mod tests {
         let error = serde_yaml_ng::from_str::<Criterion>(&obsolete.to_string())
             .expect_err("misleading discriminator must not remain an alias");
         assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn stable_prefix_coverage_criterion_round_trips() {
+        let value = serde_json::json!({
+            "type": "provider_stable_prefix_cache_coverage",
+            "min": 0.95,
+            "min_observations": 2
+        });
+        let criterion: Criterion = serde_yaml_ng::from_str(&value.to_string())
+            .expect("stable-prefix coverage criterion parses");
+
+        assert!(matches!(
+            criterion,
+            Criterion::ProviderStablePrefixCacheCoverage {
+                min_observations: 2,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(criterion).unwrap(), value);
     }
 
     #[test]
@@ -9080,5 +9223,23 @@ mod tests {
             let error = validate_criterion(&criterion).expect_err("invalid ratio must fail");
             assert!(error.contains("finite in [0.0, 1.0]"), "{error}");
         }
+    }
+
+    #[test]
+    fn stable_prefix_coverage_rejects_invalid_bounds() {
+        for min in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            let criterion = Criterion::ProviderStablePrefixCacheCoverage {
+                min,
+                min_observations: 1,
+            };
+            let error = validate_criterion(&criterion).expect_err("invalid ratio must fail");
+            assert!(error.contains("finite in [0.0, 1.0]"), "{error}");
+        }
+        let criterion = Criterion::ProviderStablePrefixCacheCoverage {
+            min: 0.95,
+            min_observations: 0,
+        };
+        let error = validate_criterion(&criterion).expect_err("zero observations must fail");
+        assert!(error.contains("min_observations must be >= 1"), "{error}");
     }
 }

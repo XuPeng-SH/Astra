@@ -22,18 +22,28 @@ pub struct PipelineHealthReport {
     /// Average billable cache-read share across all turns.
     pub avg_cache_hit_ratio: f64,
     /// Sum of the runtime's stable provider-prefix estimates for feedback
-    /// turns that carried both an estimate and request usage.
+    /// observations with actual request usage and a `provider-prefix-v1`
+    /// identity.
     #[serde(default)]
     pub stable_prefix_cache_eligible_tokens: u64,
+    /// Number of cache observations with an eligible-prefix estimate and
+    /// provider usage. This includes layouts that cannot be certified as a
+    /// contiguous provider prefix.
+    #[serde(default)]
+    pub stable_prefix_cache_observations: u32,
+    /// Number of observations whose typed identity declares the contiguous
+    /// `provider-prefix-v1` layout used by stable-prefix coverage.
+    #[serde(default)]
+    pub provider_prefix_cache_observations: u32,
     /// Cache-read tokens attributable to the stable prefix under the
     /// `provider-prefix-v1` layout. Reads are capped at the corresponding
     /// eligible prefix so conversation-history caching cannot inflate this
     /// diagnostic above 100%.
     #[serde(default)]
     pub stable_prefix_cache_read_tokens: u64,
-    /// Token-weighted stable-prefix coverage. `None` means no feedback turn
-    /// exposed the typed stable-prefix estimate; it must not be rendered as a
-    /// zero-hit cache.
+    /// Token-weighted stable-prefix coverage. `None` means no supported
+    /// provider-prefix observation exposed the typed estimate; it must not be
+    /// rendered as a zero-hit cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_prefix_cache_coverage: Option<f64>,
     /// Number of compaction events recorded.
@@ -104,13 +114,25 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                 if let (Some(eligible), Some(usage)) = (
                     frame.context.estimated_cache_eligible_tokens,
                     frame.request_usage.as_ref(),
-                ) {
-                    report.stable_prefix_cache_eligible_tokens = report
-                        .stable_prefix_cache_eligible_tokens
-                        .saturating_add(eligible);
-                    report.stable_prefix_cache_read_tokens = report
-                        .stable_prefix_cache_read_tokens
-                        .saturating_add(usage.cache_read.min(eligible));
+                ) && eligible > 0
+                {
+                    report.stable_prefix_cache_observations =
+                        report.stable_prefix_cache_observations.saturating_add(1);
+                    if frame
+                        .context
+                        .prompt_cache_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.cache_layout == "provider-prefix-v1")
+                    {
+                        report.provider_prefix_cache_observations =
+                            report.provider_prefix_cache_observations.saturating_add(1);
+                        report.stable_prefix_cache_eligible_tokens = report
+                            .stable_prefix_cache_eligible_tokens
+                            .saturating_add(eligible);
+                        report.stable_prefix_cache_read_tokens = report
+                            .stable_prefix_cache_read_tokens
+                            .saturating_add(usage.cache_read.min(eligible));
+                    }
                 }
             }
             "llm_response_full" => {
@@ -370,10 +392,11 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
     ));
     if let Some(coverage) = report.stable_prefix_cache_coverage {
         out.push_str(&format!(
-            "  Stable-prefix cache coverage: {:.1}% ({}/{} tokens, provider-prefix-v1)\n",
+            "  Stable-prefix cache coverage: {:.1}% ({}/{} tokens, {} provider-prefix-v1 observations)\n",
             coverage * 100.0,
             report.stable_prefix_cache_read_tokens,
             report.stable_prefix_cache_eligible_tokens,
+            report.provider_prefix_cache_observations,
         ));
     }
     if report.invalid_events > 0 {
@@ -439,6 +462,9 @@ mod tests {
     fn make_feedback_event(turn: u32, cache_hit_ratio: f64) -> JournalEvent {
         let cache_read = (cache_hit_ratio * 1_000.0).round() as u64;
         let fresh = 1_000u64.saturating_sub(cache_read);
+        let prompt_cache_identity =
+            astra_turn_types::PromptCacheIdentityV1::from_prefixes(&[], &[], "provider-prefix-v1")
+                .expect("valid provider-prefix identity");
         JournalEvent {
             event_type: "pipeline_feedback".into(),
             raw: serde_json::json!({
@@ -464,6 +490,7 @@ mod tests {
                             "slice_rounds_remaining": 9
                         },
                         "context": {
+                            "prompt_cache_identity": prompt_cache_identity,
                             "token_pressure": 0.1,
                             "compaction_tier": "normal"
                         },
@@ -672,10 +699,36 @@ mod tests {
 
         assert_eq!(report.stable_prefix_cache_eligible_tokens, 1_600);
         assert_eq!(report.stable_prefix_cache_read_tokens, 1_300);
+        assert_eq!(report.stable_prefix_cache_observations, 2);
+        assert_eq!(report.provider_prefix_cache_observations, 2);
         assert_eq!(report.stable_prefix_cache_coverage, Some(0.8125));
         let rendered = render_pipeline_health(&report);
         assert!(rendered.contains("Avg billable cache-read share"));
         assert!(rendered.contains("Stable-prefix cache coverage: 81.2%"));
+        assert!(rendered.contains("2 provider-prefix-v1 observations"));
+    }
+
+    #[test]
+    fn stable_prefix_coverage_does_not_claim_non_prefix_layouts() {
+        let mut event = make_feedback_event(1, 0.9);
+        event.raw["metadata"]["runtime_feedback"]["context"]["estimated_cache_eligible_tokens"] =
+            serde_json::json!(800);
+        event.raw["metadata"]["runtime_feedback"]["context"]["prompt_cache_identity"] =
+            serde_json::to_value(
+                astra_turn_types::PromptCacheIdentityV1::from_prefixes(
+                    &[],
+                    &[],
+                    "explicit-breakpoints-v1",
+                )
+                .expect("valid explicit-breakpoint identity"),
+            )
+            .expect("identity serializes");
+
+        let report = analyze_pipeline_health(&make_capture(vec![event]));
+
+        assert_eq!(report.stable_prefix_cache_observations, 1);
+        assert_eq!(report.provider_prefix_cache_observations, 0);
+        assert_eq!(report.stable_prefix_cache_coverage, None);
     }
 
     #[test]

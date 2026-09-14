@@ -22984,6 +22984,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn impossible_work_mutation_timing_is_repaired_before_admission() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let impossible = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[2],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
+        let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[1],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                impossible.to_string(),
+                repaired.to_string(),
+            ])),
+            requests: requests.clone(),
+        }));
+
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "Deliver A, retire B, and add C after A".to_string(),
+                turn_count: 1,
+                recent_tools: Vec::new(),
+                has_prior_assistant_turn: false,
+                ..Default::default()
+            })
+            .await
+            .expect("one corrected graph must be admitted");
+        let astra_services::WorkAdmissionDecision::Required {
+            deferred_graph_mutations,
+            ..
+        } = decision
+        else {
+            panic!("expected required Work");
+        };
+        assert_eq!(deferred_graph_mutations.len(), 2);
+        assert_eq!(deferred_graph_mutations[0].after_initial_tasks(), &[1]);
+        assert_eq!(deferred_graph_mutations[1].after_initial_tasks(), &[1]);
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2, "graph repair is bounded to one retry");
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("Work mutation trigger delivery is not guaranteed")
+                })
+        }));
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("Validated typed boundary")
+                        && text.contains("\"work_lifecycle\":\"required\"")
+                        && text.contains("\"activation\":\"start\"")
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn missing_work_mutation_target_repairs_once_or_remains_malformed() {
         let malformed = json!({
             "work_lifecycle":"required", "workspace_mutation":"read_only", "activation":"start",

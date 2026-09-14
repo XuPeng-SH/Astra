@@ -17,9 +17,9 @@ prompt: |
   hint, and omit scope and boundary because the runtime binds them. Do not run
   tool_search in this boundary; its runtime hint supplies the exact schema and
   invocation authority. Deliberately make this first boundary submission
-  invalid by setting remaining_gaps item 2 to a string longer than 256
-  characters while keeping item 1 schema-valid. For item 2, use exactly the
-  257-character string "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx". Wait for the runtime's explicit one-time schema-correction instruction, change only the remaining_gaps field to [] because the direct read resolves the request, and submit once more under the same active boundary. Do not make any workspace changes.
+  invalid by setting remaining_gaps to an array containing only a string
+  longer than 256 characters. Use exactly the 257-character string
+  "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx". Wait for the runtime's explicit one-time schema-correction instruction, change only the remaining_gaps field to [] because the direct read resolves the request, and submit once more under the same active boundary. Do not make any workspace changes.
   In the final answer, report the
   observed first line and distinguish the failed command attempt from the
   successful direct read.
@@ -56,7 +56,7 @@ criteria:
   - type: journal_tool_json
     name: submit_task_resolution
     document: arguments
-    path: /remaining_gaps/1
+    path: /remaining_gaps/0
     equals: "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   - type: journal_tool_json
     name: submit_task_resolution

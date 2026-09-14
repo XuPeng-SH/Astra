@@ -16,17 +16,19 @@ description: |
   the user.
 prompt: |
   In `target/astra-harness-recovery/service.conf`, raise `max_workers` from 1
-  to 4. First run
-  `bash target/astra-harness-recovery/verify.sh` to capture the current
-  failing baseline. Then make the change, rerun the same check, inspect the
+  to 4. First run `bash target/astra-harness-recovery/verify.sh` as a
+  standalone Bash command to capture the current failing baseline. Do not
+  append `echo`, `;`, `&&`, or another command that masks its exit status.
+  Then make the change, rerun the same check, inspect the
   final file, and give me a concise user-facing summary of what changed and
   the final verification result.
 prompt_variants:
   - id: natural
     prompt: |
       Please fix `target/astra-harness-recovery/service.conf` so
-      `max_workers=4`. Confirm the existing check fails before the edit, make
-      the change, run `bash target/astra-harness-recovery/verify.sh` again,
+      `max_workers=4`. Run `bash target/astra-harness-recovery/verify.sh` alone,
+      without chaining or an `echo` that masks its exit status, and confirm it
+      fails before the edit. Then make the change and run the same command again,
       inspect the result, and briefly tell me the outcome.
 models:
   - deepseek-v4-flash
@@ -43,23 +45,16 @@ teardown_cmd: "rm -rf target/astra-harness-recovery"
 criteria:
   - type: exit_code
     code: 0
-  - type: any_of
-    criteria:
-      - type: journal_tool_outcome_count
-        name: bash
-        ok: false
-        min: 1
-        max: 3
-      - type: journal_tool_json_contains
-        name: bash
-        document: result
-        path: ""
-        contains: "exit=1"
-      - type: journal_tool_json_contains
-        name: bash
-        document: result
-        path: ""
-        contains: "EXIT=1"
+  - type: journal_tool_outcome_count
+    name: bash
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_json_contains
+    name: bash
+    document: result
+    path: ""
+    contains: "exit code 1"
   - type: journal_tool_outcome_count
     name: bash
     ok: true
@@ -94,10 +89,9 @@ criteria:
       - type: tokens_between
         min: 1000
         max: 300000
-      - type: provider_prompt_cache_read_ratio
+      - type: provider_stable_prefix_cache_coverage
         min: 0.95
-        warmup_turns: 0
-        warmup_rounds: 1
+        min_observations: 2
       - type: duration_between
         min_ms: 1000
         max_ms: 45000
