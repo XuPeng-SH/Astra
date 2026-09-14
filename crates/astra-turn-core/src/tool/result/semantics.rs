@@ -249,10 +249,12 @@ const TRANSIENT_ERROR_PATTERNS: &[&str] = &[
 
 /// Check whether a tool name refers to a mutation tool (may leave side effects).
 ///
-/// Uses the canonical [`crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS`] list
+/// Uses canonical tool mutation categories and approval requirements
 /// plus MCP tools (`mcp_*` prefix) which run external server code with unknown side effects.
 fn is_mutation_tool(tool: &str) -> bool {
-    crate::cloud::approval_policy::is_cloud_approval_required(tool) || tool.starts_with("mcp_")
+    crate::tool::categories::registry().is_mutating_for(tool, None)
+        || crate::cloud::approval_policy::is_cloud_approval_required(tool)
+        || tool.starts_with("mcp_")
 }
 
 /// Well-known hard error patterns that SHOULD trigger rollback.
@@ -468,97 +470,6 @@ pub(crate) fn canonical_tool_identity_parts(name: &str, args: &Value) -> (String
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
-    if name == "git_diff" {
-        let mut canonical = serde_json::Map::new();
-        canonical.insert("action".to_string(), Value::String("diff".to_string()));
-        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
-            canonical.insert("staged".to_string(), Value::Bool(true));
-        }
-        if args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            canonical.insert("stat_only".to_string(), Value::Bool(true));
-        }
-        if let Some(base_ref) = args
-            .get("base_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
-        }
-        if let Some(git_ref) = args
-            .get("ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "HEAD")
-        {
-            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
-        }
-        if let Some(path) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| path.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("path".to_string(), Value::String(path));
-        }
-        return Some(("git".to_string(), Value::Object(canonical)));
-    }
-    if name == "git"
-        && args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "status")
-    {
-        return Some(("git".to_string(), serde_json::json!({"action": "status"})));
-    }
-    if name == "git"
-        && args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "diff")
-    {
-        let mut canonical = serde_json::Map::new();
-        canonical.insert("action".to_string(), Value::String("diff".to_string()));
-        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
-            canonical.insert("staged".to_string(), Value::Bool(true));
-        }
-        if args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            canonical.insert("stat_only".to_string(), Value::Bool(true));
-        }
-        if let Some(base_ref) = args
-            .get("base_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
-        }
-        if let Some(git_ref) = args
-            .get("ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "HEAD")
-        {
-            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
-        }
-        if let Some(path) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| path.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("path".to_string(), Value::String(path));
-        }
-        return Some(("git".to_string(), Value::Object(canonical)));
-    }
     if name != "bash" {
         return None;
     }
@@ -602,8 +513,9 @@ mod tests {
 
     #[test]
     fn health_identity_preserves_canonical_aliases_without_argument_strings() {
-        let alias = tool_health_identity("git_diff", &json!({"path":"src/"}));
-        let canonical = tool_health_identity("git", &json!({"action":"diff","path":"src"}));
+        let alias = tool_health_identity("bash", &json!({"command":"git diff -- src/"}));
+        let canonical =
+            tool_health_identity("bash", &json!({"command":"git --no-pager diff -- src"}));
         assert_eq!(alias, canonical);
         assert_eq!(alias.tool_name(), "git");
         let identity = tool_health_identity("bash", &json!({"command":"SECRET_ARGUMENT_SENTINEL"}));
@@ -965,40 +877,19 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_canonicalizes_simple_bash_git_diff_command() {
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff HEAD"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git --no-pager diff --stat"})),
-            tool_dedup_signature("git", &json!({"action": "diff", "stat_only": true}))
+            tool_dedup_signature("bash", &json!({"command": "git diff --stat"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff -- src/"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
-            )
-        );
-    }
-
-    #[test]
-    fn tool_dedup_signature_canonicalizes_structured_git_diff_tool() {
-        assert_eq!(
-            tool_dedup_signature("git_diff", &json!({"path": "src/", "ref": "HEAD"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
-            )
-        );
-        assert_eq!(
-            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "main"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "main"})
-            )
+            tool_dedup_signature("bash", &json!({"command": "git --no-pager diff -- src"}))
         );
     }
 
@@ -1006,7 +897,7 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_does_not_canonicalize_compound_bash_commands() {
         assert_ne!(
             tool_dedup_signature("bash", &json!({"command": "git diff | head"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
     }
 
@@ -1125,9 +1016,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git action timeout
+        // worktree lifecycle timeout
         assert_eq!(
-            classify_tool_error("git", output),
+            classify_tool_error("worktree", output),
             ToolErrorSeverity::HardError
         );
 
@@ -1210,7 +1101,7 @@ if let Err(e) = writeln!(file, "{line}") {
         let output = "Error: connection refused";
         // Read-only → SoftError
         assert_eq!(
-            classify_tool_error("curl", output),
+            classify_tool_error("web_fetch", output),
             ToolErrorSeverity::SoftError
         );
         // Mutation → HardError

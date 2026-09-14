@@ -437,7 +437,7 @@ pub fn build_volatile_environment_context(project_root: &Path) -> String {
 
     // 3 commits is the sweet spot: enough for the model to orient on
     // recent work ("what did I just do?") without spending ~160c/turn on
-    // ancient history that git(action=log/show) can fetch on demand. The cap
+    // ancient history that shell git log/show can fetch on demand. The cap
     // was 5; observed volatile-block sessions (69657ca7) showed commits
     // 4-5 were always just context noise the model never cited.
     let recent_commit_limit = recent_commit_limit_for_dirty(dirty);
@@ -474,29 +474,7 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         "shell_exec" | "bash" => command_hint_from_args(args).map(String::from),
-        "git" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            match action {
-                "diff" => {
-                    let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
-                    let file = args.get("file").and_then(|v| v.as_str());
-                    match file {
-                        Some(f) => Some(format!("{base} -- {f}")),
-                        None => Some(base.to_string()),
-                    }
-                }
-                "log" | "show" => args
-                    .get("ref")
-                    .or_else(|| args.get("commit"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                "blame" => args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                _ => None,
-            }
-        }
+
         "memory" => {
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
             match action {
@@ -869,7 +847,7 @@ mod tests {
     /// The volatile lane runs on every turn; each extra commit adds ~80c.
     /// Trim from 5→3 saved ~160c per session (observed in 69657ca7) and
     /// 3 has consistently been the "what did I just do?" sweet spot for
-    /// the model — anything older is better fetched via git(action=log) on demand.
+    /// the model — anything older is better fetched via shell git log on demand.
     #[test]
     fn volatile_context_caps_recent_commits_at_three() {
         let cwd = std::env::current_dir().unwrap();

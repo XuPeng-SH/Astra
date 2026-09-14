@@ -150,6 +150,22 @@ if [[ "$(grep -c 'HOST_UID:.*UID' "$compose_file")" -ne 2 ]] ||
     exit 1
 fi
 
+# The local API launcher must use the server's core readiness contract. An
+# optional dependency may make /health report `degraded`; treating that as a
+# startup failure strands dev-seed for the full timeout and then kills a
+# usable API process.
+start_api="$repo_root/scripts/dev/start-api.sh"
+if ! grep -Fq 'READY_URL="http://127.0.0.1:${API_PORT}/ready"' "$start_api" ||
+    ! grep -Fq 'api_ready() {' "$start_api" ||
+    ! grep -Fq 'Waiting for API readiness' "$start_api"; then
+    echo "setup contract failed: local API startup is not gated by /ready" >&2
+    exit 1
+fi
+if grep -Fq '"status":"healthy"' "$start_api"; then
+    echo "setup contract failed: local API startup still requires optional health status" >&2
+    exit 1
+fi
+
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" "openai"
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_API_KEY" " # still empty"
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" " # still empty"

@@ -47,7 +47,7 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
-    // Consolidated action tools: git, github, memory, session, agent.
+    // Canonical public tools.
     for expected in &[
         "bash",
         "read_file",
@@ -56,8 +56,6 @@ fn tool_schemas_include_core_tools() {
         "list_dir",
         "grep",
         "glob",
-        "git",
-        "github",
         "memory",
         "session",
         "mo_query",
@@ -161,8 +159,8 @@ fn schemas_include_consolidated_tools() {
         })
         .collect();
     // Consolidated tools cover the old individual tools
-    assert!(names.contains(&"git"), "missing git schema");
-    assert!(names.contains(&"github"), "missing github schema");
+    assert!(!names.contains(&"git"));
+    assert!(!names.contains(&"github"));
     assert!(names.contains(&"lsp"), "missing lsp schema");
     assert!(names.contains(&"agent"), "missing agent schema");
 }
@@ -170,26 +168,6 @@ fn schemas_include_consolidated_tools() {
 // Transaction fields (transaction_id, rollback_on_failure) have been removed
 // from tool schemas as part of the tool consolidation. Transaction support is
 // now handled at the execution layer, not advertised per-schema.
-
-#[test]
-fn git_schema_exposes_stash_operation() {
-    let schemas = all_tool_schemas();
-    let git_schema = schemas
-        .iter()
-        .find(|schema| schema["function"]["name"].as_str() == Some("git"))
-        .expect("missing consolidated git schema");
-    let actions = git_schema["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("missing git action enum");
-    assert!(
-        actions.iter().any(|v| v.as_str() == Some("stash")),
-        "git schema should have stash action"
-    );
-    assert!(
-        actions.iter().any(|v| v.as_str() == Some("revert_commit")),
-        "git schema should have revert_commit action"
-    );
-}
 
 // ── Conditional required (allOf/if-then) regression guards ──────────────
 //
@@ -304,77 +282,6 @@ fn agent_other_actions_have_conditional_required() {
     assert_eq!(
         conditional_required_for(agent, "send_message"),
         vec!["to".to_string(), "message".to_string()]
-    );
-}
-
-#[test]
-fn git_commit_and_revert_actions_declare_required_fields() {
-    let schemas = all_tool_schemas();
-    let git = tool_schema(&schemas, "git");
-    assert_eq!(
-        conditional_required_for(git, "blame"),
-        vec!["path".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "commit"),
-        vec!["message".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "revert_commit"),
-        vec!["commit_sha".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "file_history"),
-        vec!["file".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "log_search"),
-        vec!["query".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "checkout_file"),
-        vec!["path".to_string(), "ref".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "stash"),
-        vec!["sub_action".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "worktree"),
-        vec!["sub_action".to_string()]
-    );
-    let worktree_sub_actions =
-        git["function"]["parameters"]["x-astra-per-action-sub-actions"]["worktree"]
-            .as_array()
-            .expect("git worktree sub_action contract")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>();
-    assert_eq!(
-        worktree_sub_actions,
-        astra_tools::git_tool_contract::GIT_WORKTREE_SUB_ACTIONS
-    );
-}
-
-#[test]
-fn github_schema_requires_pr_issue_numbers_and_title() {
-    let schemas = all_tool_schemas();
-    let gh = tool_schema(&schemas, "github");
-    assert_eq!(
-        conditional_required_for(gh, "get_pr"),
-        vec!["pr_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "ci_status"),
-        vec!["pr_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "get_issue"),
-        vec!["issue_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "create_issue"),
-        vec!["title".to_string()]
     );
 }
 
@@ -643,11 +550,17 @@ fn local_cli_catalog_exposes_the_root_work_lifecycle() {
         "web_search",
         "bash",
         "read_file",
-        "git",
+        "worktree",
     ] {
         assert!(
             names.iter().any(|visible| visible == name),
             "local CLI runtime catalog should expose `{name}`: {names:?}"
+        );
+    }
+    for duplicate in ["git", "github"] {
+        assert!(
+            !names.iter().any(|name| name == duplicate),
+            "local Bash replaces duplicate {duplicate}"
         );
     }
     for name in ["start_work", "run_next_work_item", "inspect_work_plan"] {
@@ -667,7 +580,7 @@ fn cli_runtime_catalog_includes_plan_mode_wrappers() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, false, false),
+        &crate::edge_tools::cli_default_capabilities(false, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -687,7 +600,7 @@ fn cli_runtime_catalog_hides_background_task_tools_without_registry() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, false, false),
+        &crate::edge_tools::cli_default_capabilities(false, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -706,7 +619,7 @@ fn cli_runtime_catalog_includes_background_task_tools_with_registry() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, true, false),
+        &crate::edge_tools::cli_default_capabilities(false, true),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))

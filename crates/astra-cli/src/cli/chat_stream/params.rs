@@ -617,14 +617,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) database_snapshot_journal: Option<
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     >,
-    /// Session-scoped git stash rollback journal — shared with ToolExecutors for
-    /// bounded repo-state rollback support across turns.
-    pub(crate) git_stash_journal:
-        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>>,
-    /// Session-scoped git commit rollback journal — shared with ToolExecutors for
-    /// bounded committed-history rollback support across turns.
-    pub(crate) git_commit_journal:
-        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>>,
+
     /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
     /// bounded clean worktree cleanup across turns.
     pub(crate) git_worktree_journal:
@@ -804,8 +797,7 @@ impl<'a> ChatTurnParams<'a> {
             file_journal: None,
             file_state: None,
             database_snapshot_journal: None,
-            git_stash_journal: None,
-            git_commit_journal: None,
+
             git_worktree_journal: None,
             session_state_journal: None,
             bg_task_commands: ctx.bg_task_commands.clone(),

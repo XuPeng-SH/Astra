@@ -2,7 +2,7 @@
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
-//!        git(action=...), github(action=...), web_fetch, mo_query.
+//!        worktree, web_fetch, mo_query.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -70,7 +70,6 @@ pub enum SandboxExpansionError {
 }
 
 use crossterm::style::Stylize;
-use reqwest::Client;
 use serde_json::{Value, json};
 
 #[path = "edge_tools/agent_messaging.rs"]
@@ -85,17 +84,11 @@ pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 pub(crate) use astra_tools::fuzzy_replacer;
-#[path = "edge_tools/git_gix.rs"]
-mod git_gix;
-#[path = "edge_tools/github.rs"]
-mod github;
 #[path = "edge_tools/lsp_stdio_session.rs"]
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
 use astra_tools::passive_cargo_check;
-pub(crate) use git_gix::GitCommitRollbackJournal;
-pub(crate) use git_gix::GitStashRollbackJournal;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -190,13 +183,11 @@ fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
 pub fn cli_default_capabilities(
     has_agent_spawner: bool,
     has_local_background_tasks: bool,
-    has_github_auth: bool,
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     CapabilitySet::empty()
         .with(Capability::MemoryService)
         .with(Capability::Database)
-        .with_if(has_github_auth, Capability::GitHubAuth)
         .with(Capability::LSPServer)
         .with(Capability::SkillsCatalog)
         .with(Capability::PlanLifecycle)
@@ -214,6 +205,7 @@ struct CliCapabilityView {
     capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
 }
 
+/// Authorized inventory for registry/provider setup before request restrictions.
 pub fn local_tool_schemas() -> Vec<Value> {
     local_runtime_tool_schemas(all_tool_schemas())
 }
@@ -223,7 +215,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
-/// Read-only tools (read_file, grep, glob, git(action=status/diff/log)) and
+/// Read-only tools (read_file, grep, glob) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
@@ -291,9 +283,6 @@ mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
-use worktree::detect_git_remote_repos;
-#[cfg(test)]
-use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]
 pub(crate) mod memoria;
 #[cfg(test)]
@@ -362,7 +351,7 @@ pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
 const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
 
 /// Soft threshold at which aggregate-aware gating starts warning.
-/// Tools that produce large output (read_file, git(action=show)) will check this
+/// Tools that produce large output (read_file) will check this
 /// before doing I/O and suggest lighter alternatives when exceeded.
 const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
@@ -400,7 +389,7 @@ fn cli_tool_output_is_error(output: &str) -> bool {
         == astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
 }
 
-pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
+pub(crate) use astra_tools::execution_outcome::ToolExecutionOutcome;
 
 pub(crate) fn nonexecuted_tool_result_fields(
     disposition: astra_services::session_journal::ToolCallDisposition,
@@ -1309,24 +1298,16 @@ pub struct ToolExecutor {
     pub cloud_base: Option<String>,
     /// Auth token for cloud proxy calls.
     cloud_token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
-    /// Optional GitHub token for authenticated GitHub API requests.
-    pub github_token: Option<String>,
-    /// Shared async GitHub client for edge tools.
-    pub github_client: Client,
+
     /// Security sandbox policy for tool execution (None = Permissive/legacy).
     ///
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
-    /// Preferred repos for disambiguation (owner/repo format, lowercased).
-    /// Populated from: git remote origin, recent tool results, memory.
-    /// When a bare repo name like "memoria" matches multiple GitHub repos,
-    /// the resolver prefers repos whose owner/name is in this list.
-    /// Uses Mutex to allow learning from resolved repos without &mut self.
-    preferred_repos: std::sync::Mutex<Vec<String>>,
+
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
-    /// variable-size output (git(action=diff), git(action=show)) to scale their limits.
+    /// variable-size output to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
     /// Build/test iteration tracker — tracks error deltas across fix cycles.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
@@ -1378,12 +1359,7 @@ pub struct ToolExecutor {
     /// executor can perform a bounded restore without reconstructing tool history.
     pub(crate) database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
-    /// Git stash rollback journal — records captured stash handles so bounded
-    /// turn/batch rollback can re-apply shelved working tree state.
-    pub git_stash_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
-    /// Git commit rollback journal — records captured commit handles so bounded
-    /// turn/batch rollback can revert recent committed history when it is still safe.
-    pub git_commit_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
+
     /// Git worktree rollback journal — records newly created worktrees so bounded
     /// turn/batch rollback can remove them again while they are still clean.
     pub(crate) git_worktree_journal:
@@ -1519,7 +1495,6 @@ pub struct ToolExecutor {
 impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
-        let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
         let executor = Self {
             project_root: root.clone(),
@@ -1527,21 +1502,14 @@ impl ToolExecutor {
             cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
             // memory-resident secrets from lingering after drop.
-            github_token: astra_tools::github::resolve_github_token(),
+
             // GitHub API is external traffic (api.github.com), so it honours
             // HTTPS_PROXY/ALL_PROXY via the authoritative helper in astra_core::net.
             // See core/src/net.rs for the workspace proxy policy (3e3d6fa8).
-            github_client: astra_core::net::apply_env_proxy(
-                Client::builder()
-                    .timeout(Duration::from_secs(15))
-                    .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION"))),
-            )
-            .build()
-            .unwrap_or_else(|_| Client::new()),
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
-            preferred_repos: std::sync::Mutex::new(preferred_repos),
+
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker::default(),
@@ -1562,12 +1530,7 @@ impl ToolExecutor {
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
-            git_stash_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                git_gix::GitStashRollbackJournal::default(),
-            )),
-            git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                git_gix::GitCommitRollbackJournal::default(),
-            )),
+
             git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 worktree::GitWorktreeRollbackJournal::default(),
             )),
@@ -1973,13 +1936,7 @@ impl ToolExecutor {
         }
         let binding = self.runtime_environment_binding_for_tool(name, registry);
         astra_runtime_env::CapabilityResolver
-            .check_tool_call_for_surface(
-                registry,
-                name,
-                args,
-                &binding.capabilities,
-                &binding.tool_surface,
-            )
+            .check_tool_call(registry, name, args, &binding.capabilities)
             .err()
     }
 
@@ -2087,7 +2044,7 @@ impl ToolExecutor {
         use astra_turn_core::capability::Capability;
         match capability {
             Capability::AgentSpawner => self.spawn_context.is_some(),
-            Capability::GitHubAuth => self.github_token.is_some(),
+
             Capability::LocalBackgroundTasks => self.bg_task_commands.is_some(),
             // Fail-closed: unknown executor-gated capabilities are denied.
             // If a new executor-gated variant is added here, it MUST get an
@@ -2560,24 +2517,6 @@ impl ToolExecutor {
         journal: std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
     ) -> Self {
         self.database_snapshot_journal = journal;
-        self
-    }
-
-    /// Use a shared git stash rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_git_stash_journal(
-        mut self,
-        journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
-    ) -> Self {
-        self.git_stash_journal = journal;
-        self
-    }
-
-    /// Use a shared git commit rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_git_commit_journal(
-        mut self,
-        journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
-    ) -> Self {
-        self.git_commit_journal = journal;
         self
     }
 
@@ -4258,25 +4197,6 @@ impl ToolExecutor {
         out
     }
 
-    /// Add a preferred repo for disambiguation (e.g. from memory or recent usage).
-    pub fn add_preferred_repo(&self, owner_repo: &str) {
-        let normalized = owner_repo.to_lowercase();
-        match self.preferred_repos.lock() {
-            Ok(mut repos) => {
-                if !repos.iter().any(|r| r == &normalized) {
-                    repos.push(normalized);
-                }
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex — clear and re-add
-                astra_core::agent_warn!("preferred_repos", "recovering from poisoned mutex");
-                let mut repos = poisoned.into_inner();
-                repos.clear();
-                repos.push(normalized);
-            }
-        }
-    }
-
     /// Set per-turn budget pressure before executing a batch of tool calls.
     /// 0.0 = normal, 0.3 = trimming, 0.6 = compact, 0.9 = aggressive.
     pub fn set_budget_pressure(&self, pressure: f64) {
@@ -4288,20 +4208,6 @@ impl ToolExecutor {
     /// Read current budget pressure. Returns 0.0 if mutex is poisoned.
     pub fn get_budget_pressure(&self) -> f64 {
         self.budget_pressure.lock().map(|p| *p).unwrap_or(0.0)
-    }
-
-    /// Get current preferred repos (for use in repo resolution).
-    fn get_preferred_repos(&self) -> Vec<String> {
-        match self.preferred_repos.lock() {
-            Ok(r) => r.clone(),
-            Err(poisoned) => {
-                astra_core::agent_warn!(
-                    "preferred_repos",
-                    "recovering from poisoned mutex on read"
-                );
-                poisoned.into_inner().clone()
-            }
-        }
     }
 
     /// Output limit scaled by budget pressure and aggregate output.
@@ -4487,162 +4393,7 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
-        if name == "git" {
-            let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
-                Ok(action) => action,
-                Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
-            };
-            match action {
-                astra_tools::git_tool_contract::GitAction::Commit => {
-                    let Some(_workspace_mutation_lease) =
-                        astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                            &self.project_root,
-                            cancel_token,
-                            std::time::Duration::from_secs(120),
-                        )
-                        .await
-                    else {
-                        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        return ToolExecutionOutcome::error(
-                            "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git commit was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
-                        );
-                    };
-                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                        return cancelled_tool_execution_outcome("git", false);
-                    }
-                    let mut outcome = self.commit_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::RevertCommit => {
-                    let Some(_workspace_mutation_lease) =
-                        astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                            &self.project_root,
-                            cancel_token,
-                            std::time::Duration::from_secs(120),
-                        )
-                        .await
-                    else {
-                        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        return ToolExecutionOutcome::error(
-                            "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git revert was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
-                        );
-                    };
-                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                        return cancelled_tool_execution_outcome("git", false);
-                    }
-                    let mut outcome = self.revert_commit_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::Stash => {
-                    if let Err(error) =
-                        astra_tools::git_gix::validate_git_request(&self.project_root, args)
-                    {
-                        return EdgeToolRun::failure_evidence(error.message, error.evidence)
-                            .into_outcome();
-                    }
-                    let stash_action =
-                        match astra_tools::git_tool_contract::git_stash_sub_action_from_args(args) {
-                            Ok(action) => action,
-                            Err(error) => {
-                                return ToolExecutionOutcome::error(format!("Error: {error}"));
-                            }
-                        };
-                    // Read-only stash listing follows the ordinary path so it
-                    // does not contend on the workspace mutation lease.
-                    if stash_action.mutates_workspace() {
-                        let Some(_workspace_mutation_lease) =
-                        astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                            &self.project_root,
-                            cancel_token,
-                            std::time::Duration::from_secs(120),
-                        )
-                        .await
-                    else {
-                        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        return ToolExecutionOutcome::error(
-                            "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git stash was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
-                        );
-                    };
-                        if cancel_token
-                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                        {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        let mut outcome = self.stash_with_metadata(args);
-                        outcome.output = self.finalize_tool_output(outcome.output, name);
-                        self.record_output_size(outcome.output.len());
-                        return outcome;
-                    }
-                }
-                astra_tools::git_tool_contract::GitAction::Worktree => {
-                    if let Err(error) =
-                        astra_tools::git_gix::validate_git_request(&self.project_root, args)
-                    {
-                        return EdgeToolRun::failure_evidence(error.message, error.evidence)
-                            .into_outcome();
-                    }
-                    let worktree_action =
-                        match astra_tools::git_tool_contract::git_worktree_sub_action_from_args(
-                            args,
-                        ) {
-                            Ok(action) => action,
-                            Err(error) => {
-                                return ToolExecutionOutcome::error(format!("Error: {error}"));
-                            }
-                        };
-                    // `list` is a pure observation and must not wait for a
-                    // writer lease held by an unrelated operation.
-                    if worktree_action.mutates_workspace() {
-                        let Some(_workspace_mutation_lease) =
-                        astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                            &self.project_root,
-                            cancel_token,
-                            std::time::Duration::from_secs(120),
-                        )
-                        .await
-                    else {
-                        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        return ToolExecutionOutcome::error(
-                            "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git worktree was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
-                        );
-                    };
-                        if cancel_token
-                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                        {
-                            return cancelled_tool_execution_outcome("git", false);
-                        }
-                        let mut outcome = self.worktree_with_metadata(args);
-                        outcome.output = self.finalize_tool_output(outcome.output, name);
-                        self.record_output_size(outcome.output.len());
-                        return outcome;
-                    }
-                }
-                astra_tools::git_tool_contract::GitAction::Status
-                | astra_tools::git_tool_contract::GitAction::Diff
-                | astra_tools::git_tool_contract::GitAction::Log
-                | astra_tools::git_tool_contract::GitAction::Show
-                | astra_tools::git_tool_contract::GitAction::Blame
-                | astra_tools::git_tool_contract::GitAction::FileHistory
-                | astra_tools::git_tool_contract::GitAction::LogSearch
-                | astra_tools::git_tool_contract::GitAction::Contributors
-                | astra_tools::git_tool_contract::GitAction::CheckoutFile
-                | astra_tools::git_tool_contract::GitAction::Push => {
-                    // Other git actions are handled by execute_run below.
-                }
-            }
-        }
+
         self.execute_run_with_cancel(name, args, invocation, cancel_token)
             .await
             .into_outcome()
@@ -4699,11 +4450,6 @@ impl ToolExecutor {
         }
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
-        }
-        if name == "git"
-            && let Err(error) = astra_tools::git_gix::validate_git_request(&self.project_root, args)
-        {
-            return EdgeToolRun::failure_evidence(error.message, error.evidence);
         }
         // Edge-owned typed writers share the same per-workspace lease as the
         // Bash pre/post observer. Bash acquires it inside its shell boundary;
@@ -4821,10 +4567,17 @@ impl ToolExecutor {
             )
             .await;
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
-            astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
+            astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
             .as_ref()
-            .is_none_or(astra_tools::workspace_observation::WorkspaceWriterGuard::integrity_valid);
+            .is_none_or(astra_tools::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid);
+        let receipt_authority_valid = coordination_integrity_valid
+            && _workspace_mutation_lease.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+            && _recursive_writer_epoch.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceWriterGuard::receipt_authority_valid,
+            );
         if nested_run_script_callback && let Some(fields) = tool_result_fields.as_mut() {
             fields.remove("workspace_mutation_applied");
             astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(
@@ -4849,7 +4602,7 @@ impl ToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
         }
-        let writer_applied_by_owner = coordination_integrity_valid
+        let writer_applied_by_owner = receipt_authority_valid
             && !nested_run_script_callback
             && tool_result_fields
                 .as_ref()
@@ -4859,13 +4612,14 @@ impl ToolExecutor {
         let writer_applied_by_fingerprint = if writer_applied_by_owner {
             false
         } else {
-            writer_fingerprint_before
-                .zip(
-                    astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                        &self.project_root,
-                    ),
-                )
-                .is_some_and(|(before, after)| before.changed_from(Some(after)))
+            receipt_authority_valid
+                && writer_fingerprint_before
+                    .zip(
+                        astra_tools::workspace_observation::WorkspaceFingerprint::capture(
+                            &self.project_root,
+                        ),
+                    )
+                    .is_some_and(|(before, after)| before.changed_from(Some(after)))
         };
         // Redact before constructing EdgeToolRun.  This is deliberately
         // before status classification, event emission, callback posting, and
@@ -4933,9 +4687,9 @@ impl ToolExecutor {
             &self.project_root,
             is_error,
             desired_state.as_ref(),
-            coordination_integrity_valid && !nested_run_script_callback,
+            receipt_authority_valid && !nested_run_script_callback,
             targeted_observer,
-            coordination_integrity_valid && _workspace_mutation_lease.is_some(),
+            receipt_authority_valid && _workspace_mutation_lease.is_some(),
         ) {
             Ok(projection) => {
                 if let Some(receipt) = projection.convergence_receipt {
@@ -5110,58 +4864,13 @@ impl ToolExecutor {
                     *tool_result_fields = result.metadata.clone();
                     result.output
                 }
-                "git" => {
-                    let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
-                        Ok(action) => action,
-                        Err(error) => return format!("Error: {error}"),
-                    };
-                    match action {
-                        astra_tools::git_tool_contract::GitAction::Status => {
-                            git_gix::status(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Diff => git_gix::diff(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        astra_tools::git_tool_contract::GitAction::Log => {
-                            git_gix::log(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Show => git_gix::show(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        astra_tools::git_tool_contract::GitAction::Blame => {
-                            git_gix::blame(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::FileHistory => {
-                            git_gix::file_history(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::LogSearch => {
-                            git_gix::log_search(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Contributors => {
-                            git_gix::contributors(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Commit => self.commit(args),
-                        astra_tools::git_tool_contract::GitAction::RevertCommit => {
-                            self.revert_commit(args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Stash => self.stash(args),
-                        astra_tools::git_tool_contract::GitAction::CheckoutFile => {
-                            self.checkout_file(args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Worktree => self.worktree(args),
-                        astra_tools::git_tool_contract::GitAction::Push => {
-                            git_gix::push(&self.project_root, args)
-                        }
-                    }
+                "worktree" => {
+                    let outcome = self.worktree_with_metadata(args);
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
                 }
+
                 "find_definition" => self.find_definition(args),
                 "find_references" => self.find_references(args),
                 "call_graph" => self.call_graph(args),
@@ -5174,36 +4883,7 @@ impl ToolExecutor {
                 "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
-                "github" => {
-                    let action =
-                        match astra_tools::github_tool_contract::github_action_from_args(args) {
-                            Ok(action) => action,
-                            Err(error) => return format!("Error: {error}"),
-                        };
-                    match action {
-                        astra_tools::github_tool_contract::GithubAction::ListPrs => {
-                            self.list_prs(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::GetPr => {
-                            self.get_pr(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::CiStatus => {
-                            self.ci_status(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::RepoStats => {
-                            self.repo_stats(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::ListIssues => {
-                            self.list_issues(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::GetIssue => {
-                            self.get_issue(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::CreateIssue => {
-                            self.github_create_issue(args).await
-                        }
-                    }
-                }
+
                 "web_fetch" => {
                     let cache_scope = self
                         .active_session_id
@@ -5631,8 +5311,7 @@ impl ToolExecutor {
         let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
         let database_checkpoint =
             rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
-        let stash_checkpoint = rollback_on_failure.then(|| self.git_stash_journal_checkpoint());
-        let commit_checkpoint = rollback_on_failure.then(|| self.git_commit_journal_checkpoint());
+
         let worktree_checkpoint =
             rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
         let session_state_checkpoint =
@@ -5681,15 +5360,11 @@ impl ToolExecutor {
                         if let (
                             Some(file_checkpoint),
                             Some(database_checkpoint),
-                            Some(stash_checkpoint),
-                            Some(commit_checkpoint),
                             Some(worktree_checkpoint),
                             Some(session_state_checkpoint),
                         ) = (
                             file_checkpoint,
                             database_checkpoint,
-                            stash_checkpoint,
-                            commit_checkpoint,
                             worktree_checkpoint,
                             session_state_checkpoint,
                         ) {
@@ -5699,12 +5374,7 @@ impl ToolExecutor {
                             let database_entries_added = self
                                 .database_snapshot_journal_checkpoint()
                                 .saturating_sub(database_checkpoint);
-                            let stash_entries_added = self
-                                .git_stash_journal_checkpoint()
-                                .saturating_sub(stash_checkpoint);
-                            let commit_entries_added = self
-                                .git_commit_journal_checkpoint()
-                                .saturating_sub(commit_checkpoint);
+
                             let worktree_entries_added = self
                                 .git_worktree_journal_checkpoint()
                                 .saturating_sub(worktree_checkpoint);
@@ -5713,8 +5383,6 @@ impl ToolExecutor {
                                 .saturating_sub(session_state_checkpoint);
                             if file_entries_added > 0
                                 || database_entries_added > 0
-                                || stash_entries_added > 0
-                                || commit_entries_added > 0
                                 || worktree_entries_added > 0
                                 || session_state_entries_added > 0
                             {
@@ -5724,8 +5392,8 @@ impl ToolExecutor {
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
                                         "database_after_sequence": database_checkpoint,
-                                        "stash_after_sequence": stash_checkpoint,
-                                        "commit_after_sequence": commit_checkpoint,
+
+
                                         "worktree_after_sequence": worktree_checkpoint,
                                         "session_state_after_sequence": session_state_checkpoint,
                                     }))
@@ -5931,7 +5599,6 @@ impl ToolExecutor {
         let caps = cli_default_capabilities(
             self.spawn_context.is_some(),
             self.bg_task_commands.is_some(),
-            self.github_token.is_some(),
         );
         let mut active_names = Vec::new();
         let mut inactive_names = Vec::new();
@@ -5940,7 +5607,6 @@ impl ToolExecutor {
             Capability::MemoryService,
             Capability::Database,
             Capability::SkillsCatalog,
-            Capability::GitHubAuth,
             Capability::LSPServer,
             Capability::PlanLifecycle,
             Capability::LocalBackgroundTasks,
@@ -6277,14 +5943,41 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+    #[tokio::test]
+    async fn removed_repository_tools_are_not_executable_or_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        for name in ["git", "github"] {
+            assert!(
+                !super::local_tool_schemas()
+                    .iter()
+                    .any(|s| s["function"]["name"] == name)
+            );
+            let result = executor
+                .execute_with_metadata(name, &json!({"action":"commit", "message":"must not run"}))
+                .await;
+            assert!(result.is_error, "{name}: {result:?}");
+            let search = executor
+                .execute("tool_search", &json!({"query":format!("select:{name}")}))
+                .await;
+            let parsed: Value = serde_json::from_str(&search).unwrap();
+            assert!(
+                parsed["missing"].as_array().unwrap().contains(&json!(name)),
+                "{search}"
+            );
+        }
+        assert!(!dir.path().join(".git").exists());
+    }
+
     use super::{
         BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot, BgTaskOutputSnapshot,
         BgTaskOutputStatus, ToolExecutor, WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
-        background_task_output_result_fields, cli_default_capabilities, cli_tool_output_is_error,
-        detect_git_remote_repos, embedded_work_unit_observation, extract_github_owner_repo,
-        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_wait_timeout, format_background_task_stop_error, memoria,
-        parse_memory_search_contents, utf16_col_to_char_idx,
+        background_task_output_result_fields, cli_tool_output_is_error,
+        embedded_work_unit_observation, file_checkpoint_dir_for, format_background_task_error,
+        format_background_task_output, format_background_task_output_wait_timeout,
+        format_background_task_stop_error, memoria, parse_memory_search_contents,
+        utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
@@ -6360,33 +6053,6 @@ mod tests {
 
     fn assert_tool_invalid_args(result: &astra_tools::ToolResult) {
         assert_tool_error_kind(result, astra_core::ErrorKind::ToolInvalidArgs);
-    }
-
-    #[test]
-    fn local_github_capability_requires_this_users_credential() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        executor.github_token = None;
-        assert!(
-            !executor.capability_has_runtime_binding(
-                astra_turn_core::capability::Capability::GitHubAuth
-            )
-        );
-
-        executor.github_token = Some("owner-scoped-test-token".to_string());
-        assert!(
-            executor.capability_has_runtime_binding(
-                astra_turn_core::capability::Capability::GitHubAuth
-            )
-        );
-        assert!(
-            !cli_default_capabilities(false, false, false)
-                .has(astra_turn_core::capability::Capability::GitHubAuth)
-        );
-        assert!(
-            cli_default_capabilities(false, false, true)
-                .has(astra_turn_core::capability::Capability::GitHubAuth)
-        );
     }
 
     #[test]
@@ -7149,24 +6815,6 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
         );
-    }
-
-    #[tokio::test]
-    async fn cli_git_invalid_path_preserves_typed_source_evidence() {
-        let (_dir, executor) = temp_executor();
-
-        let result = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "git",
-            &serde_json::json!({"action": "diff", "path": "missing.rs"}),
-        )
-        .await;
-
-        assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.expect("typed validation metadata");
-        assert_eq!(metadata["error_kind"], "tool_invalid_args");
-        assert_eq!(metadata["recovery_evidence"]["cause"], "resource_missing");
-        assert_eq!(metadata["recovery_evidence"]["retryable"], false);
     }
 
     #[test]
@@ -9067,27 +8715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_select_github_resolves_on_cli_path() {
-        let mut executor = test_executor();
-        executor.github_token = Some("owner-scoped-test-token".to_string());
-        let out = executor
-            .execute(
-                "tool_search",
-                &serde_json::json!({"query": "select:github"}),
-            )
-            .await;
-        let parsed = parse_tool_search_output(&out);
-        assert_eq!(parsed["mode"].as_str(), Some("select"));
-        assert_eq!(
-            tool_search_string_array(&parsed, "requested"),
-            vec!["github".to_string()]
-        );
-        assert!(tool_search_string_array(&parsed, "missing").is_empty());
-        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
-        assert!(parsed["matches"][0].get("parameters").is_some());
-    }
-
-    #[tokio::test]
     async fn tool_search_select_memory_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
@@ -10754,50 +10381,6 @@ mod tests {
     mod tool_search_tests;
     mod utf16_tests;
     mod worktree_tests;
-
-    /// Regression test for 3e3d6fa8 proxy policy:
-    /// `github_client` targets api.github.com (external traffic), so it must
-    /// honour HTTPS_PROXY/ALL_PROXY via `astra_core::net::apply_env_proxy`.
-    /// Before the fix, this builder silently inherited reqwest's default env
-    /// handling without NO_PROXY / socks5 / tracing parity with the LLM client.
-    ///
-    /// We can't introspect reqwest's internal proxy config, so we assert the
-    /// observable contract: (a) the builder constructs successfully under a
-    /// variety of proxy envs (NO_PROXY, malformed, socks5 via ALL_PROXY), and
-    /// (b) `ToolExecutor::new` never panics when those envs are set — which
-    /// was the actual risk if a caller forgot to call `apply_env_proxy` and
-    /// reqwest rejected a malformed env URL at build time.
-    // serial_test: proxy env mutations race with any parallel test whose
-    // HTTP client is env-proxy-aware (e.g. cloud_sync's remote-target
-    // clients after the client_builder_for_target policy).
-    #[serial_test::serial]
-    #[test]
-    fn github_client_honours_proxy_env_without_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // valid https proxy
-        temp_env::with_var("HTTPS_PROXY", Some("http://proxy.example:8080"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // socks5 via ALL_PROXY (parity with LLM client regression)
-        temp_env::with_var("ALL_PROXY", Some("socks5://127.0.0.1:1080"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // malformed must not panic (apply_env_proxy swallows parse errors)
-        temp_env::with_var("HTTPS_PROXY", Some("not a url"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // NO_PROXY honoured
-        temp_env::with_vars(
-            [
-                ("HTTPS_PROXY", Some("http://proxy.example:8080")),
-                ("NO_PROXY", Some("api.github.com")),
-            ],
-            || {
-                let _ = ToolExecutor::new(dir.path());
-            },
-        );
-    }
 
     // ── introspect facet=session_memory (unhappy first) ───────────────
 

@@ -692,7 +692,7 @@ fn extract_file_path_from_tool_result(
 ) -> Option<String> {
     // For read_file results, the content often starts with the file path
     let tool_name = tool_result_name(msg, id_to_name)?;
-    if !matches!(tool_name, "read_file" | "grep" | "glob" | "git") {
+    if !matches!(tool_name, "read_file" | "grep" | "glob") {
         return None;
     }
     // Try to extract path from content (read_file results typically start with path)

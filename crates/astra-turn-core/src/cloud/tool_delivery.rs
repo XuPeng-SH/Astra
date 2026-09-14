@@ -1517,6 +1517,17 @@ mod tests {
         })
     }
 
+    fn worktree_remove_tool(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "worktree",
+                "arguments": r#"{"action":"exit","exit_action":"remove","discard_changes":true}"#
+            }
+        })
+    }
+
     fn approval_entry(request_id: &str, decision: ApprovalDecision, reason: Option<&str>) -> Value {
         json!({
             "kind": "approval_respond",
@@ -1569,6 +1580,119 @@ mod tests {
                 "primary approval detail must not expose {forbidden:?}: {detail}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn denied_worktree_removal_never_dispatches_to_the_edge() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let user_id = "u_worktree_remove_denied";
+        let call = worktree_remove_tool("wt-remove");
+        assert!(cloud_tool_requires_approval_for_delivery(&call));
+        assert_eq!(tool_approval_kind(&call), ApprovalKind::Explicit);
+        ledger.lock().await.insert(
+            test_approval_key(user_id, "wt-remove"),
+            approval_entry(
+                "wt-remove",
+                ApprovalDecision::Deny,
+                Some("user declined removal"),
+            ),
+        );
+
+        let audit = test_approval_audit(user_id);
+        let delivery = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            user_id,
+            &[call],
+            Duration::from_secs(1),
+            Some(&audit),
+        )
+        .await;
+
+        let approval = delivery
+            .sse_maps
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("approval_required"))
+            .expect("worktree removal must present an approval request");
+        assert_eq!(approval["approval_kind"], "explicit");
+        assert!(
+            delivery.sse_maps.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+            })
+        );
+        assert!(
+            delivery
+                .sse_maps
+                .iter()
+                .all(|event| { event.get("type").and_then(Value::as_str) != Some("tool_request") }),
+            "a denied removal must never reach the edge executor"
+        );
+        assert!(
+            delivery.tool_messages[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("user_denied"))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_approved_worktree_removal_dispatches_after_the_approval_response() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let user_id = "u_worktree_remove_approved";
+        let request_id = "wt-remove-approved";
+        let call = worktree_remove_tool(request_id);
+        assert!(cloud_tool_requires_approval_for_delivery(&call));
+        assert_eq!(tool_approval_kind(&call), ApprovalKind::Explicit);
+
+        let response_ledger = ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            response_ledger.lock().await.insert(
+                test_approval_key(user_id, request_id),
+                approval_entry(request_id, ApprovalDecision::Allow, None),
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            response_ledger.lock().await.insert(
+                tool_callback_key(user_id, request_id),
+                json!({"body": {"request_id": request_id, "status": "completed", "output": "removed"}}),
+            );
+        });
+
+        let audit = test_approval_audit(user_id);
+        let delivery = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            user_id,
+            &[call],
+            Duration::from_secs(1),
+            Some(&audit),
+        )
+        .await;
+
+        let approval_index = delivery
+            .sse_maps
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("approval_required")
+            })
+            .expect("an explicit approval request must precede removal");
+        let dispatch_index = delivery
+            .sse_maps
+            .iter()
+            .position(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
+            .expect("an approved removal must be dispatched to the selected Edge provider");
+        assert!(approval_index < dispatch_index);
+        assert_eq!(
+            delivery.sse_maps[approval_index]["approval_kind"],
+            "explicit"
+        );
+        assert!(
+            delivery.sse_maps.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+            })
+        );
+        assert!(
+            delivery.tool_messages[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("removed"))
+        );
     }
 
     #[test]

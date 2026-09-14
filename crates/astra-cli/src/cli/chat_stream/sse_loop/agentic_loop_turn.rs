@@ -846,14 +846,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                         mem_latency_ms,
                     );
                 }
-
-                if !projection.contents.is_empty() {
-                    for repo in &projection.preferred_repos {
-                        ctx.executor.add_preferred_repo(repo);
-                    }
-                    // Send "useful" feedback for retrieved memories (fire-and-forget)
-                    ctx.executor.memory_feedback_useful(projection.feedback_ids);
-                }
             }
         }
     }
@@ -1014,13 +1006,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     ctx.executor.set_budget_pressure(budget_pressure);
 
-    attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
-    // Sync the executor guard from the final payload, after capability
-    // restrictions and interaction-mode filtering have all been applied. The
-    // guard must mirror what the model actually saw.
-    let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
-    let final_visible_tool_names =
-        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
     let eligible_surface_schemas: Vec<Value> = ctx
         .registry
         .all_tool_schemas()
@@ -1038,6 +1023,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let eligible_provider_schemas = ctx
         .executor
         .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
+    attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
+    // Sync the executor guard from the final payload, after capability
+    // restrictions and interaction-mode filtering have all been applied. The
+    // guard must mirror what the model actually saw.
+    let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
+    let final_visible_tool_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
     // `enabled_tools` describes product capabilities already present on this
     // request's executable edge/provider surface. It is not inferred from
     // user prose and it does not approve an invocation: domain/effect
@@ -3590,14 +3582,17 @@ mod tests {
         // Use a capability classified as Deferred by the canonical ToolSpec
         // registry. `memory` is intentionally AlwaysLoad, so using it here
         // would test the resident-surface policy rather than activation.
-        executor.set_current_activatable_tool_names(HashSet::from(["git".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let selected = executor
-            .execute("tool_search", &json!({"query": "select:git"}))
+            .execute("tool_search", &json!({"query": "select:web_fetch"}))
             .await;
         let selected_json: Value = serde_json::from_str(&selected).unwrap_or_else(|error| {
             panic!("tool_search select should return JSON, got {error}: {selected}")
         });
-        assert_eq!(selected_json["matches"][0]["name"].as_str(), Some("git"));
+        assert_eq!(
+            selected_json["matches"][0]["name"].as_str(),
+            Some("web_fetch")
+        );
 
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
@@ -3683,7 +3678,7 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
         assert!(
-            !edge_tool_names.contains(&"git"),
+            !edge_tool_names.contains(&"web_fetch"),
             "pending selection must not surface a variable deferred schema: {edge_tool_names:?}"
         );
         assert!(
@@ -3691,7 +3686,7 @@ mod tests {
             "the stable carrier must remain available for the selected target: {edge_tool_names:?}"
         );
         assert!(
-            !valid_tool_names.contains("git"),
+            !valid_tool_names.contains("web_fetch"),
             "direct target admission must not be inferred from selection evidence"
         );
         executor.clear_current_tool_surface_for_tests();
@@ -4233,15 +4228,14 @@ mod tests {
         let all_schemas = vec![
             schema("read_file"),
             schema("tool_search"),
-            schema("git"),
             schema("web_fetch"),
         ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["git".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let search = executor
-            .execute("tool_search", &json!({"query": "select:git"}))
+            .execute("tool_search", &json!({"query": "select:web_fetch"}))
             .await;
         let search_json: Value = serde_json::from_str(&search)
             .unwrap_or_else(|error| panic!("tool_search must return JSON, got {error}: {search}"));
@@ -4251,7 +4245,7 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["name"].as_str())
             .collect();
-        assert_eq!(search_match_names, vec!["git"]);
+        assert_eq!(search_match_names, vec!["web_fetch"]);
         assert!(
             search_json["matches"][0].get("parameters").is_some(),
             "tool_search select must return callable parameter shape: {search_json}"
@@ -4344,12 +4338,8 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert!(
-            !edge_tool_names.contains("git"),
-            "selection evidence must not reinsert the full deferred schema: {edge_tool_names:?}"
-        );
-        assert!(
             !edge_tool_names.contains("web_fetch"),
-            "deferred browser capabilities must remain off the stable wire surface: {edge_tool_names:?}"
+            "selection evidence must not reinsert the full deferred schema: {edge_tool_names:?}"
         );
         assert!(
             edge_tool_names.contains("invoke_tool"),
@@ -4364,7 +4354,7 @@ mod tests {
             "next-round compaction must account only for schemas actually materialized in the payload"
         );
         assert!(
-            !valid_tool_names.contains("git"),
+            !valid_tool_names.contains("web_fetch"),
             "direct deferred calls remain absent; the carrier is the only callable wire tool"
         );
         assert_eq!(valid_tool_names, edge_tool_names);

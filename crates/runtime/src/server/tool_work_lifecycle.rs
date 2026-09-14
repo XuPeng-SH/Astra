@@ -429,8 +429,40 @@ async fn load_canonical_task_board(
     task_board_update_from_snapshot(binding, &snapshot, None, None)
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct AppliedGraphMutationSummary {
+    result_graph_revision: i64,
+    added_item_ids: Vec<String>,
+    revised_item_ids: Vec<String>,
+    added_dependencies: Vec<InitialWorkDependency>,
+    removed_dependencies: Vec<InitialWorkDependency>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct AppliedGraphMutations {
     graph_revision: i64,
+    changes: Vec<AppliedGraphMutationSummary>,
+}
+
+fn applied_graph_mutation_summary(
+    group: &astra_services::work::WorkEstablishmentMutationGroup,
+    result_graph_revision: i64,
+) -> AppliedGraphMutationSummary {
+    AppliedGraphMutationSummary {
+        result_graph_revision,
+        added_item_ids: group
+            .additions
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect(),
+        revised_item_ids: group
+            .revisions
+            .iter()
+            .map(|revision| revision.item_id.clone())
+            .collect(),
+        added_dependencies: group.dependencies.clone(),
+        removed_dependencies: group.dependency_removals.clone(),
+    }
 }
 
 pub(super) fn active_primary_attempt_board_event(
@@ -525,7 +557,7 @@ async fn reconcile_admitted_graph_mutations(
                 "canonical Work mutation schedule could not be read: {error}"
             ))
         })?;
-    let mut applied = None;
+    let mut applied = Vec::new();
     for group in snapshot.pending_graph_mutations() {
         let context = binding
             .repository
@@ -573,11 +605,15 @@ async fn reconcile_admitted_graph_mutations(
                     "canonical Work mutation returned no valid graph revision".to_string(),
                 )
             })?;
-        applied = Some(AppliedGraphMutations {
-            graph_revision: revision,
-        });
+        applied.push(applied_graph_mutation_summary(group, revision));
     }
-    Ok(applied)
+    let Some(graph_revision) = applied.last().map(|last| last.result_graph_revision) else {
+        return Ok(None);
+    };
+    Ok(Some(AppliedGraphMutations {
+        graph_revision,
+        changes: applied,
+    }))
 }
 
 fn validate_initial_task_list(tasks: &[InitialWorkTask]) -> Result<(), &'static str> {
@@ -1464,16 +1500,20 @@ pub(super) async fn execute_start_work(
             ));
         }
     }
-    match reconcile_admitted_graph_mutations(executor, invocation).await {
-        Ok(Some(applied)) => graph_revision = applied.graph_revision,
-        Ok(None) => {}
-        Err(result) => {
-            let _ = establishment
-                .record_error(&establishment_request, &result.output)
-                .await;
-            return result;
-        }
-    }
+    let applied_admission_mutations =
+        match reconcile_admitted_graph_mutations(executor, invocation).await {
+            Ok(Some(applied)) => {
+                graph_revision = applied.graph_revision;
+                applied.changes
+            }
+            Ok(None) => Vec::new(),
+            Err(result) => {
+                let _ = establishment
+                    .record_error(&establishment_request, &result.output)
+                    .await;
+                return result;
+            }
+        };
     let initial_item_count = initial_items.len();
     let declared_tasks = initial_declared_tasks(&initial_items);
     // Ordinary Work establishment and its first executable assignment are
@@ -1562,6 +1602,7 @@ pub(super) async fn execute_start_work(
             "graph_revision": graph_revision,
             "initial_item_count": initial_item_count,
             "declared_tasks": declared_tasks,
+            "applied_admission_mutations": applied_admission_mutations,
             "runnable_items": runnable_items,
             "task_board_update": task_board_update,
             "initial_task": initial_task,
@@ -2213,8 +2254,8 @@ mod tests {
     use super::{
         InitialWorkItem, InitialWorkTask, StartWorkActivation, StartWorkArgs,
         TaskGraphExecutionStatus, WORK_ERROR_KIND_ALREADY_BOUND, WORK_ERROR_KIND_NOT_BOUND,
-        board_settled_task, canonical_settlement_transition, canonical_start_work_payload,
-        compile_initial_task_graph, confirmed_assignment,
+        applied_graph_mutation_summary, board_settled_task, canonical_settlement_transition,
+        canonical_start_work_payload, compile_initial_task_graph, confirmed_assignment,
         decode_canonical_work_establishment_payload, execute_run_next_work_item,
         execute_start_work, initial_declared_tasks, start_work_operation_id,
         task_board_display_text, task_graph_execution_status, validate_initial_task_list,
@@ -2694,6 +2735,50 @@ mod tests {
         assert!(displayed.len() <= astra_server_types::WORK_TASK_BOARD_TEXT_MAX_BYTES);
         assert!(displayed.ends_with('…'));
         assert!(displayed.is_char_boundary(displayed.len()));
+    }
+
+    #[test]
+    fn applied_admission_mutation_summary_names_each_committed_graph_change() {
+        let group = astra_services::work::WorkEstablishmentMutationGroup {
+            operation_id: "admission-op".into(),
+            tool_call_id: "admission-call".into(),
+            after_initial_tasks: vec![],
+            trigger_items: vec![],
+            additions: vec![astra_services::work::WorkEstablishmentItem {
+                item_id: "task-new".into(),
+                kind: "task",
+                objective: "Run the newly admitted check".into(),
+                expected_result: "The check emits its expected result".into(),
+            }],
+            revisions: vec![astra_services::work::WorkEstablishmentItemRevision {
+                item_id: "task-old".into(),
+                expected_revision: 1,
+                kind: "task",
+                objective: "Revise the admitted task".into(),
+                expected_result: "The revised check emits its expected result".into(),
+                declaration_state: "ready",
+            }],
+            dependencies: vec![astra_services::work::WorkEstablishmentDependency {
+                predecessor_item_id: "task-old".into(),
+                successor_item_id: "task-new".into(),
+            }],
+            dependency_removals: vec![],
+        };
+
+        let value = serde_json::to_value(applied_graph_mutation_summary(&group, 7))
+            .expect("mutation receipt is serializable");
+        assert_eq!(value["result_graph_revision"], 7);
+        assert_eq!(value["added_item_ids"], json!(["task-new"]));
+        assert_eq!(value["revised_item_ids"], json!(["task-old"]));
+        assert_eq!(
+            value["added_dependencies"][0]["predecessor_item_id"],
+            "task-old"
+        );
+        assert_eq!(
+            value["added_dependencies"][0]["successor_item_id"],
+            "task-new"
+        );
+        assert_eq!(value["removed_dependencies"], json!([]));
     }
 
     #[test]

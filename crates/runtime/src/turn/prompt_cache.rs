@@ -908,7 +908,7 @@ mod tests {
             "inspect_work_criteria",
             "propose_work_criteria",
             "lsp",
-            "github",
+            "web_search",
             "web_fetch",
             "web_search",
             "session",
@@ -928,13 +928,13 @@ mod tests {
     #[test]
     fn cache_static_prefix_tool_names_follow_toml_surface_additions() {
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["github".into(), "not_a_real_tool".into()],
+            pinned_tools: vec!["web_search".into(), "not_a_real_tool".into()],
         };
         let always_load = resolve_always_load_tool_names_for_config(&cfg);
 
         assert!(
-            always_load.contains("github"),
-            "config-always_load github must be part of the cache static prefix"
+            always_load.contains("web_search"),
+            "config-always_load web_search must be part of the cache static prefix"
         );
         assert!(
             always_load.contains("grep"),
@@ -945,8 +945,8 @@ mod tests {
             "other default always_load tools must remain cache always_load"
         );
         assert!(
-            !always_load.contains("web_search"),
-            "deferred web_search must not become cache always_load without an explicit TOML always_load entry"
+            !always_load.contains("web_fetch"),
+            "deferred web_fetch must not become cache always_load without an explicit TOML always_load entry"
         );
     }
 
@@ -990,7 +990,7 @@ mod tests {
             json!({"type": "function", "function": {"name": "bash"}}), // always_load
             json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
             json!({"type": "function", "function": {"name": "memory"}}), // always_load
-            json!({"type": "function", "function": {"name": "git"}}), // always_load name in dynamic tail
+            json!({"type": "function", "function": {"name": "worktree"}}), // always_load name in dynamic tail
         ];
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -1013,7 +1013,7 @@ mod tests {
         ];
         let prefix_len = tools.len();
         tools.push(json!({"type": "function", "function": {"name": "web_fetch"}}));
-        tools.push(json!({"type": "function", "function": {"name": "git"}}));
+        tools.push(json!({"type": "function", "function": {"name": "worktree"}}));
 
         let always_load = default_test_always_load_tool_names();
         assert!(always_load.contains("bash"));
@@ -2487,8 +2487,8 @@ mod cache_stability_regression {
             schema("list_dir"),
             schema("grep"),
             schema("glob"),
-            schema("git"),
-            schema("git"),
+            schema("worktree"),
+            schema("worktree"),
             schema("memory"),
             schema("memory"),
             schema("memory"),
@@ -2540,7 +2540,7 @@ mod cache_stability_regression {
             !always_load.contains("glob"),
             "specialized glob navigation must remain deferred from the default prefix"
         );
-        for name in ["agent", "agent_fanout", "git"] {
+        for name in ["agent", "agent_fanout", "worktree"] {
             assert!(
                 !always_load.contains(name),
                 "{name} must load on demand instead of extending the default cache prefix"
@@ -2565,7 +2565,7 @@ mod cache_stability_regression {
             schema("bash"),
             schema("tool_search"),
             carrier,
-            schema("github"),
+            schema("web_search"),
         ];
         let mut always_load = default_test_always_load_tool_names();
         always_load.insert(carrier_name.to_string());
@@ -2613,7 +2613,7 @@ mod cache_stability_regression {
             let mut tools = always_load_prefix_fixture();
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the always_load portion is unaffected.
-            tools.extend([schema("mo_query"), schema("github")]);
+            tools.extend([schema("mo_query"), schema("web_search")]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2629,7 +2629,11 @@ mod cache_stability_regression {
         let a = build_once();
         let b_tools_churned = {
             let mut tools = always_load_prefix_fixture();
-            tools.extend([schema("web_fetch"), schema("github"), schema("mo_query")]);
+            tools.extend([
+                schema("web_fetch"),
+                schema("web_search"),
+                schema("mo_query"),
+            ]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2683,7 +2687,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["tools"].as_array().unwrap();
@@ -2778,7 +2782,7 @@ mod cache_stability_regression {
             )
         };
 
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
         (a, b, always_load_prefix_fixture().len())
     }
@@ -2831,7 +2835,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         // Static system + user message identical
@@ -2874,7 +2878,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         assert_eq!(a["messages"], b["messages"]);

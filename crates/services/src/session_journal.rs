@@ -1324,6 +1324,11 @@ pub struct ToolCallRecord {
     /// What happened to the requested call at the execution boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<ToolCallDisposition>,
+    /// Exact executor pre-dispatch rejection stage, when available. This is
+    /// producer-authored execution accounting; error kind or duration alone
+    /// cannot establish that dispatch did not happen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_dispatch_rejection: Option<ToolPreDispatchRejection>,
 }
 
 impl fmt::Debug for ToolCallRecord {
@@ -1355,6 +1360,13 @@ pub enum ToolCallDisposition {
     /// The request was intentionally postponed pending activation or a later
     /// retry opportunity.
     Deferred,
+}
+
+/// Bounded pre-dispatch rejection stages that can affect runtime control flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPreDispatchRejection {
+    ProviderSchemaValidation,
 }
 
 impl ToolCallDisposition {

@@ -88,6 +88,7 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::PromptCacheTokens { .. }
         | Criterion::ProviderPromptCacheReadRatio { .. }
         | Criterion::ProviderPromptCacheReadNonregressionRatio { .. }
+        | Criterion::ProviderStablePrefixCacheCoverage { .. }
         | Criterion::PromptCacheReuseScope { .. }
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. } => true,

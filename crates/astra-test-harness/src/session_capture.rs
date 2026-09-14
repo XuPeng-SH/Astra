@@ -36,6 +36,10 @@ pub struct JournalEvent {
 /// evidence.
 #[derive(Debug, Clone)]
 pub struct JournalToolCall {
+    /// Bounded executor-authored accounting facts from the durable record.
+    /// Keep large arguments/results in their existing projections rather than
+    /// cloning the complete raw tool record a second time.
+    pub runtime_metadata: serde_json::Value,
     pub call_id: Option<String>,
     pub name: String,
     /// Visible user-turn number from the enclosing canonical `turn` or
@@ -639,6 +643,11 @@ impl SessionCapture {
                     continue;
                 }
                 calls.push(JournalToolCall {
+                    runtime_metadata: serde_json::json!({
+                        "error_kind": record.get("error_kind"),
+                        "disposition": record.get("disposition"),
+                        "pre_dispatch_rejection": record.get("pre_dispatch_rejection"),
+                    }),
                     call_id,
                     name: name.to_string(),
                     turn: event

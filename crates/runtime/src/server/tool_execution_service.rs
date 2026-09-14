@@ -1302,8 +1302,8 @@ mod tests {
         );
         assert!(available["web_fetch"].is_empty());
         assert!(
-            available["github"].is_empty(),
-            "network egress alone must not claim credential-backed tools"
+            !available.contains_key("github"),
+            "provider capabilities must not resurrect removed tools"
         );
 
         let credential_service = ToolExecutionService::builder()
@@ -1318,7 +1318,7 @@ mod tests {
         let credential_tools = credential_service
             .optional_tool_providers_for_user("user-1")
             .await;
-        assert_eq!(credential_tools["github"].len(), 1);
+        assert!(!credential_tools.contains_key("github"));
     }
 
     #[tokio::test]

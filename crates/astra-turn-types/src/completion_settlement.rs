@@ -29,6 +29,13 @@ pub struct CompletionSettlementState {
     /// synthesis-only: it calibrates claims against retained evidence rather
     /// than reopening exploration or hiding the failed outcome.
     pub outcome_reconciliation_retries: u32,
+    /// A single provider-schema correction may replace a task-resolution
+    /// submission rejected by the runtime argument preflight. This is
+    /// independent of the one accepted assessment attempt and is initialized
+    /// only when a fresh reconciliation window is opened. Missing legacy
+    /// checkpoints default to zero so they never gain repair authority.
+    #[serde(default)]
+    pub outcome_reconciliation_schema_corrections_remaining: u8,
     /// Evidence-linked model interpretation accepted for the active boundary.
     /// This does not replace execution facts or deterministic verifier receipts.
     #[serde(deserialize_with = "deserialize_required_option")]
@@ -234,6 +241,7 @@ mod tests {
             output_cap_continuations: 1,
             textless_response_retries: 1,
             outcome_reconciliation_retries: 2,
+            outcome_reconciliation_schema_corrections_remaining: 11,
             outcome_reconciliation_assessment: None,
             workspace_mutation_retries: 3,
             external_effect_retries: 4,
@@ -276,7 +284,21 @@ mod tests {
             serde_json::from_value::<CompletionSettlementState>(wire.clone()).unwrap(),
             state
         );
+        let mut legacy_wire = wire.clone();
+        legacy_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("outcome_reconciliation_schema_corrections_remaining");
+        let restored_legacy =
+            serde_json::from_value::<CompletionSettlementState>(legacy_wire).unwrap();
+        assert_eq!(
+            restored_legacy.outcome_reconciliation_schema_corrections_remaining, 0,
+            "legacy checkpoints gain no schema-correction authority"
+        );
         for field in wire.as_object().unwrap().keys() {
+            if field == "outcome_reconciliation_schema_corrections_remaining" {
+                continue;
+            }
             let mut incomplete = wire.clone();
             incomplete.as_object_mut().unwrap().remove(field);
             assert!(

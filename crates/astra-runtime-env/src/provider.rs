@@ -594,6 +594,11 @@ fn runtime_workspace_provider_declares_tool(
         // Terminal rendering is an access-surface affordance, not generic
         // workspace executor capacity.
         "display_sixel" => matches!(provider_type, CapacityProviderType::CliLocal),
+        // Only these providers carry the CLI session-worktree owner.
+        "worktree" => matches!(
+            provider_type,
+            CapacityProviderType::CliLocal | CapacityProviderType::EdgeCapacity
+        ),
         // PowerShell is platform capacity. User text such as "Windows" must not
         // expose it; only a provider/runtime that advertises Windows may.
         "powershell" => {
@@ -1014,7 +1019,8 @@ mod tests {
         assert!(server.declares_tool("web_fetch"));
         assert!(server.declares_tool("web_search"));
         assert!(server.declares_tool("memory"));
-        assert!(server.declares_tool("github"));
+        assert!(!server.declares_tool("github"));
+        assert!(!server.declares_tool("git"));
         assert!(!server.declares_tool("bash"));
 
         assert!(control.declares_tool("ask_user"));
@@ -1030,7 +1036,8 @@ mod tests {
         assert!(cli.declares_tool("web_fetch"));
         assert!(cli.declares_tool("web_search"));
         assert!(cli.declares_tool("read_file"));
-        assert!(cli.declares_tool("github"));
+        assert!(!cli.declares_tool("github"));
+        assert!(!cli.declares_tool("git"));
         assert_eq!(
             cli.declares_tool("powershell"),
             RuntimePlatform::current().supports_powershell()

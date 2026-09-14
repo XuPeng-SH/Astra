@@ -207,15 +207,6 @@ impl ToolRequirements {
         }
     }
 
-    pub const fn service_or_runtime_network_credentials() -> Self {
-        Self {
-            executor: RequiredExecutor::ServiceOrRuntimeExecutor,
-            network: RequiredNetwork::AllowList,
-            credentials: true,
-            ..Self::none()
-        }
-    }
-
     pub const fn mcp() -> Self {
         Self {
             executor: RequiredExecutor::McpExecutor,
@@ -288,13 +279,6 @@ impl ToolRequirements {
         }
     }
 
-    pub const fn git_read() -> Self {
-        Self {
-            git: true,
-            ..Self::project_read()
-        }
-    }
-
     pub const fn git_write() -> Self {
         Self {
             git: true,
@@ -305,14 +289,6 @@ impl ToolRequirements {
     pub const fn git_clone() -> Self {
         Self {
             network: RequiredNetwork::AllowList,
-            ..Self::git_write()
-        }
-    }
-
-    pub const fn git_remote_write() -> Self {
-        Self {
-            network: RequiredNetwork::AllowList,
-            credentials: true,
             ..Self::git_write()
         }
     }
@@ -508,7 +484,6 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("tool_search", ToolLoadPolicy::AlwaysLoad),
         shared_network("web_search", ToolLoadPolicy::Deferred),
         shared_network("web_fetch", ToolLoadPolicy::Deferred),
-        service_or_runtime_network_credentials("github", ToolLoadPolicy::Deferred),
         project_write("publish_artifact", ToolLoadPolicy::Deferred),
         project_read("read_file", ToolLoadPolicy::AlwaysLoad),
         project_read("list_dir", ToolLoadPolicy::AlwaysLoad),
@@ -531,12 +506,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         shell("powershell", ToolLoadPolicy::Deferred),
         project_script("run_script", ToolLoadPolicy::Deferred),
         background_shell("background_shell", ToolLoadPolicy::Internal),
-        // Git remains a product-level, policy-aware adapter, but its large
-        // action union (history, worktrees, commits, remote mutation) is not
-        // a first-turn primitive. Shell covers ordinary inspection, while an
-        // explicit ToolSearch selection exposes the typed Git contract only
-        // when its audit and branch-protection semantics are actually needed.
-        git_read("git", ToolLoadPolicy::Deferred),
+        git_write("worktree", ToolLoadPolicy::Deferred),
         git_clone("git_clone", ToolLoadPolicy::Internal),
         lsp("lsp", ToolLoadPolicy::Deferred),
         lsp("find_definition", ToolLoadPolicy::Internal),
@@ -822,18 +792,11 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> Vec<Value> {
-        let provider_conflicts = provider_conflicting_tools(registry, capabilities, providers);
+        let surface = self.available_tool_surface_for_providers(registry, capabilities, providers);
         let prompt_schema_conflicts =
             astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
         self.filter_tool_schemas_impl(registry, schemas, capabilities, |tool_name| {
-            if provider_conflicts.contains_key(tool_name)
-                || prompt_schema_conflicts.contains(tool_name)
-            {
-                return false;
-            }
-            providers
-                .iter()
-                .any(|provider| provider.declares_tool(tool_name))
+            !prompt_schema_conflicts.contains(tool_name) && surface.contains(tool_name)
         })
     }
 
@@ -927,16 +890,6 @@ impl CapabilityResolver {
         args: &Value,
         capabilities: &EffectiveCapabilitySet,
     ) -> Result<(), ToolUnavailableReason> {
-        if tool_name == "git" {
-            if git_action_requires_remote_write(args) {
-                let spec = git_remote_write(tool_name, ToolLoadPolicy::AlwaysLoad);
-                return self.check(&spec, capabilities);
-            }
-            if git_action_requires_write(args) {
-                let spec = git_write(tool_name, ToolLoadPolicy::AlwaysLoad);
-                return self.check(&spec, capabilities);
-            }
-        }
         if tool_name == "lsp" && lsp_action_requires_write(args) {
             let spec = project_write(tool_name, ToolLoadPolicy::Deferred);
             return self.check(&spec, capabilities);
@@ -1448,19 +1401,6 @@ fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
-fn service_or_runtime_network_credentials(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
-    ToolSpec {
-        name: name.to_string(),
-        load_policy,
-        effect: ToolEffect {
-            uses_network: true,
-            uses_credentials: true,
-            ..ToolEffect::none()
-        },
-        required: ToolRequirements::service_or_runtime_network_credentials(),
-    }
-}
-
 fn request_scoped_mcp(name: &str) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -1475,17 +1415,6 @@ fn dynamic_tool_spec(name: &str) -> Option<ToolSpec> {
         return Some(request_scoped_mcp(name));
     }
     None
-}
-
-fn git_action_requires_write(args: &Value) -> bool {
-    matches!(
-        args.get("action").and_then(Value::as_str),
-        Some("commit" | "stash" | "revert_commit" | "push" | "clone")
-    )
-}
-
-fn git_action_requires_remote_write(args: &Value) -> bool {
-    matches!(args.get("action").and_then(Value::as_str), Some("push"))
 }
 
 fn lsp_action_requires_write(args: &Value) -> bool {
@@ -1566,18 +1495,6 @@ fn background_control(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
-fn git_read(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
-    ToolSpec {
-        name: name.to_string(),
-        load_policy,
-        effect: ToolEffect {
-            reads_workspace: true,
-            ..ToolEffect::none()
-        },
-        required: ToolRequirements::git_read(),
-    }
-}
-
 fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -1589,22 +1506,6 @@ fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
             ..ToolEffect::none()
         },
         required: ToolRequirements::git_write(),
-    }
-}
-
-fn git_remote_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
-    ToolSpec {
-        name: name.to_string(),
-        load_policy,
-        effect: ToolEffect {
-            reads_workspace: true,
-            writes_workspace: true,
-            uses_network: true,
-            uses_credentials: true,
-            mutates_external_state: true,
-            ..ToolEffect::none()
-        },
-        required: ToolRequirements::git_remote_write(),
     }
 }
 
@@ -1637,6 +1538,29 @@ fn lsp(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_repository_tools_cannot_be_restored_by_an_allowlist() {
+        let registry = ToolRegistry::builtins();
+        for names in [vec!["git"], vec!["github"], vec!["git", "github"]] {
+            let binding = RunBinding::resolve(
+                WorkspaceBinding::local_filesystem("/workspace", WorkspaceAuthority::ReadWrite),
+                ExecutorBinding::local_cli(),
+                RuntimeBinding::host_process("host"),
+                PolicyIntent::local_developer().with_allowed_tools(names.clone()),
+                &registry,
+            );
+            assert!(!binding.tool_surface.contains("bash"));
+            for name in names {
+                assert!(registry.get(name).is_none());
+                assert!(!binding.tool_surface.contains(name));
+                assert_eq!(
+                    CapabilityResolver.check_tool(&registry, name, &binding.capabilities),
+                    Err(ToolUnavailableReason::UnknownTool)
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::{
         ExecutorBinding, PolicyIntent, RunBinding, RuntimeBinding, WorkspaceAuthority,
@@ -1851,7 +1775,7 @@ mod tests {
             "write_file",
             "web_fetch",
             "web_search",
-            "git",
+            "worktree",
             "git_clone",
             "find_definition",
             "background_shell",
@@ -1909,12 +1833,12 @@ mod tests {
             WorkspaceBinding::edge_workspace("/repo", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::edge_agent("edge-agent"),
             RuntimeBinding::host_process("edge-host"),
-            PolicyIntent::local_developer().with_allowed_tools(["read_file", "git"]),
+            PolicyIntent::local_developer().with_allowed_tools(["read_file", "glob"]),
             &registry,
         );
 
         assert!(binding.tool_surface.contains("read_file"));
-        assert!(binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("glob"));
         for tool in ["bash", "write_file"] {
             assert!(
                 !binding.tool_surface.contains(tool),
@@ -1955,7 +1879,8 @@ mod tests {
 
         assert!(binding.tool_surface.contains("bash"));
         assert!(binding.tool_surface.contains("write_file"));
-        assert!(binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("glob"));
+        assert!(binding.tool_surface.contains("bash"));
     }
 
     #[test]
@@ -2175,13 +2100,14 @@ mod tests {
         );
 
         assert!(binding.tool_surface.contains("read_file"));
-        assert!(binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("glob"));
+        assert!(binding.tool_surface.contains("bash"));
         assert!(!binding.tool_surface.contains("write_file"));
         assert_eq!(
             CapabilityResolver.check_tool_call(
                 &registry,
-                "git",
-                &serde_json::json!({"action": "commit"}),
+                "write_file",
+                &serde_json::json!({"path": "file.txt", "content": "changed"}),
                 &binding.capabilities,
             ),
             Err(ToolUnavailableReason::PolicyDenied(
@@ -2388,7 +2314,7 @@ mod tests {
             binding.runtime.launch_driver,
             crate::RuntimeLaunchDriver::Kubernetes
         );
-        for tool in ["read_file", "list_dir", "grep", "glob", "git", "bash"] {
+        for tool in ["read_file", "list_dir", "grep", "glob", "bash"] {
             assert!(
                 binding.tool_surface.contains(tool),
                 "{tool} should be visible for read-only snapshot with runtime"
@@ -2429,7 +2355,8 @@ mod tests {
             &registry,
         );
 
-        assert!(binding.tool_surface.contains("git"));
+        assert!(binding.tool_surface.contains("glob"));
+        assert!(binding.tool_surface.contains("bash"));
         assert!(!binding.tool_surface.contains("git_clone"));
         assert!(!binding.tool_surface.contains("web_fetch"));
         assert!(!binding.tool_surface.contains("web_search"));
@@ -2443,94 +2370,6 @@ mod tests {
             binding.tool_surface.denial_for("web_fetch"),
             Some(&ToolUnavailableReason::PolicyDenied(
                 "network_allow_list".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn argument_sensitive_git_mutation_requires_writable_workspace() {
-        let registry = registry();
-        let binding = RunBinding::resolve(
-            WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadOnly),
-            ExecutorBinding::orchestrator_managed("orchestrator:review"),
-            RuntimeBinding::host_process("review-runtime"),
-            PolicyIntent::read_only_review(),
-            &registry,
-        );
-
-        assert_eq!(
-            CapabilityResolver.check_tool_call(
-                &registry,
-                "git",
-                &serde_json::json!({"action": "commit"}),
-                &binding.capabilities,
-            ),
-            Err(ToolUnavailableReason::PolicyDenied(
-                "filesystem_write".to_string()
-            ))
-        );
-        assert_eq!(
-            CapabilityResolver.check_tool_call(
-                &registry,
-                "git",
-                &serde_json::json!({"action": "status"}),
-                &binding.capabilities,
-            ),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn git_push_requires_network_and_credentials_beyond_local_git_writes() {
-        let registry = registry();
-        let workspace = WorkspaceBinding::local_filesystem("/repo", WorkspaceAuthority::ReadWrite);
-        let executor = ExecutorBinding::local_cli();
-        let runtime = RuntimeBinding::host_process("local-host");
-
-        let mut no_network = PolicyIntent::local_developer();
-        no_network.network = crate::NetworkPolicy::Disabled;
-        let no_network = RunBinding::resolve(
-            workspace.clone(),
-            executor.clone(),
-            runtime.clone(),
-            no_network,
-            &registry,
-        );
-        assert_eq!(
-            CapabilityResolver.check_tool_call(
-                &registry,
-                "git",
-                &serde_json::json!({"action": "push"}),
-                &no_network.capabilities,
-            ),
-            Err(ToolUnavailableReason::PolicyDenied(
-                "network_allow_list".to_string()
-            ))
-        );
-        assert_eq!(
-            CapabilityResolver.check_tool_call(
-                &registry,
-                "git",
-                &serde_json::json!({"action": "commit"}),
-                &no_network.capabilities,
-            ),
-            Ok(()),
-            "a local commit does not require network authority"
-        );
-
-        let mut no_credentials = PolicyIntent::local_developer();
-        no_credentials.credentials = crate::CredentialPolicy::Disabled;
-        let no_credentials =
-            RunBinding::resolve(workspace, executor, runtime, no_credentials, &registry);
-        assert_eq!(
-            CapabilityResolver.check_tool_call(
-                &registry,
-                "git",
-                &serde_json::json!({"action": "push"}),
-                &no_credentials.capabilities,
-            ),
-            Err(ToolUnavailableReason::PolicyDenied(
-                "credentials".to_string()
             ))
         );
     }

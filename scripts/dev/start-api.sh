@@ -76,23 +76,33 @@ fi
 API_PORT="${ASTRA_API_PORT:-17001}"
 DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
+HEALTH_URL="http://127.0.0.1:${API_PORT}/health"
+READY_URL="http://127.0.0.1:${API_PORT}/ready"
+
+# Startup readiness is owned by the core API dependency: the primary
+# database.  Optional capabilities (currently Memoria) are reported by
+# /health as degraded and must not prevent a usable API from starting.
+api_ready() {
+    local status
+    status=$(NO_PROXY=localhost,127.0.0.1 curl -s \
+        --connect-timeout 1 --max-time 2 \
+        -o /dev/null -w '%{http_code}' "$READY_URL" 2>/dev/null || true)
+    [ "$status" = "200" ]
+}
 
 # Recover from an earlier launcher losing its PID after the server became
-# healthy (notably the macOS screen branch). Starting a second server would
+# ready (notably the macOS screen branch). Starting a second server would
 # only produce a misleading bind failure while the first instance is usable.
-EXISTING_HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 \
-    "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
-if echo "$EXISTING_HEALTH" | grep -q '"status":"healthy"' && \
-   echo "$EXISTING_HEALTH" | grep -q '"database":"connected"'; then
+if api_ready; then
     EXISTING_PID=""
     if command -v lsof >/dev/null 2>&1; then
         EXISTING_PID=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)
     fi
     if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
         echo "$EXISTING_PID" > "$PID_FILE"
-        echo "⚠️  API server already healthy (PID: $EXISTING_PID, port: $API_PORT)"
+        echo "⚠️  API server already ready (PID: $EXISTING_PID, port: $API_PORT)"
     else
-        echo "⚠️  API server already healthy (port: $API_PORT; PID unavailable)"
+        echo "⚠️  API server already ready (port: $API_PORT; PID unavailable)"
     fi
     exit 0
 fi
@@ -202,16 +212,16 @@ if [ "$API_HEALTH_INTERVAL_SECONDS" -le 0 ]; then
     exit 1
 fi
 
-# Wait until the process is alive and the health endpoint reports a connected DB.
-echo "Waiting for API health (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
+# Wait until the process is alive and the core readiness endpoint accepts
+# traffic.  /health may legitimately report `degraded` while an optional
+# capability is unavailable.
+echo "Waiting for API readiness (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
 START_SECONDS=$SECONDS
 while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
-    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
-    if echo "$HEALTH" | grep -q '"status":"healthy"' && \
-       echo "$HEALTH" | grep -q '"database":"connected"'; then
+    if api_ready; then
         echo "✅ API server started (PID: $PID, port: $API_PORT)"
         exit 0
     fi
@@ -219,8 +229,16 @@ while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
 done
 
 if kill -0 "$PID" 2>/dev/null; then
-    echo "❌ API server did not become healthy in time"
-    echo "Stopping unhealthy API server (PID: $PID)..."
+    echo "❌ API server did not become ready in time"
+    echo "Last /ready response:"
+    NO_PROXY=localhost,127.0.0.1 curl -sS --connect-timeout 1 --max-time 2 \
+        "$READY_URL" 2>/dev/null || true
+    echo "Last /health response:"
+    NO_PROXY=localhost,127.0.0.1 curl -sS --connect-timeout 1 --max-time 2 \
+        "$HEALTH_URL" 2>/dev/null || true
+    echo "Recent API log:"
+    tail -20 "$LOG_FILE" 2>/dev/null || true
+    echo "Stopping unready API server (PID: $PID)..."
     kill "$PID" 2>/dev/null || true
     for _ in {1..20}; do
         if ! kill -0 "$PID" 2>/dev/null; then

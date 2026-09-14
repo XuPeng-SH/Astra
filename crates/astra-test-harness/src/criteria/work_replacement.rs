@@ -186,15 +186,33 @@ pub(super) fn verify(
             return Err("canonical graph revision moved backwards".into());
         }
         let items = board_items(board)?;
-        if call.name == "start_work"
-            && require_added_at_start
-            && items
+        if call.name == "start_work" && require_added_at_start {
+            let added_at_start: BTreeSet<_> = items
                 .keys()
                 .filter(|id| !declared.contains_key(*id))
-                .count()
-                != added_count
-        {
-            return Err("initial board does not already contain every required added item".into());
+                .cloned()
+                .collect();
+            if added_at_start.len() != added_count {
+                return Err(
+                    "initial board does not already contain every required added item".into(),
+                );
+            }
+            let applied_admission_mutations = result
+                .get("applied_admission_mutations")
+                .and_then(Value::as_array)
+                .ok_or("start_work does not report applied admission mutations")?;
+            let reported_additions: BTreeSet<_> = applied_admission_mutations
+                .iter()
+                .filter_map(|mutation| mutation.get("added_item_ids").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            if reported_additions != added_at_start {
+                return Err(
+                    "start_work mutation receipt does not identify each already-added item".into(),
+                );
+            }
         }
         for (id, base_revision) in &declared {
             if !items
@@ -390,6 +408,13 @@ mod tests {
                 .contains("initial board")
         );
         assert!(super::verify(&valid, 2, 1, 1, 2, timing()).is_ok());
+        let mut unexplained = valid.clone();
+        result(&mut unexplained, 0)["applied_admission_mutations"] = json!([]);
+        assert!(
+            super::verify(&unexplained, 2, 1, 1, 2, timing())
+                .unwrap_err()
+                .contains("mutation receipt")
+        );
         let mut early = valid.clone();
         result(&mut early, 0)["task_board_update"]["tasks"][2]["execution_status"] =
             json!("running");
@@ -462,11 +487,23 @@ mod tests {
                     "execution_status":"completed","delivery_status":"delivered"}
             })
         };
+        let applied_admission_mutations = if deferred {
+            json!([])
+        } else {
+            json!([{
+                "result_graph_revision": 2,
+                "added_item_ids": ["fresh"],
+                "revised_item_ids": [cancelled],
+                "added_dependencies": [],
+                "removed_dependencies": [],
+            }])
+        };
         let values = vec![
             (
                 "start_work",
                 json!({"status":"started","work_id":"work","branch_id":"branch","initial_item_count":2,
-                "declared_tasks":[{"item_id":"alpha","item_revision":1},{"item_id":"beta","item_revision":1}],"task_board_update":board(0)}),
+                "declared_tasks":[{"item_id":"alpha","item_revision":1},{"item_id":"beta","item_revision":1}],
+                "applied_admission_mutations":applied_admission_mutations,"task_board_update":board(0)}),
             ),
             ("settle_work_item", settle(retained, "attempt-a", 1)),
             ("settle_work_item", settle("fresh", "attempt-b", 2)),

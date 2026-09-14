@@ -16,7 +16,6 @@ pub use astra_turn_types::ToolIdempotency;
 /// Display category for CLI status lines — maps tools to formatting groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolDisplayCategory {
-    Github,
     File,
     Shell,
     Search,
@@ -72,8 +71,6 @@ impl ToolFlags {
     pub const APPROVAL_REQUIRED: Self = Self(1 << 1);
     pub const EXECUTE_COMMAND: Self = Self(1 << 2);
     pub const CODE_INTEL: Self = Self(1 << 3);
-    pub const GIT_READ: Self = Self(1 << 4);
-    pub const GITHUB_READ: Self = Self(1 << 5);
     pub const WEB: Self = Self(1 << 6);
     pub const MEMORY: Self = Self(1 << 7);
     pub const EXPLORATION: Self = Self(1 << 8);
@@ -142,8 +139,6 @@ const C: ToolFlags = ToolFlags::COMPACTABLE;
 const A: ToolFlags = ToolFlags::APPROVAL_REQUIRED;
 const AE: ToolFlags = ToolFlags::APPROVAL_REQUIRED.union(ToolFlags::EXECUTE_COMMAND);
 const CI: ToolFlags = ToolFlags::CODE_INTEL.union(ToolFlags::COMPACTABLE);
-const GR: ToolFlags = ToolFlags::GIT_READ.union(ToolFlags::COMPACTABLE);
-const GH: ToolFlags = ToolFlags::GITHUB_READ.union(ToolFlags::COMPACTABLE);
 const WB: ToolFlags = ToolFlags::WEB.union(ToolFlags::COMPACTABLE);
 const ME: ToolFlags = ToolFlags::MEMORY;
 const EX: ToolFlags = ToolFlags::EXPLORATION;
@@ -165,9 +160,11 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("search", RO, C.union(EX)),
     tool("find", RO, C.union(EX)),
     tool("tool_search", RO, C),
-    // Consolidated git tool; action-aware classification below fails closed
-    // when args are absent.
-    tool("git", MU, A),
+    // Worktree entry/exit changes the selected repository binding, and exit
+    // can permanently remove a worktree and branch. Keep every lifecycle call
+    // approval-gated; action-aware compensation policy refines removal to
+    // destructive and fails closed on unknown arguments.
+    tool("worktree", MU, A),
     // ── Code intelligence (LSP-derived, read-only) ───────────────────
     tool("symbols", RO, CI.union(EX)),
     tool("find_definition", RO, CI.union(EX)),
@@ -179,9 +176,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("dead_code", RO, CI),
     tool("extract_members", RO, CI),
     tool("lsp", RO, CI.union(EX)),
-    // Consolidated GitHub tool; action-aware classification below fails
-    // closed when args are absent.
-    tool("github", MU, A),
     // ── Web (read-only, compactable) ─────────────────────────────────
     tool("web_fetch", RO, WB),
     tool("web_search", RO, WB),
@@ -240,7 +234,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("rollback_file_edits", MU, A.union(OR)),
     tool("rollback_database_snapshots", MU, A.union(OR)),
     tool("rollback_session_state", MU, OR),
-    // (memory/git/github entries consolidated above into action-aware rows)
+    // (memory actions share one action-aware row)
     // ── Mutating — code intelligence writes ──────────────────────────
     tool("rename_symbol", MU, ToolFlags::CODE_INTEL),
     // ── Mutating — orchestration ─────────────────────────────────────
@@ -333,7 +327,7 @@ impl ToolRegistry {
     /// Returns the effective `ToolCategory` after inspecting `args` for
     /// consolidated tools.
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
-        if matches!(name, "memory" | "git" | "github") {
+        if name == "memory" {
             return classify(name, args).category;
         }
         self.category(name)
@@ -413,9 +407,6 @@ impl ToolRegistry {
     ///
     /// Derived from flags — no separate hardcoded match needed.
     pub fn display_category(&self, name: &str) -> ToolDisplayCategory {
-        if name == "github" {
-            return ToolDisplayCategory::Github;
-        }
         // MCP-prefixed Memoria tools keep the Memory display slot even when
         // they don't land in TOOL_TABLE (e.g. dynamic plugin schemas).
         if name.starts_with("memoria_") {
@@ -425,7 +416,7 @@ impl ToolRegistry {
         let category = self.category(name);
         if flags.contains(ToolFlags::CODE_INTEL) {
             ToolDisplayCategory::Code
-        } else if flags.contains(ToolFlags::GIT_READ) || name == "git" {
+        } else if name == "worktree" {
             ToolDisplayCategory::Git
         } else if flags.contains(ToolFlags::MATRIXONE) {
             ToolDisplayCategory::Mo
@@ -609,67 +600,6 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "git" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some(
-                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
-                | "contributors",
-            ) => {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = GR;
-            }
-            Some("worktree")
-                if args
-                    .and_then(|a| a.get("sub_action"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|action| matches!(action, "list" | "ls")) =>
-            {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = GR;
-            }
-            Some("checkout_file" | "worktree") => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = NONE;
-            }
-            Some("stash")
-                if args
-                    .and_then(|a| a.get("sub_action"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|action| matches!(action, "list" | "show")) =>
-            {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = GR;
-            }
-            Some("commit" | "revert_commit" | "stash" | "push") | None => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = A;
-            }
-            Some(_) => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = A;
-            }
-        }
-    }
-
-    if name == "github" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some(
-                "list_prs" | "get_pr" | "ci_status" | "repo_stats" | "list_issues" | "get_issue",
-            ) => {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = GH;
-            }
-            Some("create_issue") | None => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = A;
-            }
-            Some(_) => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = A;
-            }
-        }
-    }
-
     let shell_read_only = meta_category.is_shell()
         && args
             .and_then(|a| a.get("command"))
@@ -704,37 +634,6 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
 
     let idempotency = if shell_read_only || matches!(name, "task_output" | "task_list") {
         ToolIdempotency::PureRead
-    } else if name == "git" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some(
-                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
-                | "contributors",
-            ) => ToolIdempotency::PureRead,
-            Some("stash")
-                if args
-                    .and_then(|a| a.get("sub_action"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|action| action == "list") =>
-            {
-                ToolIdempotency::PureRead
-            }
-            Some("worktree")
-                if args
-                    .and_then(|a| a.get("sub_action"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|action| matches!(action, "list" | "ls")) =>
-            {
-                ToolIdempotency::PureRead
-            }
-            _ => ToolIdempotency::NonIdempotent,
-        }
-    } else if name == "github" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some(
-                "list_prs" | "get_pr" | "ci_status" | "repo_stats" | "list_issues" | "get_issue",
-            ) => ToolIdempotency::PureRead,
-            _ => ToolIdempotency::NonIdempotent,
-        }
     } else {
         r.idempotency(name)
     };
@@ -889,59 +788,6 @@ mod tests {
             assert_eq!(r.category(&name), ToolCategory::Mutating);
             assert_eq!(r.display_category(&name), ToolDisplayCategory::Other);
         }
-    }
-
-    #[test]
-    fn consolidated_git_is_action_aware() {
-        let status = classify("git", Some(&serde_json::json!({"action": "status"})));
-        assert_eq!(status.category, ToolCategory::ReadOnly);
-        assert!(!status.approval_required);
-        assert!(status.parallelizable);
-        assert_eq!(status.idempotency, ToolIdempotency::PureRead);
-
-        let worktree_list = classify(
-            "git",
-            Some(&serde_json::json!({"action": "worktree", "sub_action": "list"})),
-        );
-        assert_eq!(worktree_list.category, ToolCategory::ReadOnly);
-        assert!(!worktree_list.approval_required);
-        assert!(worktree_list.parallelizable);
-        assert_eq!(worktree_list.idempotency, ToolIdempotency::PureRead);
-
-        let worktree_add = classify(
-            "git",
-            Some(&serde_json::json!({"action": "worktree", "sub_action": "add"})),
-        );
-        assert_eq!(worktree_add.category, ToolCategory::Mutating);
-
-        let push = classify(
-            "git",
-            Some(&serde_json::json!({
-                "action": "push",
-                "remote": "origin",
-                "branch": "feature/my-branch"
-            })),
-        );
-        assert_eq!(push.category, ToolCategory::Mutating);
-        assert!(push.approval_required);
-        assert_eq!(push.idempotency, ToolIdempotency::NonIdempotent);
-    }
-
-    #[test]
-    fn consolidated_github_is_action_aware() {
-        let list = classify("github", Some(&serde_json::json!({"action": "list_prs"})));
-        assert_eq!(list.category, ToolCategory::ReadOnly);
-        assert!(!list.approval_required);
-        assert!(list.parallelizable);
-        assert_eq!(list.idempotency, ToolIdempotency::PureRead);
-
-        let create = classify(
-            "github",
-            Some(&serde_json::json!({"action": "create_issue", "title": "bug"})),
-        );
-        assert_eq!(create.category, ToolCategory::Mutating);
-        assert!(create.approval_required);
-        assert_eq!(create.idempotency, ToolIdempotency::NonIdempotent);
     }
 
     #[test]
@@ -1225,8 +1071,6 @@ mod tests {
             "delete_file",
             "edit_file",
             "exec",
-            "git",
-            "github",
             "multi_edit",
             "rollback_database_snapshots",
             "rollback_file_edits",
@@ -1292,23 +1136,10 @@ mod tests {
         }
 
         use serde_json::json;
-        for args in [
-            json!({"action": "status"}),
-            json!({"action": "diff"}),
-            json!({"action": "log"}),
-            json!({"action": "show"}),
-            json!({"action": "blame"}),
-            json!({"action": "file_history"}),
-            json!({"action": "contributors"}),
-            json!({"action": "log_search"}),
-        ] {
-            assert!(r.is_parallelizable_for("git", Some(&args)));
-        }
-        assert!(r.is_parallelizable_for("github", Some(&json!({"action": "list_prs"}))));
-        assert!(r.is_parallelizable_for("github", Some(&json!({"action": "get_issue"}))));
+
         assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "recall"}))));
         assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "expand"}))));
-        assert!(!r.is_parallelizable_for("git", Some(&json!({"action": "push"}))));
+
         assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "remember"}))));
         assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "forget"}))));
     }
@@ -1343,7 +1174,7 @@ mod tests {
                 "investigation tool {name} must not need approval"
             );
         }
-        let diff_action = classify("git", Some(&serde_json::json!({"action": "diff"})));
+        let diff_action = classify_name("glob");
         assert!(diff_action.parallelizable);
         assert!(diff_action.never_restrict);
         assert!(diff_action.compactable);
@@ -1371,18 +1202,10 @@ mod tests {
         }
 
         // Phase 3: Verification — back to read-only
-        let verify = ["read_file"];
+        let verify = ["read_file", "glob"];
         for name in verify {
             assert!(r.is_parallelizable(name));
             assert!(r.is_never_restrict(name));
-        }
-        for args in [
-            serde_json::json!({"action": "status"}),
-            serde_json::json!({"action": "diff"}),
-        ] {
-            let classification = classify("git", Some(&args));
-            assert!(classification.parallelizable);
-            assert!(classification.never_restrict);
         }
     }
 
@@ -1409,8 +1232,7 @@ mod tests {
 
         // `memory` must be partitioned by action, not by name.
         use serde_json::json;
-        assert!(r.is_parallelizable_for("git", Some(&json!({"action": "status"}))));
-        assert!(!r.is_parallelizable_for("git", Some(&json!({"action": "push"}))));
+
         assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "recall"}))));
         assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "remember"}))));
     }
@@ -1521,10 +1343,10 @@ mod tests {
                 "{name} should be Unknown in empty concurrency registry"
             );
         }
-        let status_action = serde_json::json!({"action": "status"});
-        assert!(r.is_parallelizable_for("git", Some(&status_action)));
+        let status_action = serde_json::json!({"action": "recall"});
+        assert!(r.is_parallelizable_for("memory", Some(&status_action)));
         assert!(crate::parallel_tool_exec::is_read_only_tool_with_args(
-            "git",
+            "memory",
             Some(&status_action)
         ));
 
@@ -1992,35 +1814,7 @@ mod tests {
             );
         }
         use serde_json::json;
-        for action in [
-            "status",
-            "log",
-            "diff",
-            "blame",
-            "file_history",
-            "contributors",
-            "log_search",
-        ] {
-            assert_eq!(
-                r.idempotency_for("git", Some(&json!({"action": action}))),
-                ToolIdempotency::PureRead,
-                "git(action={action}) should be PureRead"
-            );
-        }
-        for action in [
-            "list_prs",
-            "get_pr",
-            "list_issues",
-            "get_issue",
-            "ci_status",
-            "repo_stats",
-        ] {
-            assert_eq!(
-                r.idempotency_for("github", Some(&json!({"action": action}))),
-                ToolIdempotency::PureRead,
-                "github(action={action}) should be PureRead"
-            );
-        }
+
         for action in ["recall", "expand", "profile"] {
             assert_eq!(
                 r.idempotency_for("memory", Some(&json!({"action": action}))),
@@ -2183,7 +1977,7 @@ mod tests {
             );
             assert!(idem.is_pure_read(), "{name}: should be pure read");
         }
-        let status_action = r.idempotency_for("git", Some(&json!({"action": "status"})));
+        let status_action = r.idempotency_for("memory", Some(&json!({"action": "recall"})));
         assert!(status_action.is_safe_to_retry());
         assert!(status_action.is_pure_read());
 
@@ -2203,8 +1997,8 @@ mod tests {
                 "{name}: NonIdempotent should NOT be safe to retry"
             );
         }
-        let github_create = r.idempotency_for("github", Some(&json!({"action": "create_issue"})));
-        assert!(!github_create.is_safe_to_retry());
+        let memory_write = r.idempotency_for("memory", Some(&json!({"action": "remember"})));
+        assert!(!memory_write.is_safe_to_retry());
     }
 
     /// Full consistency: static and action-aware tools map to the correct
@@ -2229,35 +2023,6 @@ mod tests {
             );
         }
         use serde_json::json;
-        for action in [
-            "status",
-            "log",
-            "diff",
-            "blame",
-            "file_history",
-            "contributors",
-            "log_search",
-        ] {
-            assert_eq!(
-                r.idempotency_for("git", Some(&json!({"action": action}))),
-                ToolIdempotency::PureRead,
-                "git(action={action}) should be PureRead"
-            );
-        }
-        for action in [
-            "list_prs",
-            "get_pr",
-            "list_issues",
-            "get_issue",
-            "ci_status",
-            "repo_stats",
-        ] {
-            assert_eq!(
-                r.idempotency_for("github", Some(&json!({"action": action}))),
-                ToolIdempotency::PureRead,
-                "github(action={action}) should be PureRead"
-            );
-        }
 
         assert_eq!(
             r.idempotency("write_file"),
@@ -2282,14 +2047,6 @@ mod tests {
             r.idempotency_for("memory", Some(&json!({"action": "remember"}))),
             ToolIdempotency::NonIdempotent,
         );
-        assert_eq!(
-            r.idempotency_for("github", Some(&json!({"action": "list_prs"}))),
-            ToolIdempotency::PureRead,
-        );
-        assert_eq!(
-            r.idempotency_for("github", Some(&json!({"action": "create_issue"}))),
-            ToolIdempotency::NonIdempotent,
-        );
     }
 
     /// Every tool in TOOL_TABLE must agree with the canonical
@@ -2307,12 +2064,6 @@ mod tests {
     }
 
     // ── Display category tests ──────────────────────────────────────
-
-    #[test]
-    fn display_category_github_tools() {
-        let r = registry();
-        assert_eq!(r.display_category("github"), ToolDisplayCategory::Github);
-    }
 
     #[test]
     fn display_category_file_tools() {
@@ -2373,12 +2124,6 @@ mod tests {
                 "{name} should be Search category"
             );
         }
-    }
-
-    #[test]
-    fn display_category_git_tools() {
-        let r = registry();
-        assert_eq!(r.display_category("git"), ToolDisplayCategory::Git);
     }
 
     #[test]
@@ -2577,7 +2322,6 @@ mod tests {
             seen.entry(cat).or_default().push(meta.name);
         }
         let expected_categories = [
-            ToolDisplayCategory::Github,
             ToolDisplayCategory::File,
             ToolDisplayCategory::Shell,
             ToolDisplayCategory::Search,

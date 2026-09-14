@@ -54,7 +54,7 @@ pub enum Scope {
 /// Static metadata for a tool — used for catalog diagnostics and discovery, never sent to LLM.
 #[derive(Debug, Clone)]
 pub struct ToolMeta {
-    /// Tool function name (e.g. "bash", "github")
+    /// Tool function name (e.g. "bash", "web_search")
     pub name: &'static str,
     /// Short description for deferred discovery metadata.
     pub description: &'static str,
@@ -400,51 +400,14 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 360,
     },
     ToolMeta {
-        name: "git",
-        description: "Git operations: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash. Pass action as first parameter.",
-        triggers: &[
-            "git",
-            "commit",
-            "diff",
-            "blame",
-            "history",
-            "log",
-            "status",
-            "branch",
-            "stash",
-            "contributors",
-            "revert",
-            "提交",
-            "版本",
-            "差异",
-            "日志",
-            "分支",
-            "历史",
-        ],
+        name: "worktree",
+        description: "Enter or exit the session worktree; ordinary Git commands use Bash.",
+        triggers: &["worktree", "workspace branch", "工作树"],
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 50,
-    },
-    ToolMeta {
-        name: "github",
-        description: "GitHub operations: list_prs, get_pr, ci_status, repo_stats, list_issues, get_issue, create_issue. Pass action parameter.",
-        triggers: &[
-            "github",
-            "pull request",
-            "PR",
-            "issue",
-            "CI",
-            "repo",
-            "merge",
-            "review",
-        ],
-        intents: &[IntentType::GitHub],
-        scope: Scope::External,
-        requires: &[Capability::GitHubAuth],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 50,
+        schema_tokens: 100,
     },
     ToolMeta {
         name: "web_fetch",
@@ -987,7 +950,6 @@ mod tests {
     #[test]
     fn catalog_has_expected_count() {
         // Sanity check — if tools are added/removed, update this.
-        // Post-consolidation: 8 git→1, 7 github→1, 5 memory→1, 5 session→1,
         // MatrixOne exposes the canonical query tool plus rollback support;
         // agent fan-out is a dedicated tool.
         assert!(
@@ -1034,7 +996,6 @@ mod tests {
             ("memory", Capability::MemoryService),
             ("mo_query", Capability::Database),
             ("rollback_database_snapshots", Capability::Database),
-            ("github", Capability::GitHubAuth),
             ("lsp", Capability::LSPServer),
             ("skill", Capability::SkillsCatalog),
             ("enter_plan_mode", Capability::PlanLifecycle),

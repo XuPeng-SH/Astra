@@ -139,34 +139,6 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
     }
 }
 
-#[tokio::test]
-async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name() {
-    let mut executor = test_executor();
-    executor.github_token = Some("owner-scoped-test-token".to_string());
-
-    let result = executor
-        .execute(
-            "github",
-            &json!({
-                "action": "create_issue",
-                "repo": "not-owner-repo",
-                "title": "Fix it"
-            }),
-        )
-        .await;
-
-    assert!(!result.contains("github_"), "{result}");
-    let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
-    assert_eq!(parsed["ok"], false);
-    assert_eq!(parsed["tool"], "github");
-    assert!(
-        parsed["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("create_issue")
-    );
-}
-
 /// Standalone `delegate` is not a CLI executor tool. Server/runtime
 /// interception must happen before local tool execution; if it reaches
 /// this executor, it must fail closed.
@@ -212,28 +184,6 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     assert_eq!(
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
         "failed"
-    );
-}
-
-#[tokio::test]
-async fn execute_with_metadata_git_missing_action_fails_closed() {
-    let executor = test_executor();
-    let outcome = executor
-        .execute_with_metadata("git", &json!({"path": "."}))
-        .await;
-
-    assert!(outcome.is_error, "{outcome:?}");
-    assert!(
-        outcome
-            .output
-            .contains("missing required parameter `action` for `git`"),
-        "{}",
-        outcome.output
-    );
-    assert!(
-        !outcome.output.contains("On branch") && !outcome.output.contains("##"),
-        "missing action must not be silently treated as git status: {}",
-        outcome.output
     );
 }
 
@@ -844,30 +794,7 @@ fn plan_mode_background_task_guard_blocks_stop_but_allows_reads() {
 }
 
 #[test]
-fn plan_mode_guard_is_action_aware_for_git_github_and_memory() {
-    for action in ["commit", "revert_commit", "stash", "push"] {
-        assert!(
-            crate::edge_tools::is_plan_mode_blocked_tool("git", &json!({"action": action})),
-            "git(action={action}) must be blocked during plan authoring"
-        );
-    }
-
-    for action in ["status", "diff", "log", "show", "blame"] {
-        assert!(
-            !crate::edge_tools::is_plan_mode_blocked_tool("git", &json!({"action": action})),
-            "git(action={action}) must stay available during plan authoring"
-        );
-    }
-
-    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
-        "github",
-        &json!({"action": "create_issue"})
-    ));
-    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
-        "github",
-        &json!({"action": "list_prs"})
-    ));
-
+fn plan_mode_guard_is_action_aware_for_memory() {
     assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
         "memory",
         &json!({"action": "recall", "query": "release notes"})

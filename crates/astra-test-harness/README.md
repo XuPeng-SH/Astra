@@ -168,6 +168,7 @@ focus without duplicating the whole scripted journey.
 | `prompt_cache_tokens { min_read, min_creation }`    | provider prompt-cache read/write token buckets meet minimums | envelope    |
 | `provider_prompt_cache_read_ratio { min, warmup_turns, warmup_rounds }` | token-weighted cache-read ratio after explicit turn- or provider-round warm-up ≥ `min` | journal |
 | `provider_prompt_cache_read_nonregression_ratio { min, min_pairs, max_identity_transitions_per_run }` | within typed system/tool identity epochs, primary-request `current cache_read / previous cache_read` ≥ `min`, with enough pairs in every multi-observation run and bounded identity transitions; only the first pair with a zero previous read per epoch is exempt. Ratios may exceed 1.0; reads include history. Auxiliary requests are outside this metric; `provider_prompt_cache_read_ratio` measures absolute share from aggregate turn/round usage, which can include them | canonical pipeline feedback |
+| `provider_stable_prefix_cache_coverage { min, min_observations }` | token-weighted provider cache reads capped at the runtime-estimated stable system/tool prefix; requires enough typed `provider-prefix-v1` observations and valid pipeline evidence | canonical pipeline feedback |
 | `stderr_matches { pattern }`                        | multi-line regex on stderr                                   | stderr      |
 | `text_contains { needle }`                          | substring in final text                                      | envelope    |
 | `text_not_contains { needle }`                      | substring is absent from final text                          | envelope    |
@@ -182,8 +183,8 @@ focus without duplicating the whole scripted journey.
 | `journal_turn_tool_hidden { name }`                 | tool is absent from every canonical coordinator tool surface | journal     |
 | `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
 | `journal_tool_success_ratio { min, min_calls, allowed_failures? }` | raw and expected-negative-adjusted typed tool success meet the minimum | journal |
-| `journal_tool_json { name, document, path, equals }`| full arguments/result has the exact JSON-pointer value       | journal     |
-| `journal_tool_json_contains { name, document, path, contains }` | full arguments/result has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
+| `journal_tool_json { name, document, path, equals }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value | journal     |
+| `journal_tool_json_contains { name, document, path, contains }` | arguments, result, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
 | `journal_tool_sequence { tools }` | durable tool calls contain the ordered lifecycle subsequence | journal |
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |

@@ -8492,9 +8492,9 @@ pub(crate) mod tests {
             "diff --git a/src/lib.rs b/src/lib.rs\n{}",
             "+ changed from bash git diff\n".repeat(4_000)
         );
-        let large_structured_diff = format!(
+        let large_repeated_diff = format!(
             "diff --git a/src/lib.rs b/src/lib.rs\n{}",
-            "+ changed from structured git_diff\n".repeat(4_000)
+            "+ changed from repeated shell diff\n".repeat(4_000)
         );
         let mut host = MockHost::new(vec![
             tool_preamble_result(
@@ -8519,17 +8519,17 @@ pub(crate) mod tests {
             tool_preamble_result(
                 "Everything appears fixed after the diff.",
                 vec![json!({
-                    "id": "req-git_diff",
+                    "id": "req-bash-repeat",
                     "type": "function",
                     "function": {
-                        "name": "git_diff",
-                        "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                        "name": "bash",
+                        "arguments": "{\"command\":\"git --no-pager diff -- src\"}"
                     }
                 })],
                 vec![make_edge_tool_with_args(
-                    "git_diff",
-                    json!({"path": "src", "ref": "HEAD"}),
-                    &large_structured_diff,
+                    "bash",
+                    json!({"command": "git --no-pager diff -- src"}),
+                    &large_repeated_diff,
                 )],
                 95_000,
                 250,
@@ -8537,7 +8537,7 @@ pub(crate) mod tests {
             ),
             text_result("bounded final synthesis", 10, 5, Some(20)),
         ])
-        .with_valid_tools(&["bash", "git_diff"]);
+        .with_valid_tools(&["bash"]);
         let mut state = make_state();
         state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
@@ -13701,15 +13701,15 @@ mod parallel_execution_tests {
             ("read_file", "c1"),
             ("grep", "c2"),
             ("glob", "c3"),
-            ("git", "c4"),
-            ("git", "c5"),
+            ("grep", "c4"),
+            ("glob", "c5"),
             ("read_file", "c6"),
         ];
         let mut host = MockHost::new(vec![
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "done"),
         ])
-        .with_valid_tools(&["read_file", "grep", "glob", "git"]);
+        .with_valid_tools(&["read_file", "grep", "glob"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -13816,7 +13816,7 @@ mod parallel_execution_tests {
             json!({"function": {"name": "grep"}}),
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "glob"}}),
-            json!({"function": {"name": "git", "arguments": "{\"action\":\"diff\"}"}}),
+            json!({"function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}}),
         ];
         let indices: Vec<HeadlessRoundToolIdx> =
             (0..5).map(HeadlessRoundToolIdx::ServerToolCall).collect();

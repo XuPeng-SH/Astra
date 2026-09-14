@@ -31,14 +31,12 @@ pub mod code_intel;
 pub mod config_tool;
 pub mod detach;
 pub mod env_tools;
+pub mod execution_outcome;
 pub mod executor;
 pub mod exit_semantics;
 pub mod fs_ops;
 pub mod fuzzy_replacer;
 pub mod git_gix;
-pub mod git_tool_contract;
-pub mod github;
-pub mod github_tool_contract;
 pub mod internal_artifacts;
 pub mod memory_tool_contract;
 pub mod passive_cargo_check;
@@ -659,16 +657,8 @@ pub trait ToolApprovalGate: Send + Sync {
     ///
     /// # Contract for implementers
     ///
-    /// The default implementation ORs [`Self::requires_approval`] with
-    /// [`tool_requires_approval`] — the latter handles argument-sensitive
-    /// checks (e.g. `git(action=commit)` vs `git(action=diff)`).
-    ///
-    /// If you override this method you **must** either:
-    /// 1. call `tool_requires_approval(tool_name, args)` yourself, or
-    /// 2. replicate its argument-sensitive logic.
-    ///
-    /// Failing to do so will silently bypass approval checks for mutating
-    /// git/github actions.
+    /// The default combines the gate's tool policy with the canonical built-in
+    /// approval requirements. Overrides must preserve both checks.
     fn requires_approval_for(&self, tool_name: &str, args: &Value) -> bool {
         self.requires_approval(tool_name) || tool_requires_approval(tool_name, args)
     }
@@ -759,35 +749,8 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
 ];
 
 /// Returns `true` if this exact tool invocation requires user approval.
-pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
-    match tool_name {
-        "git" => crate::git_tool_contract::git_action_from_args(args)
-            .ok()
-            .is_some_and(|action| match action {
-                crate::git_tool_contract::GitAction::Commit
-                | crate::git_tool_contract::GitAction::RevertCommit
-                | crate::git_tool_contract::GitAction::Push => true,
-                crate::git_tool_contract::GitAction::Stash => {
-                    crate::git_tool_contract::git_stash_sub_action_from_args(args)
-                        .is_ok_and(|action| action.mutates_workspace())
-                }
-                crate::git_tool_contract::GitAction::Status
-                | crate::git_tool_contract::GitAction::Diff
-                | crate::git_tool_contract::GitAction::Log
-                | crate::git_tool_contract::GitAction::Show
-                | crate::git_tool_contract::GitAction::Blame
-                | crate::git_tool_contract::GitAction::FileHistory
-                | crate::git_tool_contract::GitAction::LogSearch
-                | crate::git_tool_contract::GitAction::Contributors
-                | crate::git_tool_contract::GitAction::CheckoutFile
-                | crate::git_tool_contract::GitAction::Worktree => false,
-            }),
-        "github" => args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "create_issue"),
-        _ => APPROVAL_REQUIRED_TOOLS.contains(&tool_name),
-    }
+pub fn tool_requires_approval(tool_name: &str, _args: &Value) -> bool {
+    APPROVAL_REQUIRED_TOOLS.contains(&tool_name)
 }
 
 // ─── Output management utilities ────────────────────────────────────────────
@@ -1238,69 +1201,6 @@ mod tests {
         {
             assert!(!APPROVAL_REQUIRED_TOOLS.contains(&name.as_str()));
         }
-    }
-
-    #[test]
-    fn tool_requires_approval_for_git_mutating_actions() {
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "commit", "message": "ship"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "revert_commit", "commit_sha": "abc123"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "push", "remote": "origin", "branch": "main"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "push"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "drop"})
-        ));
-    }
-
-    #[test]
-    fn tool_requires_approval_skips_git_read_only_actions() {
-        for action in [
-            "status",
-            "diff",
-            "log",
-            "show",
-            "blame",
-            "file_history",
-            "log_search",
-            "contributors",
-        ] {
-            assert!(!tool_requires_approval(
-                "git",
-                &serde_json::json!({"action": action})
-            ));
-        }
-        assert!(!tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "list"})
-        ));
-    }
-
-    #[test]
-    fn tool_requires_approval_for_github_mutating_actions() {
-        assert!(tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "create_issue", "title": "bug"})
-        ));
-        assert!(!tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "list_prs"})
-        ));
-        assert!(!tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "get_issue"})
-        ));
     }
 
     // ── ApprovalDecision ───────────────────────────────────────────────

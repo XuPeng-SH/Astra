@@ -73,6 +73,11 @@ criteria:
     max: 2
   - type: journal_tool_call_count
     name: settle_work_item
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: settle_work_item
     min: 2
     max: 2
     document: result
@@ -97,20 +102,14 @@ criteria:
   - type: duration_between
     min_ms: 0
     max_ms: 120000
-  # Cache breaks are correctness-impacting for a long Work turn: they turn
-  # every subsequent boundary into a full prompt rebuild and inflate latency
-  # and token cost.  Do not use an absolute provider-dependent token ceiling.
+  # Stable-prefix coverage measures actual provider cache reads against the
+  # runtime-estimated cacheable system/tool prefix. Total cache-read counts
+  # include growing conversation history and can change independently.
   - type: all_of
     criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
-      - type: provider_prompt_cache_read_nonregression_ratio
+      - type: provider_stable_prefix_cache_coverage
         min: 0.95
-        min_pairs: 1
-        max_identity_transitions_per_run: 1
-        # Compare cache-read counts within each system/tool identity epoch,
-        # exempting only its first pair with a zero previous read. Reads can
-        # include history; this does not assert absolute cache-read coverage.
-        # Legitimate tool-surface changes are bounded by identity transitions,
-        # not assigned a fixed round number.
+        min_observations: 2

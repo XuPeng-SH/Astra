@@ -802,7 +802,6 @@ mod tests {
             .with(Capability::MemoryService)
             .with(Capability::Database)
             .with(Capability::SkillsCatalog)
-            .with(Capability::GitHubAuth)
             .with(Capability::LSPServer);
         let plan_caps = base_caps.clone().with(Capability::PlanLifecycle);
 
@@ -990,7 +989,6 @@ mod tests {
             "read_file",
             "write_file",
             "str_replace",
-            "git",
             "run_script",
             "symbols",
             "delete_file",
@@ -1025,7 +1023,6 @@ mod tests {
             "read_file",
             "write_file",
             "publish_artifact",
-            "git",
             "run_script",
             "lsp",
         ] {
@@ -1362,10 +1359,7 @@ mod tests {
         assert!(caps.has(Capability::WorkPlanning));
         assert!(caps.has(Capability::WorkLifecycle));
         assert!(!caps.has(Capability::Database));
-        assert!(
-            !caps.has(Capability::GitHubAuth),
-            "multi-tenant Server must not claim process-level GitHub authority"
-        );
+
         assert!(!lifecycle_server_capabilities(true, false).has(Capability::ReflectService));
         assert!(caps.has(Capability::ReflectService));
 

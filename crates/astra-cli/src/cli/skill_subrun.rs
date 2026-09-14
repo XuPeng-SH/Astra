@@ -1522,19 +1522,6 @@ fn attach_subrun_tool_surface(
         );
     }
 
-    schemas_to_use = context.executor.runtime_bound_tool_schemas(schemas_to_use);
-    astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
-        payload,
-        schemas_to_use,
-        context.restricted_tools,
-    );
-    let final_visible_schemas: Vec<Value> = payload
-        .get("edge_tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let final_visible_tool_names =
-        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
     let eligible_surface_schemas: Vec<Value> = context
         .all_schemas
         .iter()
@@ -1553,6 +1540,19 @@ fn attach_subrun_tool_surface(
     let eligible_provider_schemas = context
         .executor
         .runtime_bound_provider_owned_schemas_excluding(context.restricted_tools);
+    schemas_to_use = context.executor.runtime_bound_tool_schemas(schemas_to_use);
+    astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
+        payload,
+        schemas_to_use,
+        context.restricted_tools,
+    );
+    let final_visible_schemas: Vec<Value> = payload
+        .get("edge_tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let final_visible_tool_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
     let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
@@ -2146,20 +2146,24 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let executor = edge_tools::ToolExecutor::new(root.path());
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["git".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
 
         let selected = executor
-            .execute("tool_search", &json!({"query": "select:git"}))
+            .execute("tool_search", &json!({"query": "select:web_fetch"}))
             .await;
         let selected: Value = serde_json::from_str(&selected).unwrap();
-        assert_eq!(selected["matches"][0]["name"].as_str(), Some("git"));
+        assert_eq!(selected["matches"][0]["name"].as_str(), Some("web_fetch"));
 
         // Production sub-runs start from `chat_turn_base_payload`, which owns
         // the typed edge-profile object. Keep this focused helper fixture on
         // that same boundary so the deferred manifest is observable.
         let mut payload = json!({"edge_profile": {}});
         let restricted_tools = HashSet::from(["ask_user".to_string()]);
-        let all_schemas = vec![schema("tool_search"), schema("git"), schema("read_file")];
+        let all_schemas = vec![
+            schema("tool_search"),
+            schema("web_fetch"),
+            schema("read_file"),
+        ];
 
         let policy = attach_subrun_tool_surface(
             &mut payload,
@@ -2182,13 +2186,13 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert!(
-            !visible_tool_names.contains("git"),
+            !visible_tool_names.contains("web_fetch"),
             "selection must not inject a deferred target schema: {visible_tool_names:?}"
         );
         assert!(visible_tool_names.contains(
             astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
         ));
-        assert!(!policy.visible_tool_names.contains(&"git".to_string()));
+        assert!(!policy.visible_tool_names.contains(&"web_fetch".to_string()));
 
         let deferred_tool_names: HashSet<String> = payload["edge_profile"]
             [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
@@ -2202,10 +2206,9 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            deferred_tool_names.contains("git"),
+            deferred_tool_names.contains("web_fetch"),
             "the selected target must remain in the deferred control-plane catalog without entering the wire schema: visible={visible_tool_names:?} deferred={deferred_tool_names:?}"
         );
-        let _ = executor.execute("git", &json!({"action": "status"})).await;
     }
 
     #[test]

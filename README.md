@@ -261,7 +261,7 @@ astra chat -m "Map this repository and explain its architecture"
 astra chat -y --explain verbose -m "Count the .sh files here with a shell command"
 ```
 
-File, shell, and Git tools run on this machine inside the current directory;
+File and shell tools run on this machine inside the current directory;
 the Server only sees tool results. One-shot `chat` cannot ask for approval,
 so pass `-y` (or `--permission-mode auto`) when the task needs tools; the
 TUI prompts instead. `--explain verbose` prints the runtime-recorded Explain

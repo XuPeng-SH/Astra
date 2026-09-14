@@ -143,7 +143,7 @@ pub(crate) enum WireEvent {
     /// started. Used to render real "streaming · N lines · K KB"
     /// status on long-running cells; the cell falls back to an
     /// indeterminate animation when this event never arrives (non-
-    /// streaming tools like `read_file` / `git(action=log)`).
+    /// streaming tools like `read_file` / `list_dir`).
     ToolOutput {
         name: String,
         lines: u64,

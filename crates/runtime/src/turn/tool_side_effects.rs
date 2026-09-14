@@ -13,6 +13,7 @@ const NON_CLOUD_MUTATION_TOOLS: &[&str] = &[
     "apply_patch",
     // Conservative: even a no-op checkout can refresh file contents.
     "rollback_git_worktrees",
+    "worktree",
 ];
 
 /// Tools that can directly change files or VCS state in the bound workspace.
@@ -34,6 +35,7 @@ const DIRECT_WORKSPACE_MUTATION_TOOLS: &[&str] = &[
     "notebook_edit",
     "rollback_file_edits",
     "rollback_git_worktrees",
+    "worktree",
     "rename_symbol",
 ];
 
@@ -46,11 +48,7 @@ pub fn tool_call_may_mutate_workspace(name: &str, args: Option<&Value>) -> bool 
     if DIRECT_WORKSPACE_MUTATION_TOOLS.contains(&name) {
         return true;
     }
-    if name == "git" {
-        return astra_turn_core::tool::categories::classify(name, args)
-            .category
-            .is_mutating();
-    }
+
     if astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(name) {
         return args
             .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
@@ -72,11 +70,7 @@ pub fn tool_call_records_workspace_mutation(name: &str, args: Option<&Value>) ->
     if DIRECT_WORKSPACE_MUTATION_TOOLS.contains(&name) {
         return true;
     }
-    if name == "git" {
-        return astra_turn_core::tool::categories::classify(name, args)
-            .category
-            .is_mutating();
-    }
+
     if astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(name) {
         return args
             .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
@@ -91,11 +85,6 @@ pub fn tool_call_records_workspace_mutation(name: &str, args: Option<&Value>) ->
 /// unknown tool is not an observation merely because it did not mutate a
 /// local file.
 pub fn tool_call_may_observe_workspace(name: &str, args: Option<&Value>) -> bool {
-    if name == "git" {
-        return astra_turn_core::tool::categories::classify(name, args)
-            .category
-            .is_read_only();
-    }
     if astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(name) {
         let Some(command) =
             args.and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
@@ -142,8 +131,6 @@ pub fn tool_call_may_observe_workspace(name: &str, args: Option<&Value>) -> bool
             | "find_definition"
             | "find_references"
             | "lsp"
-            | "git_diff"
-            | "git_status"
             | "inspect_file"
     )
 }
@@ -154,7 +141,7 @@ pub(crate) fn tool_classified_from_arguments(name: &str) -> bool {
     matches!(
         cloud_gated_tool_kind(name),
         Some(CloudGatedToolKind::Execute)
-    ) || matches!(name, "git" | "github")
+    )
 }
 
 /// True when a successful call with this tool name is known to invalidate
@@ -176,9 +163,7 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
     if !tool_classified_from_arguments(name) {
         return false;
     }
-    if name == "git" && git_action_is(args, "worktree") {
-        return git_worktree_action_invalidates_read_cache(args);
-    }
+
     match cloud_gated_tool_kind_with_args(name, args) {
         Some(CloudGatedToolKind::Write) => return true,
         Some(CloudGatedToolKind::Execute) => {}
@@ -212,35 +197,27 @@ pub fn tool_call_may_mutate_any_state(name: &str, args: Option<&Value>) -> bool 
         || tool_call_invalidates_read_cache(name, args)
 }
 
-fn git_action_is(args: Option<&Value>, expected: &str) -> bool {
-    args.and_then(|args| args.get("action"))
-        .and_then(Value::as_str)
-        == Some(expected)
-}
-
-fn git_worktree_action_invalidates_read_cache(args: Option<&Value>) -> bool {
-    let Some(sub_action) = args
-        .and_then(|args| args.get("action"))
-        .and_then(Value::as_str)
-    else {
-        // Conservative by design: missing `action` still evicts so we prefer
-        // extra cache misses over serving stale read-only results.
-        return true;
-    };
-    if sub_action != "worktree" {
-        return false;
-    }
-    let Some(sub_action) = args
-        .and_then(|args| args.get("sub_action"))
-        .and_then(Value::as_str)
-    else {
-        return true;
-    };
-    !matches!(sub_action, "list" | "ls")
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_worktree_switches_invalidate_workspace_reads() {
+        for action in ["enter", "exit"] {
+            let args = serde_json::json!({"action": action});
+            assert!(super::tool_call_invalidates_read_cache(
+                "worktree",
+                Some(&args)
+            ));
+            assert!(super::tool_call_may_mutate_workspace(
+                "worktree",
+                Some(&args)
+            ));
+            assert!(!super::tool_call_may_observe_workspace(
+                "worktree",
+                Some(&args)
+            ));
+        }
+    }
+
     use std::collections::HashSet;
 
     use astra_turn_core::cloud_approval_policy::{
@@ -292,29 +269,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn consolidated_git_and_github_invalidate_read_cache_by_action() {
-        assert!(!tool_name_invalidates_read_cache("git"));
-        assert!(!tool_name_invalidates_read_cache("github"));
-
-        assert!(!tool_call_invalidates_read_cache(
-            "git",
-            Some(&serde_json::json!({"action": "diff"}))
-        ));
-        assert!(tool_call_invalidates_read_cache(
-            "git",
-            Some(&serde_json::json!({"action": "commit", "message": "ship"}))
-        ));
-        assert!(!tool_call_invalidates_read_cache(
-            "github",
-            Some(&serde_json::json!({"action": "list_prs"}))
-        ));
-        assert!(tool_call_invalidates_read_cache(
-            "github",
-            Some(&serde_json::json!({"action": "create_issue", "title": "bug"}))
-        ));
     }
 
     #[test]
@@ -481,24 +435,12 @@ mod tests {
             "bash",
             Some(&serde_json::json!({"command": "sed -n '1,20p' a.txt"}))
         ));
-        assert!(tool_classified_from_arguments("git"));
-        assert!(tool_call_invalidates_read_cache(
-            "git",
-            Some(
-                &serde_json::json!({"action": "worktree", "sub_action": "add", "branch": "feature"})
-            )
-        ));
-        assert!(!tool_call_invalidates_read_cache(
-            "git",
-            Some(&serde_json::json!({"action": "worktree", "sub_action": "list"}))
-        ));
     }
 
     #[test]
     fn workspace_mutation_is_distinct_from_other_state_effects() {
         for (name, args) in [
             ("memory", serde_json::json!({"action": "remember"})),
-            ("github", serde_json::json!({"action": "create_issue"})),
             ("propose_work_plan", serde_json::json!({"additions": []})),
             ("agent", serde_json::json!({"action": "start"})),
         ] {
@@ -511,7 +453,7 @@ mod tests {
         for (name, args) in [
             ("write_file", serde_json::json!({"path": "src/lib.rs"})),
             ("rename_symbol", serde_json::json!({"symbol": "old"})),
-            ("git", serde_json::json!({"action": "checkout_file"})),
+            ("worktree", serde_json::json!({"action": "enter"})),
             (
                 "bash",
                 serde_json::json!({"command": "git checkout -- src"}),
@@ -525,11 +467,6 @@ mod tests {
 
         for (name, args) in [
             ("read_file", serde_json::json!({"path": "src/lib.rs"})),
-            ("git", serde_json::json!({"action": "diff"})),
-            (
-                "git",
-                serde_json::json!({"action": "worktree", "sub_action": "list"}),
-            ),
             (
                 "bash",
                 serde_json::json!({"command": "git show HEAD:src/lib.rs"}),

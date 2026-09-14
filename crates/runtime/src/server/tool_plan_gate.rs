@@ -481,9 +481,6 @@ mod tests {
             ("grep", json!({"pattern": "needle", "path": "src"})),
             ("glob", json!({"pattern": "**/*.rs"})),
             ("list_dir", json!({"path": "src"})),
-            ("git", json!({"action": "status"})),
-            ("git", json!({"action": "diff"})),
-            ("github", json!({"action": "list_prs"})),
             (
                 "memory",
                 json!({"action": "remember", "content": "plan context"}),
@@ -503,20 +500,8 @@ mod tests {
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "commit", "message": "ship"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "pop"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "list"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "github",
-            &json!({"action": "create_issue", "title": "bug"})
+            "worktree",
+            &json!({"action": "enter"})
         ));
     }
 }

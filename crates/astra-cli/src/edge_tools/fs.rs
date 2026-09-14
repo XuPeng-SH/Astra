@@ -620,14 +620,12 @@ impl ToolExecutor {
                 && raw_content.len() <= AUTO_EXPAND_MAX_BYTES
             {
                 let total_lines = raw_content.lines().count();
-                let numbered = add_line_numbers(
-                    &astra_tools::credential_redaction::redact_line_window(
-                        &raw_content,
-                        1,
-                        raw_content.lines().count(),
-                    ),
+                let expanded_content = astra_tools::credential_redaction::redact_line_window(
+                    &raw_content,
                     1,
+                    total_lines,
                 );
+                let numbered = add_line_numbers(&expanded_content, 1);
                 let expanded = format!(
                     "[Auto-expanded to full file ({total_lines} lines) — \
                      small enough to read entirely. Use this content for all \
@@ -635,7 +633,18 @@ impl ToolExecutor {
                      {numbered}"
                 );
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
-                    self.record_read_cached(&path, false, raw_content.clone());
+                    let delivered_range = (total_lines > 0
+                        && expanded_content.lines().count() == total_lines)
+                        .then_some(super::file_state::DeliveredLineRange {
+                            start: 1,
+                            end: total_lines as u64,
+                        });
+                    let _ = self.record_read_with_delivery_range_cached(
+                        &path,
+                        false,
+                        raw_content.clone(),
+                        delivered_range,
+                    );
                     return Ok(expanded);
                 }
             }
@@ -647,14 +656,17 @@ impl ToolExecutor {
             let numbered = add_line_numbers(&safe_content, 1);
             let mut output;
             let is_partial_delivery;
+            let delivered_line_end;
 
             if numbered.chars().count() <= self.read_file_model_output_limit() {
                 output = numbered;
                 is_partial_delivery = false;
+                delivered_line_end = (total_lines > 0).then_some(total_lines as u64);
             } else {
                 let delivery =
                     add_line_numbers_budgeted(&lines, 1, self.read_file_body_output_limit());
                 let delivered_end = delivery.complete_lines as u64;
+                delivered_line_end = (delivered_end > 0).then_some(delivered_end);
                 output = delivery.output;
                 let marker = if delivered_end > 0 {
                     format!(
@@ -673,9 +685,17 @@ impl ToolExecutor {
                 is_partial_delivery = true;
             }
 
-            self.record_read_cached(&path, is_partial_delivery, raw_content.clone());
+            let delivered_range = delivered_line_end
+                .filter(|_| safe_content.lines().count() == total_lines)
+                .map(|end| super::file_state::DeliveredLineRange { start: 1, end });
+            let overlaps_prior_delivery = self.record_read_with_delivery_range_cached(
+                &path,
+                is_partial_delivery,
+                raw_content.clone(),
+                delivered_range,
+            );
 
-            let read_warning = self.read_warning_for(&path, false);
+            let read_warning = self.read_warning_for(&path, overlaps_prior_delivery);
             push_suffix_if_fits(
                 &mut output,
                 &read_warning,
@@ -717,11 +737,17 @@ impl ToolExecutor {
             actual_start_line,
             e,
         );
+        let source_line_count = e.saturating_sub(s);
+        let line_numbers_preserve_source = safe_range.lines().count() == source_line_count;
         let numbered = add_line_numbers(&safe_range, actual_start_line);
         let mut result;
+        let mut delivered_line_end = None;
 
         if numbered.chars().count() <= self.read_file_model_output_limit() {
             result = numbered;
+            if line_numbers_preserve_source {
+                delivered_line_end = Some(e as u64);
+            }
         } else {
             let safe_lines: Vec<&str> = safe_range.split('\n').collect();
             let delivery = add_line_numbers_budgeted(
@@ -734,6 +760,9 @@ impl ToolExecutor {
             } else {
                 None
             };
+            if line_numbers_preserve_source {
+                delivered_line_end = delivered_end;
+            }
             result = delivery.output;
             let marker = if let Some(end_line) = delivered_end {
                 format!(
@@ -750,9 +779,18 @@ impl ToolExecutor {
             };
             push_suffix_if_fits(&mut result, &marker, self.read_file_model_output_limit());
         }
-        self.record_read_cached(&path, true, raw_content.clone());
+        let delivered_range = delivered_line_end.map(|end| super::file_state::DeliveredLineRange {
+            start: actual_start_line as u64,
+            end,
+        });
+        let overlaps_prior_delivery = self.record_read_with_delivery_range_cached(
+            &path,
+            true,
+            raw_content.clone(),
+            delivered_range,
+        );
 
-        let read_warning = self.read_warning_for(&path, true);
+        let read_warning = self.read_warning_for(&path, overlaps_prior_delivery);
         push_suffix_if_fits(
             &mut result,
             &read_warning,
@@ -761,9 +799,8 @@ impl ToolExecutor {
         Ok(result)
     }
 
-    fn read_warning_for(&self, path: &Path, is_ranged: bool) -> String {
+    fn read_warning_for(&self, path: &Path, overlaps_prior_delivery: bool) -> String {
         let read_count = self.file_read_count(path);
-        let ranged_count = self.file_ranged_read_count(path);
         if read_count >= 4 {
             "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
              have this content — stop re-reading and use the information from earlier reads."
@@ -772,9 +809,9 @@ impl ToolExecutor {
             "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
              earlier reads instead of requesting more ranges."
                 .to_string()
-        } else if is_ranged && ranged_count >= 3 {
-            "\n\n⚠ This file has been read in 3+ different ranges. Use grep to find \
-             specific content instead of reading more sections — it uses far fewer tokens."
+        } else if overlaps_prior_delivery {
+            "\n\n⚠ This range overlaps lines already returned for the current file content. \
+             Reuse the earlier output and request only lines you have not received."
                 .to_string()
         } else {
             String::new()
@@ -1473,14 +1510,7 @@ impl ToolExecutor {
                     "rollback_database_snapshots",
                     self.rollback_database_snapshots(args),
                 );
-                let stash_result = Self::parse_rollback_tool_output(
-                    "rollback_git_stashes",
-                    self.rollback_git_stashes(args),
-                );
-                let commit_result = Self::parse_rollback_tool_output(
-                    "rollback_git_commits",
-                    self.rollback_git_commits(args),
-                );
+
                 let worktree_result = Self::parse_rollback_tool_output(
                     "rollback_git_worktrees",
                     self.rollback_git_worktrees(args),
@@ -1497,14 +1527,7 @@ impl ToolExecutor {
                     .get("entries")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
-                let stash_entries = stash_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let commit_entries = commit_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
+
                 let worktree_entries = worktree_result
                     .get("entries")
                     .cloned()
@@ -1531,24 +1554,7 @@ impl ToolExecutor {
                             .map(|entries| entries.len() as u64)
                             .unwrap_or(0)
                     });
-                let total_stash_entries = stash_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        stash_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                let total_commit_entries = commit_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        commit_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
+
                 let total_worktree_entries = worktree_result
                     .get("total_entries")
                     .and_then(Value::as_u64)
@@ -1570,35 +1576,35 @@ impl ToolExecutor {
                 json!({
                     "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
                         && database_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && stash_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && commit_result.get("success").and_then(Value::as_bool).unwrap_or(false)
+
+
                         && worktree_result.get("success").and_then(Value::as_bool).unwrap_or(false)
                         && session_state_result.get("success").and_then(Value::as_bool).unwrap_or(false),
                     "scope": "list",
                     "total_file_entries": total_file_entries,
                     "total_database_entries": total_database_entries,
-                    "total_git_stash_entries": total_stash_entries,
-                    "total_git_commit_entries": total_commit_entries,
+
+
                     "total_git_worktree_entries": total_worktree_entries,
                     "total_session_state_entries": total_session_state_entries,
                     "file_entries": file_entries,
                     "database_entries": database_entries,
-                    "git_stash_entries": stash_entries,
-                    "git_commit_entries": commit_entries,
+
+
                     "git_worktree_entries": worktree_entries,
                     "session_state_entries": session_state_entries,
                     "files": file_result,
                     "database_snapshots": database_result,
-                    "git_stashes": stash_result,
-                    "git_commits": commit_result,
+
+
                     "git_worktrees": worktree_result,
                     "session_state": session_state_result,
                     "summary": format!(
-                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_stash_entries} git stash rollback entr{}, {total_commit_entries} git commit rollback entr{}, {total_worktree_entries} git worktree rollback entr{}, and {total_session_state_entries} session-state rollback entr{}",
+                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_worktree_entries} git worktree rollback entr{}, and {total_session_state_entries} session-state rollback entr{}",
                         if total_file_entries == 1 { "y" } else { "ies" },
                         if total_database_entries == 1 { "y" } else { "ies" },
-                        if total_stash_entries == 1 { "y" } else { "ies" },
-                        if total_commit_entries == 1 { "y" } else { "ies" },
+
+
                         if total_worktree_entries == 1 { "y" } else { "ies" },
                         if total_session_state_entries == 1 { "y" } else { "ies" }
                     ),
@@ -1614,14 +1620,7 @@ impl ToolExecutor {
                     "rollback_file_edits",
                     self.rollback_file_edits(args),
                 );
-                let commit_result = Self::parse_rollback_tool_output(
-                    "rollback_git_commits",
-                    self.rollback_git_commits(args),
-                );
-                let stash_result = Self::parse_rollback_tool_output(
-                    "rollback_git_stashes",
-                    self.rollback_git_stashes(args),
-                );
+
                 let worktree_result = Self::parse_rollback_tool_output(
                     "rollback_git_worktrees",
                     self.rollback_git_worktrees(args),
@@ -1634,8 +1633,6 @@ impl ToolExecutor {
                     .get("turn_index")
                     .and_then(Value::as_u64)
                     .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| stash_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| commit_result.get("turn_index").and_then(Value::as_u64))
                     .or_else(|| worktree_result.get("turn_index").and_then(Value::as_u64))
                     .or_else(|| {
                         session_state_result
@@ -1664,22 +1661,7 @@ impl ToolExecutor {
                     .get("failed")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
-                let restored_git_stashes = stash_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_git_stash_rollbacks = stash_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let reverted_git_commits = commit_result
-                    .get("reverted")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_git_commit_rollbacks = commit_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
+
                 let restored_git_worktrees = worktree_result
                     .get("restored")
                     .cloned()
@@ -1712,22 +1694,7 @@ impl ToolExecutor {
                     .as_array()
                     .map(|entries| entries.len())
                     .unwrap_or(0);
-                let restored_git_stash_count = restored_git_stashes
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_git_stash_count = failed_git_stash_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let reverted_git_commit_count = reverted_git_commits
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_git_commit_count = failed_git_commit_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
+
                 let restored_git_worktree_count = restored_git_worktrees
                     .as_array()
                     .map(|entries| entries.len())
@@ -1746,14 +1713,10 @@ impl ToolExecutor {
                     .unwrap_or(0);
                 let restored_total = reverted_file_count
                     + restored_snapshot_count
-                    + restored_git_stash_count
-                    + reverted_git_commit_count
                     + restored_git_worktree_count
                     + restored_session_state_count;
                 let failed_total = failed_file_count
                     + failed_database_count
-                    + failed_git_stash_count
-                    + failed_git_commit_count
                     + failed_git_worktree_count
                     + failed_session_state_count;
                 let success = restored_total > 0 && failed_total == 0;
@@ -1761,19 +1724,9 @@ impl ToolExecutor {
                     format!("No recorded rollback actions found for turn {turn_index}")
                 } else if failed_total == 0 {
                     format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, reverted {reverted_git_commit_count} recorded git commit{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index}",
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index}",
                         if reverted_file_count == 1 { "" } else { "s" },
                         if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_stash_count == 1 {
-                            ""
-                        } else {
-                            "es"
-                        },
-                        if reverted_git_commit_count == 1 {
                             ""
                         } else {
                             "s"
@@ -1791,19 +1744,9 @@ impl ToolExecutor {
                     )
                 } else {
                     format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, reverted {reverted_git_commit_count} recorded git commit{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index} with {failed_total} failure{}",
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index} with {failed_total} failure{}",
                         if reverted_file_count == 1 { "" } else { "s" },
                         if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_stash_count == 1 {
-                            ""
-                        } else {
-                            "es"
-                        },
-                        if reverted_git_commit_count == 1 {
                             ""
                         } else {
                             "s"
@@ -1827,20 +1770,20 @@ impl ToolExecutor {
                     "turn_index": turn_index,
                     "reverted_files": reverted_files,
                     "restored_database_snapshots": restored_snapshots,
-                    "restored_git_stashes": restored_git_stashes,
-                    "reverted_git_commits": reverted_git_commits,
+
+
                     "restored_git_worktrees": restored_git_worktrees,
                     "restored_session_state": restored_session_state,
                     "failed_file_rollbacks": failed_file_rollbacks,
                     "failed_database_rollbacks": failed_database_rollbacks,
-                    "failed_git_stash_rollbacks": failed_git_stash_rollbacks,
-                    "failed_git_commit_rollbacks": failed_git_commit_rollbacks,
+
+
                     "failed_git_worktree_rollbacks": failed_git_worktree_rollbacks,
                     "failed_session_state_rollbacks": failed_session_state_rollbacks,
                     "files": file_result,
                     "database_snapshots": database_result,
-                    "git_stashes": stash_result,
-                    "git_commits": commit_result,
+
+
                     "git_worktrees": worktree_result,
                     "session_state": session_state_result,
                     "summary": summary,
@@ -4328,7 +4271,7 @@ type Handler interface {
     }
 
     #[test]
-    fn read_file_ranged_reads_trigger_grep_nudge() {
+    fn read_file_disjoint_pagination_does_not_claim_redundant_reads() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("big.txt");
         let mut f = std::fs::File::create(&file_path).unwrap();
@@ -4338,7 +4281,8 @@ type Handler interface {
         drop(f);
 
         let executor = test_executor_in(dir.path());
-        // First 2 ranged reads — no warning yet
+        // Three disjoint pages are useful pagination, even when they exceed
+        // the old count-based warning threshold.
         for start in [1, 20] {
             let out = executor.read_file(&serde_json::json!({
                 "path": "big.txt",
@@ -4346,20 +4290,100 @@ type Handler interface {
                 "end_line": start + 5
             }));
             assert!(
-                !out.contains("3+ different ranges"),
-                "should not warn before 3 ranged reads"
+                !out.contains("overlaps lines already returned"),
+                "disjoint pages must not be called redundant"
             );
         }
-        // 3rd ranged read — should trigger the grep nudge
         let third = executor.read_file(&serde_json::json!({
             "path": "big.txt",
             "start_line": 40,
             "end_line": 45
         }));
         assert!(
-            third.contains("3+ different ranges") || third.contains("Use grep"),
-            "3rd ranged read should nudge toward grep, got: {}",
+            !third.contains("overlaps lines already returned"),
+            "third disjoint page must not warn, got: {}",
             &third[third.len().saturating_sub(200)..]
+        );
+    }
+
+    #[test]
+    fn read_file_warns_only_when_a_successfully_delivered_range_overlaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..3000 {
+            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        for (start, end) in [(1, 40), (41, 80), (75, 100)] {
+            let output = executor.read_file(&serde_json::json!({
+                "path": "big.txt",
+                "start_line": start,
+                "end_line": end
+            }));
+            if start == 75 {
+                assert!(
+                    output.contains("overlaps lines already returned"),
+                    "an actual overlap should be called out, got: {output}"
+                );
+            } else {
+                assert!(
+                    !output.contains("overlaps lines already returned"),
+                    "disjoint pages should not warn, got: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_file_tracks_full_and_auto_expanded_content_as_delivered_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let large_path = dir.path().join("large.txt");
+        let mut large_file = std::fs::File::create(&large_path).unwrap();
+        for line in 0..500 {
+            writeln!(large_file, "line {line}: {}", "x".repeat(80)).unwrap();
+        }
+        drop(large_file);
+
+        let small_path = dir.path().join("small.txt");
+        let mut small_file = std::fs::File::create(&small_path).unwrap();
+        for line in 0..100 {
+            writeln!(small_file, "line {line}: {}", "y".repeat(20)).unwrap();
+        }
+        drop(small_file);
+
+        let executor = test_executor_in(dir.path());
+        let full_read = executor.read_file(&serde_json::json!({"path": "large.txt"}));
+        assert!(full_read.contains("delivered through line"));
+        let repeated_large_range = executor.read_file(&serde_json::json!({
+            "path": "large.txt",
+            "start_line": 1,
+            "end_line": 40
+        }));
+        assert!(
+            repeated_large_range.contains("overlaps lines already returned"),
+            "a complete-line prefix delivered by a truncated full read counts as covered"
+        );
+
+        let first_small_range = executor.read_file(&serde_json::json!({
+            "path": "small.txt",
+            "start_line": 1,
+            "end_line": 5
+        }));
+        assert!(first_small_range.contains("Auto-expanded to full file"));
+        let small_state = executor.shared_file_state();
+        let small_key = executor.file_state_key(&small_path);
+        assert_eq!(
+            small_state
+                .lock()
+                .unwrap()
+                .get(&small_key)
+                .unwrap()
+                .delivered_line_ranges,
+            vec![crate::edge_tools::file_state::DeliveredLineRange { start: 1, end: 100 }],
+            "auto-expanded content must be retained as successfully delivered"
         );
     }
 
@@ -4376,7 +4400,7 @@ type Handler interface {
 
         let executor = test_executor_in(dir.path());
 
-        // 3 ranged reads — should trigger grep nudge
+        // Three disjoint ranged reads are not redundant.
         for start in [1, 20, 40] {
             executor.read_file(&serde_json::json!({
                 "path": "big.txt", "start_line": start, "end_line": start + 5
@@ -4386,8 +4410,8 @@ type Handler interface {
             "path": "big.txt", "start_line": 60, "end_line": 65
         }));
         assert!(
-            fourth_ranged.contains("3+ different ranges") || fourth_ranged.contains("Use grep"),
-            "4th ranged read should trigger grep nudge"
+            !fourth_ranged.contains("overlaps lines already returned"),
+            "4th disjoint page must not trigger a redundant-read warning"
         );
         assert!(
             !fourth_ranged.contains("read 4+ times"),
@@ -4396,7 +4420,7 @@ type Handler interface {
     }
 
     #[test]
-    fn ranged_read_count_resets_on_different_file() {
+    fn disjoint_range_coverage_is_tracked_per_file() {
         let dir = tempfile::tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         let file_b = dir.path().join("b.txt");
@@ -4425,21 +4449,21 @@ type Handler interface {
                 "path": "b.txt", "start_line": start, "end_line": start + 5
             }));
         }
-        // 3rd ranged read of file a — should trigger
+        // 3rd disjoint ranged read of file a — should not warn.
         let third_a = executor.read_file(&serde_json::json!({
             "path": "a.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            third_a.contains("3+ different ranges") || third_a.contains("Use grep"),
-            "3rd ranged read of file a should trigger grep nudge, got: {third_a}"
+            !third_a.contains("overlaps lines already returned"),
+            "3rd disjoint ranged read of file a should not warn, got: {third_a}"
         );
-        // 3rd ranged read of file b — should also trigger independently
+        // A third disjoint page of file b remains useful pagination too.
         let third_b = executor.read_file(&serde_json::json!({
             "path": "b.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            third_b.contains("3+ different ranges") || third_b.contains("Use grep"),
-            "3rd ranged read of file b should trigger grep nudge"
+            !third_b.contains("overlaps lines already returned") && !third_b.contains("Use grep"),
+            "3rd disjoint ranged read of file b should not trigger a grep nudge"
         );
     }
 

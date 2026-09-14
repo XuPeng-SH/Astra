@@ -377,16 +377,7 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        let ex = if let Some(ref journal) = p.git_stash_journal {
-            ex.with_shared_git_stash_journal(journal.clone())
-        } else {
-            ex
-        };
-        let ex = if let Some(ref journal) = p.git_commit_journal {
-            ex.with_shared_git_commit_journal(journal.clone())
-        } else {
-            ex
-        };
+
         let ex = if let Some(ref journal) = p.git_worktree_journal {
             ex.with_shared_git_worktree_journal(journal.clone())
         } else {
@@ -544,7 +535,6 @@ pub(crate) async fn stream_chat_sse(
     let cli_capabilities = edge_tools::cli_default_capabilities(
         p.agent_spawner.is_some(),
         p.bg_task_commands.is_some(),
-        executor.github_token.is_some(),
     );
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(

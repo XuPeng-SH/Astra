@@ -215,6 +215,7 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
 struct WorkspaceResolution<'a> {
     authority_root: &'a Path,
     execution_dir: &'a Path,
+    target_is_inside: Option<&'a dyn Fn(&Path) -> bool>,
 }
 
 /// Analyze command risks with an explicit workspace boundary.
@@ -243,6 +244,22 @@ pub fn analyze_command_risks_in_workspace_from(
         Some(WorkspaceResolution {
             authority_root: workspace_root,
             execution_dir,
+            target_is_inside: None,
+        }),
+    )
+}
+
+/// Analyze a prepared invocation using its handle-relative target resolver.
+pub fn analyze_command_risks_with_resolver(
+    command: &str,
+    target_is_inside: &dyn Fn(&Path) -> bool,
+) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(
+        command,
+        Some(WorkspaceResolution {
+            authority_root: Path::new("."),
+            execution_dir: Path::new("."),
+            target_is_inside: Some(target_is_inside),
         }),
     )
 }
@@ -1079,6 +1096,26 @@ fn redirected_write_target(
         while let Some(b' ' | b'\t') = bytes.get(target_index).copied() {
             target_index += 1;
         }
+        // `>&N` and `N>&M` duplicate a file descriptor; the digits after `&`
+        // are not a pathname. Treat non-numeric destinations such as
+        // `>&../outside` as file paths, since Bash also permits that form.
+        if bytes.get(target_index) == Some(&b'&') {
+            target_index += 1;
+            while let Some(b' ' | b'\t') = bytes.get(target_index).copied() {
+                target_index += 1;
+            }
+            let rest = &command[target_index..];
+            let target_end = rest
+                .find(|ch: char| ch.is_whitespace() || [';', '&', '|'].contains(&ch))
+                .unwrap_or(rest.len());
+            let target = rest[..target_end].trim_matches(['"', '\'']);
+            if target == "-"
+                || (!target.is_empty() && target.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                scan_from = target_index;
+                continue;
+            }
+        }
         if target_index >= bytes.len() {
             break;
         }
@@ -1139,6 +1176,9 @@ fn is_workspace_out_path(path: &str, workspace: Option<WorkspaceResolution<'_>>)
         return path.starts_with("../") || path.starts_with("..\\") || candidate.is_absolute();
     };
 
+    if let Some(resolve) = workspace.target_is_inside {
+        return !resolve(candidate);
+    }
     let root = canonicalize_existing_or_lexical(workspace.authority_root);
     let requested = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -1470,6 +1510,9 @@ mod tests {
     fn safe_workspace_local_write_has_no_workspace_out_risk() {
         for command in [
             "echo ok > reports/out.txt",
+            "echo diagnostic >&2",
+            "printf diagnostic 2>&1",
+            "exec 3>&1",
             "git status --short 2>/dev/null",
             "cargo check >/dev/null",
             "cp -p report.txt reports/out.txt",
@@ -1486,6 +1529,30 @@ mod tests {
                 "{command}: {risks:?}"
             );
         }
+    }
+
+    #[test]
+    fn descriptor_redirects_are_not_misclassified_as_external_file_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exec_dir = tempfile::tempdir().unwrap();
+        let context = Some(WorkspaceResolution {
+            authority_root: workspace.path(),
+            execution_dir: exec_dir.path(),
+            target_is_inside: None,
+        });
+
+        for command in ["echo diagnostic >&2", "printf diagnostic 2>&1", "exec 3>&1"] {
+            assert_eq!(
+                redirected_write_target(command, context),
+                None,
+                "{command} redirects to an existing descriptor, not a file"
+            );
+        }
+        assert_eq!(
+            redirected_write_target("echo payload >&../outside.txt", context),
+            Some("../outside.txt".to_string()),
+            "a non-numeric >& destination remains a path write"
+        );
     }
 
     #[test]

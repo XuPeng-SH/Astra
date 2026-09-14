@@ -124,6 +124,22 @@ fn work_plan_error(code: &str, message: &str, retryable: bool) -> astra_tools::T
     result
 }
 
+/// A stale Work context is an optimistic-precondition rejection: the requested
+/// graph mutation was never applied and is safe to retry after refreshing the
+/// canonical context. Preserve that execution boundary in the shared ledger so
+/// a corrected retry does not leave a false unresolved execution failure.
+fn work_plan_context_stale_error(message: &str) -> astra_tools::ToolResult {
+    let mut result = work_plan_error("work_plan_context_stale", message, true);
+    let metadata = result.metadata.get_or_insert_with(Default::default);
+    metadata.insert(
+        "rejection_code".to_string(),
+        Value::String("work_plan_context_stale".to_string()),
+    );
+    metadata.insert("execution_started".to_string(), Value::Bool(false));
+    metadata.insert("side_effects_maybe".to_string(), Value::Bool(false));
+    result
+}
+
 fn map_repository_error(error: WorkRepositoryError) -> astra_tools::ToolResult {
     if matches!(
         &error,
@@ -163,10 +179,8 @@ fn map_repository_error(error: WorkRepositoryError) -> astra_tools::ToolResult {
             "The session is no longer bound to the validated Work branch",
             false,
         ),
-        WorkRepositoryError::InvalidWorkProposalBasis { .. } => work_plan_error(
-            "work_plan_context_stale",
+        WorkRepositoryError::InvalidWorkProposalBasis { .. } => work_plan_context_stale_error(
             "The Work plan changed; inspect the current context before proposing again",
-            true,
         ),
         WorkRepositoryError::WorkProposalCapacityExceeded => work_plan_error(
             "work_plan_proposal_capacity",
@@ -249,20 +263,16 @@ async fn load_observation(
         || as_of.goal_revision != basis.goal_revision
         || as_of.criteria_set_revision != basis.criteria_set_revision
     {
-        return Err(work_plan_error(
-            "work_plan_context_stale",
+        return Err(work_plan_context_stale_error(
             "The Work observation changed while its plan was being inspected",
-            true,
         ));
     }
     if report.overview().delivery_branch.branch_id == basis.branch_id
         && (as_of.delivery_branch_revision != basis.branch_revision
             || as_of.graph_revision != basis.graph_revision)
     {
-        return Err(work_plan_error(
-            "work_plan_context_stale",
+        return Err(work_plan_context_stale_error(
             "The delivery branch changed while its plan was being inspected",
-            true,
         ));
     }
     Ok(report)
@@ -317,10 +327,8 @@ pub(super) async fn inspect(
         .as_deref()
         .is_some_and(|expected| expected != context.context_id())
     {
-        return work_plan_error(
-            "work_plan_context_stale",
+        return work_plan_context_stale_error(
             "The Work plan changed; restart inspection from the current context",
-            true,
         );
     }
     let item_offset = args.item_offset.unwrap_or(0);
@@ -773,10 +781,8 @@ pub(super) async fn propose(
         || context.basis().branch_goal_revision != context.basis().goal_revision
         || context.basis().branch_criteria_set_revision != context.basis().criteria_set_revision
     {
-        return work_plan_error(
-            "work_plan_context_stale",
+        return work_plan_context_stale_error(
             "The Work plan changed; inspect the current context before proposing again",
-            true,
         );
     }
     let additions = match parse_additions(args.additions) {
@@ -887,6 +893,38 @@ mod tests {
     use uuid::Uuid;
 
     static TEST_POOL: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
+    #[test]
+    fn stale_context_is_a_retryable_nonexecution_rejection() {
+        let result = work_plan_context_stale_error(
+            "The Work plan changed; inspect the current context before proposing again",
+        );
+        assert!(result.is_error);
+        let metadata = result.metadata.as_ref().expect("typed conflict metadata");
+        assert_eq!(metadata["rejection_code"], "work_plan_context_stale");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["side_effects_maybe"], false);
+        assert_eq!(metadata["retryable"], true);
+
+        let disposition =
+            astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+                metadata.get("disposition"),
+                metadata.get("execution_started").and_then(Value::as_bool),
+                astra_services::session_journal::ToolCallDisposition::Executed,
+            );
+        assert_eq!(
+            disposition,
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        );
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result),
+            astra_turn_types::ToolInvocationTerminalOutcome::Rejected {
+                rejection_code: Some(code),
+                retryable: true,
+                ..
+            } if code == "work_plan_context_stale"
+        ));
+    }
 
     fn id(prefix: &str) -> String {
         format!("{prefix}-{}", Uuid::new_v4())

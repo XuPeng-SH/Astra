@@ -70,8 +70,7 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 include,
             ))
         }
-        "github" => semantic_github_key(args),
-        "git" => semantic_git_key(args),
+
         "get_agent_info" => Some(tool_name.to_string()),
         "list_dir" => {
             let path = arg_str(args, "path").unwrap_or(".");
@@ -194,133 +193,6 @@ fn read_file_path_from_semantic_key(key: &str) -> Option<&str> {
         .and_then(|rest| rest.split_once(":start=").map(|(path, _)| path))
 }
 
-fn normalize_repo(repo: &str) -> String {
-    repo.trim().to_lowercase().trim_end_matches('/').to_string()
-}
-
-fn semantic_github_key(args: &Value) -> Option<String> {
-    let action = arg_str(args, "action")?;
-    match action {
-        "list_prs" | "list_issues" | "ci_status" | "repo_stats" => {
-            let repo = arg_str(args, "repo")?;
-            Some(format!("github:{}:{}", action, normalize_repo(repo)))
-        }
-        "get_pr" => {
-            let repo = arg_str(args, "repo")?;
-            let number = args.get("pr_number").or_else(|| args.get("number"))?;
-            Some(format!("github:get_pr:{}#{}", normalize_repo(repo), number))
-        }
-        "get_issue" => {
-            let repo = arg_str(args, "repo")?;
-            let number = args.get("issue_number").or_else(|| args.get("number"))?;
-            Some(format!(
-                "github:get_issue:{}#{}",
-                normalize_repo(repo),
-                number
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn semantic_git_key(args: &Value) -> Option<String> {
-    let action = arg_str(args, "action")?;
-    match action {
-        "status" => Some("git:status".to_string()),
-        "diff" => {
-            let git_ref = arg_str(args, "ref").unwrap_or("HEAD");
-            let base_ref = arg_str(args, "base_ref").unwrap_or("");
-            let staged = arg_bool(args, "staged").unwrap_or(false);
-            let stat_only = arg_bool(args, "stat_only").unwrap_or(false);
-            let mut path_filters: Vec<String> = args
-                .get("paths")
-                .and_then(Value::as_array)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(normalize_path)
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    arg_str(args, "path")
-                        .map(normalize_path)
-                        .into_iter()
-                        .collect()
-                });
-            // Pathspec order does not affect diff output. Canonicalizing the
-            // set prevents equivalent multi-file reviews from missing cache
-            // hits while preserving every output-shaping filter.
-            path_filters.sort();
-            path_filters.dedup();
-            Some(format!(
-                "git:diff:{}..{}:staged={}:stat_only={}:paths={}",
-                base_ref,
-                git_ref,
-                staged,
-                stat_only,
-                serde_json::to_string(&path_filters).expect("path filters serialize")
-            ))
-        }
-        "log" => {
-            let git_ref = arg_str(args, "ref").unwrap_or("HEAD");
-            let n = arg_u64(args, "n").unwrap_or(10);
-            let path = arg_str(args, "path").unwrap_or("");
-            Some(format!(
-                "git:log:{}:n={}:path={}",
-                git_ref,
-                n,
-                normalize_path(path)
-            ))
-        }
-        "show" => {
-            let revision = arg_str(args, "revision").unwrap_or("HEAD");
-            let path = arg_str(args, "path").unwrap_or("");
-            let stat = arg_bool(args, "stat_only").unwrap_or(false);
-            Some(format!(
-                "git:show:{}:{}:{}",
-                revision.to_lowercase(),
-                normalize_path(path),
-                stat
-            ))
-        }
-        "blame" => {
-            let file = arg_str(args, "path")?;
-            let line_start = arg_u64(args, "start_line")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            let line_end = arg_u64(args, "end_line")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            Some(format!(
-                "git:blame:{}:start_line={}:end_line={}",
-                normalize_path(file),
-                line_start,
-                line_end,
-            ))
-        }
-        "file_history" => {
-            let file = arg_str(args, "file")?;
-            let n = arg_u64(args, "n").unwrap_or(10);
-            Some(format!("git:file_history:{}:n={}", normalize_path(file), n))
-        }
-        "log_search" => {
-            let query = arg_str(args, "query").unwrap_or("");
-            Some(format!("git:log_search:{}", query.to_lowercase()))
-        }
-        "contributors" => {
-            let path = arg_str(args, "path").unwrap_or("");
-            let since = arg_str(args, "since").unwrap_or("");
-            Some(format!(
-                "git:contributors:path={}:since={}",
-                normalize_path(path),
-                since
-            ))
-        }
-        _ => None,
-    }
-}
-
 fn semantic_bash_git_key(args: &Value) -> Option<String> {
     let command = arg_str(args, "command")?.trim();
     if command
@@ -365,28 +237,7 @@ const DEFAULT_AUDIT_ENTRIES: usize = 256;
 /// Conservative read-only predicate used to decide whether a short cached
 /// output can be safely re-executed. Action-shaped tools must inspect args so
 /// mutating actions are never replayed blindly.
-fn is_read_only_tool(tool_name: &str, args: &Value) -> bool {
-    if tool_name == "git" {
-        return matches!(
-            arg_str(args, "action"),
-            Some(
-                "status"
-                    | "diff"
-                    | "log"
-                    | "show"
-                    | "blame"
-                    | "file_history"
-                    | "log_search"
-                    | "contributors"
-            )
-        );
-    }
-    if tool_name == "github" {
-        return matches!(
-            arg_str(args, "action"),
-            Some("list_prs" | "get_pr" | "ci_status" | "repo_stats" | "list_issues" | "get_issue")
-        );
-    }
+fn is_read_only_tool(tool_name: &str, _args: &Value) -> bool {
     matches!(
         tool_name,
         "read_file"
@@ -755,8 +606,7 @@ impl SemanticDedup {
 
         let mut files = std::collections::BTreeSet::new();
         let mut searches: Vec<String> = Vec::new();
-        let mut git_ops: Vec<&str> = Vec::new();
-        let mut github_ops: Vec<String> = Vec::new();
+
         let mut memory_ops: Vec<&str> = Vec::new();
         let mut other: Vec<String> = Vec::new();
 
@@ -777,25 +627,7 @@ impl SemanticDedup {
                         searches.push(format!("glob {}", rest));
                     }
                 }
-                "git" => {
-                    if let Some(action) = key.split(':').nth(1) {
-                        git_ops.push(action);
-                    }
-                }
-                "github" => {
-                    // Extract repo from key if present
-                    let mut parts = key.split(':');
-                    let _tool = parts.next();
-                    if let Some(action) = parts.next() {
-                        if let Some(repo) = parts.next() {
-                            github_ops.push(format!("{action} {repo}"));
-                        } else {
-                            github_ops.push(action.to_string());
-                        }
-                    } else {
-                        github_ops.push("github".to_string());
-                    }
-                }
+
                 t if t.starts_with("memory_") => {
                     memory_ops.push(t.strip_prefix("memory_").unwrap_or(t));
                 }
@@ -820,16 +652,6 @@ impl SemanticDedup {
 
         if !searches.is_empty() {
             parts.push(format!("Searches: {}", searches.join(", ")));
-        }
-
-        if !git_ops.is_empty() {
-            let unique: std::collections::HashSet<_> = git_ops.iter().collect();
-            let ops: Vec<_> = unique.iter().map(|s| **s).collect();
-            parts.push(format!("Git: {}", ops.join(", ")));
-        }
-
-        if !github_ops.is_empty() {
-            parts.push(format!("GitHub: {}", github_ops.join(", ")));
         }
 
         if !memory_ops.is_empty() {
@@ -871,19 +693,6 @@ mod tests {
     use serde_json::json;
 
     // ── Tier 2: semantic_call_key ──
-
-    #[test]
-    fn github_repo_case_insensitive() {
-        let k1 = semantic_call_key(
-            "github",
-            &json!({"action": "list_prs", "repo": "matrixorigin/mo"}),
-        );
-        let k2 = semantic_call_key(
-            "github",
-            &json!({"action": "list_prs", "repo": "MatrixOrigin/MO"}),
-        );
-        assert_eq!(k1, k2);
-    }
 
     #[test]
     fn read_file_trailing_slash() {
@@ -986,95 +795,22 @@ mod tests {
     }
 
     #[test]
-    fn git_action_diff_default_vs_explicit_head() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff"}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff", "ref": "HEAD"}));
-        assert_eq!(k1, k2, "default should match explicit HEAD");
-    }
-
-    #[test]
-    fn git_action_diff_different_refs() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff", "ref": "HEAD"}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff", "ref": "main"}));
-        assert_ne!(k1, k2, "different refs should differ");
-    }
-
-    #[test]
-    fn git_action_diff_staged_differs_from_unstaged() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff"}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff", "staged": true}));
-        assert_ne!(k1, k2, "staged vs unstaged should differ");
-    }
-
-    #[test]
-    fn git_action_diff_stat_only_differs_from_full_patch() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff", "stat_only": true}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff"}));
-        assert_ne!(
-            k1, k2,
-            "stat-only diff must not share a semantic cache key with full patch output"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_path_filter_differs_from_repo_wide_diff() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff", "path": "src/a.rs"}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff"}));
-        assert_ne!(
-            k1, k2,
-            "path-scoped diff must not share a semantic cache key with repo-wide diff"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_multiple_path_filters_differ_from_repo_wide_diff() {
-        let filtered = semantic_call_key(
-            "git",
-            &json!({"action": "diff", "paths": ["src/a.rs", "src/b.rs"]}),
-        );
-        let repository_wide = semantic_call_key("git", &json!({"action": "diff"}));
-        assert_ne!(
-            filtered, repository_wide,
-            "multi-path diff filters must be part of the semantic cache key"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_different_paths_do_not_collide() {
-        let k1 = semantic_call_key("git", &json!({"action": "diff", "path": "src/a.rs"}));
-        let k2 = semantic_call_key("git", &json!({"action": "diff", "path": "src/b.rs"}));
-        assert_ne!(
-            k1, k2,
-            "different git(action=diff) path filters must stay distinct for cache safety"
-        );
-    }
-
-    #[test]
-    fn git_action_status_always_same_key() {
-        let k1 = semantic_call_key("git", &json!({"action": "status"}));
-        let k2 = semantic_call_key("git", &json!({"action": "status", "extra": "ignored"}));
-        assert_eq!(k1, k2, "git(action=status) should always be same key");
-    }
-
-    #[test]
     fn bash_non_git_returns_none() {
         assert!(semantic_call_key("bash", &json!({"command": "ls"})).is_none());
     }
 
     #[test]
-    fn bash_git_diff_command_shares_git_action_diff_semantic_key() {
+    fn bash_git_diff_spellings_share_semantic_key() {
         let bash = semantic_call_key("bash", &json!({"command": "git --no-pager diff"}));
-        let structured = semantic_call_key("git", &json!({"action": "diff"}));
+        let structured = semantic_call_key("bash", &json!({"command": "git diff"}));
         assert_eq!(bash, structured);
 
         let bash_head = semantic_call_key("bash", &json!({"command": "git diff HEAD"}));
         assert_eq!(bash_head, structured);
 
         let bash_path = semantic_call_key("bash", &json!({"command": "git diff -- src/"}));
-        let structured_path = semantic_call_key(
-            "git",
-            &json!({"action": "diff", "path": "src", "ref": "HEAD"}),
-        );
+        let structured_path =
+            semantic_call_key("bash", &json!({"command": "git --no-pager diff -- src"}));
         assert_eq!(bash_path, structured_path);
     }
 
@@ -1086,32 +822,6 @@ mod tests {
     #[test]
     fn write_file_returns_none() {
         assert!(semantic_call_key("write_file", &json!({"path": "a.rs"})).is_none());
-    }
-
-    #[test]
-    fn github_action_get_pr_includes_number() {
-        let k1 = semantic_call_key(
-            "github",
-            &json!({"action": "get_pr", "repo": "org/repo", "pr_number": 42}),
-        );
-        let k2 = semantic_call_key(
-            "github",
-            &json!({"action": "get_pr", "repo": "org/repo", "pr_number": 43}),
-        );
-        assert_ne!(k1, k2, "different PR numbers should differ");
-    }
-
-    #[test]
-    fn github_action_get_pr_same_pr_case_insensitive() {
-        let k1 = semantic_call_key(
-            "github",
-            &json!({"action": "get_pr", "repo": "Org/Repo", "pr_number": 42}),
-        );
-        let k2 = semantic_call_key(
-            "github",
-            &json!({"action": "get_pr", "repo": "org/repo", "pr_number": 42}),
-        );
-        assert_eq!(k1, k2, "same PR on same repo should match");
     }
 
     #[test]
@@ -1150,13 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn git_action_log_search_case_insensitive() {
-        let k1 = semantic_call_key("git", &json!({"action": "log_search", "query": "Fix Bug"}));
-        let k2 = semantic_call_key("git", &json!({"action": "log_search", "query": "fix bug"}));
-        assert_eq!(k1, k2, "search query should be case insensitive");
-    }
-
-    #[test]
     fn symbols_param_differs_kinds_and_calls() {
         let k1 = semantic_call_key("symbols", &json!({"path": "foo.rs"}));
         let k2 = semantic_call_key(
@@ -1174,81 +877,6 @@ mod tests {
         let k1 = semantic_call_key("symbols", &json!({"path": "foo.rs", "pattern": "test_"}));
         let k2 = semantic_call_key("symbols", &json!({"path": "foo.rs", "pattern": "parse_"}));
         assert_ne!(k1, k2, "different pattern filters must differ");
-    }
-
-    #[test]
-    fn git_action_blame_line_range_differs() {
-        let k1 = semantic_call_key(
-            "git",
-            &json!({"action": "blame", "path": "foo.rs", "start_line": 1, "end_line": 50}),
-        );
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "blame", "path": "foo.rs", "start_line": 100, "end_line": 150}),
-        );
-        assert_ne!(k1, k2, "different blame line ranges must differ");
-    }
-
-    #[test]
-    fn git_action_blame_whole_file_differs_from_valid_line_range() {
-        let k1 = semantic_call_key("git", &json!({"action": "blame", "path": "foo.rs"}));
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "blame", "path": "foo.rs", "start_line": 1, "end_line": 1}),
-        );
-        assert_ne!(
-            k1, k2,
-            "whole-file blame and a valid one-line range are distinct reads"
-        );
-    }
-
-    #[test]
-    fn git_action_file_history_n_differs() {
-        let k1 = semantic_call_key(
-            "git",
-            &json!({"action": "file_history", "file": "foo.rs", "n": 10}),
-        );
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "file_history", "file": "foo.rs", "n": 50}),
-        );
-        assert_ne!(
-            k1, k2,
-            "different n values must differ for git(action=file_history)"
-        );
-    }
-
-    #[test]
-    fn git_action_contributors_path_differs() {
-        let k1 = semantic_call_key("git", &json!({"action": "contributors", "path": "src"}));
-        let k2 = semantic_call_key("git", &json!({"action": "contributors", "path": "tests"}));
-        assert_ne!(k1, k2, "different path filters must differ");
-    }
-
-    #[test]
-    fn git_action_contributors_since_differs() {
-        let k1 = semantic_call_key(
-            "git",
-            &json!({"action": "contributors", "since": "2.weeks.ago"}),
-        );
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "contributors", "since": "1.year.ago"}),
-        );
-        assert_ne!(k1, k2, "different since values must differ");
-    }
-
-    #[test]
-    fn git_action_contributors_no_args_same_key() {
-        let k1 = semantic_call_key("git", &json!({"action": "contributors"}));
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "contributors", "extra": "ignored"}),
-        );
-        assert_eq!(
-            k1, k2,
-            "bare git(action=contributors) calls should share same key"
-        );
     }
 
     #[test]
@@ -1591,21 +1219,6 @@ mod tests {
     }
 
     #[test]
-    fn context_inventory_shows_git_ops() {
-        let mut tracker = SemanticDedup::new(0.75);
-        tracker.check_and_record("git", &json!({"action": "status"}), "clean", 0);
-        tracker.check_and_record(
-            "git",
-            &json!({"action": "diff", "ref": "HEAD~3"}),
-            "diff",
-            1,
-        );
-
-        let inv = tracker.context_inventory();
-        assert!(inv.contains("Git:"), "should have Git section");
-    }
-
-    #[test]
     fn context_inventory_truncates_long_file_lists() {
         let mut tracker = SemanticDedup::new(0.75);
         for i in 0..10 {
@@ -1734,32 +1347,6 @@ mod tests {
     }
 
     // ── token_cosine_similarity (already covered above by Tier 3 tests) ─
-
-    #[test]
-    fn git_action_diff_key_includes_base_ref() {
-        let k1 = semantic_call_key(
-            "git",
-            &json!({"action": "diff", "base_ref": "HEAD~5", "ref": "HEAD"}),
-        );
-        let k2 = semantic_call_key("git", &json!({"action": "diff", "ref": "HEAD"}));
-        assert_ne!(
-            k1, k2,
-            "range diff should have different key from single-ref diff"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_same_range_same_key() {
-        let k1 = semantic_call_key(
-            "git",
-            &json!({"action": "diff", "base_ref": "HEAD~5", "ref": "HEAD"}),
-        );
-        let k2 = semantic_call_key(
-            "git",
-            &json!({"action": "diff", "base_ref": "HEAD~5", "ref": "HEAD"}),
-        );
-        assert_eq!(k1, k2);
-    }
 
     #[test]
     fn pre_check_block_returns_none_on_first_call() {

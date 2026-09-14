@@ -60,15 +60,7 @@ pub(crate) async fn execute_server_bash(
         Ok(workdir) => workdir,
         Err(error) => return astra_tools::ToolResult::error(error),
     };
-    let inspection_dir = match workdir.inspection_path() {
-        Ok(path) => path,
-        Err(error) => return astra_tools::ToolResult::error(error),
-    };
-    if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command_in_workspace_from(
-        command,
-        workspace_root,
-        &inspection_dir,
-    ) {
+    if let Err(reason) = astra_tools::shell_ops::validate_prepared_bash_command(command, &workdir) {
         return astra_tools::ToolResult::error(reason);
     }
     if command.len() > MAX_COMMAND_LENGTH {
@@ -91,10 +83,12 @@ pub(crate) async fn execute_server_bash(
     let explicit_source_artifacts = args
         .get(astra_tools::source_preimage::SOURCE_ARTIFACTS_FIELD)
         .is_some();
-    let mut source_preimages = match astra_tools::source_preimage::prepare(
+    let mut source_preimages = match astra_tools::source_preimage::prepare_with_inspection(
         workspace_root,
         args,
         source_scope.unwrap_or_default(),
+        #[cfg(unix)]
+        workdir.inspection(),
     ) {
         Ok(plan) => plan,
         Err(reason) => return astra_tools::ToolResult::error(format!("Error: {reason}")),
@@ -104,13 +98,26 @@ pub(crate) async fn execute_server_bash(
         // operand, or unavailable durable store must never make ordinary
         // server bash unavailable; only an explicit declaration is fail-closed.
         if let Some(scope) = source_scope {
-            source_preimages = astra_tools::source_preimage::prepare_inferred(
-                workspace_root,
-                &inspection_dir,
-                command,
-                scope,
-            )
-            .unwrap_or(None);
+            #[cfg(unix)]
+            {
+                source_preimages = astra_tools::source_preimage::prepare_inferred_with_inspection(
+                    workspace_root,
+                    workdir.inspection(),
+                    command,
+                    scope,
+                )
+                .unwrap_or(None);
+            }
+            #[cfg(not(unix))]
+            {
+                source_preimages = astra_tools::source_preimage::prepare_inferred(
+                    workspace_root,
+                    workdir.path(),
+                    command,
+                    scope,
+                )
+                .unwrap_or(None);
+            }
         }
     }
 
@@ -307,9 +314,12 @@ pub(crate) async fn execute_server_bash(
         fields.remove("_astra_scope_ownership");
         fields.remove("_astra_execution_started");
     }
-    let coordination_integrity_valid = observation_lease
-        .as_ref()
-        .is_none_or(astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid);
+    let coordination_integrity_valid = observation_lease.as_ref().is_none_or(
+        astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
+    );
+    let receipt_authority_valid = observation_lease.as_ref().is_none_or(
+        astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+    );
     let quarantine_weak_after_current = !nested_run_script_callback
         && astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(
             command,
@@ -328,6 +338,7 @@ pub(crate) async fn execute_server_bash(
         scope_settled,
         scope_ownership,
         coordination_integrity_valid,
+        receipt_authority_valid,
         quarantine_weak_after_current,
         explicit_verification,
     );
@@ -399,6 +410,7 @@ fn attach_workspace_observation(
     scope_settled: bool,
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     coordination_integrity_valid: bool,
+    receipt_authority_valid: bool,
     quarantine_weak_after_current: bool,
     explicit_verification: bool,
 ) -> astra_tools::ToolResult {
@@ -439,7 +451,7 @@ fn attach_workspace_observation(
     let workspace_changed = before
         .as_ref()
         .is_some_and(|before| before.changed_from(after));
-    if before.filter(|_| scope_settled).is_some() && workspace_changed {
+    if receipt_authority_valid && before.filter(|_| scope_settled).is_some() && workspace_changed {
         if let Some(ownership) = scope_ownership {
             if ownership.is_authoritative() {
                 result.metadata.get_or_insert_with(Default::default).extend(
@@ -482,6 +494,7 @@ fn attach_workspace_observation(
             == Some(0)
         && before_available
         && after_available
+        && receipt_authority_valid
         && !workspace_changed
         && scope_settled
         && scope_ownership.is_some_and(astra_sandbox::ScopeOwnership::is_authoritative);
@@ -868,6 +881,7 @@ mod tests {
             true,
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
             true,
+            true,
             false,
             true,
         );
@@ -905,6 +919,7 @@ mod tests {
             true,
             true,
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
+            true,
             true,
             false,
             true,
@@ -944,6 +959,7 @@ mod tests {
             true,
             true,
             Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
+            true,
             true,
             true,
             false,
@@ -998,6 +1014,7 @@ mod tests {
             false,
             None,
             true,
+            true,
             false,
             false,
         );
@@ -1034,6 +1051,7 @@ mod tests {
             false,
             false,
             None,
+            true,
             true,
             false,
             false,
@@ -1221,6 +1239,7 @@ mod tests {
             true,
             true,
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
+            true,
             true,
             false,
             false,

@@ -119,18 +119,9 @@ criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 1
-      - type: provider_prompt_cache_read_ratio
-        min: 0.90
-        # The first Work activation can legitimately append a bounded typed
-        # receipt and one or more selected schemas. Keep the user-facing raw
-        # floor at 90%. The criterion below separately bounds system/tool
-        # identity churn and checks cache-read count nonregression; its read
-        # counts can include conversation history and do not prove coverage.
-        warmup_turns: 0
-      - type: provider_prompt_cache_read_nonregression_ratio
+      - type: provider_stable_prefix_cache_coverage
         min: 0.95
-        min_pairs: 1
-        max_identity_transitions_per_run: 1
+        min_observations: 2
   - type: journal_tool_call_count
     name: ask_user
     min: 0

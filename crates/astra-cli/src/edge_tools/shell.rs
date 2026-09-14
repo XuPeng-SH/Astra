@@ -4572,27 +4572,7 @@ impl ToolExecutor {
             eprintln!("  {}", warning);
         }
 
-        // Nudge: redirect `git diff <range>` to the built-in git(action=diff/show) tool.
-        // Large multi-commit diffs via bash can timeout or produce huge uncontrolled output,
-        // while built-in tools have output budgets and pressure-scaling.
-        // We don't hard-block — instead, auto-pipe through `head -c` to prevent the
-        // pipe buffer stall that causes timeouts on large diffs.
-        let command = {
-            let trimmed = command.trim();
-            if (trimmed.starts_with("git diff ") || trimmed.starts_with("git log "))
-                && !trimmed.contains("--stat")
-                && !trimmed.contains("--name")
-                && !trimmed.contains("| head")
-                && !trimmed.contains("| tail")
-                && (trimmed.contains("..") || trimmed.contains("HEAD~"))
-            {
-                // Auto-truncate to prevent pipe stall; append a hint so the agent
-                // knows the output may be incomplete and can use built-in tools.
-                format!("{trimmed} | head -c 30000")
-            } else {
-                command.to_string()
-            }
-        };
+        let command = command.to_string();
 
         // The server may attach a separate authoritative command cap. It
         // is intentionally not the model-visible `timeout` field: callers
@@ -4892,7 +4872,7 @@ impl ToolExecutor {
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
         lease: Option<&astra_tools::workspace_observation::ExternalEffectObservationLease>,
     ) -> super::ToolExecutionOutcome {
-        if lease.is_some_and(|lease| !lease.integrity_valid()) {
+        if lease.is_some_and(|lease| !lease.receipt_authority_valid()) {
             return outcome;
         }
         if let Some(receipt) = match before {
@@ -4941,9 +4921,7 @@ impl ToolExecutor {
         let root = self.effective_project_root();
         if ownership_unsettled
             || observation_lease.is_some_and(|lease| {
-                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
-                    lease,
-                )
+                !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
             })
         {
             astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root);
@@ -4975,7 +4953,7 @@ impl ToolExecutor {
             && !workspace_changed
             && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
             && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
             )
         {
             outcome
@@ -5036,9 +5014,7 @@ impl ToolExecutor {
         let quarantine_root = root.clone();
         if ownership_unsettled
             || observation_lease.is_some_and(|lease| {
-                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
-                    lease,
-                )
+                !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
             })
         {
             astra_tools::workspace_observation::mark_workspace_observation_unsettled(
@@ -5077,7 +5053,7 @@ impl ToolExecutor {
             && !workspace_changed
             && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
             && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
             )
         {
             outcome
@@ -5497,7 +5473,7 @@ impl ToolExecutor {
             tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await;
         let coordination_unsettled = _observation_lease
             .as_ref()
-            .is_some_and(|lease| !lease.integrity_valid());
+            .is_some_and(|lease| !lease.coordination_integrity_valid());
         let outcome = match shell_result {
             Ok(Ok(output)) => {
                 let scope_ownership = output.scope_ownership;
@@ -5851,7 +5827,7 @@ impl ToolExecutor {
             self.run_shell_output_cancelable_scoped(&command, timeout_secs, cancel_token);
         let coordination_unsettled = _observation_lease
             .as_ref()
-            .is_some_and(|lease| !lease.integrity_valid());
+            .is_some_and(|lease| !lease.coordination_integrity_valid());
         match shell_result {
             Ok(scoped) => {
                 let scope_ownership = scoped.scope_ownership;
@@ -5874,7 +5850,7 @@ impl ToolExecutor {
                 );
                 let outcome = if external_lease
                     .as_ref()
-                    .is_none_or(|lease| lease.integrity_valid())
+                    .is_none_or(|lease| lease.receipt_authority_valid())
                 {
                     self.attach_external_effect_observation(
                         outcome,
@@ -5905,7 +5881,7 @@ impl ToolExecutor {
                 );
                 let outcome = if external_lease
                     .as_ref()
-                    .is_none_or(|lease| lease.integrity_valid())
+                    .is_none_or(|lease| lease.receipt_authority_valid())
                 {
                     self.attach_external_effect_observation(
                         outcome,
@@ -6900,6 +6876,7 @@ mod tests {
             fields[astra_tools::workspace_observation::SCOPE_FIELD],
             astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -6907,6 +6884,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
     }
 
     #[test]
@@ -6929,6 +6923,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -6936,6 +6931,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 
@@ -7008,6 +7020,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -7015,9 +7028,27 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_helper_crash_marks_terminal_ownership_unsettled() {
         let dir = tempfile::tempdir().unwrap();
@@ -7299,6 +7330,7 @@ mod tests {
             fields[astra_tools::workspace_observation::OBSERVED_FIELD],
             serde_json::Value::Bool(true)
         );
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
             Some(
@@ -7306,6 +7338,23 @@ mod tests {
                     | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
             )
         ));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+            );
+            let lease =
+                astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(
+                    dir.path(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(
+                !lease.receipt_authority_valid(),
+                "weak process groups cannot authorize receipts"
+            );
+        }
         assert!(dir.path().join("generated.txt").is_file());
     }
 
@@ -7576,24 +7625,21 @@ mod tests {
     }
 
     #[test]
-    fn bash_git_diff_range_auto_truncated() {
+    fn bash_preparation_preserves_git_command_semantics() {
         let executor = test_executor();
-        // Multi-commit range diff → auto-piped through head -c, not blocked
-        let result = executor
-            .bash(&serde_json::json!({"command": "git diff HEAD~5..HEAD 2>/dev/null || true"}));
-        // Should NOT contain "built-in" (we no longer hard-block)
-        assert!(
-            !result.contains("built-in"),
-            "should run, not block: {result}"
-        );
-        // --stat is untouched (no head -c appended)
-        let result = executor.bash(
-            &serde_json::json!({"command": "git diff HEAD~3..HEAD --stat 2>/dev/null || true"}),
-        );
-        assert!(
-            !result.contains("built-in"),
-            "stat should be allowed: {result}"
-        );
+        for command in [
+            "git diff HEAD~5..HEAD",
+            "git log HEAD~3..HEAD; exit 23",
+            "git diff HEAD~3..HEAD --stat",
+        ] {
+            let (prepared, _) = executor
+                .prepare_bash_invocation(&serde_json::json!({"command": command}))
+                .expect("Git commands use ordinary Bash preparation");
+            assert_eq!(
+                prepared, command,
+                "preparation must not add a pipeline that changes output or exit status"
+            );
+        }
     }
 
     #[test]

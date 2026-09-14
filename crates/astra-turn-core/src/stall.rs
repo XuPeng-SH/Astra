@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn round_tool_call_sig_canonicalizes_equivalent_diff_tools() {
+    fn round_tool_call_sig_canonicalizes_equivalent_shell_diff_commands() {
         let bash = vec![serde_json::json!({
             "id": "call_bash",
             "type": "function",
@@ -930,8 +930,8 @@ mod tests {
             "id": "call_git_diff",
             "type": "function",
             "function": {
-                "name": "git_diff",
-                "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                "name": "bash",
+                "arguments": "{\"command\":\"git --no-pager diff -- src\"}"
             }
         })];
 
@@ -940,7 +940,7 @@ mod tests {
 
         assert_eq!(bash_sigs, structured_sigs);
         assert!(bash_names.contains("bash"));
-        assert!(structured_names.contains("git_diff"));
+        assert!(structured_names.contains("bash"));
     }
 
     // ── assess_progress (general progress-aware stall) ──

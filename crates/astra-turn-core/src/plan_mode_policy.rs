@@ -190,34 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_action_aware_for_git_github_and_task_control() {
-        for action in ["commit", "revert_commit", "push"] {
-            assert!(is_plan_mode_blocked_tool("git", &json!({"action": action})));
-        }
-        assert!(is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "pop"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "git",
-            &json!({"action": "stash", "sub_action": "list"})
-        ));
-        for action in ["status", "diff", "log", "show", "blame"] {
-            assert!(!is_plan_mode_blocked_tool(
-                "git",
-                &json!({"action": action})
-            ));
-        }
-
-        assert!(is_plan_mode_blocked_tool(
-            "github",
-            &json!({"action": "create_issue"})
-        ));
-        assert!(!is_plan_mode_blocked_tool(
-            "github",
-            &json!({"action": "list_prs"})
-        ));
-
+    fn plan_mode_blocks_task_control() {
         assert!(is_plan_mode_blocked_tool(
             "task_stop",
             &json!({"task_id": "bg-shell-1"})

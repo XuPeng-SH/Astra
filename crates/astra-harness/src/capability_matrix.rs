@@ -127,14 +127,14 @@ pub const CAPABILITY_CASES: &[CapabilityCase] = &[
         },
     },
     CapabilityCase {
-        id: "tools.cli_server.git_worktree_list_contract",
+        id: "tools.cli_server.session_worktree_contract",
         quadrant: CapabilityQuadrant::ToolExecution,
         topology: Topology::CliServer,
         kind: CaseKind::Happy,
-        boundary: "git(action=worktree, sub_action=list) is projected, admitted, and executed as a read-only Edge operation",
-        system_test: "git_worktree_public_contract_dispatches_sub_action",
-        model_validation: ModelValidation::Probe {
-            case: "git_worktree_list_contract",
+        boundary: "worktree enter and exit preserve session workspace lifecycle through public dispatch",
+        system_test: "session_worktree_tool_enters_and_exits_through_public_dispatch",
+        model_validation: ModelValidation::DeterministicOnly {
+            reason: "Session worktree lifecycle requires a disposable repository and verifies workspace restoration",
         },
     },
     CapabilityCase {
