@@ -1244,6 +1244,9 @@ impl<'a> SuiteRunner<'a> {
             criteria: det,
             steps: step_results,
             attempts,
+            execution: session
+                .as_ref()
+                .map(crate::pipeline_analysis::analyze_execution_trace),
             session,
             session_captures: cleanup_captures.into_values().collect(),
             reproducer,
@@ -1431,6 +1434,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1476,6 +1480,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1531,6 +1536,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
