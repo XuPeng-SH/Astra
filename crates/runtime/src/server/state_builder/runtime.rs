@@ -113,16 +113,16 @@ pub(super) async fn build_runtime_wiring(
         );
     }
     let resource_governor = initialize_resource_governor(shared_pool).await?;
-    let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let capacity = crate::capacity_model::CapacityInput::from_env();
+    let admission_limits = capacity.distributed_admission_limits();
+    let run_concurrency_limit = capacity.run_concurrency_limit();
     let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
         state.edge_callback_ledger.clone(),
         run_engine,
     )
+    .with_admission_limits(admission_limits)
     .with_pool(shared_pool.clone())
     .with_agent_mailbox_router(agent_mailbox_router)
     .with_delegation_engine(Arc::clone(&delegation_engine))

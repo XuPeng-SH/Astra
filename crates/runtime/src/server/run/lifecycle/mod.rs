@@ -5113,22 +5113,7 @@ fn start_active_run_control_watcher(
 /// Durable run state is mandatory; process-local state is limited to live
 /// control handles that cannot survive a restart.
 fn canonical_session_admission_limits() -> astra_services::WeightedAdmissionLimits {
-    astra_services::WeightedAdmissionLimits {
-        global: astra_services::AdmissionWork {
-            resident_bytes: 8 * 1024 * 1024 * 1024,
-            context_tokens: 8_000_000,
-            provider_slots: 50,
-            cpu_units: 8 * 1024 * 1024 * 1024,
-            io_bytes: 8 * 1024 * 1024 * 1024,
-        },
-        per_owner: astra_services::AdmissionWork {
-            resident_bytes: 6 * 1024 * 1024 * 1024,
-            context_tokens: 6_000_000,
-            provider_slots: 40,
-            cpu_units: 6 * 1024 * 1024 * 1024,
-            io_bytes: 6 * 1024 * 1024 * 1024,
-        },
-    }
+    crate::capacity_model::CapacityInput::from_env().distributed_admission_limits()
 }
 
 fn fresh_request_admission_bytes(request: &ChatRequestData) -> Result<u64, serde_json::Error> {
@@ -5273,6 +5258,11 @@ pub struct AgenticRunLifecycleService {
     /// spawn and automatically released when the task completes.
     run_semaphore: Arc<tokio::sync::Semaphore>,
     weighted_admission: astra_services::WeightedAdmissionController,
+    /// One immutable capacity snapshot is shared by local and durable
+    /// admission.  Re-reading environment variables in `with_pool` could
+    /// otherwise make the local semaphore and the cross-pod budget disagree
+    /// during test/deployment composition.
+    admission_limits: astra_services::WeightedAdmissionLimits,
     distributed_weighted_admission: Option<astra_services::DatabaseWeightedAdmissionController>,
     /// Shared metrics registry for capacity/admission signals exposed via /metrics.
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
@@ -5336,6 +5326,7 @@ impl AgenticRunLifecycleService {
                     Err(error) => (None, Some(Arc::<str>::from(error))),
                 }
         };
+        let admission_limits = canonical_session_admission_limits();
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
             matrixone,
@@ -5376,10 +5367,9 @@ impl AgenticRunLifecycleService {
             background_run_abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
             execution_handoff_requested: Arc::new(AtomicBool::new(false)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
-            weighted_admission: astra_services::WeightedAdmissionController::new(
-                canonical_session_admission_limits(),
-            )
-            .expect("per-owner weighted admission limits fit global limits"),
+            weighted_admission: astra_services::WeightedAdmissionController::new(admission_limits)
+                .expect("per-owner weighted admission limits fit global limits"),
+            admission_limits,
             distributed_weighted_admission: None,
             metrics_registry: None,
             #[cfg(feature = "harness")]
@@ -5479,18 +5469,24 @@ impl AgenticRunLifecycleService {
             }
         };
         let map_distributed_error = |error: astra_services::DistributedAdmissionError| {
-            let status = if matches!(
-                &error,
-                astra_services::DistributedAdmissionError::Capacity(_)
-            ) {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
+            let (status, code) = match &error {
+                astra_services::DistributedAdmissionError::Capacity(_) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "distributed_session_admission_capacity_exhausted",
+                ),
+                astra_services::DistributedAdmissionError::ConfigurationMismatch { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "distributed_session_admission_configuration_mismatch",
+                ),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "distributed_session_admission_rejected",
+                ),
             };
             error_response_coded(
                 status,
                 format!("distributed weighted session admission rejected this turn: {error}"),
-                "distributed_session_admission_rejected",
+                code,
             )
         };
 
@@ -5890,11 +5886,30 @@ impl AgenticRunLifecycleService {
         self.distributed_weighted_admission = Some(
             astra_services::DatabaseWeightedAdmissionController::new(
                 pool.clone(),
-                canonical_session_admission_limits(),
+                self.admission_limits,
             )
             .expect("per-owner distributed admission limits fit global limits"),
         );
         self.shared_pool = Some(pool);
+        self
+    }
+
+    /// Install one capacity snapshot for both process-local and cross-pod
+    /// admission. Production composition calls this before [`Self::with_pool`]
+    /// so every service built from the same settings observes identical
+    /// limits.
+    pub fn with_admission_limits(
+        mut self,
+        limits: astra_services::WeightedAdmissionLimits,
+    ) -> Self {
+        self.weighted_admission = astra_services::WeightedAdmissionController::new(limits)
+            .expect("per-owner weighted admission limits fit global limits");
+        self.admission_limits = limits;
+        if let Some(distributed) = self.distributed_weighted_admission.as_mut() {
+            distributed
+                .with_limits(limits)
+                .expect("per-owner distributed admission limits fit global limits");
+        }
         self
     }
 

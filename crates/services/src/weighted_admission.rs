@@ -26,6 +26,8 @@ pub(crate) const DISTRIBUTED_ADMISSION_SCOPE: &str = "canonical_turn_v1";
 const DISTRIBUTED_ADMISSION_MAX_TTL: Duration = Duration::from_secs(15 * 60);
 const DISTRIBUTED_ADMISSION_IDEMPOTENCY_DOMAIN: &[u8] =
     b"astra.distributed-weighted-admission-idempotency.v1\0";
+const DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN: &[u8] =
+    b"astra.distributed-weighted-admission-capacity.v1\0";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdmissionWork {
@@ -96,6 +98,10 @@ pub enum DistributedAdmissionError {
     Fenced,
     #[error("distributed admission idempotency key was reused for different work")]
     IdempotencyMismatch,
+    #[error(
+        "distributed admission capacity configuration mismatch (active={active}, requested={requested})"
+    )]
+    ConfigurationMismatch { active: String, requested: String },
     #[error("distributed admission database operation {operation} failed: {source}")]
     Database {
         operation: &'static str,
@@ -130,6 +136,23 @@ impl DatabaseWeightedAdmissionController {
         Ok(Self { pool, limits })
     }
 
+    /// Replace the capacity snapshot used by subsequent reservations.
+    ///
+    /// The durable gate validates the new snapshot while its row is locked, so
+    /// changing a controller after it has been attached to a pool remains
+    /// fail-closed during a live rollout. This also keeps the public runtime
+    /// builder order-independent (`with_pool(...).with_admission_limits(...)`).
+    pub fn with_limits(
+        &mut self,
+        limits: WeightedAdmissionLimits,
+    ) -> Result<(), WeightedAdmissionError> {
+        if !limits.per_owner.fits_within(limits.global) {
+            return Err(WeightedAdmissionError::RequestExceedsGlobal);
+        }
+        self.limits = limits;
+        Ok(())
+    }
+
     /// Reserve hard capacity across all pods.
     ///
     /// The single gate row serializes only this short admission transaction.
@@ -156,13 +179,13 @@ impl DatabaseWeightedAdmissionController {
         let now = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
-             WHERE scope_name = ? AND expires_at <= ?",
+             WHERE scope_name = ? AND expires_at <= NOW(6)",
         )
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
-        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(|source| distributed_database_error("cleanup_expired", source))?;
+        ensure_distributed_admission_capacity(&mut tx, self.limits).await?;
 
         if let Some(existing) =
             load_distributed_reservation(&mut tx, key, &idempotency_hash).await?
@@ -424,6 +447,133 @@ async fn lock_distributed_admission_gate(
         .ok_or_else(|| {
             DistributedAdmissionError::Invalid("database time is outside chrono range".into())
         })
+}
+
+/// Bind the durable admission scope to one capacity configuration.
+///
+/// Every protocol-aware pod may share the same gate, but a rollout must not
+/// let a newly started pod silently use a different global budget. The first
+/// protocol-aware pod records a hash; later pods fail closed while reservations
+/// are active and may adopt the new hash only after the old budget has drained.
+/// A pre-hash binary cannot enforce this check, so changing capacity requires
+/// draining those binaries first.
+async fn ensure_distributed_admission_capacity(
+    tx: &mut Transaction<'_, MySql>,
+    limits: WeightedAdmissionLimits,
+) -> Result<(), DistributedAdmissionError> {
+    let requested = admission_capacity_hash(limits);
+    let active: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT capacity_hash FROM session_weighted_admission_gates
+         WHERE scope_name = ? FOR UPDATE",
+    )
+    .bind(DISTRIBUTED_ADMISSION_SCOPE)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| distributed_database_error("load_capacity_configuration", source))?;
+
+    match active {
+        None => Err(DistributedAdmissionError::Database {
+            operation: "load_capacity_configuration",
+            source: sqlx::Error::RowNotFound,
+        }),
+        Some(Some(active)) if active == requested => Ok(()),
+        Some(active) => {
+            let active_reservations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_weighted_admission_reservations
+                 WHERE scope_name = ?",
+            )
+            .bind(DISTRIBUTED_ADMISSION_SCOPE)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|source| distributed_database_error("count_capacity_reservations", source))?;
+            let transition =
+                capacity_gate_transition(active.as_deref(), active_reservations, &requested);
+            let update_operation = match &transition {
+                CapacityGateTransition::Initialize => Some("initialize_capacity_configuration"),
+                CapacityGateTransition::Rotate => Some("rotate_capacity_configuration"),
+                CapacityGateTransition::Accept | CapacityGateTransition::Reject { .. } => None,
+            };
+            match transition {
+                CapacityGateTransition::Accept => Ok(()),
+                CapacityGateTransition::Reject { active, requested } => {
+                    Err(DistributedAdmissionError::ConfigurationMismatch { active, requested })
+                }
+                CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
+                    sqlx::query(
+                        "UPDATE session_weighted_admission_gates
+                         SET capacity_hash = ?, updated_at = NOW(6)
+                         WHERE scope_name = ?",
+                    )
+                    .bind(&requested)
+                    .bind(DISTRIBUTED_ADMISSION_SCOPE)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|source| {
+                        distributed_database_error(
+                            update_operation.expect("capacity update operation"),
+                            source,
+                        )
+                    })?;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn admission_capacity_hash(limits: WeightedAdmissionLimits) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN);
+    for value in [
+        limits.global.resident_bytes,
+        limits.global.context_tokens,
+        u64::from(limits.global.provider_slots),
+        limits.global.cpu_units,
+        limits.global.io_bytes,
+        limits.per_owner.resident_bytes,
+        limits.per_owner.context_tokens,
+        u64::from(limits.per_owner.provider_slots),
+        limits.per_owner.cpu_units,
+        limits.per_owner.io_bytes,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityGateTransition {
+    Accept,
+    Initialize,
+    Rotate,
+    Reject { active: String, requested: String },
+}
+
+/// Decide how a locked gate row may adopt a requested capacity snapshot.
+///
+/// A NULL hash is the state left by the one-time schema upgrade from the old
+/// gate. It may only be initialized after old reservations have drained: an
+/// active reservation has unknown provenance and must never be silently mixed
+/// with a newly declared budget.
+fn capacity_gate_transition(
+    active: Option<&str>,
+    active_reservations: i64,
+    requested: &str,
+) -> CapacityGateTransition {
+    if active == Some(requested) {
+        return CapacityGateTransition::Accept;
+    }
+    if active_reservations > 0 {
+        return CapacityGateTransition::Reject {
+            active: active.unwrap_or("unset").to_string(),
+            requested: requested.to_string(),
+        };
+    }
+    if active.is_none() {
+        CapacityGateTransition::Initialize
+    } else {
+        CapacityGateTransition::Rotate
+    }
 }
 
 async fn load_distributed_reservation(
@@ -848,5 +998,53 @@ mod tests {
             ),
             Err(WeightedAdmissionError::OwnerExhausted)
         ));
+    }
+
+    #[test]
+    fn capacity_hash_is_stable_and_changes_when_any_budget_changes() {
+        let baseline = admission_capacity_hash(limits());
+        assert_eq!(baseline, admission_capacity_hash(limits()));
+
+        let mut changed = limits();
+        changed.global.provider_slots += 1;
+        assert_ne!(baseline, admission_capacity_hash(changed));
+
+        let mut changed = limits();
+        changed.per_owner.context_tokens += 1;
+        assert_ne!(baseline, admission_capacity_hash(changed));
+    }
+
+    #[test]
+    fn capacity_gate_rejects_unknown_or_changed_budget_while_reservations_are_active() {
+        assert_eq!(
+            capacity_gate_transition(None, 1, "requested"),
+            CapacityGateTransition::Reject {
+                active: "unset".into(),
+                requested: "requested".into(),
+            }
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("active"), 1, "requested"),
+            CapacityGateTransition::Reject {
+                active: "active".into(),
+                requested: "requested".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn capacity_gate_initializes_or_rotates_only_after_reservations_drain() {
+        assert_eq!(
+            capacity_gate_transition(None, 0, "requested"),
+            CapacityGateTransition::Initialize
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("active"), 0, "requested"),
+            CapacityGateTransition::Rotate
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("requested"), 999, "requested"),
+            CapacityGateTransition::Accept
+        );
     }
 }

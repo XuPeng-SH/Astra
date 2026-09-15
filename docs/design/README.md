@@ -16,6 +16,7 @@ These documents describe target contracts. They should not be read as proof that
 | Documentation architecture | [documentation-architecture.md](documentation-architecture.md) | Documentation class rules, domain ownership, and migration policy. |
 | Agent/provider model | [agent-backbone-capacity-provider.md](agent-backbone-capacity-provider.md) | Shared backbone semantics and capacity provider contract. |
 | Runtime lifecycle | [runtime-lifecycle.md](runtime-lifecycle.md) | Session, run, turn, task, plan, cancel, resume, recovery. |
+| Multi-session scale | [multi-session-scale.md](multi-session-scale.md) | Capacity budgets, admission alignment, and multi-server rollout invariants. |
 | Durable runs | [durable-agent-runs.md](durable-agent-runs.md) | Lease, checkpoint, resume, terminal outcome, crash recovery details. |
 | Background work journey | [background-work-user-journey.md](background-work-user-journey.md) | Foreground fan-in, explicit background handoff, visible states, and recovery UX. |
 | Capabilities | [capability-system.md](capability-system.md) | Tools, skills, MCP, provider decisions, admission, fallback. |
