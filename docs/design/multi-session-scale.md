@@ -97,6 +97,14 @@ negative or out-of-range stored rows, so the optimization does not change the
 capacity invariant. This reduces result transfer and client materialization;
 it does not remove the serialized gate or claim a p95 improvement by itself.
 
+The third stage adds a four-pool, 1000-attempt MatrixOne harness. It proves that
+independent server pools share the same durable global and owner budgets, keeps
+successful permits live until all attempts finish, and checks that release does
+not leak a reservation. The admission latency it prints includes pool and gate
+wait; it is not a full server turn or provider throughput metric. The current
+hot path also reads the gate clock and capacity hash with one locked query,
+removing a redundant round trip without weakening configuration fencing.
+
 The next stage may introduce sharded/lease-based capacity only after measured
 lock wait, pool wait, or reservation-scan evidence justifies it, with crash and
 expiry tests.

@@ -176,7 +176,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_reservation", source))?;
-        let now = lock_distributed_admission_gate(&mut tx).await?;
+        let gate = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
              WHERE scope_name = ? AND expires_at <= NOW(6)",
@@ -185,7 +185,8 @@ impl DatabaseWeightedAdmissionController {
         .execute(&mut *tx)
         .await
         .map_err(|source| distributed_database_error("cleanup_expired", source))?;
-        ensure_distributed_admission_capacity(&mut tx, self.limits).await?;
+        ensure_distributed_admission_capacity(&mut tx, self.limits, gate.capacity_hash.as_deref())
+            .await?;
 
         if let Some(existing) =
             load_distributed_reservation(&mut tx, key, &idempotency_hash).await?
@@ -202,7 +203,8 @@ impl DatabaseWeightedAdmissionController {
         let (global_used, owner_used) = load_distributed_usage(&mut tx, &key.owner_user_id).await?;
         validate_available_work(self.limits, global_used, owner_used, work)?;
 
-        let expires_at = now
+        let expires_at = gate
+            .now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
             })?)
@@ -240,7 +242,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_renewal", source))?;
-        let now = lock_distributed_admission_gate(&mut tx).await?;
+        let now = lock_distributed_admission_gate(&mut tx).await?.now;
         let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
@@ -289,7 +291,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_release", source))?;
-        lock_distributed_admission_gate(&mut tx).await?;
+        let _gate = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
              WHERE scope_name = ? AND reservation_id = ?
@@ -426,11 +428,16 @@ fn validate_available_work(
     Ok(())
 }
 
+struct LockedDistributedAdmissionGate {
+    now: chrono::NaiveDateTime,
+    capacity_hash: Option<String>,
+}
+
 async fn lock_distributed_admission_gate(
     tx: &mut Transaction<'_, MySql>,
-) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
+) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
     let row = sqlx::query(
-        "SELECT scope_name,
+        "SELECT capacity_hash,
                 CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
          FROM session_weighted_admission_gates
          WHERE scope_name = ? FOR UPDATE",
@@ -439,14 +446,18 @@ async fn lock_distributed_admission_gate(
     .fetch_one(&mut **tx)
     .await
     .map_err(|source| distributed_database_error("lock_gate", source))?;
+    let capacity_hash = row
+        .try_get::<Option<String>, _>("capacity_hash")
+        .map_err(|source| distributed_database_error("decode_gate_capacity_hash", source))?;
     let unix_ms = row
         .try_get::<i64, _>("database_now_unix_ms")
         .map_err(|source| distributed_database_error("decode_gate_database_time", source))?;
-    chrono::DateTime::from_timestamp_millis(unix_ms)
+    let now = chrono::DateTime::from_timestamp_millis(unix_ms)
         .map(|timestamp| timestamp.naive_utc())
         .ok_or_else(|| {
             DistributedAdmissionError::Invalid("database time is outside chrono range".into())
-        })
+        })?;
+    Ok(LockedDistributedAdmissionGate { now, capacity_hash })
 }
 
 /// Bind the durable admission scope to one capacity configuration.
@@ -459,63 +470,48 @@ async fn lock_distributed_admission_gate(
 async fn ensure_distributed_admission_capacity(
     tx: &mut Transaction<'_, MySql>,
     limits: WeightedAdmissionLimits,
+    active: Option<&str>,
 ) -> Result<(), DistributedAdmissionError> {
     let requested = admission_capacity_hash(limits);
-    let active: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT capacity_hash FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
+    if active == Some(requested.as_str()) {
+        return Ok(());
+    }
+    let active_reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations
+         WHERE scope_name = ?",
     )
     .bind(DISTRIBUTED_ADMISSION_SCOPE)
-    .fetch_optional(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(|source| distributed_database_error("load_capacity_configuration", source))?;
-
-    match active {
-        None => Err(DistributedAdmissionError::Database {
-            operation: "load_capacity_configuration",
-            source: sqlx::Error::RowNotFound,
-        }),
-        Some(Some(active)) if active == requested => Ok(()),
-        Some(active) => {
-            let active_reservations: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM session_weighted_admission_reservations
+    .map_err(|source| distributed_database_error("count_capacity_reservations", source))?;
+    let transition = capacity_gate_transition(active, active_reservations, &requested);
+    let update_operation = match &transition {
+        CapacityGateTransition::Initialize => Some("initialize_capacity_configuration"),
+        CapacityGateTransition::Rotate => Some("rotate_capacity_configuration"),
+        CapacityGateTransition::Accept | CapacityGateTransition::Reject { .. } => None,
+    };
+    match transition {
+        CapacityGateTransition::Accept => Ok(()),
+        CapacityGateTransition::Reject { active, requested } => {
+            Err(DistributedAdmissionError::ConfigurationMismatch { active, requested })
+        }
+        CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
+            sqlx::query(
+                "UPDATE session_weighted_admission_gates
+                 SET capacity_hash = ?, updated_at = NOW(6)
                  WHERE scope_name = ?",
             )
+            .bind(&requested)
             .bind(DISTRIBUTED_ADMISSION_SCOPE)
-            .fetch_one(&mut **tx)
+            .execute(&mut **tx)
             .await
-            .map_err(|source| distributed_database_error("count_capacity_reservations", source))?;
-            let transition =
-                capacity_gate_transition(active.as_deref(), active_reservations, &requested);
-            let update_operation = match &transition {
-                CapacityGateTransition::Initialize => Some("initialize_capacity_configuration"),
-                CapacityGateTransition::Rotate => Some("rotate_capacity_configuration"),
-                CapacityGateTransition::Accept | CapacityGateTransition::Reject { .. } => None,
-            };
-            match transition {
-                CapacityGateTransition::Accept => Ok(()),
-                CapacityGateTransition::Reject { active, requested } => {
-                    Err(DistributedAdmissionError::ConfigurationMismatch { active, requested })
-                }
-                CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
-                    sqlx::query(
-                        "UPDATE session_weighted_admission_gates
-                         SET capacity_hash = ?, updated_at = NOW(6)
-                         WHERE scope_name = ?",
-                    )
-                    .bind(&requested)
-                    .bind(DISTRIBUTED_ADMISSION_SCOPE)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|source| {
-                        distributed_database_error(
-                            update_operation.expect("capacity update operation"),
-                            source,
-                        )
-                    })?;
-                    Ok(())
-                }
-            }
+            .map_err(|source| {
+                distributed_database_error(
+                    update_operation.expect("capacity update operation"),
+                    source,
+                )
+            })?;
+            Ok(())
         }
     }
 }
