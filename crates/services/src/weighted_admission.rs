@@ -451,12 +451,11 @@ async fn lock_distributed_admission_gate(
 
 /// Bind the durable admission scope to one capacity configuration.
 ///
-/// Every protocol-aware pod may share the same gate, but a rollout must not
-/// let a newly started pod silently use a different global budget. The first
-/// protocol-aware pod records a hash; later pods fail closed while reservations
-/// are active and may adopt the new hash only after the old budget has drained.
-/// A pre-hash binary cannot enforce this check, so changing capacity requires
-/// draining those binaries first.
+/// Every server sharing this scope must use the same capacity snapshot. The
+/// first server records the snapshot; later servers fail closed while
+/// reservations are active and may adopt a new snapshot only after the active
+/// reservations have drained. A NULL hash is the uninitialized state of the
+/// current capacity protocol.
 async fn ensure_distributed_admission_capacity(
     tx: &mut Transaction<'_, MySql>,
     limits: WeightedAdmissionLimits,
@@ -551,10 +550,10 @@ enum CapacityGateTransition {
 
 /// Decide how a locked gate row may adopt a requested capacity snapshot.
 ///
-/// A NULL hash is the state left by the one-time schema upgrade from the old
-/// gate. It may only be initialized after old reservations have drained: an
-/// active reservation has unknown provenance and must never be silently mixed
-/// with a newly declared budget.
+/// A NULL hash means that this scope has not initialized its capacity snapshot.
+/// It may only be initialized when no reservation is active: an active
+/// reservation has unknown provenance and must never be silently mixed with a
+/// newly declared budget.
 fn capacity_gate_transition(
     active: Option<&str>,
     active_reservations: i64,

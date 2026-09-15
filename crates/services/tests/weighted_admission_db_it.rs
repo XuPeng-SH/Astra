@@ -8,7 +8,7 @@ use astra_services::{
 };
 use astra_turn_types::SessionKeyV1;
 use chrono::{Duration as ChronoDuration, Utc};
-use serial_test::serial;
+use serial_test::file_serial;
 use uuid::Uuid;
 
 const ADMISSION_SCOPE: &str = "canonical_turn_v1";
@@ -97,16 +97,12 @@ async fn insert_reservation_row(
     .bind((Utc::now() + ChronoDuration::minutes(1)).naive_utc())
     .execute(pool.get())
     .await
-    .expect("insert legacy reservation");
-}
-
-async fn insert_legacy_reservation(pool: &astra_core::SharedPool, key: &SessionKeyV1) {
-    insert_reservation_row(pool, key, "legacy-idempotency-hash", 1, 1, 1, 1, 1).await;
+    .expect("insert active reservation");
 }
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn capacity_changes_are_fenced_until_old_reservations_release() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
@@ -166,12 +162,22 @@ async fn capacity_changes_are_fenced_until_old_reservations_release() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn null_capacity_hash_with_legacy_reservation_fails_closed() {
+#[file_serial(admission_scope)]
+async fn uninitialized_capacity_hash_with_active_reservation_fails_closed() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
-    let legacy_key = key("legacy-owner");
-    insert_legacy_reservation(&pool, &legacy_key).await;
+    let active_key = key("uninitialized-owner");
+    insert_reservation_row(
+        &pool,
+        &active_key,
+        "uninitialized-idempotency-hash",
+        1,
+        1,
+        1,
+        1,
+        1,
+    )
+    .await;
 
     let changed = DatabaseWeightedAdmissionController::new(pool.clone(), limits(4)).unwrap();
     let error = match changed
@@ -189,7 +195,7 @@ async fn null_capacity_hash_with_legacy_reservation_fails_closed() {
                 .release()
                 .await
                 .expect("unexpected reservation release");
-            panic!("a NULL gate hash must not adopt a new budget over legacy reservations");
+            panic!("an uninitialized gate must not adopt a new budget over active reservations");
         }
     };
     assert!(matches!(
@@ -201,7 +207,7 @@ async fn null_capacity_hash_with_legacy_reservation_fails_closed() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
@@ -256,7 +262,7 @@ async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn aggregate_totals_preserve_values_above_i64_max() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
@@ -340,7 +346,7 @@ async fn aggregate_totals_preserve_values_above_i64_max() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
@@ -370,7 +376,7 @@ async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn expired_reservations_are_cleaned_before_capacity_rotation() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
@@ -411,7 +417,7 @@ async fn expired_reservations_are_cleaned_before_capacity_rotation() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-#[serial]
+#[file_serial(admission_scope)]
 async fn concurrent_reservations_never_exceed_the_cluster_slot_budget() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;

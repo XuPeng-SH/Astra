@@ -42,13 +42,12 @@ different budget fails closed while reservations are active; this prevents a
 rolling deployment from silently changing the meaning of an existing global
 limit.
 
-The hash check is a protocol between participating binaries. A pre-hash
-binary does not read or enforce `capacity_hash`, so the first rollout of this
-schema cannot safely mix old and new admission implementations while changing
-capacity. Drain or stop old admission before changing the declared budget; a
-new binary also refuses to initialize a NULL hash while legacy reservations
-are still present. Once every participating server uses this protocol, a
-changed budget can rotate only after the old reservations have drained.
+The hash check is part of the current admission protocol. Every server sharing
+the durable scope must use the same protocol and declared snapshot. A new
+scope initializes its hash on the first reservation; an uninitialized hash is
+never adopted while reservations are active. A changed budget rotates only
+after the active reservations have drained, so a rollout must keep one
+capacity snapshot across all participating servers.
 
 Only the provider-slot dimension scales with the declared pod count. Resident
 memory, context, CPU, and I/O budgets describe the shared deployment budget and
