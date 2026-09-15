@@ -1553,6 +1553,13 @@ async fn phase1_run_durability_schema_contract() {
         ["scope_name", "reservation_id"],
         "distributed admission reservations need one cross-pod physical identity"
     );
+    assert!(
+        column_names(&pool, &schema, "session_weighted_admission_gates")
+            .await
+            .iter()
+            .any(|column| column == "capacity_hash"),
+        "distributed admission gate must persist the deployment capacity snapshot"
+    );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_authority_events").await,
         ["isolation_domain", "owner_user_id", "event_id"],

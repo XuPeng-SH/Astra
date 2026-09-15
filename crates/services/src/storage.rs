@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-13-v72";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v73";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4604,6 +4604,7 @@ async fn ensure_core_schema_while_leased(
         "session_weighted_admission_gates",
         "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
             scope_name VARCHAR(64) NOT NULL,
+            capacity_hash CHAR(64) NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (scope_name)
         )",
@@ -4614,6 +4615,14 @@ async fn ensure_core_schema_while_leased(
         .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
         .execute(&pool)
         .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_weighted_admission_gates",
+        "capacity_hash",
+        "ALTER TABLE session_weighted_admission_gates ADD COLUMN capacity_hash CHAR(64) NULL",
+    )
+    .await?;
 
     core_schema_create!(
         pool,
