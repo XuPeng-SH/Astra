@@ -13,6 +13,15 @@ use uuid::Uuid;
 
 const ADMISSION_SCOPE: &str = "canonical_turn_v1";
 
+#[derive(Clone, Copy)]
+struct StoredAdmissionWork {
+    resident_bytes: i64,
+    context_tokens: i64,
+    provider_slots: i64,
+    cpu_units: i64,
+    io_bytes: i64,
+}
+
 fn limits_with_owner(provider_slots: u32, owner_provider_slots: u32) -> WeightedAdmissionLimits {
     let work = AdmissionWork {
         resident_bytes: 1_000_000,
@@ -69,11 +78,7 @@ async fn insert_reservation_row(
     pool: &astra_core::SharedPool,
     key: &SessionKeyV1,
     idempotency_hash: &str,
-    resident_bytes: i64,
-    context_tokens: i64,
-    provider_slots: i64,
-    cpu_units: i64,
-    io_bytes: i64,
+    work: StoredAdmissionWork,
 ) {
     sqlx::query(
         "INSERT INTO session_weighted_admission_reservations
@@ -89,11 +94,11 @@ async fn insert_reservation_row(
     .bind(&key.session_id)
     .bind(&key.branch_id)
     .bind(idempotency_hash)
-    .bind(resident_bytes)
-    .bind(context_tokens)
-    .bind(provider_slots)
-    .bind(cpu_units)
-    .bind(io_bytes)
+    .bind(work.resident_bytes)
+    .bind(work.context_tokens)
+    .bind(work.provider_slots)
+    .bind(work.cpu_units)
+    .bind(work.io_bytes)
     .bind((Utc::now() + ChronoDuration::minutes(1)).naive_utc())
     .execute(pool.get())
     .await
@@ -171,11 +176,13 @@ async fn uninitialized_capacity_hash_with_active_reservation_fails_closed() {
         &pool,
         &active_key,
         "uninitialized-idempotency-hash",
-        1,
-        1,
-        1,
-        1,
-        1,
+        StoredAdmissionWork {
+            resident_bytes: 1,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
     )
     .await;
 
@@ -222,16 +229,30 @@ async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
         .await
         .expect("seed capacity hash");
     seed.release().await.expect("seed reservation release");
-    insert_reservation_row(&pool, &key("invalid-owner"), "negative-row", -5, 1, 1, 1, 1).await;
+    insert_reservation_row(
+        &pool,
+        &key("invalid-owner"),
+        "negative-row",
+        StoredAdmissionWork {
+            resident_bytes: -5,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
+    )
+    .await;
     insert_reservation_row(
         &pool,
         &key("positive-owner"),
         "positive-row",
-        10,
-        1,
-        1,
-        1,
-        1,
+        StoredAdmissionWork {
+            resident_bytes: 10,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
     )
     .await;
 
@@ -298,22 +319,26 @@ async fn aggregate_totals_preserve_values_above_i64_max() {
         &pool,
         &key("large-owner-a"),
         "large-row-a",
-        huge_row,
-        1,
-        1,
-        1,
-        1,
+        StoredAdmissionWork {
+            resident_bytes: huge_row,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
     )
     .await;
     insert_reservation_row(
         &pool,
         &key("large-owner-b"),
         "large-row-b",
-        huge_row,
-        1,
-        1,
-        1,
-        1,
+        StoredAdmissionWork {
+            resident_bytes: huge_row,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        },
     )
     .await;
 
