@@ -1,6 +1,6 @@
 # Multi-session and multi-server scale
 
-> Status: first-stage implementation contract.
+> Status: staged implementation contract.
 > Last updated: 2026-09-15.
 
 This document owns the capacity and availability contract for deployments with
@@ -91,11 +91,16 @@ Every capacity change reports, per workload and per pod count:
 - durable event/control-plane QPS and end-to-end turn latency.
 
 The first implementation stage aligns local and durable admission configuration
-and records the configuration in the shared gate. It does not claim to make
-provider concurrency, database connections, or all retained session memory
-scale with pod count. The next stage may optimize the gate query or introduce
-sharded/lease-based capacity only after a measured lock-wait or
-reservation-scan bottleneck, with crash and expiry tests.
+and records the configuration in the shared gate. The second stage aggregates
+active reservation usage inside the locked MatrixOne transaction and returns
+one exact decimal row. Rust parses the decimal totals as `u64` and rejects
+negative or out-of-range stored rows, so the optimization does not change the
+capacity invariant. This reduces result transfer and client materialization;
+it does not remove the serialized gate or claim a p95 improvement by itself.
+
+The next stage may introduce sharded/lease-based capacity only after measured
+lock wait, pool wait, or reservation-scan evidence justifies it, with crash and
+expiry tests.
 
 ## Required scenarios
 

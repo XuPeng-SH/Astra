@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 const ADMISSION_SCOPE: &str = "canonical_turn_v1";
 
-fn limits(provider_slots: u32) -> WeightedAdmissionLimits {
+fn limits_with_owner(provider_slots: u32, owner_provider_slots: u32) -> WeightedAdmissionLimits {
     let work = AdmissionWork {
         resident_bytes: 1_000_000,
         context_tokens: 1_000,
@@ -23,8 +23,15 @@ fn limits(provider_slots: u32) -> WeightedAdmissionLimits {
     };
     WeightedAdmissionLimits {
         global: work,
-        per_owner: work,
+        per_owner: AdmissionWork {
+            provider_slots: owner_provider_slots,
+            ..work
+        },
     }
+}
+
+fn limits(provider_slots: u32) -> WeightedAdmissionLimits {
+    limits_with_owner(provider_slots, provider_slots)
 }
 
 fn work() -> AdmissionWork {
@@ -58,13 +65,22 @@ async fn reset_admission_scope(pool: &astra_core::SharedPool) {
     .expect("clear admission capacity hash");
 }
 
-async fn insert_legacy_reservation(pool: &astra_core::SharedPool, key: &SessionKeyV1) {
+async fn insert_reservation_row(
+    pool: &astra_core::SharedPool,
+    key: &SessionKeyV1,
+    idempotency_hash: &str,
+    resident_bytes: i64,
+    context_tokens: i64,
+    provider_slots: i64,
+    cpu_units: i64,
+    io_bytes: i64,
+) {
     sqlx::query(
         "INSERT INTO session_weighted_admission_reservations
          (scope_name, reservation_id, isolation_domain, owner_user_id, session_id,
           branch_id, idempotency_hash, resident_bytes, context_tokens,
           provider_slots, cpu_units, io_bytes, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1, 1, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(ADMISSION_SCOPE)
     .bind(Uuid::new_v4().to_string())
@@ -72,11 +88,20 @@ async fn insert_legacy_reservation(pool: &astra_core::SharedPool, key: &SessionK
     .bind(&key.owner_user_id)
     .bind(&key.session_id)
     .bind(&key.branch_id)
-    .bind("legacy-idempotency-hash")
+    .bind(idempotency_hash)
+    .bind(resident_bytes)
+    .bind(context_tokens)
+    .bind(provider_slots)
+    .bind(cpu_units)
+    .bind(io_bytes)
     .bind((Utc::now() + ChronoDuration::minutes(1)).naive_utc())
     .execute(pool.get())
     .await
     .expect("insert legacy reservation");
+}
+
+async fn insert_legacy_reservation(pool: &astra_core::SharedPool, key: &SessionKeyV1) {
+    insert_reservation_row(pool, key, "legacy-idempotency-hash", 1, 1, 1, 1, 1).await;
 }
 
 #[tokio::test]
@@ -172,6 +197,175 @@ async fn null_capacity_hash_with_legacy_reservation_fails_closed() {
         DistributedAdmissionError::ConfigurationMismatch { .. }
     ));
     reset_admission_scope(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
+    let pool = common::setup_pool().await;
+    reset_admission_scope(&pool).await;
+    let controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(4)).unwrap();
+    let seed = controller
+        .try_reserve(
+            &key("seed-owner"),
+            work(),
+            Duration::from_secs(30),
+            "seed-turn",
+        )
+        .await
+        .expect("seed capacity hash");
+    seed.release().await.expect("seed reservation release");
+    insert_reservation_row(&pool, &key("invalid-owner"), "negative-row", -5, 1, 1, 1, 1).await;
+    insert_reservation_row(
+        &pool,
+        &key("positive-owner"),
+        "positive-row",
+        10,
+        1,
+        1,
+        1,
+        1,
+    )
+    .await;
+
+    let error = match controller
+        .try_reserve(
+            &key("next-owner"),
+            work(),
+            Duration::from_secs(30),
+            "next-turn",
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(permit) => {
+            permit
+                .release()
+                .await
+                .expect("unexpected reservation release");
+            panic!("negative stored work must not be hidden by positive aggregation");
+        }
+    };
+    assert!(
+        matches!(error, DistributedAdmissionError::Invalid(_)),
+        "unexpected invalid-row result: {error}"
+    );
+    reset_admission_scope(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn aggregate_totals_preserve_values_above_i64_max() {
+    let pool = common::setup_pool().await;
+    reset_admission_scope(&pool).await;
+    let budget = AdmissionWork {
+        // Two legal BIGINT rows exceed i64::MAX in aggregate but remain below
+        // u64::MAX. The aggregate path must preserve that exact total.
+        resident_bytes: 10_000_000_000_000_000_000,
+        context_tokens: 100,
+        provider_slots: 3,
+        cpu_units: 100,
+        io_bytes: 100,
+    };
+    let controller = DatabaseWeightedAdmissionController::new(
+        pool.clone(),
+        WeightedAdmissionLimits {
+            global: budget,
+            per_owner: budget,
+        },
+    )
+    .unwrap();
+    let seed = controller
+        .try_reserve(
+            &key("large-seed-owner"),
+            work(),
+            Duration::from_secs(30),
+            "large-seed-turn",
+        )
+        .await
+        .expect("seed capacity hash");
+    seed.release().await.expect("seed reservation release");
+    let huge_row = 6_000_000_000_000_000_000;
+    insert_reservation_row(
+        &pool,
+        &key("large-owner-a"),
+        "large-row-a",
+        huge_row,
+        1,
+        1,
+        1,
+        1,
+    )
+    .await;
+    insert_reservation_row(
+        &pool,
+        &key("large-owner-b"),
+        "large-row-b",
+        huge_row,
+        1,
+        1,
+        1,
+        1,
+    )
+    .await;
+
+    let error = match controller
+        .try_reserve(
+            &key("large-next-owner"),
+            work(),
+            Duration::from_secs(30),
+            "large-next-turn",
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(permit) => {
+            permit
+                .release()
+                .await
+                .expect("unexpected reservation release");
+            panic!("aggregate total above the configured global budget was truncated");
+        }
+    };
+    assert!(matches!(
+        error,
+        DistributedAdmissionError::Capacity(
+            astra_services::WeightedAdmissionError::GlobalExhausted
+        )
+    ));
+    reset_admission_scope(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
+    let pool = common::setup_pool().await;
+    reset_admission_scope(&pool).await;
+    let controller =
+        DatabaseWeightedAdmissionController::new(pool, limits_with_owner(2, 1)).unwrap();
+    let upper = controller
+        .try_reserve(
+            &key("CaseOwner"),
+            work(),
+            Duration::from_secs(30),
+            "case-upper",
+        )
+        .await
+        .expect("first owner reservation");
+    let lower = controller
+        .try_reserve(
+            &key("caseowner"),
+            work(),
+            Duration::from_secs(30),
+            "case-lower",
+        )
+        .await
+        .expect("case-distinct owner must retain its own share");
+    upper.release().await.expect("upper owner release");
+    lower.release().await.expect("lower owner release");
 }
 
 #[tokio::test]
