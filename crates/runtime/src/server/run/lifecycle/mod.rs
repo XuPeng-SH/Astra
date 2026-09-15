@@ -181,12 +181,110 @@ const AGENT_BINDING_TURN_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 const AGENT_BINDING_TURN_CONTEXT_MAX_TOKENS: usize = 64_000;
 const AGENT_BINDING_INSTRUCTION_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+// A terminal run and its Explain Analyze publication are separate durable
+// facts. Keep an attached observer alive long enough to see the publication,
+// then close with an explicit unavailable outcome instead of waiting forever.
+const DURABLE_LIVE_ATTACH_PUBLICATION_GRACE: Duration = Duration::from_secs(5);
+// Explain artifact discovery is background context. It must never make a
+// normal user turn wait on a slow or unavailable artifact store.
+const EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(750);
+const EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
+const DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
 const DURABLE_LIVE_BATCH_MAX_EVENTS: usize = 64;
 const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
+
+fn explain_artifact_publishable_status(status: RunStatus) -> bool {
+    RunStatus::TERMINAL.contains(&status)
+}
+
+fn explain_publication_unavailable_event(
+    run_id: &str,
+    turn_id: &str,
+    execution_owner_generation: u64,
+    reason_code: &str,
+    message: &str,
+) -> Value {
+    astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        turn_id: turn_id.to_string(),
+        execution_owner_generation,
+        artifact_type: "explain_analyze_snapshot".to_string(),
+        recorded: false,
+        result: astra_turn_types::ArtifactPublicationResult::Unavailable {
+            reason_code: reason_code.to_string(),
+            message: message.to_string(),
+        },
+    }
+    .to_wire()
+}
+
+fn durable_event_type(event: &Value) -> Option<&str> {
+    event
+        .get("event_type")
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str)
+}
+
+fn durable_event_index(event: &Value, position: usize) -> i64 {
+    event
+        .get("index")
+        .and_then(Value::as_i64)
+        .unwrap_or(position as i64)
+}
+
+fn durable_event_is_settlement_finished(event: &Value) -> bool {
+    durable_event_type(event) == Some("run_settlement_finished")
+}
+
+fn durable_event_is_valid_explain_publication(event: &Value) -> bool {
+    if durable_event_type(event) != Some("artifact_publication") {
+        return false;
+    }
+    let client_event = if event.get("event_type").is_some() {
+        astra_services::runs::transform_run_event_for_client(event.clone())
+    } else {
+        event.clone()
+    };
+    astra_turn_types::ArtifactPublicationV1::from_wire(&client_event).is_ok()
+}
+
+fn explain_turn_id_from_durable_run(run: &DurableRunRecord) -> String {
+    run.events
+        .iter()
+        .cloned()
+        .map(astra_services::runs::transform_run_event_for_client)
+        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(&event).ok())
+        .find(|fact| fact.run_id == run.run_id)
+        .map(|fact| fact.turn_id)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn send_durable_live_attach_event(
+    event_tx: &mpsc::Sender<Value>,
+    event: Value,
+    deadline: Option<Instant>,
+) -> bool {
+    let timeout = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT);
+    match tokio::time::timeout(timeout, event_tx.send(event)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                "durable live-attach event delivery exceeded its bounded wait"
+            );
+            false
+        }
+    }
+}
 const DURABLE_EVENT_COMMITTED_FIELD: &str = "_astra_durable_event_committed";
 
 fn terminal_batch_settlement_ready(event_count: usize, batch_committed: bool) -> bool {
@@ -543,6 +641,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "run_waiting"
                 | "run_paused"
                 | "run_error"
+                | "artifact_publication"
                 | "run_finished"
                 | "turn_complete"
                 | "error"
@@ -10683,6 +10782,309 @@ impl AgenticRunLifecycleService {
         );
     }
 
+    async fn latest_explain_analyze_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        self.run_engine
+            .find_latest_explain_analyze_root(user_id, session_id)
+            .await
+    }
+
+    async fn append_latest_explain_artifact_context(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        edge_profile: &mut Map<String, Value>,
+    ) {
+        let run = match self.latest_explain_analyze_run(user_id, session_id).await {
+            Ok(run) => run,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    user_id,
+                    session_id,
+                    %error,
+                    "failed to discover the latest Explain Analyze run"
+                );
+                Self::append_runtime_required_prompt_text(
+                    edge_profile,
+                    crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
+                        "the server could not discover the latest Explain Analyze run: {error}"
+                    )),
+                );
+                return;
+            }
+        };
+        let Some((run_id, owner_generation)) = run else {
+            return;
+        };
+        if crate::server::explain_analyze_artifact::snapshot_missing(
+            self.shared_pool.as_ref(),
+            user_id,
+            session_id,
+            &run_id,
+        )
+        .await
+            == Ok(true)
+            && let Ok(Some(durable)) = self.run_engine.load_run(user_id, &run_id).await
+            && durable.session_id == session_id
+            && durable.run_generation == owner_generation
+        {
+            self.publish_recovered_explain(&durable).await;
+        }
+        match crate::server::explain_analyze_artifact::context_notice_for_run(
+            self.shared_pool.as_ref(),
+            user_id,
+            session_id,
+            &run_id,
+            owner_generation,
+        )
+        .await
+        {
+            Ok(Some(notice)) => Self::append_runtime_required_prompt_text(edge_profile, notice),
+            Ok(None) => {}
+            Err(error) => Self::append_runtime_required_prompt_text(
+                edge_profile,
+                crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
+                    "the server could not read Explain Analyze run {run_id}: {error}"
+                )),
+            ),
+        }
+    }
+
+    async fn append_latest_explain_artifact_context_bounded(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        edge_profile: &mut Map<String, Value>,
+    ) {
+        if tokio::time::timeout(
+            EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT,
+            self.append_latest_explain_artifact_context(user_id, session_id, edge_profile),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                user_id,
+                session_id,
+                timeout_ms = EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT.as_millis() as u64,
+                "timed out discovering the latest Explain Analyze artifact; continuing the user turn"
+            );
+            Self::append_runtime_required_prompt_text(
+                edge_profile,
+                crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
+                    "artifact discovery timed out after {} ms",
+                    EXPLAIN_CONTEXT_DISCOVERY_TIMEOUT.as_millis()
+                )),
+            );
+        }
+    }
+
+    async fn publish_explain_artifact(
+        pool: Option<&SharedPool>,
+        run_engine: &RunEngine,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        session_turn: u32,
+        owner_generation: u64,
+        events: &[Value],
+    ) -> Value {
+        use astra_turn_types::{ArtifactPublicationResult, ArtifactPublicationV1};
+        let turn_id = format!("turn-{session_turn}");
+        let result = match crate::server::explain_analyze_artifact::persist_snapshot(
+            pool,
+            user_id,
+            session_id,
+            run_id,
+            &turn_id,
+            owner_generation,
+            events,
+        )
+        .await
+        {
+            Ok(Some(handle)) => ArtifactPublicationResult::Published { handle },
+            failure => {
+                let (reason_code, message) = match &failure {
+                    Ok(None) => (
+                        "capture_unavailable",
+                        "No readable execution facts were saved.",
+                    ),
+                    Err(_) => (
+                        "storage_failed",
+                        "Report storage failed. The agent cannot read this report yet.",
+                    ),
+                    Ok(Some(_)) => unreachable!(),
+                };
+                tracing::warn!(run_id, failure = ?failure,
+                    "server Explain Analyze artifact publication unavailable");
+                ArtifactPublicationResult::Unavailable {
+                    reason_code: reason_code.to_string(),
+                    message: message.to_string(),
+                }
+            }
+        };
+        let outcome = ArtifactPublicationV1 {
+            schema_version: 1,
+            run_id: run_id.to_string(),
+            turn_id,
+            execution_owner_generation: owner_generation,
+            artifact_type: "explain_analyze_snapshot".to_string(),
+            recorded: true,
+            result,
+        };
+        Self::record_explain_publication(run_engine, user_id, session_id, outcome).await
+    }
+
+    async fn publish_explain_artifact_bounded(
+        pool: Option<&SharedPool>,
+        run_engine: &RunEngine,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        session_turn: u32,
+        owner_generation: u64,
+        events: &[Value],
+    ) -> Value {
+        let turn_id = format!("turn-{session_turn}");
+        match tokio::time::timeout(
+            EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT,
+            Self::publish_explain_artifact(
+                pool,
+                run_engine,
+                user_id,
+                session_id,
+                run_id,
+                session_turn,
+                owner_generation,
+                events,
+            ),
+        )
+        .await
+        {
+            Ok(publication) => publication,
+            Err(_) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    timeout_ms = EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT.as_millis() as u64,
+                    "timed out publishing Explain Analyze artifact; completing the run with an explicit unavailable outcome"
+                );
+                explain_publication_unavailable_event(
+                    run_id,
+                    &turn_id,
+                    owner_generation,
+                    "publication_timeout",
+                    "The Explain Analyze run completed, but saving its report timed out. The next turn may retry recovery.",
+                )
+            }
+        }
+    }
+
+    async fn record_explain_publication(
+        run_engine: &RunEngine,
+        user_id: &str,
+        session_id: &str,
+        mut outcome: astra_turn_types::ArtifactPublicationV1,
+    ) -> Value {
+        let run_id = outcome.run_id.as_str();
+        let owner_generation = outcome.execution_owner_generation;
+        let payload = serde_json::to_value(&outcome).expect("serializable publication outcome");
+        let mut identity = Sha256::new();
+        identity.update(b"astra.artifact-publication.v1\0");
+        identity.update(astra_core::canonical_json_string(&payload).as_bytes());
+        let event = json!({ "event_type":"artifact_publication",
+            "idempotency_key":format!("{:x}", identity.finalize()), "data":payload });
+
+        let recorded = run_engine
+            .append_events_if_current_generation_and_status(
+                user_id,
+                session_id,
+                run_id,
+                owner_generation,
+                &[
+                    STATUS_COMPLETED,
+                    STATUS_FAILED,
+                    STATUS_CANCELLED,
+                    "delegated",
+                ],
+                &[event],
+            )
+            .await;
+        if recorded != Ok(true) {
+            outcome.recorded = false;
+            tracing::warn!(run_id, result = ?recorded,
+                "could not retain Explain artifact publication outcome; notifying live client");
+        }
+        outcome.to_wire()
+    }
+
+    async fn publish_recovered_explain(&self, run: &DurableRunRecord) -> Option<Value> {
+        use astra_turn_types::{ArtifactPublicationResult, ArtifactPublicationV1};
+        if run.status != STATUS_COMPLETED
+            || !astra_services::runs::run_requested_explain_analyze(run)
+        {
+            return None;
+        }
+        let turn_id = run
+            .events
+            .iter()
+            .cloned()
+            .map(astra_services::runs::transform_run_event_for_client)
+            .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(&event).ok())
+            .find(|fact| fact.run_id == run.run_id)
+            .map(|fact| fact.turn_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        let result = match crate::server::explain_analyze_artifact::recover_completed_snapshot(
+            self.shared_pool.as_ref(),
+            run,
+        )
+        .await
+        {
+            Ok(Some(handle)) => ArtifactPublicationResult::Published { handle },
+            failure => {
+                tracing::warn!(run_id = %run.run_id, result = ?failure, "Explain report recovery unavailable");
+                ArtifactPublicationResult::Unavailable {
+                    reason_code: "recovery_failed".into(),
+                    message: "The server could not recover a readable report for this run.".into(),
+                }
+            }
+        };
+        let outcome = ArtifactPublicationV1 {
+            schema_version: 1,
+            run_id: run.run_id.clone(),
+            turn_id,
+            execution_owner_generation: run.run_generation,
+            artifact_type: "explain_analyze_snapshot".into(),
+            recorded: true,
+            result,
+        };
+        if let Some(existing) = run.events.iter().rev().find_map(|event| {
+            ArtifactPublicationV1::from_wire(&astra_services::runs::transform_run_event_for_client(
+                event.clone(),
+            ))
+            .ok()
+        }) && existing == outcome
+        {
+            return Some(existing.to_wire());
+        }
+        let wire = Self::record_explain_publication(
+            &self.run_engine,
+            &run.user_id,
+            &run.session_id,
+            outcome,
+        )
+        .await;
+        if let Some(live) = self.runs.write().await.get_mut(&run.run_id) {
+            live.events.push(wire.clone());
+        }
+        Some(wire)
+    }
+
     fn apply_agent_binding_prompt_context(
         edge_profile: &mut Map<String, Value>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
@@ -12236,6 +12638,7 @@ impl AgenticRunLifecycleService {
                 })
             });
         RunStatusRecord {
+            artifact_publication: None,
             run_id: run.run_id.clone(),
             session_id: run.session_id.clone(),
             parent_run_id: run.parent_run_id.clone(),
@@ -12253,6 +12656,7 @@ impl AgenticRunLifecycleService {
 
     fn durable_status_snapshot_record(snapshot: DurableRunStatusSnapshot) -> RunStatusRecord {
         RunStatusRecord {
+            artifact_publication: None,
             run_id: snapshot.run_id,
             session_id: snapshot.session_id,
             parent_run_id: snapshot.parent_run_id,
@@ -13101,6 +13505,8 @@ impl AgenticRunLifecycleService {
         let bg_work_workspace = tool_runtime_workspace.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_shared_pool = self.shared_pool.clone();
+        let bg_explain = request.explain;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
@@ -13437,6 +13843,7 @@ impl AgenticRunLifecycleService {
                         user_cancellation = true;
                     }
                 }
+                let explain_events_for_artifact = bg_explain.then(|| events.clone());
                 let mut core_trace_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
@@ -13730,6 +14137,31 @@ impl AgenticRunLifecycleService {
                             error = %error,
                             "failed to retain observations after an independently committed terminal"
                         );
+                    }
+                }
+
+                if bg_explain
+                    && owner_terminal_committed
+                    && explain_artifact_publishable_status(persisted_status)
+                {
+                    let events = if core_trace_result.is_ok() {
+                        explain_events_for_artifact.as_deref().unwrap_or_default()
+                    } else {
+                        &[]
+                    };
+                    let publication = Self::publish_explain_artifact_bounded(
+                        bg_shared_pool.as_ref(),
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        loop_state.session_turn,
+                        execution_owner_generation,
+                        events,
+                    )
+                    .await;
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                        run.events.push(publication);
                     }
                 }
 
@@ -14058,6 +14490,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
+        self.append_latest_explain_artifact_context_bounded(
+            &user_id,
+            &session_id,
+            &mut edge_profile,
+        )
+        .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -14913,6 +15351,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
+        self.append_latest_explain_artifact_context_bounded(
+            &user_id,
+            &session_id,
+            &mut edge_profile,
+        )
+        .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -16250,6 +16694,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_work_workspace = tool_runtime_workspace.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_shared_pool = self.shared_pool.clone();
+        let bg_explain = request.explain;
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -16670,6 +17116,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         user_cancellation = true;
                     }
                 }
+                let explain_events_for_artifact = bg_explain.then(|| final_events.clone());
                 // Ensure fast synchronous child-agent progress has reached both
                 // durable replay and the live SSE stream before parent terminal
                 // markers close the turn.
@@ -17119,6 +17566,32 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
+                if bg_explain
+                    && owner_terminal_committed
+                    && explain_artifact_publishable_status(persisted_status)
+                {
+                    let events = if core_trace_result.is_ok() {
+                        explain_events_for_artifact.as_deref().unwrap_or_default()
+                    } else {
+                        &[]
+                    };
+                    let publication = Self::publish_explain_artifact_bounded(
+                        bg_shared_pool.as_ref(),
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        state.session_turn,
+                        execution_owner_generation,
+                        events,
+                    )
+                    .await;
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                        run.events.push(publication.clone());
+                    }
+                    streamed_final_events.insert(0, publication);
+                }
+
                 if owner_terminal_committed && core_trace_result.is_ok() {
                     match Self::commit_canonical_turn(
                         canonical_turn.as_ref(),
@@ -17446,12 +17919,45 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.run_engine
-            .load_run_status_snapshot(&user_id, &run_id)
+        let local_publication = self
+            .runs
+            .read()
             .await
-            .map_err(|error| Self::durable_persist_error("status snapshot", error))?
+            .get(&run_id)
+            .filter(|run| run.user_id == user_id)
+            .and_then(|run| {
+                run.events
+                    .iter()
+                    .rev()
+                    .find(|event| {
+                        event.get("type").and_then(Value::as_str) == Some("artifact_publication")
+                    })
+                    .cloned()
+            });
+        let snapshot = self.run_engine.load_run_status_snapshot(&user_id, &run_id).await
+            .map_err(|error| {
+                if let Some(publication) = local_publication.as_ref()
+                    && let Ok(outcome) = astra_turn_types::ArtifactPublicationV1::from_wire(publication)
+                {
+                    tracing::warn!(run_id, %error, "durable status unavailable; returning local publication observation");
+                    let detail = match outcome.result {
+                        astra_turn_types::ArtifactPublicationResult::Unavailable { message, .. } =>
+                            format!("Run status could not be verified. Explain report unavailable: {message}"),
+                        astra_turn_types::ArtifactPublicationResult::Published { .. } =>
+                            "Run status could not be verified. The last local report publication succeeded, but storage is currently unavailable.".to_string(),
+                    };
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse::new(detail)
+                        .with_metadata(json!({"observation_source":"process_local", "artifact_publication":publication}))));
+                }
+                Self::durable_persist_error("status snapshot", error)
+            })?;
+        let mut status = snapshot
             .map(Self::durable_status_snapshot_record)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+        // This optional field can retain an unrecorded local observation. The
+        // canonical cross-pod/history source remains the run's replay stream.
+        status.artifact_publication = local_publication;
+        Ok(status)
     }
 
     async fn get_run_projection(
@@ -17615,8 +18121,81 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("stream live delta", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        let replay_events = initial.events;
-        if Self::durable_live_attach_complete(&initial.status) {
+        // A terminal status is not the Explain Analyze publication boundary.
+        // The owner commits `run_finished` first and persists the report just
+        // after it. Load the immutable run metadata once so a cross-process
+        // observer can distinguish an ordinary terminal from an Explain run
+        // that still owes its publication outcome.
+        let durable_run = self
+            .run_engine
+            .load_run(&user_id, &run_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("stream live run metadata", error))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+        let explain_requested = astra_services::runs::run_requested_explain_analyze(&durable_run);
+        let mut replay_events = initial.events;
+        // `load_run_event_delta` reports the latest high watermark even when
+        // its event list is empty.  Keep the cursor at the greatest event we
+        // actually replayed so the metadata read below can fill the exact
+        // gap opened between the two reads (publication is often that gap).
+        let mut event_cursor = replay_events
+            .iter()
+            .filter_map(|event| event.get("index").and_then(Value::as_i64))
+            .max()
+            .unwrap_or(after_event_idx);
+        for (position, event) in durable_run.events.iter().enumerate() {
+            let index = durable_event_index(event, position);
+            if index <= event_cursor {
+                continue;
+            }
+            let mut event = event.clone();
+            if let Some(object) = event.as_object_mut() {
+                object.insert("index".to_string(), Value::from(index));
+            }
+            event_cursor = event_cursor.max(index);
+            replay_events.push(event);
+        }
+        let mut publication_seen = replay_events
+            .iter()
+            .any(durable_event_is_valid_explain_publication)
+            || durable_run
+                .events
+                .iter()
+                .enumerate()
+                .any(|(position, event)| {
+                    durable_event_index(event, position) <= after_event_idx
+                        && durable_event_is_valid_explain_publication(event)
+                });
+        let mut settlement_finished = replay_events
+            .iter()
+            .any(durable_event_is_settlement_finished)
+            || durable_run
+                .events
+                .iter()
+                .enumerate()
+                .any(|(position, event)| {
+                    durable_event_index(event, position) <= after_event_idx
+                        && durable_event_is_settlement_finished(event)
+                });
+        let turn_id = explain_turn_id_from_durable_run(&durable_run);
+        let owner_generation = durable_run.run_generation;
+        let latest_complete = Self::durable_live_attach_complete(&durable_run.status);
+        if latest_complete && (!explain_requested || publication_seen) {
+            return Ok(ChatStreamRecord {
+                session_id: initial.session_id,
+                run_id,
+                events: replay_events,
+                event_rx: None,
+            });
+        }
+        if latest_complete && explain_requested && settlement_finished && !publication_seen {
+            replay_events.push(explain_publication_unavailable_event(
+                &run_id,
+                &turn_id,
+                owner_generation,
+                "publication_outcome_unrecorded",
+                "The Explain Analyze run completed, but the server did not retain a publication outcome.",
+            ));
             return Ok(ChatStreamRecord {
                 session_id: initial.session_id,
                 run_id,
@@ -17629,22 +18208,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // may not have registered its process-local broadcast channel yet.
         // Follow the durable event cursor so the losing provider retry remains
         // attached instead of ending after the initial run_started replay.
-        let mut event_cursor = replay_events
-            .iter()
-            .filter_map(|event| event.get("index").and_then(Value::as_i64))
-            .max()
-            .map_or(initial.last_event_idx, |observed| {
-                observed.max(initial.last_event_idx)
-            });
         let session_id = initial.session_id;
         let run_engine = self.run_engine.clone();
         let poll_user_id = user_id;
         let poll_run_id = run_id.clone();
         let (event_tx, event_rx) = mpsc::channel(512);
+        let mut publication_deadline =
+            latest_complete.then(|| Instant::now() + DURABLE_LIVE_ATTACH_PUBLICATION_GRACE);
         let _ = spawn_observed(
             async move {
                 for event in replay_events {
-                    if event_tx.send(event).await.is_err() {
+                    if !send_durable_live_attach_event(&event_tx, event, publication_deadline).await
+                    {
                         return;
                     }
                 }
@@ -17652,21 +18227,104 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
                 loop {
-                    interval.tick().await;
-                    let delta = match run_engine
-                        .load_run_event_delta(&poll_user_id, &poll_run_id, event_cursor)
+                    tokio::select! {
+                        _ = event_tx.closed() => return,
+                        _ = async {
+                            if let Some(deadline) = publication_deadline {
+                                tokio::time::sleep_until(deadline.into()).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            if !explain_requested || publication_seen {
+                                return;
+                            }
+                            let unavailable = explain_publication_unavailable_event(
+                                &poll_run_id,
+                                &turn_id,
+                                owner_generation,
+                                "publication_timeout",
+                                "The Explain Analyze run completed, but its publication did not arrive before the bounded wait expired.",
+                            );
+                            match tokio::time::timeout(
+                                DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT,
+                                event_tx.send(unavailable),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => return,
+                                Err(_) => tracing::error!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %poll_run_id,
+                                    "timed out delivering Explain Analyze publication-unavailable outcome"
+                                ),
+                            }
+                            return;
+                        }
+                        _ = interval.tick() => {}
+                    }
+                    if event_tx.is_closed() {
+                        return;
+                    }
+                    let read_timeout = publication_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT);
+                    let delta_result: Result<Option<DurableRunEventDelta>, String> =
+                        match tokio::time::timeout(
+                            read_timeout,
+                            run_engine.load_run_event_delta(
+                                &poll_user_id,
+                                &poll_run_id,
+                                event_cursor,
+                            ),
+                        )
                         .await
-                    {
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                Err(format!("durable live-attach read timed out: {error}"))
+                            }
+                        };
+                    let delta = match delta_result {
                         Ok(Some(delta)) => delta,
                         Ok(None) => return,
                         Err(error) => {
-                            tracing::warn!(
-                                target: "astra_runtime::run_lifecycle",
-                                user_id = %poll_user_id,
-                                run_id = %poll_run_id,
-                                error = %error,
-                                "durable live-attach polling stopped after storage failure"
-                            );
+                            if explain_requested
+                                && !publication_seen
+                                && publication_deadline.is_some()
+                            {
+                                let unavailable = explain_publication_unavailable_event(
+                                    &poll_run_id,
+                                    &turn_id,
+                                    owner_generation,
+                                    "publication_storage_unavailable",
+                                    "The Explain Analyze run completed, but the server could not read its publication state.",
+                                );
+                                match tokio::time::timeout(
+                                    DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT,
+                                    event_tx.send(unavailable),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => return,
+                                    Err(_) => tracing::error!(
+                                        target: "astra_runtime::run_lifecycle",
+                                        run_id = %poll_run_id,
+                                        error = %error,
+                                        "timed out delivering Explain Analyze storage-unavailable outcome"
+                                    ),
+                                }
+                            } else {
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    user_id = %poll_user_id,
+                                    run_id = %poll_run_id,
+                                    error = %error,
+                                    "durable live-attach polling stopped after storage failure"
+                                );
+                            }
                             return;
                         }
                     };
@@ -17676,12 +18334,65 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         } else {
                             event_cursor = event_cursor.saturating_add(1);
                         }
-                        if event_tx.send(event).await.is_err() {
+                        publication_seen |= durable_event_is_valid_explain_publication(&event);
+                        settlement_finished |= durable_event_is_settlement_finished(&event);
+                        if !send_durable_live_attach_event(&event_tx, event, publication_deadline)
+                            .await
+                        {
                             return;
                         }
                     }
                     if Self::durable_live_attach_complete(&delta.status) {
-                        return;
+                        if !explain_requested || publication_seen {
+                            return;
+                        }
+                        if durable_run_status_kind(&delta.status) == DurableRunStatusKind::Paused
+                            || settlement_finished
+                            || publication_deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            let unavailable = explain_publication_unavailable_event(
+                                &poll_run_id,
+                                &turn_id,
+                                owner_generation,
+                                if durable_run_status_kind(&delta.status)
+                                    == DurableRunStatusKind::Paused
+                                {
+                                    "run_paused_before_publication"
+                                } else if settlement_finished {
+                                    "publication_outcome_unrecorded"
+                                } else {
+                                    "publication_timeout"
+                                },
+                                if durable_run_status_kind(&delta.status)
+                                    == DurableRunStatusKind::Paused
+                                {
+                                    "The Explain Analyze run paused before the server could publish a report."
+                                } else if settlement_finished {
+                                    "The Explain Analyze run completed, but the server did not retain a publication outcome."
+                                } else {
+                                    "The Explain Analyze run completed, but its publication did not arrive before the bounded wait expired."
+                                },
+                            );
+                            match tokio::time::timeout(
+                                DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT,
+                                event_tx.send(unavailable),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => return,
+                                Err(_) => tracing::error!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %poll_run_id,
+                                    "timed out delivering Explain Analyze terminal outcome"
+                                ),
+                            }
+                            return;
+                        }
+                        publication_deadline.get_or_insert_with(|| {
+                            Instant::now() + DURABLE_LIVE_ATTACH_PUBLICATION_GRACE
+                        });
                     }
                 }
             },
@@ -18313,11 +19024,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         | RunStatus::Failed
                         | RunStatus::Cancelled
                 ) {
-                    return Ok(RunMutationRecord::applied(
-                        run_id,
-                        current.status,
-                        durable.status,
-                    ));
+                    let publication = self.publish_recovered_explain(&current).await;
+                    let mut result =
+                        RunMutationRecord::applied(run_id, current.status, durable.status);
+                    result.artifact_publication = publication;
+                    return Ok(result);
                 }
                 return Err(Self::run_state_conflict("resume", &current.status));
             }
@@ -18336,12 +19047,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_services::work::PrimaryWorkAttemptCarrierState::Failed,
             )
             .await;
+            // Completion promotion does not re-enter the executor's settlement
+            // path. Publish from the freshly loaded terminal authority here.
+            let completed = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            let publication = if completed.run_generation == durable.run_generation {
+                self.publish_recovered_explain(&completed).await
+            } else {
+                None
+            };
             Self::schedule_run_eviction(&self.runs, run_id.clone());
-            return Ok(RunMutationRecord::applied(
-                run_id,
-                STATUS_COMPLETED,
-                durable.status,
-            ));
+            let mut result = RunMutationRecord::applied(run_id, STATUS_COMPLETED, durable.status);
+            result.artifact_publication = publication;
+            return Ok(result);
         }
 
         if !self.run_execution_is_live(&durable).await {
@@ -18369,6 +19086,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(Self::run_state_conflict("resume", &current.status));
             }
             return Ok(RunMutationRecord {
+                artifact_publication: None,
                 run_id: run_id.clone(),
                 status: current.status,
                 previous_status: durable.status,

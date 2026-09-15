@@ -2770,6 +2770,7 @@ enum AgentWorkbenchOutcome {
         runs: Vec<crate::tui::local_agent_journal::LocalJournalAgentRun>,
     },
     ControlAccepted {
+        publication: Option<astra_turn_types::ArtifactPublicationV1>,
         agent_id: String,
         action: astra_thin_client::SessionRunAction,
     },
@@ -2842,7 +2843,7 @@ fn dispatch_local_agent_journal_load(
 const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum AgentControlExecution {
-    Applied,
+    Applied(Option<astra_turn_types::ArtifactPublicationV1>),
     SessionContinuationRequired {
         session_id: String,
         source_run_id: String,
@@ -2872,7 +2873,14 @@ fn project_agent_control_execution(
                 source_run_id: source_run_id.to_string(),
             })
         }
-        Some("applied") => Ok(AgentControlExecution::Applied),
+        Some("applied") => Ok(AgentControlExecution::Applied(
+            value
+                .get("artifact_publication")
+                .filter(|value| !value.is_null())
+                .map(astra_turn_types::ArtifactPublicationV1::from_wire)
+                .transpose()
+                .map_err(str::to_string)?,
+        )),
         Some(other) => Err(format!(
             "server returned unknown control disposition '{other}'"
         )),
@@ -2924,10 +2932,13 @@ fn dispatch_agent_control(
         )
         .await;
         let outcome = match result {
-            Ok(Ok(AgentControlExecution::Applied)) => AgentWorkbenchOutcome::ControlAccepted {
-                agent_id: agent_id_owned,
-                action,
-            },
+            Ok(Ok(AgentControlExecution::Applied(publication))) => {
+                AgentWorkbenchOutcome::ControlAccepted {
+                    publication,
+                    agent_id: agent_id_owned,
+                    action,
+                }
+            }
             Ok(Ok(AgentControlExecution::SessionContinuationRequired {
                 session_id,
                 source_run_id,
@@ -2977,7 +2988,7 @@ async fn execute_agent_control(
                 .await
                 .owns_local_stop()
             {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 Err("the local runtime no longer owns an active agent with this identity".into())
             }
@@ -2990,7 +3001,7 @@ async fn execute_agent_control(
                 return Err("the local delegation runtime is unavailable".into());
             };
             if engine.cancel_sub_run(&run_id).await {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 Err("the local delegated run is no longer active or controllable".into())
             }
@@ -3015,7 +3026,7 @@ async fn execute_agent_control(
             };
             let value = result.map_err(|error| error.to_string())?;
             if action == astra_thin_client::SessionRunAction::Cancel {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 project_agent_control_execution(&value)
             }
@@ -3056,7 +3067,22 @@ fn drain_agent_workbench_outcomes(
                     chat_widget.reconcile_local_agent_journal_runs(&runs);
                 }
             }
-            AgentWorkbenchOutcome::ControlAccepted { agent_id, action } => {
+            AgentWorkbenchOutcome::ControlAccepted {
+                agent_id,
+                action,
+                publication,
+            } => {
+                if let Some(outcome) = publication {
+                    let cell = match outcome.result {
+                        astra_turn_types::ArtifactPublicationResult::Published { .. } => {
+                            history_cell::system::SystemCell::info(outcome.user_notice())
+                        }
+                        astra_turn_types::ArtifactPublicationResult::Unavailable { .. } => {
+                            history_cell::system::SystemCell::warning(outcome.user_notice())
+                        }
+                    };
+                    chat_widget.commit_system(cell);
+                }
                 tracing::debug!(agent_id, ?action, "agent control accepted");
             }
             AgentWorkbenchOutcome::ControlContinuationRequired {
@@ -5144,6 +5170,7 @@ pub(crate) async fn run_tui_session(
         _ => chat_widget::ChatWidget::new(String::new()),
     };
     chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
+    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
 
     if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
         use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -5882,6 +5909,9 @@ pub(crate) async fn run_tui_session(
                                             state.explain,
                                             crate::ExplainMode::Verbose
                                         ));
+                                        chat_widget.set_explain_live_rows(
+                                            state.runtime_config.explain.effective_live_rows(),
+                                        );
                                         rebind_workbench_observers(
                                             Some(new_sid),
                                             &task_board,
@@ -6002,6 +6032,12 @@ pub(crate) async fn run_tui_session(
                                     // still draining its final transport events.
                                     let mut foreground_lifecycle_transferred = false;
                                     let mut deferred_active_bg_notifications = Vec::new();
+                                    // The host normally reports Explain Analyze repair through
+                                    // the ordered stream. Keep one outer-turn bit as a final
+                                    // integrity backstop for the case where both the canonical
+                                    // snapshot and its gap marker miss a saturated/closed lane.
+                                    let explain_analyze_terminal_degraded =
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                                     let (turn_tx, turn_stream_bridge_control) =
                                         stream_bridge::create_controlled_per_turn_bridge(
@@ -6058,6 +6094,9 @@ pub(crate) async fn run_tui_session(
                                             api,
                                             profile,
                                             post_commit_tx: Some(turn_post_commit_tx.clone()),
+                                            explain_analyze_terminal_degraded: Some(
+                                                explain_analyze_terminal_degraded.as_ref(),
+                                            ),
                                         };
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
                                         // Authentication is part of the polled turn future, not
@@ -7174,6 +7213,7 @@ pub(crate) async fn run_tui_session(
                                                         !matches!(
                                                             &ae,
                                                             TuiAppEvent::ExplainAnalyze(_)
+                                                                | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
                                                                 | TuiAppEvent::ExplainAnalyzeGap
                                                         )
                                                             || explain_mode_observes_graph(
@@ -7698,6 +7738,14 @@ pub(crate) async fn run_tui_session(
 
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
+                                    // The host's outer terminal result proves that the canonical
+                                    // Explain Analyze repair was not delivered. Route the same
+                                    // typed gap reducer used by the stream so a direct
+                                    // TurnComplete cannot freeze a lossy prefix as complete.
+                                    apply_terminal_explain_analyze_degraded_marker(
+                                        &mut chat_widget,
+                                        explain_analyze_terminal_degraded.as_ref(),
+                                    );
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     set_bash_background_hint_enabled(
                                         &mut chat_widget,
@@ -8049,6 +8097,11 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     state.config_version_id =
                                                         Some(save.new_version_id.clone());
+                                                    state.runtime_config =
+                                                        astra_config::runtime_config::RuntimeConfig::load();
+                                                    chat_widget.set_explain_live_rows(
+                                                        state.runtime_config.explain.effective_live_rows(),
+                                                    );
                                                 }
                                                 history_cell::system::SystemCell::response(outcome.message)
                                             }
@@ -9174,6 +9227,7 @@ fn handle_app_event(
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainAnalyze(_)
+        | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
         | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
@@ -9233,6 +9287,21 @@ fn event_may_have_committed_work_graph(event: &TuiAppEvent) -> bool {
     matches!(event, TuiAppEvent::WorkTaskBoardUpdate(_))
 }
 
+/// Apply an outer host terminal-integrity result before the direct turn
+/// completion reducer runs. The marker is deliberately consumed exactly once;
+/// stream-delivered ExplainAnalyzeGap events remain idempotent if both paths
+/// report the same loss.
+fn apply_terminal_explain_analyze_degraded_marker(
+    chat_widget: &mut chat_widget::ChatWidget,
+    marker: &std::sync::atomic::AtomicBool,
+) {
+    if marker.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ExplainAnalyzeGap,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9276,6 +9345,33 @@ mod tests {
         ));
         let event = TuiAppEvent::ExplainAnalyze(explain_analyze_fact());
         assert!(matches!(event, TuiAppEvent::ExplainAnalyze(_)));
+    }
+
+    #[test]
+    fn outer_explain_integrity_marker_downgrades_direct_completion() {
+        let mut widget = chat_widget::ChatWidget::new("");
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ExplainAnalyze(explain_analyze_fact()),
+        ));
+        let marker = std::sync::atomic::AtomicBool::new(true);
+
+        apply_terminal_explain_analyze_degraded_marker(&mut widget, &marker);
+        assert!(!marker.load(std::sync::atomic::Ordering::Acquire));
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::TurnComplete(Box::default()),
+        ));
+
+        let rendered = widget
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(100))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(
+            rendered.contains("incomplete"),
+            "outer terminal loss must remain visible at direct completion: {rendered}"
+        );
     }
 
     #[test]

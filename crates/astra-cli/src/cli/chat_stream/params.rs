@@ -260,11 +260,25 @@ pub enum StreamEvent {
     AgentCommunication(astra_turn_types::AgentCommunicationEvent),
     /// One canonical, versioned Explain Analyze fact as accepted from the runtime stream.
     ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    /// Terminal canonical snapshot for the Explain Analyze projection.
+    ///
+    /// Individual facts are intentionally delivered on a lossy live lane so
+    /// a slow renderer cannot stall the SSE reader. This bounded snapshot is
+    /// the repair boundary: consumers replace their live projection with the
+    /// complete accumulator before treating the turn as settled.
+    ExplainAnalyzeSnapshot {
+        events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+        delivery_degraded: bool,
+    },
+    ArtifactPublication(astra_turn_types::ArtifactPublicationV1),
     /// The active Explain Analyze stream lost coverage and could not recover
     /// all durable facts after a delivery gap.
     ExplainAnalyzeGap,
     /// Local policy approved a tool without showing an interactive prompt.
-    PermissionAutoApproved { tool: String, reason: String },
+    PermissionAutoApproved {
+        tool: String,
+        reason: String,
+    },
     /// Verdict audit events from the turn.
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event for real-time UX feedback.
@@ -565,6 +579,12 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
     /// even when `quiet` / `suppress_intermediate_output` are true.
     pub(crate) stream_event_tx: Option<StreamEventTx>,
+    /// Outer-turn integrity marker for the interactive TUI. When terminal
+    /// Explain Analyze repair cannot reach the stream consumer, the host sets
+    /// this marker so the owner can downgrade the projection before its
+    /// direct TurnComplete barrier, even if every terminal stream event was
+    /// lost under backpressure.
+    pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
     /// Strict protocol observation sink used only by
     /// `--output-format stream-json`. Ordinary CLI/TUI turns leave this unset
     /// and do not clone or retain raw SSE events.
@@ -780,6 +800,7 @@ impl<'a> ChatTurnParams<'a> {
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
+            explain_analyze_terminal_degraded: None,
             stream_json_emitter: ctx.stream_json_emitter.clone(),
             agent_live_event_sink: None,
             approval_request_tx: None,

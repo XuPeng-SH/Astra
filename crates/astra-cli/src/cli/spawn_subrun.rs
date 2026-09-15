@@ -479,6 +479,8 @@ fn stream_event_to_agent_live_kind(
         | StreamEvent::AgentLiveGap(_)
         | StreamEvent::Compaction(_)
         | StreamEvent::ExplainAnalyze(_)
+        | StreamEvent::ExplainAnalyzeSnapshot { .. }
+        | StreamEvent::ArtifactPublication(_)
         | StreamEvent::ExplainAnalyzeGap
         | StreamEvent::WorkTaskBoardUpdate(_)
         | StreamEvent::VerdictReport(_) => None,

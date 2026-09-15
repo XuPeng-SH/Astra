@@ -38,8 +38,56 @@ impl ExplainAnalyzeCell {
         delivery_degraded: bool,
         verbose: bool,
     ) -> Vec<Line<'static>> {
-        let limit = usize::from(max_rows.max(2));
-        render_graph(graph, width, true, Some(limit), delivery_degraded, verbose)
+        // The live projection is a status lane above the composer. Keep a
+        // hard ceiling even when a caller supplies the terminal height or a
+        // malformed config value; the settled cell remains the full report.
+        let limit = usize::from(max_rows.clamp(1, 5));
+        let mut lines = render_graph(graph, width, true, Some(limit), delivery_degraded, verbose);
+        // A bounded tree must not spend every row on ancestors while hiding
+        // the work actually in progress. Compact only when its path cannot fit.
+        if limit > 1
+            && let Some((index, _)) = graph
+                .nodes()
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, node)| !node.terminal_observed)
+        {
+            let mut path = vec![index];
+            while let Some(parent) = graph.nodes()[*path.last().unwrap()].parent_index {
+                if path.contains(&parent) {
+                    break;
+                }
+                path.push(parent);
+            }
+            path.reverse();
+            if path.len() >= limit {
+                lines.truncate(1);
+                let tail = &path[path.len() - (limit - 1)..];
+                for (depth, index) in tail.iter().enumerate() {
+                    let node = &graph.nodes()[*index];
+                    let prefix = if depth == 0 {
+                        "… ".to_string()
+                    } else {
+                        format!("{}└─ ", "  ".repeat(depth - 1))
+                    };
+                    let label = format!(
+                        "{prefix}{}{}",
+                        node.label,
+                        if depth + 1 == tail.len() {
+                            " · active"
+                        } else {
+                            ""
+                        }
+                    );
+                    lines.push(Line::from(Span::styled(
+                        truncate(&label, usize::from(width)),
+                        Style::default().fg(crate::tui::theme::current().fg),
+                    )));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -116,10 +164,16 @@ fn render_graph(
     } else {
         format!("{} clocks", clock_labels.len())
     };
-    let header = format!(
-        "Explain Analyze · {integrity} · {} stages · {parallel_label} {peak} · {clock_count}",
-        graph.nodes().len(),
+    let mut header = format!(
+        "Explain Analyze · {integrity} · {} stages",
+        graph.nodes().len()
     );
+    if verbose || graph.max_concurrency().is_some_and(|count| count > 1) {
+        header.push_str(&format!(" · {parallel_label} {peak}"));
+    }
+    if verbose || clock_labels.len() > 1 {
+        header.push_str(&format!(" · {clock_count}"));
+    }
     let mut lines = vec![Line::from(Span::styled(
         truncate(&header, width),
         Style::default().fg(theme.accent).bold(),
@@ -129,8 +183,35 @@ fn render_graph(
     let mut truncated = false;
     let mut seen = HashSet::new();
     let mut stack = Vec::new();
+    let mut live_branch_cache = HashMap::new();
+    let mut live_branch_visiting = HashSet::new();
     let mut roots = graph.roots().collect::<Vec<_>>();
-    roots.sort_unstable();
+    if live {
+        roots.sort_unstable_by(|left, right| {
+            let left_open = live_branch_has_open_node(
+                graph,
+                *left,
+                &mut live_branch_cache,
+                &mut live_branch_visiting,
+            );
+            let right_open = live_branch_has_open_node(
+                graph,
+                *right,
+                &mut live_branch_cache,
+                &mut live_branch_visiting,
+            );
+            right_open
+                .cmp(&left_open)
+                .then_with(|| {
+                    graph.nodes()[*right]
+                        .start_elapsed_ms
+                        .cmp(&graph.nodes()[*left].start_elapsed_ms)
+                })
+                .then_with(|| left.cmp(right))
+        });
+    } else {
+        roots.sort_unstable();
+    }
     let mut root_cursor = 0;
     let mut orphan_heading = false;
 
@@ -481,7 +562,33 @@ fn render_graph(
             }
 
             let mut children = graph.children(index).to_vec();
-            if children
+            if live {
+                // Keep the compact viewport anchored on the newest open
+                // branch. A completed preparation sibling should not hide an
+                // active provider/tool simply because it was observed first.
+                children.sort_unstable_by(|left, right| {
+                    let left_open = live_branch_has_open_node(
+                        graph,
+                        *left,
+                        &mut live_branch_cache,
+                        &mut live_branch_visiting,
+                    );
+                    let right_open = live_branch_has_open_node(
+                        graph,
+                        *right,
+                        &mut live_branch_cache,
+                        &mut live_branch_visiting,
+                    );
+                    right_open
+                        .cmp(&left_open)
+                        .then_with(|| {
+                            graph.nodes()[*right]
+                                .start_elapsed_ms
+                                .cmp(&graph.nodes()[*left].start_elapsed_ms)
+                        })
+                        .then_with(|| left.cmp(right))
+                });
+            } else if children
                 .iter()
                 .all(|child| graph.nodes()[*child].clock_domain_id == node.clock_domain_id)
             {
@@ -503,7 +610,12 @@ fn render_graph(
     }
 
     if truncated {
-        debug_assert!(node_limit.is_none_or(|limit| lines.len() < limit));
+        // A one-row live lane has room only for the header. Do not append a
+        // second truncation row or rely on debug-only assertions to enforce
+        // the configured bound.
+        if node_limit.is_some_and(|limit| lines.len() >= limit) {
+            return lines;
+        }
         let remaining = graph.nodes().len().saturating_sub(seen.len());
         let message = if remaining > 0 {
             format!("  · {remaining} more stages in turn history")
@@ -517,15 +629,30 @@ fn render_graph(
     }
     if !truncated {
         if !coverage_gaps.is_empty() {
-            let coverage = format!(
-                "Coverage · {} timing dimensions unavailable: {}",
-                coverage_gaps.len(),
-                coverage_gaps
+            let coverage = if verbose {
+                format!(
+                    "Coverage · {} timing dimensions unavailable: {}",
+                    coverage_gaps.len(),
+                    coverage_gaps
+                        .iter()
+                        .map(|gap| gap.label())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                )
+            } else {
+                let labels = coverage_gaps
                     .iter()
+                    .take(2)
                     .map(|gap| gap.label())
                     .collect::<Vec<_>>()
-                    .join(" · ")
-            );
+                    .join(" · ");
+                let more = if coverage_gaps.len() > 2 {
+                    format!(" · {} more in report", coverage_gaps.len() - 2)
+                } else {
+                    String::new()
+                };
+                format!("Not timed separately · {labels}{more}")
+            };
             let _ = push_wrapped_detail(
                 &mut lines,
                 &coverage,
@@ -570,6 +697,35 @@ fn render_graph(
         )));
     }
     lines
+}
+
+/// Whether a node's subtree contains work that has not reached a terminal
+/// fact yet. The append-only graph can contain malformed cycles, so the
+/// visiting set is part of the helper rather than relying on a tree-shaped
+/// invariant.
+fn live_branch_has_open_node(
+    graph: &ExplainAnalyzeGraphV1,
+    index: usize,
+    cache: &mut HashMap<usize, bool>,
+    visiting: &mut HashSet<usize>,
+) -> bool {
+    if let Some(open) = cache.get(&index) {
+        return *open;
+    }
+    if !visiting.insert(index) {
+        return false;
+    }
+    let open = graph
+        .nodes()
+        .get(index)
+        .is_some_and(|node| !node.terminal_observed)
+        || graph
+            .children(index)
+            .iter()
+            .any(|child| live_branch_has_open_node(graph, *child, cache, visiting));
+    visiting.remove(&index);
+    cache.insert(index, open);
+    open
 }
 
 fn outcome_label(outcome: astra_turn_types::ExplainAnalyzeOutcomeV1) -> &'static str {
@@ -1159,12 +1315,51 @@ mod tests {
         graph
     }
 
+    fn active_branch_graph() -> ExplainAnalyzeGraphV1 {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(started(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            "clock-1",
+            0,
+        ));
+        for index in 0..4 {
+            let node_id = format!("preparation-{index}");
+            graph.apply(finished(
+                &format!("{node_id}-finish"),
+                &node_id,
+                Some("turn"),
+                ExplainAnalyzeNodeKindV1::Preparation,
+                "clock-1",
+                10 + index,
+                1,
+                ExplainAnalyzeOutcomeV1::Completed,
+                None,
+                None,
+            ));
+        }
+        graph.apply(started(
+            "provider-start",
+            "provider",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            "clock-1",
+            100,
+        ));
+        graph
+    }
+
     #[test]
     fn live_tree_explains_time_usage_and_context_without_mixing_estimates() {
         let graph = example_graph();
-        let rendered = text(&ExplainAnalyzeCell::live_lines(
-            &graph, 120, 24, false, true,
-        ));
+        let lines = ExplainAnalyzeCell::live_lines(&graph, 120, 24, false, true);
+        assert!(
+            lines.len() <= 5,
+            "live Explain Analyze must stay within five rows"
+        );
+        let rendered = text(&render_graph(&graph, 120, true, None, false, true));
 
         assert!(rendered.contains("recording"), "{rendered}");
         assert!(!rendered.contains("incomplete"), "{rendered}");
@@ -1194,6 +1389,51 @@ mod tests {
         let graph = ExplainAnalyzeGraphV1::default();
         let rendered = text(&ExplainAnalyzeCell::live_lines(&graph, 100, 4, true, false));
         assert!(rendered.contains("incomplete · stream gap"), "{rendered}");
+    }
+
+    #[test]
+    fn live_one_row_keeps_only_the_header() {
+        let lines = ExplainAnalyzeCell::live_lines(&example_graph(), 100, 1, false, true);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a one-row lane must not append truncation text"
+        );
+    }
+
+    #[test]
+    fn deep_live_tree_keeps_the_active_leaf_in_five_rows() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for index in 0..9 {
+            let node = format!("stage-{index}");
+            let parent = (index > 0).then(|| format!("stage-{}", index - 1));
+            graph.apply(started(
+                &format!("event-{index}"),
+                &node,
+                parent.as_deref(),
+                ExplainAnalyzeNodeKindV1::ToolCall,
+                "clock",
+                index,
+            ));
+        }
+        let lines = ExplainAnalyzeCell::live_lines(&graph, 100, 5, false, false);
+        assert_eq!(lines.len(), 5);
+        let rendered = text(&lines);
+        assert!(rendered.contains("stage 8 · active"), "{rendered}");
+        assert!(rendered.contains("… stage 5"), "{rendered}");
+        assert!(rendered.contains("└─ stage 7"), "{rendered}");
+    }
+
+    #[test]
+    fn live_tree_prioritizes_the_current_open_branch() {
+        let rendered = text(&ExplainAnalyzeCell::live_lines(
+            &active_branch_graph(),
+            120,
+            5,
+            false,
+            false,
+        ));
+        assert!(rendered.contains("provider"), "{rendered}");
     }
 
     #[test]
@@ -1267,9 +1507,7 @@ mod tests {
         let rendered = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(120));
         assert!(rendered.contains("partial capture"), "{rendered}");
         assert!(
-            rendered.contains(
-                "Coverage · 2 timing dimensions unavailable: child-run timing · tool I/O wait breakdown",
-            ),
+            rendered.contains("Not timed separately · child-run timing · tool I/O wait breakdown",),
             "{rendered}"
         );
     }

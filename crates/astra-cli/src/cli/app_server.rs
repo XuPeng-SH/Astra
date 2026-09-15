@@ -1066,6 +1066,9 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
                 }
             }),
         )),
+        StreamEvent::ArtifactPublication(outcome) => {
+            Some(("turn/artifactPublication", outcome.to_wire()))
+        }
         StreamEvent::ExplainAnalyze(event) => {
             let mut params = serde_json::to_value(event).ok()?;
             params.as_object_mut()?.insert(
@@ -1074,6 +1077,16 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             );
             Some(("turn/explainAnalyze", params))
         }
+        StreamEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => Some((
+            "turn/explainAnalyzeSnapshot",
+            serde_json::json!({
+                "events": events,
+                "deliveryDegraded": delivery_degraded,
+            }),
+        )),
         StreamEvent::ExplainAnalyzeGap => Some((
             "turn/explainAnalyzeGap",
             serde_json::json!({"recovered": false}),
