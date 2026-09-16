@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v77";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v78";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2094,6 +2094,18 @@ async fn verify_work_canonical_schema(
             ],
         ),
         (
+            "work_proposal_trigger_attempts",
+            &[
+                "owner_id",
+                "work_id",
+                "branch_id",
+                "proposal_id",
+                "trigger_attempt_id",
+                "trigger_item_id",
+                "trigger_item_revision",
+            ],
+        ),
+        (
             "work_branches",
             &["deletion_operation_id", "deletion_requested_at"],
         ),
@@ -2194,6 +2206,22 @@ async fn verify_work_canonical_schema(
                 "criterion_revision",
                 "produced_at",
                 "check_run_id",
+            ],
+        ),
+        (
+            "work_graph_revisions",
+            "idx_work_graph_revision_patch_ref",
+            &["owner_id", "work_id", "patch_ref", "revision"],
+        ),
+        (
+            "work_proposal_trigger_attempts",
+            "idx_work_proposal_trigger_attempt",
+            &[
+                "owner_id",
+                "work_id",
+                "branch_id",
+                "trigger_attempt_id",
+                "proposal_id",
             ],
         ),
     ];
