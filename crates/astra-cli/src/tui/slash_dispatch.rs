@@ -62,10 +62,10 @@ impl SlashResult {
     }
 }
 
-/// A read-only workbench action whose I/O is owned by the event loop rather
-/// than the slash dispatcher. These actions have no mutable session effect,
-/// so they can complete after the user keeps composing without borrowing UI
-/// state across a filesystem or process wait.
+/// A workbench action whose I/O is owned by the event loop rather than the
+/// slash dispatcher. Reads and the small, idempotent progress-save request
+/// can complete after the user keeps composing without borrowing UI state
+/// across a network wait.
 pub(crate) enum SlashBackgroundRead {
     Clipboard {
         text: String,
@@ -79,6 +79,12 @@ pub(crate) enum SlashBackgroundRead {
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         session_id: String,
+    },
+    WorkRecoveryPointCapture {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        session_id: String,
+        request_id: String,
     },
     WorkCatalog {
         api: astra_thin_client::ThinClient,
@@ -116,6 +122,7 @@ pub(crate) enum WorkCommandRoute {
     Catalog,
     Tasks,
     Execution,
+    SaveProgress,
     Start(String),
     MissingGoal,
     Unsupported,
@@ -127,6 +134,7 @@ pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
         "" | "list" if remainder.trim().is_empty() => WorkCommandRoute::Catalog,
         "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
         "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
+        "save" | "checkpoint" if remainder.trim().is_empty() => WorkCommandRoute::SaveProgress,
         "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
         "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
         _ => WorkCommandRoute::Unsupported,
@@ -380,6 +388,28 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     session_id,
                 })
             }
+            WorkCommandRoute::SaveProgress => {
+                let Some(session_id) = ctx
+                    .state
+                    .session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+                else {
+                    ctx.show_error(
+                        "This conversation has no durable session yet. Send one message, then save progress."
+                            .to_string(),
+                    );
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Saving Work progress…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkRecoveryPointCapture {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id,
+                    request_id: format!("tui-recovery-{}", uuid::Uuid::new_v4().simple()),
+                })
+            }
             WorkCommandRoute::MissingGoal => {
                 ctx.show_error("Usage: /work start <goal>".to_string());
                 SlashResult::Handled
@@ -408,7 +438,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             WorkCommandRoute::Unsupported => {
                 ctx.show_error(
-                    "Usage: /work [list | status | execution | start <goal>]".to_string(),
+                    "Usage: /work [list | status | execution | save | start <goal>]".to_string(),
                 );
                 SlashResult::Handled
             }
@@ -3552,6 +3582,11 @@ mod routing_tests {
         assert_eq!(
             work_command_route(" execution "),
             WorkCommandRoute::Execution
+        );
+        assert_eq!(work_command_route("save"), WorkCommandRoute::SaveProgress);
+        assert_eq!(
+            work_command_route(" checkpoint "),
+            WorkCommandRoute::SaveProgress
         );
         assert_eq!(
             work_command_route("start ship the durable flow"),

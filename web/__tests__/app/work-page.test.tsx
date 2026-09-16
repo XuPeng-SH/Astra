@@ -48,6 +48,13 @@ test("opens a durable read attachment after resolving the public delivery branch
   const transcript = { schema_version: 1, items: [] } as never;
   const archivedBranches = { schema_version: 1, branches: [] } as never;
   const patchArtifacts = { schema_version: 1, artifacts: [] } as never;
+  const recoveryPoints = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    points: [],
+    next_cursor: null,
+  } as never;
   const selectedBranch = { branch_id: "branch-1", is_delivery: true } as never;
   const catalog = { branches: [selectedBranch] } as never;
   const attachWorkBranch = vi.fn().mockResolvedValue(attachment);
@@ -56,6 +63,7 @@ test("opens a durable read attachment after resolving the public delivery branch
   const getWorkBranchExecution = vi.fn().mockResolvedValue(execution);
   const listArchivedWorkBranches = vi.fn().mockResolvedValue(archivedBranches);
   const listWorkPatchArtifacts = vi.fn().mockResolvedValue(patchArtifacts);
+  const listWorkBranchRecoveryPoints = vi.fn().mockResolvedValue(recoveryPoints);
   const patchCommits = { schema_version: 1, operations: [] } as never;
   const listWorkPatchCommits = vi.fn().mockResolvedValue(patchCommits);
   const sdk = {
@@ -65,6 +73,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     getWorkBranchTranscript,
     listArchivedWorkBranches,
     listWorkPatchArtifacts,
+    listWorkBranchRecoveryPoints,
     listWorkPatchCommits,
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
@@ -97,6 +106,9 @@ test("opens a durable read attachment after resolving the public delivery branch
   expect(listWorkPatchCommits).toHaveBeenCalledWith("work-1", "branch-1", {
     limit: 10,
   });
+  expect(listWorkBranchRecoveryPoints).toHaveBeenCalledWith("work-1", "branch-1", {
+    limit: 10,
+  });
   expect(element.props).toMatchObject({
     initial: snapshot,
     attachment,
@@ -106,6 +118,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     archivedBranches,
     patchArtifacts,
     patchCommits,
+    recoveryPoints,
     branchCatalog: catalog,
     selectedBranch,
   });
@@ -127,6 +140,7 @@ test("restores durable patch application progress for an alternative branch", as
     getWorkBranchTranscript: vi.fn().mockResolvedValue({}),
     listArchivedWorkBranches: vi.fn().mockResolvedValue({}),
     listWorkPatchArtifacts: vi.fn().mockResolvedValue({}),
+    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue({}),
     listWorkPatchMaterializations,
     listWorkPatchCommits,
   } as never;

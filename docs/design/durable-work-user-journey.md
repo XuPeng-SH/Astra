@@ -341,7 +341,13 @@ workspace safe.
   boundary for observation only: it does not claim that a Workspace, Artifact,
   or unfinished Run can be restored. No caller-supplied manifest is published
   as `ready`; that state remains reserved for a future verifier that resolves
-  those durable payloads and effect receipts. This is still not cross-Edge
+  those durable payloads and effect receipts. The first user-facing capture
+  path is `POST /v1/works/{work}/branches/{branch}/recovery-points`; TUI exposes
+  it as `/work save` (with `/work checkpoint` as an alias), and Web lists the
+  resulting boundaries under **Saved progress**. The action is intentionally
+  explicit and non-restoring: it records the current conversation/Work point,
+  reports the missing workspace and effect coverage, and never silently
+  changes Session or execution authority. This is still not cross-Edge
   migration or Server Run-owner recovery.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The

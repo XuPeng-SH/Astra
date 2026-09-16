@@ -12,18 +12,20 @@
 use astra_core::SharedPool;
 use astra_turn_types::{
     RecoveryPointBindingStateV1, RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1,
-    RecoveryPointManifestV1, SessionKeyV1,
+    RecoveryPointManifestV1, RecoveryPointReasonV1, SessionKeyV1,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, QueryBuilder, Row, query};
 
+use crate::runs::durable_run_status_blocks_session;
 use crate::session_context_coordinator::{
     SessionContextCoordinatorError, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
     lock_recovery_context_in_transaction,
 };
 
+use super::events::{NewWorkEvent, WorkEventKind};
 use super::plan_context_repository::load_recovery_basis_in_transaction;
 use super::repository::{DatabaseWorkRepository, WorkConflictResource, WorkRepositoryError};
 use super::{WorkBranchId, WorkChangeRef, WorkContentHash, WorkId, WorkOwnerId};
@@ -75,6 +77,23 @@ pub struct NewWorkRecoveryPoint {
     pub manifest: RecoveryPointManifestV1,
 }
 
+/// A request to record a canonical, between-Run progress boundary.
+///
+/// The caller supplies only stable request identity and the revisions it saw;
+/// the manifest is built from authoritative rows inside one transaction. This
+/// prevents a client from claiming that a workspace, Run, or Artifact is
+/// restorable when no such payload has been verified.
+#[derive(Debug, Clone)]
+pub struct WorkRecoveryPointCaptureRequest {
+    pub owner_id: WorkOwnerId,
+    pub work_id: WorkId,
+    pub branch_id: WorkBranchId,
+    pub request_id: WorkChangeRef,
+    pub expected_work_revision: u64,
+    pub expected_branch_revision: u64,
+    pub reason: RecoveryPointReasonV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkRecoveryPointRecord {
     pub schema_version: u32,
@@ -102,7 +121,20 @@ pub struct WorkRecoveryPointQuery {
     pub owner_id: WorkOwnerId,
     pub work_id: WorkId,
     pub branch_id: Option<WorkBranchId>,
+    pub before: Option<WorkRecoveryPointCursor>,
     pub limit: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkRecoveryPointCursor {
+    pub created_at: DateTime<Utc>,
+    pub recovery_point_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkRecoveryPointPage {
+    pub records: Vec<WorkRecoveryPointRecord>,
+    pub next_cursor: Option<WorkRecoveryPointCursor>,
 }
 
 impl WorkRecoveryPointQuery {
@@ -111,12 +143,18 @@ impl WorkRecoveryPointQuery {
             owner_id,
             work_id,
             branch_id: None,
+            before: None,
             limit: 32,
         }
     }
 
     pub fn branch(mut self, branch_id: WorkBranchId) -> Self {
         self.branch_id = Some(branch_id);
+        self
+    }
+
+    pub fn before(mut self, before: WorkRecoveryPointCursor) -> Self {
+        self.before = Some(before);
         self
     }
 
@@ -134,6 +172,388 @@ pub struct DatabaseWorkRecoveryPointRepository {
 impl DatabaseWorkRecoveryPointRepository {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    /// Capture the current canonical Work/Session boundary atomically.
+    ///
+    /// This is intentionally a single transaction rather than a public
+    /// `record_preparing`/`mark_captured` wrapper: there is no asynchronous
+    /// payload upload in this path, so exposing two commits would let a retry
+    /// observe a manifest generated from a different clock or context head.
+    /// The request fingerprint contains only stable caller parameters. A
+    /// replay therefore returns the original immutable point even after the
+    /// Work has advanced.
+    pub async fn capture_canonical(
+        &self,
+        request: WorkRecoveryPointCaptureRequest,
+    ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
+        validate_capture_request(&request)?;
+        let request_hash = capture_request_hash(&request)?;
+        let recovery_point_id = capture_recovery_point_id(&request_hash)?;
+
+        let mut transaction = self.pool.get().begin().await.map_err(|source| {
+            WorkRepositoryError::persistence("begin canonical Work recovery capture", source)
+        })?;
+
+        // Promotion of an existing Session takes the Session authority before
+        // inserting Work. Read the branch's Session identity without a lock,
+        // then acquire Session → slot/Run → Work/branch in the same order so a
+        // concurrent promotion cannot form a Work↔Session lock cycle.
+        let branch_session_id = query(
+            "SELECT b.session_id
+             FROM works w
+             INNER JOIN work_branches b
+               ON b.owner_id = w.owner_id AND b.work_id = w.work_id
+              AND b.branch_id = ?
+             WHERE w.owner_id = ? AND w.work_id = ?
+             LIMIT 1",
+        )
+        .bind(request.branch_id.as_str())
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::persistence("read canonical Work recovery Session", source)
+        })?
+        .ok_or(WorkRepositoryError::NotFound)?
+        .try_get::<String, _>("session_id")
+        .map_err(|source| WorkRepositoryError::corrupt("Work recovery basis", source))?;
+        if branch_session_id.is_empty() {
+            return Err(WorkRepositoryError::corrupt(
+                "Work recovery basis",
+                std::io::Error::other("branch has no Session identity"),
+            ));
+        }
+
+        // The execution slot is the canonical between-Run fence. It is locked
+        // before Work/branch rows, matching promotion's Session-first order.
+        crate::storage::admit_session_execution_write(
+            &mut transaction,
+            &branch_session_id,
+            request.owner_id.as_str(),
+        )
+        .await
+        .map_err(|source| {
+            if matches!(source, sqlx::Error::RowNotFound) {
+                WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason: super::repository::WorkRecoveryPointBlocker::SessionUnavailable,
+                }
+            } else {
+                WorkRepositoryError::persistence("lock Work Session execution authority", source)
+            }
+        })?;
+
+        let branch_row = query(
+            "SELECT b.session_id, b.branch_revision,
+                    b.deletion_operation_id,
+                    CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END AS branch_archived,
+                    CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived
+             FROM works w
+             INNER JOIN work_branches b
+               ON b.owner_id = w.owner_id AND b.work_id = w.work_id
+              AND b.branch_id = ?
+             WHERE w.owner_id = ? AND w.work_id = ?
+             LIMIT 1
+             FOR UPDATE",
+        )
+        .bind(request.branch_id.as_str())
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::persistence("lock canonical Work recovery basis", source)
+        })?
+        .ok_or(WorkRepositoryError::NotFound)?;
+        let locked_branch_session_id = branch_row
+            .try_get::<String, _>("session_id")
+            .map_err(|source| WorkRepositoryError::corrupt("Work recovery basis", source))?;
+        if locked_branch_session_id != branch_session_id {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::SessionChanged,
+            });
+        }
+
+        // The request row is checked before any mutable-state admission. This
+        // is the idempotency boundary after a lost HTTP response.
+        if let Some(row) = query(&format!(
+            "{RECOVERY_POINT_SELECT_SQL}
+                 WHERE owner_id = ? AND work_id = ? AND request_id = ?
+                 LIMIT 1 FOR UPDATE"
+        ))
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(request.request_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::persistence("load canonical recovery request", source)
+        })? {
+            let stored_hash = row
+                .try_get::<String, _>("request_hash")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery point", source))?;
+            if stored_hash != request_hash.as_str() {
+                return Err(WorkRepositoryError::Conflict {
+                    resource: WorkConflictResource::RecoveryPointRequest,
+                });
+            }
+            let record = decode_record(row)?;
+            transaction.commit().await.map_err(|source| {
+                WorkRepositoryError::persistence("commit idempotent recovery capture", source)
+            })?;
+            return Ok(record);
+        }
+
+        if branch_row
+            .try_get::<i64, _>("work_archived")
+            .map_err(|source| WorkRepositoryError::corrupt("Work recovery basis", source))?
+            != 0
+            || branch_row
+                .try_get::<i64, _>("branch_archived")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery basis", source))?
+                != 0
+        {
+            return Err(WorkRepositoryError::Archived);
+        }
+        if branch_row
+            .try_get::<Option<String>, _>("deletion_operation_id")
+            .map_err(|source| WorkRepositoryError::corrupt("Work recovery basis", source))?
+            .is_some()
+        {
+            return Err(WorkRepositoryError::BranchDeleting);
+        }
+
+        let basis = load_recovery_basis_in_transaction(
+            &mut transaction,
+            &request.owner_id,
+            &request.work_id,
+            &request.branch_id,
+        )
+        .await?;
+        if u64::try_from(basis.work_revision.get()).ok() != Some(request.expected_work_revision)
+            || u64::try_from(basis.branch_revision.get()).ok()
+                != Some(request.expected_branch_revision)
+        {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::BasisChanged,
+            });
+        }
+        if basis.branch_goal_revision != basis.goal_revision
+            || basis.branch_criteria_set_revision != basis.criteria_set_revision
+        {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::BranchBasisChanged,
+            });
+        }
+        if branch_session_id.is_empty() {
+            return Err(WorkRepositoryError::corrupt(
+                "Work recovery basis",
+                std::io::Error::other("branch has no Session identity"),
+            ));
+        }
+
+        // The Session/slot lock above prevents a new Run from racing this
+        // capture. Inspect the slot owner while that fence is held.
+        let active_run = query(
+            "SELECT r.run_id, r.status, r.waiting_for, r.parent_run_id,
+                    r.work_id, r.work_branch_id
+             FROM agent_session_execution_slots slot
+             LEFT JOIN agent_runs r
+               ON r.user_id = slot.user_id AND r.run_id = slot.run_id
+             WHERE slot.user_id = ? AND slot.session_id = ?
+             LIMIT 1
+             FOR UPDATE",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(&branch_session_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| WorkRepositoryError::persistence("check active Work Run", source))?;
+        if let Some(run) = active_run {
+            let run_id = run
+                .try_get::<Option<String>, _>("run_id")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?
+                .ok_or(WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason: super::repository::WorkRecoveryPointBlocker::DanglingRunSlot,
+                })?;
+            let status = run
+                .try_get::<Option<String>, _>("status")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?
+                .ok_or(WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason: super::repository::WorkRecoveryPointBlocker::RunStatusMissing,
+                })?;
+            let waiting_for = run
+                .try_get::<Option<String>, _>("waiting_for")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
+            let work_id = run
+                .try_get::<Option<String>, _>("work_id")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
+            let work_branch_id = run
+                .try_get::<Option<String>, _>("work_branch_id")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
+            let parent_run_id = run
+                .try_get::<Option<String>, _>("parent_run_id")
+                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
+            if parent_run_id.is_some()
+                || work_id.as_deref() != Some(request.work_id.as_str())
+                || work_branch_id.as_deref() != Some(request.branch_id.as_str())
+            {
+                return Err(WorkRepositoryError::corrupt(
+                    "Work recovery Run",
+                    std::io::Error::other("execution slot owner is not this Work root Run"),
+                ));
+            }
+            if durable_run_status_blocks_session(&status, waiting_for.as_deref()) {
+                return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason: super::repository::WorkRecoveryPointBlocker::ActiveRun,
+                });
+            }
+            tracing::debug!(
+                run_id,
+                "ignoring non-blocking terminal Run during recovery capture"
+            );
+        }
+
+        let key = SessionKeyV1::owner_session(
+            "server",
+            request.owner_id.as_str(),
+            &branch_session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let context = lock_recovery_context_in_transaction(&mut transaction, &key)
+            .await
+            .map_err(map_context_verification_error)?;
+        if context.has_active_reservation {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
+            });
+        }
+        if context.has_unresolved_invocations {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
+            });
+        }
+        let execution = canonical_execution_binding(&key, context.execution_binding.as_ref())?;
+        if execution.binding_state != RecoveryPointBindingStateV1::Ready {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanging,
+            });
+        }
+        let created_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let manifest = RecoveryPointManifestV1 {
+            schema_version: astra_turn_types::RECOVERY_POINT_MANIFEST_SCHEMA_VERSION,
+            recovery_point_id: recovery_point_id.clone(),
+            owner_id: request.owner_id.as_str().to_owned(),
+            work_id: request.work_id.as_str().to_owned(),
+            branch_id: request.branch_id.as_str().to_owned(),
+            work_revision: request.expected_work_revision,
+            branch_revision: request.expected_branch_revision,
+            graph_revision: u64::try_from(basis.graph_revision.get()).map_err(|_| {
+                WorkRepositoryError::corrupt(
+                    "Work recovery basis",
+                    std::io::Error::other("graph revision exceeds recovery manifest width"),
+                )
+            })?,
+            goal_revision: u64::try_from(basis.goal_revision.get()).map_err(|_| {
+                WorkRepositoryError::corrupt(
+                    "Work recovery basis",
+                    std::io::Error::other("goal revision exceeds recovery manifest width"),
+                )
+            })?,
+            criteria_set_revision: u64::try_from(basis.criteria_set_revision.get()).map_err(
+                |_| {
+                    WorkRepositoryError::corrupt(
+                        "Work recovery basis",
+                        std::io::Error::other("criteria revision exceeds recovery manifest width"),
+                    )
+                },
+            )?,
+            session_key: key,
+            session_cursor: context.head.cursor.clone(),
+            context_head: context.head,
+            run: None,
+            execution,
+            workspace: None,
+            artifacts: Vec::new(),
+            environment: Default::default(),
+            reason: request.reason,
+            created_at,
+        };
+        manifest
+            .validate()
+            .map_err(|source| WorkRepositoryError::corrupt("Work recovery manifest", source))?;
+        let manifest_hash = manifest_hash(&manifest)?;
+        query(
+            "INSERT INTO work_recovery_points
+             (owner_id, work_id, branch_id, recovery_point_id, request_id,
+              request_hash, status, manifest_json, manifest_hash, failure_reason,
+              created_at, updated_at, ready_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'captured', ?, ?, NULL, NOW(6), NOW(6), NULL)",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(request.branch_id.as_str())
+        .bind(&recovery_point_id)
+        .bind(request.request_id.as_str())
+        .bind(request_hash.as_str())
+        .bind(serde_json::to_string(&manifest).map_err(|source| {
+            WorkRepositoryError::ManifestEncoding {
+                entity: "Work recovery point manifest",
+                source,
+            }
+        })?)
+        .bind(manifest_hash.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::insert(
+                "capture canonical Work recovery point",
+                WorkConflictResource::RecoveryPointIdentity,
+                source,
+            )
+        })?;
+        // Advance the shared Work clock in the same transaction. Web and TUI
+        // observers use that clock to invalidate their bounded projections;
+        // without this event a newly saved point could remain invisible until
+        // an unrelated Work mutation arrives.
+        super::events_repository::append_event_with_payload_hash(
+            &mut transaction,
+            &NewWorkEvent {
+                owner_id: request.owner_id.clone(),
+                work_id: request.work_id.clone(),
+                branch_id: Some(request.branch_id.clone()),
+                kind: WorkEventKind::RecoveryPointCaptured,
+                work_revision: Some(basis.work_revision),
+                goal_revision: Some(basis.goal_revision),
+                criterion_set_revision: Some(basis.criteria_set_revision),
+                branch_revision: Some(basis.branch_revision),
+                graph_revision: Some(basis.graph_revision),
+                source_ref: request.request_id.clone(),
+            },
+            Some(&manifest_hash),
+        )
+        .await?;
+        let row = query(&format!(
+            "{RECOVERY_POINT_SELECT_SQL}
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+               AND recovery_point_id = ?
+             LIMIT 1"
+        ))
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(request.branch_id.as_str())
+        .bind(&recovery_point_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::persistence("load captured canonical recovery point", source)
+        })?;
+        let record = decode_record(row)?;
+        transaction.commit().await.map_err(|source| {
+            WorkRepositoryError::persistence("commit canonical Work recovery point", source)
+        })?;
+        Ok(record)
     }
 
     /// Record a declared capture idempotently.  The Work and branch identity
@@ -400,12 +820,12 @@ impl DatabaseWorkRecoveryPointRepository {
                 .await?;
         if !revisions_match_manifest(&basis, manifest) {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the Work or branch revisions changed since capture began",
+                reason: super::repository::WorkRecoveryPointBlocker::BasisChanged,
             });
         }
         if manifest.run.is_some() {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "Run frontier verification is not available yet",
+                reason: super::repository::WorkRecoveryPointBlocker::RunFrontierUnavailable,
             });
         }
 
@@ -414,24 +834,24 @@ impl DatabaseWorkRecoveryPointRepository {
             .map_err(map_context_verification_error)?;
         if context.head != manifest.context_head || context.head.cursor != manifest.session_cursor {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the Session context head changed since capture began",
+                reason: super::repository::WorkRecoveryPointBlocker::ContextChanged,
             });
         }
         if context.has_active_reservation {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the Session still has an active turn reservation",
+                reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
             });
         }
         if context.has_unresolved_invocations {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the Session has an unresolved tool invocation",
+                reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
             });
         }
         let current_execution =
             canonical_execution_binding(&manifest.session_key, context.execution_binding.as_ref())?;
         if current_execution != manifest.execution {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the Session execution binding changed since capture began",
+                reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanged,
             });
         }
 
@@ -502,6 +922,13 @@ impl DatabaseWorkRecoveryPointRepository {
         &self,
         query_value: WorkRecoveryPointQuery,
     ) -> Result<Vec<WorkRecoveryPointRecord>, WorkRepositoryError> {
+        Ok(self.list_page(query_value).await?.records)
+    }
+
+    pub async fn list_page(
+        &self,
+        query_value: WorkRecoveryPointQuery,
+    ) -> Result<WorkRecoveryPointPage, WorkRepositoryError> {
         if query_value.limit == 0 || query_value.limit > RECOVERY_POINT_PAGE_MAX_ITEMS {
             return Err(WorkRepositoryError::corrupt(
                 "Work recovery point query",
@@ -511,6 +938,7 @@ impl DatabaseWorkRecoveryPointRepository {
             ));
         }
         let mut builder = QueryBuilder::<MySql>::new(RECOVERY_POINT_SELECT_SQL);
+        let fetch_limit = i64::from(query_value.limit) + 1;
         builder
             .push(" WHERE owner_id = ")
             .push_bind(query_value.owner_id.as_str())
@@ -521,17 +949,48 @@ impl DatabaseWorkRecoveryPointRepository {
                 .push(" AND branch_id = ")
                 .push_bind(branch_id.as_str());
         }
+        if let Some(cursor) = query_value.before.as_ref() {
+            let cursor_time = cursor.created_at.naive_utc();
+            builder
+                .push(" AND (created_at < ")
+                .push_bind(cursor_time)
+                .push(" OR (created_at = ")
+                .push_bind(cursor_time)
+                .push(" AND recovery_point_id < ")
+                .push_bind(cursor.recovery_point_id.as_str())
+                .push("))");
+        }
         builder
             .push(" ORDER BY created_at DESC, recovery_point_id DESC LIMIT ")
-            .push_bind(i64::from(query_value.limit));
-        let rows = builder
+            .push_bind(fetch_limit);
+        let mut rows = builder
             .build()
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| {
                 WorkRepositoryError::persistence("list Work recovery points", source)
             })?;
-        rows.into_iter().map(decode_record).collect()
+        let has_more = rows.len() > usize::from(query_value.limit);
+        if has_more {
+            rows.pop();
+        }
+        let records = rows
+            .into_iter()
+            .map(decode_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_more.then(|| {
+            let last = records
+                .last()
+                .expect("a recovery point page with more rows is non-empty");
+            WorkRecoveryPointCursor {
+                created_at: last.created_at,
+                recovery_point_id: last.recovery_point_id.clone(),
+            }
+        });
+        Ok(WorkRecoveryPointPage {
+            records,
+            next_cursor,
+        })
     }
 }
 
@@ -577,13 +1036,13 @@ fn canonical_execution_binding(
             RecoveryPointExecutorKindV1::Edge,
             current.executor.executor_id.clone().ok_or(
                 WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason: "the current Edge executor has no canonical identity",
+                    reason: super::repository::WorkRecoveryPointBlocker::EdgeIdentityMissing,
                 },
             )?,
         ),
         _ => {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: "the current executor kind is not recoverable",
+                reason: super::repository::WorkRecoveryPointBlocker::UnsupportedExecutor,
             });
         }
     };
@@ -609,7 +1068,7 @@ fn map_context_verification_error(error: SessionContextCoordinatorError) -> Work
             WorkRepositoryError::ManifestEncoding { entity, source }
         }
         _ => WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: "the canonical Session context is missing or requires repair",
+            reason: super::repository::WorkRecoveryPointBlocker::ContextUnavailable,
         },
     }
 }
@@ -622,6 +1081,82 @@ struct RequestHashInput<'a> {
     branch_id: &'a WorkBranchId,
     request_id: &'a WorkChangeRef,
     manifest_hash: &'a WorkContentHash,
+}
+
+#[derive(Serialize)]
+struct CanonicalCaptureRequestHashInput<'a> {
+    schema_version: u16,
+    owner_id: &'a WorkOwnerId,
+    work_id: &'a WorkId,
+    branch_id: &'a WorkBranchId,
+    request_id: &'a WorkChangeRef,
+    expected_work_revision: u64,
+    expected_branch_revision: u64,
+    reason: RecoveryPointReasonV1,
+}
+
+fn validate_capture_request(
+    request: &WorkRecoveryPointCaptureRequest,
+) -> Result<(), WorkRepositoryError> {
+    if request.expected_work_revision == 0 || request.expected_branch_revision == 0 {
+        return Err(WorkRepositoryError::corrupt(
+            "Work recovery capture request",
+            std::io::Error::other("expected revisions must be positive"),
+        ));
+    }
+    if request.request_id.as_str().is_empty()
+        || request
+            .request_id
+            .as_str()
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(WorkRepositoryError::corrupt(
+            "Work recovery capture request",
+            std::io::Error::other("request_id is not a safe identity"),
+        ));
+    }
+    Ok(())
+}
+
+fn capture_request_hash(
+    request: &WorkRecoveryPointCaptureRequest,
+) -> Result<WorkContentHash, WorkRepositoryError> {
+    let payload = serde_json::to_vec(&CanonicalCaptureRequestHashInput {
+        schema_version: REQUEST_HASH_SCHEMA_VERSION,
+        owner_id: &request.owner_id,
+        work_id: &request.work_id,
+        branch_id: &request.branch_id,
+        request_id: &request.request_id,
+        expected_work_revision: request.expected_work_revision,
+        expected_branch_revision: request.expected_branch_revision,
+        reason: request.reason,
+    })
+    .map_err(|source| WorkRepositoryError::ManifestEncoding {
+        entity: "Work recovery capture request",
+        source,
+    })?;
+    WorkContentHash::parse(format!("sha256:{:x}", Sha256::digest(payload))).map_err(|source| {
+        WorkRepositoryError::corrupt(
+            "Work recovery capture request hash",
+            std::io::Error::other(source),
+        )
+    })
+}
+
+fn capture_recovery_point_id(
+    request_hash: &WorkContentHash,
+) -> Result<String, WorkRepositoryError> {
+    let digest = request_hash
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            WorkRepositoryError::corrupt(
+                "Work recovery capture request hash",
+                std::io::Error::other("missing sha256 prefix"),
+            )
+        })?;
+    Ok(format!("rp-{digest}"))
 }
 
 fn validate_request(request: &NewWorkRecoveryPoint) -> Result<(), WorkRepositoryError> {

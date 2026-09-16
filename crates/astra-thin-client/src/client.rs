@@ -6,7 +6,9 @@ use std::time::Duration;
 use astra_server_types::{
     WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchActivityResponseV1, WorkBranchAttachRequestV1,
     WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkExecutionTargetPageV1,
-    WorkExecutionViewV1, WorkSessionBindingResponseV1, WorkTurnRequestV1,
+    WorkExecutionViewV1, WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCursorV1,
+    WorkRecoveryPointPageV1, WorkRecoveryPointViewV1, WorkSessionBindingResponseV1,
+    WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
     SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
@@ -1093,6 +1095,109 @@ impl ThinClient {
             ));
         }
         Ok(targets)
+    }
+
+    /// Record the current stable Work/Session boundary. The server derives
+    /// the manifest from canonical state and returns an explicit capability
+    /// projection; callers must not treat this as a portable workspace.
+    pub async fn post_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkRecoveryPointCaptureRequestV1,
+    ) -> Result<WorkRecoveryPointViewV1, ThinClientError> {
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        let point: WorkRecoveryPointViewV1 = Self::typed_json_or_error(response).await?;
+        validate_recovery_point_identity(&point, work_id, branch_id, None)?;
+        Ok(point)
+    }
+
+    /// List immutable progress boundaries with a stable keyset cursor.
+    pub async fn get_work_branch_recovery_points(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        cursor: Option<&WorkRecoveryPointCursorV1>,
+        limit: u16,
+    ) -> Result<WorkRecoveryPointPageV1, ThinClientError> {
+        if limit == 0 || limit > 256 {
+            return Err(ThinClientError::InvalidInput(
+                "recovery point limit must be between 1 and 256".into(),
+            ));
+        }
+        if let Some(cursor) = cursor {
+            if cursor.recovery_point_id.is_empty()
+                || cursor.recovery_point_id == "."
+                || cursor.recovery_point_id == ".."
+                || !cursor.recovery_point_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+                })
+                || cursor.created_at.is_empty()
+            {
+                return Err(ThinClientError::InvalidInput(
+                    "invalid recovery point cursor".into(),
+                ));
+            }
+        }
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(cursor) = cursor {
+            query.push(("before_created_at", cursor.created_at.clone()));
+            query.push(("before_recovery_point_id", cursor.recovery_point_id.clone()));
+        }
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .query(&query)
+            .send()
+            .await?;
+        let page: WorkRecoveryPointPageV1 = Self::typed_json_or_error(response).await?;
+        if page.schema_version != 1 || page.work_id != work_id || page.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "recovery point page identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        for point in &page.points {
+            validate_recovery_point_identity(point, work_id, branch_id, None)?;
+        }
+        Ok(page)
+    }
+
+    /// Read one immutable progress boundary without changing Work authority.
+    pub async fn get_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        recovery_point_id: &str,
+    ) -> Result<WorkRecoveryPointViewV1, ThinClientError> {
+        let path = paths::work_branch_recovery_point(work_id, branch_id, recovery_point_id)
+            .ok_or_else(|| {
+                ThinClientError::InvalidInput("invalid recovery point identity".into())
+            })?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        let point: WorkRecoveryPointViewV1 = Self::typed_json_or_error(response).await?;
+        validate_recovery_point_identity(&point, work_id, branch_id, Some(recovery_point_id))?;
+        Ok(point)
     }
 
     /// Resolve one already-known session to the public Work branch that owns
@@ -2191,6 +2296,26 @@ impl ThinClient {
     }
 }
 
+fn validate_recovery_point_identity(
+    point: &WorkRecoveryPointViewV1,
+    work_id: &str,
+    branch_id: &str,
+    recovery_point_id: Option<&str>,
+) -> Result<(), ThinClientError> {
+    if point.schema_version != 1
+        || point.work_id != work_id
+        || point.branch_id != branch_id
+        || recovery_point_id.is_some_and(|expected| point.recovery_point_id != expected)
+    {
+        return Err(ThinClientError::Json(
+            <serde_json::Error as serde::de::Error>::custom(
+                "recovery point identity disagrees with the requested resource",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn attachment_filename(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
     let filename = value
@@ -2590,6 +2715,123 @@ mod tests {
             .await
             .expect_err("a response for another Work must never be projected");
         assert!(matches!(error, ThinClientError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn work_recovery_points_are_typed_keyset_reads_and_identity_checked() {
+        let srv = MockServer::start().await;
+        let point = serde_json::json!({
+            "schema_version": 1,
+            "work_id": "work-1",
+            "branch_id": "branch-1",
+            "recovery_point_id": "rp-1",
+            "request_id": "save-1",
+            "status": "captured",
+            "reason": "user_requested",
+            "created_at": "2026-09-16T00:00:00Z",
+            "updated_at": "2026-09-16T00:00:00Z",
+            "manifest_hash": format!("sha256:{}", "a".repeat(64)),
+            "work_revision": 1,
+            "branch_revision": 1,
+            "graph_revision": 1,
+            "goal_revision": 1,
+            "criteria_set_revision": 1,
+            "session_cursor": {
+                "completed_turn": 1,
+                "journal_event_seq": 2,
+                "conversation_seq": 1,
+                "canonical_root_hash": "b".repeat(64),
+                "compaction_generation": 0
+            },
+            "execution": {
+                "placement": "server",
+                "executor_id": "server",
+                "binding_generation": 1
+            },
+            "coverage": {
+                "session_state": true,
+                "work_state": true,
+                "workspace": false,
+                "run_frontier": false,
+                "artifacts": false
+            },
+            "capabilities": {
+                "can_restore_conversation": false,
+                "can_continue_in_original_environment": false,
+                "has_portable_workspace": false,
+                "requires_target_environment_check": false,
+                "requires_effect_review": false
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/recovery-points"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({
+                "request_id": "save-1",
+                "expected_work_revision": 1,
+                "expected_branch_revision": 1,
+                "reason": "user_requested"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(point.clone()))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/recovery-points"))
+            .and(query_param("limit", "1"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "points": [point.clone()],
+                "next_cursor": null
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/recovery-points/rp-1",
+            ))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(point.clone()))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let captured = client
+            .post_work_branch_recovery_point(
+                "work-token",
+                "work-1",
+                "branch-1",
+                &WorkRecoveryPointCaptureRequestV1 {
+                    request_id: "save-1".into(),
+                    expected_work_revision: 1,
+                    expected_branch_revision: 1,
+                    reason: astra_server_types::WorkRecoveryPointReasonV1::UserRequested,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.recovery_point_id, "rp-1");
+        let page = client
+            .get_work_branch_recovery_points("work-token", "work-1", "branch-1", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.points.len(), 1);
+        let loaded = client
+            .get_work_branch_recovery_point("work-token", "work-1", "branch-1", "rp-1")
+            .await
+            .unwrap();
+        assert_eq!(loaded.manifest_hash, format!("sha256:{}", "a".repeat(64)));
+
+        let unsafe_error = client
+            .get_work_branch_recovery_point("work-token", "work-1", "branch-1", "../other")
+            .await
+            .expect_err("path fragments must fail before transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
     }
 
     #[tokio::test]
