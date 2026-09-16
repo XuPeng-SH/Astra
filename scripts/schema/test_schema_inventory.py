@@ -126,6 +126,7 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_events",
             "work_runtime_event_outbox",
             "work_runtime_event_outbox_slots",
+            "work_recovery_points",
         }
         actual = {
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
@@ -151,6 +152,7 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
         self.assertIn("canonical history", self.tables["work_events"]["state_class"])
         self.assertIn("runtime event projection", self.tables["work_runtime_event_outbox"]["merge_guidance"])
+        self.assertIn("canonical verification", self.tables["work_recovery_points"]["merge_guidance"])
         self.assertIn("terminal", self.tables["work_terminal_cuts"]["state_class"])
 
     def test_work_retention_and_runtime_coverage_metadata_is_explicit(self) -> None:
