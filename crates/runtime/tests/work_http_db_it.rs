@@ -408,10 +408,6 @@ async fn post_work_patch_export(
     branch_id: &str,
     payload: Value,
 ) -> (StatusCode, Value) {
-    let mut payload = serde_json::json!({"request_id": request_id});
-    if let Some(client_id) = client_id {
-        payload["client_id"] = Value::from(client_id);
-    }
     let request = Request::builder()
         .method("POST")
         .uri(format!(
@@ -827,6 +823,10 @@ async fn attach_work_branch_with_client(
     request_id: &str,
     client_id: Option<&str>,
 ) -> (StatusCode, Value) {
+    let mut payload = serde_json::json!({"request_id": request_id});
+    if let Some(client_id) = client_id {
+        payload["client_id"] = Value::from(client_id);
+    }
     let request = Request::builder()
         .method("POST")
         .uri(format!(
@@ -2606,7 +2606,7 @@ async fn work_branch_web_clients_keep_independent_observers_and_control() {
     assert_eq!(refreshed_b["mode"], "read_only");
 
     let (turn_status, _events, raw) = post_work_turn(
-        app,
+        app.clone(),
         &owner_id,
         work_id,
         branch_id,
