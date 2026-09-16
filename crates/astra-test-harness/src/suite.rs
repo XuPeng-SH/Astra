@@ -1,7 +1,7 @@
 //! Suite orchestration with parallel execution, circuit breaker,
 //! failure classification, and retry on rate-limit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use crate::criteria::{
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
-use crate::model_profiles::{ModelReuseSupport, load_profiles};
+use crate::model_profiles::{ModelPromptCacheProfile, ModelReuseSupport, load_profiles};
 use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
@@ -251,6 +251,20 @@ pub struct SuiteRunner<'a> {
 }
 
 impl<'a> SuiteRunner<'a> {
+    /// Resolve model capability metadata once at suite admission.
+    ///
+    /// Isolated jobs run from detached Git worktrees. Those worktrees contain
+    /// tracked source only, while `.models.yaml` is intentionally ignored so
+    /// provider/configuration metadata never becomes part of an evaluated
+    /// checkout. Keep the capability snapshot in the runner instead of
+    /// looking it up from each job's execution directory.
+    fn model_profiles_for_run(&self) -> HashMap<String, ModelPromptCacheProfile> {
+        match &self.runner_cfg.workspace_source {
+            Some(source) => load_profiles(Some(source.repository_root())),
+            None => load_profiles(self.runner_cfg.working_dir.as_deref()),
+        }
+    }
+
     fn prepare_job_workspace(&self) -> Result<(RunnerConfig, Option<IsolatedWorkspace>), String> {
         let mut cfg = self.runner_cfg.clone();
         if cfg.working_dir.is_some() && cfg.workspace_source.is_some() {
@@ -273,6 +287,7 @@ impl<'a> SuiteRunner<'a> {
         let wall_start = std::time::Instant::now();
         let started_at = chrono::Utc::now().to_rfc3339();
         let run_id = self.run_id.clone();
+        let model_profiles = Arc::new(self.model_profiles_for_run());
 
         // Build the work items: (case, model, run_index) triples.
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
@@ -403,7 +418,13 @@ impl<'a> SuiteRunner<'a> {
                     }
                 };
                 let mut report = self
-                    .run_one_with_progress(case, model, &run_id, *run_index, &job_cfg)
+                    .run_one_with_progress(
+                        case,
+                        model,
+                        *run_index,
+                        &job_cfg,
+                        model_profiles.as_ref(),
+                    )
                     .await;
                 report.run_index = *run_index;
                 self.update_circuit_breaker(
@@ -448,6 +469,7 @@ impl<'a> SuiteRunner<'a> {
                     let dashboard_tx = self.dashboard_tx.clone();
                     let run_id = self.run_id.clone();
                     let cancel_flag = self.cancel_flag.clone();
+                    let model_profiles = model_profiles.clone();
                     async move {
                         if cancel_flag
                             .as_ref()
@@ -560,7 +582,13 @@ impl<'a> SuiteRunner<'a> {
                             }
                         };
                         let mut report = self
-                            .run_one_with_progress(case, &model, &run_id, run_index, &job_cfg)
+                            .run_one_with_progress(
+                                case,
+                                &model,
+                                run_index,
+                                &job_cfg,
+                                model_profiles.as_ref(),
+                            )
                             .await;
                         report.run_index = run_index;
                         self.update_circuit_breaker(
@@ -676,8 +704,14 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
-    async fn run_one(&self, case: &Case, model: &str, cfg: &RunnerConfig) -> CaseRunReport {
-        if let Some(report) = self.skip_for_unsupported_cache_scope(cfg, case, model) {
+    async fn run_one(
+        &self,
+        case: &Case,
+        model: &str,
+        cfg: &RunnerConfig,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
+    ) -> CaseRunReport {
+        if let Some(report) = self.skip_for_unsupported_cache_scope(model_profiles, case, model) {
             eprintln!(
                 "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
                 case.name, model
@@ -1326,12 +1360,12 @@ impl<'a> SuiteRunner<'a> {
         &self,
         case: &Case,
         model: &str,
-        run_id: &str,
         run_index: u32,
         cfg: &RunnerConfig,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
     ) -> CaseRunReport {
         let started = Instant::now();
-        let mut execution = Box::pin(self.run_one(case, model, cfg));
+        let mut execution = Box::pin(self.run_one(case, model, cfg, model_profiles));
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         // Consume interval's immediate first tick so the first heartbeat is
         // a real five-second observation rather than a duplicate start event.
@@ -1348,7 +1382,7 @@ impl<'a> SuiteRunner<'a> {
                     );
                     if let Some(ref tx) = self.dashboard_tx {
                         let _ = tx.send(crate::dashboard::DashboardEvent::CaseProgress {
-                            run_id: run_id.to_string(),
+                            run_id: self.run_id.clone(),
                             case_name: case.name.clone(),
                             model: model.to_string(),
                             run_index,
@@ -1549,6 +1583,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1605,13 +1640,12 @@ impl<'a> SuiteRunner<'a> {
 
     fn skip_for_unsupported_cache_scope(
         &self,
-        cfg: &RunnerConfig,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
         case: &Case,
         model: &str,
     ) -> Option<CaseRunReport> {
         let required = case.required_cache_scope?;
-        let profiles = load_profiles(cfg.working_dir.as_deref());
-        let reuse_support = profiles
+        let reuse_support = model_profiles
             .get(model)
             .map(|profile| profile.reuse_support)
             .unwrap_or(ModelReuseSupport::Unknown);
@@ -2848,6 +2882,92 @@ mod tests {
         assert_eq!(
             report.runs[0].failure_class,
             Some(crate::classify::FailureClass::InfraVerificationUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_jobs_keep_model_metadata_from_the_admitted_source_root() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("git should be installed");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "harness@example.invalid"]);
+        git(&["config", "user.name", "Astra Harness"]);
+        std::fs::write(repo.path().join("README.md"), "fixture\n").expect("fixture");
+        std::fs::write(repo.path().join(".gitignore"), ".models.yaml\n")
+            .expect("ignore local model metadata");
+        git(&["add", "README.md", ".gitignore"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        // Model capability metadata is intentionally ignored by Git. It must
+        // still be resolved from the source root before jobs move into
+        // detached worktrees, where this file is absent.
+        std::fs::write(
+            repo.path().join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  provider: openai
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+"#,
+        )
+        .expect("write ignored model metadata");
+        let source = crate::workspace::SourceSnapshot::capture(repo.path())
+            .expect("capture source snapshot");
+
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["kimi-k2.6".into()]);
+        cfg.workspace_source = Some(source);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let mut case = case_with("isolated-cache-prefix", vec![]);
+        case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
+        let report = runner.run_all(&[case]).await;
+
+        assert_eq!(report.unavailable(), 1);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
+        assert!(
+            report.runs[0]
+                .outcome
+                .text
+                .contains("reuse_scope=IntraTurnRounds"),
+            "source-root metadata should classify the isolated job as unavailable: {:#?}",
+            report.runs[0]
+        );
+        assert!(
+            exec.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "unsupported isolated cases must not execute"
         );
     }
 
