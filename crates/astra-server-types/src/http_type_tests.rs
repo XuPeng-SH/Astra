@@ -1388,6 +1388,25 @@ fn work_create_request_is_a_strict_typed_command() {
 }
 
 #[test]
+fn work_attachment_request_can_bind_a_stable_web_client_instance() {
+    let request: WorkBranchAttachRequestV1 = serde_json::from_value(json!({
+        "request_id": "web-open:browser-a:work-1:main",
+        "client_id": "browser-a"
+    }))
+    .expect("typed Work attachment request");
+    assert_eq!(request.request_id, "web-open:browser-a:work-1:main");
+    assert_eq!(request.client_id.as_deref(), Some("browser-a"));
+    assert!(
+        serde_json::from_value::<WorkBranchAttachRequestV1>(json!({
+            "request_id": "web-open:browser-a:work-1:main",
+            "client_id": "browser-a",
+            "session_id": "client-controlled-session"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn work_turn_request_cannot_smuggle_runtime_or_session_authority() {
     let request: WorkTurnRequestV1 = serde_json::from_value(json!({
         "request_id": "continue-1",

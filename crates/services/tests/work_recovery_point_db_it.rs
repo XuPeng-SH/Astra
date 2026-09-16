@@ -11,6 +11,7 @@ use astra_turn_types::{
     RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1, RecoveryPointManifestV1,
     RecoveryPointReasonV1, SessionContextHeadV1, SessionCursorV1, SessionKeyV1,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 fn id(prefix: &str) -> String {
@@ -274,6 +275,81 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             .expect("load unauthorized recovery point")
             .is_none()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() {
+    let pool = common::setup_pool().await;
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    let owner_id = id("owner");
+    let work_id = id("work");
+    let branch_id = id("branch");
+    let session_id = id("session");
+    cleanup_owner(&pool, &owner_id).await;
+
+    repository
+        .create_genesis(common::work_genesis(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &session_id,
+            &id("intent"),
+            "Reject a recovery boundary when its criterion member disappeared.",
+        ))
+        .await
+        .expect("create Work");
+
+    let owner = WorkOwnerId::parse(&owner_id).expect("owner");
+    let work = WorkId::parse(&work_id).expect("work");
+    let branch = WorkBranchId::parse(&branch_id).expect("branch");
+    let request = NewWorkRecoveryPoint {
+        owner_id: owner.clone(),
+        work_id: work.clone(),
+        branch_id: branch.clone(),
+        request_id: WorkChangeRef::parse(id("request")).expect("request"),
+        manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+    };
+    let record = repository
+        .recovery_points()
+        .record_preparing(request)
+        .await
+        .expect("record recovery capture");
+
+    // Keep the set envelope internally self-consistent, but point it at a
+    // revision that is absent. Capture must validate the complete immutable
+    // member set in the same transaction; checking only revision/count/hash
+    // would incorrectly publish this boundary as usable.
+    let manifest_json =
+        r#"{"schema_version":1,"members":[{"criterion_id":"missing-criterion","revision":1}]}"#;
+    let manifest_hash = format!("sha256:{:x}", Sha256::digest(manifest_json.as_bytes()));
+    sqlx::query(
+        "UPDATE work_criterion_sets
+         SET member_manifest_json = ?, member_manifest_hash = ?, member_count = 1
+         WHERE owner_id = ? AND work_id = ? AND revision = 1",
+    )
+    .bind(manifest_json)
+    .bind(manifest_hash)
+    .bind(&owner_id)
+    .bind(&work_id)
+    .execute(pool.get())
+    .await
+    .expect("corrupt criterion-set member manifest");
+
+    assert!(matches!(
+        repository
+            .recovery_points()
+            .mark_captured(&owner, &work, &branch, &record.recovery_point_id)
+            .await,
+        Err(WorkRepositoryError::Corrupt { entity, .. }) if entity == "criterion definition"
+    ));
+    let loaded = repository
+        .recovery_points()
+        .load(&owner, &work, &record.recovery_point_id)
+        .await
+        .expect("load rejected recovery point")
+        .expect("recovery point remains durable");
+    assert_eq!(loaded.status, WorkRecoveryPointStatus::Preparing);
 }
 
 #[tokio::test]

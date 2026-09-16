@@ -80,6 +80,11 @@ pub(crate) enum SlashBackgroundRead {
         profile: Option<String>,
         session_id: String,
     },
+    WorkCatalog {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
+    },
     ResumePicker,
     SessionHub {
         snapshot: Box<SessionHubSnapshot>,
@@ -108,6 +113,7 @@ pub(crate) enum SlashBackgroundRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkCommandRoute {
+    Catalog,
     Tasks,
     Execution,
     Start(String),
@@ -118,7 +124,8 @@ pub(crate) enum WorkCommandRoute {
 pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
     let (subcommand, remainder) = split_sub(args.trim());
     match subcommand {
-        "" | "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
+        "" | "list" if remainder.trim().is_empty() => WorkCommandRoute::Catalog,
+        "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
         "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
         "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
         "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
@@ -340,8 +347,16 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/mcp" => handle_mcp_dispatch(args, ctx),
 
         "/work" => match work_command_route(args) {
+            WorkCommandRoute::Catalog => {
+                ctx.show_response("Loading your Work…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkCatalog {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    cursor: None,
+                })
+            }
             WorkCommandRoute::Tasks => {
-                ctx.show_response("Opened Work tasks".to_string());
+                ctx.show_response("Opened tasks for this conversation".to_string());
                 SlashResult::OpenWorkTasks
             }
             WorkCommandRoute::Execution => {
@@ -392,7 +407,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }))
             }
             WorkCommandRoute::Unsupported => {
-                ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                ctx.show_error(
+                    "Usage: /work [list | status | execution | start <goal>]".to_string(),
+                );
                 SlashResult::Handled
             }
         },
@@ -1480,7 +1497,9 @@ pub(crate) fn handle_view_result(
         | ViewResult::Model { .. }
         | ViewResult::ModelThinking { .. }
         | ViewResult::Session { .. }
-        | ViewResult::WorkspaceTrust(_) => {}
+        | ViewResult::WorkspaceTrust(_)
+        | ViewResult::WorkCatalogNextPage { .. }
+        | ViewResult::WorkSelection { .. } => {}
     }
 }
 
@@ -3526,8 +3545,9 @@ mod routing_tests {
     }
 
     #[test]
-    fn work_route_has_one_explicit_read_only_execution_surface() {
-        assert_eq!(work_command_route(""), WorkCommandRoute::Tasks);
+    fn work_route_separates_catalog_from_current_session_tasks() {
+        assert_eq!(work_command_route(""), WorkCommandRoute::Catalog);
+        assert_eq!(work_command_route("list"), WorkCommandRoute::Catalog);
         assert_eq!(work_command_route("status"), WorkCommandRoute::Tasks);
         assert_eq!(
             work_command_route(" execution "),
@@ -3541,11 +3561,6 @@ mod routing_tests {
         assert_eq!(
             work_command_route("execution extra"),
             WorkCommandRoute::Unsupported
-        );
-        assert_eq!(
-            work_command_route("list"),
-            WorkCommandRoute::Unsupported,
-            "the old list alias adds no distinct TUI behavior"
         );
     }
 

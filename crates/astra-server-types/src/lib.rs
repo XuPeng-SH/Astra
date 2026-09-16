@@ -323,6 +323,11 @@ pub struct WorkCatalogResponseV1 {
 #[serde(deny_unknown_fields)]
 pub struct WorkBranchAttachRequestV1 {
     pub request_id: String,
+    /// Stable identity for one Web client instance. The Server uses this to
+    /// keep separate browsers as separate read attachments while allowing a
+    /// refresh from the same browser to renew its attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 #[cfg(feature = "server")]

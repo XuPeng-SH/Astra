@@ -30,7 +30,7 @@ use crate::protocol::{
     SessionUpdateRequest, StreamEvent, ToolResultRequest, UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
-use crate::work::WorkTaskGraphPageV2;
+use crate::work::{WorkCatalogCursorV1, WorkCatalogPageV1, WorkTaskGraphPageV2};
 
 const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -963,6 +963,49 @@ impl ThinClient {
             .send()
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// List the authenticated owner's Work catalog in stable creation order.
+    /// This is the discovery path used by a fresh TUI session: it never
+    /// resumes or attaches a Session, and choosing a row remains an explicit
+    /// user action.
+    pub async fn list_works(
+        &self,
+        token: &str,
+        cursor: Option<&WorkCatalogCursorV1>,
+        limit: u16,
+    ) -> Result<WorkCatalogPageV1, ThinClientError> {
+        if limit == 0 || limit > WorkCatalogPageV1::MAX_ENTRIES as u16 {
+            return Err(ThinClientError::InvalidInput(
+                "Work catalog limit must be between 1 and 50".into(),
+            ));
+        }
+        let mut url = self.url(paths::WORKS)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("limit", &limit.to_string());
+            if let Some(cursor) = cursor {
+                if cursor.work_id.is_empty()
+                    || cursor
+                        .work_id
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                {
+                    return Err(ThinClientError::InvalidInput(
+                        "invalid Work catalog cursor".into(),
+                    ));
+                }
+                query.append_pair("before_created_at", &cursor.created_at);
+                query.append_pair("before_work_id", &cursor.work_id);
+            }
+        }
+        let response = self.http.get(url).headers(Self::work_api_headers(token)?);
+        let response = response.send().await?;
+        let page: WorkCatalogPageV1 = Self::typed_json_or_error(response).await?;
+        page.validate().map_err(|error| {
+            ThinClientError::Json(<serde_json::Error as serde::de::Error>::custom(error))
+        })?;
+        Ok(page)
     }
 
     /// Read one bounded public Work observation.
@@ -2175,6 +2218,7 @@ fn attachment_filename(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::WorkCatalogAttentionV1;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2244,6 +2288,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_catalog_is_typed_and_keeps_cursor_pinned_to_page_tail() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works"))
+            .and(query_param("limit", "2"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "entries": [{
+                    "work_id": "work-2",
+                    "goal": "Ship the second boundary",
+                    "work_revision": 2,
+                    "delivery_branch_id": "branch-2",
+                    "delivery_branch_revision": 3,
+                    "graph_revision": 4,
+                    "graph_item_count": 2,
+                    "pending_decision_count": 0,
+                    "event_head": 5,
+                    "seen_through_event_seq": 4,
+                    "unseen_event_count": 1,
+                    "attention": "updated",
+                    "delivery_branch_activity": "working",
+                    "created_at": "2026-08-02T00:00:00Z",
+                    "last_activity_at": "2026-08-02T00:01:00Z"
+                },
+                {
+                    "work_id": "work-1",
+                    "goal": "Ship the first boundary",
+                    "work_revision": 1,
+                    "delivery_branch_id": "branch-1",
+                    "delivery_branch_revision": 1,
+                    "graph_revision": 1,
+                    "graph_item_count": 1,
+                    "pending_decision_count": 1,
+                    "event_head": 1,
+                    "seen_through_event_seq": 1,
+                    "unseen_event_count": 0,
+                    "attention": "needs_review",
+                    "delivery_branch_activity": "idle",
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "last_activity_at": "2026-08-01T00:02:00Z"
+                }],
+                "next_cursor": {
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "work_id": "work-1"
+                }
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let page = client.list_works("work-token", None, 2).await.unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].work_id, "work-2");
+        assert_eq!(
+            page.entries[1].attention,
+            WorkCatalogAttentionV1::NeedsReview
+        );
+        assert_eq!(page.next_cursor.as_ref().unwrap().work_id, "work-1");
+    }
+
+    #[tokio::test]
     async fn work_attachment_and_turn_keep_session_authority_server_side() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2282,6 +2389,7 @@ mod tests {
                 "branch-1",
                 &WorkBranchAttachRequestV1 {
                     request_id: "attach-1".into(),
+                    client_id: None,
                 },
             )
             .await

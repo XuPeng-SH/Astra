@@ -24,6 +24,7 @@ import type {
 import {
   Archive,
   ArchiveRestore,
+  ArrowRight,
   Check,
   ChevronDown,
   ChevronRight,
@@ -50,6 +51,7 @@ import {
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
   refreshWorkBranchActivityAction,
+  refreshWorkEventsAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -103,6 +105,8 @@ const ARCHIVE_DATE_FORMATTER = new Intl.DateTimeFormat("en", {
   timeZone: "UTC",
 });
 const ACTIVE_BRANCH_ACTIVITY_REFRESH_MS = 1_200;
+const ACTIVE_WORK_EVENTS_REFRESH_MS = 2_000;
+const IDLE_WORK_EVENTS_REFRESH_MS = 10_000;
 
 function deletionProgressLabel(
   phase: WorkBranchDeletionOperationV1["phase"],
@@ -169,6 +173,9 @@ export function WorkOverviewPage({
   const [branchActivityHealth, setBranchActivityHealth] = useState<"live" | "delayed">(
     initialActivity ? "live" : "delayed",
   );
+  const [workEventsHealth, setWorkEventsHealth] = useState<"live" | "delayed" | "refreshing">(
+    "live",
+  );
   const [expandedProposalId, setExpandedProposalId] = useState<string | null>(
     null,
   );
@@ -204,6 +211,10 @@ export function WorkOverviewPage({
     useState<WorkBranchDeletionOperationV1 | null>(null);
   const deletionPollAttempt = useRef(0);
   const comparisonGeneration = useRef(0);
+  const eventHeadRef = useRef(initial.report.overview.event_head);
+  const initialEventHeadRef = useRef(initial.report.overview.event_head);
+  const pendingProjectionHead = useRef<number | null>(null);
+  const eventRefreshGeneration = useRef(0);
   const router = useRouter();
   const toast = useToast();
 
@@ -214,6 +225,44 @@ export function WorkOverviewPage({
     setBranchActivity(initialActivity ?? null);
     setBranchActivityHealth(initialActivity ? "live" : "delayed");
   }, [initialActivity, workId, selectedBranchId]);
+
+  useEffect(() => {
+    const incomingHead = initial.report.overview.event_head;
+    if (incomingHead >= eventHeadRef.current) {
+      eventHeadRef.current = incomingHead;
+    }
+    const pendingHead = pendingProjectionHead.current;
+    if (pendingHead !== null) {
+      if (incomingHead >= pendingHead) {
+        pendingProjectionHead.current = null;
+        setWorkEventsHealth("live");
+      } else {
+        setWorkEventsHealth("refreshing");
+      }
+    } else {
+      setWorkEventsHealth("live");
+    }
+  }, [initial.report.overview.event_head]);
+
+  useEffect(() => {
+    initialEventHeadRef.current = initial.report.overview.event_head;
+  }, [initial.report.overview.event_head]);
+
+  useEffect(() => {
+    // A route change can reuse this client component. Never carry the prior
+    // Work's cursor into the new identity; the next bounded read establishes
+    // the new Work's current head.
+    // The API accepts a cursor only after the first committed event. Start
+    // from the server snapshot for this Work/branch so the first poll is a
+    // valid bounded read and can discover the next event across surfaces.
+    eventHeadRef.current = initialEventHeadRef.current;
+    pendingProjectionHead.current = null;
+    setWorkEventsHealth("live");
+    eventRefreshGeneration.current += 1;
+    return () => {
+      eventRefreshGeneration.current += 1;
+    };
+  }, [selectedBranchId, workId]);
 
   const refreshBranchActivity = useCallback(async () => {
     try {
@@ -270,6 +319,52 @@ export function WorkOverviewPage({
       : null;
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
+
+  const refreshWorkEvents = useCallback(async () => {
+    const generation = eventRefreshGeneration.current;
+    const afterEventSeq = eventHeadRef.current;
+    try {
+      const result = await refreshWorkEventsAction({ workId, afterEventSeq });
+      if (generation !== eventRefreshGeneration.current) return true;
+      if (!result.ok || result.page.work_id !== workId) {
+        setWorkEventsHealth("delayed");
+        return false;
+      }
+      if (result.page.event_head > eventHeadRef.current) {
+        eventHeadRef.current = result.page.event_head;
+        pendingProjectionHead.current = result.page.event_head;
+        setWorkEventsHealth("refreshing");
+        // The server-rendered bounded snapshot is the single projection
+        // authority. Refresh it once the shared Work clock advances instead
+        // of trying to merge partial JSON in the browser.
+        router.refresh();
+      } else if (pendingProjectionHead.current !== null) {
+        // `router.refresh()` has no completion signal. Keep retrying the
+        // bounded server projection while its applied event head is behind
+        // the observed Work clock, otherwise one transient RSC failure could
+        // leave the page stale forever.
+        setWorkEventsHealth("refreshing");
+        router.refresh();
+      } else if (pendingProjectionHead.current === null) {
+        setWorkEventsHealth("live");
+      }
+      return true;
+    } catch {
+      if (generation === eventRefreshGeneration.current) {
+        setWorkEventsHealth("delayed");
+      }
+      return false;
+    }
+  }, [router, workId]);
+
+  useVisiblePoll({
+    enabled: true,
+    intervalMs: activityNeedsGraphRefresh
+      ? ACTIVE_WORK_EVENTS_REFRESH_MS
+      : IDLE_WORK_EVENTS_REFRESH_MS,
+    maximumIntervalMs: 30_000,
+    refresh: refreshWorkEvents,
+  });
   const branchLabel = workBranchLabel(branchCatalog, selectedBranch);
   const isDeliveryBranch = selectedBranch.is_delivery;
   const deliveryBranch = branchCatalog.branches.find((branch) => branch.is_delivery)!;
@@ -898,9 +993,17 @@ export function WorkOverviewPage({
             >
               {currentActivity
                 ? branchActivityHealth === "live"
-                  ? `${branchActivityLabel(currentActivity)} · Live`
+                  ? `${branchActivityLabel(currentActivity)} · ${
+                      workEventsHealth === "refreshing"
+                        ? "new update received"
+                        : workEventsHealth === "live"
+                          ? "Live"
+                          : "updates delayed"
+                    }`
                   : `Connection delayed · last confirmed ${branchActivityLabel(currentActivity)}`
-                : "Activity status unavailable · reconnecting"}
+                : workEventsHealth === "delayed"
+                  ? "Activity unavailable · reconnecting"
+                  : "Waiting for the first live update"}
             </p>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-2">
@@ -910,7 +1013,7 @@ export function WorkOverviewPage({
             </div>
             {branchCatalog.branches.length > 1 ? (
               <label className="flex items-center gap-2 text-xs text-text-muted">
-                Approach
+                View approach
                 <select
                   aria-label="Work approach"
                   className="rounded-control border border-border bg-surface px-2 py-1 text-sm font-medium text-text outline-none focus:border-accent"
@@ -932,25 +1035,38 @@ export function WorkOverviewPage({
           </div>
         </header>
 
+        <WorkJourneyGuide
+          activity={currentActivity}
+          factCode={snapshot.report.finding.fact_code}
+          pendingCount={pending.length}
+          acceptedCriteriaCount={snapshot.criteria.criteria.total}
+          isDeliveryBranch={isDeliveryBranch}
+        />
+
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
-            <WorkExecutionCard
-              key={branchId}
-              workId={overview.work_id}
-              branchId={branchId}
-              initialExecution={initialExecution}
-              attachment={attachment}
-              branchRevision={attachment?.branch_revision}
-              controlBasis={attachment?.control_basis}
+            <WorkTaskGraph
+              id="work-plan"
+              initial={snapshot.taskGraph}
+              live={turnActive || activityNeedsGraphRefresh}
             />
-            <Card className="space-y-4">
+
+            <WorkActivityCard
+              id="work-activity"
+              workId={overview.work_id}
+              activity={snapshot.activity}
+            />
+
+            <Card id="work-approach" className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <p className="text-sm font-semibold text-text">{branchLabel}</p>
+                  <p className="text-sm font-semibold text-text">
+                    {isDeliveryBranch ? "Main result" : `Alternative · ${branchLabel}`}
+                  </p>
                   <p className="mt-1 text-xs leading-5 text-text-muted">
                     {attachment?.head
-                      ? "Starts a separate approach after the latest saved turn. Work still running stays here; tools and workspace access are checked again."
-                      : "A separate approach becomes available after the first turn is saved."}
+                      ? "Start a separate approach from this saved turn. The current turn keeps running here; the new approach gets its own checks."
+                      : "Save the first turn before starting a separate approach."}
                   </p>
                   {selectedBranch.materialization ? (
                     <ForkMaterializationSummary
@@ -978,7 +1094,7 @@ export function WorkOverviewPage({
                         )
                       }
                     >
-                      {retentionPending === branchId ? "Archiving…" : "Archive"}
+                      {retentionPending === branchId ? "Archiving…" : "Archive this approach"}
                     </Button>
                   ) : null}
                   {!isDeliveryBranch ? (
@@ -1009,7 +1125,7 @@ export function WorkOverviewPage({
                       disabled={!attachment?.head || forkStarting}
                       onClick={() => void createAlternative()}
                     >
-                      {forkStarting ? "Creating…" : "Try another approach"}
+                      {forkStarting ? "Creating…" : "Start a separate approach"}
                     </Button>
                   )}
                 </div>
@@ -1154,12 +1270,14 @@ export function WorkOverviewPage({
             </Card>
 
             <WorkTranscriptCard
+              id="work-conversation"
               workId={overview.work_id}
               branchId={branchId}
               initial={transcript}
             />
 
             <WorkTurnComposer
+              key={`${overview.work_id}:${branchId}`}
               workId={overview.work_id}
               branchId={branchId}
               attachmentId={attachment?.attachment_id}
@@ -1200,13 +1318,8 @@ export function WorkOverviewPage({
               />
             ) : null}
 
-            <WorkActivityCard
-              workId={overview.work_id}
-              activity={snapshot.activity}
-            />
-
             {pending.length > 0 ? (
-              <Card className="overflow-hidden p-0">
+              <Card id="work-done-when" className="overflow-hidden p-0">
                 <div className="flex items-start gap-3 px-5 py-4">
                   <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">
                     <ClipboardCheck className="size-4" />
@@ -1287,12 +1400,7 @@ export function WorkOverviewPage({
               </Card>
             ) : null}
 
-            <WorkTaskGraph
-              initial={snapshot.taskGraph}
-              live={turnActive || activityNeedsGraphRefresh}
-            />
-
-            <Card>
+              <Card id={pending.length === 0 ? "work-done-when" : undefined}>
               <div className="flex items-center justify-between gap-3">
                 <h2 className="text-sm font-semibold text-text">Accepted Done when</h2>
                 <span className="text-xs tabular-nums text-text-muted">
@@ -1320,6 +1428,16 @@ export function WorkOverviewPage({
           </div>
 
           <aside className="space-y-5">
+            <WorkExecutionCard
+              key={branchId}
+              workId={overview.work_id}
+              branchId={branchId}
+              initialExecution={initialExecution}
+              attachment={attachment}
+              branchRevision={attachment?.branch_revision}
+              controlBasis={attachment?.control_basis}
+            />
+
             <Card>
               <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
                 Main result status
@@ -1351,6 +1469,160 @@ export function WorkOverviewPage({
       </main>
     </div>
   );
+}
+
+function WorkJourneyGuide({
+  activity,
+  factCode,
+  pendingCount,
+  acceptedCriteriaCount,
+  isDeliveryBranch,
+}: {
+  activity: WorkBranchActivityResponseV1["activity"] | null;
+  factCode: WorkObservationFactCodeV1;
+  pendingCount: number;
+  acceptedCriteriaCount: number;
+  isDeliveryBranch: boolean;
+}) {
+  const next = nextWorkAction(
+    activity,
+    factCode,
+    pendingCount,
+    acceptedCriteriaCount,
+    isDeliveryBranch,
+  );
+  return (
+    <Card
+      role="region"
+      aria-label="Next step"
+      className="mt-6 border-accent/20 bg-accent/[0.025] p-0"
+    >
+      <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:px-5">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-accent/10 text-accent">
+          {next.icon}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
+            Next step
+          </p>
+          <p className="mt-1 text-sm font-semibold text-text">{next.title}</p>
+          <p className="mt-1 text-sm leading-6 text-text-secondary">{next.detail}</p>
+        </div>
+        <a
+          href={next.href}
+          className="inline-flex shrink-0 items-center gap-1.5 text-sm font-semibold text-accent hover:underline"
+        >
+          {next.action}
+          <ArrowRight className="size-4" aria-hidden="true" />
+        </a>
+      </div>
+    </Card>
+  );
+}
+
+function nextWorkAction(
+  activity: WorkBranchActivityResponseV1["activity"] | null,
+  factCode: WorkObservationFactCodeV1,
+  pendingCount: number,
+  acceptedCriteriaCount: number,
+  isDeliveryBranch: boolean,
+) {
+  if (activity === "working") {
+    return {
+      title: "Astra is working",
+      detail:
+        pendingCount > 0
+          ? "Follow the current tasks in the plan. A completion suggestion is also ready for review."
+          : "Follow the current tasks and their latest changes in the plan.",
+      action: "View live plan",
+      href: "#work-plan",
+      icon: <ListChecks className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (activity === "waiting") {
+    return {
+      title: "Astra is waiting",
+      detail:
+        pendingCount > 0
+          ? "Check the plan for what it needs. A completion suggestion is ready for review too."
+          : "Check the plan and conversation for the input or capability it needs.",
+      action: "See what is waiting",
+      href: "#work-plan",
+      icon: <CircleDot className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (pendingCount > 0) {
+    return {
+      title: `Review ${pendingCount} Done-when suggestion${pendingCount === 1 ? "" : "s"}`,
+      detail: "Astra suggested a completion check. The Work can keep moving while you review it.",
+      action: "Review suggestions",
+      href: "#work-done-when",
+      icon: <CircleDot className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (!isDeliveryBranch) {
+    return {
+      title: "Compare this approach",
+      detail:
+        "This alternative has its own conversation and plan. Compare it with Main before choosing which result to deliver.",
+      action: "Compare with Main result",
+      href: "#work-approach",
+      icon: <GitBranch className="size-4" aria-hidden="true" />,
+    };
+  }
+  switch (factCode) {
+    case "ready_for_review":
+      return {
+        title: "Review the result",
+        detail: "The accepted Done-when checks have current supporting evidence.",
+        action: "Read the result",
+        href: "#work-conversation",
+        icon: <Check className="size-4" aria-hidden="true" />,
+      };
+    case "verification_required":
+      return {
+        title: "Check the evidence",
+        detail: "The Work has a result, but one or more Done-when checks still need proof.",
+        action: "View Done when",
+        href: "#work-done-when",
+        icon: <ListChecks className="size-4" aria-hidden="true" />,
+      };
+    case "branch_basis_out_of_date":
+      return {
+        title: "Review this approach",
+        detail: "This approach is based on an older goal or completion contract.",
+        action: "View approach",
+        href: "#work-approach",
+        icon: <CircleDot className="size-4" aria-hidden="true" />,
+      };
+    case "subject_unavailable":
+      return {
+        title: "Continue the Work",
+        detail: "There is no result revision to check yet. Guide Astra from the conversation below.",
+        action: "Continue below",
+        href: "#work-conversation",
+        icon: <ArrowRight className="size-4" aria-hidden="true" />,
+      };
+    case "criteria_not_accepted":
+      if (acceptedCriteriaCount === 0) {
+        return {
+          title: "Ask Astra to define Done when",
+          detail:
+            "This Work has no completion checks yet. Ask Astra in the conversation to propose the checks that will make the outcome reviewable.",
+          action: "Continue in conversation",
+          href: "#work-conversation",
+          icon: <Check className="size-4" aria-hidden="true" />,
+        };
+      }
+    default:
+      return {
+        title: "Define Done when",
+        detail: "Accept a completion check so Astra can tell you when this Work is finished.",
+        action: "View Done when",
+        href: "#work-done-when",
+        icon: <Check className="size-4" aria-hidden="true" />,
+      };
+  }
 }
 
 function BranchComparisonSummary({

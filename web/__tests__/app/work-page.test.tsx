@@ -1,3 +1,8 @@
+vi.mock("next/headers", () => ({
+  headers: vi.fn().mockResolvedValue(new Headers()),
+  cookies: vi.fn().mockResolvedValue({ get: vi.fn().mockReturnValue(undefined) }),
+}));
+
 vi.mock("@/lib/runtime-client", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/runtime-client")>();
   return { ...original, requireRuntimeClient: vi.fn() };
@@ -72,9 +77,14 @@ test("opens a durable read attachment after resolving the public delivery branch
   const element = await WorkPage({ params: Promise.resolve({ workId: "work-1" }) });
 
   expect(loadPresentation).toHaveBeenCalledWith(sdk, "work-1", undefined);
-  expect(attachWorkBranch).toHaveBeenCalledWith("work-1", "branch-1", {
-    requestId: expect.stringMatching(/^web-open:/),
-  });
+  const attachInput = attachWorkBranch.mock.calls[0]?.[2] as {
+    requestId: string;
+    clientId: string;
+  };
+  expect(attachInput.clientId).toMatch(/^[0-9a-f-]{36}$/u);
+  expect(attachInput.requestId).toBe(
+    `web-open:${attachInput.clientId}:work-1:branch-1`,
+  );
   expect(getWorkBranchTranscript).toHaveBeenCalledWith("work-1", "branch-1", {
     limit: 50,
   });
