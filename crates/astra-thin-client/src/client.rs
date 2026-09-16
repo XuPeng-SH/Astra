@@ -1135,19 +1135,18 @@ impl ThinClient {
                 "recovery point limit must be between 1 and 256".into(),
             ));
         }
-        if let Some(cursor) = cursor {
-            if cursor.recovery_point_id.is_empty()
+        if let Some(cursor) = cursor
+            && (cursor.recovery_point_id.is_empty()
                 || cursor.recovery_point_id == "."
                 || cursor.recovery_point_id == ".."
                 || !cursor.recovery_point_id.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
                 })
-                || cursor.created_at.is_empty()
-            {
-                return Err(ThinClientError::InvalidInput(
-                    "invalid recovery point cursor".into(),
-                ));
-            }
+                || cursor.created_at.is_empty())
+        {
+            return Err(ThinClientError::InvalidInput(
+                "invalid recovery point cursor".into(),
+            ));
         }
         let path = paths::work_branch_recovery_points(work_id, branch_id)
             .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
