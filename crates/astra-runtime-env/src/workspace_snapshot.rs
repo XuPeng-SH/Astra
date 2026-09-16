@@ -146,6 +146,8 @@ pub enum WorkspaceSnapshotValidationError {
     InvalidPath { field: &'static str },
     #[error("{field} must be a sha256:<64 lowercase hex> digest")]
     InvalidDigest { field: &'static str },
+    #[error("{field} must be a native Git object id (40 or 64 lowercase hex characters)")]
+    InvalidGitObjectId { field: &'static str },
     #[error("workspace capture fingerprints differ or capture was not marked consistent")]
     InconsistentCapture,
     #[error("workspace snapshot contains duplicate path {path}")]
@@ -230,10 +232,10 @@ impl WorkspaceSnapshotManifestV1 {
             return Err(WorkspaceSnapshotValidationError::InconsistentCapture);
         }
         if let Some(commit) = &self.repository.base_commit {
-            validate_digest("repository.base_commit", commit)?;
+            validate_git_object_id("repository.base_commit", commit)?;
         }
         if let Some(tree) = &self.repository.base_tree {
-            validate_digest("repository.base_tree", tree)?;
+            validate_git_object_id("repository.base_tree", tree)?;
         }
         for submodule in &self.repository.submodules {
             validate_identity("repository.submodules", submodule)?;
@@ -508,6 +510,23 @@ fn validate_digest(
     Ok(())
 }
 
+fn validate_git_object_id(
+    field: &'static str,
+    value: &str,
+) -> Result<(), WorkspaceSnapshotValidationError> {
+    // Git records the object id in its native object format. SHA-1
+    // repositories use 40 lowercase hex characters and SHA-256 repositories
+    // use 64; unlike content digests these values have no `sha256:` prefix.
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(WorkspaceSnapshotValidationError::InvalidGitObjectId { field });
+    }
+    Ok(())
+}
+
 fn validate_relative_path(
     field: &'static str,
     value: &str,
@@ -574,8 +593,8 @@ mod tests {
             logical_workspace_id: "workspace-a".into(),
             repository: WorkspaceSnapshotRepositoryV1 {
                 repository_id: "repo-a".into(),
-                base_commit: Some(digest('a')),
-                base_tree: Some(digest('b')),
+                base_commit: Some("a".repeat(40)),
+                base_tree: Some("b".repeat(64)),
                 submodules: vec![],
             },
             capture: WorkspaceSnapshotCaptureV1 {
@@ -670,6 +689,18 @@ mod tests {
         assert_eq!(
             snapshot.validate(),
             Err(WorkspaceSnapshotValidationError::InconsistentCapture)
+        );
+    }
+
+    #[test]
+    fn rejects_prefixed_content_digest_as_git_object_id() {
+        let mut snapshot = sample_snapshot();
+        snapshot.repository.base_commit = Some(digest('a'));
+        assert_eq!(
+            snapshot.validate(),
+            Err(WorkspaceSnapshotValidationError::InvalidGitObjectId {
+                field: "repository.base_commit"
+            })
         );
     }
 
