@@ -922,8 +922,11 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     .bind(&work_key.branch_id)
     .fetch_one(pool.get())
     .await
-    .expect("load active workspace claim lease");
-    assert_eq!(activity.0.as_deref(), Some(work_lease.lease_id.as_str()));
+    .expect("load active workspace turn reservation");
+    assert_eq!(
+        activity.0.as_deref(),
+        Some(work_reservation.reservation_id.as_str())
+    );
     assert_eq!(activity.1, Some(work_reservation.writer_epoch as i64));
     assert!(activity.2.is_some());
 
@@ -935,11 +938,150 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .verify_execution_workspace_claim_for_generation(
             &work_key,
             work_edge.generation,
-            &work_lease.lease_id,
+            &work_reservation.reservation_id,
             work_reservation.writer_epoch,
         )
         .await
         .expect("the admitting controller retains the active workspace claim");
+
+    // A retained writer can commit one turn and reserve the next one. The
+    // activity marker follows the per-turn reservation, so cleanup from the
+    // completed turn must not erase the newer turn's checkout fence.
+    let first_cursor = match coordinator
+        .commit_turn(
+            &work_reservation,
+            CanonicalTurnDeltaV1 {
+                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                config_version_id: None,
+                mode: CanonicalDeltaModeV1::Append,
+                logical_segments: vec![vec![serde_json::json!({
+                    "role": "user",
+                    "content": "first turn",
+                })]],
+            },
+            "claim-admission-commit",
+        )
+        .await
+        .expect("commit the first retained-writer turn")
+    {
+        CoordinatorMutationV1::Applied { cursor } => cursor,
+        other => panic!("unexpected first retained-writer commit: {other:?}"),
+    };
+    let work_reservation_next = match coordinator
+        .reserve_turn(
+            &work_lease,
+            Some(&first_cursor),
+            Duration::from_secs(30),
+            "claim-admission-turn-next",
+            Some(work_edge.generation),
+        )
+        .await
+        .expect("reserve the second turn under the retained writer")
+    {
+        ReserveTurnOutcome::Reserved(reservation) => reservation,
+        ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
+        other => panic!("unexpected second retained-writer reservation: {other:?}"),
+    };
+    let next_activity: Option<String> = sqlx::query_scalar(
+        "SELECT active_execution_id
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load second active workspace reservation");
+    assert_eq!(
+        next_activity.as_deref(),
+        Some(work_reservation_next.reservation_id.as_str())
+    );
+    let renewed_next = coordinator
+        .renew_turn_authority(&work_lease, &work_reservation_next, Duration::from_secs(60))
+        .await
+        .expect("a retained writer can renew its newer turn");
+    assert_eq!(renewed_next.writer_lease.lease_id, work_lease.lease_id);
+    assert_eq!(
+        renewed_next.turn_reservation.reservation_id,
+        work_reservation_next.reservation_id
+    );
+    assert_eq!(
+        renewed_next.turn_reservation.expected_cursor,
+        Some(first_cursor.clone())
+    );
+    let mut tampered_next = work_reservation_next.clone();
+    tampered_next.expected_cursor = None;
+    assert!(matches!(
+        coordinator
+            .renew_turn_authority(&work_lease, &tampered_next, Duration::from_secs(60))
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    let after_tampered_renewal: Option<i64> = sqlx::query_scalar(
+        "SELECT active_execution_expires_at_ms
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load activity after rejecting a tampered renewal");
+    assert_eq!(
+        after_tampered_renewal,
+        Some(renewed_next.turn_reservation.expires_at_unix_ms)
+    );
+    let stale_renewal = coordinator
+        .renew_turn_authority(&work_lease, &work_reservation, Duration::from_secs(60))
+        .await;
+    assert!(matches!(
+        stale_renewal,
+        Err(SessionContextCoordinatorError::Fenced)
+    ));
+    coordinator
+        .clear_execution_workspace_activity(
+            &work_key,
+            &work_reservation.reservation_id,
+            work_reservation.writer_epoch,
+        )
+        .await
+        .expect("stale first-turn cleanup is idempotent");
+    let after_stale_cleanup: Option<String> = sqlx::query_scalar(
+        "SELECT active_execution_id
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("reload active workspace reservation after stale cleanup");
+    assert_eq!(
+        after_stale_cleanup.as_deref(),
+        Some(work_reservation_next.reservation_id.as_str())
+    );
+    coordinator
+        .verify_execution_workspace_claim_for_generation(
+            &work_key,
+            work_edge.generation,
+            &work_reservation_next.reservation_id,
+            work_reservation_next.writer_epoch,
+        )
+        .await
+        .expect("the second turn retains its workspace fence after stale cleanup");
     let duplicate_actor = ActorContextV1::owner_user(
         &owner_id,
         "execution-claim-second-controller",

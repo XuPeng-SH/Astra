@@ -651,8 +651,10 @@ pub trait SessionContextCoordinator: Send + Sync {
 
     /// Revalidate the physical checkout claim immediately before execution
     /// side effects begin. The check is serialized with claim transfer and
-    /// compares the exact admission lease, so a transfer cannot race the
-    /// turn-admission-to-Run-publication gap.
+    /// compares the exact turn reservation, so a transfer cannot race the
+    /// turn-admission-to-Run-publication gap and stale turn cleanup cannot
+    /// validate or clear a later reservation. `execution_id` is the active
+    /// turn reservation id and `execution_generation` is its writer epoch.
     async fn verify_execution_workspace_claim_for_generation(
         &self,
         key: &SessionKeyV1,
@@ -662,8 +664,10 @@ pub trait SessionContextCoordinator: Send + Sync {
     ) -> Result<(), SessionContextCoordinatorError>;
 
     /// Retire the physical checkout activity lease after the canonical turn
-    /// has settled. The conditional update makes a delayed/stale cleanup
-    /// harmless after a later execution has taken the claim.
+    /// has settled. The conditional update matches the reservation identity,
+    /// making delayed cleanup harmless after a later turn has taken the claim.
+    /// `execution_id` is the completed turn reservation id and
+    /// `execution_generation` is its writer epoch.
     async fn clear_execution_workspace_activity(
         &self,
         key: &SessionKeyV1,
@@ -2678,7 +2682,12 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
     ) -> Result<RenewedTurnAuthority, SessionContextCoordinatorError> {
         validate_ttl(ttl, MAX_LEASE_TTL)?;
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        validate_reservation_request(reservation, lease, &lease.expected_cursor)?;
+        // The writer's cursor is the acquisition request's CAS identity. A
+        // retained writer can reserve later turns at newer cursors, so only
+        // validate the stable lease/reservation identity before opening the
+        // transaction. The persisted active reservation and locked canonical
+        // head are the source of truth for this turn's cursor below.
+        validate_reservation_identity(reservation, lease)?;
         let mut tx = self
             .pool
             .get()
@@ -2688,7 +2697,23 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let now = database_now_ms(&mut tx).await?;
         let mut state = lock_database_state(&mut tx, &lease.key).await?;
         let validation = validate_active_lease(&state, lease, now)
-            .and_then(|()| validate_active_reservation(&state, reservation, now));
+            .and_then(|()| validate_active_reservation(&state, reservation, now))
+            .and_then(|()| {
+                let active_reservation = state
+                    .active_reservation
+                    .as_ref()
+                    .expect("validated active reservation");
+                // Compare the caller's immutable turn identity with the
+                // persisted reservation. Its cursor must be checked against
+                // the active reservation, never against the writer's initial
+                // acquisition cursor.
+                validate_reservation_request(
+                    reservation,
+                    lease,
+                    &active_reservation.expected_cursor,
+                )?;
+                validate_active_reservation_cursor(&state, reservation)
+            });
         if let Err(error) = validation {
             record_database_authority_event(
                 &mut tx,
@@ -2721,7 +2746,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         activate_current_execution_workspace_activity_in_tx(
             &mut tx,
             &lease.key,
-            &lease.lease_id,
+            &turn_reservation.reservation_id,
             turn_reservation.writer_epoch,
             turn_reservation.expires_at_unix_ms,
             now,
@@ -2764,13 +2789,13 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let outcome = if state.active_writer.as_ref().is_some_and(|active| {
             active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
         }) {
-            clear_execution_workspace_activity_in_tx(
-                &mut tx,
-                &lease.key,
-                &lease.lease_id,
-                lease.writer_epoch,
-            )
-            .await?;
+            // Activity belongs to the active turn reservation. A retained
+            // writer may own several sequential turns, so clearing by the
+            // writer lease would let a delayed cleanup erase a newer turn's
+            // live checkout fence. Releasing the writer intentionally retires
+            // the whole Session authority; clear the session marker under the
+            // same locked state instead.
+            clear_execution_workspace_activity_for_session_in_tx(&mut tx, &lease.key).await?;
             archive_database_state_receipts(&mut tx, &state).await?;
             state.active_writer = None;
             state.active_reservation = None;
@@ -3141,7 +3166,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             activate_current_execution_workspace_activity_in_tx(
                 &mut tx,
                 &lease.key,
-                &lease.lease_id,
+                &refreshed.reservation_id,
                 refreshed.writer_epoch,
                 refreshed.expires_at_unix_ms,
                 now,
@@ -3253,7 +3278,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         activate_current_execution_workspace_activity_in_tx(
             &mut tx,
             &lease.key,
-            &lease.lease_id,
+            &reservation.reservation_id,
             reservation.writer_epoch,
             reservation.expires_at_unix_ms,
             now,
@@ -3464,7 +3489,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             activate_current_execution_workspace_activity_in_tx(
                 &mut tx,
                 &lease.key,
-                &lease.lease_id,
+                &refreshed.reservation_id,
                 refreshed.writer_epoch,
                 refreshed.expires_at_unix_ms,
                 now,
@@ -3521,7 +3546,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             activate_current_execution_workspace_activity_in_tx(
                 &mut tx,
                 &lease.key,
-                &lease.lease_id,
+                &reservation.reservation_id,
                 reservation.writer_epoch,
                 reservation.expires_at_unix_ms,
                 now,
@@ -3728,7 +3753,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         clear_execution_workspace_activity_in_tx(
             &mut tx,
             &reservation.key,
-            &reservation.lease_id,
+            &reservation.reservation_id,
             reservation.writer_epoch,
         )
         .await?;
@@ -3765,7 +3790,9 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("begin_renew_turn_reservation", source))?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
-        if let Err(error) = validate_active_reservation(&state, reservation, now) {
+        if let Err(error) = validate_active_reservation(&state, reservation, now)
+            .and_then(|()| validate_active_reservation_cursor(&state, reservation))
+        {
             record_database_authority_event(
                 &mut tx,
                 &state,
@@ -3798,7 +3825,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         activate_current_execution_workspace_activity_in_tx(
             &mut tx,
             &reservation.key,
-            &reservation.lease_id,
+            &renewed.reservation_id,
             renewed.writer_epoch,
             renewed.expires_at_unix_ms,
             now,
@@ -6925,12 +6952,39 @@ fn validate_reservation_request(
     lease: &ConversationWriterLeaseV1,
     expected_cursor: &Option<SessionCursorV1>,
 ) -> Result<(), SessionContextCoordinatorError> {
+    validate_reservation_identity(reservation, lease)?;
+    if &reservation.expected_cursor != expected_cursor {
+        return Err(SessionContextCoordinatorError::IdempotencyMismatch);
+    }
+    Ok(())
+}
+
+fn validate_reservation_identity(
+    reservation: &TurnReservationV1,
+    lease: &ConversationWriterLeaseV1,
+) -> Result<(), SessionContextCoordinatorError> {
     if reservation.key != lease.key
         || reservation.lease_id != lease.lease_id
         || reservation.writer_epoch != lease.writer_epoch
-        || &reservation.expected_cursor != expected_cursor
     {
         return Err(SessionContextCoordinatorError::IdempotencyMismatch);
+    }
+    Ok(())
+}
+
+fn validate_active_reservation_cursor(
+    state: &CoordinatorStateV1,
+    reservation: &TurnReservationV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    let active_reservation = state
+        .active_reservation
+        .as_ref()
+        .expect("validated active reservation");
+    if active_reservation.expected_cursor != reservation.expected_cursor {
+        return Err(SessionContextCoordinatorError::IdempotencyMismatch);
+    }
+    if state.head.as_ref().map(|head| &head.cursor) != active_reservation.expected_cursor.as_ref() {
+        return Err(SessionContextCoordinatorError::Fenced);
     }
     Ok(())
 }

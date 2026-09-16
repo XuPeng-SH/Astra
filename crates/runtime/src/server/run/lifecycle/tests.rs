@@ -10019,7 +10019,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     );
     assert_eq!(
         same_session.1.0.detail,
-        "another controller owns this canonical session branch"
+        "This Session is already active in another client; wait for it to finish, then retry the same input, or open a new Session for independent work"
     );
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),

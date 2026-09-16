@@ -5830,7 +5830,7 @@ impl AgenticRunLifecycleService {
                 .verify_execution_workspace_claim_for_generation(
                     &key,
                     expected_generation,
-                    &reservation.lease_id,
+                    &reservation.reservation_id,
                     reservation.writer_epoch,
                 )
                 .await
@@ -6024,7 +6024,7 @@ impl AgenticRunLifecycleService {
                 .coordinator
                 .clear_execution_workspace_activity(
                     &admission.lease.key,
-                    &admission.reservation.lease_id,
+                    &admission.reservation.reservation_id,
                     admission.reservation.writer_epoch,
                 )
                 .await
