@@ -16,7 +16,11 @@
 //! The draw pipeline lives in `super::draw`; priority is
 //! `Active > TaskBoard > Status > NextHint > Empty`.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::lock_recovery::LockRecovery;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
@@ -132,6 +136,8 @@ enum SlashBackgroundReadEffect {
         result: Result<astra_thin_client::WorkCatalogPageV1, String>,
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
     },
+    WorkContinueProgress(WorkContinueProgress),
+    WorkContinue(Result<WorkContinueSurface, String>),
     ResumePicker(crate::tui::session_picker::SessionDiscovery),
     SessionHub {
         snapshot: Box<slash_dispatch::SessionHubSnapshot>,
@@ -185,6 +191,49 @@ struct WorkExecutionSurface {
     session_id: String,
     execution: astra_thin_client::WorkExecutionViewV1,
     targets: Result<astra_thin_client::WorkExecutionTargetPageV1, String>,
+}
+
+#[derive(Debug, Clone)]
+enum WorkContinueOutcome {
+    Completed,
+    Failed(String),
+    Waiting(String),
+    Paused,
+    Cancelled,
+    Interrupted(String),
+    Unknown(String),
+    Rejected(String),
+}
+
+#[derive(Debug, Clone)]
+struct WorkContinueProgress {
+    request_id: String,
+    work_id: String,
+    message: String,
+}
+
+/// The result of an explicit Work continuation. This is a Work-scoped
+/// projection, not a native chat turn: the caller's Session identity and
+/// workspace remain untouched while the canonical Work branch is advanced.
+/// Once the Server accepts a turn, this structure is returned even when the
+/// stream or cleanup is incomplete, so the UI never loses proven output.
+struct WorkContinueSurface {
+    request_id: String,
+    work_id: String,
+    branch_id: String,
+    run_id: Option<String>,
+    response: String,
+    outcome: WorkContinueOutcome,
+    cleanup_error: Option<String>,
+}
+
+struct WorkContinueRequest<'a> {
+    requested_work_id: &'a str,
+    requested_branch_id: Option<&'a str>,
+    message: &'a str,
+    client_id: &'a str,
+    request_id: &'a str,
+    attachment_request_id: &'a str,
 }
 
 fn classify_work_execution_error(
@@ -285,6 +334,417 @@ async fn send_work_recovery_capture_error(
             effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(Err(error)),
         })
         .await;
+}
+
+fn work_delivery_identity(observation: &serde_json::Value) -> Result<(String, String), String> {
+    let work_id = observation
+        .pointer("/overview/work_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Work response did not include a work identity".to_string())?;
+    let branch_id = observation
+        .pointer("/overview/delivery_branch/branch_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Work response did not include its delivery branch".to_string())?;
+    Ok((work_id.to_owned(), branch_id.to_owned()))
+}
+
+fn work_continue_branch_id(
+    observation: &serde_json::Value,
+    requested_branch_id: Option<&str>,
+) -> Result<(String, String), String> {
+    let (work_id, delivery_branch_id) = work_delivery_identity(observation)?;
+    let branch_id = requested_branch_id
+        .map(str::trim)
+        .filter(|branch_id| !branch_id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or(delivery_branch_id);
+    Ok((work_id, branch_id))
+}
+
+fn required_work_attachment_id(attachment: &serde_json::Value) -> Result<String, String> {
+    attachment
+        .pointer("/attachment_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Work attachment response did not include attachment_id".to_string())
+}
+
+fn stream_event_run_id(event: &astra_thin_client::StreamEvent) -> Option<&str> {
+    use astra_thin_client::StreamEvent;
+    match event {
+        StreamEvent::RunStarted { run_id, .. }
+        | StreamEvent::RunPaused { run_id }
+        | StreamEvent::RunWaiting { run_id, .. }
+        | StreamEvent::RunResumed { run_id }
+        | StreamEvent::RunCancelled { run_id }
+        | StreamEvent::RunInterrupted { run_id, .. }
+        | StreamEvent::RunFinished { run_id, .. } => run_id.as_deref(),
+        // `run_error` historically exposed only its raw payload. Preserve
+        // root scoping when newer servers include the producer run id there.
+        StreamEvent::RunError { raw, .. } => raw.get("run_id").and_then(|value| value.as_str()),
+        _ => None,
+    }
+}
+
+fn work_stream_terminal_outcome(
+    event: &astra_thin_client::StreamEvent,
+    root_run_id: Option<&str>,
+) -> Option<WorkContinueOutcome> {
+    use astra_thin_client::StreamEvent;
+    let root_lifecycle = match event {
+        StreamEvent::RunFinished { .. }
+        | StreamEvent::RunPaused { .. }
+        | StreamEvent::RunWaiting { .. }
+        | StreamEvent::RunResumed { .. }
+        | StreamEvent::RunCancelled { .. }
+        | StreamEvent::RunInterrupted { .. }
+        | StreamEvent::RunStarted { .. } => match root_run_id {
+            Some(root) => {
+                stream_event_run_id(event).is_some_and(|event_run_id| event_run_id == root)
+            }
+            // A durable replay may omit run_started but still carry the
+            // authoritative run_finished. Treat its first identified
+            // lifecycle event as the root fallback; an identified root is
+            // still required for all later lifecycle events.
+            None => stream_event_run_id(event).is_some(),
+        },
+        // A run_error without a producer id is a stream-level error. If the
+        // server does attach one, only the physical root may settle the Work.
+        StreamEvent::RunError { .. } => root_run_id
+            .map(|root| stream_event_run_id(event).is_none_or(|event_run_id| event_run_id == root))
+            .unwrap_or(true),
+        // These are stream-level terminal/error facts. A known root still
+        // needs its durable lifecycle event before a successful turn is
+        // considered complete; this prevents a child turn_complete from
+        // releasing the controller early.
+        StreamEvent::Error {
+            retryable: false, ..
+        } => true,
+        StreamEvent::TurnComplete { .. } | StreamEvent::Done { .. } => root_run_id.is_none(),
+        _ => false,
+    };
+    if !root_lifecycle {
+        return None;
+    }
+    match event {
+        StreamEvent::RunError {
+            message,
+            error_kind,
+            ..
+        } => Some(WorkContinueOutcome::Failed(if message.trim().is_empty() {
+            error_kind
+                .as_deref()
+                .unwrap_or("Work run failed")
+                .to_string()
+        } else {
+            message.clone()
+        })),
+        StreamEvent::Error {
+            message,
+            code,
+            retryable: false,
+            ..
+        } => Some(WorkContinueOutcome::Failed(match code {
+            Some(code) if !code.trim().is_empty() => format!("{message} ({code})"),
+            _ => message.clone(),
+        })),
+        StreamEvent::RunFinished {
+            status: Some(status),
+            error,
+            ..
+        } => Some(match status.as_str() {
+            "completed" if error.is_none() => WorkContinueOutcome::Completed,
+            "completed" => WorkContinueOutcome::Failed(
+                error
+                    .clone()
+                    .unwrap_or_else(|| "Work reported completion with an error".to_string()),
+            ),
+            "waiting" => WorkContinueOutcome::Waiting(
+                error
+                    .clone()
+                    .unwrap_or_else(|| "Work is waiting for input".to_string()),
+            ),
+            "paused" => WorkContinueOutcome::Paused,
+            status => WorkContinueOutcome::Failed(
+                error
+                    .clone()
+                    .unwrap_or_else(|| format!("Work run ended with status `{status}`")),
+            ),
+        }),
+        StreamEvent::RunFinished { status: None, .. } => Some(WorkContinueOutcome::Unknown(
+            "Work run ended without a terminal status".to_string(),
+        )),
+        StreamEvent::RunCancelled { .. } => Some(WorkContinueOutcome::Cancelled),
+        StreamEvent::RunInterrupted { message, .. } => Some(WorkContinueOutcome::Interrupted(
+            message
+                .clone()
+                .unwrap_or_else(|| "Work run was interrupted before completion".to_string()),
+        )),
+        StreamEvent::RunPaused { .. } => Some(WorkContinueOutcome::Paused),
+        StreamEvent::RunWaiting { reason, .. } => Some(WorkContinueOutcome::Waiting(
+            reason
+                .clone()
+                .unwrap_or_else(|| "Work is waiting for input".to_string()),
+        )),
+        StreamEvent::TurnComplete { .. } => Some(WorkContinueOutcome::Completed),
+        StreamEvent::Done { .. } => Some(WorkContinueOutcome::Unknown(
+            "Work stream ended without a run status".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn work_stream_progress(
+    event: &astra_thin_client::StreamEvent,
+    work_id: &str,
+    request_id: &str,
+) -> Option<WorkContinueProgress> {
+    use astra_thin_client::StreamEvent;
+    let message = match event {
+        StreamEvent::RunStarted { run_id, .. } => format!(
+            "Work accepted · run {}",
+            run_id.as_deref().unwrap_or("pending")
+        ),
+        StreamEvent::ToolCallStart { tool, .. } => {
+            format!("Running tool · {}", tool.as_str().unwrap_or("tool call"))
+        }
+        StreamEvent::ToolCallEnd { .. } => "Tool finished".to_string(),
+        StreamEvent::ApprovalRequired { tool, detail, .. } => format!(
+            "Approval needed · {}{}",
+            tool,
+            detail
+                .as_deref()
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default()
+        ),
+        StreamEvent::UserPromptRequired { prompt, .. } => format!(
+            "Work is asking for input · {}",
+            prompt
+                .as_str()
+                .or_else(|| prompt.get("question").and_then(serde_json::Value::as_str))
+                .unwrap_or("open the Work page to answer")
+        ),
+        StreamEvent::RunWaiting { reason, .. } => format!(
+            "Work waiting · {}",
+            reason
+                .as_deref()
+                .unwrap_or("open the Work page to continue")
+        ),
+        StreamEvent::RunPaused { .. } => "Work paused · open the Work page to resume".to_string(),
+        StreamEvent::ArtifactPublication(artifact) => {
+            format!("Artifact published · {}", artifact.artifact_type)
+        }
+        StreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => format!(
+            "Usage · in {} · out {}",
+            input_tokens.unwrap_or(0),
+            output_tokens.unwrap_or(0)
+        ),
+        _ => return None,
+    };
+    Some(WorkContinueProgress {
+        request_id: request_id.to_owned(),
+        work_id: work_id.to_owned(),
+        message,
+    })
+}
+
+fn publish_work_continue_progress(
+    progress_tx: &tokio::sync::mpsc::Sender<WorkContinueProgress>,
+    progress: WorkContinueProgress,
+) {
+    // Progress is deliberately lossy: it must never prevent the terminal
+    // Work outcome from reaching the foreground. The final result uses the
+    // reliable background effect channel below.
+    let _ = progress_tx.try_send(progress);
+}
+
+async fn execute_work_continue(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    request: WorkContinueRequest<'_>,
+    progress_tx: &tokio::sync::mpsc::Sender<WorkContinueProgress>,
+) -> Result<WorkContinueSurface, String> {
+    let observation = api
+        .get_work(token, request.requested_work_id)
+        .await
+        .map_err(|error| format!("Unable to read Work {}: {error}", request.requested_work_id))?;
+    let (work_id, branch_id) = work_continue_branch_id(&observation, request.requested_branch_id)?;
+    if work_id != request.requested_work_id {
+        return Err("Work response identity disagrees with the requested Work".to_string());
+    }
+
+    let attachment = api
+        .post_work_branch_attachment(
+            token,
+            &work_id,
+            &branch_id,
+            &astra_thin_client::WorkBranchAttachRequestV1 {
+                request_id: request.attachment_request_id.to_owned(),
+                client_id: Some(request.client_id.to_owned()),
+                surface: astra_turn_types::SessionSurfaceV1::Tui,
+            },
+        )
+        .await
+        .map_err(|error| format!("Unable to attach to Work {work_id}: {error}"))?;
+    let attachment_id = required_work_attachment_id(&attachment)?;
+    publish_work_continue_progress(
+        progress_tx,
+        WorkContinueProgress {
+            request_id: request.request_id.to_owned(),
+            work_id: work_id.clone(),
+            message: "Attached to the Work branch · preparing the next turn".to_string(),
+        },
+    );
+    let stream_request = astra_thin_client::WorkTurnRequestV1 {
+        request_id: request.request_id.to_owned(),
+        attachment_id: attachment_id.clone(),
+        message: request.message.to_owned(),
+    };
+    let mut text = String::new();
+    let mut outcome = None;
+    let mut run_id = None;
+    let mut text_done_seen = false;
+    let mut next_text_progress = 256usize;
+    let mut text_progress_sent = false;
+    let mut stream = api.work_branch_turn_stream(&token, &work_id, &branch_id, &stream_request);
+    while let Some(event) = futures_util::StreamExt::next(&mut stream).await {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                outcome = Some(match error {
+                    astra_thin_client::ThinClientError::Api { status, .. }
+                        if status.is_server_error() =>
+                    {
+                        WorkContinueOutcome::Unknown(format!(
+                            "The Work response was inconclusive (HTTP {status}); check the Work status before retrying"
+                        ))
+                    }
+                    astra_thin_client::ThinClientError::Api { status, .. } => {
+                        WorkContinueOutcome::Rejected(format!(
+                            "Work turn was not accepted (HTTP {status})"
+                        ))
+                    }
+                    error => WorkContinueOutcome::Unknown(format!(
+                        "Work response was interrupted before completion: {error}"
+                    )),
+                });
+                break;
+            }
+        };
+        if run_id.is_none() {
+            if matches!(
+                &event,
+                astra_thin_client::StreamEvent::RunStarted { .. }
+                    | astra_thin_client::StreamEvent::RunFinished { .. }
+                    | astra_thin_client::StreamEvent::RunWaiting { .. }
+                    | astra_thin_client::StreamEvent::RunPaused { .. }
+                    | astra_thin_client::StreamEvent::RunCancelled { .. }
+                    | astra_thin_client::StreamEvent::RunInterrupted { .. }
+            ) {
+                let id = stream_event_run_id(&event);
+                if let Some(id) = id {
+                    // The first physical run_started is the Work turn root.
+                    // A replay without run_started uses the first identified
+                    // root lifecycle event as a conservative fallback.
+                    // Descendant lifecycle events share this stream and must
+                    // not replace the root identity or settle its controller.
+                    run_id = Some(id.to_owned());
+                }
+            }
+        }
+        match &event {
+            astra_thin_client::StreamEvent::TextDelta { content } => {
+                if !text_done_seen {
+                    if let Some(content) = content.as_str() {
+                        text.push_str(content);
+                        if !text_progress_sent || text.len() >= next_text_progress {
+                            let preview: String = text
+                                .chars()
+                                .filter(|character| !character.is_control() || *character == '\n')
+                                .take(160)
+                                .collect::<String>()
+                                .replace('\n', " ");
+                            publish_work_continue_progress(
+                                progress_tx,
+                                WorkContinueProgress {
+                                    request_id: request.request_id.to_owned(),
+                                    work_id: work_id.clone(),
+                                    message: format!("Response · {preview}"),
+                                },
+                            );
+                            text_progress_sent = true;
+                            next_text_progress = next_text_progress.saturating_add(256);
+                        }
+                    }
+                }
+            }
+            astra_thin_client::StreamEvent::TextDone { full_text } => {
+                if let Some(content) = full_text.as_str() {
+                    // `text_done` is the durable answer boundary. It may be
+                    // the only answer event in a replay, or it may correct a
+                    // provisional streamed prefix; never append it.
+                    text = content.to_owned();
+                    text_done_seen = true;
+                }
+            }
+            astra_thin_client::StreamEvent::TurnComplete {
+                assistant_text: Some(content),
+                ..
+            } if text.is_empty() => text = content.clone(),
+            _ => {}
+        }
+        if let Some(progress) = work_stream_progress(&event, &work_id, request.request_id) {
+            publish_work_continue_progress(progress_tx, progress);
+        }
+        if let Some(terminal) = work_stream_terminal_outcome(&event, run_id.as_deref()) {
+            outcome = Some(terminal);
+            break;
+        }
+    }
+
+    let outcome = outcome.unwrap_or_else(|| {
+        WorkContinueOutcome::Unknown("Work response ended before completion".to_string())
+    });
+    let mut cleanup_error = None;
+    let terminal = !matches!(outcome, WorkContinueOutcome::Unknown(_));
+    if terminal && !matches!(outcome, WorkContinueOutcome::Rejected(_)) {
+        if let Err(error) = crate::cli::work_command::release_work_controller_with_client(
+            api,
+            token,
+            &work_id,
+            &branch_id,
+            &attachment_id,
+            Some(request.client_id),
+            astra_turn_types::SessionSurfaceV1::Tui,
+        )
+        .await
+        {
+            cleanup_error = Some(error);
+        }
+    } else if matches!(outcome, WorkContinueOutcome::Rejected(_)) {
+        if let Err(error) = api
+            .delete_work_branch_attachment(token, &work_id, &branch_id, &attachment_id)
+            .await
+        {
+            cleanup_error = Some(format!("Unable to detach rejected Work turn: {error}"));
+        }
+    }
+    Ok(WorkContinueSurface {
+        request_id: request.request_id.to_owned(),
+        work_id,
+        branch_id,
+        run_id,
+        response: text,
+        outcome,
+        cleanup_error,
+    })
 }
 
 /// Structured completion for a `/memory` read. The event loop receives facts,
@@ -541,6 +1001,93 @@ async fn load_memory_search(
     serde_json::from_str(&body).map_err(|_| "Failed to parse memory results.".to_string())
 }
 
+fn dispatch_work_continue(
+    action: slash_dispatch::SlashBackgroundRead,
+    generation: u64,
+    effect_tx: tokio::sync::mpsc::Sender<SlashBackgroundReadCompletion>,
+    progress_tx: tokio::sync::mpsc::Sender<WorkContinueProgress>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
+    let slash_dispatch::SlashBackgroundRead::WorkContinue {
+        api,
+        profile,
+        work_id,
+        branch_id,
+        message,
+        client_id,
+        request_id,
+        attachment_request_id,
+    } = action
+    else {
+        unreachable!("dispatch_work_continue received a non-Work action");
+    };
+    tasks.spawn(async move {
+        let token =
+            crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref())
+                .await;
+        let result = match token {
+            Some(token) => {
+                execute_work_continue(
+                    &api,
+                    &token,
+                    WorkContinueRequest {
+                        requested_work_id: &work_id,
+                        requested_branch_id: branch_id.as_deref(),
+                        message: &message,
+                        client_id: &client_id,
+                        request_id: &request_id,
+                        attachment_request_id: &attachment_request_id,
+                    },
+                    &progress_tx,
+                )
+                .await
+            }
+            None => Err("Not logged in. Use /login to continue Work.".to_string()),
+        };
+        send_work_continue_completion(&effect_tx, generation, result).await;
+    });
+}
+
+async fn send_work_continue_completion(
+    effect_tx: &tokio::sync::mpsc::Sender<SlashBackgroundReadCompletion>,
+    generation: u64,
+    result: Result<WorkContinueSurface, String>,
+) {
+    // A terminal Work result is durable UI state. Wait for foreground
+    // capacity instead of dropping it when progress or another background
+    // read temporarily fills the queue.
+    let _ = effect_tx
+        .send(SlashBackgroundReadCompletion {
+            generation,
+            effect: SlashBackgroundReadEffect::WorkContinue(result),
+        })
+        .await;
+}
+
+fn dispatch_slash_background_action(
+    action: slash_dispatch::SlashBackgroundRead,
+    generation: u64,
+    effect_tx: tokio::sync::mpsc::Sender<SlashBackgroundReadCompletion>,
+    progress_tx: tokio::sync::mpsc::Sender<WorkContinueProgress>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    work_continue_tasks: &mut tokio::task::JoinSet<()>,
+) {
+    if matches!(
+        &action,
+        slash_dispatch::SlashBackgroundRead::WorkContinue { .. }
+    ) {
+        dispatch_work_continue(
+            action,
+            generation,
+            effect_tx,
+            progress_tx,
+            work_continue_tasks,
+        );
+    } else {
+        dispatch_slash_background_read(action, generation, effect_tx, tasks);
+    }
+}
+
 fn dispatch_slash_background_read(
     action: slash_dispatch::SlashBackgroundRead,
     generation: u64,
@@ -739,6 +1286,9 @@ fn dispatch_slash_background_read(
                     None => Err("Not logged in. Use /login to browse your Work.".to_string()),
                 };
                 SlashBackgroundReadEffect::WorkCatalog { result, cursor }
+            }
+            slash_dispatch::SlashBackgroundRead::WorkContinue { .. } => {
+                unreachable!("Work continuation is dispatched on its cleanup-aware task set")
             }
             slash_dispatch::SlashBackgroundRead::ResumePicker => {
                 match tokio::task::spawn_blocking(load_session_picker).await {
@@ -1212,23 +1762,98 @@ fn apply_slash_background_read_effect(
                 }
                 chat_widget.commit_system(history_cell::system::SystemCell::response(
                     if cursor.is_some() {
-                        "Opened older Work · choose a Work to observe"
+                        "Opened older Work · choose a Work"
                     } else {
-                        "Opened Work hub · choose a Work to observe"
+                        "Opened Work hub · choose a Work"
                     },
                 ));
                 bottom_pane.push_view(Box::new(
                     ListSelectionView::new(
                         items,
-                        Some("Your Work · Enter observes selected Work (read-only)".to_string()),
+                        Some("Your Work · Enter choose Observe or Continue".to_string()),
                     )
                     .with_results(results)
-                    .with_footer_hint("↑↓ choose · type to filter · Enter observe · Esc close"),
+                    .with_footer_hint("↑↓ choose · type to filter · Enter actions · Esc close"),
                 ));
             }
             Err(error) => {
                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
                     "Work hub unavailable: {error}"
+                )));
+            }
+        },
+        SlashBackgroundReadEffect::WorkContinueProgress(progress) => {
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
+                "Work · {} · {}",
+                crate::tui::truncate_ellipsis(&progress.work_id, 16),
+                progress.message,
+            )));
+        }
+        SlashBackgroundReadEffect::WorkContinue(result) => match result {
+            Ok(surface) => {
+                let work_label = crate::tui::truncate_ellipsis(&surface.work_id, 16);
+                let branch_label = crate::tui::truncate_ellipsis(&surface.branch_id, 16);
+                if !surface.response.trim().is_empty() {
+                    chat_widget.commit_work_response(surface.response);
+                }
+                let status = match &surface.outcome {
+                    WorkContinueOutcome::Completed => format!(
+                        "Work completed · {work_label} · branch {branch_label} · current Session unchanged"
+                    ),
+                    WorkContinueOutcome::Failed(error) => {
+                        format!("Work failed · {work_label} · {error}")
+                    }
+                    WorkContinueOutcome::Waiting(reason) => format!(
+                        "Work waiting · {work_label} · {reason} · open the Work page to answer"
+                    ),
+                    WorkContinueOutcome::Paused => {
+                        format!("Work paused · {work_label} · open the Work page to resume")
+                    }
+                    WorkContinueOutcome::Cancelled => {
+                        format!("Work cancelled · {work_label} · no new turn was committed")
+                    }
+                    WorkContinueOutcome::Interrupted(reason) => {
+                        format!("Work interrupted · {work_label} · {reason}")
+                    }
+                    WorkContinueOutcome::Unknown(reason) => format!(
+                        "Work response incomplete · {work_label} · {reason} · status is unknown; open `/work` before retrying"
+                    ),
+                    WorkContinueOutcome::Rejected(reason) => {
+                        format!("Work turn rejected · {work_label} · {reason}")
+                    }
+                };
+                let status_cell = if matches!(
+                    &surface.outcome,
+                    WorkContinueOutcome::Completed | WorkContinueOutcome::Cancelled
+                ) {
+                    history_cell::system::SystemCell::response(status)
+                } else if matches!(&surface.outcome, WorkContinueOutcome::Rejected(_)) {
+                    history_cell::system::SystemCell::error(status)
+                } else {
+                    history_cell::system::SystemCell::warning(status)
+                };
+                chat_widget.commit_system(status_cell);
+                if let Some(error) = surface.cleanup_error {
+                    chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
+                        "Work cleanup needs attention · {error}"
+                    )));
+                }
+                if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
+                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                        "The accepted request is {request_id}; retry only with `/work retry {request_id}` after checking the Work status.",
+                        request_id = surface.request_id
+                    )));
+                }
+                if let Some(run_id) = surface.run_id {
+                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                        "Work run · {}",
+                        crate::tui::truncate_ellipsis(&run_id, 16)
+                    )));
+                }
+            }
+            Err(error) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Work continuation could not be started: {error}"
                 )));
             }
         },
@@ -5602,6 +6227,14 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    // One identity per TUI process, shared by Work attachment renewals. This
+    // keeps two local TUIs independent while allowing a retry from the same
+    // process to renew its own bounded attachment.
+    let tui_client_id = format!(
+        "tui-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
@@ -5667,7 +6300,20 @@ pub(crate) async fn run_tui_session(
     let mut model_catalog_cache = None;
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
+    // Work progress is intentionally separate from the reliable completion
+    // queue. A foreground turn may pause consumption of background effects;
+    // lossy progress must never fill the queue and hide a terminal outcome.
+    let (work_continue_progress_tx, mut work_continue_progress_rx) =
+        tokio::sync::mpsc::channel::<WorkContinueProgress>(32);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
+    // Work turns are long-lived writes with controller cleanup obligations.
+    // Keep them on a separate task set so changing the local Session or
+    // pressing Ctrl-C only stops waiting for read-only actions; an accepted
+    // Work turn continues long enough to reconcile and release its controller.
+    let mut work_continue_tasks = tokio::task::JoinSet::new();
+    let mut pending_work_retries: BTreeMap<String, slash_dispatch::PendingWorkContinue> =
+        BTreeMap::new();
+    let mut settled_work_continue_requests = BTreeSet::new();
     let mut slash_background_read_count = 0usize;
     let mut slash_background_read_generation = 0u64;
     let (work_start_tx, mut work_start_rx) = tokio::sync::mpsc::channel::<WorkStartCompletion>(2);
@@ -5925,10 +6571,32 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(completion) = slash_background_read_rx.recv() => {
-                if completion.generation != slash_background_read_generation {
+                let work_completion = matches!(
+                    &completion.effect,
+                    SlashBackgroundReadEffect::WorkContinue(_)
+                );
+                // Work is an explicit cross-session surface. Its progress and
+                // final outcome remain valid after the user switches Session
+                // or stops waiting for ordinary background reads; the output
+                // carries Work identity and never mutates the new Session.
+                if !work_completion && completion.generation != slash_background_read_generation {
                     continue;
                 }
                 slash_background_read_count = slash_background_read_count.saturating_sub(1);
+                if let SlashBackgroundReadEffect::WorkContinue(Ok(surface)) = &completion.effect {
+                    settled_work_continue_requests.insert(surface.request_id.clone());
+                    if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
+                        if let Some(pending) = pending_work_retries.get_mut(&surface.request_id) {
+                            // Pin the branch resolved by the first attempt. A
+                            // later delivery selection must not turn an
+                            // explicit retry into a second Run on another
+                            // branch.
+                            pending.branch_id = Some(surface.branch_id.clone());
+                        }
+                    } else {
+                        pending_work_retries.remove(&surface.request_id);
+                    }
+                }
                 apply_slash_background_read_effect(
                     completion.effect,
                     &mut bottom_pane,
@@ -5937,6 +6605,22 @@ pub(crate) async fn run_tui_session(
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 bottom_pane.sync_popups();
+                frame_requester.schedule_frame();
+            }
+            Some(progress) = work_continue_progress_rx.recv() => {
+                if settled_work_continue_requests.contains(&progress.request_id) {
+                    // Progress and completion use independent queues, so an
+                    // older progress event may arrive after the final result.
+                    // Never let the visible state regress to Running.
+                    continue;
+                }
+                apply_slash_background_read_effect(
+                    SlashBackgroundReadEffect::WorkContinueProgress(progress),
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                );
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
                 frame_requester.schedule_frame();
             }
             Some(completion) = work_start_rx.recv() => {
@@ -6389,6 +7073,8 @@ pub(crate) async fn run_tui_session(
                                         api, profile, state: &mut state,
                                         guard: &mut guard, bottom_pane: &mut bottom_pane,
                                         chat_widget: &mut chat_widget, width: w,
+                                        client_id: &tui_client_id,
+                                        pending_work_retries: &mut pending_work_retries,
                                     };
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
                                     let flush_slash_response =
@@ -6461,12 +7147,25 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         slash_dispatch::SlashResult::BackgroundRead(action) => {
+                                            if let slash_dispatch::SlashBackgroundRead::WorkContinue {
+                                                request_id,
+                                                ..
+                                            } = action.as_ref()
+                                            {
+                                                // A retry reopens the same
+                                                // durable request identity;
+                                                // allow its fresh progress to
+                                                // reach the UI again.
+                                                settled_work_continue_requests.remove(request_id);
+                                            }
                                             slash_background_read_count += 1;
-                                            dispatch_slash_background_read(
+                                            dispatch_slash_background_action(
                                                 *action,
                                                 slash_background_read_generation,
                                                 slash_background_read_tx.clone(),
+                                                work_continue_progress_tx.clone(),
                                                 &mut slash_background_read_tasks,
+                                                &mut work_continue_tasks,
                                             );
                                         }
                                         slash_dispatch::SlashResult::Exit => { break 'main Ok(()); }
@@ -7222,11 +7921,13 @@ pub(crate) async fn run_tui_session(
                                                                                 ),
                                                                             );
                                                                             slash_background_read_count += 1;
-                                                                            dispatch_slash_background_read(
+                                                                            dispatch_slash_background_action(
                                                                                 action,
                                                                                 slash_background_read_generation,
                                                                                 slash_background_read_tx.clone(),
+                                                                                work_continue_progress_tx.clone(),
                                                                                 &mut slash_background_read_tasks,
+                                                                                &mut work_continue_tasks,
                                                                             );
                                                                             flush_chat_widget(
                                                                                 &mut guard,
@@ -8834,7 +9535,7 @@ pub(crate) async fn run_tui_session(
                                             ),
                                         );
                                         slash_background_read_count += 1;
-                                        dispatch_slash_background_read(
+                                        dispatch_slash_background_action(
                                             slash_dispatch::SlashBackgroundRead::WorkCatalog {
                                                 api: api.clone(),
                                                 profile: profile.map(str::to_owned),
@@ -8842,17 +9543,19 @@ pub(crate) async fn run_tui_session(
                                             },
                                             slash_background_read_generation,
                                             slash_background_read_tx.clone(),
+                                            work_continue_progress_tx.clone(),
                                             &mut slash_background_read_tasks,
+                                            &mut work_continue_tasks,
                                         );
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
 
-                                    // Work catalog result → observe the selected Work in the
-                                    // current task board. This is deliberately separate from
-                                    // Session resume: a fresh TUI can inspect Work created on
-                                    // Web or another Edge without silently changing its chat.
+                                    // Work catalog result → ask for an explicit action. Opening a
+                                    // Work never resumes its hidden Session or changes the
+                                    // current conversation; the user chooses observation or a
+                                    // canonical Work continuation as a separate step.
                                     if let bottom_pane::view::ViewResult::WorkSelection {
                                         work_id,
                                         branch_id,
@@ -8860,35 +9563,121 @@ pub(crate) async fn run_tui_session(
                                         graph_revision,
                                     } = &result
                                     {
-                                        if plan_task_observer.select_work(
-                                            work_id,
-                                            branch_id,
-                                            *graph_revision,
-                                        ) {
-                                            task_board.reveal_completed_for_review();
-                                            board_user_pin = Some(true);
-                                            board_expanded = true;
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::response(
-                                                    format!(
-                                                        "Observing Work · {} · read-only",
+                                        use crate::tui::bottom_pane::list_selection_view::{
+                                            ListSelectionView, SelectionItem,
+                                        };
+                                        let action_items = vec![
+                                            SelectionItem {
+                                                name: "Observe Work".to_string(),
+                                                description: Some(
+                                                    "Show its task graph here; keep this Session unchanged"
+                                                        .to_string(),
+                                                ),
+                                                is_current: true,
+                                            },
+                                            SelectionItem {
+                                                name: "Continue this Work".to_string(),
+                                                description: Some(
+                                                    "Send a new instruction to the Work branch"
+                                                        .to_string(),
+                                                ),
+                                                is_current: false,
+                                            },
+                                        ];
+                                        let action_results = vec![
+                                            bottom_pane::view::ViewResult::WorkAction {
+                                                work_id: work_id.clone(),
+                                                branch_id: branch_id.clone(),
+                                                goal: goal.clone(),
+                                                graph_revision: *graph_revision,
+                                                action: bottom_pane::view::WorkSelectionAction::Observe,
+                                            },
+                                            bottom_pane::view::ViewResult::WorkAction {
+                                                work_id: work_id.clone(),
+                                                branch_id: branch_id.clone(),
+                                                goal: goal.clone(),
+                                                graph_revision: *graph_revision,
+                                                action: bottom_pane::view::WorkSelectionAction::Continue,
+                                            },
+                                        ];
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::response(format!(
+                                                "Selected Work · {} · choose what to do",
+                                                goal
+                                            )),
+                                        );
+                                        bottom_pane.push_view(Box::new(
+                                            ListSelectionView::new(
+                                                action_items,
+                                                Some(format!(
+                                                    "Work {} · branch {}",
+                                                    crate::tui::truncate_ellipsis(work_id, 16),
+                                                    crate::tui::truncate_ellipsis(branch_id, 16),
+                                                )),
+                                            )
+                                            .with_results(action_results)
+                                            .with_footer_hint(
+                                                "↑↓ choose · Enter confirm · Esc back",
+                                            ),
+                                        ));
+                                        frame_requester.schedule_frame();
+                                    } else if let bottom_pane::view::ViewResult::WorkAction {
+                                        work_id,
+                                        branch_id,
+                                        goal,
+                                        graph_revision,
+                                        action,
+                                    } = &result
+                                    {
+                                        match action {
+                                            bottom_pane::view::WorkSelectionAction::Observe => {
+                                                if plan_task_observer.select_work(
+                                                    work_id,
+                                                    branch_id,
+                                                    *graph_revision,
+                                                ) {
+                                                    task_board.reveal_completed_for_review();
+                                                    board_user_pin = Some(true);
+                                                    board_expanded = true;
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            format!(
+                                                                "Observing Work · {} · read-only",
+                                                                goal
+                                                            ),
+                                                        ),
+                                                    );
+                                                    plan_task_observer.maybe_refresh();
+                                                    frame_requester.schedule_frame();
+                                                } else {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::error(
+                                                            "This Work selection was incomplete. Open `/work` and choose it again.",
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            bottom_pane::view::WorkSelectionAction::Continue => {
+                                                // Keep the continuation explicit and editable. The
+                                                // actual Work turn is submitted only after the user
+                                                // writes a message and presses Enter.
+                                                bottom_pane.composer.set_text(&format!(
+                                                    "/work continue {} ",
+                                                    work_id
+                                                ));
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::info(format!(
+                                                        "Continue Work · {} · write the next instruction, then press Enter",
                                                         goal
-                                                    ),
-                                                ),
-                                            );
-                                            plan_task_observer.maybe_refresh();
-                                            frame_requester.schedule_frame();
-                                        } else {
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::error(
-                                                    "This Work selection was incomplete. Open `/work` and choose it again.",
-                                                ),
-                                            );
+                                                    )),
+                                                );
+                                            }
                                         }
+                                    }
                                     // Session picker result → restore the selected session
                                     // in-place. Session selection has one product meaning:
                                     // resuming canonical server-owned work.
-                                    } else if let bottom_pane::view::ViewResult::Session {
+                                    else if let bottom_pane::view::ViewResult::Session {
                                         session_id: name,
                                     } = &result {
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -9000,6 +9789,8 @@ pub(crate) async fn run_tui_session(
                                         api, profile, state: &mut state,
                                         guard: &mut guard, bottom_pane: &mut bottom_pane,
                                         chat_widget: &mut chat_widget, width: w,
+                                        client_id: &tui_client_id,
+                                        pending_work_retries: &mut pending_work_retries,
                                     };
                                     let _ = slash_dispatch::dispatch(&cmd, &mut dctx).await;
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -9666,6 +10457,21 @@ pub(crate) async fn run_tui_session(
     }
     slash_background_read_tasks.abort_all();
     while slash_background_read_tasks.join_next().await.is_some() {}
+    // A Work continuation owns a possible controller and is deliberately not
+    // aborted with read-only actions. Give its stream a short graceful window
+    // to observe a terminal event and release the controller. If the remote
+    // stream is genuinely unavailable, the canonical Run/attachment TTL
+    // remains the recovery authority rather than pretending the turn ended.
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while work_continue_tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        work_continue_tasks.abort_all();
+        while work_continue_tasks.join_next().await.is_some() {}
+        tracing::warn!("Work continuation cleanup did not settle before TUI shutdown");
+    }
     work_start_tasks.abort_all();
     while work_start_tasks.join_next().await.is_some() {}
     // Post-commit projections are recoverable from the canonical journal.
@@ -9968,6 +10774,8 @@ fn apply_terminal_explain_analyze_degraded_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn unbound_work_session_is_an_empty_state_not_a_command_error() {
@@ -10059,6 +10867,390 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn work_stream_outcomes_never_treat_missing_or_retryable_status_as_success() {
+        use astra_thin_client::StreamEvent;
+
+        assert!(matches!(
+            work_stream_terminal_outcome(&StreamEvent::RunFinished {
+                run_id: Some("run-1".into()),
+                status: None,
+                error: None,
+            }, Some("run-1")),
+            Some(WorkContinueOutcome::Unknown(message)) if message.contains("without a terminal status")
+        ));
+        assert!(
+            work_stream_terminal_outcome(
+                &StreamEvent::Error {
+                    message: "temporary".into(),
+                    code: Some("retryable".into()),
+                    retryable: true,
+                    raw: serde_json::json!({}),
+                },
+                Some("run-1")
+            )
+            .is_none(),
+            "a retryable stream error is not proof that the Work failed"
+        );
+        assert!(matches!(
+            work_stream_terminal_outcome(&StreamEvent::RunWaiting {
+                run_id: Some("run-1".into()),
+                reason: Some("approval".into()),
+            }, Some("run-1")),
+            Some(WorkContinueOutcome::Waiting(reason)) if reason == "approval"
+        ));
+        assert!(
+            work_stream_terminal_outcome(
+                &StreamEvent::RunFinished {
+                    run_id: Some("child-1".into()),
+                    status: Some("completed".into()),
+                    error: None,
+                },
+                Some("root-1"),
+            )
+            .is_none(),
+            "a descendant terminal must not settle the physical Work root"
+        );
+    }
+
+    #[test]
+    fn work_stream_progress_keeps_waiting_and_interaction_reasons_visible() {
+        use astra_thin_client::StreamEvent;
+
+        let progress = work_stream_progress(
+            &StreamEvent::ApprovalRequired {
+                request_id: "approval-1".into(),
+                tool: "shell".into(),
+                approval_kind: astra_thin_client::ApprovalKind::Standard,
+                path: None,
+                detail: Some("needs confirmation".into()),
+                raw: serde_json::json!({}),
+            },
+            "work-1",
+            "request-1",
+        )
+        .expect("approval progress");
+        assert_eq!(progress.request_id, "request-1");
+        assert!(progress.message.contains("Approval needed"));
+        assert!(progress.message.contains("needs confirmation"));
+    }
+
+    #[test]
+    fn work_continue_retry_keeps_the_first_branch_when_delivery_changes() {
+        let observation = serde_json::json!({
+            "overview": {
+                "work_id": "work-1",
+                "delivery_branch": {"branch_id": "branch-new"}
+            }
+        });
+        let (work_id, first_branch) = work_continue_branch_id(&observation, None).unwrap();
+        assert_eq!(work_id, "work-1");
+        assert_eq!(first_branch, "branch-new");
+
+        // A retry carries the branch resolved by the first attempt. The
+        // current delivery selection is deliberately ignored so a CAS on a
+        // different client cannot start a second Run on another branch.
+        let (_, retry_branch) =
+            work_continue_branch_id(&observation, Some("branch-first")).unwrap();
+        assert_eq!(retry_branch, "branch-first");
+    }
+
+    #[tokio::test]
+    async fn work_continue_final_waits_for_a_full_background_queue() {
+        let (effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        effect_tx
+            .send(SlashBackgroundReadCompletion {
+                generation: 1,
+                effect: SlashBackgroundReadEffect::WorkContinueProgress(WorkContinueProgress {
+                    request_id: "request-queue".into(),
+                    work_id: "work-queue".into(),
+                    message: "progress".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        let final_surface = WorkContinueSurface {
+            request_id: "request-queue".into(),
+            work_id: "work-queue".into(),
+            branch_id: "branch-queue".into(),
+            run_id: Some("run-queue".into()),
+            response: "complete".into(),
+            outcome: WorkContinueOutcome::Completed,
+            cleanup_error: None,
+        };
+        let sender = effect_tx.clone();
+        let final_task = tokio::spawn(async move {
+            send_work_continue_completion(&sender, 1, Ok(final_surface)).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !final_task.is_finished(),
+            "final delivery should wait for capacity"
+        );
+        let _ = effect_rx.recv().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), final_task)
+            .await
+            .expect("final delivery should unblock")
+            .unwrap();
+        assert!(matches!(
+            effect_rx.recv().await,
+            Some(SlashBackgroundReadCompletion {
+                effect: SlashBackgroundReadEffect::WorkContinue(Ok(_)),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn work_continue_keeps_partial_text_and_unknown_request_replayable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overview": {
+                    "work_id": "work-1",
+                    "delivery_branch": {"branch_id": "branch-1"}
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "attachment_id": "attachment-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "data: {\"type\":\"text_delta\",\"content\":\"partial answer\"}\n\n",
+            ))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(16);
+        let surface = execute_work_continue(
+            &api,
+            "token",
+            WorkContinueRequest {
+                requested_work_id: "work-1",
+                requested_branch_id: None,
+                message: "continue",
+                client_id: "tui-client",
+                request_id: "request-1",
+                attachment_request_id: "attach-request-1",
+            },
+            &progress_tx,
+        )
+        .await
+        .expect("an accepted but incomplete stream returns a surface");
+        assert_eq!(surface.response, "partial answer");
+        assert!(matches!(surface.outcome, WorkContinueOutcome::Unknown(_)));
+        assert!(surface.cleanup_error.is_none());
+        assert!(
+            progress_rx.try_recv().is_ok(),
+            "the Work attachment/stream should publish progress before EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_continue_keeps_terminal_response_when_controller_cleanup_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overview": {
+                    "work_id": "work-1",
+                    "delivery_branch": {"branch_id": "branch-1"}
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "attachment_id": "attachment-1",
+                "branch_revision": 2,
+                "control_basis": {
+                    "writer_epoch": 3,
+                    "canonical_root_hash": null
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"text_delta\",\"content\":\"done\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root-2\",\"status\":\"completed\"}\n\n"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/control-operations",
+            ))
+            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+        let surface = execute_work_continue(
+            &api,
+            "token",
+            WorkContinueRequest {
+                requested_work_id: "work-1",
+                requested_branch_id: None,
+                message: "continue",
+                client_id: "tui-client",
+                request_id: "request-2",
+                attachment_request_id: "attach-request-2",
+            },
+            &progress_tx,
+        )
+        .await
+        .expect("terminal Work outcome remains structured");
+        assert_eq!(surface.response, "done");
+        assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
+        assert!(surface.cleanup_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn work_continue_keeps_server_error_unknown_for_exact_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overview": {
+                    "work_id": "work-1",
+                    "delivery_branch": {"branch_id": "branch-1"}
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "attachment_id": "attachment-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+        let surface = execute_work_continue(
+            &api,
+            "token",
+            WorkContinueRequest {
+                requested_work_id: "work-1",
+                requested_branch_id: None,
+                message: "continue",
+                client_id: "tui-client",
+                request_id: "request-3",
+                attachment_request_id: "attach-request-3",
+            },
+            &progress_tx,
+        )
+        .await
+        .expect("a 5xx response is an accepted-or-rejected unknown");
+        assert!(
+            matches!(surface.outcome, WorkContinueOutcome::Unknown(reason) if reason.contains("503"))
+        );
+        assert_eq!(surface.branch_id, "branch-1");
+    }
+
+    #[tokio::test]
+    async fn work_continue_scopes_root_lifecycle_and_replays_text_done() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overview": {
+                    "work_id": "work-1",
+                    "delivery_branch": {"branch_id": "branch-1"}
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "attachment_id": "attachment-1",
+                "branch_revision": 2,
+                "control_basis": {
+                    "writer_epoch": 3,
+                    "canonical_root_hash": null
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"run_started\",\"run_id\":\"root-1\"}\n\n",
+                "data: {\"type\":\"run_started\",\"run_id\":\"child-1\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"child-1\",\"status\":\"completed\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"partial\"}\n\n",
+                "data: {\"type\":\"text_done\",\"full_text\":\"authoritative answer\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root-1\",\"status\":\"completed\"}\n\n"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/control-operations",
+            ))
+            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+        let surface = execute_work_continue(
+            &api,
+            "token",
+            WorkContinueRequest {
+                requested_work_id: "work-1",
+                requested_branch_id: None,
+                message: "continue",
+                client_id: "tui-client",
+                request_id: "request-root",
+                attachment_request_id: "attach-request-root",
+            },
+            &progress_tx,
+        )
+        .await
+        .expect("root terminal should produce a Work surface");
+        assert_eq!(surface.run_id.as_deref(), Some("root-1"));
+        assert_eq!(surface.response, "authoritative answer");
+        assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
+        assert!(surface.cleanup_error.is_some());
     }
 
     #[test]

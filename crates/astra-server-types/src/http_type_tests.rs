@@ -1388,14 +1388,23 @@ fn work_create_request_is_a_strict_typed_command() {
 }
 
 #[test]
-fn work_attachment_request_can_bind_a_stable_web_client_instance() {
+fn work_attachment_request_can_bind_a_stable_surface_client_instance() {
     let request: WorkBranchAttachRequestV1 = serde_json::from_value(json!({
-        "request_id": "web-open:browser-a:work-1:main",
-        "client_id": "browser-a"
+        "request_id": "tui-open:client-a:work-1:main",
+        "client_id": "client-a",
+        "surface": "tui"
     }))
     .expect("typed Work attachment request");
-    assert_eq!(request.request_id, "web-open:browser-a:work-1:main");
-    assert_eq!(request.client_id.as_deref(), Some("browser-a"));
+    assert_eq!(request.request_id, "tui-open:client-a:work-1:main");
+    assert_eq!(request.client_id.as_deref(), Some("client-a"));
+    assert_eq!(request.surface, astra_turn_types::SessionSurfaceV1::Tui);
+    assert!(
+        serde_json::from_value::<WorkBranchAttachRequestV1>(json!({
+            "request_id": "legacy-open:work-1:main"
+        }))
+        .is_err(),
+        "the attachment actor surface is required"
+    );
     assert!(
         serde_json::from_value::<WorkBranchAttachRequestV1>(json!({
             "request_id": "web-open:browser-a:work-1:main",

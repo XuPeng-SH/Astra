@@ -412,14 +412,20 @@ test("attachWorkBranch establishes bounded read continuity without session ident
   const client = new AstraClient({ baseUrl: "https://astra.example" });
 
   await expect(
-    client.attachWorkBranch("work-1", "branch-1", { requestId: "open-1" }),
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "open-1",
+      surface: "web",
+    }),
   ).resolves.toEqual(workAttachment);
   const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
   expect(url).toBe(
     "https://astra.example/v1/works/work-1/branches/branch-1/attachments",
   );
   expect(init.method).toBe("POST");
-  expect(JSON.parse(String(init.body))).toEqual({ request_id: "open-1" });
+  expect(JSON.parse(String(init.body))).toEqual({
+    request_id: "open-1",
+    surface: "web",
+  });
   expect(JSON.stringify(workAttachment)).not.toContain("session_id");
 });
 
@@ -432,12 +438,14 @@ test("attachWorkBranch carries a stable Web client identity when provided", asyn
     client.attachWorkBranch("work-1", "branch-1", {
       requestId: "open-1",
       clientId: "browser-a",
+      surface: "web",
     }),
   ).resolves.toEqual(workAttachment);
   const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
   expect(JSON.parse(String(init.body))).toEqual({
     request_id: "open-1",
     client_id: "browser-a",
+    surface: "web",
   });
 });
 
@@ -1752,12 +1760,16 @@ test("Work attachment rejects malformed continuity and request identities", asyn
   globalThis.fetch = fetchMock;
   const client = new AstraClient({ baseUrl: "https://astra.example" });
   await expect(
-    client.attachWorkBranch("work-1", "branch-1", { requestId: "bad\nrequest" }),
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "bad\nrequest",
+      surface: "web",
+    }),
   ).rejects.toThrow("control-free");
   await expect(
     client.attachWorkBranch("work-1", "branch-1", {
       requestId: "open-1",
       clientId: "other browser",
+      surface: "web",
     }),
   ).rejects.toThrow("canonical");
   expect(fetchMock).not.toHaveBeenCalled();

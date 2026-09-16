@@ -2194,6 +2194,14 @@ export type WorkBranchAttachmentV1 = {
   expires_at: string;
 };
 
+export type WorkAttachmentSurface =
+  | "cli"
+  | "tui"
+  | "web"
+  | "app"
+  | "server"
+  | "edge";
+
 export type WorkBranchControlBasisV1 = {
   writer_epoch: number;
   canonical_root_hash: string | null;

@@ -449,11 +449,17 @@ pub struct WorkCatalogResponseV1 {
 #[serde(deny_unknown_fields)]
 pub struct WorkBranchAttachRequestV1 {
     pub request_id: String,
-    /// Stable identity for one Web client instance. The Server uses this to
-    /// keep separate browsers as separate read attachments while allowing a
-    /// refresh from the same browser to renew its attachment.
+    /// Stable identity for one client instance. The Server uses this together
+    /// with `surface` to keep separate browsers, TUIs, and other clients as
+    /// separate read attachments while allowing a refresh from the same
+    /// instance to renew its attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// The surface that owns this attachment. A client instance identity is
+    /// only meaningful together with its surface: two TUI processes and a
+    /// browser must never collapse into one actor. It is required so the
+    /// server never guesses which actor owns a controller attachment.
+    pub surface: astra_turn_types::SessionSurfaceV1,
 }
 
 #[cfg(feature = "server")]
