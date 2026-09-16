@@ -43,6 +43,8 @@ pub enum WorkConflictResource {
     WorkEventIdentity,
     WorkAttentionReceipt,
     WorkProposalIdentity,
+    RecoveryPointIdentity,
+    RecoveryPointRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
