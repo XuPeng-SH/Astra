@@ -269,7 +269,7 @@ impl WorkspaceSnapshotManifestV1 {
             });
         }
         let mut computed_total_bytes = 0_u64;
-        let mut computed_blob_count = 0_u64;
+        let mut computed_blob_refs = std::collections::BTreeSet::new();
         let mut previous_path: Option<&str> = None;
         for entry in &self.entries {
             validate_relative_path("entry.path", &entry.path)?;
@@ -319,9 +319,14 @@ impl WorkspaceSnapshotManifestV1 {
                                 change: entry.change,
                             });
                         }
-                        if let Some(blob_ref) = &entry.blob_ref {
-                            validate_identity("entry.blob_ref", blob_ref)?;
-                        }
+                        let Some(blob_ref) = entry.blob_ref.as_ref() else {
+                            return Err(WorkspaceSnapshotValidationError::InvalidEntryContent {
+                                path: entry.path.clone(),
+                                kind: entry.kind,
+                                change: entry.change,
+                            });
+                        };
+                        validate_identity("entry.blob_ref", blob_ref)?;
                         if entry.symlink_target.is_some() {
                             return Err(WorkspaceSnapshotValidationError::InvalidEntryContent {
                                 path: entry.path.clone(),
@@ -334,11 +339,7 @@ impl WorkspaceSnapshotManifestV1 {
                                 field: "content.total_bytes",
                             },
                         )?;
-                        computed_blob_count = computed_blob_count.checked_add(1).ok_or(
-                            WorkspaceSnapshotValidationError::ContentAggregateMismatch {
-                                field: "content.blob_count",
-                            },
-                        )?;
+                        computed_blob_refs.insert(blob_ref);
                     }
                     WorkspaceSnapshotEntryKindV1::Directory => {
                         if entry.size != 0
@@ -400,7 +401,7 @@ impl WorkspaceSnapshotManifestV1 {
         let mut previous_pattern: Option<&str> = None;
         for exclusion in &self.exclusions {
             validate_identity("exclusion.pattern", &exclusion.pattern)?;
-            validate_identity("exclusion.reason", &exclusion.reason)?;
+            validate_description("exclusion.reason", &exclusion.reason)?;
             if previous_pattern.is_some_and(|previous| previous >= exclusion.pattern.as_str()) {
                 return Err(WorkspaceSnapshotValidationError::NonCanonicalEntryOrder);
             }
@@ -411,7 +412,7 @@ impl WorkspaceSnapshotManifestV1 {
                 field: "content.total_bytes",
             });
         }
-        if self.content.blob_count != computed_blob_count {
+        if self.content.blob_count != computed_blob_refs.len() as u64 {
             return Err(WorkspaceSnapshotValidationError::ContentAggregateMismatch {
                 field: "content.blob_count",
             });
@@ -483,6 +484,25 @@ fn validate_identity(
         || value
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        if value.len() > MAX_ID_BYTES {
+            return Err(WorkspaceSnapshotValidationError::Oversized {
+                field,
+                maximum: MAX_ID_BYTES,
+            });
+        }
+        return Err(WorkspaceSnapshotValidationError::InvalidIdentity { field });
+    }
+    Ok(())
+}
+
+fn validate_description(
+    field: &'static str,
+    value: &str,
+) -> Result<(), WorkspaceSnapshotValidationError> {
+    if value.is_empty()
+        || value.len() > MAX_ID_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
     {
         if value.len() > MAX_ID_BYTES {
             return Err(WorkspaceSnapshotValidationError::Oversized {
