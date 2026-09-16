@@ -426,6 +426,8 @@ const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
     ("list", "Browse Work from any device or session"),
     ("status", "Show tasks for this conversation"),
     ("start", "Track this conversation as durable Work"),
+    ("continue", "Send the next instruction to an existing Work"),
+    ("retry", "Retry a Work request whose result is unknown"),
     (
         "execution",
         "Show live execution placement and handoff targets",
@@ -1160,6 +1162,8 @@ mod tests {
                 ("list", "Browse Work from any device or session"),
                 ("status", "Show tasks for this conversation"),
                 ("start", "Track this conversation as durable Work"),
+                ("continue", "Send the next instruction to an existing Work"),
+                ("retry", "Retry a Work request whose result is unknown"),
                 (
                     "execution",
                     "Show live execution placement and handoff targets"

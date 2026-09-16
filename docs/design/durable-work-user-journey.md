@@ -89,6 +89,17 @@ usable. Duplicate admission requests reuse an idempotency identity; unresolved
 external effects are reconciled through the invocation ledger before any retry
 that could repeat them.
 
+On TUI, `/work` first opens the owner-scoped catalog and then presents two
+explicit actions for the selected item: **Observe Work** keeps the current
+Session read-only, while **Continue this Work** prepares an editable
+`/work continue <work-id> <message>` command. The continuation uses a TUI-scoped
+attachment and the canonical Work turn endpoint; it never resumes the hidden
+Work Session in the current chat tab. The TUI receives lifecycle progress for
+accepted runs, tools, approvals, prompts, and waiting states. A stream that
+ends before a terminal fact keeps the partial response and request identity and
+offers `/work retry <request-id>` after the user checks the Work status. A
+terminal response remains visible even if controller cleanup needs attention.
+
 ### 4. Continue on another Edge
 
 The product action is `Continue on another Edge`. It is separate from the
@@ -277,7 +288,12 @@ workspace safe.
 - TUI `/work start` promotes its current durable Session through the Server Work
   binding API. It rejects a missing Session, reuses the Session on exact retry,
   and prints the Work id, `Ctrl+T` task-board hint, and the Web `/now` entry
-  point. There is no configured Web deep link yet.
+  point. There is no configured Web deep link yet. TUI `/work` opens an
+  owner-scoped catalog with explicit Observe/Continue actions; Continue routes
+  a Work-scoped turn through a TUI attachment, shows accepted-run lifecycle
+  progress without feeding Work Session events into the current chat, and
+  preserves partial/unknown results with an exact retry request id. There is
+  no automatic Session resume.
 - TUI `/work execution` reads the current Work binding, authoritative provider
   generation, and a bounded target directory without blocking the render loop.
   It is a read-only diagnostic surface; provider switching and retry are

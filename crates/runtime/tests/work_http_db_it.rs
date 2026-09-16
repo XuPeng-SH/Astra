@@ -823,7 +823,7 @@ async fn attach_work_branch_with_client(
     request_id: &str,
     client_id: Option<&str>,
 ) -> (StatusCode, Value) {
-    let mut payload = serde_json::json!({"request_id": request_id});
+    let mut payload = serde_json::json!({"request_id": request_id, "surface": "web"});
     if let Some(client_id) = client_id {
         payload["client_id"] = Value::from(client_id);
     }

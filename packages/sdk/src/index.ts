@@ -253,6 +253,7 @@ export type {
   WorkCatalogPageV1,
   WorkConversationHeadV1,
   WorkBranchAttachmentV1,
+  WorkAttachmentSurface,
   WorkArchivedBranchCursorV1,
   WorkArchivedBranchEntryV1,
   WorkArchivedBranchListParamsV1,

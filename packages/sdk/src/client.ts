@@ -65,6 +65,7 @@ import type {
   WorkCatalogCursorV1,
   WorkCatalogPageV1,
   WorkBranchAttachmentV1,
+  WorkAttachmentSurface,
   WorkArchivedBranchListParamsV1,
   WorkArchivedBranchPageV1,
   WorkBranchControlBasisV1,
@@ -1637,14 +1638,23 @@ export class AstraClient {
   async attachWorkBranch(
     workId: string,
     branchId: string,
-    input: { requestId: string; clientId?: string },
+    input: {
+      requestId: string;
+      clientId?: string;
+      surface: WorkAttachmentSurface;
+    },
   ): Promise<WorkBranchAttachmentV1> {
     assertWorkRequestId(input.requestId);
     if (input.clientId !== undefined) {
       assertWorkClientId(input.clientId);
     }
-    const body: { request_id: string; client_id?: string } = {
+    const body: {
+      request_id: string;
+      client_id?: string;
+      surface: WorkAttachmentSurface;
+    } = {
       request_id: input.requestId,
+      surface: input.surface,
     };
     if (input.clientId !== undefined) {
       body.client_id = input.clientId;

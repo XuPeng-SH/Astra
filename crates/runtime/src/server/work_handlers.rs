@@ -1747,24 +1747,20 @@ pub(super) async fn post_work_branch_attachment_handler(
         .await
         .map_err(map_work_attachment_coordinator_error)?
         .unwrap_or_default();
-    // A Web browser instance is a distinct observer. Keep its actor identity
-    // stable across Server replicas so a refresh renews that browser's
-    // attachment while another browser cannot inherit its controller claim.
+    // A client instance is a distinct observer. Keep its actor identity stable
+    // across Server replicas so a refresh renews that surface's attachment
+    // while another client cannot inherit its controller claim. The surface
+    // itself is a separate coordinate in the canonical attachment identity.
     let (actor_id, device_id) = payload
         .client_id
         .as_deref()
-        .map(|client_id| {
-            (
-                format!("web-client:{client_id}"),
-                Some(client_id.to_owned()),
-            )
-        })
+        .map(|client_id| (format!("client:{client_id}"), Some(client_id.to_owned())))
         .unwrap_or_else(|| (state.session_actor_id.clone(), None));
     let actor = astra_turn_types::ActorContextV1::owner_user(
         owner_id.as_str(),
         actor_id,
         astra_turn_types::ActorKindV1::Server,
-        astra_turn_types::SessionSurfaceV1::Web,
+        payload.surface,
         device_id,
         authority_epochs,
     );

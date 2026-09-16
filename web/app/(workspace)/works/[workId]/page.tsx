@@ -59,6 +59,7 @@ export default async function WorkPage({
         // existing bounded slot instead of allocating another one.
         requestId: `web-open:${clientId}:${workId}:${branchId}`,
         clientId,
+        surface: "web",
       }),
       runtime.sdk.getWorkBranchActivity(workId, branchId),
       runtime.sdk.getWorkBranchExecution(workId, branchId),

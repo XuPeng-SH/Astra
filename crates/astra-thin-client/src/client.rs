@@ -62,6 +62,70 @@ fn stream_event_is_terminal(event: &StreamEvent) -> bool {
     )
 }
 
+/// Decode one already-admitted SSE response with the same terminal-event
+/// semantics for every streaming endpoint. A transport close after a
+/// terminal event is considered a clean end; EOF before a terminal event is
+/// surfaced as an error so callers cannot report a partial Work turn as
+/// completed.
+fn classified_sse_response(
+    resp: Response,
+) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
+    stream! {
+        let mut parser = SseParser::new();
+        let mut byte_stream = resp.bytes_stream();
+        let mut saw_terminal = false;
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    if saw_terminal {
+                        return;
+                    }
+                    yield Err(e.into());
+                    return;
+                }
+            };
+            match parser.push_bytes(&chunk) {
+                Ok(events) => {
+                    for event in events {
+                        saw_terminal |= stream_event_is_terminal(&event);
+                        yield Ok(event);
+                    }
+                }
+                Err(error) => {
+                    if saw_terminal {
+                        return;
+                    }
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        match parser.finish() {
+            Ok(events) => {
+                for event in events {
+                    saw_terminal |= stream_event_is_terminal(&event);
+                    yield Ok(event);
+                }
+            }
+            Err(error) => {
+                if saw_terminal {
+                    return;
+                }
+                yield Err(error);
+                return;
+            }
+        }
+        if !saw_terminal {
+            yield Err(ThinClientError::SseParse(
+                "SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)"
+                    .to_string(),
+            ));
+        }
+    }
+    .boxed()
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test override: when `Some(ms)`, `sleep_between_attempts` uses this flat
@@ -1541,56 +1605,80 @@ impl ThinClient {
                     return;
                 }
             };
-            let mut parser = SseParser::new();
-            let mut byte_stream = resp.bytes_stream();
-            let mut saw_terminal = false;
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        if saw_terminal {
-                            return;
-                        }
-                        yield Err(e.into());
-                        return;
-                    }
-                };
-                match parser.push_bytes(&chunk) {
-                    Ok(evs) => {
-                        for ev in evs {
-                            saw_terminal |= stream_event_is_terminal(&ev);
-                            yield Ok(ev);
-                        }
-                    }
-                    Err(e) => {
-                        if saw_terminal {
-                            return;
-                        }
-                        yield Err(e);
-                        return;
-                    }
-                }
+            let mut events = classified_sse_response(resp);
+            while let Some(event) = events.next().await {
+                yield event;
             }
-            match parser.finish() {
-                Ok(evs) => {
-                    for ev in evs {
-                        saw_terminal |= stream_event_is_terminal(&ev);
-                        yield Ok(ev);
-                    }
+        }
+        .boxed()
+    }
+
+    /// `POST /v1/works/:work_id/branches/:branch_id/turns` — yields the same
+    /// classified lifecycle events as ordinary chat streaming. Work callers
+    /// consume this stream as a projection only; SessionInfo/RunBound events
+    /// must never be applied to the caller's ordinary Session UI.
+    pub fn work_branch_turn_stream(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkTurnRequestV1,
+    ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
+        let path = match paths::work_branch_turns(work_id, branch_id) {
+            Some(path) => path,
+            None => {
+                return stream! {
+                    yield Err(ThinClientError::InvalidInput(
+                        "invalid work_id or branch_id".into(),
+                    ));
                 }
-                Err(e) => {
-                    if saw_terminal {
-                        return;
-                    }
-                    yield Err(e);
+                .boxed();
+            }
+        };
+        let url = match self.url(&path) {
+            Ok(url) => url,
+            Err(error) => {
+                return stream! {
+                    yield Err(error);
+                }
+                .boxed();
+            }
+        };
+        let mut headers = match Self::work_api_headers(token) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return stream! {
+                    yield Err(error);
+                }
+                .boxed();
+            }
+        };
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let req = self.http_stream.post(url).headers(headers).json(request);
+        let fut = async move {
+            let response = req.send().await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(ThinClientError::Api { status, body });
+            }
+            Ok(response)
+        };
+
+        stream! {
+            let response = match fut.await {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Err(error);
                     return;
                 }
-            }
-            if !saw_terminal {
-                yield Err(ThinClientError::SseParse(
-                    "SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)"
-                        .to_string(),
-                ));
+            };
+            let mut events = classified_sse_response(response);
+            while let Some(event) = events.next().await {
+                yield event;
             }
         }
         .boxed()
@@ -2481,7 +2569,10 @@ mod tests {
             .and(path("/v1/works/work-1/branches/branch-1/attachments"))
             .and(header("authorization", "Bearer work-token"))
             .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
-            .and(body_json(serde_json::json!({"request_id": "attach-1"})))
+            .and(body_json(serde_json::json!({
+                "request_id": "attach-1",
+                "surface": "cli"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "work_id": "work-1",
                 "branch_id": "branch-1",
@@ -2514,6 +2605,7 @@ mod tests {
                 &WorkBranchAttachRequestV1 {
                     request_id: "attach-1".into(),
                     client_id: None,
+                    surface: astra_turn_types::SessionSurfaceV1::Cli,
                 },
             )
             .await
@@ -3075,6 +3167,44 @@ mod tests {
                 ref run_id,
             } if session_id == "s-x" && run_id.is_none()
         ));
+    }
+
+    #[tokio::test]
+    async fn wiremock_work_branch_turn_stream_uses_work_contract_and_terminal_events() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(header("accept", "text/event-stream"))
+            .and(body_json(serde_json::json!({
+                "request_id": "turn-1",
+                "attachment_id": "attachment-1",
+                "message": "Continue the Work."
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"text_delta\",\"content\":\"continued\"}\n\n",
+                "data: {\"type\":\"turn_complete\",\"assistant_text\":\"continued\"}\n\n"
+            )))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let request = WorkTurnRequestV1 {
+            request_id: "turn-1".into(),
+            attachment_id: "attachment-1".into(),
+            message: "Continue the Work.".into(),
+        };
+        let events = futures_util::StreamExt::collect::<Vec<_>>(client.work_branch_turn_stream(
+            "work-token",
+            "work-1",
+            "branch-1",
+            &request,
+        ))
+        .await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], Ok(StreamEvent::TextDelta { .. })));
+        assert!(matches!(events[1], Ok(StreamEvent::TurnComplete { .. })));
     }
 
     #[tokio::test]

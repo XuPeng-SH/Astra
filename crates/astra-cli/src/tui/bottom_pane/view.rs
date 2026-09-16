@@ -51,12 +51,28 @@ pub(crate) enum ViewResult {
         goal: String,
         graph_revision: u64,
     },
+    /// Explicit action chosen after selecting a Work. Observation never
+    /// changes the current Session; continuation is routed through the
+    /// canonical Work turn endpoint by the event loop.
+    WorkAction {
+        work_id: String,
+        branch_id: String,
+        goal: String,
+        graph_revision: u64,
+        action: WorkSelectionAction,
+    },
     /// Continue the owner-scoped Work catalog without changing the current
     /// conversation or selecting a Work implicitly.
     WorkCatalogNextPage {
         cursor: astra_thin_client::WorkCatalogCursorV1,
     },
     InsertCommand(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkSelectionAction {
+    Observe,
+    Continue,
 }
 
 /// The only terminal outcomes of the config editor. The editor's internal
