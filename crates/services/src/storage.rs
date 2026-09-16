@@ -3856,6 +3856,7 @@ async fn ensure_core_schema_while_leased(
             vector_db_snapshot_id VARCHAR(64) NULL,
             metadata JSON NULL,
             project_id VARCHAR(128) NULL,
+            provider_creation_hash CHAR(64) NULL,
             project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session',
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -3883,6 +3884,14 @@ async fn ensure_core_schema_while_leased(
         "agent_sessions",
         "delete_requested_at",
         "ALTER TABLE agent_sessions ADD COLUMN delete_requested_at DATETIME(6) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "agent_sessions",
+        "provider_creation_hash",
+        "ALTER TABLE agent_sessions ADD COLUMN provider_creation_hash CHAR(64) NULL",
     )
     .await?;
     let legacy_delete_intents_backfilled = query(
