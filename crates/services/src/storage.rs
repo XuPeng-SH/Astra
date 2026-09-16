@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v78";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v79";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1161,13 +1161,13 @@ pub async fn admit_session_execution_write(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error> {
     admit_session_event_write(tx, session_id, user_id, false).await?;
 
     // Lock the derived slot before any run row. A missing slot is a valid
     // state; the SELECT still establishes the canonical access order for
     // engines that protect the key range on FOR UPDATE.
-    let _: Option<String> = query_scalar(
+    let run_id: Option<String> = query_scalar(
         "SELECT run_id FROM agent_session_execution_slots
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
@@ -1175,7 +1175,7 @@ pub async fn admit_session_execution_write(
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(())
+    Ok(run_id)
 }
 
 /// Admit the session and execution slot before locking an exact run.
@@ -1187,7 +1187,7 @@ pub async fn admit_session_scoped_run_write(
     run_id: &str,
     allow_missing_run: bool,
 ) -> Result<bool, sqlx::Error> {
-    admit_session_execution_write(tx, session_id, user_id).await?;
+    let _ = admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",

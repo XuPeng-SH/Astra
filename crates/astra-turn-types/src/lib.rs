@@ -113,7 +113,8 @@ pub use provider_contract::{
 };
 pub use recovery_point::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
-    RecoveryPointBindingStateV1, RecoveryPointCapabilityAssessmentV1,
+    RecoveryPointAssessmentV1, RecoveryPointBindingStateV1, RecoveryPointBlockerV1,
+    RecoveryPointCapabilityAssessmentV1, RecoveryPointCoverageStatusV1, RecoveryPointCoverageV1,
     RecoveryPointEnvironmentRequirementsV1, RecoveryPointExecutionBindingV1,
     RecoveryPointExecutorKindV1, RecoveryPointManifestV1, RecoveryPointReasonV1,
     RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,

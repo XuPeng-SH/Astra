@@ -89,6 +89,11 @@ pub struct RecoveryPointExecutionBindingV1 {
     pub logical_workspace_id: String,
     pub executor_kind: RecoveryPointExecutorKindV1,
     pub executor_id: String,
+    /// Digest of the complete canonical Session execution binding. The
+    /// recovery projection is intentionally smaller than that binding, so a
+    /// publisher must retain this digest and compare it with the canonical
+    /// row instead of treating the projection as an authority.
+    pub canonical_binding_hash: String,
     /// Hash of the canonical Session/Work execution binding represented by
     /// the fields above.  It proves identity of the captured binding; a
     /// publication verifier must still compare it with the current binding
@@ -99,7 +104,9 @@ pub struct RecoveryPointExecutionBindingV1 {
 }
 
 /// Reference to an independently captured workspace manifest and its content
-/// package.  A ready recovery point must reference a complete snapshot.
+/// package. A published recovery point must reference a complete snapshot;
+/// this stage intentionally leaves the field absent until a snapshot store
+/// exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPointWorkspaceReferenceV1 {
@@ -182,6 +189,196 @@ pub struct RecoveryPointCapabilityAssessmentV1 {
     pub requires_effect_review: bool,
 }
 
+/// A fact-level status for one recovery-point dimension. These values are
+/// deliberately descriptive: `published` never implies that every dimension
+/// is portable or that an automatic restore action exists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPointCoverageStatusV1 {
+    Verified,
+    NotApplicable,
+    NotCaptured,
+    Changed,
+    RequiresReview,
+    Unavailable,
+    Corrupt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPointCoverageV1 {
+    pub work: RecoveryPointCoverageStatusV1,
+    pub conversation: RecoveryPointCoverageStatusV1,
+    pub run: RecoveryPointCoverageStatusV1,
+    pub workspace: RecoveryPointCoverageStatusV1,
+    pub artifacts: RecoveryPointCoverageStatusV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPointBlockerV1 {
+    pub code: String,
+    pub user_message: String,
+    pub recovery_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+}
+
+/// Server-derived explanation of what a published point actually proves.
+/// It is a read model, not input to publication and not a restore grant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPointAssessmentV1 {
+    pub schema_version: u16,
+    pub conversation_state_verified: bool,
+    pub restore_action_available: bool,
+    pub coverage: RecoveryPointCoverageV1,
+    pub blockers: Vec<RecoveryPointBlockerV1>,
+}
+
+impl RecoveryPointAssessmentV1 {
+    /// Assessment exposed when a persisted point can be identified but its
+    /// manifest or hash no longer passes the contract.  The record remains
+    /// visible so operators can remove or repair the exact point, while no
+    /// untrusted manifest data is returned and no recovery action is implied.
+    pub fn corrupt(reason: &'static str) -> Self {
+        Self {
+            schema_version: 1,
+            conversation_state_verified: false,
+            restore_action_available: false,
+            coverage: RecoveryPointCoverageV1 {
+                work: RecoveryPointCoverageStatusV1::Corrupt,
+                conversation: RecoveryPointCoverageStatusV1::Corrupt,
+                run: RecoveryPointCoverageStatusV1::Corrupt,
+                workspace: RecoveryPointCoverageStatusV1::Corrupt,
+                artifacts: RecoveryPointCoverageStatusV1::Corrupt,
+            },
+            blockers: vec![RecoveryPointBlockerV1 {
+                code: "recovery_point_corrupt".into(),
+                user_message: "This recovery point is damaged and cannot be used for continuation."
+                    .into(),
+                recovery_action:
+                    "Remove the damaged point and create a new recovery point at a safe boundary."
+                        .into(),
+                diagnostics: Some(reason.into()),
+            }],
+        }
+    }
+
+    /// Assessment used while a capture is still only a caller declaration.
+    /// Keeping every dimension non-positive prevents a shaped JSON manifest
+    /// from becoming an implied restore grant.
+    pub fn unverified() -> Self {
+        Self {
+            schema_version: 1,
+            conversation_state_verified: false,
+            restore_action_available: false,
+            coverage: RecoveryPointCoverageV1 {
+                work: RecoveryPointCoverageStatusV1::Unavailable,
+                conversation: RecoveryPointCoverageStatusV1::Unavailable,
+                run: RecoveryPointCoverageStatusV1::NotApplicable,
+                workspace: RecoveryPointCoverageStatusV1::NotCaptured,
+                artifacts: RecoveryPointCoverageStatusV1::Unavailable,
+            },
+            blockers: vec![RecoveryPointBlockerV1 {
+                code: "capture_not_verified".into(),
+                user_message: "This saved request has not been verified by the server yet.".into(),
+                recovery_action: "Retry the save at a safe boundary.".into(),
+                diagnostics: None,
+            }],
+        }
+    }
+
+    /// Assessment for the first publisher stage. Work and conversation are
+    /// proven by the canonical publisher; workspace portability remains
+    /// intentionally unavailable until a snapshot/content store exists.
+    pub fn published_without_workspace(manifest: &RecoveryPointManifestV1) -> Self {
+        let mut blockers = Vec::new();
+        let workspace_status = if manifest.workspace.is_some() {
+            blockers.push(RecoveryPointBlockerV1 {
+                code: "workspace_not_verified".into(),
+                user_message: "A workspace reference is present, but its content has not been verified by the publisher.".into(),
+                recovery_action: "Verify the workspace snapshot before using it on another environment.".into(),
+                diagnostics: None,
+            });
+            RecoveryPointCoverageStatusV1::RequiresReview
+        } else {
+            blockers.push(RecoveryPointBlockerV1 {
+                code: "workspace_not_captured".into(),
+                user_message: "Code files are still on the original execution environment."
+                    .into(),
+                recovery_action: "Continue on the original environment or capture a workspace snapshot before moving.".into(),
+                diagnostics: None,
+            });
+            RecoveryPointCoverageStatusV1::NotCaptured
+        };
+        let run_status = match manifest.run.as_ref() {
+            None => {
+                blockers.push(RecoveryPointBlockerV1 {
+                    code: "run_not_captured".into(),
+                    user_message: "No Run checkpoint was captured; this point describes the Session boundary only.".into(),
+                    recovery_action: "Inspect the Run history before choosing a continuation action.".into(),
+                    diagnostics: None,
+                });
+                RecoveryPointCoverageStatusV1::NotCaptured
+            }
+            Some(run) => {
+                blockers.push(RecoveryPointBlockerV1 {
+                    code: "run_not_verified".into(),
+                    user_message: "The saved Run details are available for inspection, but have not been verified for resume.".into(),
+                    recovery_action: "Inspect the Run checkpoint before choosing a continuation action.".into(),
+                    diagnostics: None,
+                });
+                if run.has_unresolved_effects {
+                    blockers.push(RecoveryPointBlockerV1 {
+                        code: "effect_review_required".into(),
+                        user_message:
+                            "One or more external operation results still need confirmation."
+                                .into(),
+                        recovery_action:
+                            "Review the operation result before continuing or replaying it."
+                                .into(),
+                        diagnostics: run.effect_frontier.clone(),
+                    });
+                }
+                RecoveryPointCoverageStatusV1::RequiresReview
+            }
+        };
+        let artifacts_status = if manifest.artifacts.is_empty() {
+            blockers.push(RecoveryPointBlockerV1 {
+                code: "artifacts_not_captured".into(),
+                user_message: "No artifact references were captured in this recovery point.".into(),
+                recovery_action:
+                    "Open the canonical Work artifacts separately before continuing elsewhere."
+                        .into(),
+                diagnostics: None,
+            });
+            RecoveryPointCoverageStatusV1::NotCaptured
+        } else {
+            blockers.push(RecoveryPointBlockerV1 {
+                code: "artifacts_not_verified".into(),
+                user_message: "Referenced artifacts are listed, but retention and content have not been verified by the publisher.".into(),
+                recovery_action: "Verify each artifact before relying on it during recovery.".into(),
+                diagnostics: None,
+            });
+            RecoveryPointCoverageStatusV1::RequiresReview
+        };
+        Self {
+            schema_version: 1,
+            conversation_state_verified: true,
+            restore_action_available: false,
+            coverage: RecoveryPointCoverageV1 {
+                work: RecoveryPointCoverageStatusV1::Verified,
+                conversation: RecoveryPointCoverageStatusV1::Verified,
+                run: run_status,
+                workspace: workspace_status,
+                artifacts: artifacts_status,
+            },
+            blockers,
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RecoveryPointValidationError {
     #[error("unsupported recovery point schema version {actual}")]
@@ -204,6 +401,8 @@ pub enum RecoveryPointValidationError {
     DuplicateArtifact { artifact_id: String },
     #[error("execution binding hash does not match its canonical fields")]
     InvalidBindingHash,
+    #[error("canonical execution binding hash is invalid")]
+    InvalidCanonicalBindingHash,
     #[error("too many artifacts (maximum {maximum})")]
     TooManyArtifacts { maximum: usize },
     #[error("too many environment requirements (maximum {maximum})")]
@@ -297,6 +496,10 @@ impl RecoveryPointManifestV1 {
             });
         }
         validate_digest("execution.binding_hash", &self.execution.binding_hash)?;
+        validate_digest(
+            "execution.canonical_binding_hash",
+            &self.execution.canonical_binding_hash,
+        )?;
         if self.execution.binding_hash != self.execution.content_hash() {
             return Err(RecoveryPointValidationError::InvalidBindingHash);
         }
@@ -447,6 +650,7 @@ impl RecoveryPointExecutionBindingV1 {
             logical_workspace_id: &'a str,
             executor_kind: RecoveryPointExecutorKindV1,
             executor_id: &'a str,
+            canonical_binding_hash: &'a str,
             physical_workspace_id: Option<&'a str>,
         }
 
@@ -456,6 +660,7 @@ impl RecoveryPointExecutionBindingV1 {
             logical_workspace_id: &self.logical_workspace_id,
             executor_kind: self.executor_kind,
             executor_id: &self.executor_id,
+            canonical_binding_hash: &self.canonical_binding_hash,
             physical_workspace_id: self.physical_workspace_id.as_deref(),
         };
         let bytes = serde_json::to_vec(&identity).expect("binding identity is serializable");
@@ -577,6 +782,7 @@ mod tests {
                 executor_kind: RecoveryPointExecutorKindV1::Edge,
                 executor_id: "edge-a".into(),
                 binding_hash: digest('e'),
+                canonical_binding_hash: digest('f'),
                 physical_workspace_id: Some("materialization-a".into()),
             },
             workspace: Some(RecoveryPointWorkspaceReferenceV1 {
@@ -615,6 +821,48 @@ mod tests {
         assert!(capabilities.requires_target_environment_check);
         assert!(!capabilities.requires_effect_review);
         assert!(manifest.content_hash().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn published_assessment_explains_missing_workspace_and_effect_review() {
+        let mut manifest = sample_manifest();
+        manifest.execution.binding_hash = manifest.execution.content_hash();
+        manifest.workspace = None;
+        manifest.run.as_mut().unwrap().has_unresolved_effects = true;
+        manifest.run.as_mut().unwrap().effect_frontier = Some("frontier-1".into());
+        let assessment = RecoveryPointAssessmentV1::published_without_workspace(&manifest);
+        assert!(assessment.conversation_state_verified);
+        assert!(!assessment.restore_action_available);
+        assert_eq!(
+            assessment.coverage.workspace,
+            RecoveryPointCoverageStatusV1::NotCaptured
+        );
+        assert_eq!(
+            assessment.coverage.run,
+            RecoveryPointCoverageStatusV1::RequiresReview
+        );
+        assert!(
+            assessment
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "effect_review_required")
+        );
+    }
+
+    #[test]
+    fn corrupt_assessment_is_explicit_and_contains_no_recovery_capability() {
+        let assessment = RecoveryPointAssessmentV1::corrupt("manifest_hash_mismatch");
+        assert!(!assessment.conversation_state_verified);
+        assert!(!assessment.restore_action_available);
+        assert_eq!(
+            assessment.coverage.conversation,
+            RecoveryPointCoverageStatusV1::Corrupt
+        );
+        assert_eq!(assessment.blockers[0].code, "recovery_point_corrupt");
+        assert_eq!(
+            assessment.blockers[0].diagnostics.as_deref(),
+            Some("manifest_hash_mismatch")
+        );
     }
 
     #[test]

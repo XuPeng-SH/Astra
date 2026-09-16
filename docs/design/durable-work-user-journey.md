@@ -319,17 +319,23 @@ workspace safe.
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.
-- Recovery-point foundations now have one shared typed manifest for Work,
-  branch, Session cursor/context head, Run frontier, execution binding,
-  Workspace snapshot, Artifact references, and environment requirements. The
-  Workspace manifest validates the capture declaration shape, matching
-  fingerprints, canonical paths, content aggregates, file/blob digests,
-  symlink boundaries, and MatrixOne Git4Data source references. The Work
-  repository records owner-scoped, idempotent
-  `preparing` captures and removes them with branch cleanup. No caller-supplied
-  manifest is published as `ready`: a future canonical verifier must resolve
-  the Session/Run/binding facts and uploaded content first. This is the durable
-  capture contract, not yet cross-Edge migration or Server Run-owner recovery.
+- Recovery points now have one shared typed manifest for Work, branch, Session
+  cursor/context head, Run frontier, execution binding, Workspace snapshot,
+  Artifact references, and environment requirements. The Workspace manifest
+  validates the capture declaration shape, matching fingerprints, canonical
+  paths, content aggregates, file/blob digests, symlink boundaries, and
+  MatrixOne Git4Data source references. A server-authored safe-boundary
+  publisher builds the manifest from canonical Work/Session facts, rejects an
+  active writer, reservation, Run, or changing provider, and publishes it only
+  after a locked re-check. Exact request retries are stable and changed request
+  bodies conflict. `GET` recovery-point views expose a server-derived
+  assessment: conversation and Work state can be verified while the current
+  stage explicitly reports `workspace_not_captured`; published does not mean
+  portable or automatically restorable. The lower-level preparing capture is
+  retained for staging and is never treated as a published point. Recovery
+  points are removed with branch cleanup. This is still not cross-Edge
+  migration, workspace content restore, historical rollback, or Server
+  Run-owner recovery.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

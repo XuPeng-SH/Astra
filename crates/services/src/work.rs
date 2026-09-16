@@ -213,8 +213,9 @@ pub use proposal::{
 };
 pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use recovery_point::{
-    DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
-    WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
+    DatabaseWorkRecoveryPointRepository, NewServerWorkRecoveryPoint, NewWorkRecoveryPoint,
+    WORK_RECOVERY_POINT_SCHEMA_VERSION, WorkRecoveryPointQuery, WorkRecoveryPointRecord,
+    WorkRecoveryPointStatus,
 };
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
@@ -1350,7 +1351,7 @@ pub(crate) const WORK_RECOVERY_POINTS_CREATE_SQL: &str =
     failure_reason VARCHAR(1024) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    ready_at DATETIME(6) NULL,
+    published_at DATETIME(6) NULL,
     PRIMARY KEY (owner_id, work_id, recovery_point_id),
     UNIQUE KEY uq_work_recovery_point_request (owner_id, work_id, request_id),
     INDEX idx_work_recovery_points_branch_status (
@@ -1360,13 +1361,13 @@ pub(crate) const WORK_RECOVERY_POINTS_CREATE_SQL: &str =
         owner_id, created_at, work_id, recovery_point_id
     ),
     CONSTRAINT chk_work_recovery_point_status CHECK (
-        status IN ('preparing', 'ready', 'failed', 'aborted')
+        status IN ('preparing', 'published', 'failed', 'aborted')
     ),
     CONSTRAINT chk_work_recovery_point_ready_shape CHECK (
-        (status = 'ready'
-         AND manifest_json IS NOT NULL AND manifest_hash IS NOT NULL AND ready_at IS NOT NULL
+        (status = 'published'
+         AND manifest_json IS NOT NULL AND manifest_hash IS NOT NULL AND published_at IS NOT NULL
          AND failure_reason IS NULL)
-        OR (status <> 'ready' AND ready_at IS NULL)
+        OR (status <> 'published' AND published_at IS NULL)
     ),
     CONSTRAINT chk_work_recovery_point_failure_shape CHECK (
         (status = 'failed' AND failure_reason IS NOT NULL)
@@ -2136,6 +2137,7 @@ mod tests {
             "work_acceptance_decisions",
             "work_events",
             "work_attention_receipts",
+            "work_recovery_points",
         ] {
             assert!(
                 table_names.contains(required),

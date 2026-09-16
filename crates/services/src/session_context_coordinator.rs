@@ -406,6 +406,45 @@ pub struct SessionAdmissionSnapshotV1 {
     pub authority_epochs: AuthorityEpochsV1,
 }
 
+/// The canonical Session facts needed by a recovery publisher after it has
+/// acquired the transaction's context-head lock. Keeping this projection in
+/// the Session coordinator prevents recovery code from reimplementing lease,
+/// reservation, head, and execution-binding decoding rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockedSessionRecoveryBoundaryV1 {
+    pub head: SessionContextHeadV1,
+    pub active_writer: Option<ConversationWriterLeaseV1>,
+    pub active_reservation: Option<TurnReservationV1>,
+    pub execution_binding: Option<SessionExecutionBindingV1>,
+    pub database_now_unix_ms: i64,
+}
+
+/// Lock and decode the canonical Session boundary for a transaction that has
+/// already acquired the shared session execution admission fence. The caller
+/// must treat a missing head or binding as unavailable; this helper never
+/// synthesizes either fact.
+pub(crate) async fn lock_recovery_boundary(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<LockedSessionRecoveryBoundaryV1, SessionContextCoordinatorError> {
+    key.validate()
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+    let (state, database_now_unix_ms) = lock_database_state_at_now(tx, key).await?;
+    let head = state.head.ok_or_else(|| {
+        SessionContextCoordinatorError::NeedsRepair(
+            "context head is missing at the recovery boundary".into(),
+        )
+    })?;
+    let execution_binding = load_execution_binding_in_tx(tx, key, true).await?;
+    Ok(LockedSessionRecoveryBoundaryV1 {
+        head,
+        active_writer: state.active_writer,
+        active_reservation: state.active_reservation,
+        execution_binding,
+        database_now_unix_ms,
+    })
+}
+
 #[async_trait]
 pub trait SessionContextCoordinator: Send + Sync {
     async fn load_head(

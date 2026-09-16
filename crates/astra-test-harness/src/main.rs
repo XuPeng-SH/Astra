@@ -271,43 +271,63 @@ fn resolve_workspace_astra_bin(ancestor: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+fn resolve_existing_astra_bin(path: &std::path::Path, cwd: &std::path::Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "astra binary {:?} does not exist or cannot be resolved from {}",
+            path,
+            cwd.display()
+        )
+    })?;
+    if !resolved.is_file() {
+        anyhow::bail!("astra binary {:?} is not a file", resolved.display());
+    }
+    Ok(resolved)
+}
+
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     if let Some(p) = explicit {
-        if !p.is_file() {
-            anyhow::bail!(
+        return resolve_existing_astra_bin(&p, &cwd).with_context(|| {
+            format!(
                 "--astra-bin {:?} does not exist or is not a file",
                 p.display()
-            );
-        }
-        return Ok(p);
+            )
+        });
     }
     if let Ok(env_path) = std::env::var("ASTRA_BIN")
         && !env_path.trim().is_empty()
     {
         let p = PathBuf::from(env_path);
-        if p.is_file() {
+        if let Ok(resolved) = resolve_existing_astra_bin(&p, &cwd) {
             eprintln!(
                 "[astra-test] using astra bin from ASTRA_BIN: {}",
-                p.display()
+                resolved.display()
             );
-            return Ok(p);
+            return Ok(resolved);
         }
     }
     if let Some(found) = find_on_path("astra") {
+        let resolved = resolve_existing_astra_bin(&found, &cwd)?;
         eprintln!(
             "[astra-test] using astra bin from PATH: {}",
-            found.display()
+            resolved.display()
         );
-        return Ok(found);
+        return Ok(resolved);
     }
-    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     for ancestor in cwd.ancestors() {
         if let Some(candidate) = resolve_workspace_astra_bin(ancestor) {
+            let resolved = resolve_existing_astra_bin(&candidate, &cwd)?;
             eprintln!(
                 "[astra-test] using astra bin from workspace: {}",
-                candidate.display()
+                resolved.display()
             );
-            return Ok(candidate);
+            return Ok(resolved);
         }
     }
     anyhow::bail!(
@@ -696,7 +716,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_astra_bin;
+    use super::{resolve_existing_astra_bin, resolve_workspace_astra_bin};
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
     use std::time::Duration;
@@ -733,6 +753,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&release_bin, b"release-newer").unwrap();
         assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
+
+    #[test]
+    fn explicit_relative_binary_is_resolved_before_subprocess_cwd_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let binary = debug.join("astra");
+        fs::write(&binary, b"binary").unwrap();
+
+        let resolved =
+            resolve_existing_astra_bin(std::path::Path::new("target/debug/astra"), dir.path())
+                .unwrap();
+        assert_eq!(resolved, fs::canonicalize(binary).unwrap());
     }
 
     #[test]
