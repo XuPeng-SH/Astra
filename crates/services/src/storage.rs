@@ -3578,12 +3578,43 @@ async fn backfill_conversation_manifest_segments(
     }
 }
 
+async fn ensure_workspace_claim_activity_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_id",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_id VARCHAR(128) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_generation",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_generation BIGINT NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_expires_at_ms",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_expires_at_ms BIGINT NULL",
+    )
+    .await
+}
+
 async fn ensure_core_schema_while_leased(
     settings: &MatrixOneSettings,
     pool: sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
+        ensure_workspace_claim_activity_columns(&pool, &settings.database).await?;
         verify_core_schema_catalog(&pool, &settings.database).await?;
         verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
         verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
@@ -4253,6 +4284,9 @@ async fn ensure_core_schema_while_leased(
             workspace_identity VARCHAR(8192) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             branch_id VARCHAR(128) NOT NULL,
+            active_execution_id VARCHAR(128) NULL,
+            active_execution_generation BIGINT NULL,
+            active_execution_expires_at_ms BIGINT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (isolation_domain, owner_user_id, workspace_identity_hash),
             UNIQUE KEY uq_session_execution_workspace_claim_session
@@ -4263,6 +4297,11 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    // The activity lease is the canonical cross-process fact that a claimed
+    // checkout is currently executing.  Keep the migration explicit so a
+    // database created by an earlier binary cannot silently admit a transfer
+    // in the gap between turn admission and durable Run/slot publication.
+    ensure_workspace_claim_activity_columns(&pool, &settings.database).await?;
 
     core_schema_create!(
         pool,

@@ -319,6 +319,14 @@ workspace safe.
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.
+  A checkout claim is an active single-writer fence rather than a permanent
+  Session lock: an idle owner can be transferred atomically to a fresh Session
+  after its live execution slot and unresolved invocation records are clear.
+  Abandoned running slots are reclaimable only after both the owner lease and
+  the shared stale window expire; manually paused or unresolved work remains
+  fenced until an explicit recovery action settles it. A fresh Session is
+  never redirected to `/resume` another Session merely because it shares the
+  same checkout.
 - Recovery points now have one shared typed manifest for Work, branch, Session
   cursor/context head, Run frontier, execution binding, Workspace snapshot,
   Artifact references, and environment requirements. The Workspace manifest

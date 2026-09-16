@@ -2991,15 +2991,11 @@ pub(crate) fn session_hub_view(
         .as_deref()
         .filter(|owner| !owner.is_empty() && Some(*owner) != Some(snapshot.session_id.as_str()))
     {
-        if snapshot.session_id.is_empty() {
-            pairs.push(("recovery", format!("available via /resume {owner}")));
-        } else {
-            pairs.push((
-                "execution",
-                format!("not admitted · checkout belongs to Session {owner}"),
-            ));
-            pairs.push(("next", format!("/resume {owner}")));
-        }
+        // This is only an optional previous-session hint. A fresh Session is
+        // never considered blocked or redirected because another Session was
+        // used in the same checkout; the server admission fence reports an
+        // active conflict only when it is actually live.
+        pairs.push(("previous", format!("available via /resume {owner}")));
     }
     if let Some(error) =
         session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())
