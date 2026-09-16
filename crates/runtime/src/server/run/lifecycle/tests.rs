@@ -10013,7 +10013,14 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         )
         .await);
     assert_eq!(same_session.0, StatusCode::CONFLICT);
-    assert_eq!(same_session.1.0.detail, "session already has an active run");
+    assert_eq!(
+        same_session.1.0.error_code.as_deref(),
+        Some("session_writer_conflict")
+    );
+    assert_eq!(
+        same_session.1.0.detail,
+        "another controller owns this canonical session branch"
+    );
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),
         1,
@@ -10061,12 +10068,53 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     })
     .await
     .expect("independent users and sessions must finish while one provider run is blocked");
-    assert_eq!(
-        llm.fast_requests.load(Ordering::SeqCst),
-        2,
-        "both independent runs must reach the provider exactly once while the blocked request is open"
+    assert!(
+        llm.fast_requests.load(Ordering::SeqCst) >= 2,
+        "both independent runs must reach the provider while the blocked request is open"
     );
-    assert_eq!(llm.requests.load(Ordering::SeqCst), 3);
+    assert!(
+        llm.requests.load(Ordering::SeqCst) >= 3,
+        "the blocked run and both independent runs must cross the provider boundary"
+    );
+    // The lifecycle may issue bounded diagnostic/introspection calls in
+    // addition to the primary turn. Count the canonical primary admissions
+    // from the durable ledger so those diagnostics cannot look like duplicate
+    // user turns while this test still proves one primary admission per run.
+    let primary_fast_requests = sqlx::query(
+        "SELECT run_id, COUNT(*) AS admission_count
+         FROM model_request_context_events
+         WHERE event_stage = 'accepted'
+           AND purpose = 'primary_agent'
+           AND run_id IN (?, ?)
+         GROUP BY run_id",
+    )
+    .bind(&fast_a_run_id)
+    .bind(&fast_b_run_id)
+    .fetch_all(pool.get())
+    .await
+    .expect("count durable primary provider admissions for independent runs")
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<String, _>("run_id")
+                .expect("durable admission row must include run id"),
+            row.try_get::<i64, _>("admission_count")
+                .expect("durable admission row must include count"),
+        )
+    })
+    .collect::<HashMap<_, _>>();
+    for run_id in [&fast_a_run_id, &fast_b_run_id] {
+        assert_eq!(
+            primary_fast_requests.get(run_id).copied(),
+            Some(1),
+            "independent run {run_id} must have exactly one durable primary provider admission"
+        );
+    }
+    assert_eq!(
+        primary_fast_requests.len(),
+        2,
+        "only the two independent runs should have durable primary admissions in this query"
+    );
     for events in [&fast_a_events, &fast_b_events] {
         assert!(
             events
@@ -10235,12 +10283,56 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         replay_event_type(event) == Some("run_finished")
             && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
     }));
-    assert_eq!(
-        llm.fast_requests.load(Ordering::SeqCst),
-        4,
-        "each accepted terminal run must make exactly one provider request"
+    assert!(
+        llm.fast_requests.load(Ordering::SeqCst) >= 4,
+        "each accepted terminal run must reach the provider"
     );
-    assert_eq!(llm.requests.load(Ordering::SeqCst), 5);
+    assert!(
+        llm.requests.load(Ordering::SeqCst) >= 5,
+        "the cancelled run and every accepted terminal run must cross the provider boundary"
+    );
+    let primary_terminal_requests = sqlx::query(
+        "SELECT run_id, COUNT(*) AS admission_count
+         FROM model_request_context_events
+         WHERE event_stage = 'accepted'
+           AND purpose = 'primary_agent'
+           AND run_id IN (?, ?, ?, ?)
+         GROUP BY run_id",
+    )
+    .bind(&fast_a_run_id)
+    .bind(&fast_b_run_id)
+    .bind(&resumed_original_run_id)
+    .bind(&after_cancel_run_id)
+    .fetch_all(pool.get())
+    .await
+    .expect("count durable primary provider admissions for reused sessions")
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<String, _>("run_id")
+                .expect("durable admission row must include run id"),
+            row.try_get::<i64, _>("admission_count")
+                .expect("durable admission row must include count"),
+        )
+    })
+    .collect::<HashMap<_, _>>();
+    for run_id in [
+        &fast_a_run_id,
+        &fast_b_run_id,
+        &resumed_original_run_id,
+        &after_cancel_run_id,
+    ] {
+        assert_eq!(
+            primary_terminal_requests.get(run_id).copied(),
+            Some(1),
+            "accepted terminal run {run_id} must have exactly one durable primary provider admission"
+        );
+    }
+    assert_eq!(
+        primary_terminal_requests.len(),
+        4,
+        "only accepted terminal runs should have durable primary admissions in this query"
+    );
 
     for (user_id, run_id) in [
         (&owner_a, &blocked_run_id),
