@@ -190,6 +190,12 @@ post-commit receipt read resumes through `run_next_work_item`; its receipt must
 restore the board even when the graph is already complete. These receipts read
 one canonical snapshot after settlement or task allocation so the live board
 observes cancellation and replacement together with successor assignment. The
+accepted `propose_work_plan` receipt also exposes bounded `applied_mutations`
+arrays for added items, revised source revisions and declaration states, and
+dependency additions or removals. Those arrays describe the accepted proposal
+at its recorded graph revision; they do not guess a revised item's target
+revision because shared item identities may allocate different successors on
+sibling branches.
 `start_work` result separately reports declared task count and any already
 applied admission graph changes, so a server-applied addition or revision is
 visible as a completed change and is not proposed again by the model.
