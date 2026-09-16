@@ -50,6 +50,7 @@ export default async function WorkPage({
       patchArtifactsResult,
       patchMaterializationsResult,
       patchCommitsResult,
+      recoveryPointsResult,
     ] =
       await Promise.allSettled([
       runtime.sdk.attachWorkBranch(workId, branchId, {
@@ -71,6 +72,7 @@ export default async function WorkPage({
             limit: 10,
           }),
       runtime.sdk.listWorkPatchCommits(workId, deliveryBranch.branch_id, { limit: 10 }),
+      runtime.sdk.listWorkBranchRecoveryPoints(workId, branchId, { limit: 10 }),
     ]);
     const readOrThrow = <T,>(result: PromiseSettledResult<T>): T | null => {
       if (result.status === "fulfilled") return result.value;
@@ -96,6 +98,7 @@ export default async function WorkPage({
         patchArtifacts={readOrThrow(patchArtifactsResult)}
         patchMaterializations={readOrThrow(patchMaterializationsResult)}
         patchCommits={readOrThrow(patchCommitsResult)}
+        recoveryPoints={readOrThrow(recoveryPointsResult)}
       />
     );
   } catch (error) {

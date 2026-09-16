@@ -27,6 +27,7 @@ const EVENT_LABELS: Record<WorkEventKind, string> = {
   run_delegated: "Astra delegated the next workstream",
   run_failed: "The latest run stopped with an error",
   run_cancelled: "The latest run was cancelled",
+  recovery_point_captured: "Progress saved",
   runtime_events_expired:
     "Some older runtime updates expired before projection",
 };

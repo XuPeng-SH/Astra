@@ -125,6 +125,9 @@ enum SlashBackgroundReadEffect {
         timeline: crate::tui::timeline::Timeline,
     },
     WorkExecution(Result<WorkExecutionSurface, WorkExecutionLoadError>),
+    WorkRecoveryPointCapture(
+        Result<astra_thin_client::WorkRecoveryPointViewV1, WorkRecoveryPointCaptureError>,
+    ),
     WorkCatalog {
         result: Result<astra_thin_client::WorkCatalogPageV1, String>,
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
@@ -158,6 +161,22 @@ enum WorkExecutionLoadError {
     Request(String),
 }
 
+/// Errors for `/work save` retain the distinction between an ordinary empty
+/// state and a failed canonical write, so the TUI can give the next useful
+/// action instead of printing a raw HTTP response.
+enum WorkRecoveryPointCaptureError {
+    SessionNotBound,
+    SessionUnavailable,
+    RunActive,
+    TurnActive,
+    EffectsUnresolved,
+    RepairRequired,
+    BasisChanged,
+    ExecutionChanging,
+    VerificationUnavailable,
+    Request(String),
+}
+
 /// The complete read-only projection needed by `/work execution`. The
 /// execution placement is authoritative; target discovery is a separately
 /// degradable read so a registry outage never hides the location of the next
@@ -187,6 +206,85 @@ fn classify_work_execution_error(
         }
     }
     WorkExecutionLoadError::Request(error.to_string())
+}
+
+fn classify_work_recovery_point_error(
+    error: astra_thin_client::ThinClientError,
+) -> WorkRecoveryPointCaptureError {
+    match error {
+        astra_thin_client::ThinClientError::Api { status, body } => {
+            let code = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            match code.as_deref() {
+                Some("work_session_binding_not_found")
+                    if status == reqwest::StatusCode::NOT_FOUND => {
+                    WorkRecoveryPointCaptureError::SessionNotBound
+                }
+                Some("recovery_point_session_unavailable") => {
+                    WorkRecoveryPointCaptureError::SessionUnavailable
+                }
+                Some("recovery_point_run_active") => WorkRecoveryPointCaptureError::RunActive,
+                Some("recovery_point_turn_active") => WorkRecoveryPointCaptureError::TurnActive,
+                Some("recovery_point_effect_unresolved") => {
+                    WorkRecoveryPointCaptureError::EffectsUnresolved
+                }
+                Some("recovery_point_repair_required") => {
+                    WorkRecoveryPointCaptureError::RepairRequired
+                }
+                Some("recovery_point_basis_changed") => {
+                    WorkRecoveryPointCaptureError::BasisChanged
+                }
+                Some("recovery_point_execution_changing") => {
+                    WorkRecoveryPointCaptureError::ExecutionChanging
+                }
+                Some("recovery_point_verification_unavailable") => {
+                    WorkRecoveryPointCaptureError::VerificationUnavailable
+                }
+                _ => WorkRecoveryPointCaptureError::Request(format!(
+                    "The Server could not save Work progress (HTTP {}). Retry after checking the Work status.",
+                    status.as_u16()
+                )),
+            }
+        }
+        astra_thin_client::ThinClientError::Http(error)
+            if error.is_connect() || error.is_timeout() || error.is_request() =>
+        {
+            WorkRecoveryPointCaptureError::Request(
+                "The Server connection was lost before progress was confirmed. Retry when it recovers.".into(),
+            )
+        }
+        other => WorkRecoveryPointCaptureError::Request(other.to_string()),
+    }
+}
+
+fn positive_work_revision(observation: &serde_json::Value) -> Result<u64, String> {
+    let revision = observation
+        .pointer("/overview/work_revision")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "Work observation did not include its current revision".to_string())?;
+    u64::try_from(revision)
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| "Work observation returned an invalid revision".to_string())
+}
+
+async fn send_work_recovery_capture_error(
+    effect_tx: tokio::sync::mpsc::Sender<SlashBackgroundReadCompletion>,
+    generation: u64,
+    error: WorkRecoveryPointCaptureError,
+) {
+    let _ = effect_tx
+        .send(SlashBackgroundReadCompletion {
+            generation,
+            effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(Err(error)),
+        })
+        .await;
 }
 
 /// Structured completion for a `/memory` read. The event loop receives facts,
@@ -527,6 +625,101 @@ fn dispatch_slash_background_read(
                     )),
                 };
                 SlashBackgroundReadEffect::WorkExecution(result)
+            }
+            slash_dispatch::SlashBackgroundRead::WorkRecoveryPointCapture {
+                api,
+                profile,
+                session_id,
+                request_id,
+            } => {
+                let token = crate::cli::session::session_runtime::fresh_access_token(
+                    &api,
+                    profile.as_deref(),
+                )
+                .await;
+                let result = match token {
+                    Some(token) => {
+                        let binding = match api.get_work_session_binding(&token, &session_id).await {
+                            Ok(binding) => binding,
+                            Err(error) => {
+                                let _ = effect_tx
+                                    .send(SlashBackgroundReadCompletion {
+                                        generation,
+                                        effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(
+                                            Err(classify_work_recovery_point_error(error)),
+                                        ),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        };
+                        let work = match api.get_work(&token, &binding.work_id).await {
+                            Ok(work) => work,
+                            Err(error) => {
+                                return send_work_recovery_capture_error(
+                                    effect_tx,
+                                    generation,
+                                    classify_work_recovery_point_error(error),
+                                )
+                                .await;
+                            }
+                        };
+                        let work_revision = match positive_work_revision(&work) {
+                            Ok(revision) => revision,
+                            Err(error) => {
+                                return send_work_recovery_capture_error(
+                                    effect_tx,
+                                    generation,
+                                    WorkRecoveryPointCaptureError::Request(error),
+                                )
+                                .await;
+                            }
+                        };
+                        let branch_revision = match api
+                            .get_work_branch_activity(&token, &binding.work_id, &binding.branch_id)
+                            .await
+                        {
+                            Ok(activity) if activity.branch_revision > 0 => {
+                                activity.branch_revision as u64
+                            }
+                            Ok(_) => {
+                                return send_work_recovery_capture_error(
+                                    effect_tx,
+                                    generation,
+                                    WorkRecoveryPointCaptureError::Request(
+                                        "Work branch did not report a valid revision".to_string(),
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                return send_work_recovery_capture_error(
+                                    effect_tx,
+                                    generation,
+                                    classify_work_recovery_point_error(error),
+                                )
+                                .await;
+                            }
+                        };
+                        api.post_work_branch_recovery_point(
+                            &token,
+                            &binding.work_id,
+                            &binding.branch_id,
+                            &astra_thin_client::WorkRecoveryPointCaptureRequestV1 {
+                                request_id,
+                                expected_work_revision: work_revision,
+                                expected_branch_revision: branch_revision,
+                                reason: astra_thin_client::WorkRecoveryPointReasonV1::UserRequested,
+                            },
+                        )
+                        .await
+                        .map_err(classify_work_recovery_point_error)
+                    }
+                    None => Err(WorkRecoveryPointCaptureError::Request(
+                        "Not logged in. Use /login.".to_string(),
+                    )),
+                };
+                SlashBackgroundReadEffect::WorkRecoveryPointCapture(result)
             }
             slash_dispatch::SlashBackgroundRead::WorkCatalog {
                 api,
@@ -908,6 +1101,73 @@ fn apply_slash_background_read_effect(
             Err(WorkExecutionLoadError::Request(error)) => {
                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
                     "Work execution unavailable: {error}"
+                )));
+            }
+        },
+        SlashBackgroundReadEffect::WorkRecoveryPointCapture(result) => match result {
+            Ok(point) => {
+                let turns = point.session_cursor.completed_turn;
+                let record_id = crate::tui::truncate_ellipsis(&point.recovery_point_id, 16);
+                let work_path = format!(
+                    "/works/{}?branch={}#work-progress",
+                    point.work_id, point.branch_id
+                );
+                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
+                    "Progress saved · {record_id} · {turns} committed {} · conversation and Work state recorded",
+                    if turns == 1 { "turn" } else { "turns" }
+                )));
+                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                    "Open {work_path} to inspect record {record_id}. It does not include code files or running effects yet, so it cannot restore the workspace."
+                )));
+            }
+            Err(WorkRecoveryPointCaptureError::SessionNotBound) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "This conversation is not a Work yet. Use `/work start <goal>` first, then `/work save`.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::SessionUnavailable) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    "Work progress could not be saved because its Session is unavailable. Refresh the Work and retry after the Session reconnects.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::RunActive) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "Work progress was not saved because a Run is still active. Wait for it to finish, then use `/work save` again.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::TurnActive) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "Work progress was not saved because a turn is still being committed. Wait for the turn to settle, then retry.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::EffectsUnresolved) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    "Work progress was not saved because an external operation has an unknown result. Review the Run/effect outcome before retrying; do not replay it blindly.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::RepairRequired) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    "Work progress was not saved because the Server found inconsistent Run state. Refresh the Work; if it persists, inspect Server diagnostics before continuing.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::BasisChanged) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "Work changed while this save was starting. Refresh the Work, then save the current progress again.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::ExecutionChanging) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "Work execution environment is changing. Wait for that operation to settle, then save progress again.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::VerificationUnavailable) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    "The Server could not verify the Session boundary, so progress was not marked saved. Retry when verification is available.",
+                ));
+            }
+            Err(WorkRecoveryPointCaptureError::Request(error)) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Work progress could not be saved: {error}"
                 )));
             }
         },
@@ -9799,6 +10059,89 @@ mod tests {
         assert!(
             matches!(error, WorkExecutionLoadError::Request(message) if message.contains("404"))
         );
+    }
+
+    #[test]
+    fn work_recovery_errors_explain_the_next_safe_action() {
+        let cases = [
+            (
+                "recovery_point_run_active",
+                WorkRecoveryPointCaptureError::RunActive,
+            ),
+            (
+                "recovery_point_turn_active",
+                WorkRecoveryPointCaptureError::TurnActive,
+            ),
+            (
+                "recovery_point_effect_unresolved",
+                WorkRecoveryPointCaptureError::EffectsUnresolved,
+            ),
+            (
+                "recovery_point_repair_required",
+                WorkRecoveryPointCaptureError::RepairRequired,
+            ),
+            (
+                "recovery_point_basis_changed",
+                WorkRecoveryPointCaptureError::BasisChanged,
+            ),
+            (
+                "recovery_point_execution_changing",
+                WorkRecoveryPointCaptureError::ExecutionChanging,
+            ),
+            (
+                "recovery_point_verification_unavailable",
+                WorkRecoveryPointCaptureError::VerificationUnavailable,
+            ),
+        ];
+        for (code, expected) in cases {
+            let error =
+                classify_work_recovery_point_error(astra_thin_client::ThinClientError::Api {
+                    status: reqwest::StatusCode::CONFLICT,
+                    body: serde_json::json!({ "code": code }).to_string(),
+                });
+            assert!(matches!(
+                (error, expected),
+                (
+                    WorkRecoveryPointCaptureError::RunActive,
+                    WorkRecoveryPointCaptureError::RunActive
+                ) | (
+                    WorkRecoveryPointCaptureError::TurnActive,
+                    WorkRecoveryPointCaptureError::TurnActive
+                ) | (
+                    WorkRecoveryPointCaptureError::EffectsUnresolved,
+                    WorkRecoveryPointCaptureError::EffectsUnresolved
+                ) | (
+                    WorkRecoveryPointCaptureError::RepairRequired,
+                    WorkRecoveryPointCaptureError::RepairRequired
+                ) | (
+                    WorkRecoveryPointCaptureError::BasisChanged,
+                    WorkRecoveryPointCaptureError::BasisChanged
+                ) | (
+                    WorkRecoveryPointCaptureError::ExecutionChanging,
+                    WorkRecoveryPointCaptureError::ExecutionChanging
+                ) | (
+                    WorkRecoveryPointCaptureError::VerificationUnavailable,
+                    WorkRecoveryPointCaptureError::VerificationUnavailable
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_work_recovery_api_error_is_sanitized_for_tui() {
+        let error = classify_work_recovery_point_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: serde_json::json!({
+                "code": "new_server_internal_detail",
+                "secret": "must-not-reach-the-terminal"
+            })
+            .to_string(),
+        });
+        assert!(matches!(
+            error,
+            WorkRecoveryPointCaptureError::Request(message)
+                if message == "The Server could not save Work progress (HTTP 500). Retry after checking the Work status."
+        ));
     }
 
     fn explain_analyze_fact() -> astra_turn_types::ExplainAnalyzeEventV1 {

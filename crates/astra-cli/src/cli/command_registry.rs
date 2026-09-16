@@ -430,6 +430,10 @@ const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
         "execution",
         "Show live execution placement and handoff targets",
     ),
+    (
+        "save",
+        "Record conversation and Work progress at a stable point",
+    ),
 ];
 // The bare command opens the editor; `edit` is only an alias.
 const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
@@ -1159,6 +1163,10 @@ mod tests {
                 (
                     "execution",
                     "Show live execution placement and handoff targets"
+                ),
+                (
+                    "save",
+                    "Record conversation and Work progress at a stable point"
                 )
             ]
         );

@@ -1306,7 +1306,11 @@ test("keeps a retryable comparison failure local and retryable", async () => {
     screen.getByRole("button", { name: "Compare with Main result" }),
   );
 
-  expect(await screen.findByText(/temporarily unavailable/i)).toBeVisible();
+  expect(
+    await screen.findByText(
+      "The comparison is temporarily unavailable. You can safely try again.",
+    ),
+  ).toBeVisible();
   expect(
     screen.getByRole("button", { name: "Compare with Main result" }),
   ).toBeEnabled();

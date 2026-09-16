@@ -20,6 +20,7 @@ import type {
   WorkPatchMaterializationPageV2,
   WorkPatchCommitPageV1,
   WorkExecutionViewV1,
+  WorkRecoveryPointPageV1,
 } from "@astra/sdk";
 import {
   Archive,
@@ -154,6 +155,7 @@ export function WorkOverviewPage({
   patchArtifacts,
   patchMaterializations,
   patchCommits,
+  recoveryPoints,
 }: {
   initial: WorkOverviewSnapshot;
   attachment?: WorkBranchAttachmentV1 | null;
@@ -166,6 +168,7 @@ export function WorkOverviewPage({
   patchArtifacts?: WorkPatchArtifactPageV1 | null;
   patchMaterializations?: WorkPatchMaterializationPageV2 | null;
   patchCommits?: WorkPatchCommitPageV1 | null;
+  recoveryPoints?: WorkRecoveryPointPageV1 | null;
 }) {
   const [snapshot, setSnapshot] = useState(initial);
   const [turnActive, setTurnActive] = useState(false);
@@ -1057,6 +1060,8 @@ export function WorkOverviewPage({
               activity={snapshot.activity}
             />
 
+            <WorkRecoveryPointsCard points={recoveryPoints} />
+
             <Card id="work-approach" className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -1789,6 +1794,185 @@ function ForkMaterializationSummary({
       ))}
     </dl>
   );
+}
+
+function WorkRecoveryPointsCard({
+  points,
+}: {
+  points?: WorkRecoveryPointPageV1 | null;
+}) {
+  return (
+    <Card id="work-progress" className="space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-text">Saved progress</h2>
+          <p className="mt-1 text-xs leading-5 text-text-muted">
+            Conversation and Work state recorded at a stable point. Code files are not included yet.
+          </p>
+        </div>
+        {points?.points.length ? (
+          <span className="rounded-full bg-surface-muted px-2 py-0.5 text-xs tabular-nums text-text-muted">
+            {points.points.length}
+          </span>
+        ) : null}
+      </div>
+      {points === undefined || points === null ? (
+        <p className="text-sm leading-6 text-text-secondary">
+          Progress records are temporarily unavailable. The Work itself remains readable.
+        </p>
+      ) : points.points.length === 0 ? (
+        <p className="text-sm leading-6 text-text-secondary">
+          No progress saved yet. In TUI, use <code className="rounded bg-surface-muted px-1">/work save</code> after a stable turn.
+        </p>
+      ) : (
+        <ul className="divide-y divide-border/70 border-t border-border/70">
+          {points.points.map((point) => (
+            <li key={point.recovery_point_id} className="py-2.5 text-sm">
+              <details className="group">
+                <summary className="flex cursor-pointer list-none items-center gap-3 rounded-control px-1 py-1 outline-none transition-colors hover:bg-surface-muted/60 focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+                  <ChevronRight className="size-4 shrink-0 text-text-muted transition-transform group-open:rotate-90" />
+                  <span
+                    className={cn(
+                      "size-2 shrink-0 rounded-full",
+                      point.status === "captured" || point.status === "ready"
+                        ? "bg-success"
+                        : point.status === "failed" || point.status === "aborted"
+                          ? "bg-danger"
+                          : "bg-warning",
+                    )}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-medium text-text">
+                      {recoveryPointStatusLabel(point.status)}
+                    </span>
+                    <span className="block text-xs text-text-muted">
+                      record {recoveryPointShortId(point)} · {recoveryPointTurnLabel(point)}
+                      {formatRecoveryPointDate(point.created_at)}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-xs text-text-muted">
+                    {recoveryPointPlacementLabel(point)}
+                  </span>
+                </summary>
+                <div className="ml-7 mt-2 grid gap-2 rounded-control bg-surface-muted/45 px-3 py-2.5 text-xs leading-5 text-text-muted sm:grid-cols-2">
+                  <div>
+                    <p className="font-medium text-text-secondary">Recorded</p>
+                    <p>{recoveryPointCoverageLabel(point)}</p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Boundary</p>
+                    <p>
+                      Work r{point.work_revision} · branch r{point.branch_revision} · graph r
+                      {point.graph_revision}
+                    </p>
+                    <p>
+                      Session turn {point.session_cursor.completed_turn} · binding generation {point.execution.binding_generation}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Available next</p>
+                    <p>{recoveryPointCapabilityLabel(point)}</p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Not included</p>
+                    <p>{recoveryPointMissingCoverageLabel(point)}</p>
+                  </div>
+                </div>
+              </details>
+            </li>
+          ))}
+        </ul>
+      )}
+      {points?.next_cursor ? (
+        <p className="text-xs leading-5 text-text-muted">
+          Showing the latest {points.points.length} saved points. Older points are available through the Work API.
+        </p>
+      ) : null}
+      <p className="text-xs leading-5 text-text-muted">
+        Restore and workspace migration are not available from these records yet.
+      </p>
+    </Card>
+  );
+}
+
+function recoveryPointStatusLabel(status: WorkRecoveryPointPageV1["points"][number]["status"]): string {
+  switch (status) {
+    case "captured":
+    case "ready":
+      return "Progress saved";
+    case "preparing":
+      return "Saving progress";
+    case "failed":
+      return "Save failed";
+    case "aborted":
+      return "Save stopped";
+  }
+  return "Progress state unavailable";
+}
+
+function recoveryPointTurnLabel(point: WorkRecoveryPointPageV1["points"][number]): string {
+  return point.session_cursor.completed_turn === 0
+    ? "Before the first committed turn"
+    : `${point.session_cursor.completed_turn} committed ${point.session_cursor.completed_turn === 1 ? "turn" : "turns"}`;
+}
+
+function recoveryPointShortId(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  return point.recovery_point_id.length > 16
+    ? `${point.recovery_point_id.slice(0, 15)}…`
+    : point.recovery_point_id;
+}
+
+function recoveryPointPlacementLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  return point.execution.placement === "edge" ? "Edge" : "Server";
+}
+
+function recoveryPointCoverageLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  const recorded = [
+    point.coverage.session_state && "conversation",
+    point.coverage.work_state && "Work state",
+    point.coverage.workspace && "workspace",
+    point.coverage.run_frontier && "run frontier",
+    point.coverage.artifacts && "artifacts",
+  ].filter(Boolean);
+  return recorded.length > 0 ? recorded.join(" · ") : "Nothing recorded";
+}
+
+function recoveryPointMissingCoverageLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  const missing = [
+    !point.coverage.workspace && "code/workspace files",
+    !point.coverage.run_frontier && "active run frontier",
+    !point.coverage.artifacts && "artifacts",
+  ].filter(Boolean);
+  return missing.length > 0 ? missing.join(" · ") : "None";
+}
+
+function recoveryPointCapabilityLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  if (point.capabilities.can_restore_conversation) {
+    return point.capabilities.can_continue_in_original_environment
+      ? "Conversation and original environment can continue"
+      : "Conversation can be restored after an environment check";
+  }
+  if (point.capabilities.requires_effect_review) {
+    return "Review unresolved external effects before continuing";
+  }
+  return "Use this as a progress reference; restore is not available yet";
+}
+
+function formatRecoveryPointDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf())
+    ? ""
+    : ` · ${ARCHIVE_DATE_FORMATTER.format(date)}`;
 }
 
 function ProposalDetail({

@@ -297,6 +297,123 @@ pub struct WorkExecutionSwitchOperationV1 {
     pub failure_code: Option<String>,
 }
 
+/// User-facing reason for recording one immutable progress boundary. The
+/// server may add more reasons for automatic boundaries later; clients must
+/// render the enum rather than infer behavior from its text.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRecoveryPointReasonV1 {
+    #[default]
+    UserRequested,
+    BeforeEnvironmentChange,
+    RunSettled,
+    SafeBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRecoveryPointStatusV1 {
+    Preparing,
+    Captured,
+    Ready,
+    Failed,
+    Aborted,
+}
+
+/// The portion of canonical state included in this progress record. A false
+/// value is an explicit gap, not an estimate that the content might exist.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCoverageV1 {
+    pub session_state: bool,
+    pub work_state: bool,
+    pub workspace: bool,
+    pub run_frontier: bool,
+    pub artifacts: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCapabilitiesV1 {
+    pub can_restore_conversation: bool,
+    pub can_continue_in_original_environment: bool,
+    pub has_portable_workspace: bool,
+    pub requires_target_environment_check: bool,
+    pub requires_effect_review: bool,
+}
+
+/// Safe public projection of the conversation boundary. The owner and opaque
+/// Session identity remain server-side; these counters and the content root
+/// are enough to explain what was recorded and to compare later points.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointSessionCursorV1 {
+    pub completed_turn: u32,
+    pub journal_event_seq: u64,
+    pub conversation_seq: u64,
+    pub canonical_root_hash: String,
+    pub compaction_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointExecutionV1 {
+    pub placement: WorkExecutionPlacementV1,
+    pub executor_id: String,
+    pub binding_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointViewV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub recovery_point_id: String,
+    pub request_id: String,
+    pub status: WorkRecoveryPointStatusV1,
+    pub reason: WorkRecoveryPointReasonV1,
+    pub created_at: String,
+    pub updated_at: String,
+    pub manifest_hash: String,
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub goal_revision: u64,
+    pub criteria_set_revision: u64,
+    pub session_cursor: WorkRecoveryPointSessionCursorV1,
+    pub execution: WorkRecoveryPointExecutionV1,
+    pub coverage: WorkRecoveryPointCoverageV1,
+    pub capabilities: WorkRecoveryPointCapabilitiesV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCaptureRequestV1 {
+    pub request_id: String,
+    pub expected_work_revision: u64,
+    pub expected_branch_revision: u64,
+    #[serde(default)]
+    pub reason: WorkRecoveryPointReasonV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCursorV1 {
+    pub created_at: String,
+    pub recovery_point_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointPageV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub points: Vec<WorkRecoveryPointViewV1>,
+    pub next_cursor: Option<WorkRecoveryPointCursorV1>,
+}
+
 #[cfg(feature = "server")]
 #[derive(Serialize)]
 #[serde(transparent)]
@@ -308,6 +425,15 @@ pub struct WorkObservationResponseV1(pub astra_services::work::WorkObservationRe
 pub struct WorkCatalogQueryV1 {
     pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub before_work_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointQueryV1 {
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_recovery_point_id: Option<String>,
     pub limit: Option<u16>,
 }
 

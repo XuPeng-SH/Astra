@@ -214,12 +214,13 @@ pub use proposal::{
 pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use recovery_point::{
     DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
+    WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointPage,
     WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
 };
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
-    WorkRepository, WorkRepositoryError,
+    WorkRecoveryPointBlocker, WorkRepository, WorkRepositoryError,
 };
 pub use runtime_event_outbox::{
     WorkRuntimeEventProjectionResult, project_pending_runtime_events,
