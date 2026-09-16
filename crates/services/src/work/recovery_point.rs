@@ -435,6 +435,18 @@ fn decode_record(
             })
         })
         .transpose()?;
+    let recovery_point_id = text("recovery_point_id")?;
+    if recovery_point_id.len() > RECOVERY_POINT_ID_MAX_BYTES
+        || recovery_point_id.is_empty()
+        || recovery_point_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(WorkRepositoryError::corrupt(
+            "Work recovery point",
+            std::io::Error::other("invalid recovery point identity"),
+        ));
+    }
     let manifest = optional_text("manifest_json")?
         .map(|value| {
             let manifest: RecoveryPointManifestV1 =
@@ -447,6 +459,7 @@ fn decode_record(
             if manifest.owner_id != owner_id.as_str()
                 || manifest.work_id != work_id.as_str()
                 || manifest.branch_id != branch_id.as_str()
+                || manifest.recovery_point_id != recovery_point_id
             {
                 return Err(WorkRepositoryError::corrupt(
                     "Work recovery point manifest",
@@ -473,18 +486,6 @@ fn decode_record(
         return Err(WorkRepositoryError::corrupt(
             "Work recovery point",
             std::io::Error::other("ready recovery point has no complete manifest"),
-        ));
-    }
-    let recovery_point_id = text("recovery_point_id")?;
-    if recovery_point_id.len() > RECOVERY_POINT_ID_MAX_BYTES
-        || recovery_point_id.is_empty()
-        || recovery_point_id
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        return Err(WorkRepositoryError::corrupt(
-            "Work recovery point",
-            std::io::Error::other("invalid recovery point identity"),
         ));
     }
     let created_at = super::repository::decode_timestamp(

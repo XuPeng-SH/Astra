@@ -154,8 +154,11 @@ pub async fn run_preflight(
     // for the harness so an owner-auth probe cannot be skipped merely because
     // the caller did not export the local development variables in its shell.
     dotenvy::dotenv().ok();
-    check_binary(astra_bin)?;
-    let readiness = check_server(astra_bin).await?;
+    // Model probes intentionally run from a disposable directory. Resolve the
+    // executable before changing CWD so a caller-provided `./target/debug/astra`
+    // remains executable during health, registration, retry, and cleanup.
+    let astra_bin = canonical_binary_path(astra_bin)?;
+    let readiness = check_server(&astra_bin).await?;
     if require_memoria {
         check_memoria_readiness(&readiness).await?;
     }
@@ -173,7 +176,7 @@ pub async fn run_preflight(
     let mut effective_profile = requested_profile.map(str::to_string);
     for model in models {
         effective_profile = check_model(
-            astra_bin,
+            &astra_bin,
             model,
             effective_profile.as_deref(),
             probe_workspace.path(),
@@ -196,6 +199,12 @@ fn check_binary(astra_bin: &Path) -> Result<(), PreflightError> {
         }
     }
     Ok(())
+}
+
+fn canonical_binary_path(astra_bin: &Path) -> Result<std::path::PathBuf, PreflightError> {
+    let canonical = std::fs::canonicalize(astra_bin).map_err(|_| PreflightError::BinaryNotFound)?;
+    check_binary(&canonical)?;
+    Ok(canonical)
 }
 
 async fn check_server(astra_bin: &Path) -> Result<ServerReadiness, PreflightError> {
@@ -658,6 +667,36 @@ mod tests {
             );
         }
         assert!(super::validate_health_probe(&vec![b' '; 65537], Some(0)).is_err());
+    }
+
+    #[test]
+    fn canonical_binary_path_survives_a_later_cwd_change() {
+        let current_dir = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&current_dir).unwrap();
+        let bin = dir.path().join("astra");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&bin, permissions).unwrap();
+        }
+        let relative = bin.strip_prefix(&current_dir).unwrap();
+        let canonical = super::canonical_binary_path(relative).unwrap();
+        assert!(canonical.is_absolute());
+        let other_cwd = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new(relative)
+                .current_dir(other_cwd.path())
+                .output()
+                .is_err()
+        );
+        let output = std::process::Command::new(&canonical)
+            .current_dir(other_cwd.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
     }
 
     use super::*;
