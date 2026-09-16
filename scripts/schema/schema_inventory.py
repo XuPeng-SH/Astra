@@ -1608,6 +1608,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::work",
         product_owner="Work runtime projection hot coordination and sequencing",
     ),
+    "work_recovery_points": TableMetadata(
+        semantic_owner="astra_services::work::recovery_point",
+        state_class="durable Work recovery capture and idempotency fact",
+        primary_query="recovery point by owner_id/work_id/branch_id/recovery_point_id, request_id, status, and created_at",
+        retention_policy="retain preparing and terminal capture records while recovery, artifact references, and audit need them; remove with the owning branch or Work cleanup policy",
+        rebuildability="not rebuildable during capture recovery because request identity, manifest hash, status, and Work/branch binding are authoritative",
+        merge_guidance="keep recovery captures separate from Work events, Run checkpoints, and Workspace content; this table records capture request state while canonical verification owns ready publication",
+        migration_owner="astra_services::work",
+        product_owner="Work recovery capture, idempotency, and branch cleanup",
+    ),
     "auth_reauthentication_proofs": TableMetadata(
         semantic_owner="astra_services::auth::reauthentication",
         state_class="durable reauthentication trust fact",

@@ -2,8 +2,9 @@ mod common;
 
 use astra_services::work::{
     DatabaseWorkBranchDeletionService, DatabaseWorkRepository, NewWorkRecoveryPoint,
-    WorkBranchDeletionRequest, WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkId,
-    WorkOwnerId, WorkRecoveryPointQuery, WorkRecoveryPointStatus, WorkRepository, WorkRevision,
+    WorkBranchDeletionRequest, WorkBranchId, WorkBranchRevision, WorkChangeRef,
+    WorkConflictResource, WorkId, WorkOwnerId, WorkRecoveryPointQuery, WorkRecoveryPointStatus,
+    WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use astra_turn_types::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointEnvironmentRequirementsV1,
@@ -162,11 +163,53 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
     };
     let record = repository
         .recovery_points()
-        .record_preparing(request)
+        .record_preparing(request.clone())
         .await
         .expect("record recovery capture");
     assert_eq!(record.status, WorkRecoveryPointStatus::Preparing);
     assert!(record.ready_at.is_none());
+
+    // A retry of the exact admitted request must return the same durable row,
+    // while reusing the request identity for a different manifest is a typed
+    // conflict rather than a second capture.
+    let replay = repository
+        .recovery_points()
+        .record_preparing(request.clone())
+        .await
+        .expect("replay recovery capture");
+    assert_eq!(replay, record);
+    let mut changed_request = request.clone();
+    changed_request.manifest.created_at = "2026-09-16T00:00:01Z".to_owned();
+    assert!(matches!(
+        repository
+            .recovery_points()
+            .record_preparing(changed_request)
+            .await,
+        Err(WorkRepositoryError::Conflict {
+            resource: WorkConflictResource::RecoveryPointRequest
+        })
+    ));
+
+    let replay_repository = repository.recovery_points();
+    let (left, right) = tokio::join!(
+        replay_repository.record_preparing(request.clone()),
+        replay_repository.record_preparing(request.clone()),
+    );
+    let left = left.expect("concurrent left replay");
+    let right = right.expect("concurrent right replay");
+    assert_eq!(left, record);
+    assert_eq!(right, record);
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_recovery_points
+         WHERE owner_id = ? AND work_id = ? AND recovery_point_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .bind(&record.recovery_point_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count replayed recovery rows");
+    assert_eq!(row_count, 1);
 
     let loaded = repository
         .recovery_points()
