@@ -428,7 +428,9 @@ dev-sdk-deps:
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
-	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ]; then \
+	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ] || \
+		[ -n "$$(find packages/sdk/src packages/sdk/package.json packages/sdk/tsconfig.json packages/sdk/tsup.config.ts \
+			-type f -newer packages/sdk/dist/index.js -print -quit 2>/dev/null)" ]; then \
 		echo "Building local @astra/sdk package..."; \
 		cd packages/sdk && npm run build; \
 	else \
