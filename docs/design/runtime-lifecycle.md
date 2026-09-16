@@ -182,8 +182,9 @@ referenced initial tasks must be delivered before the mutation is committed.
 The immutable establishment decision retains these triggers beyond establishment
 completion. Scheduling, including settlement's automatic successor allocation,
 must apply due mutations before selecting another task or declaring completion.
-Accepted proposals mark applied mutations, so recovery replays the same operation
-and item identities without repeating semantic admission. Settlement and resume
+Accepted graph revisions mark applied mutations, so recovery replays the same
+operation and item identities without repeating semantic admission even after
+terminal proposal rows leave the bounded proposal queue. Settlement and resume
 receipts publish the durable graph revision and canonical task states, including
 retired declarations, even when a mutation committed before replay. A failed
 post-commit receipt read resumes through `run_next_work_item`; its receipt must
@@ -199,8 +200,31 @@ sibling branches.
 `start_work` result separately reports declared task count and any already
 applied admission graph changes, so a server-applied addition or revision is
 visible as a completed change and is not proposed again by the model.
+The `settle_work_item` receipt narrows that field to the admission changes
+whose trigger was the exact settled attempt and item revision. That association
+is committed under the branch lock before reconciliation, so a crash between
+settlement and proposal application replays the same receipt instead of
+claiming an empty change set or attributing a later trigger's change to an
+earlier attempt. Resume and `run_next_work_item` receipts expose the bounded
+cumulative accepted set, while the settlement receipt remains an exact
+per-attempt explanation. If a pre-association accepted graph revision is
+recovered, the receipt says
+`applied_admission_mutation_attribution: "unavailable"` and publishes the
+cumulative set with `applied_admission_mutations_scope: "cumulative_recovery"`;
+it never guesses
+which current attempt caused that historical change.
+Terminal-cut recovery uses the same exact marker; a legacy accepted revision
+without one stays recoverable only through an explicit repair path and cannot
+silently assign terminal ownership to a current attempt.
 Initial-candidate references are not aliases for arbitrary later replacements;
 conflicting retirement/prerequisite lifetimes are rejected before establishment.
+
+The canonical schema now includes the durable trigger-association table and a
+composite `work_graph_revisions(owner_id, work_id, patch_ref, revision)` index.
+Fresh installations receive both from the schema manifest. Existing databases
+must add the table and index through the repository's schema migration process
+before deploying a binary that verifies this contract; `CREATE TABLE IF NOT
+EXISTS` and `CREATE INDEX` declarations are not an in-place upgrade mechanism.
 
 Tasks are durable work items projected into UI boards.
 
