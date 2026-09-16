@@ -425,7 +425,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 }
             }
         }
-        if let Some(cap) = &run.session {
+        let fallback_execution = run.session.as_ref().map(|cap| {
             s.push_str(&format!(
                 "    session: id={} events={} skipped={} tools_from_journal={:?}\n",
                 cap.session_id,
@@ -434,7 +434,6 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 cap.tools_invoked()
             ));
             let health = crate::pipeline_analysis::analyze_pipeline_health(cap);
-            let execution = run.execution.as_ref().unwrap_or(&health.execution);
             if health.turns_with_feedback > 0 {
                 if let Some(stable_prefix_coverage) = health.stable_prefix_cache_coverage {
                     s.push_str(&format!(
@@ -462,42 +461,53 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     ));
                 }
             }
-            if execution.total_tool_calls > 0 || !execution.evidence_complete {
-                if !execution.evidence_complete {
-                    s.push_str(&format!(
-                        "    execution: evidence=incomplete lower_bound=true skipped_lines={} dropped_lines={} integrity_errors={}\n",
-                        execution.skipped_lines,
-                        execution.dropped_lines,
-                        execution.integrity_errors,
-                    ));
-                }
+            health.execution
+        });
+        if let Some(execution) = run.execution.as_ref().or(fallback_execution.as_ref())
+            && (execution.total_tool_calls > 0 || !execution.evidence_complete)
+        {
+            let scope = match execution.scope {
+                crate::pipeline_analysis::ExecutionTraceScope::Session => "session",
+                crate::pipeline_analysis::ExecutionTraceScope::CaseAttempts => "case_attempts",
+            };
+            s.push_str(&format!(
+                "    execution: scope={scope} captures={}/{}\n",
+                execution.captured_capture_count, execution.expected_capture_count,
+            ));
+            if !execution.evidence_complete {
                 s.push_str(&format!(
-                    "    execution: tools={} executed={} success={} failed={} rejected={} reused={} suppressed={} deferred={} unknown={} unknown_disposition={}\n",
-                    execution.total_tool_calls,
-                    execution.executed_tool_calls,
-                    execution.successful_tool_calls,
-                    execution.failed_tool_calls,
-                    execution.rejected_tool_calls,
-                    execution.reused_tool_calls,
-                    execution.suppressed_tool_calls,
-                    execution.deferred_tool_calls,
-                    execution.unknown_outcome_tool_calls,
-                    execution.unknown_disposition_tool_calls,
+                    "    execution: evidence=incomplete lower_bound=true skipped_lines={} dropped_lines={} integrity_errors={}\n",
+                    execution.skipped_lines,
+                    execution.dropped_lines,
+                    execution.integrity_errors,
                 ));
-                if execution.settlement_attempts > 0 {
-                    s.push_str(&format!(
-                        "    execution: settlements={} success={} rejected={}\n",
-                        execution.settlement_attempts,
-                        execution.successful_settlements,
-                        execution.rejected_settlements,
-                    ));
-                }
-                for (reason, count) in &execution.runtime_rejection_reasons {
-                    s.push_str(&format!(
-                        "    execution: runtime_rejections={} × {}\n",
-                        count, reason
-                    ));
-                }
+            }
+            s.push_str(&format!(
+                "    execution: tools={} executed={} success={} failed={} rejected={} reused={} suppressed={} deferred={} unknown={} unknown_disposition={}\n",
+                execution.total_tool_calls,
+                execution.executed_tool_calls,
+                execution.successful_tool_calls,
+                execution.failed_tool_calls,
+                execution.rejected_tool_calls,
+                execution.reused_tool_calls,
+                execution.suppressed_tool_calls,
+                execution.deferred_tool_calls,
+                execution.unknown_outcome_tool_calls,
+                execution.unknown_disposition_tool_calls,
+            ));
+            if execution.settlement_attempts > 0 {
+                s.push_str(&format!(
+                    "    execution: settlements={} success={} rejected={}\n",
+                    execution.settlement_attempts,
+                    execution.successful_settlements,
+                    execution.rejected_settlements,
+                ));
+            }
+            for (reason, count) in &execution.runtime_rejection_reasons {
+                s.push_str(&format!(
+                    "    execution: runtime_rejections={} × {}\n",
+                    count, reason
+                ));
             }
         }
         // Diagnostic hints on FAIL — copy-paste debugging commands.
@@ -978,6 +988,26 @@ mod tests {
 
         assert!(out.contains("[WARN] token budget exceeded"));
         assert!(!out.contains("[FAIL] token budget exceeded"));
+    }
+
+    #[test]
+    fn text_report_shows_incomplete_execution_without_selected_session() {
+        let mut report = mk_report_passed();
+        report.runs[0].execution = Some(crate::pipeline_analysis::ExecutionTraceReport {
+            scope: crate::pipeline_analysis::ExecutionTraceScope::CaseAttempts,
+            expected_capture_count: 2,
+            captured_capture_count: 1,
+            total_tool_calls: 1,
+            executed_tool_calls: 1,
+            successful_tool_calls: 1,
+            evidence_complete: false,
+            ..Default::default()
+        });
+
+        let out = render(&report, Format::Text, false);
+        assert!(out.contains("execution: scope=case_attempts captures=1/2"));
+        assert!(out.contains("execution: evidence=incomplete"));
+        assert!(out.contains("execution: tools=1 executed=1 success=1"));
     }
 
     #[test]

@@ -82,6 +82,17 @@ pub struct PipelineHealthReport {
 /// execution or settlement counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionTraceReport {
+    /// The journal scope represented by these counters. A single session is
+    /// only the final/root session selected for a case; `case_attempts`
+    /// combines every captured root-attempt session.
+    #[serde(default)]
+    pub scope: ExecutionTraceScope,
+    /// Number of root-attempt sessions expected by the caller.
+    #[serde(default)]
+    pub expected_capture_count: u32,
+    /// Number of root-attempt sessions actually present in the projection.
+    #[serde(default)]
+    pub captured_capture_count: u32,
     /// Every de-duplicated tool record in the invocation-scoped journal,
     /// including records that were rejected or intentionally suppressed.
     pub total_tool_calls: u32,
@@ -133,6 +144,17 @@ pub struct ExecutionTraceReport {
     pub integrity_errors: u32,
 }
 
+/// Scope of an execution attribution projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTraceScope {
+    /// Counters for one selected session journal.
+    #[default]
+    Session,
+    /// Counters aggregated across every root attempt captured for a case.
+    CaseAttempts,
+}
+
 fn default_evidence_complete() -> bool {
     true
 }
@@ -140,6 +162,9 @@ fn default_evidence_complete() -> bool {
 impl Default for ExecutionTraceReport {
     fn default() -> Self {
         Self {
+            scope: ExecutionTraceScope::Session,
+            expected_capture_count: 0,
+            captured_capture_count: 0,
             total_tool_calls: 0,
             executed_tool_calls: 0,
             successful_tool_calls: 0,
@@ -320,7 +345,17 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
 /// `work_settlement_evidence_required`) rather than a broad journal category.
 pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport {
     let has_integrity_errors = capture.has_integrity_errors();
+    if capture.events.is_empty()
+        && capture.skipped_lines == 0
+        && capture.dropped_lines == 0
+        && !has_integrity_errors
+    {
+        return ExecutionTraceReport::default();
+    }
     let mut report = ExecutionTraceReport {
+        scope: ExecutionTraceScope::Session,
+        expected_capture_count: 1,
+        captured_capture_count: 1,
         evidence_complete: capture.skipped_lines == 0
             && capture.dropped_lines == 0
             && !has_integrity_errors,
@@ -402,6 +437,91 @@ pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport
             *report.runtime_rejection_reasons.entry(reason).or_default() += 1;
         }
     }
+    report
+}
+
+/// Aggregate execution attribution across the root-attempt sessions owned by
+/// one case. Each session is already de-duplicated by `journal_tool_calls`;
+/// duplicate session identities are rejected rather than counted twice.
+/// Missing captures are lower-bound evidence and therefore cannot certify the
+/// complete case projection.
+pub fn analyze_execution_traces<'a, I>(
+    captures: I,
+    expected_capture_count: usize,
+) -> ExecutionTraceReport
+where
+    I: IntoIterator<Item = &'a SessionCapture>,
+{
+    let mut report = ExecutionTraceReport {
+        scope: ExecutionTraceScope::CaseAttempts,
+        expected_capture_count: expected_capture_count.min(u32::MAX as usize) as u32,
+        captured_capture_count: 0,
+        evidence_complete: true,
+        ..ExecutionTraceReport::default()
+    };
+    let mut seen_sessions = std::collections::BTreeSet::new();
+    for capture in captures {
+        report.captured_capture_count = report.captured_capture_count.saturating_add(1);
+        if capture.session_id.trim().is_empty() || !seen_sessions.insert(capture.session_id.clone())
+        {
+            report.evidence_complete = false;
+            continue;
+        }
+        let session = analyze_execution_trace(capture);
+        report.total_tool_calls = report
+            .total_tool_calls
+            .saturating_add(session.total_tool_calls);
+        report.executed_tool_calls = report
+            .executed_tool_calls
+            .saturating_add(session.executed_tool_calls);
+        report.successful_tool_calls = report
+            .successful_tool_calls
+            .saturating_add(session.successful_tool_calls);
+        report.failed_tool_calls = report
+            .failed_tool_calls
+            .saturating_add(session.failed_tool_calls);
+        report.rejected_tool_calls = report
+            .rejected_tool_calls
+            .saturating_add(session.rejected_tool_calls);
+        report.reused_tool_calls = report
+            .reused_tool_calls
+            .saturating_add(session.reused_tool_calls);
+        report.suppressed_tool_calls = report
+            .suppressed_tool_calls
+            .saturating_add(session.suppressed_tool_calls);
+        report.deferred_tool_calls = report
+            .deferred_tool_calls
+            .saturating_add(session.deferred_tool_calls);
+        report.unknown_outcome_tool_calls = report
+            .unknown_outcome_tool_calls
+            .saturating_add(session.unknown_outcome_tool_calls);
+        report.unknown_disposition_tool_calls = report
+            .unknown_disposition_tool_calls
+            .saturating_add(session.unknown_disposition_tool_calls);
+        report.settlement_attempts = report
+            .settlement_attempts
+            .saturating_add(session.settlement_attempts);
+        report.successful_settlements = report
+            .successful_settlements
+            .saturating_add(session.successful_settlements);
+        report.rejected_settlements = report
+            .rejected_settlements
+            .saturating_add(session.rejected_settlements);
+        for (reason, count) in session.runtime_rejection_reasons {
+            report
+                .runtime_rejection_reasons
+                .entry(reason)
+                .and_modify(|existing| *existing = existing.saturating_add(count))
+                .or_insert(count);
+        }
+        report.evidence_complete &= session.evidence_complete;
+        report.skipped_lines = report.skipped_lines.saturating_add(session.skipped_lines);
+        report.dropped_lines = report.dropped_lines.saturating_add(session.dropped_lines);
+        report.integrity_errors = report
+            .integrity_errors
+            .saturating_add(session.integrity_errors);
+    }
+    report.evidence_complete &= report.captured_capture_count as usize == expected_capture_count;
     report
 }
 
@@ -703,6 +823,14 @@ fn render_execution_summary(report: &PipelineHealthReport, out: &mut String) {
     if execution.total_tool_calls == 0 && execution.evidence_complete {
         return;
     }
+    let scope = match execution.scope {
+        ExecutionTraceScope::Session => "session",
+        ExecutionTraceScope::CaseAttempts => "case_attempts",
+    };
+    out.push_str(&format!(
+        "  Execution scope: {scope} captures={}/{}\n",
+        execution.captured_capture_count, execution.expected_capture_count,
+    ));
     if !execution.evidence_complete {
         out.push_str(&format!(
             "  Execution evidence: incomplete (counts are lower bounds; skipped_lines={} dropped_lines={} integrity_errors={})\n",
@@ -1094,6 +1222,77 @@ mod tests {
         assert_eq!(report.execution.deferred_tool_calls, 1);
         assert_eq!(report.execution.unknown_disposition_tool_calls, 1);
         assert!(!report.execution.evidence_complete);
+    }
+
+    #[test]
+    fn execution_trace_aggregates_distinct_root_attempt_captures() {
+        let mut first = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "first-failed",
+                "ok": false,
+                "disposition": "executed"
+            }
+        ]))]);
+        first.session_id = "first-session".into();
+        let mut second = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "second-succeeded",
+                "ok": true,
+                "disposition": "executed"
+            }
+        ]))]);
+        second.session_id = "second-session".into();
+
+        let report = analyze_execution_traces([&first, &second], 2);
+        assert_eq!(report.scope, ExecutionTraceScope::CaseAttempts);
+        assert_eq!(report.captured_capture_count, 2);
+        assert_eq!(report.expected_capture_count, 2);
+        assert_eq!(report.total_tool_calls, 2);
+        assert_eq!(report.executed_tool_calls, 2);
+        assert_eq!(report.successful_tool_calls, 1);
+        assert_eq!(report.failed_tool_calls, 1);
+        assert!(report.evidence_complete);
+    }
+
+    #[test]
+    fn execution_trace_marks_missing_root_attempt_capture_incomplete() {
+        let mut first = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "first-failed",
+                "ok": false,
+                "disposition": "executed"
+            }
+        ]))]);
+        first.session_id = "first-session".into();
+
+        let report = analyze_execution_traces([&first], 2);
+        assert_eq!(report.captured_capture_count, 1);
+        assert_eq!(report.expected_capture_count, 2);
+        assert_eq!(report.total_tool_calls, 1);
+        assert!(!report.evidence_complete);
+    }
+
+    #[test]
+    fn execution_trace_rejects_duplicate_root_session_capture() {
+        let mut first = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "same-call",
+                "ok": true,
+                "disposition": "executed"
+            }
+        ]))]);
+        first.session_id = "same-session".into();
+        let mut duplicate = first.clone();
+        duplicate.events[0].raw["tool_calls"][0]["call_id"] = "different-call".into();
+
+        let report = analyze_execution_traces([&first, &duplicate], 2);
+        assert_eq!(report.captured_capture_count, 2);
+        assert_eq!(report.total_tool_calls, 1);
+        assert!(!report.evidence_complete);
     }
 
     #[test]

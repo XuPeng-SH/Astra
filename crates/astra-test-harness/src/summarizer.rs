@@ -71,6 +71,12 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                 "tools_used": r.outcome.tools_used,
                 "failure_class": r.failure_class.as_ref().map(|c| c.to_string()),
                 "execution": r.execution.as_ref().map(|execution| serde_json::json!({
+                    "scope": match execution.scope {
+                        crate::pipeline_analysis::ExecutionTraceScope::Session => "session",
+                        crate::pipeline_analysis::ExecutionTraceScope::CaseAttempts => "case_attempts",
+                    },
+                    "expected_capture_count": execution.expected_capture_count,
+                    "captured_capture_count": execution.captured_capture_count,
                     "total_tool_calls": execution.total_tool_calls,
                     "executed_tool_calls": execution.executed_tool_calls,
                     "successful_tool_calls": execution.successful_tool_calls,
