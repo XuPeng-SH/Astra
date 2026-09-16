@@ -402,6 +402,14 @@ async fn main() -> Result<()> {
             "--suite is required in CLI mode. Use --live-dashboard for the web console."
         )
     })?;
+    // Capture the source revision before reading case files. After the case
+    // matrix is assembled below, admission verifies that this exact source
+    // is still clean and current; only then may slow pre-flight probes run.
+    let workspace_source = if args.working_dir.is_none() {
+        astra_test_harness::workspace::source_snapshot_for_suite(suite_path)?
+    } else {
+        None
+    };
     let mut cases = Case::load_dir(suite_path)
         .with_context(|| format!("load cases from {}", suite_path.display()))?;
     if cases.is_empty() {
@@ -451,6 +459,15 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
     let mut runner_profile = args.profile.clone();
+
+    if let Some(ref snapshot) = workspace_source {
+        astra_test_harness::workspace::ensure_snapshot_unchanged(snapshot)?;
+        eprintln!(
+            "[astra-test] live Git suite will use one isolated worktree per execution job from {} at {}",
+            snapshot.repository_root().display(),
+            snapshot.revision()
+        );
+    }
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
@@ -515,6 +532,7 @@ async fn main() -> Result<()> {
         .with_fallback_models(fallback_models.clone())
         .with_required_memoria_subsystem_health();
     runner_cfg.working_dir = args.working_dir.clone();
+    runner_cfg.workspace_source = workspace_source;
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
     runner_cfg.cleanup_created_sessions = true;
