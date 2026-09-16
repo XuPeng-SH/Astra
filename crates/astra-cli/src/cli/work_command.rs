@@ -129,6 +129,7 @@ async fn run_work_turn(
             branch_id,
             &WorkBranchAttachRequestV1 {
                 request_id: request_id("attach"),
+                client_id: None,
             },
         )
         .await
@@ -192,6 +193,7 @@ async fn release_work_controller(
             branch_id,
             &WorkBranchAttachRequestV1 {
                 request_id: request_id("release-basis"),
+                client_id: None,
             },
         )
         .await

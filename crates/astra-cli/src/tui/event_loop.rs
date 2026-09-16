@@ -125,6 +125,10 @@ enum SlashBackgroundReadEffect {
         timeline: crate::tui::timeline::Timeline,
     },
     WorkExecution(Result<WorkExecutionSurface, WorkExecutionLoadError>),
+    WorkCatalog {
+        result: Result<astra_thin_client::WorkCatalogPageV1, String>,
+        cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
+    },
     ResumePicker(crate::tui::session_picker::SessionDiscovery),
     SessionHub {
         snapshot: Box<slash_dispatch::SessionHubSnapshot>,
@@ -524,6 +528,25 @@ fn dispatch_slash_background_read(
                 };
                 SlashBackgroundReadEffect::WorkExecution(result)
             }
+            slash_dispatch::SlashBackgroundRead::WorkCatalog {
+                api,
+                profile,
+                cursor,
+            } => {
+                let result = match crate::cli::session::session_runtime::fresh_access_token(
+                    &api,
+                    profile.as_deref(),
+                )
+                .await
+                {
+                    Some(token) => api
+                        .list_works(&token, cursor.as_ref(), 50)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => Err("Not logged in. Use /login to browse your Work.".to_string()),
+                };
+                SlashBackgroundReadEffect::WorkCatalog { result, cursor }
+            }
             slash_dispatch::SlashBackgroundRead::ResumePicker => {
                 match tokio::task::spawn_blocking(load_session_picker).await {
                     Ok(discovery) => SlashBackgroundReadEffect::ResumePicker(discovery),
@@ -888,6 +911,67 @@ fn apply_slash_background_read_effect(
                 )));
             }
         },
+        SlashBackgroundReadEffect::WorkCatalog { result, cursor } => match result {
+            Ok(page) if page.entries.is_empty() => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "No Work found for this account. Use `/work start <goal>` to create one.",
+                ));
+            }
+            Ok(page) => {
+                use crate::tui::bottom_pane::list_selection_view::{
+                    ListSelectionView, SelectionItem,
+                };
+                let mut items = page
+                    .entries
+                    .iter()
+                    .map(|entry| SelectionItem {
+                        name: entry.goal.clone(),
+                        description: Some(format_work_catalog_entry(entry)),
+                        is_current: false,
+                    })
+                    .collect::<Vec<_>>();
+                let mut results = page
+                    .entries
+                    .into_iter()
+                    .map(|entry| bottom_pane::view::ViewResult::WorkSelection {
+                        work_id: entry.work_id,
+                        branch_id: entry.delivery_branch_id,
+                        goal: entry.goal,
+                        graph_revision: entry.graph_revision,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(next_cursor) = page.next_cursor {
+                    items.push(SelectionItem {
+                        name: "Older Work".to_string(),
+                        description: Some("Show the next page of saved Work".to_string()),
+                        is_current: false,
+                    });
+                    results.push(bottom_pane::view::ViewResult::WorkCatalogNextPage {
+                        cursor: next_cursor,
+                    });
+                }
+                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                    if cursor.is_some() {
+                        "Opened older Work · choose a Work to observe"
+                    } else {
+                        "Opened Work hub · choose a Work to observe"
+                    },
+                ));
+                bottom_pane.push_view(Box::new(
+                    ListSelectionView::new(
+                        items,
+                        Some("Your Work · Enter observes selected Work (read-only)".to_string()),
+                    )
+                    .with_results(results)
+                    .with_footer_hint("↑↓ choose · type to filter · Enter observe · Esc close"),
+                ));
+            }
+            Err(error) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Work hub unavailable: {error}"
+                )));
+            }
+        },
         SlashBackgroundReadEffect::ResumePicker(discovery) => {
             if discovery.total() == 0 {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(
@@ -994,6 +1078,46 @@ fn apply_slash_background_read_effect(
                 "{action} failed: {error}"
             )));
         }
+    }
+}
+
+fn format_work_catalog_entry(entry: &astra_thin_client::WorkCatalogEntryV1) -> String {
+    let activity = match entry.delivery_branch_activity {
+        astra_thin_client::WorkBranchActivityV1::Working => "working",
+        astra_thin_client::WorkBranchActivityV1::Waiting => "waiting for you",
+        astra_thin_client::WorkBranchActivityV1::Paused => "paused",
+        astra_thin_client::WorkBranchActivityV1::Idle => "ready to continue",
+    };
+    if entry.pending_decision_count > 0 {
+        format!(
+            "{activity} · {} decision{} · {} task{}",
+            entry.pending_decision_count,
+            if entry.pending_decision_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+            entry.graph_item_count,
+            if entry.graph_item_count == 1 { "" } else { "s" },
+        )
+    } else if entry.unseen_event_count > 0 {
+        format!(
+            "{activity} · {} new update{} · {} task{}",
+            entry.unseen_event_count,
+            if entry.unseen_event_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+            entry.graph_item_count,
+            if entry.graph_item_count == 1 { "" } else { "s" },
+        )
+    } else {
+        format!(
+            "{activity} · {} task{} · up to date",
+            entry.graph_item_count,
+            if entry.graph_item_count == 1 { "" } else { "s" },
+        )
     }
 }
 
@@ -6082,6 +6206,13 @@ pub(crate) async fn run_tui_session(
                                             );
                                         }
                                         slash_dispatch::SlashResult::OpenWorkTasks => {
+                                            // `/work status` means the current
+                                            // conversation. If the user was
+                                            // observing a catalog Work, clear
+                                            // that read-only target before
+                                            // opening the session's board.
+                                            plan_task_observer
+                                                .rebind_session(state.session_id.as_deref());
                                             open_work_task_surface(
                                                 &task_board,
                                                 Some(&plan_task_observer),
@@ -8499,10 +8630,71 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
 
+                                    if let bottom_pane::view::ViewResult::WorkCatalogNextPage {
+                                        cursor,
+                                    } = &result
+                                    {
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::response(
+                                                "Loading older Work…",
+                                            ),
+                                        );
+                                        slash_background_read_count += 1;
+                                        dispatch_slash_background_read(
+                                            slash_dispatch::SlashBackgroundRead::WorkCatalog {
+                                                api: api.clone(),
+                                                profile: profile.map(str::to_owned),
+                                                cursor: Some(cursor.clone()),
+                                            },
+                                            slash_background_read_generation,
+                                            slash_background_read_tx.clone(),
+                                            &mut slash_background_read_tasks,
+                                        );
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // Work catalog result → observe the selected Work in the
+                                    // current task board. This is deliberately separate from
+                                    // Session resume: a fresh TUI can inspect Work created on
+                                    // Web or another Edge without silently changing its chat.
+                                    if let bottom_pane::view::ViewResult::WorkSelection {
+                                        work_id,
+                                        branch_id,
+                                        goal,
+                                        graph_revision,
+                                    } = &result
+                                    {
+                                        if plan_task_observer.select_work(
+                                            work_id,
+                                            branch_id,
+                                            *graph_revision,
+                                        ) {
+                                            task_board.reveal_completed_for_review();
+                                            board_user_pin = Some(true);
+                                            board_expanded = true;
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::response(
+                                                    format!(
+                                                        "Observing Work · {} · read-only",
+                                                        goal
+                                                    ),
+                                                ),
+                                            );
+                                            plan_task_observer.maybe_refresh();
+                                            frame_requester.schedule_frame();
+                                        } else {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "This Work selection was incomplete. Open `/work` and choose it again.",
+                                                ),
+                                            );
+                                        }
                                     // Session picker result → restore the selected session
                                     // in-place. Session selection has one product meaning:
                                     // resuming canonical server-owned work.
-                                    if let bottom_pane::view::ViewResult::Session {
+                                    } else if let bottom_pane::view::ViewResult::Session {
                                         session_id: name,
                                     } = &result {
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);

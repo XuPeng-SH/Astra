@@ -42,6 +42,20 @@ pub(crate) enum ViewResult {
         confirmed: bool,
     },
     Memory(MemorySelection),
+    /// Select a durable Work from the owner catalog for read-only observation.
+    /// This carries canonical ids rather than a rendered row label so a
+    /// filtered picker cannot attach the wrong Work.
+    WorkSelection {
+        work_id: String,
+        branch_id: String,
+        goal: String,
+        graph_revision: u64,
+    },
+    /// Continue the owner-scoped Work catalog without changing the current
+    /// conversation or selecting a Work implicitly.
+    WorkCatalogNextPage {
+        cursor: astra_thin_client::WorkCatalogCursorV1,
+    },
     InsertCommand(String),
 }
 
@@ -207,6 +221,13 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn prefer_esc_to_handle_key_event(&self) -> bool {
+        false
+    }
+
+    /// Whether a leading `/` should return focus to the composer and open the
+    /// global command palette. Text-entry views keep the slash for their own
+    /// input; read-only result views may opt in.
+    fn slash_reclaims_focus(&self) -> bool {
         false
     }
 

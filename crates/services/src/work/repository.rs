@@ -135,6 +135,8 @@ pub enum WorkRepositoryError {
     BranchActive,
     #[error("the Work branch has a durable deletion in progress")]
     BranchDeleting,
+    #[error("Work recovery point cannot be captured: {reason}")]
+    RecoveryPointNotCapturable { reason: &'static str },
     #[error("branch retention has a stale or incoherent {resource:?} basis")]
     StaleBranchRetention {
         resource: super::WorkBranchRetentionBasisResource,

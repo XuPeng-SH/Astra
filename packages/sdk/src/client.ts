@@ -270,6 +270,17 @@ function assertWorkRequestId(value: string): void {
   }
 }
 
+function assertWorkClientId(value: string): void {
+  const bytes = new TextEncoder().encode(value).length;
+  if (
+    bytes === 0 ||
+    bytes > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(value)
+  ) {
+    throw new TypeError("clientId must be non-empty, canonical, and at most 128 UTF-8 bytes");
+  }
+}
+
 function assertWorkExecutionExecutorId(value: string): void {
   if (
     value.length === 0 ||
@@ -1504,12 +1515,21 @@ export class AstraClient {
   async attachWorkBranch(
     workId: string,
     branchId: string,
-    input: { requestId: string },
+    input: { requestId: string; clientId?: string },
   ): Promise<WorkBranchAttachmentV1> {
     assertWorkRequestId(input.requestId);
+    if (input.clientId !== undefined) {
+      assertWorkClientId(input.clientId);
+    }
+    const body: { request_id: string; client_id?: string } = {
+      request_id: input.requestId,
+    };
+    if (input.clientId !== undefined) {
+      body.client_id = input.clientId;
+    }
     const raw = await this.post<unknown>(
       workBranchAttachmentsPath(workId, branchId),
-      { request_id: input.requestId },
+      body,
       { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
     );
     const attachment = decodeWorkBranchAttachmentV1(raw);

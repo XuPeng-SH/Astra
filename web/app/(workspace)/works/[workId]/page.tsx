@@ -1,7 +1,12 @@
 import { AstraApiError } from "@astra/sdk";
+import { cookies, headers } from "next/headers";
 import { notFound } from "next/navigation";
 import { WorkOverviewPage } from "@/components/app/work-overview-page";
 import { requireRuntimeClient } from "@/lib/runtime-client";
+import {
+  WEB_CLIENT_ID_COOKIE,
+  WEB_CLIENT_ID_HEADER,
+} from "@/lib/runtime-config";
 import {
   getWorkBranchPresentation,
   RequestedWorkBranchNotFound,
@@ -16,6 +21,16 @@ export default async function WorkPage({
 }) {
   const { workId } = await params;
   const requestedBranchId = (await searchParams)?.branch;
+  const requestHeaders = await headers();
+  const cookieStore = await cookies();
+  const forwardedClientId = requestHeaders.get(WEB_CLIENT_ID_HEADER);
+  const cookieClientId = cookieStore.get(WEB_CLIENT_ID_COOKIE)?.value;
+  const clientId =
+    (forwardedClientId && /^[A-Za-z0-9._:-]{1,128}$/u.test(forwardedClientId)
+      ? forwardedClientId
+      : cookieClientId && /^[A-Za-z0-9._:-]{1,128}$/u.test(cookieClientId)
+        ? cookieClientId
+        : crypto.randomUUID());
   const runtime = await requireRuntimeClient({
     auth: "required",
     operation: "open Work",
@@ -38,7 +53,11 @@ export default async function WorkPage({
     ] =
       await Promise.allSettled([
       runtime.sdk.attachWorkBranch(workId, branchId, {
-        requestId: `web-open:${crypto.randomUUID()}`,
+        // This page is refreshed as Work events arrive. Keep one logical
+        // read attachment for this Work/branch so each refresh renews the
+        // existing bounded slot instead of allocating another one.
+        requestId: `web-open:${clientId}:${workId}:${branchId}`,
+        clientId,
       }),
       runtime.sdk.getWorkBranchActivity(workId, branchId),
       runtime.sdk.getWorkBranchExecution(workId, branchId),

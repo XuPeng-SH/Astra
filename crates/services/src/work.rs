@@ -1360,7 +1360,7 @@ pub(crate) const WORK_RECOVERY_POINTS_CREATE_SQL: &str =
         owner_id, created_at, work_id, recovery_point_id
     ),
     CONSTRAINT chk_work_recovery_point_status CHECK (
-        status IN ('preparing', 'ready', 'failed', 'aborted')
+        status IN ('preparing', 'captured', 'ready', 'failed', 'aborted')
     ),
     CONSTRAINT chk_work_recovery_point_ready_shape CHECK (
         (status = 'ready'

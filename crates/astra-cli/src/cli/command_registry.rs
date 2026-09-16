@@ -420,8 +420,11 @@ const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
 // The bare command opens the agent workbench; `list` is only an alias.
 const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[];
-// The bare command opens the Work board; `status` is only an alias.
+// `/work` opens the owner's Work hub. `status` stays focused on the current
+// conversation's task board; discovery and execution are separate actions.
 const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "Browse Work from any device or session"),
+    ("status", "Show tasks for this conversation"),
     ("start", "Track this conversation as durable Work"),
     (
         "execution",
@@ -431,6 +434,7 @@ const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
 // The bare command opens the editor; `edit` is only an alias.
 const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
 const WORK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "Browse your durable Work"),
     ("start", "Track this conversation as durable Work"),
     ("status", "Open the canonical Work task board"),
 ];
@@ -1149,6 +1153,8 @@ mod tests {
         assert_eq!(
             work.visible_tui_subcommands(),
             [
+                ("list", "Browse Work from any device or session"),
+                ("status", "Show tasks for this conversation"),
                 ("start", "Track this conversation as durable Work"),
                 (
                     "execution",

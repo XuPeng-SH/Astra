@@ -1601,6 +1601,22 @@ impl BottomPane {
         if let Some(a) = self.handle_ctrl_keys(key) {
             return a;
         }
+        // A slash is an explicit command-palette gesture. Let it reclaim
+        // focus from a completed picker (for example `/work`'s catalog) so a
+        // user can immediately type `/model` or any other command without
+        // first guessing which close key the overlay expects. The picker is
+        // already a read-only action; closing it does not mutate Work.
+        if matches!(key.code, KeyCode::Char('/'))
+            && key.modifiers.is_empty()
+            && self
+                .active_view()
+                .is_some_and(|view| view.slash_reclaims_focus())
+        {
+            self.pop_active_view();
+            self.composer.set_text("/");
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
+        }
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }

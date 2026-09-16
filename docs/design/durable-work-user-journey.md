@@ -183,8 +183,10 @@ per projection and recover retention gaps with a bounded snapshot. They must
 not scan all events or rebuild the entire Work view for every task update. The
 owner-scoped Server activity read discovers Runs started by other surfaces; a
 local Web composer flag is not evidence that a Run is active. Each visible Work
-detail page polls one exact branch about every 1.2 seconds so a quiet page can
-discover a Run started elsewhere. The latest `/now` page refreshes its first
+detail page polls one exact branch about every 1.2 seconds and its Work event
+head about every 2 seconds while active (10 seconds while idle), so a quiet page
+can discover a Run started elsewhere and a Work started from TUI or another
+Edge can trigger a bounded server snapshot refresh. The latest `/now` page refreshes its first
 20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
 refresh remains bounded to its first page while a Run can change it. Hidden tabs
 pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
@@ -291,7 +293,13 @@ workspace safe.
   active task graphs refresh their first bounded page every 2 seconds even for
   TUI-originated Runs. Both
   loops pause in hidden tabs, add jitter, back off after errors, and avoid
-  overlapping requests. Load targets remain unmeasured.
+  overlapping requests. The Web page uses one stable read-attachment identity
+  per browser instance and Work/branch, and renews it on projection refresh, so
+  live updates do not consume a new attachment slot or inherit another
+  browser's controller. An expired attachment is replaced by a fresh
+  read-only generation without waiting for the janitor. Switching Work or
+  branch remounts the composer and closes only that browser stream; the durable
+  Server Run keeps its own lifecycle. Load targets remain unmeasured.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
@@ -326,10 +334,15 @@ workspace safe.
   fingerprints, canonical paths, content aggregates, file/blob digests,
   symlink boundaries, and MatrixOne Git4Data source references. The Work
   repository records owner-scoped, idempotent
-  `preparing` captures and removes them with branch cleanup. No caller-supplied
-  manifest is published as `ready`: a future canonical verifier must resolve
-  the Session/Run/binding facts and uploaded content first. This is the durable
-  capture contract, not yet cross-Edge migration or Server Run-owner recovery.
+  `preparing` captures and removes them with branch cleanup. A canonical
+  same-transaction verifier can now publish `captured` after it confirms the
+  current Work/branch revisions, immutable graph basis, Session context head,
+  quiescent invocation state, and execution binding. `captured` is a logical
+  boundary for observation only: it does not claim that a Workspace, Artifact,
+  or unfinished Run can be restored. No caller-supplied manifest is published
+  as `ready`; that state remains reserved for a future verifier that resolves
+  those durable payloads and effect receipts. This is still not cross-Edge
+  migration or Server Run-owner recovery.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

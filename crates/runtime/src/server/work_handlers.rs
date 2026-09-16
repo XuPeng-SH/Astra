@@ -56,6 +56,7 @@ use astra_server_types::{
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
+const WORK_CLIENT_ID_MAX_BYTES: usize = 128;
 const WORK_TURN_MESSAGE_MAX_BYTES: usize = 256 * 1024;
 const WORK_TASK_GRAPH_DEFAULT_ITEM_LIMIT: u16 = 8;
 const WORK_TASK_GRAPH_DEFAULT_DEPENDENCY_LIMIT: u16 = 128;
@@ -434,6 +435,14 @@ fn valid_work_request_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= WORK_REQUEST_ID_MAX_BYTES
         && !value.chars().any(char::is_control)
+}
+
+fn valid_work_client_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= WORK_CLIENT_ID_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn criteria_proposal_summary(
@@ -1410,6 +1419,19 @@ pub(super) async fn post_work_branch_attachment_handler(
             Vec::new(),
         ));
     }
+    if payload
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| !valid_work_client_id(client_id))
+    {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_attachment_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
     let owner_id = authenticated_work_owner(&state, &headers).await?;
     let work_id = WorkId::parse(work_id).map_err(|_| {
         work_error(
@@ -1467,12 +1489,25 @@ pub(super) async fn post_work_branch_attachment_handler(
         .await
         .map_err(map_work_attachment_coordinator_error)?
         .unwrap_or_default();
+    // A Web browser instance is a distinct observer. Keep its actor identity
+    // stable across Server replicas so a refresh renews that browser's
+    // attachment while another browser cannot inherit its controller claim.
+    let (actor_id, device_id) = payload
+        .client_id
+        .as_deref()
+        .map(|client_id| {
+            (
+                format!("web-client:{client_id}"),
+                Some(client_id.to_owned()),
+            )
+        })
+        .unwrap_or_else(|| (state.session_actor_id.clone(), None));
     let actor = astra_turn_types::ActorContextV1::owner_user(
         owner_id.as_str(),
-        state.session_actor_id.clone(),
+        actor_id,
         astra_turn_types::ActorKindV1::Server,
-        astra_turn_types::SessionSurfaceV1::Server,
-        None,
+        astra_turn_types::SessionSurfaceV1::Web,
+        device_id,
         authority_epochs,
     );
     let service = astra_services::DatabaseSessionHandoffService::new(pool, coordinator);
