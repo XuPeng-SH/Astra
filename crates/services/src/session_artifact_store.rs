@@ -2692,7 +2692,7 @@ async fn load_and_verify_content_chunks(
         });
     }
     chunks.sort_by_key(|chunk| chunk.chunk_index);
-    if let Err(error) = validate_content_chunk_refs(
+    validate_content_chunk_refs(
         &chunks
             .iter()
             .map(|chunk| SessionArtifactContentChunkV1 {
@@ -2701,9 +2701,7 @@ async fn load_and_verify_content_chunks(
                 byte_size: chunk.bytes.len() as u64,
             })
             .collect::<Vec<_>>(),
-    ) {
-        return Err(error);
-    }
+    )?;
     Ok(chunks)
 }
 
