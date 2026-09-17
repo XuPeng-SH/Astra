@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Shared helpers for validating the source identity reported by Astra /health.
 
 api_health_build_git_sha() {
