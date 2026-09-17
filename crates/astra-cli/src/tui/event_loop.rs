@@ -775,8 +775,23 @@ struct SlashBackgroundReadCompletion {
 }
 
 struct WorkStartCompletion {
-    session_id: String,
+    /// The Session that the Work promotion used. This is present even when
+    /// promotion failed after creating a Session, so the caller can keep the
+    /// usable Session instead of forcing a second invisible one on retry.
+    session_id: Option<String>,
+    requested_session_id: Option<String>,
+    attachment_epoch: u64,
     result: Result<serde_json::Value, String>,
+}
+
+/// A conversational submit held behind a pristine Work identity. Keep its
+/// attachment epoch outside BottomPane's ordinary next-turn queue so a later
+/// Session's turn settlement cannot consume it as a follow-up for the wrong
+/// conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWorkStartSubmission {
+    attachment_epoch: u64,
+    text: String,
 }
 
 fn work_start_request_id(session_id: &str, goal: &str) -> String {
@@ -791,6 +806,39 @@ fn work_start_request_id(session_id: &str, goal: &str) -> String {
     format!("tui-work-start-{:x}", digest.finalize())
 }
 
+async fn ensure_work_start_session(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        return Ok(session_id);
+    }
+    let raw = api
+        .post_sessions_json(
+            token,
+            &serde_json::json!({
+                "title": "Work",
+                "metadata": {
+                    "created_by": "tui_work_start"
+                }
+            }),
+        )
+        .await
+        .map_err(|error| format!("Could not create a durable Session: {error}"))?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .or_else(|| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "Session service returned no session identity".to_string())
+}
+
 fn dispatch_work_start(
     request: slash_dispatch::WorkStartRequest,
     effect_tx: tokio::sync::mpsc::Sender<WorkStartCompletion>,
@@ -802,29 +850,144 @@ fn dispatch_work_start(
             request.profile.as_deref(),
         )
         .await;
+        let requested_session_id = request.session_id.clone();
+        let attachment_epoch = request.attachment_epoch;
+        let mut session_id = None;
         let result = match token {
-            Some(token) => request
-                .api
-                .post_work_session_binding(
-                    &token,
-                    &request.session_id,
-                    &astra_thin_client::WorkCreateRequestV1 {
-                        request_id: work_start_request_id(&request.session_id, &request.goal),
-                        goal: request.goal,
-                        criteria: Vec::new(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string()),
+            Some(token) => {
+                // `/work start` is a first-class lifecycle action. A fresh
+                // TUI therefore creates its durable Session as part of this
+                // operation instead of requiring a throwaway chat message.
+                match ensure_work_start_session(&request.api, &token, request.session_id).await {
+                    Ok(created_session_id) => {
+                        session_id = Some(created_session_id);
+                        let session_id = session_id
+                            .as_deref()
+                            .expect("created Work Session identity is present");
+                        let goal = request.goal.clone();
+                        request
+                            .api
+                            .post_work_session_binding(
+                                &token,
+                                session_id,
+                                &astra_thin_client::WorkCreateRequestV1 {
+                                    request_id: work_start_request_id(session_id, &goal),
+                                    goal,
+                                    criteria: Vec::new(),
+                                },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             None => Err("Not logged in. Use /login.".to_string()),
         };
         let _ = effect_tx
             .send(WorkStartCompletion {
-                session_id: request.session_id,
+                session_id,
+                requested_session_id,
+                attachment_epoch,
                 result,
             })
             .await;
     });
+}
+
+/// A pristine TUI has no Session identity until its first conversational
+/// submit. While `/work start` is creating and binding that identity, a plain
+/// message must wait for the same attachment instead of racing the normal
+/// chat path and silently creating a second Session. Local slash actions and
+/// shell commands remain usable during the short handoff window.
+fn should_queue_work_start_submission(
+    text: &str,
+    runtime_notification_submission: bool,
+    work_start_in_flight: bool,
+    current_session_id: Option<&str>,
+    expected_attachment_epoch: Option<u64>,
+    current_attachment_epoch: u64,
+) -> bool {
+    if !work_start_in_flight
+        || current_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
+        || expected_attachment_epoch != Some(current_attachment_epoch)
+        || runtime_notification_submission
+    {
+        return false;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // `/plan <goal>` is a conversational submit despite its slash prefix.
+    // Other slash commands are local controls and should stay responsive so
+    // the user can inspect or explicitly switch Sessions while Work starts.
+    !trimmed.starts_with('/') || slash_plan_goal(trimmed).is_some()
+}
+
+/// Returns whether a pristine Work start still owns the sessionless identity.
+/// Background notifications must wait in this state: allowing one to enter the
+/// ordinary chat path would materialize a second Session before the Work
+/// Session is attached.
+fn work_start_identity_pending(
+    work_start_in_flight: bool,
+    current_session_id: Option<&str>,
+    expected_attachment_epoch: Option<u64>,
+    current_attachment_epoch: u64,
+) -> bool {
+    work_start_in_flight
+        && current_session_id.is_none_or(|session_id| session_id.trim().is_empty())
+        && expected_attachment_epoch == Some(current_attachment_epoch)
+}
+
+/// Move messages held behind a pristine Work start back into the ordinary
+/// submit lane. The first message is scheduled immediately once the Work
+/// Session is attached; the rest retain FIFO ordering in the existing
+/// follow-up queue. If the user has a draft, append the held messages instead
+/// of overwriting it or submitting under an unexpected Session.
+fn release_work_start_submissions(
+    pending: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    queued_followup_submissions: &mut VecDeque<String>,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    if bottom_pane.composer.is_empty() {
+        if let Some(first) = pending.pop_front() {
+            bottom_pane.composer.set_text(&first);
+            queued_followup_submissions.extend(pending.drain(..));
+            return true;
+        }
+    }
+
+    let restored = pending.drain(..).collect::<Vec<_>>().join("\n\n");
+    bottom_pane.restore_into_composer(&restored);
+    false
+}
+
+fn restore_work_start_submissions_after_scope_change(
+    pending: &mut VecDeque<PendingWorkStartSubmission>,
+    bottom_pane: &mut BottomPane,
+    current_attachment_epoch: u64,
+) -> usize {
+    let mut restored = Vec::new();
+    let mut retained = VecDeque::new();
+    while let Some(submission) = pending.pop_front() {
+        if submission.attachment_epoch == current_attachment_epoch {
+            retained.push_back(submission);
+        } else {
+            restored.push(submission.text);
+        }
+    }
+    *pending = retained;
+    if restored.is_empty() {
+        return 0;
+    }
+    bottom_pane.restore_into_composer(&restored.join("\n\n"));
+    restored.len()
 }
 
 /// Runs derived turn persistence in order. A turn's canonical journal event is
@@ -1724,7 +1887,7 @@ fn apply_slash_background_read_effect(
         SlashBackgroundReadEffect::WorkCatalog { result, cursor } => match result {
             Ok(page) if page.entries.is_empty() => {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(
-                    "No Work found for this account. Use `/work start <goal>` to create one.",
+                    "No tracked Work yet. Start one here with `/work start <goal>` — for example, `/work start Fix the flaky API test`.",
                 ));
             }
             Ok(page) => {
@@ -1762,18 +1925,20 @@ fn apply_slash_background_read_effect(
                 }
                 chat_widget.commit_system(history_cell::system::SystemCell::response(
                     if cursor.is_some() {
-                        "Opened older Work · choose a Work"
+                        "Opened older Work · choose a task to view or continue"
                     } else {
-                        "Opened Work hub · choose a Work"
+                        "Opened Work · choose a task to view or continue"
                     },
                 ));
                 bottom_pane.push_view(Box::new(
                     ListSelectionView::new(
                         items,
-                        Some("Your Work · Enter choose Observe or Continue".to_string()),
+                        Some("Your Work · choose a task, then View or Continue".to_string()),
                     )
                     .with_results(results)
-                    .with_footer_hint("↑↓ choose · type to filter · Enter actions · Esc close"),
+                    .with_footer_hint(
+                        "↑↓ choose · type to filter · Enter view actions · Esc close",
+                    ),
                 ));
             }
             Err(error) => {
@@ -6356,6 +6521,13 @@ pub(crate) async fn run_tui_session(
     let (work_start_tx, mut work_start_rx) = tokio::sync::mpsc::channel::<WorkStartCompletion>(2);
     let mut work_start_tasks = tokio::task::JoinSet::new();
     let mut work_start_in_flight = false;
+    // The epoch fences messages typed while a pristine `/work start` is
+    // establishing the conversation identity. They are released only if the
+    // user is still on that same sessionless attachment; an explicit switch
+    // keeps the messages visible as a draft instead of sending them to the
+    // wrong Session.
+    let mut work_start_attachment_epoch = None::<u64>;
+    let mut pending_work_start_submissions = VecDeque::<PendingWorkStartSubmission>::new();
     // A single ordered worker owns all derived persistence for completed
     // turns. The canonical journal fsync remains in the foreground turn;
     // workspace/checkpoint/CSL/telemetry projections never do.
@@ -6662,6 +6834,56 @@ pub(crate) async fn run_tui_session(
             }
             Some(completion) = work_start_rx.recv() => {
                 work_start_in_flight = false;
+                let expected_attachment_epoch = work_start_attachment_epoch.take();
+                let attachment_still_current = expected_attachment_epoch
+                    == Some(completion.attachment_epoch)
+                    && state.session_attachment_epoch == completion.attachment_epoch;
+                // Starting Work from a pristine TUI creates its Session on
+                // the server. Attach that identity only if the user is still
+                // on the same sessionless conversation; a concurrent explicit
+                // session switch must never be overwritten.
+                let mut attached_new_work_session = false;
+                if completion.requested_session_id.is_none()
+                    && attachment_still_current
+                    && state.session_id.is_none()
+                    && let Some(session_id) = completion.session_id.as_deref()
+                {
+                    state.set_session_id(session_id.to_string());
+                    crate::cli::session::session_startup::initialize_journal_pub(
+                        &mut state,
+                        session_id,
+                    );
+                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                    chat_widget = replay_session_into_widget(
+                        &mut guard,
+                        session_id,
+                        width,
+                        &api,
+                        profile,
+                        state.explain != crate::ExplainMode::Off,
+                    )
+                    .await;
+                    chat_widget.set_explain_verbose(matches!(
+                        state.explain,
+                        crate::ExplainMode::Verbose
+                    ));
+                    chat_widget.set_explain_live_rows(
+                        state.runtime_config.explain.effective_live_rows(),
+                    );
+                    rebind_workbench_observers(
+                        Some(session_id),
+                        &task_board,
+                        &server_agent_observer,
+                        &plan_task_observer,
+                        &mut board_user_pin,
+                    );
+                    attached_new_work_session = true;
+                }
+                let work_start_succeeded = completion.result.is_ok();
+                let work_is_current = attached_new_work_session
+                    || completion.session_id.as_deref().is_some_and(|session_id| {
+                        state.session_id.as_deref() == Some(session_id)
+                    });
                 match completion.result {
                     Ok(observation) => {
                         let work_id = observation
@@ -6670,10 +6892,15 @@ pub(crate) async fn run_tui_session(
                             .unwrap_or("Work");
                         chat_widget.commit_system(history_cell::system::SystemCell::response(
                             format!(
-                                "Work started · {work_id} · Ctrl+T tasks · Web → Now follows automatically"
+                                "Work started · {work_id}{}",
+                                if work_is_current {
+                                    "\nNext: describe the first step here, or use `/work status` to view its tasks. Web → Now follows automatically.".to_string()
+                                } else {
+                                    "\nIt stays attached to its original Session. Your current Session was left unchanged; use `/work` to observe or continue it.".to_string()
+                                }
                             ),
                         ));
-                        if state.session_id.as_deref() == Some(completion.session_id.as_str()) {
+                        if work_is_current {
                             board_user_pin = Some(true);
                             board_expanded = true;
                             if plan_task_observer.request_refresh() {
@@ -6694,14 +6921,102 @@ pub(crate) async fn run_tui_session(
                         }
                     }
                     Err(error) => {
-                        chat_widget.commit_system(history_cell::system::SystemCell::error(
-                            format!("Work could not start: {error}"),
+                        let message = if attached_new_work_session {
+                            format!(
+                                "Work could not start: {error}\nYour new Session is ready. Retry `/work start <goal>` to retry this exact conversation."
+                            )
+                        } else {
+                            format!("Work could not start: {error}")
+                        };
+                        chat_widget
+                            .commit_system(history_cell::system::SystemCell::error(message));
+                    }
+                }
+                // A user may press Enter while the pristine Work Session is
+                // being created. Release those messages only after the
+                // attachment decision above. Keep this queue separate from
+                // BottomPane's ordinary follow-up queue: a different Session
+                // may settle a normal turn before this lifecycle request
+                // completes, and must never consume Work-scoped input.
+                let pending_for_work = std::mem::take(&mut pending_work_start_submissions);
+                if !pending_for_work.is_empty() {
+                    let mut pending = VecDeque::new();
+                    let mut stale = Vec::new();
+                    for submission in pending_for_work {
+                        if submission.attachment_epoch == completion.attachment_epoch {
+                            pending.push_back(submission.text);
+                        } else {
+                            stale.push(submission.text);
+                        }
+                    }
+                    let auto_submit = work_start_succeeded && work_is_current && stale.is_empty();
+                    if !stale.is_empty() {
+                        bottom_pane.restore_into_composer(&stale.join("\n\n"));
+                        chat_widget.commit_system(history_cell::system::SystemCell::info(
+                            "A message queued for the previous Work Session was kept in the composer after the Session changed. Review it before sending.",
+                        ));
+                    }
+                    let scheduled = if auto_submit {
+                        release_work_start_submissions(
+                            &mut pending,
+                            &mut bottom_pane,
+                            &mut queued_followup_submissions,
+                        )
+                    } else {
+                        let restored = pending.drain(..).collect::<Vec<_>>().join("\n\n");
+                        bottom_pane.restore_into_composer(&restored);
+                        false
+                    };
+                    if scheduled {
+                        event_stream.push_front(TuiEvent::Key(
+                            crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Enter,
+                                crossterm::event::KeyModifiers::NONE,
+                            ),
+                        ));
+                        if !queued_followup_submissions.is_empty() {
+                            chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                "Your messages are queued and will be sent in order.".to_string(),
+                            ));
+                        }
+                    } else if !auto_submit {
+                        chat_widget.commit_system(history_cell::system::SystemCell::info(
+                            "Your message was kept in the composer because Work finished in another Session or needs a retry. Review it before sending.".to_string(),
+                        ));
+                    } else {
+                        chat_widget.commit_system(history_cell::system::SystemCell::info(
+                            "Your queued message was added below the draft. Review it, then press Enter to send it in this Work.",
                         ));
                     }
                 }
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 frame_requester.schedule_frame();
+            }
+            Some(work_start_task_result) = work_start_tasks.join_next(), if !work_start_tasks.is_empty() => {
+                // The worker normally reports a typed completion before it
+                // exits. A panic or task cancellation must still release the
+                // input gate; otherwise a pristine TUI would remain stuck in
+                // "starting" forever with no actionable error.
+                if let Err(error) = work_start_task_result {
+                    work_start_in_flight = false;
+                    work_start_attachment_epoch = None;
+                    let pending = std::mem::take(&mut pending_work_start_submissions)
+                        .into_iter()
+                        .map(|submission| submission.text)
+                        .collect::<Vec<_>>();
+                    if !pending.is_empty() {
+                        bottom_pane.restore_into_composer(
+                            &pending.into_iter().collect::<Vec<_>>().join("\n\n"),
+                        );
+                    }
+                    chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                        "Work start stopped before the Server replied: {error}. Your message is kept in the composer; retry `/work start <goal>` when ready.",
+                    )));
+                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                    flush_chat_widget(&mut guard, &mut chat_widget, width);
+                    frame_requester.schedule_frame();
+                }
             }
             Some(effect) = model_catalog_rx.recv() => {
                 model_catalog_loading = false;
@@ -6734,6 +7049,29 @@ pub(crate) async fn run_tui_session(
             }
             Some(ev) = event_stream.next() => {
                 let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
+                if runtime_notification_event
+                    && runtime_notification_turn_pending
+                    && work_start_identity_pending(
+                        work_start_in_flight,
+                        state.session_id.as_deref(),
+                        work_start_attachment_epoch,
+                        state.session_attachment_epoch,
+                    )
+                {
+                    // Keep the durable notification facts in SessionState,
+                    // but do not let this synthetic Enter materialize a
+                    // second Session while `/work start` owns the pristine
+                    // attachment. The normal wake path will retry after the
+                    // Work Session is attached (or after the user switches to
+                    // another explicit Session).
+                    release_runtime_notification_turn(
+                        &mut runtime_notification_turn_pending,
+                        &mut runtime_notification_wake_at,
+                        true,
+                        std::time::Instant::now(),
+                    );
+                    continue;
+                }
                 let ev = match ev {
                     TuiEvent::RuntimeNotificationTurn => TuiEvent::Key(
                         crossterm::event::KeyEvent::new(
@@ -6996,6 +7334,35 @@ pub(crate) async fn run_tui_session(
                                     }
                                 }
 
+                                if should_queue_work_start_submission(
+                                    &text,
+                                    runtime_notification_submission,
+                                    work_start_in_flight,
+                                    state.session_id.as_deref(),
+                                    work_start_attachment_epoch,
+                                    state.session_attachment_epoch,
+                                ) {
+                                    let preview = user_intent_preview(&text);
+                                    pending_work_start_submissions.push_back(
+                                        PendingWorkStartSubmission {
+                                            attachment_epoch: state.session_attachment_epoch,
+                                            text,
+                                        },
+                                    );
+                                    chat_widget.commit_system(
+                                        history_cell::system::SystemCell::info(format!(
+                                            "Work is starting · queued: {preview} · it will send automatically when its Session is ready.",
+                                        )),
+                                    );
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    finish_submission_feedback(
+                                        &mut bottom_pane,
+                                        &mut status_indicator,
+                                    );
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+
                                 let flush_submission_immediately =
                                     should_flush_submission_immediately(&text);
                                 // Persist the semantic submission, not merely the
@@ -7104,6 +7471,7 @@ pub(crate) async fn run_tui_session(
                                     // native slash action so the existing
                                     // replay path can observe a rebind.
                                     let pre_sid = state.session_id.clone();
+                                    let pre_attachment_epoch = state.session_attachment_epoch;
                                     let pre_plan_snapshot = (text.trim() == "/plan")
                                         .then(|| capture_plan_mode_ui_snapshot(&state));
                                     let mut dctx = slash_dispatch::DispatchContext {
@@ -7152,20 +7520,32 @@ pub(crate) async fn run_tui_session(
                                             );
                                         }
                                         slash_dispatch::SlashResult::OpenWorkTasks => {
-                                            // `/work status` means the current
-                                            // conversation. If the user was
-                                            // observing a catalog Work, clear
-                                            // that read-only target before
-                                            // opening the session's board.
-                                            plan_task_observer
-                                                .rebind_session(state.session_id.as_deref());
-                                            open_work_task_surface(
-                                                &task_board,
-                                                Some(&plan_task_observer),
-                                                &mut board_expanded,
-                                                &mut board_user_pin,
-                                                &frame_requester,
-                                            );
+                                            if state
+                                                .session_id
+                                                .as_deref()
+                                                .is_none_or(str::is_empty)
+                                            {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::info(
+                                                        "There is no current Work to show. Use `/work start <goal>` to begin one, or `/work` to choose an existing task.",
+                                                    ),
+                                                );
+                                            } else {
+                                                // `/work status` means the current
+                                                // conversation. If the user was
+                                                // observing a catalog Work, clear
+                                                // that read-only target before
+                                                // opening the session's board.
+                                                plan_task_observer
+                                                    .rebind_session(state.session_id.as_deref());
+                                                open_work_task_surface(
+                                                    &task_board,
+                                                    Some(&plan_task_observer),
+                                                    &mut board_expanded,
+                                                    &mut board_user_pin,
+                                                    &frame_requester,
+                                                );
+                                            }
                                         }
                                         slash_dispatch::SlashResult::OpenBackgroundTasks => {
                                             let _ = force_open_background_task_view(
@@ -7186,6 +7566,8 @@ pub(crate) async fn run_tui_session(
                                                 );
                                             } else {
                                                 work_start_in_flight = true;
+                                                work_start_attachment_epoch =
+                                                    Some(request.attachment_epoch);
                                                 dispatch_work_start(
                                                     *request,
                                                     work_start_tx.clone(),
@@ -7229,7 +7611,15 @@ pub(crate) async fn run_tui_session(
                                     // (resume/new-session paths), swap the
                                     // ChatWidget so its scrollback + persistence
                                     // attach to the restored session.
-                                    if state.session_id != pre_sid {
+                                    if state.session_id != pre_sid
+                                        || state.session_attachment_epoch != pre_attachment_epoch
+                                    {
+                                        let restored_work_submissions =
+                                            restore_work_start_submissions_after_scope_change(
+                                                &mut pending_work_start_submissions,
+                                                &mut bottom_pane,
+                                                state.session_attachment_epoch,
+                                            );
                                         // A completion captured for the old
                                         // session must never paint the new
                                         // session. Cancel the work and advance
@@ -7265,6 +7655,13 @@ pub(crate) async fn run_tui_session(
                                                 &server_agent_observer,
                                                 &plan_task_observer,
                                                 &mut board_user_pin,
+                                            );
+                                        }
+                                        if restored_work_submissions > 0 {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::info(
+                                                    "A message queued for the previous Work Session was kept in the composer after the Session changed. Review it before sending.",
+                                                ),
                                             );
                                         }
                                     }
@@ -9748,6 +10145,7 @@ pub(crate) async fn run_tui_session(
                                     } = &result {
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         let pre_sid = state.session_id.clone();
+                                        let pre_attachment_epoch = state.session_attachment_epoch;
                                         if let Err(error) = crate::cli::slash::slash_session::restore_session_into_state(
                                             &name,
                                             profile,
@@ -9762,13 +10160,24 @@ pub(crate) async fn run_tui_session(
                                                 )),
                                             );
                                         }
+                                        let session_rebound = state.session_id != pre_sid
+                                            || state.session_attachment_epoch != pre_attachment_epoch;
+                                        let restored_work_submissions = if session_rebound {
+                                            restore_work_start_submissions_after_scope_change(
+                                                &mut pending_work_start_submissions,
+                                                &mut bottom_pane,
+                                                state.session_attachment_epoch,
+                                            )
+                                        } else {
+                                            0
+                                        };
                                         // If the resume attached a new session
                                         // id, swap the ChatWidget to replay
                                         // that session's transcript. The
                                         // `replay_session_into_widget` helper
                                         // emits its own "resumed N cells"
                                         // banner — so no extra info line here.
-                                        if state.session_id != pre_sid
+                                        if session_rebound
                                             && let Some(ref new_sid) = state.session_id
                                             && !new_sid.is_empty()
                                         {
@@ -9787,6 +10196,13 @@ pub(crate) async fn run_tui_session(
                                                 &server_agent_observer,
                                                 &plan_task_observer,
                                                 &mut board_user_pin,
+                                            );
+                                        }
+                                        if restored_work_submissions > 0 {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::info(
+                                                    "A message queued for the previous Work Session was kept in the composer after the Session changed. Review it before sending.",
+                                                ),
                                             );
                                         }
                                     } else {
@@ -10379,6 +10795,12 @@ pub(crate) async fn run_tui_session(
                     && bottom_pane.composer.is_empty()
                     && !bottom_pane.has_active_view()
                     && !runtime_notification_turn_pending
+                    && !work_start_identity_pending(
+                        work_start_in_flight,
+                        state.session_id.as_deref(),
+                        work_start_attachment_epoch,
+                        state.session_attachment_epoch,
+                    )
                 {
                     runtime_notification_wake_at = None;
                     runtime_notification_turn_pending = true;
@@ -11905,6 +12327,163 @@ mod tests {
         assert!(first.starts_with("tui-work-start-"));
         assert!(first.len() <= 256);
     }
+
+    #[tokio::test]
+    async fn pristine_work_start_creates_a_session_without_a_chat_turn() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": "session-created-for-work"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let session_id = ensure_work_start_session(&api, "token", None)
+            .await
+            .expect("a pristine Work start should create its Session");
+        assert_eq!(session_id, "session-created-for-work");
+    }
+
+    #[tokio::test]
+    async fn work_start_reuses_an_existing_session_without_creating_another() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let session_id =
+            ensure_work_start_session(&api, "token", Some("session-already-bound".to_string()))
+                .await
+                .expect("an existing Session should be reused");
+        assert_eq!(session_id, "session-already-bound");
+    }
+
+    #[test]
+    fn pristine_work_start_queues_conversation_but_keeps_local_controls_responsive() {
+        assert!(should_queue_work_start_submission(
+            "inspect the branch",
+            false,
+            true,
+            None,
+            Some(4),
+            4,
+        ));
+        assert!(should_queue_work_start_submission(
+            "/plan inspect the branch",
+            false,
+            true,
+            None,
+            Some(4),
+            4,
+        ));
+        assert!(!should_queue_work_start_submission(
+            "/session",
+            false,
+            true,
+            None,
+            Some(4),
+            4,
+        ));
+        assert!(!should_queue_work_start_submission(
+            "inspect the branch",
+            false,
+            true,
+            Some("session-switched"),
+            Some(4),
+            5,
+        ));
+        assert!(!should_queue_work_start_submission(
+            "<runtime notification>",
+            true,
+            true,
+            None,
+            Some(4),
+            4,
+        ));
+    }
+
+    #[test]
+    fn runtime_notification_waits_for_pristine_work_identity() {
+        assert!(work_start_identity_pending(true, None, Some(7), 7));
+        assert!(work_start_identity_pending(true, Some(""), Some(7), 7));
+        assert!(!work_start_identity_pending(
+            true,
+            Some("session-t"),
+            Some(7),
+            7
+        ));
+        assert!(!work_start_identity_pending(true, None, Some(7), 8));
+        assert!(!work_start_identity_pending(false, None, Some(7), 7));
+    }
+
+    #[test]
+    fn work_start_messages_leave_the_queue_when_session_scope_changes() {
+        let mut pane = BottomPane::new();
+        pane.composer.set_text("draft in the new Session");
+        let mut pending = VecDeque::from([
+            PendingWorkStartSubmission {
+                attachment_epoch: 4,
+                text: "old Work instruction".into(),
+            },
+            PendingWorkStartSubmission {
+                attachment_epoch: 5,
+                text: "same scope instruction".into(),
+            },
+        ]);
+
+        let restored =
+            restore_work_start_submissions_after_scope_change(&mut pending, &mut pane, 5);
+
+        assert_eq!(restored, 1);
+        assert_eq!(
+            pane.composer.text(),
+            "draft in the new Session\n\nold Work instruction"
+        );
+        assert_eq!(
+            pending
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            vec!["same scope instruction"]
+        );
+    }
+
+    #[test]
+    fn work_start_release_preserves_fifo_and_draft_when_attachment_changes() {
+        let mut pane = BottomPane::new();
+        let mut pending = VecDeque::from([
+            "first instruction".to_string(),
+            "second instruction".to_string(),
+        ]);
+        let mut followups = VecDeque::new();
+
+        assert!(release_work_start_submissions(
+            &mut pending,
+            &mut pane,
+            &mut followups,
+        ));
+        assert_eq!(pane.composer.text(), "first instruction");
+        assert!(pending.is_empty());
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec!["second instruction"]
+        );
+
+        let mut switched_pane = BottomPane::new();
+        switched_pane.composer.set_text("new Session draft");
+        let mut switched_pending = VecDeque::from(["old Work instruction".to_string()]);
+        let mut switched_followups = VecDeque::new();
+        assert!(!release_work_start_submissions(
+            &mut switched_pending,
+            &mut switched_pane,
+            &mut switched_followups,
+        ));
+        assert_eq!(
+            switched_pane.composer.text(),
+            "new Session draft\n\nold Work instruction"
+        );
+        assert!(switched_followups.is_empty());
+    }
+
     use crate::background_task_error::BackgroundTaskError;
 
     use crate::cli::turn::local_run_control::LocalRunControl;

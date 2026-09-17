@@ -58,11 +58,16 @@ TUI.
 | `/tasks` | Open the live background task panel. |
 | `/agent` | Open the agent monitor for active and recent runs. |
 
-`/work` opens the canonical durable Work board. Use `/work start <goal>` to
-track the current conversation as durable Work; the conversation must have a
-saved session first. `/work status` remains accepted as an alias for the
-board. `/tasks` opens the live shell and local-agent task panel used by
-Shift+Down/Ctrl+B; it reuses the same session-bound registry and controls.
+`/work` opens the canonical durable Work board. Use `/work start <goal>` to track the
+current conversation as durable Work. If this TUI has not sent a message yet,
+the command creates and binds its durable Session automatically; no throwaway
+message or `/resume` is required. `/work status` remains accepted as an alias
+for the board. If you press Enter with a normal message while that first Work
+action is still starting, the message is shown in the queue and sent after the
+same Session is attached. A deliberate Session switch leaves the message in
+the composer for review instead of sending it to the wrong conversation. `/tasks`
+opens the live shell and local-agent task panel used by Shift+Down/Ctrl+B; it
+reuses the same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains
@@ -72,7 +77,7 @@ accepted as an alias for the monitor.
 
 | Command | What it does |
 | --- | --- |
-| `/explain [on\|verbose\|off]` | Show measured execution facts at the selected detail. A bare `/explain` is the idempotent `on` form. |
+| `/explain` | Cycle execution detail through off, on, and verbose. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |

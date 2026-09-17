@@ -38,7 +38,14 @@ pub(crate) enum SlashResult {
 pub(crate) struct WorkStartRequest {
     pub api: astra_thin_client::ThinClient,
     pub profile: Option<String>,
-    pub session_id: String,
+    /// A new TUI has no durable Session until its first turn. Starting Work
+    /// is itself a durable action, so the worker creates and binds one rather
+    /// than asking the user to send a meaningless message first.
+    pub session_id: Option<String>,
+    /// Attachment generation at the moment the user asked to start Work.
+    /// A completion from an earlier conversation must never adopt a Session
+    /// after the user has explicitly switched elsewhere.
+    pub attachment_epoch: u64,
     pub goal: String,
 }
 
@@ -427,7 +434,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         "/work" => match work_command_route(args) {
             WorkCommandRoute::Catalog => {
-                ctx.show_response("Loading your Work…".to_string());
+                ctx.show_response(
+                    "Loading Work… choose a task to view or continue, or use `/work start <goal>` to begin one."
+                        .to_string(),
+                );
                 SlashResult::background_read(SlashBackgroundRead::WorkCatalog {
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
@@ -447,7 +457,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then inspect Work execution."
+                        "This conversation has no Work yet. Use `/work start <goal>` to track it, or `/work` to choose an existing task; execution becomes available after a Work is selected."
                             .to_string(),
                     );
                     return SlashResult::Handled;
@@ -468,7 +478,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then save progress."
+                        "There is no Work checkpoint to save yet. Use `/work start <goal>` first, or `/work` to choose an existing task."
                             .to_string(),
                     );
                     return SlashResult::Handled;
@@ -482,28 +492,24 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 })
             }
             WorkCommandRoute::MissingGoal => {
-                ctx.show_error("Usage: /work start <goal>".to_string());
+                ctx.show_info(
+                    "Start a tracked task in this TUI. Example: `/work start Fix the flaky API test`"
+                        .to_string(),
+                );
                 SlashResult::Handled
             }
             WorkCommandRoute::Start(goal) => {
-                let Some(session_id) = ctx
-                    .state
-                    .session_id
-                    .as_deref()
-                    .filter(|session_id| !session_id.is_empty())
-                    .map(str::to_owned)
-                else {
-                    ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then start Work."
-                            .to_string(),
-                    );
-                    return SlashResult::Handled;
-                };
-                ctx.show_response("Starting Work…".to_string());
+                ctx.show_response("Starting tracked Work…".to_string());
                 SlashResult::StartWork(Box::new(WorkStartRequest {
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
-                    session_id,
+                    session_id: ctx
+                        .state
+                        .session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())
+                        .map(str::to_owned),
+                    attachment_epoch: ctx.state.session_attachment_epoch,
                     goal,
                 }))
             }
@@ -562,7 +568,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             WorkCommandRoute::Unsupported => {
                 ctx.show_error(
-                    "Usage: /work [list | status | execution | save | start <goal> | continue <work-id> <message> | retry <request-id>]".to_string(),
+                    "Usage: /work [start <goal> | list | status | continue <work-id> <message> | execution | save | retry <request-id>]".to_string(),
                 );
                 SlashResult::Handled
             }
