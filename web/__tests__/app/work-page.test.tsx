@@ -13,6 +13,7 @@ vi.mock("@/lib/work-overview", async (importOriginal) => {
 });
 
 import WorkPage from "@/app/(workspace)/works/[workId]/page";
+import { AstraApiError } from "@astra/sdk";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { getWorkBranchPresentation } from "@/lib/work-overview";
 
@@ -162,4 +163,93 @@ test("restores durable patch application progress for an alternative branch", as
     limit: 10,
   });
   expect(element.props.patchCommits).toBe(commits);
+});
+
+test("keeps the Work view usable when attachment rejects due to a stale Server", async () => {
+  const snapshot = { report: { overview: { work_id: "work-1" } } } as never;
+  const selectedBranch = { branch_id: "branch-1", is_delivery: true } as never;
+  const catalog = { branches: [selectedBranch] } as never;
+  const attachmentError = new AstraApiError(
+    400,
+    "invalid_work_attachment_request",
+    "/v1/works/work-1/branches/branch-1/attachments",
+    "invalid_work_attachment_request",
+  );
+  const sdk = {
+    attachWorkBranch: vi.fn().mockRejectedValue(attachmentError),
+    getWorkBranchActivity: vi.fn().mockResolvedValue(null),
+    getWorkBranchExecution: vi.fn().mockResolvedValue(null),
+    getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
+    listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
+    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
+    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
+    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+  } as never;
+  requireClient.mockResolvedValue({ sdk } as never);
+  loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
+
+  const element = await WorkPage({ params: Promise.resolve({ workId: "work-1" }) });
+
+  expect(element.props.attachment).toBeNull();
+  expect(element.props.attachmentNotice).toMatch(/Server rejected the read attachment request/u);
+});
+
+test("keeps a saved Work readable while a read attachment is temporarily unavailable", async () => {
+  const snapshot = { report: { overview: { work_id: "work-1" } } } as never;
+  const selectedBranch = { branch_id: "branch-1", is_delivery: true } as never;
+  const catalog = { branches: [selectedBranch] } as never;
+  const attachmentError = new AstraApiError(
+    503,
+    "work_attach_unavailable",
+    "/v1/works/work-1/branches/branch-1/attachments",
+    "work_attach_unavailable",
+    "availability",
+    true,
+  );
+  const sdk = {
+    attachWorkBranch: vi.fn().mockRejectedValue(attachmentError),
+    getWorkBranchActivity: vi.fn().mockResolvedValue(null),
+    getWorkBranchExecution: vi.fn().mockResolvedValue(null),
+    getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
+    listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
+    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
+    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
+    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+  } as never;
+  requireClient.mockResolvedValue({ sdk } as never);
+  loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
+
+  const element = await WorkPage({ params: Promise.resolve({ workId: "work-1" }) });
+
+  expect(element.props.attachment).toBeNull();
+  expect(element.props.attachmentNotice).toBeUndefined();
+});
+
+test("does not turn an attachment authentication error into a partial page", async () => {
+  const snapshot = { report: { overview: { work_id: "work-1" } } } as never;
+  const selectedBranch = { branch_id: "branch-1", is_delivery: true } as never;
+  const catalog = { branches: [selectedBranch] } as never;
+  const attachmentError = new AstraApiError(
+    401,
+    "authentication_required",
+    "/v1/works/work-1/branches/branch-1/attachments",
+    "authentication_required",
+    "authentication",
+  );
+  const sdk = {
+    attachWorkBranch: vi.fn().mockRejectedValue(attachmentError),
+    getWorkBranchActivity: vi.fn().mockResolvedValue(null),
+    getWorkBranchExecution: vi.fn().mockResolvedValue(null),
+    getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
+    listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
+    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
+    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
+    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+  } as never;
+  requireClient.mockResolvedValue({ sdk } as never);
+  loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
+
+  await expect(
+    WorkPage({ params: Promise.resolve({ workId: "work-1" }) }),
+  ).rejects.toBe(attachmentError);
 });
