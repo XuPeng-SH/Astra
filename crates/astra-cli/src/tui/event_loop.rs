@@ -23,7 +23,7 @@ use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use crossterm::style::Stylize;
 use tokio_stream::StreamExt;
 
-use super::app_event::TuiAppEvent;
+use super::app_event::{RestoreInputQueue, RestoreInputRequest, TuiAppEvent};
 use super::bottom_pane::view::BottomPaneViewAction;
 use super::bottom_pane::{BottomPane, BottomPaneAction, UserIntentRejectReason};
 use super::chat_widget::UserEvent;
@@ -3432,21 +3432,33 @@ fn reconcile_server_agent_observer(
     }
 }
 
-/// Stage an explicitly selected permission policy while a turn owns
-/// `SessionState`. The running turn retains the policy/tool surface it was
-/// assembled with; the event loop applies this UI intent only after the turn
-/// settles. Keeping it out of the active manager prevents a picker from
-/// pretending that an in-flight tool changed policy retroactively.
-fn stage_permission_mode_for_next_turn(
+/// Keep user intent visible until the exact server application acknowledgement.
+/// Cycling back to the active mode still submits a new request: an earlier
+/// request may already have been accepted by the server.
+fn stage_permission_mode_for_next_round(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     mode: crate::cli::permission_manager::PermissionMode,
+    _current_mode: crate::cli::permission_manager::PermissionMode,
 ) {
-    bottom_pane.stage_permission_mode_for_next_turn(mode);
+    bottom_pane.stage_permission_mode_for_next_round(mode);
     chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-        "{} · applies after the current turn",
+        "{} · requested for next model round",
         slash_dispatch::permission_mode_feedback(mode)
     )));
+}
+
+/// The pending selection is the cycle cursor; the applied policy remains
+/// authoritative until the ordered execution stream acknowledges this request.
+fn stage_cycled_permission_mode_for_active_turn(
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    current_mode: crate::cli::permission_manager::PermissionMode,
+) -> crate::cli::permission_manager::PermissionMode {
+    let cycle_cursor = bottom_pane.staged_permission_mode().unwrap_or(current_mode);
+    let next_mode = slash_dispatch::next_permission_mode_for_cycle(cycle_cursor);
+    stage_permission_mode_for_next_round(bottom_pane, chat_widget, next_mode, current_mode);
+    next_mode
 }
 
 #[derive(Clone)]
@@ -5043,6 +5055,73 @@ fn next_pending_deferred_slash_flush(result: &slash_dispatch::SlashResult) -> bo
 fn should_flush_ambient_commits(pending_deferred_slash_flush: bool) -> bool {
     !pending_deferred_slash_flush
 }
+
+fn turn_counter_delta(current: u64, baseline: u64) -> u64 {
+    current.saturating_sub(baseline)
+}
+
+fn take_restore_input_request(queue: &RestoreInputQueue) -> Option<RestoreInputRequest> {
+    queue.lock().ok()?.pop_front()
+}
+
+fn discard_restore_input_request(queue: &RestoreInputQueue, request: &RestoreInputRequest) {
+    if let Ok(mut pending) = queue.lock() {
+        pending.retain(|candidate| {
+            candidate.submission_id != request.submission_id
+                || candidate.session_id != request.session_id
+        });
+    }
+}
+
+fn apply_restore_input_request(
+    request: &RestoreInputRequest,
+    current_session_id: Option<&str>,
+    authorized_submission_id: Option<&str>,
+    bottom_pane: &mut BottomPane,
+    applied_submission_ids: &mut std::collections::HashSet<String>,
+) -> bool {
+    if let Some(authorized_submission_id) = authorized_submission_id {
+        if request.submission_id != authorized_submission_id {
+            tracing::debug!(
+                request_submission_id = %request.submission_id,
+                active_submission_id = %authorized_submission_id,
+                "ignored restore-input request for a different active submission"
+            );
+            return false;
+        }
+        // A fresh session is often assigned by the server from inside the
+        // active turn. In that case the turn-start snapshot is `None`; the
+        // submission identity above is the authority until the request
+        // settles. Once a session was already bound, keep the strict match.
+        if current_session_id.is_some() && request.session_id.as_deref() != current_session_id {
+            tracing::debug!(
+                request_session_id = ?request.session_id,
+                current_session_id = ?current_session_id,
+                submission_id = %request.submission_id,
+                "ignored active restore-input request for a different session"
+            );
+            return false;
+        }
+    } else if request.session_id.as_deref() != current_session_id {
+        tracing::debug!(
+            request_session_id = ?request.session_id,
+            current_session_id = ?current_session_id,
+            submission_id = %request.submission_id,
+            "ignored restore-input request for a different session"
+        );
+        return false;
+    }
+    if !applied_submission_ids.insert(request.submission_id.clone()) {
+        tracing::debug!(
+            submission_id = %request.submission_id,
+            "ignored duplicate restore-input request"
+        );
+        return false;
+    }
+    bottom_pane.restore_into_composer(&request.text);
+    true
+}
+
 fn refresh_footer_from_state(
     bottom_pane: &mut BottomPane,
     state: &crate::cli::session::session_state::SessionState,
@@ -5255,6 +5334,8 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    let restore_input_queue: RestoreInputQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
@@ -5524,6 +5605,10 @@ pub(crate) async fn run_tui_session(
     // User's explicit Ctrl+T choice. `None` = compact baseline;
     // `Some(true|false)` = honour the user's pin until the task list empties.
     let mut board_user_pin: Option<bool> = None;
+    // A rejected submission may be delivered through both the normal event
+    // lane and the reliable fallback queue. Keep one local idempotency set so
+    // a late duplicate cannot append the same draft twice.
+    let mut restored_input_submission_ids = std::collections::HashSet::new();
 
     frame_requester.schedule_frame();
 
@@ -5531,6 +5616,18 @@ pub(crate) async fn run_tui_session(
         guard
             .ensure_tui_modes()
             .map_err(|e| format!("failed to restore terminal input mode: {e}"))?;
+        if let Some(request) = take_restore_input_request(&restore_input_queue) {
+            if apply_restore_input_request(
+                &request,
+                state.session_id.as_deref(),
+                None,
+                &mut bottom_pane,
+                &mut restored_input_submission_ids,
+            ) {
+                frame_requester.schedule_frame();
+            }
+            continue;
+        }
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
 
@@ -5809,12 +5906,19 @@ pub(crate) async fn run_tui_session(
                             bottom_pane.handle_key(key)
                         };
                         match bottom_pane_action {
-                            BottomPaneAction::OpenPermissionModePicker => {
-                                bottom_pane.push_view(Box::new(
-                                    slash_dispatch::build_permission_mode_picker(
-                                        state.perm_manager.mode(),
-                                    ),
-                                ));
+                            BottomPaneAction::CyclePermissionMode => {
+                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                    state.perm_manager.mode(),
+                                );
+                                slash_dispatch::apply_permission_mode_selection(
+                                    &mut state,
+                                    &mut bottom_pane,
+                                    &mut chat_widget,
+                                    next_mode,
+                                );
+                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
@@ -6324,6 +6428,10 @@ pub(crate) async fn run_tui_session(
                                     let mut guidance_closure_deadline: Option<tokio::time::Instant> =
                                         None;
 
+                                    let mut permission_control = super::permission_control::ActivePermissionControl::new(
+                                        api.clone(), profile.map(str::to_owned), active_remote_run_id.clone(),
+                                        state.perm_manager.permission_control_signal(),
+                                    );
                                     let turn_result = {
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let delegation_engine_for_control =
@@ -6348,6 +6456,9 @@ pub(crate) async fn run_tui_session(
                                             state.active_work_registry.clone();
                                         let active_session_hub_snapshot =
                                             slash_dispatch::session_hub_snapshot(&state);
+                                        let turn_session_id = state.session_id.clone();
+                                        let turn_submission_id =
+                                            uuid::Uuid::now_v7().to_string();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
                                             api,
                                             profile,
@@ -6356,7 +6467,11 @@ pub(crate) async fn run_tui_session(
                                                 explain_analyze_terminal_degraded.as_ref(),
                                             ),
                                         };
-                                        let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
+                                        let mut tui_ui = ui_adapter::TuiUiAdapter::new(
+                                            tui_tx.clone(),
+                                            restore_input_queue.clone(),
+                                            turn_submission_id.clone(),
+                                        );
                                         // Authentication is part of the polled turn future, not
                                         // an await in the UI event handler. Slow refreshes therefore
                                         // leave transcript, composer, resize, and interrupt input
@@ -6387,6 +6502,20 @@ pub(crate) async fn run_tui_session(
                                         let mut turn_result_ready: Option<Result<(), String>> = None;
                                         let mut terminal_mode_closure_started = false;
                                         let r: Result<(), String> = loop {
+                                            if let Some(request) =
+                                                take_restore_input_request(&restore_input_queue)
+                                            {
+                                                if apply_restore_input_request(
+                                                    &request,
+                                                    turn_session_id.as_deref(),
+                                                    Some(&turn_submission_id),
+                                                    &mut bottom_pane,
+                                                    &mut restored_input_submission_ids,
+                                                ) {
+                                                    frame_requester.schedule_frame();
+                                                }
+                                                continue;
+                                            }
                                             if !terminal_mode_closure_started
                                                 && let Err(e) = guard.ensure_tui_modes()
                                             {
@@ -6563,19 +6692,6 @@ pub(crate) async fn run_tui_session(
                                                                 }
                                                                 None => {}
                                                             }
-                                                            // Shift+Tab opens the same explicit picker as
-                                                            // idle mode. Permission policies are not a
-                                                            // cycling dial, and a selected mode only applies
-                                                            // at the next safe turn boundary.
-                                                            if k.code == crossterm::event::KeyCode::BackTab {
-                                                                bottom_pane.push_view(Box::new(
-                                                                    slash_dispatch::build_permission_mode_picker(
-                                                                        perm_mode_mirror.current(),
-                                                                    ),
-                                                                ));
-                                                                frame_requester.schedule_frame();
-                                                                continue;
-                                                            }
                                                             if is_background_task_manage_key(&k) {
                                                                 let _ = force_open_background_task_view(
                                                                     &mut background_registry,
@@ -6743,6 +6859,15 @@ pub(crate) async fn run_tui_session(
                                                             // Ctrl+C interrupts.
                                                             bottom_pane.pre_draw_tick(std::time::Instant::now());
                                                             match bottom_pane.handle_key(k) {
+                                                                    BottomPaneAction::CyclePermissionMode => {
+                                                                        let mode = stage_cycled_permission_mode_for_active_turn(
+                                                                            &mut bottom_pane,
+                                                                            &mut chat_widget,
+                                                                            perm_mode_mirror.current(),
+                                                                        );
+                                                                        permission_control.request(mode);
+                                                                        frame_requester.schedule_frame();
+                                                                    }
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         match slash_dispatch::immediate_control(&queued_text) {
                                                                             Some(slash_dispatch::ImmediateControl::Exit) => {
@@ -7066,11 +7191,13 @@ pub(crate) async fn run_tui_session(
                                                                         result: Some(bottom_pane::view::ViewResult::Permission(mode)),
                                                                         ..
                                                                     } => {
-                                                                        stage_permission_mode_for_next_turn(
+                                                                        stage_permission_mode_for_next_round(
                                                                             &mut bottom_pane,
                                                                             &mut chat_widget,
                                                                             mode,
+                                                                            perm_mode_mirror.current(),
                                                                         );
+                                                                        permission_control.request(mode);
                                                                         frame_requester.schedule_frame();
                                                                     }
                                                                     BottomPaneAction::ViewCompleted {
@@ -7080,11 +7207,13 @@ pub(crate) async fn run_tui_session(
                                                                         }),
                                                                         ..
                                                                     } => {
-                                                                        stage_permission_mode_for_next_turn(
+                                                                        stage_permission_mode_for_next_round(
                                                                             &mut bottom_pane,
                                                                             &mut chat_widget,
                                                                             mode,
+                                                                            perm_mode_mirror.current(),
                                                                         );
+                                                                        permission_control.request(mode);
                                                                         frame_requester.schedule_frame();
                                                                     }
                                                                     BottomPaneAction::ViewCompleted {
@@ -7369,6 +7498,29 @@ pub(crate) async fn run_tui_session(
                                                     continue;
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
+                                                    if let TuiAppEvent::RestoreInput(request) = &ae {
+                                                        // A queue-full fallback may contain the
+                                                        // same request if a retry raced the normal
+                                                        // lane. Remove it before applying the event
+                                                        // so the draft is restored exactly once.
+                                                        discard_restore_input_request(
+                                                            &restore_input_queue,
+                                                            request,
+                                                        );
+                                                        if apply_restore_input_request(
+                                                            request,
+                                                            turn_session_id.as_deref(),
+                                                            Some(&turn_submission_id),
+                                                            &mut bottom_pane,
+                                                            &mut restored_input_submission_ids,
+                                                        ) {
+                                                            frame_requester.schedule_frame();
+                                                        }
+                                                        continue;
+                                                    }
+                                                    if let TuiAppEvent::SessionBound(session_id) = &ae {
+                                                        permission_control.bind_session(session_id);
+                                                    }
                                                     if let TuiAppEvent::RunBound(run_id) = &ae {
                                                         let mut bound = astra_core::sync_poison::recover_mutex_lock(
                                                             &active_remote_run_id,
@@ -7891,6 +8043,14 @@ pub(crate) async fn run_tui_session(
                                                     // here would clash. Catches turn-boundary
                                                     // pivots (e.g. exit_plan_mode → Auto) within
                                                     // one inner tick.
+                                                    if let Some(outcome) = permission_control.reconcile(&perm_mode_mirror) {
+                                                        match outcome {
+                                                            Ok(_) => bottom_pane.clear_staged_permission_mode(),
+                                                            Err(error) => {
+                                                                chat_widget.commit_system(history_cell::system::SystemCell::response(error));
+                                                            }
+                                                        }
+                                                    }
                                                     let live_mode = perm_mode_mirror.current();
                                                     if bottom_pane.footer.permission_mode
                                                         != Some(live_mode)
@@ -7936,6 +8096,10 @@ pub(crate) async fn run_tui_session(
                                         r
                                     };
 
+                                    if matches!(permission_control.reconcile(&perm_mode_mirror), Some(Ok(_))) {
+                                        bottom_pane.clear_staged_permission_mode();
+                                    }
+                                    drop(permission_control);
                                     if !deferred_active_bg_notifications.is_empty() {
                                         state
                                             .pending_bg_notifications
@@ -8066,10 +8230,26 @@ pub(crate) async fn run_tui_session(
                                     // current request's assembly and provider usage. A trace is
                                     // only a recovery fallback for paths that did not expose the
                                     // live context signals.
-                                    let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
-                                    let turn_completion = state.total_completion_tokens - pre_completion_tokens;
-                                    let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
-                                    let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
+                                    // A rejected admission, a session rebind, or a late recovery
+                                    // projection can leave a counter below the snapshot captured
+                                    // at turn start. Rendering a summary must never panic in that
+                                    // unhappy path; the delta is meaningful only while monotonic.
+                                    let turn_prompt = turn_counter_delta(
+                                        state.total_prompt_tokens,
+                                        pre_prompt_tokens,
+                                    );
+                                    let turn_completion = turn_counter_delta(
+                                        state.total_completion_tokens,
+                                        pre_completion_tokens,
+                                    );
+                                    let turn_cache_read = turn_counter_delta(
+                                        state.total_cache_read_tokens,
+                                        pre_cache_read,
+                                    );
+                                    let turn_cache_creation = turn_counter_delta(
+                                        state.total_cache_creation_tokens,
+                                        pre_cache_creation,
+                                    );
                                     // Keep fresh input separate from cache reads in TurnStats so
                                     // the renderer can show both total provider traffic and the
                                     // cache hit ratio without confusing either with context size.
@@ -8694,6 +8874,19 @@ pub(crate) async fn run_tui_session(
                 }
             }
             Some(ae) = tui_rx.recv() => {
+                if let TuiAppEvent::RestoreInput(request) = &ae {
+                    discard_restore_input_request(&restore_input_queue, request);
+                    if apply_restore_input_request(
+                        request,
+                        state.session_id.as_deref(),
+                        None,
+                        &mut bottom_pane,
+                        &mut restored_input_submission_ids,
+                    ) {
+                        frame_requester.schedule_frame();
+                    }
+                    continue;
+                }
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                 if apply_live_session_binding(
                     &ae,
@@ -9500,6 +9693,7 @@ fn handle_app_event(
         | TuiAppEvent::AgentLiveGap(_)
         | TuiAppEvent::AgentCommunication(_)
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::RestoreInput(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::Compaction(_)
@@ -9607,6 +9801,111 @@ mod tests {
         assert!(
             matches!(error, WorkExecutionLoadError::Request(message) if message.contains("404"))
         );
+    }
+
+    #[test]
+    fn turn_counter_delta_is_safe_when_recovery_rewinds_a_projection() {
+        assert_eq!(turn_counter_delta(12, 7), 5);
+        assert_eq!(
+            turn_counter_delta(7, 12),
+            0,
+            "a late session recovery must not panic summary rendering"
+        );
+    }
+
+    #[test]
+    fn restore_input_is_session_scoped_idempotent_and_preserves_new_draft() {
+        let mut pane = BottomPane::new();
+        let mut applied = std::collections::HashSet::new();
+        let request = RestoreInputRequest {
+            text: "rejected message".into(),
+            session_id: Some("session-a".into()),
+            submission_id: "submission-a".into(),
+        };
+
+        assert!(apply_restore_input_request(
+            &request,
+            Some("session-a"),
+            None,
+            &mut pane,
+            &mut applied,
+        ));
+        assert!(!apply_restore_input_request(
+            &request,
+            Some("session-a"),
+            None,
+            &mut pane,
+            &mut applied,
+        ));
+        assert_eq!(
+            pane.composer.text(),
+            "rejected message",
+            "duplicate delivery must not duplicate the draft"
+        );
+
+        let stale = RestoreInputRequest {
+            text: "stale session message".into(),
+            session_id: Some("session-old".into()),
+            submission_id: "submission-old".into(),
+        };
+        assert!(!apply_restore_input_request(
+            &stale,
+            Some("session-a"),
+            None,
+            &mut pane,
+            &mut applied,
+        ));
+        assert!(!pane.composer.text().contains("stale session message"));
+
+        pane.composer.set_text("new draft");
+        let later = RestoreInputRequest {
+            text: "another rejected message".into(),
+            session_id: Some("session-a".into()),
+            submission_id: "submission-b".into(),
+        };
+        assert!(apply_restore_input_request(
+            &later,
+            Some("session-a"),
+            None,
+            &mut pane,
+            &mut applied,
+        ));
+        let composer = pane.composer.text();
+        assert!(composer.contains("new draft"));
+        assert!(composer.contains("another rejected message"));
+    }
+
+    #[test]
+    fn active_restore_accepts_session_assigned_during_this_submission() {
+        let mut pane = BottomPane::new();
+        let mut applied = std::collections::HashSet::new();
+        let request = RestoreInputRequest {
+            text: "first message".into(),
+            session_id: Some("server-assigned-session".into()),
+            submission_id: "active-submission".into(),
+        };
+
+        assert!(apply_restore_input_request(
+            &request,
+            None,
+            Some("active-submission"),
+            &mut pane,
+            &mut applied,
+        ));
+        assert_eq!(pane.composer.text(), "first message");
+
+        let unrelated = RestoreInputRequest {
+            submission_id: "other-submission".into(),
+            ..request
+        };
+        assert!(!apply_restore_input_request(
+            &unrelated,
+            None,
+            Some("active-submission"),
+            &mut pane,
+            &mut applied,
+        ));
+        assert_eq!(pane.composer.text(), "first message");
     }
 
     fn explain_analyze_fact() -> astra_turn_types::ExplainAnalyzeEventV1 {
@@ -10450,10 +10749,11 @@ mod tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = chat_widget::ChatWidget::new("");
 
-        stage_permission_mode_for_next_turn(
+        stage_permission_mode_for_next_round(
             &mut bottom_pane,
             &mut chat_widget,
             crate::cli::permission_manager::PermissionMode::Auto,
+            state.perm_manager.mode(),
         );
 
         assert_eq!(
@@ -10462,8 +10762,168 @@ mod tests {
             "an active turn must retain the policy it was assembled with"
         );
         assert_eq!(
+            bottom_pane.footer.pending_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Auto),
+            "an active selection must be visible as a next-turn intent"
+        );
+        assert_eq!(
             bottom_pane.take_staged_permission_mode(),
             Some(crate::cli::permission_manager::PermissionMode::Auto)
+        );
+    }
+
+    #[test]
+    fn active_picker_selection_matching_live_mode_waits_for_ack() {
+        let current = crate::cli::permission_manager::PermissionMode::Prompt;
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+
+        stage_permission_mode_for_next_round(
+            &mut bottom_pane,
+            &mut chat_widget,
+            crate::cli::permission_manager::PermissionMode::Auto,
+            current,
+        );
+        assert_eq!(
+            bottom_pane.staged_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Auto)
+        );
+
+        // Returning to the live mode cannot cancel a request already accepted
+        // remotely. Keep the replacement intent pending until acknowledged.
+        stage_permission_mode_for_next_round(&mut bottom_pane, &mut chat_widget, current, current);
+        assert_eq!(bottom_pane.staged_permission_mode(), Some(current));
+        assert_eq!(bottom_pane.footer.pending_permission_mode(), Some(current));
+    }
+
+    #[test]
+    fn active_shift_tab_cycles_from_staged_mode_without_mutating_current_policy() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let mode_mirror = state.perm_manager.mode_mirror_handle();
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.composer.set_text("draft remains intact");
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        let action = bottom_pane.handle_key(key);
+        assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+        let first = stage_cycled_permission_mode_for_active_turn(
+            &mut bottom_pane,
+            &mut chat_widget,
+            mode_mirror.current(),
+        );
+        assert_eq!(
+            first,
+            crate::cli::permission_manager::PermissionMode::AcceptEdits
+        );
+
+        let action = bottom_pane.handle_key(key);
+        assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+        let second = stage_cycled_permission_mode_for_active_turn(
+            &mut bottom_pane,
+            &mut chat_widget,
+            mode_mirror.current(),
+        );
+        assert_eq!(second, crate::cli::permission_manager::PermissionMode::Plan);
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt,
+            "runtime cycling must not rewrite the policy of the active turn"
+        );
+        assert!(!bottom_pane.has_active_view());
+        assert_eq!(bottom_pane.composer.text(), "draft remains intact");
+        assert_eq!(
+            bottom_pane.staged_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Plan)
+        );
+        assert_eq!(
+            bottom_pane.footer.pending_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Plan),
+            "the footer must expose the pending next-turn selection while the turn runs"
+        );
+
+        let staged = bottom_pane
+            .take_staged_permission_mode()
+            .expect("the selected mode must remain pending until settlement");
+        assert_eq!(
+            bottom_pane.footer.pending_permission_mode(),
+            None,
+            "settlement must clear the pending presentation before applying the policy"
+        );
+        slash_dispatch::apply_permission_mode_selection(
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+            staged,
+        );
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Plan
+        );
+    }
+
+    #[test]
+    fn active_shift_tab_cycles_through_bypass_and_waits_for_exact_ack() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let mode_mirror = state.perm_manager.mode_mirror_handle();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        for _ in 0..4 {
+            assert!(matches!(
+                bottom_pane.handle_key(key),
+                BottomPaneAction::CyclePermissionMode
+            ));
+            stage_cycled_permission_mode_for_active_turn(
+                &mut bottom_pane,
+                &mut chat_widget,
+                mode_mirror.current(),
+            );
+        }
+        assert_eq!(
+            bottom_pane.staged_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Bypass)
+        );
+
+        assert!(matches!(
+            bottom_pane.handle_key(key),
+            BottomPaneAction::CyclePermissionMode
+        ));
+        let returned = stage_cycled_permission_mode_for_active_turn(
+            &mut bottom_pane,
+            &mut chat_widget,
+            mode_mirror.current(),
+        );
+        assert_eq!(
+            returned,
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
+        assert_eq!(
+            bottom_pane.staged_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Prompt),
+            "cycling back must supersede any previously accepted request"
+        );
+        assert_eq!(
+            bottom_pane.footer.pending_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Prompt),
+            "the status line keeps the request visible until acknowledged"
+        );
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt
         );
     }
 
@@ -10511,7 +10971,7 @@ mod tests {
         let mut state = crate::cli::session::session_state::SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = chat_widget::ChatWidget::new("");
-        bottom_pane.stage_permission_mode_for_next_turn(
+        bottom_pane.stage_permission_mode_for_next_round(
             crate::cli::permission_manager::PermissionMode::Auto,
         );
 

@@ -56,6 +56,21 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
     }
 }
 
+/// Return the next mode for the low-friction Shift+Tab cycle.
+///
+/// The shortcut is an explicit user policy selection, including Bypass.
+/// Deny stays sticky; leaving it requires an explicit mode selection.
+pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
+    match current {
+        PermissionMode::Deny => PermissionMode::Deny,
+        PermissionMode::Prompt => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::Auto,
+        PermissionMode::Auto => PermissionMode::Bypass,
+        PermissionMode::Bypass => PermissionMode::Prompt,
+    }
+}
+
 pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
     mode.chip_text()
 }
@@ -157,7 +172,10 @@ fn print_permission_mode(mode: PermissionMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PermissionCommandAction, handle_permission_command, parse_permission_command};
+    use super::{
+        PermissionCommandAction, handle_permission_command, next_permission_mode_for_cycle,
+        parse_permission_command,
+    };
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::plan;
@@ -231,6 +249,34 @@ mod tests {
         assert_eq!(
             parse_permission_command("trace --export"),
             PermissionCommandAction::MissingTraceExport
+        );
+    }
+
+    #[test]
+    fn permission_mode_cycle_includes_bypass_and_keeps_deny_sticky() {
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Prompt),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Plan),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Auto),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Bypass),
+            PermissionMode::Prompt
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Deny),
+            PermissionMode::Deny
         );
     }
 

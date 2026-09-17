@@ -1289,17 +1289,35 @@ impl BottomPane {
         self.skill_popup = None;
     }
 
-    pub(crate) fn stage_permission_mode_for_next_turn(
+    pub(crate) fn stage_permission_mode_for_next_round(
         &mut self,
         mode: crate::cli::permission_manager::PermissionMode,
     ) {
         self.staged_permission_mode = Some(mode);
+        self.footer.set_pending_permission_mode(mode);
+    }
+
+    /// Clear a pending selection after acknowledgement or response settlement.
+    pub(crate) fn clear_staged_permission_mode(&mut self) {
+        self.staged_permission_mode = None;
+        self.footer.clear_pending_permission_mode();
+    }
+
+    /// Peek at the requested policy without consuming it.
+    /// Repeated runtime shortcuts use this value as their cycle cursor while
+    /// the currently executing round keeps its captured policy.
+    pub(crate) fn staged_permission_mode(
+        &self,
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
+        self.staged_permission_mode
     }
 
     pub(crate) fn take_staged_permission_mode(
         &mut self,
     ) -> Option<crate::cli::permission_manager::PermissionMode> {
-        self.staged_permission_mode.take()
+        let mode = self.staged_permission_mode.take();
+        self.footer.clear_pending_permission_mode();
+        mode
     }
 
     fn close_mention(&mut self) {
@@ -1433,9 +1451,6 @@ impl BottomPane {
     }
 
     /// Move focus within the pending-approval queue.
-    pub fn move_approval_focus_up(&mut self) {
-        self.approval_queue.move_focus_up();
-    }
     pub fn move_approval_focus_down(&mut self) {
         self.approval_queue.move_focus_down();
     }
@@ -1628,7 +1643,7 @@ impl BottomPane {
             return a;
         }
         if key.code == KeyCode::BackTab {
-            return BottomPaneAction::OpenPermissionModePicker;
+            return BottomPaneAction::CyclePermissionMode;
         }
         self.route_to_composer(key)
     }
@@ -1769,10 +1784,6 @@ impl BottomPane {
             KeyCode::Esc if self.composer.is_empty() => Some(BottomPaneAction::Consumed),
             KeyCode::Tab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
                 self.move_approval_focus_down();
-                Some(BottomPaneAction::Consumed)
-            }
-            KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
-                self.move_approval_focus_up();
                 Some(BottomPaneAction::Consumed)
             }
             _ => None,
@@ -1978,7 +1989,8 @@ impl BottomPane {
     }
 
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
-        let mut changed = false;
+        let mut changed = self.approval_queue.prune_closed() > 0;
+        self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
@@ -2418,10 +2430,10 @@ pub(crate) enum BottomPaneAction {
     /// editor here would stop polling that turn, so the dispatcher must show a
     /// non-blocking explanation instead.
     ExternalEditorUnavailable,
-    /// Request the explicit permission-mode picker. Permission modes encode
-    /// distinct capability/consent policies, so keyboard navigation must
-    /// never silently advance through them as if they were one dial.
-    OpenPermissionModePicker,
+    /// Cycle the everyday permission policies. The event loop applies the
+    /// action immediately while idle, or stages it for the next safe turn
+    /// boundary while a turn is running.
+    CyclePermissionMode,
     ViewCompleted {
         result: Option<view::ViewResult>,
         reopen: Option<String>,

@@ -1387,12 +1387,23 @@ pub(crate) fn permission_mode_feedback(
     crate::cli::permission_command::permission_mode_feedback(mode)
 }
 
+pub(crate) fn next_permission_mode_for_cycle(
+    current: crate::cli::permission_manager::PermissionMode,
+) -> crate::cli::permission_manager::PermissionMode {
+    crate::cli::permission_command::next_permission_mode_for_cycle(current)
+}
+
 pub(crate) fn apply_permission_mode_selection(
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     mode: crate::cli::permission_manager::PermissionMode,
 ) {
+    // Applying a mode is the ownership boundary for any active-turn staged
+    // intent. Clear both the queue and its status-line projection before
+    // publishing the new live policy so one frame cannot show stale pending
+    // state after settlement.
+    bottom_pane.clear_staged_permission_mode();
     state.perm_manager.set_mode(mode);
     crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
     let released = bottom_pane.reevaluate_approvals_for_mode(mode);
