@@ -664,6 +664,11 @@ impl BottomPane {
         std::mem::take(&mut self.queued_next_turn_submissions)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_user_intent_count(&self) -> usize {
+        self.pending_user_intents.len()
+    }
+
     fn has_pending_user_intents(&self) -> bool {
         !self.pending_user_intents.is_empty()
     }
@@ -2111,9 +2116,9 @@ impl BottomPane {
             return;
         };
         use crate::tui::history_cell::HistoryCell;
-        use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_terminal};
+        use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_buffer};
         use ratatui::widgets::{Widget, Wrap};
-        let lines = sanitize_lines_for_terminal(cell.display_lines(area.width));
+        let lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
         FullRowParagraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);

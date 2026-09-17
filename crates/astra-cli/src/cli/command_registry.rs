@@ -202,6 +202,18 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("tools", "Tool performance: calls, timing, success rate"),
 ];
 
+const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("on", "Show concise measured execution facts"),
+    (
+        "verbose",
+        "Include context, dependency, and coverage details",
+    ),
+    (
+        "off",
+        "Hide explain output while retaining durable evidence",
+    ),
+];
+
 const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[("log", "Server-owned sync log hint")];
 
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -583,12 +595,22 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_arg_hint("[start <goal>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
+    CommandMeta::new(
+        "/tasks",
+        "Open the live background task panel",
+        CommandGroup::Work,
+    )
+    .with_usage_examples(&["tasks"])
+    .with_tui_route(TuiCommandRoute::Native),
     // ── Inspect and settings ───────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
-        "Cycle execution detail: off, on, or verbose",
+        "Show measured execution facts (on, verbose, or off)",
         CommandGroup::Inspect,
     )
+    .with_subcommands(EXPLAIN_SUBCOMMANDS)
+    .with_arg_hint("[on|verbose|off]")
+    .with_usage_examples(&["explain", "explain verbose", "explain off"])
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/compact",
@@ -1135,6 +1157,11 @@ mod tests {
             ]
         );
 
+        let tasks = resolve_command_meta("/tasks").expect("tasks command registered");
+        assert_eq!(tasks.tui_route, TuiCommandRoute::Native);
+        assert!(tasks.visible_tui_subcommands().is_empty());
+        assert_eq!(tasks.arg_hint, None);
+
         let config = resolve_command_meta("/config").expect("config command registered");
         assert!(config.visible_tui_subcommands().is_empty());
     }
@@ -1321,6 +1348,7 @@ mod tests {
                 "/plan",
                 "/memory",
                 "/work",
+                "/tasks",
                 "/explain",
                 "/reflect",
                 "/inspect",

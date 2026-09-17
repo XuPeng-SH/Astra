@@ -55,11 +55,14 @@ TUI.
 | `/stop` | Stop the active run. |
 | `/plan` | Enter or exit plan mode, then describe the plan in the composer. |
 | `/work` | Open the Work board or start durable work. |
+| `/tasks` | Open the live background task panel. |
 | `/agent` | Open the agent monitor for active and recent runs. |
 
-`/work` opens the canonical task board. Use `/work start <goal>` to track the
-current conversation as durable Work; the conversation must have a saved
-session first. `/work status` remains accepted as an alias for the board.
+`/work` opens the canonical durable Work board. Use `/work start <goal>` to
+track the current conversation as durable Work; the conversation must have a
+saved session first. `/work status` remains accepted as an alias for the
+board. `/tasks` opens the live shell and local-agent task panel used by
+Shift+Down/Ctrl+B; it reuses the same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains
@@ -69,7 +72,7 @@ accepted as an alias for the monitor.
 
 | Command | What it does |
 | --- | --- |
-| `/explain` | Cycle execution detail through off, on, and verbose. |
+| `/explain [on\|verbose\|off]` | Show measured execution facts at the selected detail. A bare `/explain` is the idempotent `on` form. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |
@@ -80,6 +83,12 @@ accepted as an alias for the monitor.
 diff` compares evidence. `/stats` opens a selector, or you can open a focused
 view with `/stats cost`, `/stats health`, `/stats history`, `/stats learn`, or
 `/stats tools`. `/context dump [path]` writes a JSON snapshot to a file.
+
+`/explain` changes presentation only; it never changes the recorded execution
+facts. `on` keeps subsequent execution concise, `verbose` adds context,
+dependency, and coverage details, and `off` suppresses the projection for
+subsequent execution while retaining durable evidence and already recorded
+history. Invalid arguments leave the current mode unchanged.
 
 ## Tools
 

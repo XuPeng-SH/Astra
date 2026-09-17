@@ -131,6 +131,10 @@ continuation, not automatic replay of an interrupted execution.
   independently of the largest domain-valid object.
 - Validate the complete fanout before spawning any slot. A partial launch has
   a fixed target count, explicit rejected slots, and no automatic replacements.
+- Fanout admission is bounded to 50 slots. The bound is enforced before any
+  child is admitted and is repeated when projecting a slot identity, so an
+  oversized request cannot allocate an unbounded group or bypass the runtime
+  contract through recovery.
 - Fast children may finish before the UI draws the launch receipt; monotonic
   projection must skip directly to terminal without showing a later running
   regression.
@@ -172,9 +176,11 @@ Unit and property tests establish the state machine:
 The terminal PTY journey uses an adversarial mock model, not a cooperative
 script. It attempts to claim completion immediately after launch. The test
 must prove that request is never sent to the model. While children are gated,
-the test verifies the runtime launch receipt, responsive composer,
-Shift+Down task navigation, stable selection across refreshes, explicit
-backgrounding, and cancellation.
+the journey should verify the runtime launch receipt, responsive composer,
+Shift+Down/Ctrl+B task navigation, stable selection across refreshes, explicit
+backgrounding, and cancellation. `/tasks` is the equivalent slash entry to
+that same live panel and should be covered by the same adversarial journey when
+the PTY route is exercised.
 
 The online CI gate uses the real Axum routes and real MatrixOne with a mock LLM
 or no LLM. It asserts actual root/child run rows, non-null ownership,

@@ -299,7 +299,15 @@ impl AgentRunProjection {
         if !should_accept_agent_state(self.state, state) {
             return false;
         }
+        let lifecycle_changed = self.state.status != state.status;
         self.state = state;
+        if lifecycle_changed {
+            // A lifecycle receipt with no result is not an instruction to
+            // discard the output accumulated by the live stream. Keep that
+            // evidence while replacing the current error below; status-only
+            // attention text is stored separately in `attention_summary`.
+            self.detail.error = None;
+        }
         if !matches!(
             state.status,
             AgentRunStatus::Waiting | AgentRunStatus::Paused
@@ -1157,6 +1165,7 @@ fn merge_agent_task_cells(
         error,
         ctrl_b_background_hint,
     } = source;
+    let lifecycle_changed = target.status != status;
 
     if started_at < target.started_at {
         target.started_at = started_at;
@@ -1164,8 +1173,14 @@ fn merge_agent_task_cells(
     if target.description == target.tool_use_id && description != tool_use_id {
         target.description = description;
     }
-    if accept_content && target.error.is_none() {
-        target.error = error;
+    if accept_lifecycle && lifecycle_changed {
+        // A newer lifecycle snapshot supersedes status-scoped error detail.
+        // Do not touch output_summary here: it may be the only copy of live
+        // output when the snapshot carries no result text.
+        target.error = None;
+    }
+    if accept_content && let Some(error) = error {
+        target.error.get_or_insert(error);
     }
     target.ctrl_b_background_hint |= ctrl_b_background_hint;
     if accept_content
@@ -1231,12 +1246,20 @@ fn agent_fanout_membership(
 
 fn agent_run_state_from_fanout_receipt(status: &str) -> Option<AgentRunStatus> {
     match status {
+        // These are the canonical fanout slot states. Keep the older
+        // wire labels as aliases because a receipt may be replayed after a
+        // client restart, but always project them into the same lifecycle
+        // enum used by live events and the durable run reconciler.
+        "planned" | "spawn_accepted" => Some(AgentRunStatus::Starting),
         "launched" | "running" => Some(AgentRunStatus::Running),
-        "waiting" => Some(AgentRunStatus::Waiting),
+        "waiting" | "waiting_for_input" => Some(AgentRunStatus::Waiting),
         "completed" => Some(AgentRunStatus::Completed),
         "interrupted" => Some(AgentRunStatus::Interrupted),
-        "cancelled" => Some(AgentRunStatus::Cancelled),
-        "failed" => Some(AgentRunStatus::Failed),
+        "spawn_rejected" | "failed" => Some(AgentRunStatus::Failed),
+        "cancelled" | "cancelled_by_user" | "cancelled_by_runtime" => {
+            Some(AgentRunStatus::Cancelled)
+        }
+        "timed_out" => Some(AgentRunStatus::Failed),
         _ => None,
     }
 }
@@ -1481,7 +1504,6 @@ fn apply_server_agent_detail(
                 _ => unreachable!(),
             }
         });
-        projection.detail.output_summary = attention.clone();
         projection.set_attention_summary(attention);
     }
 }
@@ -1585,15 +1607,9 @@ fn apply_local_agent_status(
             }
         }
         AgentStatus::Idle => {
-            if projection.detail.output_summary.is_none() {
-                projection.detail.output_summary = Some("Agent is waiting for input.".into());
-            }
             projection.set_attention_summary(Some("Waiting for input".into()));
         }
         AgentStatus::Waiting { reason } => {
-            if projection.detail.output_summary.is_none() && !reason.trim().is_empty() {
-                projection.detail.output_summary = Some(reason.clone());
-            }
             projection.set_attention_summary((!reason.trim().is_empty()).then(|| reason.clone()));
         }
         AgentStatus::Completed { result, .. } => {
@@ -1645,7 +1661,7 @@ fn apply_local_agent_status(
                 .get_or_insert_with(std::time::Instant::now);
             projection.detail.duration_ms = Some(elapsed_ms);
             if !reason.trim().is_empty() {
-                projection.detail.output_summary = Some(reason.clone());
+                append_terminal_reason_preserving_output(&mut projection.detail, reason);
             }
             projection.detail.error = None;
         }
@@ -2619,12 +2635,18 @@ impl ChatWidget {
             )));
         }
         if let Some(publication) = publication {
-            self.commit_concurrent_system(SystemCell::info(publication.user_notice()));
-            if let Some(error) = publication.render_error {
-                self.commit_concurrent_system(SystemCell::warning(format!(
-                    "Explain Analyze report was not rendered: {error}"
-                )));
-            }
+            let notice = publication.user_notice();
+            let cell = if publication.render_error.is_some() {
+                SystemCell::warning(notice)
+            } else {
+                SystemCell::info(notice)
+            };
+            let cell = if let Some(link) = publication.user_link() {
+                cell.with_link(link)
+            } else {
+                cell
+            };
+            self.commit_concurrent_system(cell);
         }
         if let Some(error) = publication_error {
             self.commit_concurrent_system(SystemCell::warning(format!(
@@ -3515,7 +3537,7 @@ impl ChatWidget {
                     slot_index,
                     slot_label: slot_label.to_string(),
                 };
-            self.agent_runs.ensure(
+            let state_accepted = self.agent_runs.ensure(
                 agent_id.clone(),
                 slot_label.to_string(),
                 AgentRunState::observed(state),
@@ -3535,6 +3557,38 @@ impl ChatWidget {
             if let Some(transcript_target) = transcript_target {
                 projection
                     .set_transcript_target(AgentProjectionSource::LiveStream, transcript_target);
+            }
+            if state_accepted
+                && let Some(reason) = [
+                    agent.get("terminal_reason"),
+                    agent.get("finish_reason"),
+                    agent.get("reason"),
+                    agent.get("error"),
+                    agent
+                        .get("result")
+                        .and_then(|result| result.get("finish_reason")),
+                    agent.get("result").and_then(|result| result.get("reason")),
+                    agent.get("result").and_then(|result| result.get("error")),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .find(|reason| !reason.is_empty())
+            {
+                match state {
+                    AgentRunStatus::Waiting => {
+                        let attention = format!("Waiting for {reason}");
+                        projection.set_attention_summary(Some(attention));
+                    }
+                    AgentRunStatus::Failed | AgentRunStatus::Interrupted => {
+                        projection.detail.error = Some(reason.to_string());
+                    }
+                    AgentRunStatus::Cancelled => {
+                        append_terminal_reason_preserving_output(&mut projection.detail, reason);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -3745,6 +3799,15 @@ impl ChatWidget {
                     if !matches!(
                         signal,
                         astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted { .. }
+                            | astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted {
+                                ..
+                            }
+                            | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired {
+                                ..
+                            }
+                            | astra_turn_core::agent_live_event::AgentLiveSignal::ExecutionWaiting {
+                                ..
+                            }
                     ) {
                         append_agent_live_output(
                             cell,
@@ -3796,9 +3859,26 @@ impl ChatWidget {
                         AgentLiveTermination::Interrupted => "interrupted",
                         AgentLiveTermination::Cancelled => "cancelled",
                     };
-                    let summary = reason.clone().or_else(|| cell.output_summary.clone());
+                    // Success/delegation/cancellation reasons are terminal
+                    // status detail, not errors. Keep them visible in the
+                    // summary without replacing findings already streamed by
+                    // the run. Failure/interruption reasons stay in the
+                    // dedicated error field and never duplicate the output.
+                    let (summary, error) = match termination {
+                        AgentLiveTermination::Completed
+                        | AgentLiveTermination::Delegated
+                        | AgentLiveTermination::Cancelled => {
+                            if let Some(reason) = reason.as_deref() {
+                                append_terminal_reason_preserving_output(cell, reason);
+                            }
+                            (cell.output_summary.clone(), None)
+                        }
+                        AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => {
+                            (cell.output_summary.clone(), reason)
+                        }
+                    };
                     let elapsed = cell.started_at.elapsed().as_millis() as u64;
-                    cell.complete(status_str, elapsed.max(duration_ms), summary, reason);
+                    cell.complete(status_str, elapsed.max(duration_ms), summary, error);
                 }
             }
         }
@@ -4636,6 +4716,29 @@ fn append_agent_live_output(cell: &mut TaskCell, text: &str) {
     cell.output_summary = Some(next);
 }
 
+fn append_terminal_reason_preserving_output(cell: &mut TaskCell, reason: &str) {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return;
+    }
+    let already_present = cell
+        .output_summary
+        .as_deref()
+        .is_some_and(|output| output.lines().any(|line| line.trim() == reason));
+    if already_present {
+        return;
+    }
+    if cell
+        .output_summary
+        .as_deref()
+        .is_some_and(|output| !output.trim().is_empty())
+    {
+        append_agent_live_output(cell, &format!("\n{reason}"));
+    } else {
+        cell.output_summary = Some(reason.to_owned());
+    }
+}
+
 fn agent_live_event_payload_bytes(
     event: &astra_turn_core::agent_live_event::AgentLiveEvent,
 ) -> usize {
@@ -4755,7 +4858,7 @@ fn box_into_arc(b: Box<dyn HistoryCell>) -> Arc<dyn HistoryCell> {
 mod tests {
     use super::*;
     use crate::tui::agent_run_projection::{
-        AgentProjectionConfidence, AgentProjectionSource, AgentRunStatus,
+        AgentProjectionConfidence, AgentProjectionSource, AgentRunState, AgentRunStatus,
     };
     use crate::tui::history_cell::tool::ToolStatus;
     use astra_services::SessionArtifactStore;
@@ -7485,11 +7588,12 @@ mod tests {
                 .map(|cell| cell.status),
             Some(crate::tui::history_cell::task::TaskStatus::Waiting)
         ));
-        assert!(
+        assert_eq!(
             widget
                 .agent_run_cell("reviewer@attention")
-                .and_then(|cell| cell.output_summary.as_deref())
-                .is_some_and(|summary| summary.contains("Approval required"))
+                .and_then(|cell| cell.output_summary.as_deref()),
+            None,
+            "attention text belongs to the typed attention field, not the live output buffer"
         );
 
         widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
@@ -7511,6 +7615,55 @@ mod tests {
                 .attention_summary
                 .is_none(),
             "a resumed run must not retain an old attention reason"
+        );
+    }
+
+    #[test]
+    fn live_output_survives_attention_and_resume_transitions() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-attention-output".into(),
+            agent_id: "reviewer@attention-output".into(),
+            kind: AgentLiveEventKind::OutputDelta("finding before approval".into()),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-attention-output".into(),
+            agent_id: "reviewer@attention-output".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::ApprovalRequired {
+                request_id: "approval-output".into(),
+                tool: "bash".into(),
+                approval_kind: "explicit".into(),
+                path: None,
+                detail: Some("git status".into()),
+                display_label: None,
+            }),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-attention-output".into(),
+            agent_id: "reviewer@attention-output".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "bash".into(),
+                description: "git status".into(),
+                tool_use_id: "tool-after-output-approval".into(),
+            },
+        })));
+
+        let output = widget
+            .agent_run_cell("reviewer@attention-output")
+            .and_then(|cell| cell.output_summary.as_deref())
+            .unwrap_or_default();
+        assert_eq!(output, "finding before approval");
+        assert_eq!(
+            widget
+                .agent_monitor_snapshot(0)
+                .rows
+                .first()
+                .map(|row| row.state.status),
+            Some(AgentRunStatus::Running)
         );
     }
 
@@ -7713,6 +7866,239 @@ mod tests {
                 .map(|cell| cell.description.as_str()),
             Some("Correctness boundary review")
         );
+    }
+
+    #[test]
+    fn canonical_fanout_slot_statuses_remain_visible_after_receipt_replay() {
+        let cases = [
+            ("planned", AgentRunStatus::Starting),
+            ("spawn_accepted", AgentRunStatus::Starting),
+            ("running", AgentRunStatus::Running),
+            ("waiting_for_input", AgentRunStatus::Waiting),
+            ("completed", AgentRunStatus::Completed),
+            ("interrupted", AgentRunStatus::Interrupted),
+            ("failed", AgentRunStatus::Failed),
+            ("cancelled_by_user", AgentRunStatus::Cancelled),
+            ("cancelled_by_runtime", AgentRunStatus::Cancelled),
+            ("timed_out", AgentRunStatus::Failed),
+            ("spawn_rejected", AgentRunStatus::Failed),
+        ];
+
+        for (wire_status, expected) in cases {
+            assert_eq!(
+                agent_run_state_from_fanout_receipt(wire_status),
+                Some(expected),
+                "canonical receipt status {wire_status} must project to a visible lifecycle"
+            );
+        }
+        assert_eq!(agent_run_state_from_fanout_receipt("future_status"), None);
+    }
+
+    #[test]
+    fn accepted_fanout_completion_clears_an_earlier_failure() {
+        let receipt = |status: &str, reason: Option<&str>| {
+            let mut agent = serde_json::json!({
+                "slot_index": 0,
+                "agent_id": "reviewer@failure-replay",
+                "run_id": "run-failure-replay",
+                "status": status,
+            });
+            if let Some(reason) = reason {
+                agent["terminal_reason"] = serde_json::json!(reason);
+            }
+            serde_json::json!({
+                "group_id": "failure-replay",
+                "target_count": 1,
+                "agents": [agent],
+            })
+            .to_string()
+        };
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(&receipt("failed", Some("boom")));
+        let failed = widget
+            .agent_run_cell("reviewer@failure-replay")
+            .expect("failed receipt creates a projection");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+
+        widget.on_agent_fanout_launch_receipt(&receipt("completed", None));
+        let completed = widget
+            .agent_run_cell("reviewer@failure-replay")
+            .expect("completed receipt keeps the projection");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.error, None);
+        assert_eq!(completed.output_summary, None);
+    }
+
+    #[test]
+    fn accepted_fanout_completion_clears_an_earlier_waiting_message() {
+        let receipt = |status: &str, reason: Option<&str>| {
+            let mut agent = serde_json::json!({
+                "slot_index": 0,
+                "agent_id": "reviewer@waiting-replay",
+                "run_id": "run-waiting-replay",
+                "status": status,
+            });
+            if let Some(reason) = reason {
+                agent["terminal_reason"] = serde_json::json!(reason);
+            }
+            serde_json::json!({
+                "group_id": "waiting-replay",
+                "target_count": 1,
+                "agents": [agent],
+            })
+            .to_string()
+        };
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(&receipt("waiting_for_input", Some("approval")));
+        let waiting = widget
+            .agent_run_cell("reviewer@waiting-replay")
+            .expect("waiting receipt creates a projection");
+        assert_eq!(waiting.status, TaskStatus::Waiting);
+        assert_eq!(
+            widget
+                .agent_monitor_snapshot(0)
+                .rows
+                .first()
+                .and_then(|row| row.attention_summary.as_deref()),
+            Some("Waiting for approval")
+        );
+        assert_eq!(waiting.output_summary, None);
+
+        widget.on_agent_fanout_launch_receipt(&receipt("completed", None));
+        let completed = widget
+            .agent_run_cell("reviewer@waiting-replay")
+            .expect("completed receipt keeps the projection");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.output_summary, None);
+        assert_eq!(completed.error, None);
+    }
+
+    #[test]
+    fn canonical_fanout_receipt_replay_keeps_terminal_reason_and_lifecycle() {
+        let cases = [
+            ("spawn_accepted", AgentRunStatus::Starting, None),
+            (
+                "waiting_for_input",
+                AgentRunStatus::Waiting,
+                Some("approval"),
+            ),
+            (
+                "cancelled_by_runtime",
+                AgentRunStatus::Cancelled,
+                Some("owner released"),
+            ),
+            (
+                "timed_out",
+                AgentRunStatus::Failed,
+                Some("deadline exceeded"),
+            ),
+        ];
+        let slots = cases
+            .iter()
+            .enumerate()
+            .map(|(slot_index, (status, _, reason))| {
+                let mut slot = serde_json::json!({
+                    "slot_index": slot_index,
+                    "id": format!("slot-{slot_index}"),
+                    "agent_id": format!("reviewer@{slot_index}"),
+                    "run_id": format!("run-{slot_index}"),
+                    "status": status,
+                });
+                if let Some(reason) = reason {
+                    if *status == "timed_out" {
+                        slot["terminal_reason"] = serde_json::Value::Null;
+                        slot["finish_reason"] = serde_json::json!("");
+                        slot["result"] = serde_json::json!({
+                            "status": status,
+                            "finish_reason": reason
+                        });
+                    } else {
+                        slot["terminal_reason"] = serde_json::json!(reason);
+                    }
+                }
+                slot
+            })
+            .collect::<Vec<_>>();
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "incomplete",
+                "group_id": "canonical-statuses",
+                "target_count": cases.len(),
+                "fanout": {"slots": slots}
+            })
+            .to_string(),
+        );
+
+        let rows = widget.agent_monitor_snapshot(10);
+        assert_eq!(rows.len(), cases.len());
+        for (slot_index, (_, expected, reason)) in cases.iter().enumerate() {
+            let agent_id = format!("reviewer@{slot_index}");
+            let row = rows
+                .iter()
+                .find(|row| row.agent_id == agent_id)
+                .expect("receipt slot should remain visible");
+            assert_eq!(row.state.status, *expected);
+            if let Some(reason) = reason {
+                let detail = widget
+                    .agent_run_cell(&agent_id)
+                    .expect("receipt slot has a detail cell");
+                let rendered_reason = detail
+                    .error
+                    .as_deref()
+                    .or(detail.output_summary.as_deref())
+                    .or(row.attention_summary.as_deref())
+                    .unwrap_or_default();
+                assert!(rendered_reason.contains(reason), "{rendered_reason}");
+            }
+        }
+
+        // A durable terminal projection must win over a delayed receipt from
+        // an earlier lifecycle state. The stale receipt may still refresh
+        // membership, but it must not rewrite the user's terminal reason or
+        // make the run look actionable again.
+        {
+            let projection = widget
+                .agent_runs
+                .get_mut("reviewer@3")
+                .expect("timeout slot exists");
+            assert!(
+                projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Completed,))
+            );
+            projection.detail.output_summary = Some("authoritative result".into());
+            projection.detail.error = None;
+        }
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "incomplete",
+                "group_id": "canonical-statuses",
+                "target_count": cases.len(),
+                "fanout": {"slots": [{
+                    "slot_index": 3,
+                    "id": "slot-3",
+                    "agent_id": "reviewer@3",
+                    "run_id": "run-3",
+                    "status": "waiting_for_input",
+                    "terminal_reason": "late approval request"
+                }]}
+            })
+            .to_string(),
+        );
+        let terminal = widget
+            .agent_runs
+            .get("reviewer@3")
+            .expect("terminal projection remains present");
+        assert_eq!(terminal.state.status, AgentRunStatus::Completed);
+        assert_eq!(
+            terminal.detail.output_summary.as_deref(),
+            Some("authoritative result")
+        );
+        assert_eq!(terminal.detail.error, None);
+        assert_eq!(terminal.attention_summary, None);
     }
 
     #[test]
@@ -8853,6 +9239,11 @@ mod tests {
             crate::tui::history_cell::task::TaskStatus::Cancelled,
             "list and detail must agree that user cancellation is not failure"
         );
+        assert_eq!(
+            row.output_summary.as_deref(),
+            Some("running\nuser cancellation")
+        );
+        assert_eq!(row.error, None);
         let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows[0].state.status, AgentRunStatus::Cancelled);
     }
@@ -8882,6 +9273,112 @@ mod tests {
             row.status,
             crate::tui::history_cell::task::TaskStatus::Completed
         ));
+    }
+
+    #[test]
+    fn terminal_reason_does_not_replace_live_output() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+
+        for (index, termination) in [
+            AgentLiveTermination::Completed,
+            AgentLiveTermination::Delegated,
+            AgentLiveTermination::Failed,
+            AgentLiveTermination::Interrupted,
+            AgentLiveTermination::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let agent_id = format!("reviewer@terminal-{index}");
+            let mut widget = fresh();
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+                run_id: format!("run-terminal-{index}"),
+                agent_id: agent_id.clone(),
+                kind: AgentLiveEventKind::OutputDelta("live finding".into()),
+            })));
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+                run_id: format!("run-terminal-{index}"),
+                agent_id: agent_id.clone(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination,
+                    duration_ms: 1,
+                    reason: Some("terminal reason".into()),
+                },
+            })));
+
+            let detail = widget
+                .agent_run_cell(&agent_id)
+                .expect("terminal projection remains inspectable");
+            let expected_output = match termination {
+                AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => "live finding",
+                AgentLiveTermination::Completed
+                | AgentLiveTermination::Delegated
+                | AgentLiveTermination::Cancelled => "live finding\nterminal reason",
+            };
+            assert_eq!(
+                detail.output_summary.as_deref(),
+                Some(expected_output),
+                "{termination:?} must retain live output"
+            );
+            let expected_error = match termination {
+                AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => {
+                    Some("terminal reason")
+                }
+                AgentLiveTermination::Completed
+                | AgentLiveTermination::Delegated
+                | AgentLiveTermination::Cancelled => None,
+            };
+            assert_eq!(detail.error.as_deref(), expected_error, "{termination:?}");
+            if matches!(
+                termination,
+                AgentLiveTermination::Completed | AgentLiveTermination::Delegated
+            ) {
+                assert_eq!(detail.status, TaskStatus::Completed);
+            }
+        }
+    }
+
+    #[test]
+    fn fanout_cancelled_reason_preserves_live_output() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let receipt = |status: &str, reason: Option<&str>| {
+            let mut agent = serde_json::json!({
+                "slot_index": 0,
+                "agent_id": "reviewer@cancelled-receipt",
+                "run_id": "run-cancelled-receipt",
+                "status": status,
+            });
+            if let Some(reason) = reason {
+                agent["terminal_reason"] = serde_json::json!(reason);
+            }
+            serde_json::json!({
+                "group_id": "cancelled-receipt",
+                "target_count": 1,
+                "agents": [agent],
+            })
+            .to_string()
+        };
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(&receipt("running", None));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-cancelled-receipt".into(),
+            agent_id: "reviewer@cancelled-receipt".into(),
+            kind: AgentLiveEventKind::OutputDelta("live finding".into()),
+        })));
+        widget.on_agent_fanout_launch_receipt(&receipt("cancelled_by_user", Some("user stopped")));
+
+        let detail = widget
+            .agent_run_cell("reviewer@cancelled-receipt")
+            .expect("cancelled fanout projection remains inspectable");
+        assert_eq!(detail.status, TaskStatus::Cancelled);
+        assert_eq!(
+            detail.output_summary.as_deref(),
+            Some("live finding\nuser stopped")
+        );
     }
 
     #[test]
@@ -9752,6 +10249,31 @@ mod tests {
     }
 
     #[test]
+    fn accepted_projection_merge_clears_old_error_but_keeps_live_output() {
+        let mut target = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::observed(AgentRunStatus::Running),
+        );
+        target.detail.output_summary = Some("finding from the live stream".into());
+        target.detail.error = Some("stale failure".into());
+
+        let source = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::observed(AgentRunStatus::Completed),
+        );
+        merge_agent_projections(&mut target, source);
+
+        assert_eq!(target.state.status, AgentRunStatus::Completed);
+        assert_eq!(
+            target.detail.output_summary.as_deref(),
+            Some("finding from the live stream")
+        );
+        assert_eq!(target.detail.error, None);
+    }
+
+    #[test]
     fn sparse_runtime_facts_merge_per_field_without_erasing_local_evidence() {
         let mut projection = AgentRunProjection::new(
             "agent".into(),
@@ -9947,6 +10469,38 @@ mod tests {
         assert_eq!(
             widget.agent_run_cell("reviewer@waiting").unwrap().status,
             crate::tui::history_cell::task::TaskStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn local_cancelled_reason_preserves_live_output() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-reviewer@local-cancel".into(),
+            agent_id: "reviewer@local-cancel".into(),
+            kind: AgentLiveEventKind::OutputDelta("live finding".into()),
+        })));
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "reviewer@local-cancel",
+                AgentStatus::Cancelled {
+                    by_user: true,
+                    reason: "user stopped".into(),
+                },
+            )]),
+            &[],
+        );
+
+        let detail = widget
+            .agent_run_cell("reviewer@local-cancel")
+            .expect("cancelled local projection remains inspectable");
+        assert_eq!(detail.status, TaskStatus::Cancelled);
+        assert_eq!(
+            detail.output_summary.as_deref(),
+            Some("live finding\nuser stopped")
         );
     }
 

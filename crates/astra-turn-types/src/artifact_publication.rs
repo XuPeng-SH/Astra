@@ -51,12 +51,20 @@ impl ArtifactPublicationV1 {
     }
 
     pub fn user_notice(&self) -> String {
-        match &self.result {
-            ArtifactPublicationResult::Published { handle } => {
-                format!("Explain report saved on server · available to the agent\n{handle}")
+        match (self.recorded, &self.result) {
+            (true, ArtifactPublicationResult::Published { .. }) => {
+                "Explain Analyze report saved on server".to_string()
             }
-            ArtifactPublicationResult::Unavailable { message, .. } => {
-                format!("Explain report could not be saved on server · {message}")
+            (false, ArtifactPublicationResult::Published { .. }) => {
+                "Explain Analyze report produced · server recording unconfirmed".to_string()
+            }
+            (true, ArtifactPublicationResult::Unavailable { message, .. }) => {
+                format!("Explain Analyze report unavailable on server · {message}")
+            }
+            (false, ArtifactPublicationResult::Unavailable { message, .. }) => {
+                format!(
+                    "Explain Analyze report unavailable · server recording unconfirmed · {message}"
+                )
             }
         }
     }
@@ -97,6 +105,18 @@ impl ArtifactPublicationV1 {
 mod tests {
     use super::*;
 
+    fn publication(recorded: bool, result: ArtifactPublicationResult) -> ArtifactPublicationV1 {
+        ArtifactPublicationV1 {
+            schema_version: 1,
+            run_id: "run".into(),
+            turn_id: "turn-1".into(),
+            execution_owner_generation: 1,
+            artifact_type: "explain_analyze_snapshot".into(),
+            recorded,
+            result,
+        }
+    }
+
     #[test]
     fn publication_round_trip_preserves_success_and_unrecorded_failure() {
         for result in [
@@ -124,5 +144,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn user_notice_does_not_claim_unrecorded_publication_is_durable() {
+        let handle = format!("artifact://session/explain-analyze/{}", "a".repeat(64));
+        let published = publication(
+            false,
+            ArtifactPublicationResult::Published {
+                handle: handle.clone(),
+            },
+        );
+        let notice = published.user_notice();
+        assert!(notice.contains("recording unconfirmed"));
+        assert!(!notice.contains(&handle));
+        assert!(!notice.contains("saved on server"));
+
+        let unavailable = publication(
+            false,
+            ArtifactPublicationResult::Unavailable {
+                reason_code: "storage_failed".into(),
+                message: "Report storage failed.".into(),
+            },
+        );
+        let notice = unavailable.user_notice();
+        assert!(notice.contains("recording unconfirmed"));
+        assert!(notice.contains("Report storage failed."));
     }
 }
