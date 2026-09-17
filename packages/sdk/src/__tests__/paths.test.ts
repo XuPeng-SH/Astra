@@ -18,6 +18,8 @@ import {
   workBranchExecutionSwitchesPath,
   workBranchExecutionSwitchPath,
   workBranchExecutionSwitchRetryPath,
+  workBranchInteractionsPath,
+  workBranchInteractionRespondPath,
 } from "../paths";
 
 describe("paths — buildQueryString", () => {
@@ -138,6 +140,15 @@ describe("paths — helpers encode ids", () => {
     );
     expect(() => workBranchExecutionSwitchPath("work-1", "branch-1", "../x")).toThrow(
       "operationId",
+    );
+  });
+
+  test("Work interaction paths keep the public branch boundary explicit", () => {
+    expect(workBranchInteractionsPath("work-1", "branch-1")).toBe(
+      "/v1/works/work-1/branches/branch-1/interactions",
+    );
+    expect(workBranchInteractionRespondPath("work-1", "branch-1")).toBe(
+      "/v1/works/work-1/branches/branch-1/interactions/respond",
     );
   });
 });

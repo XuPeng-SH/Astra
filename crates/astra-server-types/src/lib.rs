@@ -297,6 +297,268 @@ pub struct WorkExecutionSwitchOperationV1 {
     pub failure_code: Option<String>,
 }
 
+/// User-facing reason for recording one immutable progress boundary. The
+/// server may add more reasons for automatic boundaries later; clients must
+/// render the enum rather than infer behavior from its text.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRecoveryPointReasonV1 {
+    #[default]
+    UserRequested,
+    BeforeEnvironmentChange,
+    RunSettled,
+    SafeBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRecoveryPointStatusV1 {
+    Preparing,
+    Captured,
+    Ready,
+    Failed,
+    Aborted,
+}
+
+/// The portion of canonical state included in this progress record. A false
+/// value is an explicit gap, not an estimate that the content might exist.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCoverageV1 {
+    pub session_state: bool,
+    pub work_state: bool,
+    pub workspace: bool,
+    pub run_frontier: bool,
+    pub artifacts: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCapabilitiesV1 {
+    pub can_restore_conversation: bool,
+    pub can_continue_in_original_environment: bool,
+    pub has_portable_workspace: bool,
+    pub requires_target_environment_check: bool,
+    pub requires_effect_review: bool,
+}
+
+/// Safe public projection of the conversation boundary. The owner and opaque
+/// Session identity remain server-side; these counters and the content root
+/// are enough to explain what was recorded and to compare later points.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointSessionCursorV1 {
+    pub completed_turn: u32,
+    pub journal_event_seq: u64,
+    pub conversation_seq: u64,
+    pub canonical_root_hash: String,
+    pub compaction_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointExecutionV1 {
+    pub placement: WorkExecutionPlacementV1,
+    pub executor_id: String,
+    pub binding_generation: u64,
+}
+
+/// Public locator for the verified workspace package referenced by a recovery
+/// point.  The artifact id is an owner-scoped API identity; clients must use
+/// the workspace artifact endpoints instead of interpreting it as a local
+/// path or public URL.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointWorkspaceV1 {
+    pub snapshot_id: String,
+    pub logical_workspace_id: String,
+    pub manifest_hash: String,
+    pub content_root: String,
+    pub byte_size: u64,
+    pub complete: bool,
+    pub artifact_id: String,
+    pub artifact_type: String,
+    pub content_digest: String,
+}
+
+/// Public typed artifact locator retained by a recovery point.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointArtifactV1 {
+    pub artifact_id: String,
+    pub artifact_type: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointViewV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub recovery_point_id: String,
+    pub request_id: String,
+    pub status: WorkRecoveryPointStatusV1,
+    pub reason: WorkRecoveryPointReasonV1,
+    pub created_at: String,
+    pub updated_at: String,
+    pub manifest_hash: String,
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub goal_revision: u64,
+    pub criteria_set_revision: u64,
+    pub session_cursor: WorkRecoveryPointSessionCursorV1,
+    pub execution: WorkRecoveryPointExecutionV1,
+    #[serde(default)]
+    pub workspace: Option<WorkRecoveryPointWorkspaceV1>,
+    #[serde(default)]
+    pub artifacts: Vec<WorkRecoveryPointArtifactV1>,
+    pub coverage: WorkRecoveryPointCoverageV1,
+    pub capabilities: WorkRecoveryPointCapabilitiesV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCaptureRequestV1 {
+    pub request_id: String,
+    pub expected_work_revision: u64,
+    pub expected_branch_revision: u64,
+    #[serde(default)]
+    pub reason: WorkRecoveryPointReasonV1,
+    /// A sealed, owner-scoped workspace package can be attached while the
+    /// canonical recovery point is published. The server derives the
+    /// snapshot reference and never accepts client capabilities or `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_artifact_id: Option<String>,
+}
+
+/// Immutable server facts observed before a local workspace capture starts.
+/// A client must echo these facts when beginning the upload; comparing the
+/// hashes prevents a file snapshot captured at one Session head from being
+/// silently labelled as a later head.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBasisExpectationV1 {
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub context_head_hash: String,
+    pub execution_binding_hash: String,
+}
+
+/// Public pre-capture basis. The hashes are opaque content identities; the
+/// cursor is included only to make the state understandable in TUI/Web.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBasisV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    /// Opaque workspace identity that a capture client must place in the
+    /// snapshot manifest.  It is returned by the server because a cold
+    /// client cannot derive the bound Session workspace identity safely.
+    pub logical_workspace_id: String,
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub context_head_hash: String,
+    pub execution_binding_hash: String,
+    pub session_cursor: WorkRecoveryPointSessionCursorV1,
+}
+
+/// Start a resumable workspace recovery package upload. The manifest is
+/// decoded and fully verified after the byte artifact is sealed; keeping the
+/// wire value opaque here lets the runtime own the versioned filesystem
+/// contract without duplicating it in every client package.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactBeginRequestV1 {
+    pub request_id: String,
+    pub basis: WorkWorkspaceRecoveryBasisExpectationV1,
+    pub snapshot_manifest: serde_json::Value,
+    pub content_digest: String,
+    pub byte_size: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryChunkV1 {
+    pub chunk_index: u64,
+    pub digest: String,
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactSealRequestV1 {
+    pub chunks: Vec<WorkWorkspaceRecoveryChunkV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryChunkReceiptV1 {
+    pub schema_version: u16,
+    pub artifact_id: String,
+    pub digest: String,
+    pub byte_size: u64,
+    pub inserted: bool,
+}
+
+/// One deterministic content-addressed blob in a workspace package.  The
+/// logical chunk index is the order used for aggregate verification; the
+/// blob reference is the identity used by manifest entries.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBlobV1 {
+    pub chunk_index: u64,
+    pub blob_ref: String,
+    pub digest: String,
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub artifact_id: String,
+    pub sealed: bool,
+    pub verified: bool,
+    pub snapshot_id: String,
+    pub manifest_hash: String,
+    pub content_root: String,
+    pub content_digest: String,
+    pub byte_size: u64,
+    pub chunk_count: u64,
+    /// The complete manifest and deterministic blob layout are returned on
+    /// every artifact read.  A second client can therefore discover and
+    /// download the package without inheriting uploader memory or state.
+    pub snapshot_manifest: serde_json::Value,
+    pub blobs: Vec<WorkWorkspaceRecoveryBlobV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCursorV1 {
+    pub created_at: String,
+    pub recovery_point_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointPageV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub points: Vec<WorkRecoveryPointViewV1>,
+    pub next_cursor: Option<WorkRecoveryPointCursorV1>,
+}
+
 #[cfg(feature = "server")]
 #[derive(Serialize)]
 #[serde(transparent)]
@@ -312,6 +574,15 @@ pub struct WorkCatalogQueryV1 {
 }
 
 #[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointQueryV1 {
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_recovery_point_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
 #[derive(Serialize)]
 pub struct WorkCatalogResponseV1 {
     pub schema_version: u16,
@@ -323,6 +594,17 @@ pub struct WorkCatalogResponseV1 {
 #[serde(deny_unknown_fields)]
 pub struct WorkBranchAttachRequestV1 {
     pub request_id: String,
+    /// Stable identity for one client instance. The Server uses this together
+    /// with `surface` to keep separate browsers, TUIs, and other clients as
+    /// separate read attachments while allowing a refresh from the same
+    /// instance to renew its attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The surface that owns this attachment. A client instance identity is
+    /// only meaningful together with its surface: two TUI processes and a
+    /// browser must never collapse into one actor. It is required so the
+    /// server never guesses which actor owns a controller attachment.
+    pub surface: astra_turn_types::SessionSurfaceV1,
 }
 
 #[cfg(feature = "server")]
@@ -625,6 +907,236 @@ pub struct WorkTurnRequestV1 {
     pub request_id: String,
     pub attachment_id: String,
     pub message: String,
+}
+
+/// The two user-facing durable interaction kinds that can pause a Work run.
+/// Provider-owned interactions never cross this Work boundary; they remain
+/// on the provider-authenticated callback path.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkInteractionKindV1 {
+    Approval,
+    UserPrompt,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkApprovalDecisionV1 {
+    Allow,
+    Deny,
+}
+
+/// A public projection of one currently pending user interaction.  The
+/// backing Session and executor authority are deliberately absent; the
+/// `run_id` is retained so a response can be bound to the exact durable run
+/// that opened this request.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchInteractionV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub run_id: String,
+    pub request_id: String,
+    pub kind: WorkInteractionKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchInteractionPageV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub interactions: Vec<WorkBranchInteractionV1>,
+}
+
+/// A Work response is bound to an explicit run and attachment.  This avoids
+/// re-selecting a different "current" run after an acknowledgement is lost,
+/// which would break idempotent retries and could answer the wrong request.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchInteractionResponseRequestV1 {
+    pub attachment_id: String,
+    pub run_id: String,
+    pub request_id: String,
+    #[serde(flatten)]
+    pub response: WorkBranchInteractionResponseV1,
+}
+
+#[cfg(feature = "server")]
+impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            serde::de::Error::custom("Work interaction response must be an object")
+        })?;
+        let allowed = [
+            "attachment_id",
+            "run_id",
+            "request_id",
+            "kind",
+            "decision",
+            "reason",
+            "cancelled",
+            "answers",
+        ];
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err(serde::de::Error::custom(format!(
+                "unknown Work interaction response field `{field}`"
+            )));
+        }
+        let required_string = |field: &str| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| serde::de::Error::custom(format!("missing or invalid `{field}`")))
+        };
+        let attachment_id = required_string("attachment_id")?;
+        let run_id = required_string("run_id")?;
+        let request_id = required_string("request_id")?;
+        let kind = required_string("kind")?;
+        let response = match kind.as_str() {
+            "approval" => {
+                let allowed = [
+                    "attachment_id",
+                    "run_id",
+                    "request_id",
+                    "kind",
+                    "decision",
+                    "reason",
+                ];
+                if let Some(field) = object
+                    .keys()
+                    .find(|field| !allowed.contains(&field.as_str()))
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown approval response field `{field}`"
+                    )));
+                }
+                let decision = object
+                    .get("decision")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::custom("missing `decision`"))
+                    .and_then(|value| {
+                        serde_json::from_value(value)
+                            .map_err(|error| serde::de::Error::custom(error.to_string()))
+                    })?;
+                let reason = object
+                    .get("reason")
+                    .cloned()
+                    .map(|value| {
+                        serde_json::from_value(value)
+                            .map_err(|error| serde::de::Error::custom(error.to_string()))
+                    })
+                    .transpose()?;
+                WorkBranchInteractionResponseV1::Approval { decision, reason }
+            }
+            "user_prompt" => {
+                let allowed = [
+                    "attachment_id",
+                    "run_id",
+                    "request_id",
+                    "kind",
+                    "cancelled",
+                    "answers",
+                ];
+                if let Some(field) = object
+                    .keys()
+                    .find(|field| !allowed.contains(&field.as_str()))
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown user prompt response field `{field}`"
+                    )));
+                }
+                let cancelled = object
+                    .get("cancelled")
+                    .map(|value| {
+                        serde_json::from_value(value.clone())
+                            .map_err(|error| serde::de::Error::custom(error.to_string()))
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                let answers = object.get("answers").cloned();
+                WorkBranchInteractionResponseV1::UserPrompt { cancelled, answers }
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "`kind` must be approval or user_prompt",
+                ));
+            }
+        };
+        Ok(Self {
+            attachment_id,
+            run_id,
+            request_id,
+            response,
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkBranchInteractionResponseV1 {
+    Approval {
+        decision: WorkApprovalDecisionV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    UserPrompt {
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<serde_json::Value>,
+    },
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkInteractionResolutionOutcomeV1 {
+    Resolved,
+    Idempotent,
+    Queued,
+    AuthorityLost,
+    Superseded,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchInteractionReceiptV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub run_id: String,
+    pub request_id: String,
+    pub outcome: WorkInteractionResolutionOutcomeV1,
 }
 
 #[cfg(feature = "server")]
@@ -1277,6 +1789,7 @@ pub struct HealthResponse {
     pub memoria: String,
     pub interaction_api_major: String,
     pub build_git_sha: String,
+    pub build_git_dirty: bool,
 }
 
 #[cfg(feature = "server")]

@@ -8,6 +8,9 @@ const MIN_CHOICES: usize = 2;
 const MAX_CHOICES: usize = 9;
 const MIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
+// Reserved by the Work Web composer while it edits an "Other" option. It is
+// never a user answer and must not cross the canonical answer boundary.
+const RESERVED_OTHER_SENTINEL: &str = "__astra_other__";
 const ASK_USER_EXAMPLE: &str = r#"{"questions":[{"header":"Scope","question":"Which scope should we ship first?","options":["Core flow","Full workflow"],"allow_freeform":true}]}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +543,12 @@ pub fn normalize_ask_user_answers(
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
+            }
+            if trimmed == RESERVED_OTHER_SENTINEL {
+                return Err(ask_user_response_error(format!(
+                    "answer '{}' is reserved for the Work composer and is not a user value",
+                    RESERVED_OTHER_SENTINEL
+                )));
             }
             if !option_labels.contains(trimmed) && !question.allow_freeform {
                 return Err(ask_user_response_error(format!(
@@ -1125,6 +1134,32 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("missing answer for question 'What should we call it?'"));
+    }
+
+    #[test]
+    fn normalize_answers_rejects_work_composer_other_sentinel() {
+        let prompt = parse_ask_user_prompt(&json!({
+            "questions": [{
+                "header": "Scope",
+                "question": "Which scope should we ship first?",
+                "options": ["Core flow", "Full workflow"],
+                "allow_freeform": true
+            }]
+        }))
+        .unwrap();
+        let err = normalize_ask_user_answers(
+            &prompt,
+            &AskUserAnswers {
+                answers: vec![AskUserQuestionAnswer {
+                    question: "Which scope should we ship first?".into(),
+                    answers: vec![RESERVED_OTHER_SENTINEL.into()],
+                    multi_select: false,
+                    annotation: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("reserved for the Work composer"));
     }
 
     #[test]

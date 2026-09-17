@@ -5,7 +5,8 @@ use astra_core::{
     error_response_coded, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
 };
 use astra_turn_types::{
-    ModelSelection, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
+    ModelSelection, SessionAttachmentV1, SessionKeyV1,
+    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
     ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
 };
 pub use astra_turn_types::{
@@ -105,6 +106,46 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Read the exact Work scope for one run without scanning a bounded
+    /// session listing. This is used at cross-surface interaction boundaries.
+    async fn get_run_work_scope(
+        &self,
+        _run_id: String,
+        _user_id: String,
+    ) -> Result<Option<DurableRunWorkScope>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run Work scope is not supported",
+        ))
+    }
+
+    async fn list_active_work_runs(
+        &self,
+        _work_id: String,
+        _branch_id: String,
+        _user_id: String,
+        _session_id: String,
+    ) -> Result<Vec<(String, String, Option<String>)>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Active Work runs are not supported",
+        ))
+    }
+
+    /// Read the bounded interaction frontier for one durable run. This keeps
+    /// Work polling independent from full transcript hydration.
+    async fn get_run_interaction_projection(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _kind: DurableRunInteractionKind,
+    ) -> Result<Option<DurableRunInteractionProjection>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run interaction projection not supported",
+        ))
+    }
 
     async fn get_run_projection(
         &self,
@@ -275,6 +316,34 @@ pub trait RunLifecycleService: Send + Sync {
             StatusCode::NOT_IMPLEMENTED,
             "Durable run interactions are not supported",
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_run_interaction_with_attachment(
+        &self,
+        run_id: String,
+        user_id: String,
+        expected_session_id: String,
+        request_id: String,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+        attachment: Option<DurableRunInteractionAttachmentGuard>,
+    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
+        if attachment.is_some() {
+            return Err(error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "Work attachment fencing is not supported by this run service",
+            ));
+        }
+        self.resolve_run_interaction(
+            run_id,
+            user_id,
+            expected_session_id,
+            request_id,
+            kind,
+            response_data,
+        )
+        .await
     }
 
     /// Drain pending tool progress events for a run.
@@ -1112,6 +1181,18 @@ pub struct RunProjectionRecord {
     pub recent_events: Vec<serde_json::Value>,
 }
 
+/// Constant-size projection for a Work interaction read. The interaction
+/// endpoint needs only the current wait frontier and its required/resolved
+/// facts; it must not hydrate the complete run transcript on every poll.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunInteractionProjection {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub waiting_for: Option<String>,
+    pub recent_events: Vec<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelRunRecord {
     pub run_id: String,
@@ -1455,6 +1536,28 @@ pub struct DurableRunRecord {
     pub events: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The metadata needed to authorize an interaction against one exact Work
+/// run. Shared stores return this from an indexed point lookup so answering a
+/// Work prompt never depends on a bounded session run list or full event
+/// history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunWorkScope {
+    pub session_id: String,
+    pub parent_run_id: Option<String>,
+    pub work_binding: Option<DurableWorkRunBinding>,
+}
+
+/// Attachment and Work identity checked inside the same transaction as an
+/// interaction response. The attachment is a read capability; it must still
+/// exist and be unexpired at the exact response commit boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunInteractionAttachmentGuard {
+    pub key: SessionKeyV1,
+    pub attachment_id: String,
+    pub work_id: String,
+    pub branch_id: String,
 }
 
 /// Result of one committed recovery ownership transition. The run contains
@@ -1921,6 +2024,76 @@ async fn load_run_metadata_for_exact_session_tx(
         .await
         .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
     row.map(run_record_from_row).transpose()
+}
+
+async fn lock_work_interaction_attachment_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    run: &DurableRunRecord,
+    guard: &DurableRunInteractionAttachmentGuard,
+) -> Result<(), String> {
+    let row = sqlx::query(
+        "SELECT attachment_json FROM session_attachments
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ? AND attachment_id = ?
+         FOR UPDATE",
+    )
+    .bind(&guard.key.isolation_domain)
+    .bind(&guard.key.owner_user_id)
+    .bind(&guard.key.session_id)
+    .bind(&guard.key.branch_id)
+    .bind(&guard.attachment_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| {
+        db_error(
+            "lock_work_interaction_attachment",
+            guard.attachment_id.as_str(),
+            source,
+        )
+        .to_string()
+    })?
+    .ok_or_else(|| "work_interaction_attachment_fenced".to_string())?;
+    let raw: String = row.try_get("attachment_json").map_err(|source| {
+        db_error(
+            "decode_work_interaction_attachment",
+            guard.attachment_id.as_str(),
+            source,
+        )
+        .to_string()
+    })?;
+    let attachment: SessionAttachmentV1 = serde_json::from_str(&raw).map_err(|source| {
+        db_error(
+            "decode_work_interaction_attachment_json",
+            guard.attachment_id.as_str(),
+            sqlx::Error::Decode(Box::new(source)),
+        )
+        .to_string()
+    })?;
+    attachment
+        .validate()
+        .map_err(|_| "work_interaction_attachment_fenced".to_string())?;
+    let now = crate::db_row::database_now_unix_ms(tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_work_interaction_attachment_time",
+                guard.attachment_id.as_str(),
+                source,
+            )
+            .to_string()
+        })?;
+    if attachment.key != guard.key
+        || attachment.attachment_id != guard.attachment_id
+        || attachment.expires_at_unix_ms <= now
+        || run.session_id != guard.key.session_id
+        || run.parent_run_id.is_some()
+        || !run.work_binding.as_ref().is_some_and(|work| {
+            work.work_id().as_str() == guard.work_id && work.branch_id().as_str() == guard.branch_id
+        })
+    {
+        return Err("work_interaction_attachment_fenced".to_string());
+    }
+    Ok(())
 }
 
 /// Validate checkpoint custody before taking handoff/attachment locks.
@@ -4495,6 +4668,100 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
 
+    /// Load only the exact metadata needed to scope a Work interaction. The
+    /// default is correct for process-local stores; database stores override
+    /// it with their metadata-only indexed query.
+    async fn load_run_work_scope(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunWorkScope>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .map(|run| DurableRunWorkScope {
+                session_id: run.session_id,
+                parent_run_id: run.parent_run_id,
+                work_binding: run.work_binding,
+            }))
+    }
+
+    /// Return active root runs for one Work branch. Production stores answer
+    /// this from the Work index rather than scanning a bounded session tree.
+    async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        let page = self.list_session_runs(user_id, session_id, 256).await?;
+        Ok(page
+            .runs
+            .into_iter()
+            .filter(|run| {
+                run.parent_run_id.is_none()
+                    && matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                    && run.work_binding.as_ref().is_some_and(|binding| {
+                        binding.work_id().as_str() == work_id
+                            && binding.branch_id().as_str() == branch_id
+                    })
+            })
+            .map(|run| (run.run_id, run.status, run.waiting_for))
+            .collect())
+    }
+
+    /// Load the current interaction wait frontier and its indexed facts. This
+    /// read is deliberately narrower than a general run projection so a Web
+    /// observer can poll a long-running Work without scanning transcript
+    /// history. Stores that cannot provide the indexed form may fall back to
+    /// their process-local run representation.
+    async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: DurableRunInteractionKind,
+    ) -> Result<Option<DurableRunInteractionProjection>, String> {
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(None);
+        };
+        let request_id = run.events.iter().rev().find_map(|event| {
+            (extract_event_type(event) == "interaction_wait_started"
+                && event
+                    .pointer("/data/waiting_for")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kind.waiting_for()))
+            .then(|| extract_interaction_request_id(event))
+            .flatten()
+        });
+        let recent_events = request_id
+            .as_deref()
+            .map(|request_id| {
+                run.events
+                    .iter()
+                    .filter(|event| {
+                        extract_interaction_request_id(event).as_deref() == Some(request_id)
+                            && (extract_event_type(event) == kind.required_event_type()
+                                || (kind == DurableRunInteractionKind::AskUser
+                                    && extract_event_type(event) == "user_prompt_required")
+                                || extract_event_type(event) == kind.resolved_event_type())
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(DurableRunInteractionProjection {
+            run_id: run.run_id,
+            session_id: run.session_id,
+            status: run.status,
+            waiting_for: run.waiting_for,
+            recent_events,
+        }))
+    }
+
     /// Find the newest root run that explicitly requested Explain Analyze.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
@@ -5043,6 +5310,35 @@ pub trait RunStateStore: Send + Sync {
         _response_data: serde_json::Value,
     ) -> Result<DurableRunInteractionResolveOutcome, String> {
         Err("durable run interaction resolution is not supported by this store".to_string())
+    }
+
+    /// Resolve an interaction while fencing the exact Work attachment in the
+    /// same authority transaction. Stores without session attachments may
+    /// serve unguarded callers, but must fail closed when a caller supplies a
+    /// guard; the production database store overrides this method.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_run_interaction_with_attachment(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+        attachment: Option<DurableRunInteractionAttachmentGuard>,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        if attachment.is_some() {
+            return Err("work attachment fencing is not supported by this run store".to_string());
+        }
+        self.resolve_run_interaction(
+            user_id,
+            expected_session_id,
+            run_id,
+            request_id,
+            kind,
+            response_data,
+        )
+        .await
     }
 
     /// Open the exact durable wait frontier for one previously registered
@@ -7508,6 +7804,50 @@ impl RunStateStore for InMemoryRunStateStore {
             }))
     }
 
+    async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: DurableRunInteractionKind,
+    ) -> Result<Option<DurableRunInteractionProjection>, String> {
+        let runs = self.runs.read().await;
+        let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
+            return Ok(None);
+        };
+        let request_id = run.events.iter().rev().find_map(|event| {
+            (extract_event_type(event) == "interaction_wait_started"
+                && event
+                    .pointer("/data/waiting_for")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kind.waiting_for()))
+            .then(|| extract_interaction_request_id(event))
+            .flatten()
+        });
+        let recent_events = request_id
+            .as_deref()
+            .map(|request_id| {
+                run.events
+                    .iter()
+                    .filter(|event| {
+                        extract_interaction_request_id(event).as_deref() == Some(request_id)
+                            && (extract_event_type(event) == kind.required_event_type()
+                                || (kind == DurableRunInteractionKind::AskUser
+                                    && extract_event_type(event) == "user_prompt_required")
+                                || extract_event_type(event) == kind.resolved_event_type())
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(DurableRunInteractionProjection {
+            run_id: run.run_id.clone(),
+            session_id: run.session_id.clone(),
+            status: run.status.clone(),
+            waiting_for: run.waiting_for.clone(),
+            recent_events,
+        }))
+    }
+
     async fn load_run_event_delta(
         &self,
         user_id: &str,
@@ -8880,6 +9220,31 @@ impl RunStateStore for InMemoryRunStateStore {
         kind: DurableRunInteractionKind,
         response_data: serde_json::Value,
     ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        self.resolve_run_interaction_with_attachment(
+            user_id,
+            expected_session_id,
+            run_id,
+            request_id,
+            kind,
+            response_data,
+            None,
+        )
+        .await
+    }
+
+    async fn resolve_run_interaction_with_attachment(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+        attachment: Option<DurableRunInteractionAttachmentGuard>,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        if attachment.is_some() {
+            return Err("work attachment fencing is not supported by this run store".to_string());
+        }
         enum Mutation {
             Resolved {
                 run: DurableRunRecord,
@@ -14600,6 +14965,152 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(run))
     }
 
+    async fn load_run_work_scope(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunWorkScope>, String> {
+        self.load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map(|record| {
+                record.map(|run| DurableRunWorkScope {
+                    session_id: run.session_id,
+                    parent_run_id: run.parent_run_id,
+                    work_binding: run.work_binding,
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        let rows = sqlx::query(
+            "SELECT run_id, status, waiting_for FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND work_id = ?
+               AND work_branch_id = ? AND parent_run_id IS NULL
+               AND status IN (?, ?, ?)
+             ORDER BY updated_at DESC, run_id DESC LIMIT 2",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(work_id)
+        .bind(branch_id)
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_WAITING)
+        .bind(STATUS_PAUSED)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("list_active_work_runs", work_id, source).to_string())?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("run_id").map_err(|source| {
+                        db_error("decode_active_work_run_id", work_id, source).to_string()
+                    })?,
+                    row.try_get("status").map_err(|source| {
+                        db_error("decode_active_work_run_status", work_id, source).to_string()
+                    })?,
+                    row.try_get("waiting_for").map_err(|source| {
+                        db_error("decode_active_work_run_waiting", work_id, source).to_string()
+                    })?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: DurableRunInteractionKind,
+    ) -> Result<Option<DurableRunInteractionProjection>, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let Some(waiting_for) = run.waiting_for.as_deref() else {
+            return Ok(Some(DurableRunInteractionProjection {
+                run_id: run.run_id,
+                session_id: run.session_id,
+                status: run.status,
+                waiting_for: None,
+                recent_events: Vec::new(),
+            }));
+        };
+        if waiting_for != kind.waiting_for() {
+            return Ok(Some(DurableRunInteractionProjection {
+                run_id: run.run_id,
+                session_id: run.session_id,
+                status: run.status,
+                waiting_for: run.waiting_for,
+                recent_events: Vec::new(),
+            }));
+        }
+        let request_id: Option<String> = sqlx::query_scalar(
+            "SELECT interaction_request_id FROM agent_run_events
+             FORCE INDEX (idx_agent_run_events_control_type_idx)
+             WHERE user_id = ? AND run_id = ? AND event_type = 'interaction_wait_started'
+               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.waiting_for')) = ?
+             ORDER BY event_idx DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(kind.waiting_for())
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error("load_run_interaction_projection_frontier", run_id, source).to_string()
+        })?;
+        let recent_events = if let Some(request_id) = request_id {
+            let required_type = kind.required_event_type();
+            let alternate_required_type = if kind == DurableRunInteractionKind::AskUser {
+                "user_prompt_required"
+            } else {
+                required_type
+            };
+            let rows = sqlx::query(
+                "SELECT event_type, event_idx, payload_json
+                 FROM agent_run_events
+                 WHERE user_id = ? AND run_id = ? AND interaction_request_id = ?
+                   AND event_type IN (?, ?, ?)
+                 ORDER BY event_idx ASC",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .bind(&request_id)
+            .bind(required_type)
+            .bind(alternate_required_type)
+            .bind(kind.resolved_event_type())
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("load_run_interaction_projection_facts", run_id, source).to_string()
+            })?;
+            rows.into_iter()
+                .map(|row| {
+                    decode_run_event_payload(&row, run_id).map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(DurableRunInteractionProjection {
+            run_id: run.run_id,
+            session_id: run.session_id,
+            status: run.status,
+            waiting_for: run.waiting_for,
+            recent_events,
+        }))
+    }
+
     async fn find_latest_explain_analyze_root(
         &self,
         user_id: &str,
@@ -20131,6 +20642,28 @@ impl RunStateStore for DatabaseRunStateStore {
         kind: DurableRunInteractionKind,
         response_data: serde_json::Value,
     ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        self.resolve_run_interaction_with_attachment(
+            user_id,
+            expected_session_id,
+            run_id,
+            request_id,
+            kind,
+            response_data,
+            None,
+        )
+        .await
+    }
+
+    async fn resolve_run_interaction_with_attachment(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+        attachment: Option<DurableRunInteractionAttachmentGuard>,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
         let queued_response_event_type = kind
             .queued_response_event_type()
             .unwrap_or("interaction_response_queue_unsupported");
@@ -20208,6 +20741,9 @@ impl RunStateStore for DatabaseRunStateStore {
                     existing,
                     &response_data,
                 ));
+            }
+            if let Some(attachment) = attachment.as_ref() {
+                lock_work_interaction_attachment_tx(&mut tx, &run, attachment).await?;
             }
             let Some(required) = required else {
                 tx.rollback().await.map_err(|source| {
@@ -25358,6 +25894,30 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn in_memory_interaction_resolution_fails_closed_for_attachment_guard() {
+        let store = InMemoryRunStateStore::new();
+        let guard = DurableRunInteractionAttachmentGuard {
+            key: SessionKeyV1::owner_session("server", "u1", "s1", "main"),
+            attachment_id: "attachment-1".into(),
+            work_id: "work-1".into(),
+            branch_id: "branch-1".into(),
+        };
+        let error = store
+            .resolve_run_interaction_with_attachment(
+                "u1",
+                "s1",
+                "run-1",
+                "request-1",
+                DurableRunInteractionKind::Approval,
+                json!({"decision": "allow"}),
+                Some(guard),
+            )
+            .await
+            .expect_err("in-memory stores must not silently ignore an attachment guard");
+        assert!(error.contains("attachment fencing is not supported"));
     }
 
     fn execution_owner_cancel_request(
@@ -33294,6 +33854,303 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup interaction slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_work_interaction_attachment_is_atomic_and_replay_safe_on_matrixone() {
+        use crate::work::{GraphRevision, WorkBranchId, WorkId};
+        use astra_turn_types::{
+            ActorContextV1, ActorKindV1, AuthorityEpochsV1, DEFAULT_CONVERSATION_BRANCH_ID,
+            SessionAttachmentModeV1, SessionPlacementV1, SessionSurfaceV1,
+        };
+
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("work-attachment-user-{nonce}");
+        let session_id = format!("work-attachment-session-{nonce}");
+        let work_id = format!("work-attachment-work-{nonce}");
+        let branch_id = format!("work-attachment-branch-{nonce}");
+        let key = SessionKeyV1::owner_session(
+            "server",
+            &user_id,
+            &session_id,
+            DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+        async fn insert_attachment(
+            pool: &astra_core::SharedPool,
+            attachment: &astra_turn_types::SessionAttachmentV1,
+        ) {
+            let json = serde_json::to_string(attachment).expect("attachment JSON");
+            sqlx::query(
+                "INSERT INTO session_attachments
+                 (isolation_domain, owner_user_id, session_id, branch_id,
+                  attachment_id, attachment_epoch, idempotency_hash, request_hash,
+                  actor_id, mode, placement, observed_manifest_root,
+                  attachment_json, expires_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            )
+            .bind(&attachment.key.isolation_domain)
+            .bind(&attachment.key.owner_user_id)
+            .bind(&attachment.key.session_id)
+            .bind(&attachment.key.branch_id)
+            .bind(&attachment.attachment_id)
+            .bind(attachment.attachment_epoch as i64)
+            .bind("a".repeat(64))
+            .bind("b".repeat(64))
+            .bind(&attachment.actor.actor_id)
+            .bind("read_only")
+            .bind("server")
+            .bind(json)
+            .bind(attachment.expires_at_unix_ms)
+            .execute(pool.get())
+            .await
+            .expect("insert test attachment");
+        }
+
+        async fn prepare_waiting_run(
+            store: &DatabaseRunStateStore,
+            user_id: &str,
+            session_id: &str,
+            run_id: &str,
+            work_id: &str,
+            branch_id: &str,
+            request_id: &str,
+        ) {
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.to_string();
+            run.session_id = session_id.to_string();
+            run.work_binding = Some(DurableWorkRunBinding::new(
+                WorkId::parse(work_id).expect("work id"),
+                WorkBranchId::parse(branch_id).expect("branch id"),
+                GraphRevision::new(1).expect("graph revision"),
+            ));
+            store.insert_run(run).await.expect("insert Work run");
+            let required = [approval_required_event(request_id, "bash", session_id)];
+            assert_eq!(
+                store
+                    .register_guarded_interaction_batch(
+                        AtomicRunInteractionBatchRegistrationRequest {
+                            user_id,
+                            run_id,
+                            expected_session_id: session_id,
+                            expected_control_epoch: -1,
+                            expected_owner_generation: 0,
+                            events: &required,
+                        },
+                    )
+                    .await
+                    .expect("register Work approval"),
+                AtomicRunInteractionBatchRegistration::Registered
+            );
+            assert_eq!(
+                store
+                    .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                        user_id,
+                        run_id,
+                        expected_session_id: session_id,
+                        request_id,
+                        kind: DurableRunInteractionKind::Approval,
+                        expected_control_epoch: -1,
+                        expected_owner_generation: 0,
+                    })
+                    .await
+                    .expect("open Work approval frontier"),
+                DurableRunInteractionWaitOutcome::Waiting
+            );
+        }
+
+        let actor = ActorContextV1::owner_user(
+            &user_id,
+            "web-attachment-test",
+            ActorKindV1::Server,
+            SessionSurfaceV1::Web,
+            None,
+            AuthorityEpochsV1::default(),
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let attachment_id = Uuid::new_v4().to_string();
+        let attachment = astra_turn_types::SessionAttachmentV1 {
+            schema_version: astra_turn_types::SESSION_ATTACHMENT_SCHEMA_VERSION,
+            attachment_id: attachment_id.clone(),
+            attachment_epoch: 1,
+            key: key.clone(),
+            actor,
+            mode: SessionAttachmentModeV1::ReadOnly,
+            placement: SessionPlacementV1::Server,
+            observed_cursor: None,
+            observed_manifest_root: None,
+            workspace: None,
+            attached_at_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+        };
+        attachment.validate().expect("valid read attachment");
+        insert_attachment(&pool, &attachment).await;
+
+        let valid_run_id = format!("work-attachment-valid-run-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &valid_run_id,
+            &work_id,
+            &branch_id,
+            "valid-approval",
+        )
+        .await;
+        let guard = DurableRunInteractionAttachmentGuard {
+            key: key.clone(),
+            attachment_id: attachment_id.clone(),
+            work_id: work_id.clone(),
+            branch_id: branch_id.clone(),
+        };
+        let allow = json!({
+            "request_id": "valid-approval",
+            "outcome": "approved",
+            "decision": "allow",
+            "tool": "bash",
+            "approval_kind": "standard"
+        });
+        assert!(matches!(
+            store
+                .resolve_run_interaction_with_attachment(
+                    &user_id,
+                    &session_id,
+                    &valid_run_id,
+                    "valid-approval",
+                    DurableRunInteractionKind::Approval,
+                    allow.clone(),
+                    Some(guard.clone()),
+                )
+                .await
+                .expect("valid read attachment resolves approval"),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        sqlx::query(
+            "DELETE FROM session_attachments
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND attachment_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&key.branch_id)
+        .bind(&attachment_id)
+        .execute(pool.get())
+        .await
+        .expect("detach test attachment");
+        assert!(matches!(
+            store
+                .resolve_run_interaction_with_attachment(
+                    &user_id,
+                    &session_id,
+                    &valid_run_id,
+                    "valid-approval",
+                    DurableRunInteractionKind::Approval,
+                    allow,
+                    Some(guard.clone()),
+                )
+                .await
+                .expect("detached replay returns the recorded result"),
+            DurableRunInteractionResolveOutcome::Idempotent(_)
+        ));
+        let rejected_run_id = format!("work-attach-rejected-{nonce}");
+        let rejected_session_id = format!("work-attach-r-session-{nonce}");
+        let rejected_key = SessionKeyV1::owner_session(
+            "server",
+            &user_id,
+            &rejected_session_id,
+            DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        insert_active_database_session_fixture(&pool, &user_id, &rejected_session_id).await;
+        let expired_attachment_id = Uuid::new_v4().to_string();
+        let expired_attachment = astra_turn_types::SessionAttachmentV1 {
+            attachment_id: expired_attachment_id.clone(),
+            key: rejected_key.clone(),
+            attached_at_unix_ms: now - 120_000,
+            expires_at_unix_ms: now - 60_000,
+            ..attachment
+        };
+        insert_attachment(&pool, &expired_attachment).await;
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &rejected_session_id,
+            &rejected_run_id,
+            &work_id,
+            &branch_id,
+            "expired-approval",
+        )
+        .await;
+        let expired_guard = DurableRunInteractionAttachmentGuard {
+            key: rejected_key,
+            attachment_id: expired_attachment_id.clone(),
+            work_id,
+            branch_id,
+        };
+        let error = store
+            .resolve_run_interaction_with_attachment(
+                &user_id,
+                &rejected_session_id,
+                &rejected_run_id,
+                "expired-approval",
+                DurableRunInteractionKind::Approval,
+                json!({
+                    "request_id": "expired-approval",
+                    "outcome": "approved",
+                    "decision": "allow",
+                    "tool": "bash",
+                    "approval_kind": "standard"
+                }),
+                Some(expired_guard),
+            )
+            .await
+            .expect_err("expired attachment must be fenced before resolution");
+        assert_eq!(error, "work_interaction_attachment_fenced");
+        let rejected = store
+            .load_run(&user_id, &rejected_run_id)
+            .await
+            .expect("load fenced run")
+            .expect("fenced run exists");
+        assert!(rejected.events.iter().all(|event| !matches!(
+            extract_event_type(event).as_str(),
+            "approval_resolved" | "run_resumed"
+        )));
+
+        for run_id in [&valid_run_id, &rejected_run_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM session_attachments WHERE owner_user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup Work attachment rows");
+        sqlx::query("DELETE FROM session_attachments WHERE owner_user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&rejected_session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup rejected Work attachment rows");
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup Work interaction slot");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup Work interaction session");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&rejected_session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup rejected Work interaction session");
     }
 
     #[tokio::test]

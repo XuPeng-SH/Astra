@@ -48,14 +48,14 @@ use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunEventDelta,
-    DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
-    DurableWorkItemRunBinding, DurableWorkRunBinding, ModelSelectionMode,
-    RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
-    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
-    RunProjectionCheckpointRecord, RunProjectionRecord, RunStartIdempotency,
-    RunStartIdempotencyKind, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
-    RuntimeAuthRequest, RuntimeProfileRequest, durable_run_status_blocks_session,
-    durable_run_status_is_terminal, durable_run_status_kind,
+    DurableRunInteractionAttachmentGuard, DurableRunRecord, DurableRunStartClaim,
+    DurableRunStatusKind, DurableRunStatusSnapshot, DurableRunWorkScope, DurableWorkItemRunBinding,
+    DurableWorkRunBinding, ModelSelectionMode, RequestedTurnInteractionMode,
+    ResolvedModelSelection, RunContinuationRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord,
+    RunProjectionRecord, RunStartIdempotency, RunStartIdempotencyKind, RunStatusRecord,
+    RunUserIntentData, RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
+    durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -2212,6 +2212,38 @@ struct DurableRunApprovalGate {
     wait_started_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
+const APPROVAL_ACTION_SUMMARY_MAX_BYTES: usize = 2_048;
+
+/// Keep the approval card useful without exposing the raw tool payload. The
+/// summary is produced at the canonical gate before the request is persisted,
+/// so every observer sees the same bounded, redacted action description.
+fn approval_action_summary(tool_name: &str, args: &Value) -> Option<String> {
+    let is_empty = args.is_null() || args.as_object().is_some_and(serde_json::Map::is_empty);
+    if is_empty {
+        return Some(format!("{tool_name} (no arguments)"));
+    }
+    // Redact the structured value before serialization so key-aware rules
+    // catch short/camel-case credentials that text patterns cannot identify.
+    // Keep the serialized display pass as a second boundary for credential
+    // syntax embedded in free-form strings.
+    let mut safe_args = args.clone();
+    astra_tools::credential_redaction::redact_credentials_in_json(&mut safe_args);
+    let encoded = serde_json::to_string(&safe_args).ok()?;
+    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(&encoded);
+    let mut summary = format!("{tool_name} arguments: {redacted}");
+    if summary.len() > APPROVAL_ACTION_SUMMARY_MAX_BYTES {
+        summary.truncate(
+            summary
+                .char_indices()
+                .take_while(|(index, _)| *index < APPROVAL_ACTION_SUMMARY_MAX_BYTES)
+                .last()
+                .map_or(0, |(index, character)| index + character.len_utf8()),
+        );
+        summary.push('…');
+    }
+    Some(summary)
+}
+
 impl DurableRunApprovalGate {
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -2291,6 +2323,8 @@ impl DurableRunApprovalGate {
             {
                 data["detail"] = Value::String(plan.to_string());
             }
+        } else if let Some(summary) = approval_action_summary(tool_name, args) {
+            data["detail"] = Value::String(summary);
         }
         json!({
             "event_type": "approval_required",
@@ -18637,6 +18671,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         Ok(status)
     }
 
+    async fn get_run_interaction_projection(
+        &self,
+        run_id: String,
+        user_id: String,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<
+        Option<astra_services::runs::DurableRunInteractionProjection>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        self.run_engine
+            .load_run_interaction_projection(&user_id, &run_id, kind)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to load run interaction projection: {error}"),
+                )
+            })
+    }
+
     async fn get_run_projection(
         &self,
         run_id: String,
@@ -19083,6 +19137,31 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         })
     }
 
+    async fn get_run_work_scope(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<Option<astra_services::runs::DurableRunWorkScope>, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .load_run_work_scope(&user_id, &run_id)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+    }
+
+    async fn list_active_work_runs(
+        &self,
+        work_id: String,
+        branch_id: String,
+        user_id: String,
+        session_id: String,
+    ) -> Result<Vec<(String, String, Option<String>)>, (StatusCode, Json<ErrorResponse>)> {
+        self.run_engine
+            .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+    }
+
     async fn drain_approval_requests(&self, run_id: &str) -> Vec<serde_json::Value> {
         let mut channels = self.approval_channels.lock().await;
         let Some(rx) = channels.get_mut(run_id) else {
@@ -19143,6 +19222,43 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
             .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+    }
+
+    async fn resolve_run_interaction_with_attachment(
+        &self,
+        run_id: String,
+        user_id: String,
+        expected_session_id: String,
+        request_id: String,
+        kind: astra_services::runs::DurableRunInteractionKind,
+        response_data: Value,
+        attachment: Option<astra_services::runs::DurableRunInteractionAttachmentGuard>,
+    ) -> Result<
+        astra_services::runs::DurableRunInteractionResolveOutcome,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        self.run_engine
+            .resolve_run_interaction_with_attachment(
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &request_id,
+                kind,
+                response_data,
+                attachment,
+            )
+            .await
+            .map_err(|error| {
+                if error == "work_interaction_attachment_fenced" {
+                    error_response_coded(
+                        StatusCode::CONFLICT,
+                        "Work attachment is no longer valid",
+                        "attachment_fenced",
+                    )
+                } else {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, error)
+                }
+            })
     }
 
     async fn drain_progress_events(&self, run_id: &str) -> Vec<serde_json::Value> {

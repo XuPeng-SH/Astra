@@ -258,6 +258,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "run_waiting"
             | "run_paused"
             | "run_resumed"
+            | "approval_required"
             | "runtime.control.handoff.requested"
             | "runtime.control.handoff.rejected"
             | "ask_user_prompted"

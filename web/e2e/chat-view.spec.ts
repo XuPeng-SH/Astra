@@ -196,10 +196,14 @@ function workSurfacePanel(page: Page) {
 
 async function openWorkSurfaceIfNeeded(page: Page) {
   const surface = workSurfacePanel(page);
+  const expandButton = page.getByRole('button', { name: 'Expand run workspace' }).first();
+  if (await expandButton.isVisible().catch(() => false)) {
+    await expandButton.click();
+  }
   const workButton = page.getByRole('button', { name: /^Activity$/ }).first();
   if (await workButton.isVisible().catch(() => false)) {
     await workButton.click();
-    await expect(surface.getByRole('heading', { name: 'Activity' })).toBeVisible();
+    await expect(surface.getByRole('heading', { name: 'Astra Workbench' })).toBeVisible();
   }
   return surface;
 }
@@ -374,7 +378,7 @@ test('activity panel hides environment internals before work runs', async ({ pag
   await page.goto('/e2e/chat-view?status=running');
   const surface = await openWorkSurfaceIfNeeded(page);
 
-  await expect(surface.getByRole('heading', { name: 'Activity' })).toBeVisible();
+  await expect(surface.getByRole('heading', { name: 'Astra Workbench' })).toBeVisible();
   await expect(surface.getByText('Workspace', { exact: true })).toHaveCount(0);
   await expect(surface.getByText('Executor', { exact: true })).toHaveCount(0);
   await expect(surface.getByText('Server sandbox')).toHaveCount(0);

@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use super::turn_cancellation::apply_user_cancelled_turn;
-use super::turn_entry::TurnContext;
+use super::turn_entry::{TurnContext, TurnUsage};
 use super::turn_failure_reporting::{
     reconcile_and_report_turn_failure, report_admission_rejection,
 };
@@ -24,6 +24,13 @@ pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) turn_start: Instant,
     pub(crate) ui: &'a mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+    pub(crate) turn_usage_sink: Option<&'a std::sync::Arc<std::sync::Mutex<Option<TurnUsage>>>>,
+}
+
+fn publish_turn_usage(dispatch: &TurnDispatch<'_, '_>, usage: Option<TurnUsage>) {
+    if let Some(sink) = dispatch.turn_usage_sink {
+        *sink.lock().unwrap_or_else(|error| error.into_inner()) = usage;
+    }
 }
 
 pub(crate) async fn settle_interrupted_turn(
@@ -31,6 +38,11 @@ pub(crate) async fn settle_interrupted_turn(
     dispatch: &mut TurnDispatch<'_, '_>,
     result: Result<StreamResult, crate::TurnFailure>,
 ) {
+    let usage = match &result {
+        Ok(result) => TurnUsage::from_stream_result(result),
+        Err(failure) => TurnUsage::from_partial(&failure.partial),
+    };
+    publish_turn_usage(dispatch, usage);
     apply_user_cancelled_turn(
         state,
         dispatch.ctx.api,
@@ -50,6 +62,7 @@ pub(crate) async fn settle_successful_turn(
     dispatch: &mut TurnDispatch<'_, '_>,
     result: StreamResult,
 ) {
+    publish_turn_usage(dispatch, TurnUsage::from_stream_result(&result));
     apply_turn_success_async(
         state,
         dispatch.ctx.api,
@@ -84,6 +97,7 @@ pub(crate) async fn settle_failed_turn(
         dispatch.ui,
     )
     .await;
+    publish_turn_usage(dispatch, TurnUsage::from_partial(&failure.partial));
     clear_recovery_scoped_turn_restrictions(state);
 }
 
@@ -126,6 +140,7 @@ mod tests {
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
+            turn_usage_sink: None,
         };
 
         settle_successful_turn(
@@ -167,6 +182,7 @@ mod tests {
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
+            turn_usage_sink: None,
         };
         let mut failure = crate::TurnFailure {
             error: "boom".into(),
@@ -209,6 +225,7 @@ mod tests {
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
+            turn_usage_sink: None,
         };
         let mut failure = crate::TurnFailure {
             error: "[invalid_request] This checkout is already attached to another Session".into(),
