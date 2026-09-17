@@ -23,7 +23,14 @@ import type {
   WorkExecutionTargetPageV1,
   WorkExecutionSwitchOperationV1,
   WorkRecoveryPointV1,
+  WorkRecoveryPointWorkspaceV1,
+  WorkRecoveryPointArtifactV1,
   WorkRecoveryPointPageV1,
+  WorkWorkspaceRecoveryArtifactV1,
+  WorkWorkspaceRecoveryBlobV1,
+  WorkWorkspaceRecoveryBasisExpectationV1,
+  WorkWorkspaceRecoveryBasisV1,
+  WorkWorkspaceRecoveryChunkReceiptV1,
   WorkBranchControlBasisV1,
   WorkBranchControlOperationV2,
   WorkBranchCreationOperationV1,
@@ -139,6 +146,20 @@ function nullableExecutionIdentity(value: unknown, path: string): string | null 
   return opaqueIdentity(value, path);
 }
 
+// `executor_name` is a human-facing label (for example "My Work Laptop"),
+// not the stable executor identity.  Keep the identity decoder for
+// `executor_id`/operation ids, but do not reject ordinary spaces in a display
+// name: doing so makes an otherwise readable Work execution projection crash
+// the whole Web page.
+function nullableExecutionDisplayName(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  const name = nonEmptyString(value, path);
+  if (name.length > 256 || /[\u0000-\u001f\u007f]/u.test(name)) {
+    throw new TypeError(`${path} must be a bounded control-free display name`);
+  }
+  return name;
+}
+
 function executionFailureCode(value: unknown, path: string): string | null {
   if (value === null) return null;
   const code = nonEmptyString(value, path);
@@ -188,7 +209,7 @@ export function decodeWorkExecutionViewV1(value: unknown): WorkExecutionViewV1 {
     ),
     placement: oneOf(object.placement, ["server", "edge"] as const, `${path}.placement`),
     executor_id: nullableExecutionIdentity(object.executor_id, `${path}.executor_id`),
-    executor_name: nullableExecutionIdentity(object.executor_name, `${path}.executor_name`),
+    executor_name: nullableExecutionDisplayName(object.executor_name, `${path}.executor_name`),
     operation_id: nullableExecutionIdentity(object.operation_id, `${path}.operation_id`),
     attempt,
     failure_code: executionFailureCode(object.failure_code, `${path}.failure_code`),
@@ -222,8 +243,8 @@ export function decodeWorkExecutionTargetPageV1(
     targetIds.add(executorId);
     return {
       executor_id: executorId,
-      display_name: nullableExecutionIdentity(target.display_name, `${targetPath}.display_name`),
-      hostname: nullableExecutionIdentity(target.hostname, `${targetPath}.hostname`),
+      display_name: nullableExecutionDisplayName(target.display_name, `${targetPath}.display_name`),
+      hostname: nullableExecutionDisplayName(target.hostname, `${targetPath}.hostname`),
       capabilities: target.capabilities.map((capability, capabilityIndex) =>
         capabilityIdentity(capability, `${targetPath}.capabilities[${capabilityIndex}]`)),
       connected: booleanValue(target.connected, `${targetPath}.connected`),
@@ -316,6 +337,8 @@ function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPoin
       "criteria_set_revision",
       "session_cursor",
       "execution",
+      "workspace",
+      "artifacts",
       "coverage",
       "capabilities",
     ],
@@ -356,6 +379,76 @@ function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPoin
     ],
     `${path}.capabilities`,
   );
+  let workspace: WorkRecoveryPointWorkspaceV1 | null = null;
+  if (object.workspace !== null) {
+    const workspaceObject = exactObject(
+      object.workspace,
+      [
+        "snapshot_id",
+        "logical_workspace_id",
+        "manifest_hash",
+        "content_root",
+        "byte_size",
+        "complete",
+        "artifact_id",
+        "artifact_type",
+        "content_digest",
+      ],
+      `${path}.workspace`,
+    );
+    workspace = {
+      snapshot_id: opaqueIdentity(workspaceObject.snapshot_id, `${path}.workspace.snapshot_id`),
+      logical_workspace_id: opaqueIdentity(
+        workspaceObject.logical_workspace_id,
+        `${path}.workspace.logical_workspace_id`,
+      ),
+      manifest_hash: contentHash(
+        workspaceObject.manifest_hash,
+        `${path}.workspace.manifest_hash`,
+      ),
+      content_root: contentHash(workspaceObject.content_root, `${path}.workspace.content_root`),
+      byte_size: safeIntegerAtLeast(workspaceObject.byte_size, 0, `${path}.workspace.byte_size`),
+      complete: booleanValue(workspaceObject.complete, `${path}.workspace.complete`),
+      artifact_id: opaqueIdentity(workspaceObject.artifact_id, `${path}.workspace.artifact_id`),
+      artifact_type: opaqueIdentity(
+        workspaceObject.artifact_type,
+        `${path}.workspace.artifact_type`,
+      ),
+      content_digest: contentHash(
+        workspaceObject.content_digest,
+        `${path}.workspace.content_digest`,
+      ),
+    };
+  }
+  if (!Array.isArray(object.artifacts) || object.artifacts.length > 256) {
+    throw new TypeError(`${path}.artifacts must contain at most 256 entries`);
+  }
+  const artifacts: WorkRecoveryPointArtifactV1[] = object.artifacts.map((value, index) => {
+    const artifact = exactObject(
+      value,
+      ["artifact_id", "artifact_type", "digest", "location_ref"],
+      `${path}.artifacts[${index}]`,
+    );
+    return {
+      artifact_id: opaqueIdentity(artifact.artifact_id, `${path}.artifacts[${index}].artifact_id`),
+      artifact_type: opaqueIdentity(
+        artifact.artifact_type,
+        `${path}.artifacts[${index}].artifact_type`,
+      ),
+      digest: contentHash(artifact.digest, `${path}.artifacts[${index}].digest`),
+      location_ref: nullableExecutionIdentity(
+        artifact.location_ref,
+        `${path}.artifacts[${index}].location_ref`,
+      ),
+    };
+  });
+  const artifactIds = new Set<string>();
+  for (const artifact of artifacts) {
+    if (artifactIds.has(artifact.artifact_id)) {
+      throw new TypeError(`${path}.artifacts contain a duplicate artifact identity`);
+    }
+    artifactIds.add(artifact.artifact_id);
+  }
   return {
     schema_version: 1,
     work_id: resourceIdentity(object.work_id, `${path}.work_id`),
@@ -421,6 +514,8 @@ function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPoin
         `${path}.execution.binding_generation`,
       ),
     },
+    workspace,
+    artifacts,
     coverage: {
       session_state: booleanValue(coverage.session_state, `${path}.coverage.session_state`),
       work_state: booleanValue(coverage.work_state, `${path}.coverage.work_state`),
@@ -455,6 +550,209 @@ function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPoin
 
 export function decodeWorkRecoveryPointV1(value: unknown): WorkRecoveryPointV1 {
   return decodeWorkRecoveryPoint(value, "work_recovery_point");
+}
+
+/** Strict decoder for the pre-capture Work/Session basis. */
+export function decodeWorkWorkspaceRecoveryBasisV1(
+  value: unknown,
+): WorkWorkspaceRecoveryBasisV1 {
+  const path = "work_workspace_recovery_basis";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "logical_workspace_id",
+      "work_revision",
+      "branch_revision",
+      "graph_revision",
+      "context_head_hash",
+      "execution_binding_hash",
+      "session_cursor",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const sessionCursor = exactObject(
+    object.session_cursor,
+    [
+      "completed_turn",
+      "journal_event_seq",
+      "conversation_seq",
+      "canonical_root_hash",
+      "compaction_generation",
+    ],
+    `${path}.session_cursor`,
+  );
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    logical_workspace_id: opaqueIdentity(
+      object.logical_workspace_id,
+      `${path}.logical_workspace_id`,
+    ),
+    work_revision: positiveRevision(object.work_revision, `${path}.work_revision`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    graph_revision: positiveRevision(object.graph_revision, `${path}.graph_revision`),
+    context_head_hash: contentHash(object.context_head_hash, `${path}.context_head_hash`),
+    execution_binding_hash: contentHash(
+      object.execution_binding_hash,
+      `${path}.execution_binding_hash`,
+    ),
+    session_cursor: {
+      completed_turn: boundedCount(
+        sessionCursor.completed_turn,
+        Number.MAX_SAFE_INTEGER,
+        `${path}.session_cursor.completed_turn`,
+      ),
+      journal_event_seq: safeIntegerAtLeast(
+        sessionCursor.journal_event_seq,
+        0,
+        `${path}.session_cursor.journal_event_seq`,
+      ),
+      conversation_seq: safeIntegerAtLeast(
+        sessionCursor.conversation_seq,
+        0,
+        `${path}.session_cursor.conversation_seq`,
+      ),
+      canonical_root_hash: conversationRootHash(
+        sessionCursor.canonical_root_hash,
+        `${path}.session_cursor.canonical_root_hash`,
+      ),
+      compaction_generation: safeIntegerAtLeast(
+        sessionCursor.compaction_generation,
+        0,
+        `${path}.session_cursor.compaction_generation`,
+      ),
+    },
+  };
+}
+
+/** Strict decoder for a Work-owned, content-addressed workspace package. */
+export function decodeWorkWorkspaceRecoveryArtifactV1(
+  value: unknown,
+): WorkWorkspaceRecoveryArtifactV1 {
+  const path = "work_workspace_recovery_artifact";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "artifact_id",
+      "sealed",
+      "verified",
+      "snapshot_id",
+      "manifest_hash",
+      "content_root",
+      "content_digest",
+      "byte_size",
+      "chunk_count",
+      "snapshot_manifest",
+      "blobs",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const chunkCount = safeIntegerAtLeast(object.chunk_count, 0, `${path}.chunk_count`);
+  const byteSize = safeIntegerAtLeast(object.byte_size, 0, `${path}.byte_size`);
+  if (
+    object.snapshot_manifest === null ||
+    typeof object.snapshot_manifest !== "object" ||
+    Array.isArray(object.snapshot_manifest)
+  ) {
+    throw new TypeError(`${path}.snapshot_manifest must be a JSON object`);
+  }
+  if (!Array.isArray(object.blobs)) {
+    throw new TypeError(`${path}.blobs must be an array`);
+  }
+  const blobs = object.blobs.map((value, index): WorkWorkspaceRecoveryBlobV1 => {
+    const blobPath = `${path}.blobs[${index}]`;
+    const blob = exactObject(
+      value,
+      ["chunk_index", "blob_ref", "digest", "byte_size"],
+      blobPath,
+    );
+    const chunkIndex = safeIntegerAtLeast(blob.chunk_index, 0, `${blobPath}.chunk_index`);
+    const blobRef = opaqueIdentity(blob.blob_ref, `${blobPath}.blob_ref`);
+    if (blobRef.length > 512) {
+      throw new TypeError(`${blobPath}.blob_ref is too long`);
+    }
+    return {
+      chunk_index: chunkIndex,
+      blob_ref: blobRef,
+      digest: contentHash(blob.digest, `${blobPath}.digest`),
+      byte_size: safeIntegerAtLeast(blob.byte_size, 0, `${blobPath}.byte_size`),
+    };
+  });
+  for (let index = 0; index < blobs.length; index += 1) {
+    if (blobs[index]?.chunk_index !== index) {
+      throw new TypeError(`${path}.blobs must have contiguous chunk indexes`);
+    }
+    if (index > 0 && blobs[index - 1]?.blob_ref >= blobs[index]?.blob_ref) {
+      throw new TypeError(`${path}.blobs must be in canonical blob_ref order`);
+    }
+    if (index > 0 && blobs[index - 1]?.digest === blobs[index]?.digest) {
+      throw new TypeError(`${path}.blobs must not repeat a digest`);
+    }
+  }
+  if (blobs.length !== chunkCount) {
+    throw new TypeError(`${path}.blobs must match chunk_count`);
+  }
+  const totalSize = blobs.reduce((total, blob) => {
+    const next = total + blob.byte_size;
+    if (!Number.isSafeInteger(next)) {
+      throw new TypeError(`${path}.blobs total byte size is not a safe integer`);
+    }
+    return next;
+  }, 0);
+  if (totalSize !== byteSize) {
+    throw new TypeError(`${path}.blobs must match byte_size`);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    artifact_id: resourceIdentity(object.artifact_id, `${path}.artifact_id`),
+    sealed: booleanValue(object.sealed, `${path}.sealed`),
+    verified: booleanValue(object.verified, `${path}.verified`),
+    snapshot_id: opaqueIdentity(object.snapshot_id, `${path}.snapshot_id`),
+    manifest_hash: contentHash(object.manifest_hash, `${path}.manifest_hash`),
+    content_root: contentHash(object.content_root, `${path}.content_root`),
+    content_digest: contentHash(object.content_digest, `${path}.content_digest`),
+    byte_size: byteSize,
+    chunk_count: chunkCount,
+    snapshot_manifest: object.snapshot_manifest as Record<string, unknown>,
+    blobs,
+  };
+}
+
+/** Strict decoder for an idempotent workspace package chunk upload receipt. */
+export function decodeWorkWorkspaceRecoveryChunkReceiptV1(
+  value: unknown,
+): WorkWorkspaceRecoveryChunkReceiptV1 {
+  const path = "work_workspace_recovery_chunk_receipt";
+  const object = exactObject(
+    value,
+    ["schema_version", "artifact_id", "digest", "byte_size", "inserted"],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  return {
+    schema_version: 1,
+    artifact_id: resourceIdentity(object.artifact_id, `${path}.artifact_id`),
+    digest: contentHash(object.digest, `${path}.digest`),
+    byte_size: safeIntegerAtLeast(object.byte_size, 0, `${path}.byte_size`),
+    inserted: booleanValue(object.inserted, `${path}.inserted`),
+  };
 }
 
 export function decodeWorkRecoveryPointPageV1(value: unknown): WorkRecoveryPointPageV1 {

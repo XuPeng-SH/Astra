@@ -2902,6 +2902,7 @@ mod tests {
                     expected_work_revision: 1,
                     expected_branch_revision: 1,
                     reason: astra_server_types::WorkRecoveryPointReasonV1::UserRequested,
+                    workspace_artifact_id: None,
                 },
             )
             .await

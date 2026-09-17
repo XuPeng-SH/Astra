@@ -1,5 +1,6 @@
 use super::*;
 use crate::server::header_utils::collect_forward_headers;
+use astra_runtime_env::{WorkspaceSnapshotManifestV1, WorkspaceSnapshotPackage};
 use astra_services::runs::{
     ChatRequestData, ModelSelectionMode, RunStartIdempotency, RunStartIdempotencyKind,
     WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest,
@@ -22,10 +23,16 @@ use astra_services::work::{
     WorkRecoveryPointCursor, WorkRecoveryPointQuery, WorkRepository, WorkRepositoryError,
     WorkRevision, WorkSubjectRef, WorkTaskGraphQuery,
 };
+use astra_services::{
+    DatabaseSessionArtifactStore, SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1,
+    SessionArtifactContentChunkV1, SessionArtifactContentDescriptorV1, SessionArtifactContentStore,
+    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionContextCoordinator,
+};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -51,13 +58,16 @@ use astra_server_types::{
     WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
     WorkObservationResponseV1, WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1,
     WorkPatchCommitRequestV1, WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1,
-    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkRecoveryPointCapabilitiesV1,
-    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1,
-    WorkRecoveryPointExecutionV1, WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1,
-    WorkRecoveryPointReasonV1, WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1,
-    WorkRecoveryPointViewV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
+    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkRecoveryPointArtifactV1,
+    WorkRecoveryPointCapabilitiesV1, WorkRecoveryPointCaptureRequestV1,
+    WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1, WorkRecoveryPointExecutionV1,
+    WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1, WorkRecoveryPointReasonV1,
+    WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1, WorkRecoveryPointViewV1,
+    WorkRecoveryPointWorkspaceV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
     WorkTaskGraphResponseV1, WorkTranscriptItemV1, WorkTranscriptPageResponseV1,
-    WorkTranscriptQueryV1, WorkTurnRequestV1,
+    WorkTranscriptQueryV1, WorkTurnRequestV1, WorkWorkspaceRecoveryArtifactBeginRequestV1,
+    WorkWorkspaceRecoveryArtifactResponseV1, WorkWorkspaceRecoveryArtifactSealRequestV1,
+    WorkWorkspaceRecoveryBlobV1, WorkWorkspaceRecoveryChunkReceiptV1, WorkWorkspaceRecoveryChunkV1,
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
@@ -291,7 +301,8 @@ fn map_recovery_point_blocker(
         Blocker::RunFrontierUnavailable
         | Blocker::EdgeIdentityMissing
         | Blocker::UnsupportedExecutor
-        | Blocker::ContextUnavailable => {
+        | Blocker::ContextUnavailable
+        | Blocker::WorkspaceArtifactUnavailable => {
             tracing::warn!(work_id, blocker = ?reason, "recovery point verification unavailable");
             work_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -351,6 +362,47 @@ fn public_recovery_point(
         astra_services::work::WorkRecoveryPointStatus::Captured
             | astra_services::work::WorkRecoveryPointStatus::Ready
     );
+    let workspace_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "workspace_snapshot_package_v1");
+    let has_portable_workspace = verified_boundary
+        && manifest
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.complete)
+        && workspace_artifact.is_some();
+    let workspace = has_portable_workspace
+        .then(|| {
+            let workspace_ref = manifest.workspace.as_ref()?;
+            let artifact_ref = workspace_artifact?;
+            Some(WorkRecoveryPointWorkspaceV1 {
+                snapshot_id: workspace_ref.snapshot_id.clone(),
+                logical_workspace_id: workspace_ref.logical_workspace_id.clone(),
+                manifest_hash: workspace_ref.manifest_hash.clone(),
+                content_root: workspace_ref.content_root.clone(),
+                byte_size: workspace_ref.byte_size,
+                complete: workspace_ref.complete,
+                artifact_id: artifact_ref.artifact_id.clone(),
+                artifact_type: artifact_ref.artifact_type.clone(),
+                content_digest: artifact_ref.digest.clone(),
+            })
+        })
+        .flatten();
+    let artifacts = if verified_boundary {
+        manifest
+            .artifacts
+            .iter()
+            .map(|artifact| WorkRecoveryPointArtifactV1 {
+                artifact_id: artifact.artifact_id.clone(),
+                artifact_type: artifact.artifact_type.clone(),
+                digest: artifact.digest.clone(),
+                location_ref: artifact.location_ref.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(WorkRecoveryPointViewV1 {
         schema_version: 1,
         work_id: record.work_id.as_str().to_owned(),
@@ -383,21 +435,23 @@ fn public_recovery_point(
             executor_id: manifest.execution.executor_id.clone(),
             binding_generation: manifest.execution.binding_generation,
         },
+        workspace,
+        artifacts,
         coverage: WorkRecoveryPointCoverageV1 {
             session_state: verified_boundary,
             work_state: verified_boundary,
-            workspace: verified_boundary && manifest.workspace.is_some(),
+            workspace: has_portable_workspace,
             run_frontier: verified_boundary && manifest.run.is_some(),
             artifacts: verified_boundary && !manifest.artifacts.is_empty(),
         },
-        // A captured logical boundary is not a restorable payload. Keep every
-        // positive capability false until a future content/effect verifier
-        // can prove it, rather than letting the shape of the manifest imply
-        // a restore guarantee.
+        // A portable file package is useful for explicit installation, but it
+        // does not restore conversation, an unfinished Run, or provider
+        // authority. Keep those capabilities false until their own verifier
+        // exists.
         capabilities: WorkRecoveryPointCapabilitiesV1 {
             can_restore_conversation: false,
             can_continue_in_original_environment: false,
-            has_portable_workspace: false,
+            has_portable_workspace,
             requires_target_environment_check: manifest.environment.platform.is_some()
                 || manifest.environment.runtime_fingerprint.is_some()
                 || !manifest.environment.required_capabilities.is_empty()
@@ -687,6 +741,26 @@ fn work_digest(domain: &str, fields: &[&str]) -> String {
         hasher.update(field.as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn workspace_recovery_basis_hash<T: serde::Serialize>(
+    domain: &str,
+    value: &T,
+) -> Result<String, serde_json::Error> {
+    let encoded = serde_json::to_string(value)?;
+    Ok(format!("sha256:{}", work_digest(domain, &[&encoded])))
+}
+
+fn public_recovery_point_session_cursor(
+    cursor: &astra_turn_types::SessionCursorV1,
+) -> WorkRecoveryPointSessionCursorV1 {
+    WorkRecoveryPointSessionCursorV1 {
+        completed_turn: cursor.completed_turn,
+        journal_event_seq: cursor.journal_event_seq,
+        conversation_seq: cursor.conversation_seq,
+        canonical_root_hash: cursor.canonical_root_hash.clone(),
+        compaction_generation: cursor.compaction_generation,
+    }
 }
 
 fn valid_work_request_id(value: &str) -> bool {
@@ -4819,6 +4893,1510 @@ async fn attest_execution_pair(
 /// Record one owner-scoped, quiescent Work/Session progress boundary. The
 /// server derives the manifest inside one transaction; callers cannot claim
 /// workspace, artifact, or unfinished-Run restore capability.
+pub(super) async fn post_work_workspace_recovery_artifact_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+    payload: Result<Json<WorkWorkspaceRecoveryArtifactBeginRequestV1>, JsonRejection>,
+) -> WorkApiResult<WorkWorkspaceRecoveryArtifactResponseV1> {
+    require_work_api_major(&headers)?;
+    let Json(payload) = payload.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_artifact_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    if !valid_work_recovery_request_id(&payload.request_id)
+        || !valid_sha256_content_digest(&payload.content_digest)
+        || payload.basis.work_revision == 0
+        || payload.basis.branch_revision == 0
+        || payload.basis.graph_revision == 0
+        || !valid_sha256_content_digest(&payload.basis.context_head_hash)
+        || !valid_sha256_content_digest(&payload.basis.execution_binding_hash)
+    {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_artifact_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    let (binding, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let session_id = binding.session_id.as_str().to_owned();
+    let manifest: WorkspaceSnapshotManifestV1 =
+        serde_json::from_value(payload.snapshot_manifest.clone()).map_err(|_| {
+            work_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_workspace_snapshot_manifest",
+                WorkApiErrorCategory::InvalidRequest,
+                false,
+                Vec::new(),
+            )
+        })?;
+    manifest.validate().map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_snapshot_manifest",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let Some((unique_payload_bytes, unique_blob_count, _)) =
+        workspace_manifest_blob_layout(&manifest)
+    else {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    };
+    if unique_payload_bytes != payload.byte_size || unique_blob_count != payload.chunk_count {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let manifest_hash = manifest.content_hash().map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_snapshot_manifest",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let artifact_id = format!(
+        "wsp-{}",
+        &work_digest(
+            "workspace-recovery-artifact",
+            &[
+                owner_id.as_str(),
+                work_id.as_str(),
+                branch_id.as_str(),
+                &payload.request_id,
+            ],
+        )[..59]
+    );
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
+    if let Some(response) = replay_workspace_artifact_begin(WorkspaceArtifactBeginReplayInput {
+        store: &store,
+        user_id: owner_id.as_str(),
+        session_id: &session_id,
+        work_id: &work_id,
+        branch_id: &branch_id,
+        artifact_id: &artifact_id,
+        request: &payload,
+        manifest_hash: &manifest_hash,
+    })
+    .await?
+    {
+        return Ok(Json(response));
+    }
+
+    // No artifact exists yet. Capture the canonical basis only for the first
+    // request; an exact replay above must retain the original basis even if a
+    // later turn advanced the Session or Work.
+    let default_logical_workspace_id = execution_logical_workspace_id(&key);
+    let execution = coordinator
+        .load_execution_binding(&key)
+        .await
+        .map_err(map_execution_switch_error)?
+        .unwrap_or_else(|| {
+            astra_services::SessionExecutionBindingV1::server_work_default(
+                default_logical_workspace_id.clone(),
+            )
+        });
+    if manifest.logical_workspace_id != execution.logical_workspace_id {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let context_head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(map_work_attachment_coordinator_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_basis_mismatch",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    let work_revision = sqlx::query(
+        "SELECT work_revision
+         FROM works
+         WHERE owner_id = ? AND work_id = ?
+         LIMIT 1",
+    )
+    .bind(owner_id.as_str())
+    .bind(work_id.as_str())
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|_| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?
+    .and_then(|row| row.try_get::<i64, _>("work_revision").ok())
+    .and_then(|revision| u64::try_from(revision).ok())
+    .ok_or_else(|| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    let current_context_head_hash = workspace_recovery_basis_hash("context-head", &context_head)
+        .map_err(|_| {
+            work_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_recovery_artifact_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?;
+    let current_execution_binding_hash =
+        workspace_recovery_basis_hash("execution-binding", &execution).map_err(|_| {
+            work_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_recovery_artifact_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?;
+    let branch_revision = u64::try_from(binding.branch_revision.get()).map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    let graph_revision = u64::try_from(binding.graph_revision.get()).map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    if payload.basis.work_revision != work_revision
+        || payload.basis.branch_revision != branch_revision
+        || payload.basis.graph_revision != graph_revision
+        || payload.basis.context_head_hash != current_context_head_hash
+        || payload.basis.execution_binding_hash != current_execution_binding_hash
+    {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let descriptor = SessionArtifactContentDescriptorV1 {
+        schema_version: astra_services::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+        backend: SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1.to_string(),
+        digest: payload.content_digest.clone(),
+        byte_size: payload.byte_size,
+        chunk_count: payload.chunk_count,
+        sealed: false,
+    };
+    let record = SessionArtifactJsonRecord {
+        artifact_id: artifact_id.clone(),
+        session_id: session_id.clone(),
+        user_id: owner_id.as_str().to_owned(),
+        artifact_kind: "workspace_snapshot_package_v1".to_string(),
+        source: Some("work_recovery".to_string()),
+        turn: None,
+        round: None,
+        content: serde_json::to_value(&manifest).map_err(|_| {
+            work_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_recovery_artifact_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?,
+        metadata: Some(serde_json::json!({
+            "work_id": work_id.as_str(),
+            "branch_id": branch_id.as_str(),
+            "logical_workspace_id": execution.logical_workspace_id.clone(),
+            "request_id": payload.request_id,
+            "manifest_hash": manifest_hash,
+            "work_revision": work_revision,
+            "branch_revision": branch_revision,
+            "graph_revision": graph_revision,
+            "context_head_hash": current_context_head_hash,
+            "execution_binding_hash": current_execution_binding_hash,
+            "context_head": context_head,
+            "execution_binding": execution,
+        })),
+        references: Vec::new(),
+    };
+    let stored = match store.begin_byte_artifact(record, descriptor).await {
+        Ok(stored) => stored,
+        Err(error @ astra_services::SessionArtifactStoreError::ByteArtifactConflict { .. }) => {
+            if let Some(response) =
+                replay_workspace_artifact_begin(WorkspaceArtifactBeginReplayInput {
+                    store: &store,
+                    user_id: owner_id.as_str(),
+                    session_id: &session_id,
+                    work_id: &work_id,
+                    branch_id: &branch_id,
+                    artifact_id: &artifact_id,
+                    request: &payload,
+                    manifest_hash: &manifest_hash,
+                })
+                .await?
+            {
+                return Ok(Json(response));
+            }
+            return Err(map_workspace_artifact_store_error(error));
+        }
+        Err(error) => return Err(map_workspace_artifact_store_error(error)),
+    };
+    let sealed = stored
+        .content
+        .get("content")
+        .and_then(|value| value.get("sealed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(Json(work_workspace_artifact_response(
+        &work_id,
+        &branch_id,
+        artifact_id,
+        sealed,
+        false,
+        &manifest,
+        &payload.content_digest,
+        payload.byte_size,
+        payload.chunk_count,
+    )))
+}
+
+/// Read the canonical state that must be echoed when a local workspace
+/// capture begins. This is intentionally a separate read: the capture itself
+/// can take minutes, so the server cannot infer its starting Session head from
+/// the eventual manifest.
+pub(super) async fn get_work_workspace_recovery_basis_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+) -> WorkApiResult<astra_server_types::WorkWorkspaceRecoveryBasisV1> {
+    require_work_api_major(&headers)?;
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_basis_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let (binding, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let execution = coordinator
+        .load_execution_binding(&key)
+        .await
+        .map_err(map_execution_switch_error)?
+        .unwrap_or_else(|| {
+            astra_services::SessionExecutionBindingV1::server_work_default(
+                execution_logical_workspace_id(&key),
+            )
+        });
+    let context_head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(map_work_attachment_coordinator_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_basis_mismatch",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    let work_revision = sqlx::query(
+        "SELECT work_revision
+         FROM works
+         WHERE owner_id = ? AND work_id = ?
+         LIMIT 1",
+    )
+    .bind(owner_id.as_str())
+    .bind(work_id.as_str())
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|_| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_basis_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?
+    .and_then(|row| row.try_get::<i64, _>("work_revision").ok())
+    .and_then(|revision| u64::try_from(revision).ok())
+    .ok_or_else(|| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_basis_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    Ok(Json(astra_server_types::WorkWorkspaceRecoveryBasisV1 {
+        schema_version: 1,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        logical_workspace_id: execution.logical_workspace_id.clone(),
+        work_revision,
+        branch_revision: u64::try_from(binding.branch_revision.get()).map_err(|_| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_basis_mismatch",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?,
+        graph_revision: u64::try_from(binding.graph_revision.get()).map_err(|_| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_basis_mismatch",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?,
+        context_head_hash: workspace_recovery_basis_hash("context-head", &context_head).map_err(
+            |_| {
+                work_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace_recovery_basis_unavailable",
+                    WorkApiErrorCategory::Availability,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            },
+        )?,
+        execution_binding_hash: workspace_recovery_basis_hash("execution-binding", &execution)
+            .map_err(|_| {
+                work_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace_recovery_basis_unavailable",
+                    WorkApiErrorCategory::Availability,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            })?,
+        session_cursor: public_recovery_point_session_cursor(&context_head.cursor),
+    }))
+}
+
+pub(super) async fn put_work_workspace_recovery_chunk_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, artifact_id, digest)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<Json<WorkWorkspaceRecoveryChunkReceiptV1>, (StatusCode, Json<WorkApiErrorV1>)> {
+    require_work_api_major(&headers)?;
+    if !valid_sha256_content_digest(&digest) || !valid_work_attachment_id(&artifact_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_chunk",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let sealed = ensure_workspace_artifact_catalog(
+        &pool,
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        &work_id,
+        &branch_id,
+        &artifact_id,
+    )
+    .await?;
+    if sealed {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_conflict",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ));
+    }
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
+    let receipt = store
+        .put_content_chunk(
+            owner_id.as_str(),
+            binding.session_id.as_str(),
+            &artifact_id,
+            &digest,
+            body.to_vec(),
+        )
+        .await
+        .map_err(map_workspace_artifact_store_error)?;
+    Ok(Json(WorkWorkspaceRecoveryChunkReceiptV1 {
+        schema_version: 1,
+        artifact_id,
+        digest: receipt.digest,
+        byte_size: receipt.byte_size,
+        inserted: receipt.inserted,
+    }))
+}
+
+pub(super) async fn get_work_workspace_recovery_artifact_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, artifact_id)): Path<(String, String, String)>,
+) -> WorkApiResult<WorkWorkspaceRecoveryArtifactResponseV1> {
+    require_work_api_major(&headers)?;
+    if !valid_work_attachment_id(&artifact_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_artifact_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
+    // A metadata-only catalog read is enough for upload chunks, but this
+    // endpoint advertises a verified package. Materialize and validate the
+    // sealed manifest/blob layout once so a corrupted or generic byte
+    // artifact can never be presented as a portable workspace.
+    let (stored, manifest) = load_verified_workspace_artifact(
+        &store,
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        &artifact_id,
+    )
+    .await?;
+    if !workspace_artifact_belongs_to_branch(&stored.artifact, &work_id, &branch_id, None) {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    Ok(Json(work_workspace_artifact_response(
+        &work_id,
+        &branch_id,
+        artifact_id,
+        true,
+        true,
+        &manifest,
+        &stored.descriptor.digest,
+        stored.descriptor.byte_size,
+        stored.descriptor.chunk_count,
+    )))
+}
+
+pub(super) async fn get_work_workspace_recovery_chunk_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, artifact_id, digest)): Path<(String, String, String, String)>,
+) -> Result<Response, (StatusCode, Json<WorkApiErrorV1>)> {
+    require_work_api_major(&headers)?;
+    if !valid_sha256_content_digest(&digest) || !valid_work_attachment_id(&artifact_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_chunk",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let sealed = ensure_workspace_artifact_catalog(
+        &pool,
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        &work_id,
+        &branch_id,
+        &artifact_id,
+    )
+    .await?;
+    if !sealed {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_not_sealed",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        ));
+    }
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
+    let chunk = store
+        .load_byte_artifact_chunk(
+            owner_id.as_str(),
+            binding.session_id.as_str(),
+            &artifact_id,
+            &digest,
+        )
+        .await
+        .map_err(map_workspace_artifact_read_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::NOT_FOUND,
+                "workspace_recovery_chunk_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            )
+        })?;
+    let mut response = Response::new(axum::body::Body::from(chunk.bytes.clone()));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&chunk.bytes.len().to_string()).expect("length header"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::ETAG,
+        axum::http::HeaderValue::from_str(&format!("\"{}\"", chunk.digest)).expect("digest header"),
+    );
+    Ok(response)
+}
+
+pub(super) async fn post_work_workspace_recovery_artifact_seal_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, artifact_id)): Path<(String, String, String)>,
+    payload: Result<Json<WorkWorkspaceRecoveryArtifactSealRequestV1>, JsonRejection>,
+) -> WorkApiResult<WorkWorkspaceRecoveryArtifactResponseV1> {
+    require_work_api_major(&headers)?;
+    let Json(payload) = payload.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_seal_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    if !valid_work_attachment_id(&artifact_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_artifact_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let chunks = payload
+        .chunks
+        .into_iter()
+        .map(
+            |chunk: WorkWorkspaceRecoveryChunkV1| SessionArtifactContentChunkV1 {
+                chunk_index: chunk.chunk_index,
+                digest: chunk.digest,
+                byte_size: chunk.byte_size,
+            },
+        )
+        .collect::<Vec<_>>();
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
+    let plan = load_workspace_artifact_upload_plan(
+        &store,
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        &work_id,
+        &branch_id,
+        &artifact_id,
+        None,
+    )
+    .await?;
+    if plan.descriptor.sealed {
+        if !workspace_chunk_refs_match_plan(&chunks, &plan.blob_layout) {
+            return Err(work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_artifact_conflict",
+                WorkApiErrorCategory::Conflict,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            ));
+        }
+    } else if !workspace_chunk_refs_match_plan(&chunks, &plan.blob_layout) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_seal_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    store
+        .seal_byte_artifact(
+            owner_id.as_str(),
+            binding.session_id.as_str(),
+            &artifact_id,
+            chunks,
+            Vec::new(),
+        )
+        .await
+        .map_err(map_workspace_artifact_store_error)?;
+    let (stored, manifest) = load_verified_workspace_artifact(
+        &store,
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        &artifact_id,
+    )
+    .await?;
+    let metadata_matches = stored
+        .artifact
+        .metadata
+        .as_ref()
+        .and_then(|value| value.get("work_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(work_id.as_str())
+        && stored
+            .artifact
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("branch_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(branch_id.as_str());
+    if !metadata_matches {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    Ok(Json(work_workspace_artifact_response(
+        &work_id,
+        &branch_id,
+        artifact_id,
+        true,
+        true,
+        &manifest,
+        &stored.descriptor.digest,
+        stored.descriptor.byte_size,
+        stored.descriptor.chunk_count,
+    )))
+}
+
+async fn load_verified_workspace_artifact(
+    store: &DatabaseSessionArtifactStore,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<
+    (
+        astra_services::StoredSessionArtifactContentV1,
+        WorkspaceSnapshotManifestV1,
+    ),
+    (StatusCode, Json<WorkApiErrorV1>),
+> {
+    let stored = store
+        .load_byte_artifact(user_id, session_id, artifact_id)
+        .await
+        // This is a read-side integrity boundary.  A sealed artifact whose
+        // persisted bytes no longer match its catalog is a server-side
+        // package conflict, not malformed input from the caller.
+        .map_err(map_workspace_artifact_read_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::NOT_FOUND,
+                "workspace_recovery_artifact_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            )
+        })?;
+    let manifest: WorkspaceSnapshotManifestV1 = serde_json::from_value(stored.manifest.clone())
+        .map_err(|_| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_package_invalid",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    let Some((_, _, blob_layout)) = workspace_manifest_blob_layout(&manifest) else {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    };
+    if stored.chunks.len() != blob_layout.len() {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let digest_layout = blob_layout
+        .iter()
+        .map(|(blob_ref, (digest, size))| (digest.clone(), (blob_ref.clone(), *size)))
+        .collect::<BTreeMap<_, _>>();
+    if digest_layout.len() != blob_layout.len() {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let mut blobs = BTreeMap::new();
+    for chunk in &stored.chunks {
+        let Some((blob_ref, expected_size)) = digest_layout.get(&chunk.digest) else {
+            return Err(work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_package_invalid",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            ));
+        };
+        if chunk.bytes.len() as u64 != *expected_size {
+            return Err(work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_package_invalid",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            ));
+        }
+        blobs.insert(blob_ref.clone(), chunk.bytes.clone());
+    }
+    WorkspaceSnapshotPackage {
+        manifest: manifest.clone(),
+        blobs,
+    }
+    .verify()
+    .map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    Ok((stored, manifest))
+}
+
+struct WorkspaceArtifactUploadPlan {
+    manifest: WorkspaceSnapshotManifestV1,
+    descriptor: SessionArtifactContentDescriptorV1,
+    blob_layout: BTreeMap<String, (String, u64)>,
+}
+
+struct WorkspaceArtifactBeginReplayInput<'a> {
+    store: &'a DatabaseSessionArtifactStore,
+    user_id: &'a str,
+    session_id: &'a str,
+    work_id: &'a WorkId,
+    branch_id: &'a WorkBranchId,
+    artifact_id: &'a str,
+    request: &'a WorkWorkspaceRecoveryArtifactBeginRequestV1,
+    manifest_hash: &'a str,
+}
+
+/// Return the immutable result of an already-created begin request. The
+/// request id is the idempotency key, so this path deliberately does not read
+/// current context or execution state. A later state change must be checked
+/// when the recovery point is published, but it must not turn a lost HTTP
+/// response into a different upload plan or a duplicate artifact.
+async fn replay_workspace_artifact_begin(
+    input: WorkspaceArtifactBeginReplayInput<'_>,
+) -> Result<Option<WorkWorkspaceRecoveryArtifactResponseV1>, (StatusCode, Json<WorkApiErrorV1>)> {
+    let Some(stored) = input
+        .store
+        .load_json_artifact(input.user_id, input.session_id, input.artifact_id)
+        .await
+        .map_err(map_workspace_artifact_store_error)?
+    else {
+        return Ok(None);
+    };
+    if stored.artifact_kind != "workspace_snapshot_package_v1"
+        || !workspace_artifact_belongs_to_branch(
+            &stored,
+            input.work_id,
+            input.branch_id,
+            Some(input.request.request_id.as_str()),
+        )
+    {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_conflict",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let basis_matches = stored
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("work_revision"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(input.request.basis.work_revision)
+        && stored
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("branch_revision"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(input.request.basis.branch_revision)
+        && stored
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("graph_revision"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(input.request.basis.graph_revision)
+        && stored
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("context_head_hash"))
+            .and_then(serde_json::Value::as_str)
+            == Some(input.request.basis.context_head_hash.as_str())
+        && stored
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("execution_binding_hash"))
+            .and_then(serde_json::Value::as_str)
+            == Some(input.request.basis.execution_binding_hash.as_str());
+    if !basis_matches {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_conflict",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let plan = load_workspace_artifact_upload_plan(
+        input.store,
+        input.user_id,
+        input.session_id,
+        input.work_id,
+        input.branch_id,
+        input.artifact_id,
+        Some(input.request.request_id.as_str()),
+    )
+    .await?;
+    let existing_manifest_hash = plan.manifest.content_hash().map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    if existing_manifest_hash != input.manifest_hash
+        || plan.descriptor.digest != input.request.content_digest
+        || plan.descriptor.byte_size != input.request.byte_size
+        || plan.descriptor.chunk_count != input.request.chunk_count
+    {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_conflict",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    if plan.descriptor.sealed {
+        let (verified, verified_manifest) = load_verified_workspace_artifact(
+            input.store,
+            input.user_id,
+            input.session_id,
+            input.artifact_id,
+        )
+        .await?;
+        return Ok(Some(work_workspace_artifact_response(
+            input.work_id,
+            input.branch_id,
+            input.artifact_id.to_owned(),
+            true,
+            true,
+            &verified_manifest,
+            &verified.descriptor.digest,
+            verified.descriptor.byte_size,
+            verified.descriptor.chunk_count,
+        )));
+    }
+    // An unsealed catalog can outlive its one-day upload lease.  Returning a
+    // successful replay without renewing that lease leaves the caller in a
+    // misleading state: the next PUT/seal immediately fails as expired.
+    // Re-run the canonical store begin with the stored immutable manifest and
+    // metadata (never freshly derived Session state), which renews both lease
+    // and retention while preserving exact idempotency across later turns.
+    let stored_manifest = stored.content.get("manifest").cloned().ok_or_else(|| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    input
+        .store
+        .begin_byte_artifact(
+            SessionArtifactJsonRecord {
+                artifact_id: stored.artifact_id.clone(),
+                session_id: stored.session_id.clone(),
+                user_id: stored.user_id.clone(),
+                artifact_kind: stored.artifact_kind.clone(),
+                source: stored.source.clone(),
+                turn: stored.turn,
+                round: stored.round,
+                content: stored_manifest,
+                metadata: stored.metadata.clone(),
+                references: Vec::new(),
+            },
+            plan.descriptor.clone(),
+        )
+        .await
+        .map_err(map_workspace_artifact_store_error)?;
+    Ok(Some(work_workspace_artifact_response(
+        input.work_id,
+        input.branch_id,
+        input.artifact_id.to_owned(),
+        false,
+        false,
+        &plan.manifest,
+        &plan.descriptor.digest,
+        plan.descriptor.byte_size,
+        plan.descriptor.chunk_count,
+    )))
+}
+
+/// Read and validate the catalog portion of a workspace package without
+/// loading every blob. Upload and seal endpoints call this before touching
+/// bytes, so an artifact id cannot be reused across Work branches or
+/// redirected to a generic sealed payload. The metadata GET performs the
+/// stronger full-package verification below because it advertises a verified
+/// workspace.
+async fn load_workspace_artifact_upload_plan(
+    store: &DatabaseSessionArtifactStore,
+    user_id: &str,
+    session_id: &str,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    artifact_id: &str,
+    request_id: Option<&str>,
+) -> Result<WorkspaceArtifactUploadPlan, (StatusCode, Json<WorkApiErrorV1>)> {
+    let stored = store
+        .load_json_artifact(user_id, session_id, artifact_id)
+        .await
+        .map_err(map_workspace_artifact_store_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::NOT_FOUND,
+                "workspace_recovery_artifact_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            )
+        })?;
+    if !workspace_artifact_belongs_to_branch(&stored, work_id, branch_id, request_id)
+        || stored.artifact_kind != "workspace_snapshot_package_v1"
+        || stored.status.as_deref() == Some("expired")
+    {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    let Some(manifest_value) = stored.content.get("manifest").cloned() else {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    };
+    let Some(descriptor_value) = stored.content.get("content").cloned() else {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    };
+    let manifest: WorkspaceSnapshotManifestV1 =
+        serde_json::from_value(manifest_value).map_err(|_| {
+            work_error(
+                StatusCode::CONFLICT,
+                "workspace_recovery_package_invalid",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    manifest.validate().map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    let descriptor: SessionArtifactContentDescriptorV1 = serde_json::from_value(descriptor_value)
+        .map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    let Some((unique_payload_bytes, unique_blob_count, blob_layout)) =
+        workspace_manifest_blob_layout(&manifest)
+    else {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    };
+    if descriptor.schema_version != astra_services::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION
+        || descriptor.backend != SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1
+        || !valid_sha256_content_digest(&descriptor.digest)
+        || descriptor.byte_size != unique_payload_bytes
+        || descriptor.chunk_count != unique_blob_count
+        || manifest.content.blob_count != unique_blob_count
+        || manifest.content.total_bytes < unique_payload_bytes
+    {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    Ok(WorkspaceArtifactUploadPlan {
+        manifest,
+        descriptor,
+        blob_layout,
+    })
+}
+
+async fn ensure_workspace_artifact_catalog(
+    pool: &astra_core::SharedPool,
+    user_id: &str,
+    session_id: &str,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    artifact_id: &str,
+) -> Result<bool, (StatusCode, Json<WorkApiErrorV1>)> {
+    let row = sqlx::query(
+        "SELECT artifact_kind, CAST(metadata AS CHAR) AS metadata_json, status,
+                JSON_UNQUOTE(JSON_EXTRACT(content_json, '$.content.sealed')) AS sealed
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|_| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?
+    .ok_or_else(|| {
+        work_error(
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let status = row.try_get::<String, _>("status").map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    let metadata = row
+        .try_get::<Option<String>, _>("metadata_json")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let metadata_matches = metadata
+        .as_ref()
+        .and_then(|value| value.get("work_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(work_id.as_str())
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("branch_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(branch_id.as_str());
+    let artifact_kind = row.try_get::<String, _>("artifact_kind").map_err(|_| {
+        work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })?;
+    if artifact_kind != "workspace_snapshot_package_v1" || !metadata_matches || status == "expired"
+    {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    Ok(row
+        .try_get::<Option<String>, _>("sealed")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true"))
+}
+
+fn workspace_chunk_refs_match_plan(
+    chunks: &[SessionArtifactContentChunkV1],
+    blob_layout: &BTreeMap<String, (String, u64)>,
+) -> bool {
+    if chunks.len() != blob_layout.len()
+        || chunks
+            .iter()
+            .enumerate()
+            .any(|(index, chunk)| chunk.chunk_index != index as u64)
+    {
+        return false;
+    }
+    chunks
+        .iter()
+        .zip(blob_layout.values())
+        .all(|(chunk, (digest, size))| chunk.digest == *digest && chunk.byte_size == *size)
+}
+
+/// Return the unique uploaded payload layout expected by a workspace package.
+/// A manifest may reference one blob from several paths; the byte artifact is
+/// uploaded once and the manifest carries the fan-out.  Capture providers use
+/// a one-to-one `blob_ref`/digest relation, which keeps the wire representation
+/// deterministic and lets verification reject ambiguous hand-built manifests.
+fn workspace_manifest_blob_layout(
+    manifest: &WorkspaceSnapshotManifestV1,
+) -> Option<(u64, u64, BTreeMap<String, (String, u64)>)> {
+    let mut layout = BTreeMap::new();
+    let mut digest_to_ref = BTreeMap::<String, String>::new();
+    for entry in &manifest.entries {
+        let (Some(blob_ref), Some(digest)) = (entry.blob_ref.as_ref(), entry.digest.as_ref())
+        else {
+            continue;
+        };
+        if let Some((existing_digest, existing_size)) = layout.get(blob_ref) {
+            if existing_digest != digest || *existing_size != entry.size {
+                return None;
+            }
+        } else {
+            if let Some(existing_ref) = digest_to_ref.insert(digest.clone(), blob_ref.clone()) {
+                if existing_ref != *blob_ref {
+                    return None;
+                }
+            }
+            layout.insert(blob_ref.clone(), (digest.clone(), entry.size));
+        }
+    }
+    let total = layout
+        .values()
+        .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))?;
+    Some((total, layout.len() as u64, layout))
+}
+
+fn workspace_artifact_belongs_to_branch(
+    stored: &astra_services::StoredSessionArtifact,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    request_id: Option<&str>,
+) -> bool {
+    let Some(metadata) = stored.metadata.as_ref() else {
+        return false;
+    };
+    let matches = metadata.get("work_id").and_then(serde_json::Value::as_str)
+        == Some(work_id.as_str())
+        && metadata
+            .get("branch_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(branch_id.as_str());
+    matches
+        && request_id.is_none_or(|request| {
+            metadata
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(request)
+        })
+}
+
+fn work_workspace_artifact_response(
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    artifact_id: String,
+    sealed: bool,
+    verified: bool,
+    manifest: &WorkspaceSnapshotManifestV1,
+    content_digest: &str,
+    byte_size: u64,
+    chunk_count: u64,
+) -> WorkWorkspaceRecoveryArtifactResponseV1 {
+    let blobs = workspace_manifest_blob_layout(manifest)
+        .expect("validated workspace manifest has a canonical blob layout")
+        .2
+        .into_iter()
+        .enumerate()
+        .map(
+            |(chunk_index, (blob_ref, (digest, byte_size)))| WorkWorkspaceRecoveryBlobV1 {
+                chunk_index: chunk_index as u64,
+                blob_ref,
+                digest,
+                byte_size,
+            },
+        )
+        .collect();
+    WorkWorkspaceRecoveryArtifactResponseV1 {
+        schema_version: 1,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        artifact_id,
+        sealed,
+        verified,
+        snapshot_id: manifest.snapshot_id.clone(),
+        manifest_hash: manifest.content_hash().unwrap_or_default(),
+        content_root: manifest.content.content_root.clone(),
+        content_digest: content_digest.to_owned(),
+        byte_size,
+        chunk_count,
+        snapshot_manifest: serde_json::to_value(manifest)
+            .expect("workspace snapshot manifest serialization cannot fail"),
+        blobs,
+    }
+}
+
+fn valid_sha256_content_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn map_workspace_artifact_store_error(
+    error: astra_services::SessionArtifactStoreError,
+) -> (StatusCode, Json<WorkApiErrorV1>) {
+    use astra_services::SessionArtifactStoreError as ArtifactError;
+    let (status, code, category, retryable, hints) = match error {
+        ArtifactError::ArtifactNotFound { .. }
+        | ArtifactError::SessionNotOwned { .. }
+        | ArtifactError::ByteArtifactContentUnavailable { .. } => (
+            StatusCode::NOT_FOUND,
+            "workspace_recovery_artifact_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ),
+        ArtifactError::ContentChunkDigestMismatch { .. }
+        | ArtifactError::ContentChunkSizeMismatch { .. }
+        | ArtifactError::InvalidContentDigest(_)
+        | ArtifactError::InvalidContentChunkOrder
+        | ArtifactError::InvalidByteArtifactMetadata(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_recovery_artifact",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ),
+        ArtifactError::ByteArtifactConflict { .. }
+        | ArtifactError::SealedByteArtifactConflict { .. }
+        | ArtifactError::ByteArtifactUploadClosed { .. }
+        | ArtifactError::ContentUploadReservationExpired { .. } => (
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_conflict",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_recovery_artifact_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ),
+    };
+    work_error(status, code, category, retryable, hints)
+}
+
+fn map_workspace_artifact_read_error(
+    error: astra_services::SessionArtifactStoreError,
+) -> (StatusCode, Json<WorkApiErrorV1>) {
+    use astra_services::SessionArtifactStoreError as ArtifactError;
+    match error {
+        ArtifactError::ContentChunkDigestMismatch { .. }
+        | ArtifactError::ContentChunkSizeMismatch { .. }
+        | ArtifactError::ByteArtifactContentUnavailable { .. }
+        | ArtifactError::InvalidByteArtifactMetadata(_)
+        | ArtifactError::InvalidContentDigest(_)
+        | ArtifactError::InvalidContentChunkOrder => work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        ArtifactError::ByteArtifactNotSealed { .. } => work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_artifact_not_sealed",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        ),
+        other => map_workspace_artifact_store_error(other),
+    }
+}
+
 pub(super) async fn post_work_branch_recovery_point_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4858,40 +6436,129 @@ pub(super) async fn post_work_branch_recovery_point_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let record = DatabaseWorkRepository::new(pool)
-        .recovery_points()
-        .capture_canonical(WorkRecoveryPointCaptureRequest {
-            owner_id,
-            work_id: work_id.clone(),
-            branch_id: branch_id.clone(),
-            request_id: WorkChangeRef::parse(payload.request_id).map_err(|_| {
+    let base_request = WorkRecoveryPointCaptureRequest {
+        owner_id: owner_id.clone(),
+        work_id: work_id.clone(),
+        branch_id: branch_id.clone(),
+        request_id: WorkChangeRef::parse(payload.request_id.clone()).map_err(|_| {
+            work_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_recovery_point_request",
+                WorkApiErrorCategory::InvalidRequest,
+                false,
+                Vec::new(),
+            )
+        })?,
+        expected_work_revision: payload.expected_work_revision,
+        expected_branch_revision: payload.expected_branch_revision,
+        reason: match payload.reason {
+            WorkRecoveryPointReasonV1::UserRequested => {
+                astra_turn_types::RecoveryPointReasonV1::UserRequested
+            }
+            WorkRecoveryPointReasonV1::BeforeEnvironmentChange => {
+                astra_turn_types::RecoveryPointReasonV1::BeforeEnvironmentChange
+            }
+            WorkRecoveryPointReasonV1::RunSettled => {
+                astra_turn_types::RecoveryPointReasonV1::RunSettled
+            }
+            WorkRecoveryPointReasonV1::SafeBoundary => {
+                astra_turn_types::RecoveryPointReasonV1::SafeBoundary
+            }
+        },
+    };
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    let record = if let Some(artifact_id) = payload.workspace_artifact_id {
+        if !valid_work_attachment_id(&artifact_id) {
+            return Err(work_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_workspace_recovery_artifact_id",
+                WorkApiErrorCategory::InvalidRequest,
+                false,
+                Vec::new(),
+            ));
+        }
+        let binding = repository
+            .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
+            .await
+            .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+        let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
+        let (stored, manifest) = load_verified_workspace_artifact(
+            &store,
+            owner_id.as_str(),
+            binding.session_id.as_str(),
+            &artifact_id,
+        )
+        .await?;
+        let metadata_matches = stored
+            .artifact
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("work_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(work_id.as_str())
+            && stored
+                .artifact
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("branch_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(branch_id.as_str())
+            && stored
+                .artifact
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(payload.request_id.as_str());
+        if !metadata_matches {
+            return Err(work_error(
+                StatusCode::NOT_FOUND,
+                "workspace_recovery_artifact_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            ));
+        }
+        let workspace = astra_turn_types::RecoveryPointWorkspaceReferenceV1 {
+            snapshot_id: manifest.snapshot_id.clone(),
+            logical_workspace_id: manifest.logical_workspace_id.clone(),
+            manifest_hash: manifest.content_hash().map_err(|_| {
                 work_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_recovery_point_request",
-                    WorkApiErrorCategory::InvalidRequest,
+                    StatusCode::CONFLICT,
+                    "workspace_recovery_package_invalid",
+                    WorkApiErrorCategory::Conflict,
                     false,
-                    Vec::new(),
+                    vec![WorkApiActionHint::RefreshWork],
                 )
             })?,
-            expected_work_revision: payload.expected_work_revision,
-            expected_branch_revision: payload.expected_branch_revision,
-            reason: match payload.reason {
-                WorkRecoveryPointReasonV1::UserRequested => {
-                    astra_turn_types::RecoveryPointReasonV1::UserRequested
-                }
-                WorkRecoveryPointReasonV1::BeforeEnvironmentChange => {
-                    astra_turn_types::RecoveryPointReasonV1::BeforeEnvironmentChange
-                }
-                WorkRecoveryPointReasonV1::RunSettled => {
-                    astra_turn_types::RecoveryPointReasonV1::RunSettled
-                }
-                WorkRecoveryPointReasonV1::SafeBoundary => {
-                    astra_turn_types::RecoveryPointReasonV1::SafeBoundary
-                }
-            },
-        })
-        .await
-        .map_err(|error| map_repository_error(work_id.as_str(), error))?;
+            content_root: manifest.content.content_root.clone(),
+            byte_size: stored.descriptor.byte_size,
+            complete: true,
+        };
+        let artifact = astra_turn_types::RecoveryPointArtifactReferenceV1 {
+            artifact_id: artifact_id.clone(),
+            artifact_type: "workspace_snapshot_package_v1".to_string(),
+            digest: stored.descriptor.digest.clone(),
+            location_ref: Some(format!("session-artifact:{artifact_id}")),
+        };
+        repository
+            .recovery_points()
+            .capture_workspace_canonical(
+                astra_services::work::WorkWorkspaceRecoveryPointCaptureRequest {
+                    base: base_request,
+                    workspace,
+                    artifact,
+                },
+            )
+            .await
+            .map_err(|error| map_repository_error(work_id.as_str(), error))?
+    } else {
+        repository
+            .recovery_points()
+            .capture_canonical(base_request)
+            .await
+            .map_err(|error| map_repository_error(work_id.as_str(), error))?
+    };
     let view = public_recovery_point(record)
         .map_err(|error| map_recovery_point_projection_error(work_id.as_str(), error))?;
     Ok(Json(view))
@@ -8006,6 +9673,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_manifest_layout_deduplicates_shared_file_content() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut manifest = astra_runtime_env::WorkspaceSnapshotManifestV1 {
+            schema_version: astra_runtime_env::WORKSPACE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+            snapshot_id: "snapshot-1".to_string(),
+            logical_workspace_id: "workspace-1".to_string(),
+            repository: astra_runtime_env::WorkspaceSnapshotRepositoryV1 {
+                repository_id: "repo-1".to_string(),
+                base_commit: None,
+                base_tree: None,
+                submodules: Vec::new(),
+            },
+            capture: astra_runtime_env::WorkspaceSnapshotCaptureV1 {
+                fingerprint_before: digest.clone(),
+                fingerprint_after: digest.clone(),
+                captured_at: "2026-09-17T00:00:00Z".to_string(),
+                consistent: true,
+            },
+            entries: vec![
+                astra_runtime_env::WorkspaceSnapshotEntryV1 {
+                    path: "a.txt".to_string(),
+                    kind: astra_runtime_env::WorkspaceSnapshotEntryKindV1::File,
+                    change: astra_runtime_env::WorkspaceSnapshotChangeV1::Modified,
+                    mode: 0o644,
+                    size: 3,
+                    digest: Some(digest.clone()),
+                    blob_ref: Some("blob-a".to_string()),
+                    symlink_target: None,
+                    renamed_from: None,
+                },
+                astra_runtime_env::WorkspaceSnapshotEntryV1 {
+                    path: "b.txt".to_string(),
+                    kind: astra_runtime_env::WorkspaceSnapshotEntryKindV1::File,
+                    change: astra_runtime_env::WorkspaceSnapshotChangeV1::Modified,
+                    mode: 0o644,
+                    size: 3,
+                    digest: Some(digest.clone()),
+                    blob_ref: Some("blob-a".to_string()),
+                    symlink_target: None,
+                    renamed_from: None,
+                },
+            ],
+            exclusions: Vec::new(),
+            data_sources: Vec::new(),
+            content: astra_runtime_env::WorkspaceSnapshotContentV1 {
+                content_root: digest.clone(),
+                total_bytes: 6,
+                blob_count: 1,
+                pack_ref: None,
+            },
+        };
+        manifest.content.content_root = manifest.computed_content_root().expect("content root");
+        manifest.validate().expect("valid shared manifest");
+
+        let (bytes, count, layout) = workspace_manifest_blob_layout(&manifest).expect("layout");
+        assert_eq!(bytes, 3);
+        assert_eq!(count, 1);
+        assert_eq!(layout.get("blob-a"), Some(&(digest, 3)));
+        let response = work_workspace_artifact_response(
+            &WorkId::parse("work-1").expect("work"),
+            &WorkBranchId::parse("branch-1").expect("branch"),
+            "wsp-1".to_string(),
+            true,
+            true,
+            &manifest,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            3,
+            1,
+        );
+        assert_eq!(response.blobs[0].chunk_index, 0);
+        assert_eq!(response.blobs[0].blob_ref, "blob-a");
+        assert_eq!(response.snapshot_manifest["snapshot_id"], "snapshot-1");
+
+        manifest.entries[1].blob_ref = Some("blob-b".to_string());
+        assert!(workspace_manifest_blob_layout(&manifest).is_none());
+    }
+
     fn creation(owner: &str, request_id: &str, goal: &str) -> DerivedWorkCreation {
         creation_with_criteria(owner, request_id, goal, Vec::new())
     }
@@ -8096,6 +9841,22 @@ mod tests {
         let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::BasisChanged);
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(error.code, "recovery_point_basis_changed");
+        assert!(!error.retryable);
+        assert!(matches!(
+            error.action_hints.as_slice(),
+            [WorkApiActionHint::RefreshWork]
+        ));
+    }
+
+    #[test]
+    fn workspace_artifact_read_integrity_errors_are_package_conflicts() {
+        let (status, Json(error)) = map_workspace_artifact_read_error(
+            astra_services::SessionArtifactStoreError::ContentChunkSizeMismatch {
+                digest: "sha256:broken".to_string(),
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "workspace_recovery_package_invalid");
         assert!(!error.retryable);
         assert!(matches!(
             error.action_hints.as_slice(),

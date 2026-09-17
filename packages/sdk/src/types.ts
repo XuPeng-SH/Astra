@@ -2067,6 +2067,25 @@ export type WorkRecoveryPointExecutionV1 = {
   binding_generation: number;
 };
 
+export type WorkRecoveryPointWorkspaceV1 = {
+  snapshot_id: string;
+  logical_workspace_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  byte_size: number;
+  complete: boolean;
+  artifact_id: string;
+  artifact_type: string;
+  content_digest: WorkContentHash;
+};
+
+export type WorkRecoveryPointArtifactV1 = {
+  artifact_id: string;
+  artifact_type: string;
+  digest: WorkContentHash;
+  location_ref: string | null;
+};
+
 export type WorkRecoveryPointV1 = {
   schema_version: 1;
   work_id: string;
@@ -2085,6 +2104,8 @@ export type WorkRecoveryPointV1 = {
   criteria_set_revision: number;
   session_cursor: WorkRecoveryPointSessionCursorV1;
   execution: WorkRecoveryPointExecutionV1;
+  workspace: WorkRecoveryPointWorkspaceV1 | null;
+  artifacts: WorkRecoveryPointArtifactV1[];
   coverage: WorkRecoveryPointCoverageV1;
   capabilities: WorkRecoveryPointCapabilitiesV1;
 };
@@ -2094,6 +2115,92 @@ export type WorkRecoveryPointCaptureInputV1 = {
   expectedWorkRevision: number;
   expectedBranchRevision: number;
   reason?: WorkRecoveryPointReasonV1;
+  workspaceArtifactId?: string;
+};
+
+export type WorkWorkspaceRecoveryBasisExpectationV1 = {
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+};
+
+export type WorkWorkspaceRecoveryBasisV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  logical_workspace_id: string;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+};
+
+export type WorkWorkspaceRecoveryArtifactBeginInputV1 = {
+  requestId: string;
+  basis: WorkWorkspaceRecoveryBasisExpectationV1;
+  snapshotManifest: Record<string, unknown>;
+  contentDigest: WorkContentHash;
+  byteSize: number;
+  chunkCount: number;
+};
+
+export type WorkWorkspaceRecoveryChunkV1 = {
+  chunk_index: number;
+  digest: WorkContentHash;
+  byte_size: number;
+};
+
+export type WorkWorkspaceRecoveryArtifactSealInputV1 = {
+  chunks: WorkWorkspaceRecoveryChunkV1[];
+};
+
+export type WorkWorkspaceRecoveryArtifactV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  artifact_id: string;
+  sealed: boolean;
+  verified: boolean;
+  snapshot_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  content_digest: WorkContentHash;
+  byte_size: number;
+  chunk_count: number;
+  snapshot_manifest: Record<string, unknown>;
+  blobs: WorkWorkspaceRecoveryBlobV1[];
+};
+
+export type WorkWorkspaceRecoveryPackageV1 = {
+  artifact: WorkWorkspaceRecoveryArtifactV1;
+  blobs: Array<WorkWorkspaceRecoveryBlobV1 & { bytes: Uint8Array }>;
+};
+
+/** Controls cold workspace package downloads without flooding the runtime. */
+export type WorkWorkspaceRecoveryDownloadOptionsV1 = {
+  /** Maximum number of blob requests in flight. Defaults to four. */
+  concurrency?: number;
+  /** Abort queued and in-flight blob requests. */
+  signal?: AbortSignal;
+};
+
+export type WorkWorkspaceRecoveryChunkReceiptV1 = {
+  schema_version: 1;
+  artifact_id: string;
+  digest: WorkContentHash;
+  byte_size: number;
+  inserted: boolean;
+};
+
+export type WorkWorkspaceRecoveryBlobV1 = {
+  chunk_index: number;
+  blob_ref: string;
+  digest: WorkContentHash;
+  byte_size: number;
 };
 
 export type WorkRecoveryPointCursorV1 = {
@@ -3031,6 +3138,20 @@ export type WorkApiErrorV1 = {
     | "recovery_point_execution_changing"
     | "recovery_point_basis_changed"
     | "recovery_point_verification_unavailable"
+    | "invalid_workspace_recovery_artifact"
+    | "invalid_workspace_recovery_artifact_id"
+    | "invalid_workspace_recovery_artifact_request"
+    | "invalid_workspace_recovery_chunk"
+    | "invalid_workspace_recovery_seal_request"
+    | "invalid_workspace_snapshot_manifest"
+    | "workspace_recovery_artifact_conflict"
+    | "workspace_recovery_artifact_not_found"
+    | "workspace_recovery_artifact_not_sealed"
+    | "workspace_recovery_artifact_unavailable"
+    | "workspace_recovery_basis_mismatch"
+    | "workspace_recovery_basis_unavailable"
+    | "workspace_recovery_chunk_not_found"
+    | "workspace_recovery_package_invalid"
     | "control_operation_terminal"
     | "control_operation_not_found"
     | "control_operation_unavailable"

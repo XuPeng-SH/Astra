@@ -216,6 +216,7 @@ pub use recovery_point::{
     DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
     WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointPage,
     WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
+    WorkWorkspaceRecoveryPointCaptureRequest,
 };
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,

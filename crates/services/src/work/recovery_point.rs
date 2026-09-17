@@ -11,8 +11,9 @@
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    RecoveryPointBindingStateV1, RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1,
-    RecoveryPointManifestV1, RecoveryPointReasonV1, SessionKeyV1,
+    RecoveryPointArtifactReferenceV1, RecoveryPointBindingStateV1, RecoveryPointExecutionBindingV1,
+    RecoveryPointExecutorKindV1, RecoveryPointManifestV1, RecoveryPointReasonV1,
+    RecoveryPointWorkspaceReferenceV1, SessionKeyV1,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -92,6 +93,16 @@ pub struct WorkRecoveryPointCaptureRequest {
     pub expected_work_revision: u64,
     pub expected_branch_revision: u64,
     pub reason: RecoveryPointReasonV1,
+}
+
+/// A canonical capture request that includes one already sealed and verified
+/// workspace package. The package is still only a portable file restore
+/// capability; it does not make an unfinished Run or conversation restorable.
+#[derive(Debug, Clone)]
+pub struct WorkWorkspaceRecoveryPointCaptureRequest {
+    pub base: WorkRecoveryPointCaptureRequest,
+    pub workspace: RecoveryPointWorkspaceReferenceV1,
+    pub artifact: RecoveryPointArtifactReferenceV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -187,8 +198,46 @@ impl DatabaseWorkRecoveryPointRepository {
         &self,
         request: WorkRecoveryPointCaptureRequest,
     ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
+        self.capture_canonical_inner(request, None, None).await
+    }
+
+    /// Publish a new immutable recovery point whose workspace package has
+    /// already been streamed, sealed, and verified by the caller. The
+    /// artifact reachability edge is added in the same transaction as the
+    /// recovery row and Work event, so retention GC cannot observe a published
+    /// point without its bytes.
+    pub async fn capture_workspace_canonical(
+        &self,
+        request: WorkWorkspaceRecoveryPointCaptureRequest,
+    ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
+        self.capture_canonical_inner(
+            request.base,
+            Some(request.workspace),
+            Some(request.artifact),
+        )
+        .await
+    }
+
+    async fn capture_canonical_inner(
+        &self,
+        request: WorkRecoveryPointCaptureRequest,
+        workspace: Option<RecoveryPointWorkspaceReferenceV1>,
+        artifact: Option<RecoveryPointArtifactReferenceV1>,
+    ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
         validate_capture_request(&request)?;
-        let request_hash = capture_request_hash(&request)?;
+        if workspace.is_some() != artifact.is_some() {
+            return Err(WorkRepositoryError::corrupt(
+                "Work workspace recovery capture",
+                std::io::Error::other(
+                    "workspace and artifact references must be provided together",
+                ),
+            ));
+        }
+        let request_hash = if workspace.is_none() {
+            capture_request_hash(&request)?
+        } else {
+            capture_request_hash_with_workspace(&request, workspace.as_ref(), artifact.as_ref())?
+        };
         let recovery_point_id = capture_recovery_point_id(&request_hash)?;
 
         let mut transaction = self.pool.get().begin().await.map_err(|source| {
@@ -440,6 +489,30 @@ impl DatabaseWorkRecoveryPointRepository {
                 reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanging,
             });
         }
+        if let (Some(workspace), Some(artifact)) = (&workspace, &artifact) {
+            let current_execution_binding =
+                context.execution_binding.clone().unwrap_or_else(|| {
+                    SessionExecutionBindingV1::server_work_default(format!(
+                        "session:{}:branch:{}",
+                        key.session_id, key.branch_id
+                    ))
+                });
+            verify_sealed_workspace_artifact_in_transaction(
+                &mut transaction,
+                WorkspaceArtifactVerificationInput {
+                    owner_id: request.owner_id.as_str(),
+                    session_id: &branch_session_id,
+                    work_id: request.work_id.as_str(),
+                    branch_id: request.branch_id.as_str(),
+                    basis: &basis,
+                    context: &context,
+                    current_execution_binding: &current_execution_binding,
+                    workspace,
+                    artifact,
+                },
+            )
+            .await?;
+        }
         let created_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let manifest = RecoveryPointManifestV1 {
             schema_version: astra_turn_types::RECOVERY_POINT_MANIFEST_SCHEMA_VERSION,
@@ -474,8 +547,8 @@ impl DatabaseWorkRecoveryPointRepository {
             context_head: context.head,
             run: None,
             execution,
-            workspace: None,
-            artifacts: Vec::new(),
+            workspace,
+            artifacts: artifact.iter().cloned().collect(),
             environment: Default::default(),
             reason: request.reason,
             created_at,
@@ -513,6 +586,22 @@ impl DatabaseWorkRecoveryPointRepository {
                 source,
             )
         })?;
+        if let Some(artifact) = &artifact {
+            query(
+                "INSERT IGNORE INTO session_artifact_references
+                 (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+                 VALUES (?, ?, ?, 'recovery_point', ?, NOW(6))",
+            )
+            .bind(request.owner_id.as_str())
+            .bind(&branch_session_id)
+            .bind(artifact.artifact_id.as_str())
+            .bind(&recovery_point_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| {
+                WorkRepositoryError::persistence("retain workspace recovery artifact", source)
+            })?;
+        }
         // Advance the shared Work clock in the same transaction. Web and TUI
         // observers use that clock to invalidate their bounded projections;
         // without this event a newly saved point could remain invisible until
@@ -854,6 +943,22 @@ impl DatabaseWorkRecoveryPointRepository {
                 reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanged,
             });
         }
+        // Workspace-capable points may only be published through
+        // `capture_workspace_canonical`, which proves the sealed package and
+        // binds it to the current logical execution workspace.  The older
+        // preparing/marking API has no package verifier and must fail closed
+        // instead of turning a caller-shaped `complete=true` into a restore
+        // capability.
+        if manifest.workspace.is_some()
+            || manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_type == "workspace_snapshot_package_v1")
+        {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            });
+        }
 
         let updated = query(
             "UPDATE work_recovery_points
@@ -1014,6 +1119,348 @@ fn revisions_match_manifest(
         && basis.branch_criteria_set_revision == basis.criteria_set_revision
 }
 
+struct WorkspaceArtifactVerificationInput<'a> {
+    owner_id: &'a str,
+    session_id: &'a str,
+    work_id: &'a str,
+    branch_id: &'a str,
+    basis: &'a super::WorkPlanBasis,
+    context: &'a crate::session_context_coordinator::RecoveryContextFactsV1,
+    current_execution_binding: &'a SessionExecutionBindingV1,
+    workspace: &'a RecoveryPointWorkspaceReferenceV1,
+    artifact: &'a RecoveryPointArtifactReferenceV1,
+}
+
+async fn verify_sealed_workspace_artifact_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    input: WorkspaceArtifactVerificationInput<'_>,
+) -> Result<(), WorkRepositoryError> {
+    let WorkspaceArtifactVerificationInput {
+        owner_id,
+        session_id,
+        work_id,
+        branch_id,
+        basis,
+        context,
+        current_execution_binding,
+        workspace,
+        artifact,
+    } = input;
+    if artifact.artifact_type != "workspace_snapshot_package_v1"
+        || !workspace.complete
+        || artifact.artifact_id.trim().is_empty()
+        || workspace.logical_workspace_id.trim().is_empty()
+    {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+    let row = query(
+        "SELECT artifact_kind, content_json, CAST(metadata AS CHAR) AS metadata_json, status
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         LIMIT 1 FOR UPDATE",
+    )
+    .bind(owner_id)
+    .bind(session_id)
+    .bind(artifact.artifact_id.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|source| WorkRepositoryError::persistence("verify workspace artifact", source))?
+    .ok_or(WorkRepositoryError::RecoveryPointNotCapturable {
+        reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+    })?;
+    let status = row
+        .try_get::<String, _>("status")
+        .map_err(|source| WorkRepositoryError::corrupt("workspace artifact", source))?;
+    let artifact_kind = row
+        .try_get::<String, _>("artifact_kind")
+        .map_err(|source| WorkRepositoryError::corrupt("workspace artifact", source))?;
+    let metadata = row
+        .try_get::<Option<String>, _>("metadata_json")
+        .map_err(|source| WorkRepositoryError::corrupt("workspace artifact", source))?
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let content_json = row
+        .try_get::<String, _>("content_json")
+        .map_err(|source| WorkRepositoryError::corrupt("workspace artifact", source))?;
+    let content: serde_json::Value = serde_json::from_str(&content_json).map_err(|source| {
+        WorkRepositoryError::ManifestEncoding {
+            entity: "workspace artifact descriptor",
+            source,
+        }
+    })?;
+    let descriptor = content.get("content").cloned().ok_or_else(|| {
+        WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        }
+    })?;
+    let descriptor: crate::session_artifact_store::SessionArtifactContentDescriptorV1 =
+        serde_json::from_value(descriptor).map_err(|_| {
+            WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            }
+        })?;
+    let manifest_value = content.get("manifest").cloned().ok_or_else(|| {
+        WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        }
+    })?;
+    let package_manifest: astra_runtime_env::WorkspaceSnapshotManifestV1 =
+        serde_json::from_value(manifest_value).map_err(|_| {
+            WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            }
+        })?;
+    package_manifest
+        .validate()
+        .map_err(|_| WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        })?;
+    let package_manifest_hash = package_manifest.content_hash().map_err(|_| {
+        WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        }
+    })?;
+    let sealed = descriptor.sealed;
+    let digest = descriptor.digest.as_str();
+    let byte_size = descriptor.byte_size;
+    let context_head_matches = serde_json::to_value(&context.head)
+        .ok()
+        .and_then(|expected| {
+            metadata
+                .as_ref()
+                .and_then(|value| value.get("context_head"))
+                .map(|actual| actual == &expected)
+        })
+        == Some(true);
+    let execution_binding_matches = serde_json::to_value(current_execution_binding)
+        .ok()
+        .and_then(|expected| {
+            metadata
+                .as_ref()
+                .and_then(|value| value.get("execution_binding"))
+                .map(|actual| actual == &expected)
+        })
+        == Some(true);
+    let basis_metadata_matches = metadata
+        .as_ref()
+        .and_then(|value| value.get("work_revision"))
+        .and_then(serde_json::Value::as_u64)
+        == u64::try_from(basis.work_revision.get()).ok()
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("branch_revision"))
+            .and_then(serde_json::Value::as_u64)
+            == u64::try_from(basis.branch_revision.get()).ok()
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("graph_revision"))
+            .and_then(serde_json::Value::as_u64)
+            == u64::try_from(basis.graph_revision.get()).ok();
+    let metadata_matches = metadata
+        .as_ref()
+        .and_then(|value| value.get("logical_workspace_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(workspace.logical_workspace_id.as_str())
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("manifest_hash"))
+            .and_then(serde_json::Value::as_str)
+            == Some(workspace.manifest_hash.as_str())
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("work_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(work_id)
+        && metadata
+            .as_ref()
+            .and_then(|value| value.get("branch_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(branch_id)
+        && context_head_matches
+        && execution_binding_matches
+        && basis_metadata_matches
+        && artifact.location_ref.as_deref()
+            == Some(&format!("session-artifact:{}", artifact.artifact_id));
+    let package_identity_matches = artifact_kind == "workspace_snapshot_package_v1"
+        && status != "expired"
+        && sealed
+        && descriptor.schema_version
+            == crate::session_artifact_store::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION
+        && descriptor.backend
+            == crate::session_artifact_store::SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1
+        && digest == artifact.digest.as_str()
+        && byte_size == workspace.byte_size
+        && package_manifest.snapshot_id == workspace.snapshot_id
+        && package_manifest.logical_workspace_id == workspace.logical_workspace_id
+        && package_manifest_hash == workspace.manifest_hash
+        && package_manifest.content.content_root == workspace.content_root
+        && package_manifest.content.total_bytes >= workspace.byte_size;
+    if !package_identity_matches {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+
+    // The package is immutable after begin/seal.  If the current canonical
+    // Work/Session boundary moved while it was being uploaded, retrying the
+    // old capture can never make that package represent the new boundary.
+    // Return the existing typed drift blockers so HTTP can tell the caller to
+    // refresh the basis and capture a new package instead of retrying forever.
+    let has_basis_metadata = metadata.as_ref().is_some_and(|value| {
+        value
+            .get("work_revision")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && value
+                .get("branch_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            && value
+                .get("graph_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+    });
+    let has_context_metadata = metadata
+        .as_ref()
+        .is_some_and(|value| value.get("context_head").is_some());
+    let has_execution_metadata = metadata
+        .as_ref()
+        .is_some_and(|value| value.get("execution_binding").is_some());
+    if has_basis_metadata && !basis_metadata_matches {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::BasisChanged,
+        });
+    }
+    if has_context_metadata && !context_head_matches {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::ContextChanged,
+        });
+    }
+    if has_execution_metadata && !execution_binding_matches {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanged,
+        });
+    }
+    if !metadata_matches {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+
+    // Re-verify the typed payload at the canonical publication boundary. A
+    // generic sealed byte artifact may carry the right catalog metadata while
+    // containing a different manifest or a different ordered set of blobs;
+    // metadata alone is therefore never a portable-workspace proof.
+    let mut layout = std::collections::BTreeMap::<String, (String, u64)>::new();
+    let mut digest_to_ref = std::collections::BTreeMap::<String, (String, u64)>::new();
+    for entry in &package_manifest.entries {
+        let (Some(blob_ref), Some(entry_digest)) = (&entry.blob_ref, &entry.digest) else {
+            continue;
+        };
+        if let Some((existing_digest, existing_size)) = layout.get(blob_ref) {
+            if existing_digest != entry_digest || *existing_size != entry.size {
+                return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason:
+                        super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                });
+            }
+        } else {
+            if let Some((existing_ref, _)) =
+                digest_to_ref.insert(entry_digest.clone(), (blob_ref.clone(), entry.size))
+                && existing_ref != *blob_ref
+            {
+                return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                    reason:
+                        super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                });
+            }
+            layout.insert(blob_ref.clone(), (entry_digest.clone(), entry.size));
+        }
+    }
+    if descriptor.chunk_count != layout.len() as u64 {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+    // Lock artifact-local references first, then shared content rows through
+    // the canonical content-store helper.  The helper sorts shared digest
+    // locks globally and restores logical order for hashing, so two
+    // publishers that mention the same blobs in reverse file order cannot
+    // deadlock each other.
+    let chunk_refs = crate::session_artifact_store::load_content_chunk_refs(
+        transaction,
+        owner_id,
+        session_id,
+        artifact.artifact_id.as_str(),
+    )
+    .await
+    .map_err(|source| WorkRepositoryError::corrupt("workspace artifact references", source))?;
+    if chunk_refs.len() != layout.len() {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+    let stored_chunks = crate::session_artifact_store::load_and_verify_content_chunks(
+        transaction,
+        owner_id,
+        &chunk_refs,
+    )
+    .await
+    .map_err(|source| WorkRepositoryError::corrupt("workspace artifact chunks", source))?;
+    let mut blobs = std::collections::BTreeMap::new();
+    let expected_order = layout.values().collect::<Vec<_>>();
+    let mut aggregate = Sha256::new();
+    let mut aggregate_size = 0_u64;
+    for (index, chunk) in stored_chunks.into_iter().enumerate() {
+        let chunk_index = chunk.chunk_index;
+        let chunk_digest = chunk.digest;
+        let bytes = chunk.bytes;
+        let Some((expected_digest, expected_size)) = expected_order.get(index) else {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            });
+        };
+        let Some((blob_ref, _)) = digest_to_ref.get(&chunk_digest) else {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            });
+        };
+        if chunk_index != index as u64
+            || chunk_digest != *expected_digest
+            || bytes.len() as u64 != *expected_size
+            || format!("sha256:{:x}", Sha256::digest(&bytes)) != chunk_digest
+        {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            });
+        }
+        aggregate.update(&bytes);
+        aggregate_size = aggregate_size
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            })?;
+        blobs.insert(blob_ref.clone(), bytes);
+    }
+    if format!("sha256:{:x}", aggregate.finalize()) != descriptor.digest
+        || aggregate_size != descriptor.byte_size
+    {
+        return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        });
+    }
+    astra_runtime_env::WorkspaceSnapshotPackage {
+        manifest: package_manifest,
+        blobs,
+    }
+    .verify()
+    .map_err(|_| WorkRepositoryError::RecoveryPointNotCapturable {
+        reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+    })?;
+    Ok(())
+}
+
 fn canonical_execution_binding(
     key: &SessionKeyV1,
     current: Option<&SessionExecutionBindingV1>,
@@ -1093,6 +1540,10 @@ struct CanonicalCaptureRequestHashInput<'a> {
     expected_work_revision: u64,
     expected_branch_revision: u64,
     reason: RecoveryPointReasonV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<&'a RecoveryPointWorkspaceReferenceV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<&'a RecoveryPointArtifactReferenceV1>,
 }
 
 fn validate_capture_request(
@@ -1131,6 +1582,8 @@ fn capture_request_hash(
         expected_work_revision: request.expected_work_revision,
         expected_branch_revision: request.expected_branch_revision,
         reason: request.reason,
+        workspace: None,
+        artifact: None,
     })
     .map_err(|source| WorkRepositoryError::ManifestEncoding {
         entity: "Work recovery capture request",
@@ -1139,6 +1592,35 @@ fn capture_request_hash(
     WorkContentHash::parse(format!("sha256:{:x}", Sha256::digest(payload))).map_err(|source| {
         WorkRepositoryError::corrupt(
             "Work recovery capture request hash",
+            std::io::Error::other(source),
+        )
+    })
+}
+
+fn capture_request_hash_with_workspace(
+    request: &WorkRecoveryPointCaptureRequest,
+    workspace: Option<&RecoveryPointWorkspaceReferenceV1>,
+    artifact: Option<&RecoveryPointArtifactReferenceV1>,
+) -> Result<WorkContentHash, WorkRepositoryError> {
+    let payload = serde_json::to_vec(&CanonicalCaptureRequestHashInput {
+        schema_version: REQUEST_HASH_SCHEMA_VERSION,
+        owner_id: &request.owner_id,
+        work_id: &request.work_id,
+        branch_id: &request.branch_id,
+        request_id: &request.request_id,
+        expected_work_revision: request.expected_work_revision,
+        expected_branch_revision: request.expected_branch_revision,
+        reason: request.reason,
+        workspace,
+        artifact,
+    })
+    .map_err(|source| WorkRepositoryError::ManifestEncoding {
+        entity: "Work workspace recovery capture request",
+        source,
+    })?;
+    WorkContentHash::parse(format!("sha256:{:x}", Sha256::digest(payload))).map_err(|source| {
+        WorkRepositoryError::corrupt(
+            "Work workspace recovery capture request hash",
             std::io::Error::other(source),
         )
     })

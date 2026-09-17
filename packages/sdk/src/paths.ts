@@ -146,6 +146,57 @@ export function workBranchRecoveryPointsPath(workId: string, branchId: string): 
   return `${workBranchPath(workId, branchId)}/recovery-points`;
 }
 
+export function workBranchWorkspaceRecoveryArtifactsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/workspace-recovery-artifacts`;
+}
+
+export function workBranchWorkspaceRecoveryBasisPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/workspace-recovery-basis`;
+}
+
+export function workBranchWorkspaceRecoveryArtifactPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+): string {
+  if (
+    artifactId === "." ||
+    artifactId === ".." ||
+    artifactId.length === 0 ||
+    Array.from(artifactId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(artifactId)
+  ) {
+    throw new TypeError("artifactId is not a canonical workspace artifact identity");
+  }
+  return `${workBranchWorkspaceRecoveryArtifactsPath(workId, branchId)}/${encodeURIComponent(artifactId)}`;
+}
+
+export function workBranchWorkspaceRecoveryChunkPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+  digest: string,
+): string {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+    throw new TypeError("digest is not a canonical content digest");
+  }
+  return `${workBranchWorkspaceRecoveryArtifactPath(workId, branchId, artifactId)}/chunks/${encodeURIComponent(digest)}`;
+}
+
+export function workBranchWorkspaceRecoverySealPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+): string {
+  return `${workBranchWorkspaceRecoveryArtifactPath(workId, branchId, artifactId)}/seal`;
+}
+
 export function workBranchRecoveryPointPath(
   workId: string,
   branchId: string,

@@ -38,6 +38,27 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
                 .post(crate::server::work_handlers::post_work_branch_recovery_point_handler),
         )
         .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts",
+            post(crate::server::work_handlers::post_work_workspace_recovery_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-basis",
+            get(crate::server::work_handlers::get_work_workspace_recovery_basis_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}",
+            get(crate::server::work_handlers::get_work_workspace_recovery_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/chunks/{digest}",
+            get(crate::server::work_handlers::get_work_workspace_recovery_chunk_handler)
+                .put(crate::server::work_handlers::put_work_workspace_recovery_chunk_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/seal",
+            post(crate::server::work_handlers::post_work_workspace_recovery_artifact_seal_handler),
+        )
+        .route(
             "/v1/works/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}",
             get(crate::server::work_handlers::get_work_branch_recovery_point_handler),
         )

@@ -77,7 +77,7 @@ accepted as an alias for the monitor.
 
 | Command | What it does |
 | --- | --- |
-| `/explain` | Cycle execution detail through off, on, and verbose. |
+| `/explain [on\|verbose\|off]` | Show measured execution facts at the selected detail. A bare `/explain` is the idempotent `on` form. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |

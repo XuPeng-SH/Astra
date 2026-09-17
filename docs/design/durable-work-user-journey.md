@@ -368,13 +368,19 @@ workspace safe.
   migration or Server Run-owner recovery.
 - The shared Artifact catalog now has an owner-scoped, content-addressed byte
   backend with resumable chunk puts, one artifact-level upload lease, temporary
-  reachability edges, and an atomic seal verifier. It is ready for the next capture slice (one typed
-  workspace package plus its file blobs), but no Work recovery point references
-  those bytes yet. Session hard-delete refuses while a preparing/captured/ready
-  Work recovery point still depends on the Session provenance; the canonical
-  Work branch-deletion operation releases those points before deleting the
-  Session, so neither ordinary Session deletion nor cleanup can silently
-  discard a saved boundary.
+  reachability edges, and an atomic seal verifier. Work workspace capture reads
+  a canonical basis (including the opaque bound `logical_workspace_id`) before
+  local files are collected, echoes its five expectation fields at
+  upload admission, and rejects a changed Session/Work head instead of
+  relabelling an old filesystem snapshot. A verified Work artifact read returns
+  the typed manifest and deterministic blob layout, so a second Web/TUI/Edge
+  client can discover, download, and hash the package before handing it to the
+  target materializer, without the uploader's in-memory state. Session
+  hard-delete refuses while a
+  preparing/captured/ready Work recovery point still depends on the Session
+  provenance; the canonical Work branch-deletion operation releases those
+  points before deleting the Session, so neither ordinary Session deletion nor
+  cleanup can silently discard a saved boundary.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

@@ -363,6 +363,35 @@ pub struct WorkRecoveryPointExecutionV1 {
     pub binding_generation: u64,
 }
 
+/// Public locator for the verified workspace package referenced by a recovery
+/// point.  The artifact id is an owner-scoped API identity; clients must use
+/// the workspace artifact endpoints instead of interpreting it as a local
+/// path or public URL.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointWorkspaceV1 {
+    pub snapshot_id: String,
+    pub logical_workspace_id: String,
+    pub manifest_hash: String,
+    pub content_root: String,
+    pub byte_size: u64,
+    pub complete: bool,
+    pub artifact_id: String,
+    pub artifact_type: String,
+    pub content_digest: String,
+}
+
+/// Public typed artifact locator retained by a recovery point.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointArtifactV1 {
+    pub artifact_id: String,
+    pub artifact_type: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_ref: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkRecoveryPointViewV1 {
@@ -383,6 +412,10 @@ pub struct WorkRecoveryPointViewV1 {
     pub criteria_set_revision: u64,
     pub session_cursor: WorkRecoveryPointSessionCursorV1,
     pub execution: WorkRecoveryPointExecutionV1,
+    #[serde(default)]
+    pub workspace: Option<WorkRecoveryPointWorkspaceV1>,
+    #[serde(default)]
+    pub artifacts: Vec<WorkRecoveryPointArtifactV1>,
     pub coverage: WorkRecoveryPointCoverageV1,
     pub capabilities: WorkRecoveryPointCapabilitiesV1,
 }
@@ -395,6 +428,118 @@ pub struct WorkRecoveryPointCaptureRequestV1 {
     pub expected_branch_revision: u64,
     #[serde(default)]
     pub reason: WorkRecoveryPointReasonV1,
+    /// A sealed, owner-scoped workspace package can be attached while the
+    /// canonical recovery point is published. The server derives the
+    /// snapshot reference and never accepts client capabilities or `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_artifact_id: Option<String>,
+}
+
+/// Immutable server facts observed before a local workspace capture starts.
+/// A client must echo these facts when beginning the upload; comparing the
+/// hashes prevents a file snapshot captured at one Session head from being
+/// silently labelled as a later head.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBasisExpectationV1 {
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub context_head_hash: String,
+    pub execution_binding_hash: String,
+}
+
+/// Public pre-capture basis. The hashes are opaque content identities; the
+/// cursor is included only to make the state understandable in TUI/Web.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBasisV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    /// Opaque workspace identity that a capture client must place in the
+    /// snapshot manifest.  It is returned by the server because a cold
+    /// client cannot derive the bound Session workspace identity safely.
+    pub logical_workspace_id: String,
+    pub work_revision: u64,
+    pub branch_revision: u64,
+    pub graph_revision: u64,
+    pub context_head_hash: String,
+    pub execution_binding_hash: String,
+    pub session_cursor: WorkRecoveryPointSessionCursorV1,
+}
+
+/// Start a resumable workspace recovery package upload. The manifest is
+/// decoded and fully verified after the byte artifact is sealed; keeping the
+/// wire value opaque here lets the runtime own the versioned filesystem
+/// contract without duplicating it in every client package.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactBeginRequestV1 {
+    pub request_id: String,
+    pub basis: WorkWorkspaceRecoveryBasisExpectationV1,
+    pub snapshot_manifest: serde_json::Value,
+    pub content_digest: String,
+    pub byte_size: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryChunkV1 {
+    pub chunk_index: u64,
+    pub digest: String,
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactSealRequestV1 {
+    pub chunks: Vec<WorkWorkspaceRecoveryChunkV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryChunkReceiptV1 {
+    pub schema_version: u16,
+    pub artifact_id: String,
+    pub digest: String,
+    pub byte_size: u64,
+    pub inserted: bool,
+}
+
+/// One deterministic content-addressed blob in a workspace package.  The
+/// logical chunk index is the order used for aggregate verification; the
+/// blob reference is the identity used by manifest entries.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryBlobV1 {
+    pub chunk_index: u64,
+    pub blob_ref: String,
+    pub digest: String,
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWorkspaceRecoveryArtifactResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub artifact_id: String,
+    pub sealed: bool,
+    pub verified: bool,
+    pub snapshot_id: String,
+    pub manifest_hash: String,
+    pub content_root: String,
+    pub content_digest: String,
+    pub byte_size: u64,
+    pub chunk_count: u64,
+    /// The complete manifest and deterministic blob layout are returned on
+    /// every artifact read.  A second client can therefore discover and
+    /// download the package without inheriting uploader memory or state.
+    pub snapshot_manifest: serde_json::Value,
+    pub blobs: Vec<WorkWorkspaceRecoveryBlobV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

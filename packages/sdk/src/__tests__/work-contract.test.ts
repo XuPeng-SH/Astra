@@ -39,6 +39,9 @@ import {
   decodeWorkExecutionSwitchOperationV1,
   decodeWorkRecoveryPointV1,
   decodeWorkRecoveryPointPageV1,
+  decodeWorkWorkspaceRecoveryArtifactV1,
+  decodeWorkWorkspaceRecoveryBasisV1,
+  decodeWorkWorkspaceRecoveryChunkReceiptV1,
 } from "../index";
 
 const fixture = JSON.parse(
@@ -132,6 +135,7 @@ function response(status: number, body: unknown): Response {
     status,
     statusText: status === 200 ? "OK" : "Error",
     text: () => Promise.resolve(JSON.stringify(body)),
+    json: () => Promise.resolve(body),
     headers: new Headers({ "content-type": "application/json" }),
   } as unknown as Response;
 }
@@ -142,6 +146,7 @@ function textResponse(data: string, headers: Record<string, string>): Response {
     status: 200,
     statusText: "OK",
     text: () => Promise.resolve(data),
+    json: () => Promise.resolve(JSON.parse(data)),
     headers: new Headers(headers),
   } as unknown as Response;
 }
@@ -2738,9 +2743,9 @@ const executionTargets = {
   branch_id: "branch-1",
   targets: [
     {
-      executor_id: "edge-laptop",
-      display_name: "Laptop",
-      hostname: "laptop.local",
+    executor_id: "edge-laptop",
+      display_name: "My Work Laptop",
+      hostname: "my work laptop",
       capabilities: ["runtime_process_authorization_v1"],
       connected: true,
     },
@@ -2797,6 +2802,8 @@ const recoveryPoint = {
     executor_id: "server",
     binding_generation: 1,
   },
+  workspace: null,
+  artifacts: [],
   coverage: {
     session_state: true,
     work_state: true,
@@ -2815,8 +2822,17 @@ const recoveryPoint = {
 
 test("execution decoders enforce identity, bounded targets, and terminal generations", () => {
   expect(decodeWorkExecutionViewV1(executionView).generation).toBe(3);
+  expect(
+    decodeWorkExecutionViewV1({ ...executionView, executor_name: "My Work Laptop" }).executor_name,
+  ).toBe("My Work Laptop");
   expect(decodeWorkExecutionViewV1({ ...executionView, initialized: false }).initialized).toBe(false);
   expect(decodeWorkExecutionTargetPageV1(executionTargets).targets).toHaveLength(2);
+  expect(() =>
+    decodeWorkExecutionTargetPageV1({
+      ...executionTargets,
+      targets: [{ ...executionTargets.targets[0], display_name: "bad\nname" }],
+    }),
+  ).toThrow("bounded control-free display name");
   expect(decodeWorkExecutionSwitchOperationV1(executionOperation).state).toBe("succeeded");
 
   const duplicate = structuredClone(executionTargets);
@@ -2854,6 +2870,74 @@ test("recovery point decoders preserve logical coverage and reject bad roots", (
   expect(() => decodeWorkRecoveryPointV1({ ...recoveryPoint, future: true })).toThrow(
     "unsupported field set",
   );
+});
+
+test("workspace recovery artifact decoders preserve content identity and reject drift", () => {
+  const artifact = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    artifact_id: "wsp-a",
+    sealed: true,
+    verified: true,
+    snapshot_id: "snapshot-1",
+    manifest_hash: `sha256:${"a".repeat(64)}`,
+    content_root: `sha256:${"b".repeat(64)}`,
+    content_digest: `sha256:${"c".repeat(64)}`,
+    byte_size: 12,
+    chunk_count: 1,
+    snapshot_manifest: { schema_version: 1 },
+    blobs: [
+      {
+        chunk_index: 0,
+        blob_ref: "blob-a",
+        digest: `sha256:${"d".repeat(64)}`,
+        byte_size: 12,
+      },
+    ],
+  } as const;
+  expect(decodeWorkWorkspaceRecoveryArtifactV1(artifact).artifact_id).toBe("wsp-a");
+  expect(
+    decodeWorkWorkspaceRecoveryChunkReceiptV1({
+      schema_version: 1,
+      artifact_id: "wsp-a",
+      digest: `sha256:${"c".repeat(64)}`,
+      byte_size: 12,
+      inserted: true,
+    }).inserted,
+  ).toBe(true);
+  expect(() =>
+    decodeWorkWorkspaceRecoveryArtifactV1({ ...artifact, content_digest: "not-a-hash" }),
+  ).toThrow("canonical SHA-256 content hash");
+  expect(() =>
+    decodeWorkWorkspaceRecoveryArtifactV1({
+      ...artifact,
+      blobs: [{ ...artifact.blobs[0], chunk_index: 1 }],
+    }),
+  ).toThrow("contiguous chunk indexes");
+});
+
+test("workspace recovery basis decoder preserves the pre-capture cursor", () => {
+  const basis = decodeWorkWorkspaceRecoveryBasisV1({
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    logical_workspace_id: "session:s-1:branch:b-1",
+    work_revision: 2,
+    branch_revision: 3,
+    graph_revision: 4,
+    context_head_hash: `sha256:${"e".repeat(64)}`,
+    execution_binding_hash: `sha256:${"f".repeat(64)}`,
+    session_cursor: {
+      completed_turn: 1,
+      journal_event_seq: 2,
+      conversation_seq: 3,
+      canonical_root_hash: "a".repeat(64),
+      compaction_generation: 0,
+    },
+  });
+  expect(basis.logical_workspace_id).toBe("session:s-1:branch:b-1");
+  expect(basis.session_cursor.conversation_seq).toBe(3);
 });
 
 test("execution client methods use no-store reads and sealed mutation bodies", async () => {
@@ -2970,4 +3054,269 @@ test("recovery point capture preserves typed unresolved-effect errors", async ()
     retryable: false,
     actionHints: ["review_effects", "refresh_work"],
   });
+});
+
+test("workspace recovery basis errors are covered by the typed API contract", async () => {
+  const body: WorkApiErrorV1 = {
+    code: "workspace_recovery_basis_mismatch",
+    category: "conflict",
+    retryable: false,
+    action_hints: ["refresh_work"],
+  };
+  globalThis.fetch = vi.fn().mockResolvedValue(response(409, body));
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.getWorkBranchWorkspaceRecoveryBasis("work-1", "branch-1"),
+  ).rejects.toMatchObject({
+    status: 409,
+    code: "workspace_recovery_basis_mismatch",
+    category: "conflict",
+    retryable: false,
+    actionHints: ["refresh_work"],
+  });
+});
+
+test("workspace recovery client methods keep chunk uploads and seals typed", async () => {
+  const basis = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    logical_workspace_id: "session:s-1:branch:b-1",
+    work_revision: 1,
+    branch_revision: 1,
+    graph_revision: 1,
+    context_head_hash: `sha256:${"e".repeat(64)}`,
+    execution_binding_hash: `sha256:${"f".repeat(64)}`,
+    session_cursor: {
+      completed_turn: 0,
+      journal_event_seq: 0,
+      conversation_seq: 0,
+      canonical_root_hash: "a".repeat(64),
+      compaction_generation: 0,
+    },
+  } as const;
+  const artifact = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    artifact_id: "wsp-a",
+    sealed: true,
+    verified: true,
+    snapshot_id: "snapshot-1",
+    manifest_hash: `sha256:${"a".repeat(64)}`,
+    content_root: `sha256:${"b".repeat(64)}`,
+    content_digest: `sha256:${"c".repeat(64)}`,
+    byte_size: 2,
+    chunk_count: 1,
+    snapshot_manifest: { schema_version: 1 },
+    blobs: [
+      {
+        chunk_index: 0,
+        blob_ref: "blob-a",
+        digest: `sha256:${"d".repeat(64)}`,
+        byte_size: 2,
+      },
+    ],
+  } as const;
+  const digest = `sha256:${"d".repeat(64)}` as const;
+  const bytes = new Uint8Array([1, 2]);
+  const chunkReceipt = {
+    schema_version: 1,
+    artifact_id: "wsp-a",
+    digest,
+    byte_size: 2,
+    inserted: true,
+  } as const;
+  const chunkResponse = {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    arrayBuffer: () => Promise.resolve(bytes.buffer),
+    headers: new Headers({
+      "content-type": "application/octet-stream",
+      "content-length": "2",
+      etag: `"${digest}"`,
+    }),
+  } as unknown as Response;
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce(response(200, basis))
+    .mockResolvedValueOnce(response(201, artifact))
+    .mockResolvedValueOnce(response(200, chunkReceipt))
+    .mockResolvedValueOnce(response(200, artifact))
+    .mockResolvedValueOnce(response(200, artifact))
+    .mockResolvedValueOnce(chunkResponse);
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.getWorkBranchWorkspaceRecoveryBasis("work-1", "branch-1"),
+  ).resolves.toEqual(basis);
+  await expect(
+    client.beginWorkBranchWorkspaceRecoveryArtifact("work-1", "branch-1", {
+      requestId: "snapshot-1",
+      // A cold client echoes the complete basis response. The SDK projects
+      // its five expectation fields into the deny-unknown-fields begin body.
+      basis,
+      snapshotManifest: { schema_version: 1 },
+      contentDigest: artifact.content_digest,
+      byteSize: 2,
+      chunkCount: 1,
+    }),
+  ).resolves.toEqual(artifact);
+  await expect(
+    client.putWorkBranchWorkspaceRecoveryChunk("work-1", "branch-1", "wsp-a", digest, bytes),
+  ).resolves.toEqual(chunkReceipt);
+  await expect(
+    client.sealWorkBranchWorkspaceRecoveryArtifact("work-1", "branch-1", "wsp-a", {
+      chunks: [{ chunk_index: 0, digest, byte_size: 2 }],
+    }),
+  ).resolves.toEqual(artifact);
+  await expect(
+    client.getWorkBranchWorkspaceRecoveryArtifact("work-1", "branch-1", "wsp-a"),
+  ).resolves.toEqual(artifact);
+  await expect(
+    client.getWorkBranchWorkspaceRecoveryChunk("work-1", "branch-1", "wsp-a", digest),
+  ).resolves.toEqual(bytes);
+
+  const calls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+  expect(JSON.parse(String(calls[1]?.[1].body)).basis).toEqual({
+    work_revision: 1,
+    branch_revision: 1,
+    graph_revision: 1,
+    context_head_hash: basis.context_head_hash,
+    execution_binding_hash: basis.execution_binding_hash,
+  });
+  expect(calls[2]?.[1].method).toBe("PUT");
+  expect(calls[2]?.[1].body).toBe(bytes);
+  expect((calls[2]?.[1].headers as Record<string, string>)["Content-Type"]).toBe(
+    "application/octet-stream",
+  );
+  expect(calls[3]?.[0]).toContain("/workspace-recovery-artifacts/wsp-a/seal");
+});
+
+test("a cold client can download and verify the complete workspace package", async () => {
+  const digest = "sha256:a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f63222" as const;
+  const artifact = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    artifact_id: "wsp-a",
+    sealed: true,
+    verified: true,
+    snapshot_id: "snapshot-1",
+    manifest_hash: `sha256:${"a".repeat(64)}`,
+    content_root: `sha256:${"b".repeat(64)}`,
+    content_digest: digest,
+    byte_size: 2,
+    chunk_count: 1,
+    snapshot_manifest: { schema_version: 1 },
+    blobs: [{ chunk_index: 0, blob_ref: "blob-a", digest, byte_size: 2 }],
+  } as const;
+  const bytes = new Uint8Array([1, 2]);
+  const chunkResponse = {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    arrayBuffer: () => Promise.resolve(bytes.buffer),
+    headers: new Headers({
+      "content-type": "application/octet-stream",
+      "content-length": "2",
+      etag: `"${digest}"`,
+    }),
+  } as unknown as Response;
+  globalThis.fetch = vi
+    .fn()
+    .mockResolvedValueOnce(response(200, artifact))
+    .mockResolvedValueOnce(chunkResponse);
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.downloadWorkBranchWorkspaceRecoveryPackage("work-1", "branch-1", "wsp-a"),
+  ).resolves.toMatchObject({
+    artifact,
+    blobs: [{ blob_ref: "blob-a", bytes }],
+  });
+});
+
+test("cold workspace downloads apply bounded backpressure", async () => {
+  const blobs = [
+    {
+      chunk_index: 0,
+      blob_ref: "blob-a",
+      digest: "sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      byte_size: 1,
+    },
+    {
+      chunk_index: 1,
+      blob_ref: "blob-b",
+      digest: "sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986",
+      byte_size: 1,
+    },
+    {
+      chunk_index: 2,
+      blob_ref: "blob-c",
+      digest: "sha256:084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5",
+      byte_size: 1,
+    },
+  ] as const;
+  const artifact = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    artifact_id: "wsp-a",
+    sealed: true,
+    verified: true,
+    snapshot_id: "snapshot-1",
+    manifest_hash: `sha256:${"a".repeat(64)}`,
+    content_root: `sha256:${"b".repeat(64)}`,
+    content_digest: "sha256:039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+    byte_size: 3,
+    chunk_count: 3,
+    snapshot_manifest: { schema_version: 1 },
+    blobs,
+  } as const;
+  let active = 0;
+  let maxActive = 0;
+  let chunkRequests = 0;
+  globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    if (chunkRequests === 0) {
+      chunkRequests += 1;
+      return Promise.resolve(response(200, artifact));
+    }
+    chunkRequests += 1;
+    const descriptor = blobs.find((blob) => url.endsWith(`/${encodeURIComponent(blob.digest)}`));
+    if (descriptor === undefined) return Promise.reject(new Error("unknown chunk"));
+    const bytes = new Uint8Array([descriptor.chunk_index + 1]);
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      arrayBuffer: async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await Promise.resolve();
+        active -= 1;
+        return bytes.buffer;
+      },
+      headers: new Headers({
+        "content-type": "application/octet-stream",
+        "content-length": "1",
+        etag: `"${descriptor.digest}"`,
+      }),
+    } as unknown as Response);
+  });
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.downloadWorkBranchWorkspaceRecoveryPackage("work-1", "branch-1", "wsp-a", {
+      concurrency: 2,
+    }),
+  ).resolves.toMatchObject({
+    artifact,
+    blobs: [{ blob_ref: "blob-a" }, { blob_ref: "blob-b" }, { blob_ref: "blob-c" }],
+  });
+  expect(maxActive).toBeLessThanOrEqual(2);
+  expect(chunkRequests).toBe(4);
 });

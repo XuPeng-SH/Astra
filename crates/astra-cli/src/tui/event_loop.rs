@@ -130,7 +130,7 @@ enum SlashBackgroundReadEffect {
     },
     WorkExecution(Result<WorkExecutionSurface, WorkExecutionLoadError>),
     WorkRecoveryPointCapture(
-        Result<astra_thin_client::WorkRecoveryPointViewV1, WorkRecoveryPointCaptureError>,
+        Box<Result<astra_thin_client::WorkRecoveryPointViewV1, WorkRecoveryPointCaptureError>>,
     ),
     WorkCatalog {
         result: Result<astra_thin_client::WorkCatalogPageV1, String>,
@@ -331,7 +331,7 @@ async fn send_work_recovery_capture_error(
     let _ = effect_tx
         .send(SlashBackgroundReadCompletion {
             generation,
-            effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(Err(error)),
+            effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(Box::new(Err(error))),
         })
         .await;
 }
@@ -1356,7 +1356,7 @@ fn dispatch_slash_background_read(
                                     .send(SlashBackgroundReadCompletion {
                                         generation,
                                         effect: SlashBackgroundReadEffect::WorkRecoveryPointCapture(
-                                            Err(classify_work_recovery_point_error(error)),
+                                            Box::new(Err(classify_work_recovery_point_error(error))),
                                         ),
                                     })
                                     .await;
@@ -1420,6 +1420,7 @@ fn dispatch_slash_background_read(
                                 expected_work_revision: work_revision,
                                 expected_branch_revision: branch_revision,
                                 reason: astra_thin_client::WorkRecoveryPointReasonV1::UserRequested,
+                                workspace_artifact_id: None,
                             },
                         )
                         .await
@@ -1429,7 +1430,7 @@ fn dispatch_slash_background_read(
                         "Not logged in. Use /login.".to_string(),
                     )),
                 };
-                SlashBackgroundReadEffect::WorkRecoveryPointCapture(result)
+                SlashBackgroundReadEffect::WorkRecoveryPointCapture(Box::new(result))
             }
             slash_dispatch::SlashBackgroundRead::WorkCatalog {
                 api,
@@ -1817,7 +1818,7 @@ fn apply_slash_background_read_effect(
                 )));
             }
         },
-        SlashBackgroundReadEffect::WorkRecoveryPointCapture(result) => match result {
+        SlashBackgroundReadEffect::WorkRecoveryPointCapture(result) => match *result {
             Ok(point) => {
                 let turns = point.session_cursor.completed_turn;
                 let record_id = crate::tui::truncate_ellipsis(&point.recovery_point_id, 16);
@@ -3164,10 +3165,10 @@ fn take_ready_result_if_all_closure_barriers_clear<T>(
         .flatten()
 }
 
-fn begin_turn_result_closure(
+fn begin_turn_result_closure<T>(
     bridge: &stream_bridge::PerTurnStreamBridgeControl,
-    turn_result_ready: &mut Option<Result<(), String>>,
-    result: Result<(), String>,
+    turn_result_ready: &mut Option<Result<T, String>>,
+    result: Result<T, String>,
 ) {
     // This is the sole non-shutdown transition from a running turn future to
     // a publishable result. Closing receiver admission first makes the later
@@ -7723,14 +7724,10 @@ pub(crate) async fn run_tui_session(
 
                                     let turn_start = std::time::Instant::now();
                                     bottom_pane.footer.clear_context_window_for_new_request();
-                                    let pre_prompt_tokens = state.total_prompt_tokens;
                                     // Explain mode is snapshotted for this turn so toggling it
                                     // while a request is in flight affects the next turn only.
                                     let turn_explain_mode = state.explain;
-                                    let pre_completion_tokens = state.total_completion_tokens;
                                     let _pre_cost = state.total_session_cost;
-                                    let pre_cache_read = state.total_cache_read_tokens;
-                                    let pre_cache_creation = state.total_cache_creation_tokens;
                                     let pre_cached_context_trace_turn_id = state
                                         .latest_context_assembly_trace
                                         .as_ref()
@@ -7871,9 +7868,17 @@ pub(crate) async fn run_tui_session(
                                         };
                                         tokio::pin!(fut);
 
-                                        let mut turn_result_ready: Option<Result<(), String>> = None;
+                                        let mut turn_result_ready: Option<
+                                            Result<
+                                                Option<crate::cli::turn::turn_entry::TurnUsage>,
+                                                String,
+                                            >,
+                                        > = None;
                                         let mut terminal_mode_closure_started = false;
-                                        let r: Result<(), String> = loop {
+                                        let r: Result<
+                                            Option<crate::cli::turn::turn_entry::TurnUsage>,
+                                            String,
+                                        > = loop {
                                             if !terminal_mode_closure_started
                                                 && let Err(e) = guard.ensure_tui_modes()
                                             {
@@ -9555,15 +9560,22 @@ pub(crate) async fn run_tui_session(
                                     // current request's assembly and provider usage. A trace is
                                     // only a recovery fallback for paths that did not expose the
                                     // live context signals.
-                                    let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
-                                    let turn_completion = state.total_completion_tokens - pre_completion_tokens;
-                                    let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
-                                    let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
-                                    // Keep fresh input separate from cache reads in TurnStats so
-                                    // the renderer can show both total provider traffic and the
-                                    // cache hit ratio without confusing either with context size.
-                                    let turn_fresh_input =
-                                        turn_prompt.saturating_add(turn_cache_creation);
+                                    // StreamResult/PartialTurnData owns the exact usage for this
+                                    // logical turn. Lifetime counters are intentionally not used:
+                                    // admission refreshes and concurrent executors can change
+                                    // them while this turn is in flight.
+                                    let turn_usage = turn_result
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|usage| *usage);
+                                    let turn_fresh_input = turn_usage.map(|usage| {
+                                        usage
+                                            .prompt_tokens
+                                            .saturating_add(usage.cache_creation_tokens)
+                                    });
+                                    let turn_completion = turn_usage.map(|usage| usage.completion_tokens);
+                                    let turn_cache_read =
+                                        turn_usage.map(|usage| usage.cache_read_tokens);
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -9590,8 +9602,8 @@ pub(crate) async fn run_tui_session(
                                         let ctx = chat_widget::TurnContext {
                                             elapsed_ms: Some(elapsed.as_millis() as u64),
                                             ttft_ms,
-                                            tokens_in: Some(turn_fresh_input),
-                                            tokens_out: Some(turn_completion),
+                                            tokens_in: turn_fresh_input,
+                                            tokens_out: turn_completion,
                                             // Drive the `💾 N%` segment:
                                             // hit rate = cache_read / total_input.
                                             // Only plumbed when the provider
@@ -9599,19 +9611,20 @@ pub(crate) async fn run_tui_session(
                                             // turn — `None` keeps the segment
                                             // off entirely (first turn, non-
                                             // caching provider, etc.).
-                                            cache_read_tokens: (turn_cache_read > 0)
-                                                .then_some(turn_cache_read),
+                                            cache_read_tokens: turn_cache_read
+                                                .filter(|tokens| *tokens > 0),
                                             tools: turn_tool_count,
-                                            cumulative_tokens: Some(
+                                            cumulative_tokens: turn_usage.map(|_| {
                                                 state
                                                     .total_prompt_tokens
                                                     .saturating_add(state.total_completion_tokens)
                                                     .saturating_add(
                                                         state.total_cache_creation_tokens,
                                                     )
-                                                    .saturating_add(state.total_cache_read_tokens),
-                                            ),
-                                            cumulative_cost_usd: Some(state.total_session_cost),
+                                                    .saturating_add(state.total_cache_read_tokens)
+                                            }),
+                                            cumulative_cost_usd: turn_usage
+                                                .map(|_| state.total_session_cost),
                                         };
                                         if let Some(ev) = chat_widget::translate(
                                             TuiAppEvent::TurnComplete,
@@ -9627,7 +9640,7 @@ pub(crate) async fn run_tui_session(
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
 
                                     if exit_after_turn_settlement {
-                                        break 'main turn_result;
+                                        break 'main turn_result.map(|_| ());
                                     }
 
                                     let new_tok = std::sync::Arc::new(
@@ -11266,6 +11279,32 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn turn_usage_comes_from_canonical_stream_result() {
+        let mut result = crate::StreamResult {
+            prompt_tokens: 120,
+            completion_tokens: 20,
+            cache_read_tokens: 8,
+            cache_creation_tokens: 4,
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 1,
+                provider_reported: 1,
+                unavailable: 0,
+            },
+            ..Default::default()
+        };
+        let usage = crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result)
+            .expect("provider usage is present");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 20);
+        result.token_usage_coverage.provider_reported = 0;
+        result.prompt_tokens = 0;
+        result.completion_tokens = 0;
+        result.cache_read_tokens = 0;
+        result.cache_creation_tokens = 0;
+        assert!(crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result).is_none());
+    }
+
+    #[test]
     fn unbound_work_session_is_an_empty_state_not_a_command_error() {
         let error = classify_work_execution_error(astra_thin_client::ThinClientError::Api {
             status: reqwest::StatusCode::NOT_FOUND,
@@ -12112,7 +12151,7 @@ mod tests {
             ))
             .await
             .expect("bridge open");
-        let mut ready = None;
+        let mut ready: Option<Result<(), String>> = None;
 
         begin_turn_result_closure(
             &bridge,

@@ -293,7 +293,7 @@ pub fn capture_git_worktree(
             },
             WorkspaceSnapshotExclusionV1 {
                 pattern: ".git/".to_string(),
-                reason: "repository internals are reconstructed on the target".to_string(),
+                reason: "Git metadata is excluded; this package restores files only".to_string(),
             },
         ],
         data_sources: Vec::new(),
@@ -1190,15 +1190,26 @@ fn validate_materialization_layout(
             symlinks.insert(entry.path.clone(), target.clone());
         }
     }
+    let mut resolution_cache = BTreeMap::new();
     for path in symlinks.keys() {
-        validate_symlink_resolution(path, &symlinks)?;
+        validate_symlink_resolution_with_cache(path, &symlinks, &mut resolution_cache)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_symlink_resolution(
     path: &str,
     symlinks: &BTreeMap<String, String>,
+) -> Result<(), WorkspaceSnapshotCaptureError> {
+    let mut cache = BTreeMap::new();
+    validate_symlink_resolution_with_cache(path, symlinks, &mut cache)
+}
+
+fn validate_symlink_resolution_with_cache(
+    path: &str,
+    symlinks: &BTreeMap<String, String>,
+    cache: &mut BTreeMap<String, ResolvedSymlink>,
 ) -> Result<(), WorkspaceSnapshotCaptureError> {
     let mut components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
     let _ = components.pop();
@@ -1207,25 +1218,38 @@ fn validate_symlink_resolution(
     };
     components.extend(target.split('/').map(str::to_owned));
     let mut active = BTreeSet::new();
-    let _ = resolve_symlink_components(&components, Vec::new(), symlinks, &mut active, path)?;
+    let _ =
+        resolve_symlink_components(&components, Vec::new(), symlinks, &mut active, cache, path)?;
     Ok(())
 }
 
 /// Resolve one component sequence while keeping the active expansion stack.
 /// A symlink is removed from the stack after its own target has been resolved,
 /// so a safe path may visit the same alias more than once while an actual
-/// cycle is still rejected.
+/// cycle is still rejected. Successful alias expansions are memoized by their
+/// canonical path. Cache entries retain only their direct alias dependencies;
+/// an iterative graph walk checks whether using one would intersect the
+/// current active stack, without recursively expanding the alias or copying a
+/// transitive dependency set.
+#[derive(Clone)]
+struct ResolvedSymlink {
+    components: Vec<String>,
+    dependencies: BTreeSet<String>,
+}
+
 fn resolve_symlink_components(
     components: &[String],
     initial: Vec<String>,
     symlinks: &BTreeMap<String, String>,
     active: &mut BTreeSet<String>,
+    cache: &mut BTreeMap<String, ResolvedSymlink>,
     original: &str,
-) -> Result<Vec<String>, WorkspaceSnapshotCaptureError> {
+) -> Result<ResolvedSymlink, WorkspaceSnapshotCaptureError> {
     struct Frame {
         components: Vec<String>,
         index: usize,
         active_symlink: Option<String>,
+        direct_dependencies: BTreeSet<String>,
     }
 
     let mut resolved = initial;
@@ -1233,28 +1257,30 @@ fn resolve_symlink_components(
         components: components.to_vec(),
         index: 0,
         active_symlink: None,
+        direct_dependencies: BTreeSet::new(),
     }];
-    while !frames.is_empty() {
-        if frames
-            .last()
-            .is_some_and(|frame| frame.index >= frame.components.len())
-        {
-            let Some(frame) = frames.pop() else {
-                break;
-            };
+    while let Some(frame) = frames.last_mut() {
+        if frame.index >= frame.components.len() {
+            let frame = frames.pop().expect("frame exists");
             if let Some(symlink) = frame.active_symlink {
                 active.remove(&symlink);
+                cache.insert(
+                    symlink,
+                    ResolvedSymlink {
+                        components: resolved.clone(),
+                        dependencies: frame.direct_dependencies,
+                    },
+                );
+            } else {
+                return Ok(ResolvedSymlink {
+                    components: resolved,
+                    dependencies: frame.direct_dependencies,
+                });
             }
             continue;
         }
-        let component = {
-            let Some(frame) = frames.last_mut() else {
-                break;
-            };
-            let component = frame.components[frame.index].clone();
-            frame.index += 1;
-            component
-        };
+        let component = frame.components[frame.index].clone();
+        frame.index += 1;
         match component.as_str() {
             "" | "." => {}
             ".." => {
@@ -1271,24 +1297,59 @@ fn resolve_symlink_components(
                     continue;
                 };
                 let _ = resolved.pop();
-                if !active.insert(candidate.clone()) {
+                if active.contains(&candidate) {
                     return Err(WorkspaceSnapshotCaptureError::UnsafePath(
                         original.to_string(),
                     ));
                 }
-                let target_components = next_target
-                    .split('/')
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
+                if let Some(cached) = cache.get(&candidate)
+                    && !cached_expansion_touches_active(&candidate, active, cache)
+                {
+                    frame.direct_dependencies.insert(candidate);
+                    resolved = cached.components.clone();
+                    continue;
+                }
+                frame.direct_dependencies.insert(candidate.clone());
+                active.insert(candidate.clone());
                 frames.push(Frame {
-                    components: target_components,
+                    components: next_target.split('/').map(str::to_owned).collect(),
                     index: 0,
                     active_symlink: Some(candidate),
+                    direct_dependencies: BTreeSet::new(),
                 });
             }
         }
     }
-    Ok(resolved)
+    Err(WorkspaceSnapshotCaptureError::UnsafePath(
+        original.to_string(),
+    ))
+}
+
+fn cached_expansion_touches_active(
+    root: &str,
+    active: &BTreeSet<String>,
+    cache: &BTreeMap<String, ResolvedSymlink>,
+) -> bool {
+    // The common package-level validation path starts each root with no
+    // active expansion. There is no cycle to detect in that state, so avoid
+    // walking the cached dependency graph for every alias in a long chain.
+    if active.is_empty() {
+        return false;
+    }
+    let mut pending = vec![root.to_string()];
+    let mut visited = BTreeSet::new();
+    while let Some(candidate) = pending.pop() {
+        if !visited.insert(candidate.clone()) {
+            continue;
+        }
+        if active.contains(&candidate) {
+            return true;
+        }
+        if let Some(entry) = cache.get(&candidate) {
+            pending.extend(entry.dependencies.iter().cloned());
+        }
+    }
+    false
 }
 
 fn checked_child_path(
@@ -1719,6 +1780,104 @@ mod tests {
             validate_symlink_resolution("dir/link", &symlinks),
             Err(WorkspaceSnapshotCaptureError::UnsafePath(path)) if path == "dir/link"
         ));
+    }
+
+    #[test]
+    fn symlink_resolution_memoizes_a_safe_diamond() {
+        // Each alias references the next alias twice. Without memoization the
+        // validator expands this DAG exponentially even though it has only a
+        // linear number of distinct symlinks.
+        let mut symlinks = BTreeMap::new();
+        for index in 0..30 {
+            symlinks.insert(
+                format!("a{index}"),
+                format!("a{next}/a{next}", next = index + 1),
+            );
+        }
+        symlinks.insert("a30".to_string(), ".".to_string());
+        assert!(validate_symlink_resolution("a0", &symlinks).is_ok());
+    }
+
+    #[test]
+    fn symlink_resolution_rejects_a_cycle() {
+        let symlinks = BTreeMap::from([
+            ("a0".to_string(), "a1".to_string()),
+            ("a1".to_string(), "a0".to_string()),
+        ]);
+        assert!(matches!(
+            validate_symlink_resolution("a0", &symlinks),
+            Err(WorkspaceSnapshotCaptureError::UnsafePath(path)) if path == "a0"
+        ));
+    }
+
+    #[test]
+    fn symlink_resolution_handles_a_deep_chain_without_recursion() {
+        let depth = 6_000;
+        let mut symlinks = BTreeMap::new();
+        for index in 0..depth {
+            symlinks.insert(format!("a{index}"), format!("a{}", index + 1));
+        }
+        assert!(validate_symlink_resolution("a0", &symlinks).is_ok());
+    }
+
+    #[test]
+    fn full_layout_validation_reuses_one_cache_for_a_deep_chain() {
+        let depth = 6_000;
+        let mut entries = Vec::with_capacity(depth + 1);
+        for index in 0..depth {
+            entries.push(WorkspaceSnapshotEntryV1 {
+                path: format!("a{index}"),
+                kind: WorkspaceSnapshotEntryKindV1::Symlink,
+                change: WorkspaceSnapshotChangeV1::Added,
+                mode: 0o777,
+                size: 0,
+                digest: None,
+                blob_ref: None,
+                symlink_target: Some(format!("a{}", index + 1)),
+                renamed_from: None,
+            });
+        }
+        entries.push(WorkspaceSnapshotEntryV1 {
+            path: format!("a{depth}"),
+            kind: WorkspaceSnapshotEntryKindV1::Directory,
+            change: WorkspaceSnapshotChangeV1::Added,
+            mode: 0o755,
+            size: 0,
+            digest: None,
+            blob_ref: None,
+            symlink_target: None,
+            renamed_from: None,
+        });
+        let package = WorkspaceSnapshotPackage {
+            manifest: WorkspaceSnapshotManifestV1 {
+                schema_version: WORKSPACE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+                snapshot_id: "snapshot-deep-chain".to_string(),
+                logical_workspace_id: "workspace-deep-chain".to_string(),
+                repository: crate::WorkspaceSnapshotRepositoryV1 {
+                    repository_id: "repo-deep-chain".to_string(),
+                    base_commit: None,
+                    base_tree: None,
+                    submodules: Vec::new(),
+                },
+                capture: crate::WorkspaceSnapshotCaptureV1 {
+                    fingerprint_before: "fingerprint".to_string(),
+                    fingerprint_after: "fingerprint".to_string(),
+                    captured_at: "2026-09-17T00:00:00Z".to_string(),
+                    consistent: true,
+                },
+                entries,
+                exclusions: Vec::new(),
+                data_sources: Vec::new(),
+                content: crate::WorkspaceSnapshotContentV1 {
+                    content_root: format!("sha256:{}", "0".repeat(64)),
+                    total_bytes: 0,
+                    blob_count: 0,
+                    pack_ref: None,
+                },
+            },
+            blobs: BTreeMap::new(),
+        };
+        assert!(validate_materialization_layout(&package).is_ok());
     }
 
     #[cfg(unix)]

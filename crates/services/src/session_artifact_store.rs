@@ -677,6 +677,17 @@ pub trait SessionArtifactContentStore: Send + Sync {
         session_id: &str,
         artifact_id: &str,
     ) -> Result<Option<StoredSessionArtifactContentV1>, SessionArtifactStoreError>;
+
+    /// Read one declared chunk without materializing the rest of a sealed
+    /// artifact. The catalog and owner/session reference are still checked,
+    /// and the returned bytes are verified against their content digest.
+    async fn load_byte_artifact_chunk(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        digest: &str,
+    ) -> Result<Option<SessionArtifactContentChunkV1WithBytes>, SessionArtifactStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -2475,6 +2486,82 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             chunks: stored_chunks,
         }))
     }
+
+    async fn load_byte_artifact_chunk(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        digest: &str,
+    ) -> Result<Option<SessionArtifactContentChunkV1WithBytes>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        validate_content_digest(digest)?;
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let Some(row) = query(
+            "SELECT status,
+                    JSON_UNQUOTE(JSON_EXTRACT(content_json, '$.content.sealed')) AS sealed
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        if row.try_get::<String, _>("status")? == "expired" {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        if row.try_get::<Option<String>, _>("sealed")?.as_deref() != Some("true") {
+            return Err(SessionArtifactStoreError::ByteArtifactNotSealed {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let row = query(
+            "SELECT refs.chunk_index, refs.byte_size, chunks.content
+             FROM session_artifact_content_refs refs
+             INNER JOIN session_artifact_content_chunks chunks
+               ON chunks.user_id = refs.user_id
+              AND chunks.content_digest = refs.content_digest
+             WHERE refs.user_id = ? AND refs.session_id = ? AND refs.artifact_id = ?
+               AND refs.content_digest = ?
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(digest)
+        .fetch_optional(&pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let chunk_index = row.try_get::<u64, _>("chunk_index")?;
+        let declared_size = row.try_get::<u64, _>("byte_size")?;
+        let bytes = row.try_get::<Vec<u8>, _>("content")?;
+        if declared_size != bytes.len() as u64 || content_digest(&bytes) != digest {
+            return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
+                digest: digest.to_string(),
+            });
+        }
+        Ok(Some(SessionArtifactContentChunkV1WithBytes {
+            chunk_index,
+            digest: digest.to_string(),
+            bytes,
+        }))
+    }
 }
 
 async fn retain_references_in_transaction(
@@ -2516,7 +2603,7 @@ async fn retain_references_in_transaction(
     Ok(())
 }
 
-async fn load_content_chunk_refs(
+pub(crate) async fn load_content_chunk_refs(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
@@ -2644,7 +2731,7 @@ async fn ensure_content_upload_reservations(
     Ok(())
 }
 
-async fn load_and_verify_content_chunks(
+pub(crate) async fn load_and_verify_content_chunks(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     refs: &[SessionArtifactContentChunkV1],
@@ -2653,12 +2740,7 @@ async fn load_and_verify_content_chunks(
     // global owner+digest order, then restore logical chunk order for aggregate
     // hashing and materialization. This prevents two seals that share blobs
     // in opposite file order from forming a lock cycle.
-    let mut lock_order = refs.to_vec();
-    lock_order.sort_by(|left, right| {
-        left.digest
-            .cmp(&right.digest)
-            .then(left.chunk_index.cmp(&right.chunk_index))
-    });
+    let lock_order = canonical_content_chunk_lock_order(refs);
     let mut chunks = Vec::with_capacity(refs.len());
     for reference in &lock_order {
         let row = query(
@@ -2703,6 +2785,22 @@ async fn load_and_verify_content_chunks(
             .collect::<Vec<_>>(),
     )?;
     Ok(chunks)
+}
+
+/// Return references in the global order used when locking shared content
+/// rows.  The owner is fixed by the transaction's authenticated scope, so the
+/// digest is the first ordering key; chunk index only makes duplicate or
+/// malformed references deterministic before validation rejects them.
+pub(crate) fn canonical_content_chunk_lock_order(
+    refs: &[SessionArtifactContentChunkV1],
+) -> Vec<SessionArtifactContentChunkV1> {
+    let mut lock_order = refs.to_vec();
+    lock_order.sort_by(|left, right| {
+        left.digest
+            .cmp(&right.digest)
+            .then(left.chunk_index.cmp(&right.chunk_index))
+    });
+    lock_order
 }
 
 fn validate_relative_path(relative: &Path) -> Result<(), String> {
@@ -3441,6 +3539,35 @@ mod tests {
             validate_content_chunk_refs(&refs),
             Err(SessionArtifactStoreError::InvalidContentChunkOrder)
         ));
+    }
+
+    #[test]
+    fn shared_content_lock_order_is_digest_canonical_and_logical_order_is_restored_later() {
+        let refs = vec![
+            SessionArtifactContentChunkV1 {
+                chunk_index: 0,
+                digest: content_digest(b"z"),
+                byte_size: 1,
+            },
+            SessionArtifactContentChunkV1 {
+                chunk_index: 1,
+                digest: content_digest(b"a"),
+                byte_size: 1,
+            },
+        ];
+        let order = canonical_content_chunk_lock_order(&refs);
+        assert!(order[0].digest < order[1].digest);
+        assert_eq!(
+            order
+                .iter()
+                .map(|item| item.chunk_index)
+                .collect::<Vec<_>>(),
+            if refs[0].digest < refs[1].digest {
+                vec![0, 1]
+            } else {
+                vec![1, 0]
+            }
+        );
     }
 
     #[tokio::test]

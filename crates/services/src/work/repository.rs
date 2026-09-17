@@ -86,6 +86,8 @@ pub enum WorkRecoveryPointBlocker {
     UnsupportedExecutor,
     #[error("the canonical Session context is missing or requires repair")]
     ContextUnavailable,
+    #[error("the workspace recovery package is missing or not sealed")]
+    WorkspaceArtifactUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

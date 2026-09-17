@@ -104,6 +104,12 @@ pub struct RecoveryPointExecutionBindingV1 {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPointWorkspaceReferenceV1 {
     pub snapshot_id: String,
+    /// The logical workspace identity selected by the canonical execution
+    /// binding.  A filesystem package may only be attached to a recovery
+    /// point for the same logical workspace; a Session/Work branch id is not
+    /// a substitute because the execution binding uses the conversation
+    /// branch identity (normally `main`).
+    pub logical_workspace_id: String,
     pub manifest_hash: String,
     pub content_root: String,
     pub byte_size: u64,
@@ -342,6 +348,13 @@ impl RecoveryPointManifestV1 {
         }
         if let Some(workspace) = &self.workspace {
             validate_identity("workspace.snapshot_id", &workspace.snapshot_id)?;
+            validate_identity(
+                "workspace.logical_workspace_id",
+                &workspace.logical_workspace_id,
+            )?;
+            if workspace.logical_workspace_id != self.execution.logical_workspace_id {
+                return Err(RecoveryPointValidationError::SessionIdentityMismatch);
+            }
             validate_digest("workspace.manifest_hash", &workspace.manifest_hash)?;
             validate_digest("workspace.content_root", &workspace.content_root)?;
             if !workspace.complete {
@@ -581,6 +594,7 @@ mod tests {
             },
             workspace: Some(RecoveryPointWorkspaceReferenceV1 {
                 snapshot_id: "snapshot-a".into(),
+                logical_workspace_id: "workspace-a".into(),
                 manifest_hash: digest('b'),
                 content_root: digest('c'),
                 byte_size: 12,
