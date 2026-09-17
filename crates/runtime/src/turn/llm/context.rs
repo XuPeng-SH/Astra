@@ -15,6 +15,111 @@ use sha2::{Digest, Sha256};
 use super::super::agentic_loop::host::AgenticLoopState;
 use super::super::prompt_cache::PromptCacheConfig;
 
+const ACTIVE_TURN_FRAME_MAX_CHARS: usize = 2_000;
+const ACTIVE_TURN_FRAME_INSTRUCTION: &str = "Resolve the current human request against the immediately preceding user-assistant exchange. Treat older transcript and runtime context as background unless the user explicitly broadens the scope.";
+
+fn bounded_active_turn_text(value: &str) -> (String, bool) {
+    let mut chars = value.chars();
+    let mut bounded = chars
+        .by_ref()
+        .take(ACTIVE_TURN_FRAME_MAX_CHARS)
+        .collect::<String>();
+    let truncated = chars.next().is_some();
+    if truncated {
+        bounded.push_str("...");
+    }
+    (bounded, truncated)
+}
+
+/// Build the dynamic, typed anchor for one real human turn.
+///
+/// The full canonical transcript remains available to the model. This frame
+/// only identifies the latest request and its nearest textual exchange so an
+/// elliptical follow-up does not accidentally promote an old topic. It lives
+/// in the volatile lane; the stable focus policy remains the cacheable rule.
+fn active_turn_frame_payload(messages: &[Value], user_content: &str) -> Option<Value> {
+    let current_index = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)?;
+    let current_text =
+        astra_turn_core::prompt_facing::extract_text_content(messages.get(current_index)?)?;
+    // Only the latest canonical human message can own this frame. If the host
+    // has not appended the current request yet, do not accidentally anchor an
+    // older identical request.
+    if current_text.trim() != user_content.trim() {
+        return None;
+    }
+
+    let mut prior_assistant = None;
+    let mut prior_user = None;
+    for message in messages[..current_index].iter().rev() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && prior_assistant.is_none()
+        {
+            if let Some(text) = astra_turn_core::prompt_facing::extract_text_content(message)
+                .filter(|text| !text.trim().is_empty())
+            {
+                prior_assistant = Some(bounded_active_turn_text(&text));
+            }
+            continue;
+        }
+        if astra_turn_types::is_human_user_message(message) && prior_assistant.is_some() {
+            if let Some(text) = astra_turn_core::prompt_facing::extract_text_content(message)
+                .filter(|text| !text.trim().is_empty())
+            {
+                prior_user = Some(bounded_active_turn_text(&text));
+            }
+            break;
+        }
+    }
+
+    let (current_preview, current_truncated) = bounded_active_turn_text(&current_text);
+    let mut payload = json!({
+        "schema": "active_turn_frame.v1",
+        "instruction": ACTIVE_TURN_FRAME_INSTRUCTION,
+        "latest_user_message_preview": current_preview,
+        "latest_user_message_truncated": current_truncated,
+        "canonical_source": "conversation_history",
+        "preview_limit_chars": ACTIVE_TURN_FRAME_MAX_CHARS,
+    });
+    if let Some((prior_user, truncated)) = prior_user {
+        payload["immediate_prior_user_request_preview"] = Value::String(prior_user);
+        payload["immediate_prior_user_request_truncated"] = Value::Bool(truncated);
+    }
+    if let Some((prior_assistant, truncated)) = prior_assistant {
+        payload["immediate_prior_assistant_response_preview"] = Value::String(prior_assistant);
+        payload["immediate_prior_assistant_response_truncated"] = Value::Bool(truncated);
+    }
+    Some(payload)
+}
+
+fn enqueue_active_turn_frame(state: &mut AgenticLoopState, user_content: &str) {
+    // Round zero is the one provider boundary for a human turn. Internal
+    // re-assemblies in that round replace the singleton with the same
+    // canonical payload; later tool rounds must not create another frame.
+    if state.current_round_index != 0 {
+        return;
+    }
+    let Some(payload) = active_turn_frame_payload(&state.messages, user_content) else {
+        return;
+    };
+    // Preserve the exact frame through context-memory reruns and bounded
+    // history recomposition. Rebuilding from a shorter projection would make
+    // the same human turn lose context or change its cache suffix.
+    if state.volatile_pending.iter().any(|injection| {
+        injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+    }) || state.messages.iter().enumerate().any(|(index, message)| {
+        astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            && astra_turn_types::append_only_runtime_authority_is_active(&state.messages, index)
+    }) {
+        return;
+    }
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+        payload,
+    );
+}
+
 pub(crate) fn cache_capability_from_model_metadata(
     value: Option<astra_services::PromptCacheCapabilityData>,
 ) -> Option<astra_turn_core::cache_placement::CacheCapability> {
@@ -1291,6 +1396,8 @@ pub(crate) fn assemble_context_pipeline(
             ),
         ));
     }
+
+    enqueue_active_turn_frame(state, input.user_content);
 
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
@@ -3180,6 +3287,230 @@ mod context_cache_contract_tests {
             message.get("role").and_then(Value::as_str) == Some("user")
                 && message_text(message) == "不要修改，只读 review uncommitted changes"
         }));
+    }
+
+    #[test]
+    fn active_turn_frame_is_canonical_once_per_human_turn() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": "summarize the current issue"}),
+        ];
+
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        let first = state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+            })
+            .expect("first human turn gets one active frame")
+            .clone();
+        assert_eq!(first.round_index, 0);
+        assert_eq!(first.payload["schema"], "active_turn_frame.v1");
+        assert_eq!(
+            first.payload["latest_user_message_preview"],
+            "summarize the current issue"
+        );
+        assert_eq!(first.payload["latest_user_message_truncated"], false);
+        assert_eq!(
+            first.payload["immediate_prior_user_request_preview"],
+            "investigate the old issue"
+        );
+        assert_eq!(
+            first.payload["immediate_prior_assistant_response_preview"],
+            "old issue findings"
+        );
+
+        // Context-memory reruns in the same provider round replace the
+        // singleton with the same payload instead of stacking prompt noise.
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        assert_eq!(
+            state
+                .volatile_pending
+                .iter()
+                .filter(|injection| {
+                    injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+                })
+                .count(),
+            1
+        );
+        assert_eq!(state.volatile_pending[0].payload, first.payload);
+
+        // Later tool rounds already have the current goal in canonical
+        // history and must not mint a second frame.
+        state.current_round_index = 1;
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(state.volatile_pending[0].payload, first.payload);
+    }
+
+    #[test]
+    fn active_turn_frame_projects_to_append_only_runtime_authority() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": "summarize the current issue"}),
+        ];
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let wire = assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role": "system", "content": "stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "active-frame-append-only",
+            provider: "openai",
+            model_name: "deepseek-v4-flash",
+            cache_capability: Some(capability),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .expect("append-only active frame must assemble");
+
+        let frame = state
+            .messages
+            .iter()
+            .find(|message| {
+                astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            })
+            .expect("append-only frame persisted in canonical history");
+        assert_eq!(frame["role"], "user");
+        assert_eq!(
+            astra_turn_types::runtime_authority_lifetime(frame),
+            Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn)
+        );
+        assert!(!astra_turn_types::is_human_user_message(frame));
+        assert!(wire.iter().any(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+        }));
+        assert!(wire.iter().any(|message| {
+            message_text(message).contains("immediate_prior_assistant_response_preview")
+        }));
+    }
+
+    #[test]
+    fn active_turn_frame_reuses_immutable_context_after_failed_retry_and_history_trim() {
+        let long_current = format!(
+            "{} keep this scope and disable tools at the end",
+            "x".repeat(2_200)
+        );
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": long_current}),
+        ];
+        enqueue_active_turn_frame(&mut state, &long_current);
+        let original = state.volatile_pending[0].payload.clone();
+        assert_eq!(original["latest_user_message_truncated"], true);
+        assert!(
+            original["latest_user_message_preview"]
+                .as_str()
+                .expect("preview text")
+                .ends_with("...")
+        );
+        assert!(
+            !original["latest_user_message_preview"]
+                .as_str()
+                .expect("preview text")
+                .contains("disable tools at the end")
+        );
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|message| message.get("content")),
+            Some(&Value::String(long_current.clone())),
+            "the full current request remains in canonical conversation history"
+        );
+        assert_eq!(
+            original["canonical_source"], "conversation_history",
+            "the bounded field must identify itself as a non-authoritative preview"
+        );
+
+        state.lease_volatile_pending().expect("lease first attempt");
+        state.restore_volatile_attempt_lease();
+        state.messages.truncate(1);
+        state
+            .messages
+            .push(json!({"role": "user", "content": long_current}));
+        enqueue_active_turn_frame(&mut state, &long_current);
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(
+            state.volatile_pending[0].payload, original,
+            "retry must reuse the exact frame instead of rebuilding from trimmed history"
+        );
+
+        let append_only = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let _wire = assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role": "system", "content": "stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "active-frame-canonical",
+            provider: "openai",
+            model_name: "deepseek-v4-flash",
+            cache_capability: Some(append_only),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .expect("append-only frame must commit after retry");
+        let canonical = state
+            .messages
+            .iter()
+            .find(|message| {
+                astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            })
+            .expect("committed active frame")
+            .clone();
+        state.messages = vec![
+            json!({"role": "user", "content": long_current}),
+            canonical.clone(),
+        ];
+        state.volatile_pending.clear();
+        enqueue_active_turn_frame(&mut state, &long_current);
+        assert!(state.volatile_pending.is_empty());
+        assert!(state.messages.iter().any(|message| message == &canonical));
+
+        state.current_round_index = 0;
+        state
+            .messages
+            .push(json!({"role": "assistant", "content": "done"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "new request"}));
+        state.volatile_pending.clear();
+        enqueue_active_turn_frame(&mut state, "new request");
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_ne!(state.volatile_pending[0].payload, original);
+        assert_eq!(
+            state.volatile_pending[0].payload["latest_user_message_preview"],
+            "new request"
+        );
     }
 
     #[test]
