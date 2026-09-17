@@ -57,9 +57,10 @@ Server Run-owner recovery require separate contracts and release gates.
 ### 1. Start or promote once
 
 Web and TUI create Work through the same Server Work service. Web may create a
-new Work. TUI may promote its current idle durable Session, preserving that
-Session instead of creating a hidden second conversation. If TUI has no durable
-Session yet, it explains the one prerequisite and offers the next action.
+new Work. TUI promotes its current idle durable Session when one exists. If a
+fresh TUI has no Session yet, `/work start <goal>` creates and binds the
+Session as part of the same explicit action; the user never needs to send a
+throwaway message or issue `/resume`.
 
 On success, both surfaces show the same `work_id` and selected `branch_id`.
 TUI should expose a direct Web link when the profile has a configured Web origin;
@@ -286,9 +287,9 @@ workspace safe.
 ## Current implementation audit
 
 - TUI `/work start` promotes its current durable Session through the Server Work
-  binding API. It rejects a missing Session, reuses the Session on exact retry,
-  and prints the Work id, `Ctrl+T` task-board hint, and the Web `/now` entry
-  point. There is no configured Web deep link yet. TUI `/work` opens an
+  binding API, creating and binding a Session when the TUI is pristine. It
+  reuses the Session on exact retry, and prints the Work id, the next action,
+  and the Web `/now` entry point. There is no configured Web deep link yet. TUI `/work` opens an
   owner-scoped catalog with explicit Observe/Continue actions; Continue routes
   a Work-scoped turn through a TUI attachment, shows accepted-run lifecycle
   progress without feeding Work Session events into the current chat, and

@@ -649,9 +649,9 @@ impl BottomPane {
         locally_owned
     }
 
-    /// Accept a message for the next turn once the current answer is visible.
-    /// The event loop transfers this FIFO lane to its ordinary submit path as
-    /// soon as the current canonical turn boundary is committed.
+    /// Accept a message for the next safe conversational turn. The event loop
+    /// transfers this FIFO lane to its ordinary submit path once the current
+    /// run or Session lifecycle action has reached a safe boundary.
     pub fn queue_next_turn_submission(&mut self, text: String) -> bool {
         if text.trim().is_empty() {
             return false;
@@ -2257,7 +2257,7 @@ impl BottomPane {
         Widget::render(
             Line::from(Span::styled(
                 truncate_display(
-                    "Next message queued · starts after this reply is committed",
+                    "Message queued · starts when the current action is ready",
                     area.width as usize,
                 ),
                 title_style,

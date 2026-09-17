@@ -1275,6 +1275,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',
         'check_recorded', 'gaps_accepted',
         'run_completed', 'run_delegated', 'run_failed', 'run_cancelled',
+        'recovery_point_captured',
         'runtime_events_expired'
     )),
     CONSTRAINT chk_work_event_work_revision CHECK (
