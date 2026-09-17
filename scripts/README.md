@@ -74,6 +74,13 @@ python3 -m unittest \
 bash scripts/harness/test_local_gateway_contract.sh
 ```
 
+`work_surface_live.py` is a separate opt-in cross-surface product journey. It
+uses a real controlling TUI terminal plus a real Playwright browser against an
+exact-build candidate Server. It is not discovered by `make test-offline` or
+the mocked `web` E2E suite. Run it through `make test-work-live` with a
+disposable owner token; the command retains evidence and never restarts a
+shared API process.
+
 See the [Terminal-Bench results](../README.md#terminal-bench-21) for the public
 benchmark summary.
 

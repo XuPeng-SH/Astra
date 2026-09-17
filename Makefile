@@ -1619,6 +1619,38 @@ test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, th
 		--eval-file target/astra-test-harness/capabilities/eval.json \
 		--parallel "$${PARALLEL:-1}" --runs "$${RUNS:-1}"
 
+# ----------------------------------------------------------------------------
+# Opt-in cross-surface Work journey.
+#
+# This is intentionally outside test-offline and the mocked Web E2E lane. It
+# needs a disposable owner token and an already-running candidate Server whose
+# /health build_git_sha exactly matches this checkout. The runner starts only
+# its own Web and TUI processes, so it cannot restart or stop a developer's
+# shared API process.
+#
+# Variables:
+#   ASTRA_HARNESS_ACCESS_TOKEN — required, never printed or put on argv
+#   ASTRA_API_URL              — candidate Server (default: 127.0.0.1:17001)
+#   ASTRA_WORK_LIVE_MODEL      — TUI bootstrap model selector (the Work turn
+#                                  uses the candidate Server's canonical default)
+#   ASTRA_WORK_LIVE_WEB_PORT   — isolated Web port (default: 3537)
+#   ASTRA_WORK_LIVE_TIMEOUT    — bounded journey deadline in seconds
+#   ASTRA_WORK_LIVE_RUN_DIR    — retain state, PTY, Web, and Playwright evidence
+# ----------------------------------------------------------------------------
+.PHONY: test-work-live
+test-work-live: dev-web-deps ## Run the real TUI → Web Work journey (opt-in; not offline/CI)
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
+	@run_dir="$${ASTRA_WORK_LIVE_RUN_DIR:-$$(mktemp -d -t astra-work-live.XXXXXX)}"; \
+	ASTRA_HARNESS_ACCESS_TOKEN="$${ASTRA_HARNESS_ACCESS_TOKEN:-}" \
+	python3 scripts/harness/work_surface_live.py \
+		--api-url "$${ASTRA_API_URL:-http://127.0.0.1:17001}" \
+		--model "$${ASTRA_WORK_LIVE_MODEL:-deepseek-v4-flash}" \
+		--profile "$${ASTRA_WORK_LIVE_PROFILE:-harness-auto}" \
+		--web-port "$${ASTRA_WORK_LIVE_WEB_PORT:-3537}" \
+		--timeout "$${ASTRA_WORK_LIVE_TIMEOUT:-240}" \
+		--astra-bin "$(CURDIR)/target/debug/astra" \
+		--run-dir "$$run_dir" --keep-artifacts
+
 # ============================================================================
 # Code Quality
 # ============================================================================

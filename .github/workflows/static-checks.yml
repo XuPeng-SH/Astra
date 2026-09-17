@@ -109,7 +109,8 @@ jobs:
           python3 -m unittest \
             scripts.harness.test_benchmark_model_seed \
             scripts.harness.test_case_history \
-            scripts.harness.test_fresh_database_contract
+            scripts.harness.test_fresh_database_contract \
+            scripts.harness.test_work_surface_live
           bash scripts/harness/test_local_gateway_contract.sh
       - name: Validate offline script contracts
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.script_contracts == 'true' }}
