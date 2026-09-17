@@ -103,6 +103,21 @@ impl WorkspaceSnapshotPackage {
                 });
             }
         }
+        let referenced = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| entry.blob_ref.as_deref())
+            .collect::<BTreeSet<_>>();
+        if let Some(unexpected) = self
+            .blobs
+            .keys()
+            .find(|blob_ref| !referenced.contains(blob_ref.as_str()))
+        {
+            return Err(WorkspaceSnapshotCaptureError::UnexpectedBlob(
+                unexpected.clone(),
+            ));
+        }
         validate_materialization_layout(self)?;
         Ok(())
     }
@@ -155,6 +170,8 @@ pub enum WorkspaceSnapshotCaptureError {
     BlobSizeMismatch { path: String },
     #[error("snapshot contains a duplicate blob reference with different bytes: {0}")]
     DuplicateBlob(String),
+    #[error("snapshot contains an unreferenced content blob: {0}")]
+    UnexpectedBlob(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1661,6 +1678,25 @@ mod tests {
         assert!(matches!(
             package.verify(),
             Err(WorkspaceSnapshotCaptureError::UnsafePath(path)) if path == "a/b"
+        ));
+    }
+
+    #[test]
+    fn package_verify_rejects_unreferenced_blob() {
+        let dir = repository();
+        fs::write(dir.path().join("src/main.txt"), "hello").expect("file");
+        let mut package = capture_git_worktree(
+            dir.path(),
+            &WorkspaceSnapshotCaptureOptions::new("snapshot-extra", "workspace-extra"),
+        )
+        .expect("capture");
+        package.blobs.insert(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            b"extra".to_vec(),
+        );
+        assert!(matches!(
+            package.verify(),
+            Err(WorkspaceSnapshotCaptureError::UnexpectedBlob(_))
         ));
     }
 

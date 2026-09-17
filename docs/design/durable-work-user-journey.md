@@ -365,6 +365,15 @@ workspace safe.
   reports the missing workspace and effect coverage, and never silently
   changes Session or execution authority. This is still not cross-Edge
   migration or Server Run-owner recovery.
+- The shared Artifact catalog now has an owner-scoped, content-addressed byte
+  backend with resumable chunk puts, one artifact-level upload lease, temporary
+  reachability edges, and an atomic seal verifier. It is ready for the next capture slice (one typed
+  workspace package plus its file blobs), but no Work recovery point references
+  those bytes yet. Session hard-delete refuses while a preparing/captured/ready
+  Work recovery point still depends on the Session provenance; the canonical
+  Work branch-deletion operation releases those points before deleting the
+  Session, so neither ordinary Session deletion nor cleanup can silently
+  discard a saved boundary.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

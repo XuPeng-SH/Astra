@@ -11,8 +11,8 @@ use astra_services::work::{
     WorkRevision,
 };
 use astra_services::{
-    AcquireWriterOutcome, DatabaseSessionContextCoordinator, ReserveTurnOutcome,
-    SessionContextCoordinator,
+    AcquireWriterOutcome, DatabaseSessionContextCoordinator, DatabaseSessionService,
+    ReserveTurnOutcome, SessionContextCoordinator, SessionService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -21,6 +21,7 @@ use astra_turn_types::{
     RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1, RecoveryPointManifestV1,
     RecoveryPointReasonV1, SessionContextHeadV1, SessionCursorV1, SessionKeyV1, SessionSurfaceV1,
 };
+use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -605,6 +606,58 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
         .expect("load rejected recovery point")
         .expect("recovery point remains durable");
     assert_eq!(loaded.status, WorkRecoveryPointStatus::Preparing);
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn delivery_session_delete_explains_work_management_path() {
+    let pool = common::setup_pool().await;
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    let owner_id = id("owner");
+    let work_id = id("work");
+    let branch_id = id("delivery");
+    let session_id = id("session");
+    cleanup_owner(&pool, &owner_id).await;
+
+    repository
+        .create_genesis(common::work_genesis(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &session_id,
+            &id("intent"),
+            "Explain why a delivery Session cannot be deleted while progress is saved.",
+        ))
+        .await
+        .expect("create Work");
+    let owner = WorkOwnerId::parse(&owner_id).expect("owner");
+    let work = WorkId::parse(&work_id).expect("work");
+    let branch = WorkBranchId::parse(&branch_id).expect("branch");
+    repository
+        .recovery_points()
+        .record_preparing(NewWorkRecoveryPoint {
+            owner_id: owner,
+            work_id: work,
+            branch_id: branch,
+            request_id: WorkChangeRef::parse(id("request")).expect("request"),
+            manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+        })
+        .await
+        .expect("record delivery recovery point");
+
+    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let (status, body) = service
+        .delete_session(session_id.clone(), owner_id.clone())
+        .await
+        .expect_err("delivery Session deletion must remain protected");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body.0.error_code.as_deref(), Some("session_has_saved_work"));
+    assert!(body.0.detail.contains(&work_id));
+    assert!(body.0.detail.contains(&branch_id));
+    assert!(body.0.detail.contains("choose another delivery branch"));
+
+    cleanup_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
