@@ -65,6 +65,13 @@ test("opens a durable read attachment after resolving the public delivery branch
   const listArchivedWorkBranches = vi.fn().mockResolvedValue(archivedBranches);
   const listWorkPatchArtifacts = vi.fn().mockResolvedValue(patchArtifacts);
   const listWorkBranchRecoveryPoints = vi.fn().mockResolvedValue(recoveryPoints);
+  const getWorkBranchInteractions = vi.fn().mockResolvedValue({
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    interactions: [],
+    next_cursor: null,
+  });
   const patchCommits = { schema_version: 1, operations: [] } as never;
   const listWorkPatchCommits = vi.fn().mockResolvedValue(patchCommits);
   const sdk = {
@@ -75,6 +82,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     listArchivedWorkBranches,
     listWorkPatchArtifacts,
     listWorkBranchRecoveryPoints,
+    getWorkBranchInteractions,
     listWorkPatchCommits,
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
@@ -110,6 +118,7 @@ test("opens a durable read attachment after resolving the public delivery branch
   expect(listWorkBranchRecoveryPoints).toHaveBeenCalledWith("work-1", "branch-1", {
     limit: 10,
   });
+  expect(getWorkBranchInteractions).toHaveBeenCalledWith("work-1", "branch-1");
   expect(element.props).toMatchObject({
     initial: snapshot,
     attachment,
@@ -142,6 +151,7 @@ test("restores durable patch application progress for an alternative branch", as
     listArchivedWorkBranches: vi.fn().mockResolvedValue({}),
     listWorkPatchArtifacts: vi.fn().mockResolvedValue({}),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue({}),
+    getWorkBranchInteractions: vi.fn().mockResolvedValue({}),
     listWorkPatchMaterializations,
     listWorkPatchCommits,
   } as never;
@@ -184,6 +194,7 @@ test("keeps the Work view usable when attachment rejects due to a stale Server",
     listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
     listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+    getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
   loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
@@ -215,6 +226,7 @@ test("keeps a saved Work readable while a read attachment is temporarily unavail
     listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
     listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+    getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
   loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
@@ -245,6 +257,7 @@ test("does not turn an attachment authentication error into a partial page", asy
     listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
     listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
+    getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
   loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });

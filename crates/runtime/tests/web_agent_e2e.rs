@@ -4802,12 +4802,13 @@ async fn get_run_status_with_auth(app: &Router, run_id: &str, auth: &str) -> (St
     (status, json)
 }
 
-/// GET /chat/runs/{run_id}/stream?last_index=N — returns SSE events.
+/// GET /chat/runs/{run_id}/stream?last_index=N&replay_only=true — returns the
+/// durable backlog without the live-attach `session_info` envelope.
 async fn get_run_stream(app: &Router, run_id: &str, last_index: u32) -> (StatusCode, Vec<Value>) {
     let req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/chat/runs/{run_id}/stream?last_index={last_index}"
+            "/chat/runs/{run_id}/stream?last_index={last_index}&replay_only=true"
         ))
         .header("authorization", TOKEN)
         .body(Body::empty())
