@@ -1,4 +1,4 @@
-import { AstraApiError } from "@astra/sdk";
+import { AstraApiError, type WorkBranchAttachmentV1 } from "@astra/sdk";
 import { cookies, headers } from "next/headers";
 import { notFound } from "next/navigation";
 import { WorkOverviewPage } from "@/components/app/work-overview-page";
@@ -86,12 +86,26 @@ export default async function WorkPage({
       }
       throw error;
     };
+    const attachmentNotice =
+      attachmentResult.status === "rejected"
+        ? attachmentRequestNotice(attachmentResult.reason)
+        : undefined;
+    const attachmentRead =
+      attachmentResult.status === "fulfilled"
+        ? { value: attachmentResult.value, notice: undefined }
+        : attachmentNotice
+          ? { value: null, notice: attachmentNotice }
+          : {
+              value: readOrThrow<WorkBranchAttachmentV1>(attachmentResult),
+              notice: undefined,
+            };
     return (
       <WorkOverviewPage
         initial={initial}
         branchCatalog={catalog}
         selectedBranch={selectedBranch}
-        attachment={readOrThrow(attachmentResult)}
+        attachment={attachmentRead.value}
+        attachmentNotice={attachmentRead.notice}
         initialActivity={readOrThrow(activityResult)}
         initialExecution={readOrThrow(executionResult)}
         transcript={readOrThrow(transcriptResult)}
@@ -111,4 +125,20 @@ export default async function WorkPage({
     }
     throw error;
   }
+}
+
+function attachmentRequestNotice(error: unknown): string | undefined {
+  if (!(error instanceof AstraApiError) || !error.path.endsWith("/attachments")) {
+    return undefined;
+  }
+  if (
+    error.status === 400 &&
+    error.code === "invalid_work_attachment_request"
+  ) {
+    return "The Server rejected the read attachment request. This can happen when Web and Server builds use different Work contracts. Restart the Astra Server from this checkout, then refresh the page. Saved Work data remains available.";
+  }
+  if (error.status === 426 && error.code === "unsupported_client_version") {
+    return "This Astra Server needs the matching Web Work contract. Restart the Server from this checkout, then refresh the page. Saved Work data remains available.";
+  }
+  return undefined;
 }

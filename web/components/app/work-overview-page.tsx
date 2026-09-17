@@ -146,6 +146,7 @@ function branchActivityLabel(activity: WorkBranchActivityResponseV1["activity"])
 export function WorkOverviewPage({
   initial,
   attachment,
+  attachmentNotice,
   initialActivity,
   initialExecution,
   transcript,
@@ -159,6 +160,7 @@ export function WorkOverviewPage({
 }: {
   initial: WorkOverviewSnapshot;
   attachment?: WorkBranchAttachmentV1 | null;
+  attachmentNotice?: string;
   initialActivity?: WorkBranchActivityResponseV1 | null;
   initialExecution?: WorkExecutionViewV1 | null;
   transcript?: WorkTranscriptPageV1 | null;
@@ -1037,6 +1039,15 @@ export function WorkOverviewPage({
             ) : null}
           </div>
         </header>
+
+        {attachmentNotice ? (
+          <div
+            role="alert"
+            className="mt-5 rounded-control border border-warning/40 bg-warning/10 px-4 py-3 text-sm leading-6 text-text-secondary"
+          >
+            {attachmentNotice}
+          </div>
+        ) : null}
 
         <WorkJourneyGuide
           activity={currentActivity}

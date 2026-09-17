@@ -809,6 +809,19 @@ test("shows committed continuity without inferring activity from delivery state"
   expect(screen.queryByText(/^Working$/)).not.toBeInTheDocument();
 });
 
+test("explains a Work contract mismatch without hiding the saved Work", () => {
+  render(
+    <TestWorkOverviewPage
+      initial={snapshot()}
+      attachment={null}
+      attachmentNotice="Live Work continuity is unavailable because this Web UI and Astra Server use different Work contracts."
+    />,
+  );
+
+  expect(screen.getByRole("alert")).toHaveTextContent(/different Work contracts/u);
+  expect(screen.getByText("Live continuity unavailable · durable Work facts remain readable")).toBeVisible();
+});
+
 test("reuses the action identity after a retryable failure", async () => {
   loadProposal.mockResolvedValue({ ok: true, detail });
   resolveProposal
