@@ -62,9 +62,9 @@ pub enum Command {
 pub enum ConfigCmd {
     /// List all admin config keys and values.
     List,
-    /// Read a single admin config value (e.g. `get reasoning_offering_id`).
+    /// Read a server setting (e.g. `get judgment_model`).
     Get(ConfigKeyArgs),
-    /// Set an admin config value (e.g. `set reasoning_offering_id <offering-id>`).
+    /// Set a server setting (e.g. `set judgment_model jev-1.13.0`).
     Set(ConfigSetArgs),
     /// Delete an admin config value.
     #[command(visible_alias = "delete")]

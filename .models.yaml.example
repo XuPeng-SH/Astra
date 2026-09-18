@@ -5,12 +5,12 @@
 # Quick start:
 #   1. cp .models.yaml.example .models.yaml
 #   2. Fill in your API keys
-#   3. astra-admin model load .models.yaml    # import to running server
-#   4. astra-admin model check <name>         # activate after connectivity probe
+#   3. astra admin model load .models.yaml --update-existing  # import and check
+#   4. astra admin config get judgment_model  # inspect optional judgment default
 #
 # This file defines available LLM models. Each entry is loaded into the
-# `infra_llm_models` table in MatrixOne. Models are inactive until explicitly
-# checked (connectivity probe) via `astra-admin model check`.
+# `infra_llm_models` table in MatrixOne. Load checks new or updated models;
+# `astra admin model check <name>` can repeat the connectivity check later.
 #
 # ─── Field Reference ──────────────────────────────────────────────────────────
 #
@@ -26,6 +26,7 @@
 #   base_url      — API base URL (no trailing slash)
 #
 # Optional fields:
+#   judgment_default      — true on one model: bind it for memory judgments after load
 #   description           — Human-readable description (shown in model list)
 #   tags                  — Capability tags (list). Used for model selection:
 #                             "selector"  — cheap model for intent/memory extraction
@@ -205,14 +206,18 @@
   supported_parameters: [tools]
 
 # Optional memory judgment pilot (not a chat/reasoning/extraction model).
-# Register with a real api_key, run `astra admin model check`, then bind its
-# exact Offering ID with:
-#   astra admin config set judgment_offering_id <offering-id>
-# Unset to use the ordinary selector in newly started sessions:
-#   astra admin config unset judgment_offering_id
+# Set judgment_default: true on one model to enable it automatically after
+# model load (including make dev-seed). Load checks connectivity before binding.
+# To switch an already active model manually:
+#   astra admin config set judgment_model jev-1.13.0
+#   astra admin config get judgment_model
+# To use the ordinary selector in newly started sessions:
+#   astra admin config unset judgment_model
+# Omitting judgment_default leaves the existing binding unchanged.
 # Credentials are stored encrypted through the existing model registry.
 # An empty api_key is unusable; no JET_KEY environment variable is required.
 # - name: jev-1.13.0
+#   judgment_default: true
 #   provider: typesafe
 #   base_url: https://api.typesafe.ai
 #   api_key: ""

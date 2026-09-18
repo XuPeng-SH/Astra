@@ -19,9 +19,18 @@ needed.
    receives only Offering identity. Runtime routing uses admin configuration,
    not environment variables. An empty key cannot be used or bound.
 
-2. Run `astra admin model check <name>` to activate the Offering using a typed
-   provider connectivity probe, then obtain its exact Offering ID.
-3. Run `astra admin config set judgment_offering_id <offering-id>`.
+2. Add `judgment_default: true` to that model entry in `.models.yaml`.
+   `astra admin model load .models.yaml --update-existing` (also used by
+   `make dev-seed`) checks the model and automatically binds it by name.
+   Only one entry may declare this default. Missing or false declarations
+   leave the existing binding unchanged; failed checks or rejected bindings
+   return an error instead of claiming the default was enabled.
+3. To switch an already active model manually, run
+   `astra admin config set judgment_model jev-1.13.0`.
+   Inspect it with `astra admin config get judgment_model`. Exact names are
+   resolved against the deployment catalog; ambiguous names are rejected.
+   The server still stores only the canonical Offering ID and validates
+   activity and credentials before changing the binding.
 4. Start a new Session to refresh the CLI's cached judgment Offering.
 
 The binding can also select an ordinary LLM Offering. It is an Offering routing
@@ -31,7 +40,7 @@ available to users whose policy forbids them. Provider credentials and active
 status are revalidated by the completion boundary for every call.
 
 To disable the pilot, run
-`astra admin config unset judgment_offering_id`, then start a new Session.
+`astra admin config unset judgment_model`, then start a new Session.
 Existing sessions retain their cached Offering selection. Other server instances
 share the admin configuration and model registry through the database.
 

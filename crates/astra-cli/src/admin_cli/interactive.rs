@@ -54,15 +54,15 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ("config list", "List admin config values"),
     (
         "config get",
-        "Get an admin config value  (e.g. config get reasoning_offering_id)",
+        "Get an admin config value  (e.g. config get judgment_model)",
     ),
     (
         "config set",
-        "Set an admin config value  (e.g. config set reasoning_offering_id <offering-id>)",
+        "Set an admin config value  (e.g. config set judgment_model jev-1.13.0)",
     ),
     (
         "config unset",
-        "Delete an admin config value  (e.g. config unset reasoning_offering_id)",
+        "Delete an admin config value  (e.g. config unset judgment_model)",
     ),
     ("help", "Show this help"),
     ("exit", "Exit admin REPL"),
