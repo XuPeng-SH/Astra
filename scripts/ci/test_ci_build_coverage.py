@@ -49,6 +49,12 @@ class BuildCoverageTests(unittest.TestCase):
             "cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2",
         ])
 
+    def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
+        commands = workflow_run_script(".github/workflows/test.yml", "Test inline terminal resize with xterm reflow")
+        self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)
+        self.assertIn("npm ci --ignore-scripts --prefix scripts/tui-reflow", commands)
+        self.assertIn('ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow', commands)
+
     def test_ci_resolves_the_actual_builder_base_not_only_the_planner(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("FROM dependency-inputs AS builder", dockerfile)

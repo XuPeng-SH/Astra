@@ -5368,7 +5368,7 @@ pub(crate) async fn run_tui_session(
     let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
-    let mut event_stream = TuiEventStream::new(draw_rx);
+    let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
     {
@@ -7289,13 +7289,14 @@ pub(crate) async fn run_tui_session(
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
-                                                        event @ (TuiEvent::Resize | TuiEvent::Draw) => {
+                                                        event @ (TuiEvent::Resize { .. } | TuiEvent::Draw) => {
                                                             let w = guard
                                                                 .terminal
                                                                 .size()
                                                                 .map(|s| s.width)
                                                                 .unwrap_or(80);
-                                                            if matches!(event, TuiEvent::Resize) {
+                                                            if let TuiEvent::Resize { cursor, size, interrupted } = event {
+                                                                guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string())?;
                                                                 refresh_open_transcript_view(
                                                                     &chat_widget,
                                                                     &mut bottom_pane,
@@ -8827,8 +8828,8 @@ pub(crate) async fn run_tui_session(
                         }
                         frame_requester.schedule_frame();
                     }
-                    TuiEvent::Resize => {
-                        guard.terminal.invalidate_viewport();
+                    TuiEvent::Resize { cursor, size, interrupted } => {
+                        guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string())?;
                         {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     refresh_open_transcript_view(

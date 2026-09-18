@@ -34,18 +34,32 @@ pub struct EventStream {
     poll_internal_waker: Waker,
     stream_wake_task_executed: Arc<AtomicBool>,
     stream_wake_task_should_shutdown: Arc<AtomicBool>,
-    task_sender: SyncSender<Task>,
+    task_sender: SyncSender<WorkerTask>,
 }
 
 impl Default for EventStream {
     fn default() -> Self {
-        let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
+        let (task_sender, receiver) = mpsc::sync_channel::<WorkerTask>(1);
 
         thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
+                let task = match task {
+                    WorkerTask::Poll(task) => task,
+                    WorkerTask::Barrier(ack) => {
+                        let _ = ack.send(());
+                        continue;
+                    }
+                };
                 loop {
-                    if let Ok(true) = poll_internal(None, &EventFilter) {
+                    // A dropped stream may still have a queued wake task. Do
+                    // not let that task reacquire the reader after a handoff.
+                    if task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
                         break;
+                    }
+                    match poll_internal(None, &EventFilter) {
+                        Ok(false) => {}
+                        // Let the stream's next poll surface reader errors too.
+                        Ok(true) | Err(_) => break,
                     }
 
                     if task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
@@ -68,10 +82,32 @@ impl Default for EventStream {
 }
 
 impl EventStream {
+    /// Wait until the reusable wake worker has released the shared reader.
+    ///
+    /// Call from a blocking thread before a synchronous query. The next stream
+    /// poll resumes the same worker. The acknowledgement, rather than a wake
+    /// pipe byte, establishes exclusive ownership for the query.
+    pub fn pause(&mut self) -> io::Result<()> {
+        self.stream_wake_task_should_shutdown
+            .store(true, Ordering::SeqCst);
+        let _ = self.poll_internal_waker.wake();
+        let (ack, done) = mpsc::sync_channel(0);
+        self.task_sender
+            .send(WorkerTask::Barrier(ack))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event worker stopped"))?;
+        done.recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event worker stopped"))
+    }
+
     /// Constructs a new instance of `EventStream`.
     pub fn new() -> EventStream {
         EventStream::default()
     }
+}
+
+enum WorkerTask {
+    Poll(Task),
+    Barrier(SyncSender<()>),
 }
 
 struct Task {
@@ -88,9 +124,8 @@ struct Task {
 //
 // Stream::poll_next can return Poll::Pending which means that there's no
 // event available. We are going to spawn a thread with the
-// poll_internal(None, &EventFilter) call. This call blocks until an
-// event is available and then we have to wake up the executor with notification
-// that the task can be resumed.
+// poll_internal(None, &EventFilter) call, waiting for input or cancellation.
+// Then we wake the executor so the task can be resumed.
 //
 // 2. poll_internal waker
 //
@@ -123,11 +158,11 @@ impl Stream for EventStream {
 
                     stream_wake_task_should_shutdown.store(false, Ordering::SeqCst);
 
-                    let _ = self.task_sender.send(Task {
+                    let _ = self.task_sender.send(WorkerTask::Poll(Task {
                         stream_waker,
                         stream_wake_task_executed,
                         stream_wake_task_should_shutdown,
-                    });
+                    }));
                 }
                 Poll::Pending
             }

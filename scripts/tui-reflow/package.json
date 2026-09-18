@@ -1,0 +1,6 @@
+{
+  "name": "astra-tui-reflow-tests",
+  "private": true,
+  "scripts": { "test": "node resize.cjs" },
+  "devDependencies": { "@xterm/headless": "5.5.0" }
+}

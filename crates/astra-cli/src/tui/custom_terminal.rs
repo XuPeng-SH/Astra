@@ -293,21 +293,46 @@ where
         Ok(())
     }
 
+    /// Rows added by reflow of the transient frame itself. The terminal's
+    /// cursor relocation includes these rows as well as reflow of history;
+    /// only the latter should move the viewport origin. The cursor line is
+    /// retained by xterm during reflow, and height shrink discards rows below
+    /// the cursor before applying width reflow.
+    pub fn viewport_reflow_rows(&self, size: Size) -> (u16, u16) {
+        if size.width == 0 || size.width >= self.viewport_area.width {
+            return (0, 0);
+        }
+        let retained_bottom = size
+            .height
+            .max(self.last_known_cursor_pos.y.saturating_add(1));
+        let mut before_cursor = 0u16;
+        let mut after_cursor = 0u16;
+        for (row, cells) in self
+            .previous_buffer()
+            .content
+            .chunks(usize::from(self.viewport_area.width))
+            .enumerate()
+        {
+            let y = self.viewport_area.y.saturating_add(row as u16);
+            if y >= retained_bottom || y == self.last_known_cursor_pos.y {
+                continue;
+            }
+            let added = reflow_rows_added(cells, size.width);
+            if y < self.last_known_cursor_pos.y {
+                before_cursor = before_cursor.saturating_add(added);
+            } else {
+                after_cursor = after_cursor.saturating_add(added);
+            }
+        }
+        (before_cursor, after_cursor)
+    }
+
     /// Sets the viewport area.
     pub fn set_viewport_area(&mut self, area: Rect) {
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
-    }
-
-    /// Queries the backend for size and resizes if it doesn't match the previous size.
-    pub fn autoresize(&mut self) -> io::Result<()> {
-        let screen_size = self.size()?;
-        if screen_size != self.last_known_screen_size {
-            self.resize(screen_size)?;
-        }
-        Ok(())
     }
 
     /// Draws a single frame to the terminal.
@@ -323,7 +348,7 @@ where
     ///
     /// This method will:
     ///
-    /// - autoresize the terminal if necessary
+    /// - defer a frame if the input owner has not reconciled the terminal size
     /// - call the render callback, passing it a [`Frame`] reference to render to
     /// - flush the current internal state by copying the current buffer to the backend
     /// - move the cursor to the last known position if it was set during the rendering closure
@@ -358,7 +383,7 @@ where
     ///
     /// This method will:
     ///
-    /// - autoresize the terminal if necessary
+    /// - defer a frame if the input owner has not reconciled the terminal size
     /// - call the render callback, passing it a [`Frame`] reference to render to
     /// - flush the current internal state by copying the current buffer to the backend
     /// - move the cursor to the last known position if it was set during the rendering closure
@@ -383,9 +408,9 @@ where
         F: FnOnce(&mut Frame) -> Result<(), E>,
         E: Into<io::Error>,
     {
-        // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
-        // and the terminal (if growing), which may OOB.
-        self.autoresize()?;
+        // TerminalGuard checks size before clearing or flushing history. Once
+        // a frame starts, finish it instead of leaving a cleared viewport blank.
+        // The input owner's size watchdog also recovers missed resize signals.
 
         let mut frame = self.get_frame();
 
@@ -400,7 +425,13 @@ where
         self.flush()?;
 
         match cursor_position {
-            None => self.hide_cursor()?,
+            None => {
+                // Diff-only frames can end on a ClearToEnd command. Park a
+                // hidden cursor at a known anchor rather than retaining the
+                // position of an earlier glyph write for resize recovery.
+                self.set_cursor_position(self.viewport_area.as_position())?;
+                self.hide_cursor()?;
+            }
             Some(position) => {
                 self.show_cursor()?;
                 self.set_cursor_position(position)?;
@@ -446,7 +477,7 @@ where
 
     /// Clear from `position` through the end of the visible screen and force a full redraw.
     pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
-        Self::backend_io(self.backend.set_cursor_position(position))?;
+        self.set_cursor_position(position)?;
         Self::backend_io(self.backend.clear_region(ClearType::AfterCursor))?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
@@ -542,6 +573,41 @@ enum DrawCommand {
     ClearToEnd { x: u16, y: u16, bg: Color },
 }
 
+// Keep reflow accounting and terminal writes on the same trailing-cell rule.
+fn last_painted_column(row: &[Cell]) -> usize {
+    let bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
+    let mut last = 0;
+    let mut column = 0;
+    while column < row.len() {
+        let cell = &row[column];
+        let width = display_width(cell.symbol());
+        let visible = terminal_hyperlinks::strip_link_markers(cell.symbol());
+        if visible != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
+            last = column + width.saturating_sub(1);
+        }
+        column += width.max(1);
+    }
+    last
+}
+
+fn reflow_rows_added(row: &[Cell], width: u16) -> u16 {
+    let end = last_painted_column(row);
+    let mut column = 0;
+    let mut physical_column = 0;
+    let mut added = 0;
+    while column <= end && column < row.len() {
+        let symbol_width = display_width(row[column].symbol()).max(1);
+        let cells = symbol_width.min(usize::from(width));
+        if physical_column + cells > usize::from(width) {
+            added += 1;
+            physical_column = 0;
+        }
+        physical_column += cells;
+        column += symbol_width;
+    }
+    added
+}
+
 fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
@@ -559,17 +625,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
         // Multi-width glyphs extend that region through their full displayed width.
         // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
         // versus emitting multiple space Put commands.
-        let mut last_nonblank_column = 0usize;
-        let mut column = 0usize;
-        while column < row.len() {
-            let cell = &row[column];
-            let width = display_width(cell.symbol());
-            let visible_symbol = terminal_hyperlinks::strip_link_markers(cell.symbol());
-            if visible_symbol != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
-                last_nonblank_column = column + (width.saturating_sub(1));
-            }
-            column += width.max(1); // treat zero-width symbols as width 1
-        }
+        let last_nonblank_column = last_painted_column(row);
 
         if last_nonblank_column + 1 < row.len() {
             let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
@@ -793,6 +849,27 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::layout::Rect;
     use ratatui::style::Style;
+
+    #[test]
+    fn reflow_counts_wide_glyph_boundaries_and_ignores_unpainted_padding() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 1));
+        buffer.set_string(0, 0, "你你你", Style::default());
+        assert_eq!(reflow_rows_added(&buffer.content, 3), 2);
+        assert_eq!(reflow_rows_added(&buffer.content, 40), 0);
+
+        buffer.set_string(80, 0, "path", Style::default());
+        assert_eq!(reflow_rows_added(&buffer.content, 40), 2);
+    }
+
+    #[test]
+    fn reflow_counts_styled_spaces_that_the_diff_really_paints() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 1));
+        buffer
+            .cell_mut((99, 0))
+            .unwrap()
+            .set_style(Style::default().add_modifier(Modifier::DIM));
+        assert_eq!(reflow_rows_added(&buffer.content, 40), 2);
+    }
 
     #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {

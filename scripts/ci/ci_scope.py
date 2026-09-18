@@ -157,7 +157,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             _enable(result, *RUST_SCOPES)
             continue
         if path == ".nvmrc":
-            _enable(result, "sdk", "web")
+            _enable(result, "sdk", "web", "test_cli")
             continue
         if path.startswith("vendor/"):
             # Vendored Rust code is a compiler input, not an unknown-area
@@ -170,6 +170,9 @@ def classify(paths: list[str]) -> dict[str, bool]:
             continue
         if path.startswith("web/"):
             _enable(result, "web")
+            continue
+        if path.startswith("scripts/tui-reflow/"):
+            _enable(result, "test_cli")
             continue
         if path.startswith("scripts/harness/"):
             _enable(result, "harness")

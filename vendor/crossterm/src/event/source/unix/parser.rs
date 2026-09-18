@@ -241,6 +241,29 @@ mod tests {
     }
 
     #[test]
+    fn cursor_reply_survives_every_split_and_preserves_input() {
+        let response = b"\x1b[5;3R";
+        for split in 1..response.len() {
+            let mut parser = Parser::default();
+            parser.set_startup_query(true);
+            parser.advance(b"a", false);
+            parser.advance(&response[..split], false);
+            parser.advance(&response[split..], false);
+            parser.advance(b"\x1b[200~resize paste\x1b[201~", false);
+            parser.set_startup_query(false);
+            assert_eq!(
+                parser.collect::<Vec<_>>(),
+                vec![
+                    key('a'),
+                    InternalEvent::CursorPosition(2, 4),
+                    InternalEvent::Event(Event::Paste("resize paste".into())),
+                ],
+                "split={split}"
+            );
+        }
+    }
+
+    #[test]
     fn bracketed_paste_is_not_interpreted_as_a_color_response() {
         let mut parser = Parser::default();
         parser.advance(b"\x1b[200~\x1b]11;rgb:ff/ff/ff\x07hello\x1b[201~", false);

@@ -39,6 +39,15 @@ class CiScopeTests(unittest.TestCase):
         self.assertFalse(scopes["online_core"])
         self.assertFalse(scopes["online_integration"])
 
+    def test_terminal_reflow_harness_selects_cli_pty_lane(self) -> None:
+        for path in ("scripts/tui-reflow/resize.cjs", "scripts/tui-reflow/pty_bridge.py",
+                     "scripts/tui-reflow/package-lock.json"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["test_cli"])
+                self.assertEqual(sum(scopes.values()), 1)
+        self.assertTrue(classify([".nvmrc"])["test_cli"])
+
     def test_test_only_rust_change_selects_owning_shard(self) -> None:
         scopes = classify(["crates/core/tests/repo_layout_contract.rs"])
         self.assertTrue(scopes["rust"])

@@ -87,3 +87,69 @@ pub fn query_startup_attributes(colors: bool, timeout: Duration) -> io::Result<S
     reader.set_startup_query(false);
     result
 }
+
+struct ResizeFilter;
+impl Filter for ResizeFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        matches!(event, InternalEvent::Event(super::Event::Resize(_, _)))
+    }
+}
+
+/// Cursor reply and the terminal dimensions for which it was requested.
+#[derive(Debug)]
+pub struct CursorPositionReport {
+    /// Dimensions sampled after draining old resize notifications.
+    pub size: (u16, u16),
+    /// None when the terminal did not answer within the query deadline.
+    pub position: Option<(u16, u16)>,
+    /// Another resize arrived while this reply was in flight. Its event is
+    /// left queued; the caller may track movement but must defer painting.
+    pub interrupted: bool,
+}
+
+/// Query the cursor through the shared reader with a bounded deadline.
+///
+/// The caller must pause/drop its EventStream first. Unrelated input remains
+/// queued in FIFO order; stale CPR replies are discarded before issuing DSR.
+/// This does not change terminal modes or create another terminal reader.
+pub fn query_cursor_position(timeout: Duration) -> io::Result<CursorPositionReport> {
+    use super::filter::CursorPositionFilter;
+
+    let mut reader = lock_internal_event_reader();
+    reader.set_startup_query(true);
+    let result = (|| {
+        // Older SIGWINCH notifications do not invalidate the query we are
+        // about to issue. Keep keyboard/paste input in the shared FIFO.
+        while reader.poll(Some(Duration::ZERO), &ResizeFilter)? {
+            reader.read(&ResizeFilter)?;
+        }
+        while reader.poll(Some(Duration::ZERO), &CursorPositionFilter)? {
+            reader.read(&CursorPositionFilter)?;
+        }
+        let size = crate::terminal::size()?;
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"\x1b[6n")?;
+        stdout.flush()?;
+        drop(stdout);
+
+        let deadline = Instant::now() + timeout;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            if reader.poll(Some(remaining), &CursorPositionFilter)? {
+                if let InternalEvent::CursorPosition(x, y) = reader.read(&CursorPositionFilter)? {
+                    return Ok(CursorPositionReport {
+                        size,
+                        position: Some((x, y)),
+                        interrupted: reader.poll(Some(Duration::ZERO), &ResizeFilter)?,
+                    });
+                }
+            }
+        }
+        Ok(CursorPositionReport {
+            size,
+            position: None,
+            interrupted: reader.poll(Some(Duration::ZERO), &ResizeFilter)?,
+        })
+    })();
+    reader.set_startup_query(false);
+    result
+}

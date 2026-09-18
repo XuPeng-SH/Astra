@@ -256,6 +256,14 @@ jobs:
         run: |
           cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
           cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+      - name: Test inline terminal resize with xterm reflow
+        run: |
+          cargo build --locked -p astra-cli --bin astra
+          npm ci --ignore-scripts --prefix scripts/tui-reflow
+          ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"

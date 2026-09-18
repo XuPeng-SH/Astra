@@ -1,6 +1,12 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
@@ -11,7 +17,11 @@ use tokio_stream::wrappers::ReceiverStream;
 pub(crate) enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
-    Resize,
+    Resize {
+        cursor: Option<(u16, u16)>,
+        size: (u16, u16),
+        interrupted: bool,
+    },
     Draw,
     /// Internal wake that asks the idle loop to reconcile queued runtime
     /// facts at a model boundary. This must stay typed: injecting magic text
@@ -22,16 +32,24 @@ pub(crate) enum TuiEvent {
 
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
-    crossterm_stream: EventStream,
+    crossterm_stream: Option<EventStream>,
+    resize_query: Option<tokio::task::JoinHandle<(EventStream, TuiEvent)>>,
+    size_check: tokio::time::Interval,
+    observed_size: Option<(u16, u16)>,
+    resize_pending: Arc<AtomicBool>,
     draw_stream: ReceiverStream<()>,
     poll_draw_first: bool,
 }
 
 impl TuiEventStream {
-    pub(crate) fn new(draw_rx: mpsc::Receiver<()>) -> Self {
+    pub(crate) fn new(draw_rx: mpsc::Receiver<()>, resize_pending: Arc<AtomicBool>) -> Self {
         Self {
             pending: VecDeque::new(),
-            crossterm_stream: EventStream::new(),
+            crossterm_stream: Some(EventStream::new()),
+            resize_query: None,
+            size_check: tokio::time::interval(Duration::from_millis(100)),
+            observed_size: crossterm::terminal::size().ok(),
+            resize_pending,
             draw_stream: ReceiverStream::new(draw_rx),
             poll_draw_first: false,
         }
@@ -43,7 +61,33 @@ impl TuiEventStream {
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         loop {
-            let event = Pin::new(&mut self.crossterm_stream).poll_next(cx);
+            if let Some(query) = self.resize_query.as_mut() {
+                match Pin::new(query).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok((stream, report))) => {
+                        self.resize_query = None;
+                        self.crossterm_stream = Some(stream);
+                        if let TuiEvent::Resize { size, .. } = &report {
+                            self.observed_size = Some(*size);
+                        }
+                        return Poll::Ready(Some(report));
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(None),
+                }
+            }
+            let pending = self.resize_pending.load(Ordering::Acquire);
+            if pending || self.size_check.poll_tick(cx).is_ready() {
+                let size = crossterm::terminal::size().ok();
+                if let Some(size) = size
+                    && (pending || self.observed_size != Some(size))
+                {
+                    return self.start_resize_query(size);
+                }
+            }
+            let Some(stream) = self.crossterm_stream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            let event = Pin::new(stream).poll_next(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -52,6 +96,10 @@ impl TuiEventStream {
             }
             match event {
                 Poll::Ready(Some(Ok(event))) => {
+                    if let Event::Resize(width, height) = event {
+                        let size = crossterm::terminal::size().unwrap_or((width, height));
+                        return self.start_resize_query(size);
+                    }
                     if let Some(mapped) = map_crossterm_event(event) {
                         return Poll::Ready(Some(mapped));
                     }
@@ -62,6 +110,41 @@ impl TuiEventStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+
+    fn start_resize_query(&mut self, size: (u16, u16)) -> Poll<Option<TuiEvent>> {
+        let Some(mut stream) = self.crossterm_stream.take() else {
+            return Poll::Ready(None);
+        };
+        self.resize_query = Some(tokio::task::spawn_blocking(move || {
+            let result = stream.pause().and_then(|()| {
+                #[cfg(unix)]
+                {
+                    crossterm::event::query_cursor_position(Duration::from_millis(150))
+                        .map(|report| (report.size, report.position, report.interrupted))
+                }
+                #[cfg(windows)]
+                {
+                    crossterm::cursor::position().map(|cursor| (size, Some(cursor), false))
+                }
+            });
+            let (size, cursor, interrupted) = result.unwrap_or((size, None, false));
+            (
+                stream,
+                TuiEvent::Resize {
+                    size,
+                    cursor,
+                    interrupted,
+                },
+            )
+        }));
+        // Mark the viewport pending before the async query can yield to a draw,
+        // including narrow/wide round trips ending at the original dimensions.
+        Poll::Ready(Some(TuiEvent::Resize {
+            size,
+            cursor: None,
+            interrupted: true,
+        }))
     }
 
     fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
@@ -83,7 +166,11 @@ fn map_crossterm_event(event: Event) -> Option<TuiEvent> {
             Some(TuiEvent::Key(normalize_key_event(key_event)))
         }
         Event::Key(_) => None,
-        Event::Resize(_, _) => Some(TuiEvent::Resize),
+        Event::Resize(width, height) => Some(TuiEvent::Resize {
+            cursor: None,
+            size: (width, height),
+            interrupted: false,
+        }),
         Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
         Event::FocusGained | Event::FocusLost => Some(TuiEvent::Draw),
         _ => None,

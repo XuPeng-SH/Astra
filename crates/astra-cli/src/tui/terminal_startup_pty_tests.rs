@@ -73,7 +73,10 @@ fn probe_child() {
         println!("NO_QUERY");
         return;
     }
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let _entered = runtime.enter();
     let before = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
     let started = Instant::now();
@@ -130,7 +133,14 @@ fn probe_child() {
     }
     let sixel_before = astra_tools::display_sixel::cached_sixel_support();
     startup.prepare_tui().unwrap();
-    let guard = crate::tui::terminal::TerminalGuard::init().unwrap();
+    let mut guard = crate::tui::terminal::TerminalGuard::init().unwrap();
+    if case == "resize_missed" {
+        // The shared reader is initialized by startup. Discard SIGWINCH to
+        // exercise the size watchdog, without a synthetic resize event.
+        unsafe {
+            libc::signal(libc::SIGWINCH, libc::SIG_IGN);
+        }
+    }
     startup.handoff();
     if case == "late_da1" {
         assert!(sixel_before.is_none());
@@ -139,6 +149,8 @@ fn probe_child() {
         assert!(result.output.contains("has not been confirmed"));
         assert!(astra_tools::display_sixel::cached_sixel_support().is_none());
     }
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut stream = crate::tui::event::TuiEventStream::new(rx, guard.resize_pending.clone());
     println!("INPUT_READY");
     if case == "sigint_handoff" {
         runtime.block_on(async {
@@ -170,8 +182,6 @@ fn probe_child() {
     }
     let events = runtime.block_on(async {
         use tokio_stream::StreamExt;
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut stream = crate::tui::event::TuiEventStream::new(rx);
         let mut events = Vec::new();
         while events.len() < expected_events(&case).len() {
             let budget = if matches!(
@@ -186,19 +196,61 @@ fn probe_child() {
                 .await
                 .expect("input was not preserved")
                 .expect("input stream ended");
+            if let crate::tui::event::TuiEvent::Resize {
+                cursor,
+                size,
+                interrupted,
+            } = &event
+            {
+                guard
+                    .reconcile_resize(*cursor, *size, *interrupted)
+                    .unwrap();
+            }
             match event {
                 crate::tui::event::TuiEvent::Key(key) => {
                     events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
                 }
                 crate::tui::event::TuiEvent::Paste(text) => events.push(format!("paste:{text}")),
+                crate::tui::event::TuiEvent::Resize {
+                    interrupted: true, ..
+                } if case == "resize_timeout" => {
+                    tx.send(()).await.unwrap();
+                    assert!(
+                        matches!(
+                            tokio::time::timeout(Duration::from_millis(50), stream.next()).await,
+                            Ok(Some(crate::tui::event::TuiEvent::Draw))
+                        ),
+                        "cursor query blocked draw delivery"
+                    );
+                }
+                crate::tui::event::TuiEvent::Resize {
+                    cursor,
+                    size,
+                    interrupted: false,
+                } if case.starts_with("resize_") => {
+                    assert!(guard.terminal.viewport_area.y < size.1);
+                    events.push(format!("resize:{cursor:?}"));
+                }
                 _ => {}
             }
         }
         // A late OSC reply must not become a fourth keyboard event.
+        let extra_input = tokio::time::timeout(Duration::from_millis(40), async {
+            loop {
+                match stream.next().await {
+                    Some(
+                        event @ (crate::tui::event::TuiEvent::Key(_)
+                        | crate::tui::event::TuiEvent::Paste(_)),
+                    ) => break event,
+                    None => panic!("input stream ended"),
+                    _ => {} // Resize notifications may be duplicated/coalesced by the OS.
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(40), stream.next())
-                .await
-                .is_err()
+            extra_input.is_err(),
+            "unexpected input {extra_input:?}; collected={events:?}"
         );
         events
     });
@@ -230,6 +282,18 @@ fn expected_events(case: &str) -> Vec<String> {
             "key:Esc:KeyModifiers(0x0)".to_string(),
             "key:Char('f'):KeyModifiers(0x0)".to_string(),
         ],
+        "resize_reply" | "resize_fragmented" | "resize_timeout" | "resize_missed"
+        | "resize_invalid" => vec![
+            if case == "resize_invalid" {
+                "resize:Some((65534, 65534))".to_string()
+            } else if case != "resize_timeout" {
+                "resize:Some((2, 4))".to_string()
+            } else {
+                "resize:None".to_string()
+            },
+            "key:Char('a'):KeyModifiers(0x0)".to_string(),
+            "paste:resize paste".to_string(),
+        ],
         "arrow" => vec!["key:Up:KeyModifiers(0x0)".to_string()],
         "alt" => vec!["key:Char('f'):KeyModifiers(ALT)".to_string()],
         _ => vec![
@@ -244,6 +308,11 @@ fn special_input(case: &str) -> bool {
     matches!(
         case,
         "escape"
+            | "resize_reply"
+            | "resize_fragmented"
+            | "resize_timeout"
+            | "resize_missed"
+            | "resize_invalid"
             | "poll_escape"
             | "escape_then_f"
             | "arrow"
@@ -323,7 +392,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     let mut output = Vec::new();
     let mut replied = false;
     let mut sent_input = false;
-    let mut cursor_replied = false;
+    let mut cursor_replies = 0;
     loop {
         if Instant::now() > deadline {
             child.kill().ok();
@@ -446,6 +515,20 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                     std::thread::sleep(Duration::from_millis(20));
                     master.write_all(b"f").unwrap();
                 }
+                "resize_reply" | "resize_fragmented" | "resize_timeout" | "resize_missed"
+                | "resize_invalid" => {
+                    let size = Winsize {
+                        ws_row: 20,
+                        ws_col: 60,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    // SAFETY: valid PTY and window-size pointer.
+                    assert_eq!(
+                        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                        0
+                    );
+                }
                 "arrow" => master.write_all(b"\x1b[A").unwrap(),
                 "alt" => master.write_all(b"\x1bf").unwrap(),
                 // SAFETY: this is the live test child we just spawned.
@@ -467,9 +550,37 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 _ => unreachable!(),
             }
         }
-        if !cursor_replied && output.windows(4).any(|bytes| bytes == b"\x1b[6n") {
-            master.write_all(b"\x1b[8;1R").unwrap();
-            cursor_replied = true;
+        let queries = output
+            .windows(4)
+            .filter(|bytes| *bytes == b"\x1b[6n")
+            .count();
+        if queries > cursor_replies {
+            cursor_replies += 1;
+            if cursor_replies == 1 {
+                master.write_all(b"\x1b[8;1R").unwrap();
+            } else if case.starts_with("resize_") {
+                // User input received during DSR must survive in FIFO order.
+                if cursor_replies == 2 {
+                    master.write_all(b"a").unwrap();
+                }
+                if case != "resize_timeout" {
+                    if case == "resize_fragmented" {
+                        // Split inside a recognized CSI, not after a bare ESC:
+                        // hosted-runner scheduling can exceed the 40 ms Escape
+                        // ambiguity window even for a requested 5 ms sleep.
+                        // Parser unit tests cover every CPR byte boundary.
+                        master.write_all(b"\x1b[5;").unwrap();
+                        master.write_all(b"3R").unwrap();
+                    } else if case == "resize_invalid" {
+                        master.write_all(b"\x1b[65535;65535R").unwrap();
+                    } else {
+                        master.write_all(b"\x1b[5;3R").unwrap();
+                    }
+                }
+                if cursor_replies == 2 {
+                    master.write_all(b"\x1b[200~resize paste\x1b[201~").unwrap();
+                }
+            }
         }
         if child.try_wait().unwrap().is_some() {
             // Read remaining output on the next poll; the slave closes at exit.
@@ -652,4 +763,17 @@ fn pty_sixel_waits_for_da1_and_records_negative_evidence() {
     );
     let (value, _) = run_case("no_sixel");
     assert_eq!(value["sixel_before"], false, "no_sixel: {value}");
+}
+
+#[test]
+fn pty_resize_cursor_query_preserves_input_and_handles_missing_reply() {
+    for case in [
+        "resize_reply",
+        "resize_fragmented",
+        "resize_timeout",
+        "resize_missed",
+        "resize_invalid",
+    ] {
+        run_case(case);
+    }
 }

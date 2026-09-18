@@ -26,6 +26,8 @@ pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
     pending_history: VecDeque<PendingHistory>,
     is_zellij: bool,
+    pub(crate) resize_pending: Arc<AtomicBool>,
+    clipped_reflow_below_cursor: Option<u16>,
     /// Scrollback is deliberately drained over several frames for very long
     /// replies. This keeps terminal writes from monopolising the same event
     /// loop that owns keyboard input and the composer.
@@ -118,6 +120,8 @@ impl TerminalGuard {
             terminal,
             pending_history: VecDeque::new(),
             is_zellij,
+            resize_pending: Arc::new(AtomicBool::new(false)),
+            clipped_reflow_below_cursor: None,
             history_drain_requester: None,
         };
         // Tell display_sixel the TUI owns the terminal, so it queues images for
@@ -231,6 +235,67 @@ impl TerminalGuard {
         preparing
     }
 
+    pub fn reconcile_resize(
+        &mut self,
+        cursor: Option<(u16, u16)>,
+        queried_size: (u16, u16),
+        interrupted: bool,
+    ) -> io::Result<()> {
+        let size = self.terminal.size()?;
+        // Treat out-of-screen replies as missing, never as scroll distances.
+        let cursor = cursor.filter(|&(x, y)| x < queried_size.0 && y < queried_size.1);
+        self.resize_pending.store(
+            interrupted || size.width != queried_size.0 || size.height != queried_size.1,
+            Ordering::Release,
+        );
+        if self.resize_pending.load(Ordering::Acquire) {
+            // xterm can discard the footer's newly wrapped rows below a
+            // bottom-clamped cursor before a narrow/wide round trip settles.
+            // The cursor retains that displacement even after the cells have
+            // disappeared, so remember it while deferring the actual repaint.
+            if cursor.is_some_and(|(_, y)| y == queried_size.1.saturating_sub(1)) {
+                let queried = ratatui::layout::Size::new(queried_size.0, queried_size.1);
+                self.clipped_reflow_below_cursor
+                    .get_or_insert(self.terminal.viewport_reflow_rows(queried).1);
+            }
+            return Ok(());
+        }
+        if self.clipped_reflow_below_cursor.is_none()
+            && size == self.terminal.last_known_screen_size
+            && cursor.is_none_or(|(_, y)| y == self.terminal.last_known_cursor_pos.y)
+        {
+            // Coalesced resize events can return to the original dimensions
+            // after the emulator discarded cells below the cursor.
+            self.terminal.invalidate_viewport();
+            return Ok(());
+        }
+        // With no CPR support, at least account for cursor clamping on a
+        // height shrink. Never erase unrelated history to guess at reflow.
+        let y = cursor.map(|(_, y)| y).unwrap_or_else(|| {
+            self.terminal
+                .last_known_cursor_pos
+                .y
+                .min(size.height.saturating_sub(1))
+        });
+        let reflow_rows = if cursor.is_some() {
+            let (before, after) = self.terminal.viewport_reflow_rows(size);
+            before.saturating_add(self.clipped_reflow_below_cursor.take().unwrap_or(after))
+        } else {
+            self.clipped_reflow_below_cursor = None;
+            0
+        };
+        let offset = i32::from(y)
+            - i32::from(self.terminal.last_known_cursor_pos.y)
+            - i32::from(reflow_rows);
+        let mut area = self.terminal.viewport_area;
+        area.y =
+            (i32::from(area.y) + offset).clamp(0, i32::from(size.height.saturating_sub(1))) as u16;
+        self.terminal.set_viewport_area(area);
+        self.terminal.clear()?;
+        self.terminal.resize(size)?;
+        Ok(())
+    }
+
     /// Draw the viewport — matches Codex tui.rs::draw() sequence:
     /// 1. update_inline_viewport (scroll if height changed, clear if viewport moved)
     /// 2. flush_pending_history (insert above viewport)
@@ -241,6 +306,15 @@ impl TerminalGuard {
         height: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> io::Result<()> {
+        // A scheduled frame or a runtime event can arrive before SIGWINCH is
+        // consumed. Preserve the old cursor anchor until the input owner has
+        // queried its position in the resized terminal.
+        if self.terminal.size()? != self.terminal.last_known_screen_size {
+            self.resize_pending.store(true, Ordering::Release);
+        }
+        if self.resize_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
@@ -274,13 +348,14 @@ impl TerminalGuard {
     /// that space instead of printing more blank lines.
     /// If viewport area changed, clear old area and set new one.
     fn update_inline_viewport(terminal: &mut CustomTerminal, height: u16) -> io::Result<bool> {
-        let size = terminal.size()?;
+        let size = terminal.last_known_screen_size;
         let mut area = terminal.viewport_area;
         area.height = height.min(size.height);
         area.width = size.width;
         let mut needs_full_repaint = false;
 
         if area.bottom() > size.height {
+            terminal.clear()?;
             let scroll_by = area.bottom() - size.height;
             queue!(
                 terminal.backend_mut(),

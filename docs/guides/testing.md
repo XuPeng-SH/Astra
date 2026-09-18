@@ -112,6 +112,26 @@ targets and requests for an explicit deferred replacement use separate cases.
 - SaaS capability test plan: [`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md) (`make test-saas`; Rust HTTP E2E plus optional remote `@astra/sdk` coverage).
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 
+## Terminal resize and reflow
+
+The inline TUI regression drives the real binary through a controlling PTY and
+xterm.js's headless terminal (including native reflow). It checks repeated
+narrow/wide and short/tall transitions, draft input, rapid resizes with delayed
+cursor replies, one live footer/composer across the entire buffer, and
+preservation of pre-existing and committed startup history. It uses a
+synthetic token and an unavailable loopback endpoint; no model or real account
+is needed. Python 3 and the repository's Node.js version are required.
+
+```bash
+cargo build --locked -p astra-cli --bin astra
+npm ci --ignore-scripts --prefix scripts/tui-reflow
+ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
+```
+
+The `terminal-pty` CI lane runs it on Linux and macOS. The Rust terminal-reader
+PTY tests also verify that a resize cursor query preserves keyboard/paste
+input and times out when the terminal does not answer.
+
 ## Live MatrixOne system E2E
 
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
