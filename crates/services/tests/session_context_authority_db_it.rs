@@ -629,6 +629,20 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         .await
         .expect("begin durable switch");
     assert_eq!(begun.attempt, 1);
+
+    // Simulate the original handler exiting after the durable begin commit.
+    // A controller-authorized retry must be able to resume this permanently
+    // switching receipt instead of treating it as a terminal failure.
+    let stranded = coordinator
+        .authorize_execution_switch_retry(&key, &begun.operation_id, &attachment.attachment_id)
+        .await
+        .expect("authorize recovery of stranded switch");
+    assert_eq!(
+        stranded.state,
+        astra_services::SessionExecutionSwitchStateV1::Switching
+    );
+    assert_eq!(stranded.operation_id, begun.operation_id);
+
     let failed = coordinator
         .complete_execution_switch(
             &key,

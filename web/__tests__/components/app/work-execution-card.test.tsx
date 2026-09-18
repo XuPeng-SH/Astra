@@ -226,6 +226,35 @@ test("checks a switching device change without taking control or retrying it", a
   expect(retryExecution).not.toHaveBeenCalled();
 });
 
+test("resumes a permanently switching device change after the original handler exits", async () => {
+  const switching = { ...succeeded, state: "switching" as const };
+  // Every observation remains switching: this models a durable receipt left
+  // behind by a server crash, rather than a mock that eventually settles on
+  // its own.
+  observeExecution.mockResolvedValue({ ok: true, operation: switching });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: switching.operation_id, state: "switching" }}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "Resume device change" }));
+  await waitFor(() => expect(acquireControl).toHaveBeenCalledTimes(1));
+  await waitFor(() =>
+    expect(retryExecution).toHaveBeenCalledWith({
+      workId: "work-1",
+      branchId: "branch-1",
+      operationId: "switch-1",
+      attachmentId: "attachment-1",
+    }),
+  );
+});
+
 test("does not retry a recovered device change when controller acquisition is denied", async () => {
   const failed = {
     ...succeeded,

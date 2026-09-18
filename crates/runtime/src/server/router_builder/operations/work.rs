@@ -52,7 +52,13 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/chunks/{digest}",
             get(crate::server::work_handlers::get_work_workspace_recovery_chunk_handler)
-                .put(crate::server::work_handlers::put_work_workspace_recovery_chunk_handler),
+                .put(crate::server::work_handlers::put_work_workspace_recovery_chunk_handler)
+                // The workspace snapshot contract uploads one complete file
+                // blob per request. Override the process-wide JSON limit for
+                // this route with the same bound enforced by the manifest.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    astra_runtime_env::WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+                )),
         )
         .route(
             "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/seal",

@@ -11,6 +11,13 @@ use std::io::{self, Write};
 use thiserror::Error;
 
 pub const WORKSPACE_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Maximum size of one complete file blob in the workspace snapshot protocol.
+///
+/// Snapshot entries and the recovery upload route both use one request per
+/// content-addressed blob. Keeping this limit in the shared contract means a
+/// manifest accepted by the server can always be uploaded through production
+/// HTTP without relying on a larger process-wide request limit.
+pub const WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 const WORKSPACE_SNAPSHOT_HASH_DOMAIN: &[u8] = b"astra.workspace-snapshot-manifest.v1\0";
 const MAX_ID_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 4096;
@@ -166,6 +173,14 @@ pub enum WorkspaceSnapshotValidationError {
     ContentAggregateMismatch { field: &'static str },
     #[error("workspace snapshot content root does not match canonical entries")]
     ContentRootMismatch,
+    #[error(
+        "entry {path} is larger than the workspace snapshot blob limit ({maximum} bytes): {size}"
+    )]
+    BlobTooLarge {
+        path: String,
+        size: u64,
+        maximum: usize,
+    },
     #[error("entry {path} has invalid content fields for {kind:?} / {change:?}")]
     InvalidEntryContent {
         path: String,
@@ -304,6 +319,13 @@ impl WorkspaceSnapshotManifestV1 {
             } else {
                 match entry.kind {
                     WorkspaceSnapshotEntryKindV1::File => {
+                        if entry.size > WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES as u64 {
+                            return Err(WorkspaceSnapshotValidationError::BlobTooLarge {
+                                path: entry.path.clone(),
+                                size: entry.size,
+                                maximum: WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+                            });
+                        }
                         let Some(digest) = entry.digest.as_deref() else {
                             return Err(WorkspaceSnapshotValidationError::InvalidEntryContent {
                                 path: entry.path.clone(),
@@ -693,6 +715,25 @@ mod tests {
             snapshot.validate(),
             Err(WorkspaceSnapshotValidationError::ContentRootMismatch)
         );
+    }
+
+    #[test]
+    fn rejects_file_entries_that_cannot_fit_one_recovery_upload() {
+        let mut snapshot = sample_snapshot();
+        snapshot.entries[0].size = (WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES + 1) as u64;
+        snapshot.content.total_bytes = snapshot.entries[0].size;
+        snapshot.content.content_root = snapshot.computed_content_root().unwrap();
+
+        assert!(matches!(
+            snapshot.validate(),
+            Err(WorkspaceSnapshotValidationError::BlobTooLarge {
+                ref path,
+                size,
+                maximum,
+            }) if path == "src/main.rs"
+                && size == (WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES + 1) as u64
+                && maximum == WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES
+        ));
     }
 
     #[test]

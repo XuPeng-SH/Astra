@@ -669,6 +669,7 @@ pub use astra_server_types::edge_connection_pool;
 
 #[cfg(test)]
 mod tests {
+    use crate::{AppState, ServiceInfo};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -681,7 +682,12 @@ mod tests {
         multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
-    use axum::{Json, http::StatusCode};
+    use axum::{
+        Json,
+        body::Body,
+        http::{Method, Request, StatusCode},
+    };
+    use tower::ServiceExt;
 
     #[derive(Default)]
     struct RecordingEdgeDispatchService {
@@ -882,5 +888,37 @@ mod tests {
 
         assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);
         assert_eq!(run_lifecycle.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_router_allows_workspace_blob_over_process_body_limit() {
+        let app = super::build_app(AppState::new(
+            ServiceInfo::default(),
+            Arc::new(crate::app_state::MatrixOneHealthChecker::new(
+                astra_core::MatrixOneSettings::mock(),
+            )),
+        ));
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "/v1/works/work-1/branches/branch-1/workspace-recovery-artifacts/artifact-1/chunks/{digest}"
+                    ))
+                    .header(astra_server_types::WORK_API_MAJOR_HEADER, "1")
+                    .body(Body::from(vec![
+                        0_u8;
+                        astra_runtime_env::WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES / 2
+                    ]))
+                    .expect("workspace upload request should build"),
+            )
+            .await
+            .expect("production router should return a response");
+
+        // The route-specific limit must supersede the 4 MiB process default;
+        // the unconfigured test auth service then rejects the request after
+        // the body has been extracted.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

@@ -14,10 +14,10 @@
 //! makes the integrity and materialization rules directly testable.
 
 use crate::{
-    WORKSPACE_SNAPSHOT_MANIFEST_SCHEMA_VERSION, WorkspaceSnapshotCaptureV1,
-    WorkspaceSnapshotChangeV1, WorkspaceSnapshotContentV1, WorkspaceSnapshotEntryKindV1,
-    WorkspaceSnapshotEntryV1, WorkspaceSnapshotExclusionV1, WorkspaceSnapshotManifestV1,
-    WorkspaceSnapshotRepositoryV1,
+    WORKSPACE_SNAPSHOT_MANIFEST_SCHEMA_VERSION, WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+    WorkspaceSnapshotCaptureV1, WorkspaceSnapshotChangeV1, WorkspaceSnapshotContentV1,
+    WorkspaceSnapshotEntryKindV1, WorkspaceSnapshotEntryV1, WorkspaceSnapshotExclusionV1,
+    WorkspaceSnapshotManifestV1, WorkspaceSnapshotRepositoryV1,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -172,6 +172,14 @@ pub enum WorkspaceSnapshotCaptureError {
     DuplicateBlob(String),
     #[error("snapshot contains an unreferenced content blob: {0}")]
     UnexpectedBlob(String),
+    #[error(
+        "workspace file {path} is larger than the snapshot blob limit ({maximum} bytes): {size}"
+    )]
+    BlobTooLarge {
+        path: String,
+        size: u64,
+        maximum: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,7 +551,7 @@ fn capture_workspace_path(
         if fd < 0 {
             return Err(read_path_error(relative, io::Error::last_os_error()));
         }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let file = unsafe { File::from_raw_fd(fd) };
         let mut opened_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         if unsafe { libc::fstat(fd, opened_stat.as_mut_ptr()) } != 0 {
             return Err(read_path_error(relative, io::Error::last_os_error()));
@@ -555,9 +563,23 @@ fn capture_workspace_path(
                 reason: "workspace path changed to a non-regular file".to_string(),
             });
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| read_path_error(relative, source))?;
+        let declared_size = u64::try_from(opened_stat.st_size).unwrap_or(u64::MAX);
+        if declared_size > WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES as u64 {
+            return Err(WorkspaceSnapshotCaptureError::BlobTooLarge {
+                path: relative.to_string(),
+                size: declared_size,
+                maximum: WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+            });
+        }
+        let bytes =
+            read_blob_with_limit(file).map_err(|source| read_path_error(relative, source))?;
+        if bytes.len() > WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES {
+            return Err(WorkspaceSnapshotCaptureError::BlobTooLarge {
+                path: relative.to_string(),
+                size: bytes.len() as u64,
+                maximum: WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+            });
+        }
         return Ok(WorkspacePathContent::File {
             mode: mode_bits(opened_stat.st_mode),
             bytes,
@@ -568,6 +590,16 @@ fn capture_workspace_path(
     } else {
         Ok(WorkspacePathContent::Special)
     }
+}
+
+/// Read at most one byte past the supported blob size. The extra byte lets
+/// callers distinguish an exact-limit file from one that grew during capture
+/// without allowing a concurrent growth race to allocate without a bound.
+fn read_blob_with_limit(reader: impl Read) -> io::Result<Vec<u8>> {
+    let limit = (WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES as u64).saturating_add(1);
+    let mut bytes = Vec::new();
+    reader.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(not(unix))]
@@ -967,6 +999,13 @@ fn capture_entries(
                 });
             }
             WorkspacePathContent::File { mode, bytes } => {
+                if bytes.len() > WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES {
+                    return Err(WorkspaceSnapshotCaptureError::BlobTooLarge {
+                        path: path.clone(),
+                        size: bytes.len() as u64,
+                        maximum: WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+                    });
+                }
                 let digest = content_digest(&bytes);
                 captured.push(CapturedEntry {
                     entry: WorkspaceSnapshotEntryV1 {
@@ -1544,6 +1583,44 @@ mod tests {
         assert!(package.manifest.entries.iter().any(|entry| {
             entry.path == "new.txt" && entry.change == WorkspaceSnapshotChangeV1::Added
         }));
+    }
+
+    #[test]
+    fn rejects_a_file_larger_than_the_uploadable_blob_limit() {
+        let dir = repository();
+        fs::write(
+            dir.path().join("large.bin"),
+            vec![b'x'; WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES + 1],
+        )
+        .expect("large file");
+        git(dir.path(), &["add", "large.bin"]);
+
+        let error = capture_git_worktree(
+            dir.path(),
+            &WorkspaceSnapshotCaptureOptions::new("snapshot-large", "workspace-large"),
+        )
+        .expect_err("oversized file must be rejected before upload");
+        assert!(matches!(
+            error,
+            WorkspaceSnapshotCaptureError::BlobTooLarge {
+                ref path,
+                size,
+                maximum,
+            } if path == "large.bin"
+                && size == (WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES + 1) as u64
+                && maximum == WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES
+        ));
+    }
+
+    #[test]
+    fn bounded_blob_read_stops_after_one_byte_over_the_limit() {
+        let bytes = read_blob_with_limit(std::io::Cursor::new(vec![
+            b'x';
+            WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES
+                + 1024
+        ]))
+        .expect("bounded read");
+        assert_eq!(bytes.len(), WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES + 1);
     }
 
     #[test]

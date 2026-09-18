@@ -98,6 +98,7 @@ export function WorkExecutionCard({
   const [operation, setOperation] = useState<WorkExecutionSwitchOperationV1 | null>(null);
   const [controllerReady, setControllerReady] = useState(attachment?.mode === "controller");
   const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<"move" | "resume" | "check" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const operationGeneration = useRef(0);
@@ -187,6 +188,7 @@ export function WorkExecutionCard({
     setTargetsLoading(false);
     setOperation(null);
     setBusy(false);
+    setBusyAction(null);
     setRefreshing(false);
     setControllerReady(attachment?.mode === "controller");
     setError(null);
@@ -336,6 +338,7 @@ export function WorkExecutionCard({
     const generation = operationGeneration.current + 1;
     operationGeneration.current = generation;
     setBusy(true);
+    setBusyAction("move");
     setError(null);
     try {
       if (!(await ensureController(generation))) return;
@@ -389,7 +392,10 @@ export function WorkExecutionCard({
         setError("The device change could not be confirmed. Its state is safe to check again.");
       }
     } finally {
-      if (mounted.current && operationGeneration.current === generation) setBusy(false);
+      if (mounted.current && operationGeneration.current === generation) {
+        setBusy(false);
+        setBusyAction(null);
+      }
     }
   }
 
@@ -397,13 +403,17 @@ export function WorkExecutionCard({
     if (
       busy ||
       !operation ||
-      operation.state !== "failed" ||
-      !attachment?.attachment_id
+      (operation.state !== "failed" && operation.state !== "switching")
     )
       return;
+    if (!attachment?.attachment_id) {
+      setError("Take control of this Work here before resuming its device change.");
+      return;
+    }
     const generation = operationGeneration.current + 1;
     operationGeneration.current = generation;
     setBusy(true);
+    setBusyAction("resume");
     setError(null);
     try {
       if (!(await ensureController(generation))) return;
@@ -447,7 +457,10 @@ export function WorkExecutionCard({
         setError("The retry could not be confirmed. The previous result remains available.");
       }
     } finally {
-      if (mounted.current && operationGeneration.current === generation) setBusy(false);
+      if (mounted.current && operationGeneration.current === generation) {
+        setBusy(false);
+        setBusyAction(null);
+      }
     }
   }
 
@@ -459,6 +472,7 @@ export function WorkExecutionCard({
     const generation = operationGeneration.current + 1;
     operationGeneration.current = generation;
     setBusy(true);
+    setBusyAction("check");
     setError(null);
     try {
       const result = await observeWorkExecutionSwitchAction({
@@ -488,7 +502,10 @@ export function WorkExecutionCard({
         setError("The device change is still recorded. Check again when the target is online.");
       }
     } finally {
-      if (mounted.current && operationGeneration.current === generation) setBusy(false);
+      if (mounted.current && operationGeneration.current === generation) {
+        setBusy(false);
+        setBusyAction(null);
+      }
     }
   }
 
@@ -542,24 +559,24 @@ export function WorkExecutionCard({
                 </span>
               ) : (
                 <span className="text-text-muted">
-                  You can leave this page. The recorded device change can be checked again later.
+                  The device change is recorded. Check its status, or resume it here if the
+                  original device handler stopped.
                 </span>
               )}
-              <Button
-                size="sm"
-                onClick={() =>
-                  void (operation.state === "switching" ? checkSwitch() : retryMove())
-                }
-                disabled={busy}
-              >
-                {busy
-                  ? operation.state === "switching"
-                    ? "Checking…"
-                    : "Trying again…"
-                  : operation.state === "switching"
-                    ? "Check device change"
-                    : "Try device change again"}
-              </Button>
+              {operation.state === "switching" ? (
+                <>
+                  <Button size="sm" variant="ghost" onClick={() => void checkSwitch()} disabled={busy}>
+                    {busyAction === "check" ? "Checking…" : "Check device change"}
+                  </Button>
+                  <Button size="sm" onClick={() => void retryMove()} disabled={busy}>
+                    {busyAction === "resume" ? "Resuming…" : "Resume device change"}
+                  </Button>
+                </>
+              ) : (
+                <Button size="sm" onClick={() => void retryMove()} disabled={busy}>
+                  {busyAction === "resume" ? "Trying again…" : "Try device change again"}
+                </Button>
+              )}
             </div>
           ) : null}
         </div>
