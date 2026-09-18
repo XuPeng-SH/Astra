@@ -1165,6 +1165,7 @@ struct BlockingLeaseEdgeRegistry {
     registration_started: Notify,
     release_registration: Notify,
     claim_release_started: Notify,
+    claim_release_dropped: Notify,
     claim_release_gate: Notify,
     rollback_count: AtomicUsize,
     release_attempts: AtomicUsize,
@@ -1179,11 +1180,12 @@ struct BlockingLeaseEdgeRegistry {
     unregister_completed: Notify,
 }
 
-struct ReleaseDropSentinel<'a>(&'a AtomicUsize);
+struct ReleaseDropSentinel<'a>(&'a AtomicUsize, &'a Notify);
 
 impl Drop for ReleaseDropSentinel<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 
@@ -1214,6 +1216,7 @@ impl BlockingLeaseEdgeRegistry {
             registration_started: Notify::new(),
             release_registration: Notify::new(),
             claim_release_started: Notify::new(),
+            claim_release_dropped: Notify::new(),
             claim_release_gate: Notify::new(),
             rollback_count: AtomicUsize::new(0),
             release_attempts: AtomicUsize::new(0),
@@ -1296,7 +1299,7 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
             None => None,
         };
         self.active_releases.fetch_add(1, Ordering::SeqCst);
-        let _sentinel = ReleaseDropSentinel(&self.active_releases);
+        let _sentinel = ReleaseDropSentinel(&self.active_releases, &self.claim_release_dropped);
         self.claim_release_started.notify_one();
         if self.block_every_release || (self.block_first_release && attempt == 0) {
             self.claim_release_gate.notified().await;
@@ -1557,7 +1560,16 @@ async fn pending_release_disconnect(wait_for_heartbeat: bool, live_pool: Option<
         // fresh pending publication attempt just before heartbeat is due.
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
+        // Advancing the clock only wakes timers; one yield does not guarantee
+        // that the publication task has processed its timeout. Observe its
+        // drop before jumping again, or the retry delay can start at t=29 and
+        // race the heartbeat instead of holding the resource ahead of it.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.claim_release_dropped.notified(),
+        )
+        .await
+        .expect("first publication attempt timed out before advancing to retry");
         tokio::time::advance(std::time::Duration::from_secs(24)).await;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),

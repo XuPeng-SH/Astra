@@ -1710,7 +1710,10 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
-    let child_request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    // This includes two parent rounds plus child admission before the first
+    // edge request. Keep it bounded, but allow the same 10s budget as the
+    // child completion below when CI is running another E2E concurrently.
+    let child_request = wait_for_sse(&mut rx, "tool_request", 10).await;
     assert_eq!(child_request["tool"], "read_file");
     assert_eq!(child_request["request_id"], "call-child-read-file");
     assert_eq!(

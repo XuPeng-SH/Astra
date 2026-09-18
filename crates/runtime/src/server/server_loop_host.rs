@@ -17446,6 +17446,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
     }
 
+    async fn hydrate_restored_history(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        // Mock rounds previously returned before the provider recovery gate.
+        // They do not own durable provider attempts, including after exhaustion.
+        #[cfg(feature = "e2e-hooks")]
+        if self.test_llm_rounds_wired {
+            return Ok(());
+        }
+        self.hydrate_provider_canonical_transitions(state).await
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -17505,16 +17518,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 });
             }
         }
-
-        // This is the single recovery gate shared by background and SSE run
-        // lifecycles: both have completed history restoration before the host
-        // can execute a real turn. The service first recovers expired
-        // pre-delivery owners and rejects every live or delivery-unknown old
-        // invocation. Run-generation fencing stops future old admissions, but
-        // only this delivery boundary prevents a duplicate after an already
-        // authorized HTTP request. Failure precedes model resolution,
-        // provider-attempt admission, and all new HTTP I/O.
-        self.hydrate_provider_canonical_transitions(state).await?;
 
         // Reconcile a fast semantic preflight before the primary request so
         // its typed optional capabilities (for example `agent_fanout`) are
@@ -41160,6 +41163,26 @@ mod tests {
         assert_eq!(state.final_text.trim(), "Hello from server");
         assert_eq!(state.total_prompt, 100);
         assert_eq!(state.total_completion, 50);
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn mock_llm_history_hydration_never_enters_provider_wal_gate() {
+        for rounds in [Vec::new(), vec![json!({"text": "mock"})]] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".into(),
+                "s".into(),
+            )
+            .with_test_llm_rounds(rounds)
+            .build();
+            let mut state = create_test_state();
+            host.hydrate_restored_history(&mut state).await.unwrap();
+            // Even the no-pool branch of the real WAL gate sets this flag.
+            assert!(!host.canonical_transition_hydrated);
+            assert!(state.provider_canonical_wal_base.is_none());
+        }
     }
 
     #[tokio::test]

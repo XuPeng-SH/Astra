@@ -2327,6 +2327,20 @@ async fn deferred_settlement_does_not_consume_another_users_bounded_batch_slot()
     .await
     .expect("defer one owner's retry eligibility");
 
+    // The sweeper is global: other tests can leave eligible settlement debt
+    // in this lane's shared database. Give only our eligible fixture priority
+    // so a one-row batch tests retry eligibility, not unrelated backlog order.
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts
+         SET next_retry_at = '2000-01-01 00:00:00.000000'
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plans[1].invocation_id())
+    .execute(pool)
+    .await
+    .expect("prioritize this test's eligible settlement");
+
     assert_eq!(
         reconcile_inference_settlements(&shared_pool, 1)
             .await
@@ -2343,6 +2357,7 @@ async fn deferred_settlement_does_not_consume_another_users_bounded_batch_slot()
     .fetch_all(pool)
     .await
     .expect("load deferred fairness outcomes");
+    assert_eq!(statuses.len(), 2);
     for row in statuses {
         let invocation_id = row.get::<String, _>("invocation_id");
         let expected = if invocation_id == plans[0].invocation_id() {

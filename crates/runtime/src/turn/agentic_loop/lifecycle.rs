@@ -3221,7 +3221,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
     turn_index: usize,
-) -> Result<PreparedTurnIteration, String> {
+) -> Result<PreparedTurnIteration, astra_core::ClassifiedError> {
     let quiet = host.is_quiet();
 
     // Outer loop: re-evaluate pause/cancel state until we either get
@@ -3441,7 +3441,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             return Err(format!(
                 "{} (budget: {} turns)",
                 CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns
-            ));
+            )
+            .into());
         }
     }
 
@@ -3518,9 +3519,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             return Err(format!(
                 "Rate limit cooldown active ({}). Resets in ~{secs}s. Please wait and retry.",
                 reason.as_str(),
-            ));
+            )
+            .into());
         }
     }
+
+    // Preserve cancellation, pause and no-round exits before touching the WAL.
+    // Recovery must still precede semantic admission and resume compaction.
+    // Durable hosts make repeated calls a no-op once recovery succeeds.
+    host.hydrate_restored_history(state).await?;
 
     state.charged_iterations = state
         .charged_iterations
@@ -3620,7 +3627,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 if host.requires_turn_intent_decision() {
                     return Err(
                         "semantic task admission is temporarily unavailable; primary execution was not started, so retrying cannot bypass the canonical Work lifecycle"
-                            .to_string(),
+                            .to_string().into(),
                     );
                 }
                 tracing::debug!(
@@ -4305,7 +4312,7 @@ mod tests {
                 ));
             } else {
                 assert!(
-                    matches!(result, Err(ref error) if error == "execution iteration accounting overflow")
+                    matches!(result, Err(ref error) if error.message == "execution iteration accounting overflow")
                 );
             }
             assert_eq!((state.charged_iterations, state.remaining_turns), before);
@@ -6800,7 +6807,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("semantic task admission is temporarily unavailable"));
+        assert!(
+            error
+                .to_string()
+                .contains("semantic task admission is temporarily unavailable")
+        );
         assert_eq!(
             host.turn_count(),
             0,
