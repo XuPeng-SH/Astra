@@ -219,6 +219,389 @@ async fn append_run_control_event(
     tx.commit().await.expect("commit inference control event");
 }
 
+async fn hold_pool_checkouts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    count: usize,
+) -> Vec<sqlx::pool::PoolConnection<sqlx::MySql>> {
+    let mut held = Vec::with_capacity(count);
+    for _ in 0..count {
+        held.push(
+            tokio::time::timeout(std::time::Duration::from_secs(5), pool.acquire())
+                .await
+                .expect("acquire inference cancellation fixture before deadline")
+                .expect("acquire inference cancellation fixture"),
+        );
+    }
+    held
+}
+
+async fn assert_independent_query_can_replace_cancelled_checkout(pool: &sqlx::Pool<sqlx::MySql>) {
+    let value: i64 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query_scalar("SELECT 1").fetch_one(pool),
+    )
+    .await
+    .expect("cancelled inference checkout must release pool capacity")
+    .expect("independent inference query after cancellation");
+    assert_eq!(value, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn cancelled_inference_recovery_and_settlement_close_their_physical_checkouts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("inference-cancel-user-{suffix}");
+    let session_id = format!("inference-cancel-session-{suffix}");
+    let run_id = format!("inference-cancel-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let admitted = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "cancelled_settlement",
+    ))
+    .expect("plan cancelled settlement fixture");
+    admit_inference_invocation(&shared_pool, &admitted)
+        .await
+        .expect("admit cancelled settlement fixture");
+    let uncertain = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        1,
+        "cancelled_admission_recovery",
+    ))
+    .expect("plan cancelled admission recovery fixture");
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("cancel the blocked persistence fixture".to_string()),
+    };
+    let max_connections = shared_pool.stats().max_connections as usize;
+    assert!(
+        max_connections >= 3,
+        "cancellation isolation requires blocker, worker, and health-query capacity"
+    );
+
+    let mut lifecycle_blocker = pool.begin().await.expect("begin lifecycle blocker");
+    sqlx::query(
+        "SELECT session_id FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *lifecycle_blocker)
+    .await
+    .expect("lock lifecycle fence");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            settle_uncertain_inference_admission(&shared_pool, &uncertain, &terminal),
+        )
+        .await
+        .is_err(),
+        "lifecycle-fence recovery must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    lifecycle_blocker
+        .rollback()
+        .await
+        .expect("release lifecycle blocker");
+
+    let mut settlement_blocker = pool.begin().await.expect("begin settlement blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(&mut *settlement_blocker)
+    .await
+    .expect("lock inference invocation settlement row");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            declare_inference_settlement(&shared_pool, &admitted, &terminal),
+        )
+        .await
+        .is_err(),
+        "settlement debt write must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    settlement_blocker
+        .rollback()
+        .await
+        .expect("release settlement blocker");
+
+    finish_inference_invocation(&shared_pool, &admitted, &terminal)
+        .await
+        .expect("finish cancellation-safe terminal fixture");
+    sqlx::query(
+        "INSERT INTO inference_invocation_settlement_debts
+         (user_id, invocation_id, session_id, harness_run_id,
+          terminal_status, terminal_fingerprint, usage_status,
+          provider_delivery_state)
+         SELECT user_id, invocation_id, session_id, harness_run_id,
+                status, terminal_fingerprint, usage_status,
+                provider_delivery_state
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .execute(pool)
+    .await
+    .expect("seed matching terminal cleanup debt");
+    let mut terminal_cleanup_blocker = pool.begin().await.expect("begin terminal cleanup blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(&mut *terminal_cleanup_blocker)
+    .await
+    .expect("lock matching terminal cleanup debt");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            finish_inference_invocation(&shared_pool, &admitted, &terminal),
+        )
+        .await
+        .is_err(),
+        "idempotent terminal debt cleanup must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    terminal_cleanup_blocker
+        .rollback()
+        .await
+        .expect("release terminal cleanup blocker");
+    finish_inference_invocation(&shared_pool, &admitted, &terminal)
+        .await
+        .expect("retry exact terminal cleanup after cancellation");
+    let terminal_cleanup_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count terminal cleanup debts after exact replay");
+    assert_eq!(terminal_cleanup_debts, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn cancelled_provider_attempt_persistence_closes_its_physical_checkouts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("provider-attempt-cancel-user-{suffix}");
+    let session_id = format!("provider-attempt-cancel-session-{suffix}");
+    let run_id = format!("provider-attempt-cancel-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let max_connections = shared_pool.stats().max_connections as usize;
+    assert!(
+        max_connections >= 3,
+        "provider-attempt cancellation isolation requires blocker, worker, and health-query capacity"
+    );
+
+    let admission_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "cancelled_provider_attempt_admission",
+    ))
+    .expect("plan cancelled provider attempt admission fixture");
+    admit_inference_invocation(&shared_pool, &admission_plan)
+        .await
+        .expect("admit cancelled provider attempt admission fixture");
+    let admission_attempt = provider_attempt(&admission_plan, 0);
+    let mut admission_blocker = pool.begin().await.expect("begin attempt admission blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(admission_plan.invocation_id())
+    .fetch_one(&mut *admission_blocker)
+    .await
+    .expect("lock provider attempt admission invocation");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            begin_inference_provider_attempt(&shared_pool, &admission_attempt),
+        )
+        .await
+        .is_err(),
+        "provider attempt admission must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    admission_blocker
+        .rollback()
+        .await
+        .expect("release provider attempt admission blocker");
+    begin_inference_provider_attempt(&shared_pool, &admission_attempt)
+        .await
+        .expect("retry provider attempt admission after cancellation");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &admission_attempt)
+            .await
+            .expect_err("exact attempt admission replay must forbid duplicate provider delivery")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
+    let success_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        1,
+        "cancelled_combined_successful_settlement",
+    ))
+    .expect("plan cancelled combined successful settlement fixture");
+    admit_inference_invocation(&shared_pool, &success_plan)
+        .await
+        .expect("admit cancelled combined successful settlement fixture");
+    let success_attempt = provider_attempt(&success_plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &success_attempt)
+        .await
+        .expect("begin combined successful settlement attempt");
+    let success_terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage::default(),
+        Some("provider-cancellation-success".to_string()),
+    );
+    let mut success_blocker = pool
+        .begin()
+        .await
+        .expect("begin combined settlement blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(success_plan.invocation_id())
+    .fetch_one(&mut *success_blocker)
+    .await
+    .expect("lock combined successful settlement invocation");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            finish_successful_inference_provider_attempt_and_invocation(
+                &shared_pool,
+                &success_plan,
+                &success_attempt,
+                &success_terminal,
+            ),
+        )
+        .await
+        .is_err(),
+        "combined successful settlement must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    success_blocker
+        .rollback()
+        .await
+        .expect("release combined successful settlement blocker");
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &success_plan,
+        &success_attempt,
+        &success_terminal,
+    )
+    .await
+    .expect("retry combined successful settlement after cancellation");
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &success_plan,
+        &success_attempt,
+        &success_terminal,
+    )
+    .await
+    .expect("exact combined successful settlement replay remains idempotent");
+
+    let failure_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        2,
+        "cancelled_failed_provider_terminal",
+    ))
+    .expect("plan cancelled failed provider terminal fixture");
+    admit_inference_invocation(&shared_pool, &failure_plan)
+        .await
+        .expect("admit cancelled failed provider terminal fixture");
+    let failure_attempt = provider_attempt(&failure_plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &failure_attempt)
+        .await
+        .expect("begin failed provider terminal attempt");
+    let failure_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("provider_failed".to_string()),
+        error_message: Some("cancel the blocked failed terminal fixture".to_string()),
+    };
+    let mut failure_blocker = pool.begin().await.expect("begin failed terminal blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(failure_plan.invocation_id())
+    .fetch_one(&mut *failure_blocker)
+    .await
+    .expect("lock failed provider terminal invocation");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            finish_inference_provider_attempt(&shared_pool, &failure_attempt, &failure_terminal,),
+        )
+        .await
+        .is_err(),
+        "failed provider terminal must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    failure_blocker
+        .rollback()
+        .await
+        .expect("release failed provider terminal blocker");
+    finish_inference_provider_attempt(&shared_pool, &failure_attempt, &failure_terminal)
+        .await
+        .expect("retry failed provider terminal after cancellation");
+    finish_inference_provider_attempt(&shared_pool, &failure_attempt, &failure_terminal)
+        .await
+        .expect("exact failed provider terminal replay remains idempotent");
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -5568,6 +5951,33 @@ async fn combined_successful_settlement_commits_exact_terminal() {
     )
     .await
     .expect("commit combined physical and logical success");
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+    )
+    .await
+    .expect("exact combined physical and logical success replay is idempotent");
+    let conflicting_terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("different-combined-success-response".to_string()),
+    );
+    assert_eq!(
+        finish_successful_inference_provider_attempt_and_invocation(
+            &shared_pool,
+            &plan,
+            &attempt,
+            &conflicting_terminal,
+        )
+        .await
+        .expect_err("conflicting combined success replay must fail closed")
+        .kind,
+        ServiceErrorKind::Conflict
+    );
 
     let persisted = sqlx::query(
         "SELECT invocation.status AS invocation_status,
