@@ -977,6 +977,10 @@ pub struct ChatRequestData {
     pub session_admission_facts: Option<SessionAdmissionFacts>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
+    /// Trusted metadata for a generic evaluation trial.  It is injected by
+    /// the evaluation entrypoint and never deserialized from ordinary chat
+    /// transports or added to the model prompt.
+    pub evaluation_admission: Option<crate::evaluation::EvaluationRunAdmission>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
@@ -1068,6 +1072,13 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("work_binding", &self.work_binding)
             .field("run_start_idempotency", &self.run_start_idempotency)
+            .field(
+                "evaluation_admission",
+                &self
+                    .evaluation_admission
+                    .as_ref()
+                    .map(|admission| (&admission.experiment_id, &admission.trial_id)),
+            )
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
             .field("model_selection_mode", &self.model_selection_mode)
@@ -36473,6 +36484,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             agent_id: None,
             model: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
@@ -36570,6 +36582,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             agent_id: None,
             model: Some("gpt-4".to_string()),
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
@@ -36690,6 +36703,7 @@ mod tests {
                     session_admission_facts: None,
                     work_binding: None,
                     run_start_idempotency: None,
+                    evaluation_admission: None,
                     agent_id: None,
                     model: None,
                     model_selection_mode: ModelSelectionMode::ExplicitOffering,

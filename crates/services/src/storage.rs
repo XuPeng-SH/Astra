@@ -3850,6 +3850,63 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE evaluation_materialization_receipts ADD UNIQUE INDEX uq_eval_materialization_idempotency (owner_user_id, idempotency_key)",
     )
     .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_trial_observations",
+        "CREATE TABLE IF NOT EXISTS evaluation_trial_observations (
+            schema_version INT NOT NULL DEFAULT 1,
+            owner_user_id VARCHAR(128) NOT NULL,
+            observation_id VARCHAR(64) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            execution_run_id VARCHAR(128) NOT NULL,
+            execution_run_generation BIGINT NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            observation_json LONGTEXT NOT NULL,
+            materialization_receipt_ids_json TEXT NOT NULL,
+            request_fingerprint VARCHAR(128) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, observation_id),
+            UNIQUE KEY uq_eval_observation_trial (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_observation_idempotency (owner_user_id, idempotency_key),
+            INDEX idx_eval_observation_owner_experiment
+                (owner_user_id, experiment_id, created_at, observation_id),
+            INDEX idx_eval_observation_owner_run
+                (owner_user_id, execution_run_id, execution_run_generation)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_trial_observations",
+        "uq_eval_observation_trial",
+        &["owner_user_id", "trial_id"],
+        "ALTER TABLE evaluation_trial_observations ADD UNIQUE INDEX uq_eval_observation_trial (owner_user_id, trial_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_trial_observations",
+        "uq_eval_observation_idempotency",
+        &["owner_user_id", "idempotency_key"],
+        "ALTER TABLE evaluation_trial_observations ADD UNIQUE INDEX uq_eval_observation_idempotency (owner_user_id, idempotency_key)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_trial_observations",
+        "idx_eval_observation_owner_experiment",
+        &["owner_user_id", "experiment_id", "created_at", "observation_id"],
+        "ALTER TABLE evaluation_trial_observations ADD INDEX idx_eval_observation_owner_experiment (owner_user_id, experiment_id, created_at, observation_id)",
+    )
+    .await?;
 
     core_schema_create!(
         pool,

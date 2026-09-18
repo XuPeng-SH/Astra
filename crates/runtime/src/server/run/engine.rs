@@ -7470,6 +7470,7 @@ mod tests {
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
+            evaluation_admission: None,
             full_llm_capture: false,
             agent_id: None,
             model: None,
