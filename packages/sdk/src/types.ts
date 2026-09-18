@@ -56,6 +56,8 @@ export type StreamEventType =
   | "agent_interrupted"
   | "task_board_snapshot"
   | "tool_approval_request"
+  | "approval_required"
+  | "user_prompt_required"
   | "ping"
   | "device_revoked"
   | "device_lease_expired"
@@ -728,6 +730,29 @@ export type ToolApprovalRequestEvent = {
   args: Record<string, unknown>;
 };
 
+/** A durable approval gate projected onto a Work stream.  The public Work
+ * surface intentionally omits the backing Session identity; `request_id`
+ * plus the public Work branch identifies the interaction. */
+export type ApprovalRequiredEvent = {
+  type: "approval_required";
+  request_id: string;
+  tool: string;
+  approval_kind: "standard" | "explicit";
+  path?: string;
+  detail?: string;
+  display_label?: string;
+  run_id?: string;
+};
+
+/** A durable ask-user gate projected onto a Work stream.  The prompt is kept
+ * as an opaque canonical payload and validated by the server when answered. */
+export type UserPromptRequiredEvent = {
+  type: "user_prompt_required";
+  request_id: string;
+  prompt: unknown;
+  run_id?: string;
+};
+
 export type PingEvent = {
   type: "ping";
   run_id?: string;
@@ -816,6 +841,8 @@ export type StreamEvent = (
   | ToolTransportFailedEvent
   | RunBlockedEvent
   | ToolApprovalRequestEvent
+  | ApprovalRequiredEvent
+  | UserPromptRequiredEvent
   | PingEvent
   | DeviceLeaseEndedEvent
   | ToolExecutionStartedEvent
@@ -1791,6 +1818,64 @@ export type WorkTurnInput = {
   message: string;
 };
 
+export type WorkInteractionKindV1 = "approval" | "user_prompt";
+export type WorkApprovalDecisionV1 = "allow" | "deny";
+
+export type WorkBranchInteractionV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  run_id: string;
+  request_id: string;
+  kind: WorkInteractionKindV1;
+  tool?: string;
+  approval_kind?: "standard" | "explicit" | string;
+  path?: string;
+  detail?: string;
+  display_label?: string;
+  prompt?: unknown;
+};
+
+export type WorkBranchInteractionPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  interactions: WorkBranchInteractionV1[];
+};
+
+export type WorkBranchInteractionResponseInputV1 = {
+  attachmentId: string;
+  runId: string;
+  requestId: string;
+  response:
+    | {
+        kind: "approval";
+        decision: WorkApprovalDecisionV1;
+        reason?: string;
+      }
+    | {
+        kind: "user_prompt";
+        cancelled: boolean;
+        answers?: unknown;
+      };
+};
+
+export type WorkInteractionResolutionOutcomeV1 =
+  | "resolved"
+  | "idempotent"
+  | "queued"
+  | "authority_lost"
+  | "superseded";
+
+export type WorkBranchInteractionReceiptV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  run_id: string;
+  request_id: string;
+  outcome: WorkInteractionResolutionOutcomeV1;
+};
+
 export type WorkContentHash = `sha256:${string}`;
 export type WorkRetentionState = "active" | "archived";
 export type WorkRevisionAlignment = "current" | "behind";
@@ -2024,6 +2109,198 @@ export type WorkExecutionSwitchOperationV1 = {
   failure_code: string | null;
 };
 
+export type WorkRecoveryPointReasonV1 =
+  | "user_requested"
+  | "before_environment_change"
+  | "run_settled"
+  | "safe_boundary";
+
+export type WorkRecoveryPointStatusV1 =
+  | "preparing"
+  | "captured"
+  | "ready"
+  | "failed"
+  | "aborted";
+
+export type WorkRecoveryPointCoverageV1 = {
+  session_state: boolean;
+  work_state: boolean;
+  workspace: boolean;
+  run_frontier: boolean;
+  artifacts: boolean;
+};
+
+export type WorkRecoveryPointCapabilitiesV1 = {
+  can_restore_conversation: boolean;
+  can_continue_in_original_environment: boolean;
+  has_portable_workspace: boolean;
+  requires_target_environment_check: boolean;
+  requires_effect_review: boolean;
+};
+
+export type WorkRecoveryPointSessionCursorV1 = {
+  completed_turn: number;
+  journal_event_seq: number;
+  conversation_seq: number;
+  canonical_root_hash: string;
+  compaction_generation: number;
+};
+
+export type WorkRecoveryPointExecutionV1 = {
+  placement: WorkExecutionPlacementV1;
+  executor_id: string;
+  binding_generation: number;
+};
+
+export type WorkRecoveryPointWorkspaceV1 = {
+  snapshot_id: string;
+  logical_workspace_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  byte_size: number;
+  complete: boolean;
+  artifact_id: string;
+  artifact_type: string;
+  content_digest: WorkContentHash;
+};
+
+export type WorkRecoveryPointArtifactV1 = {
+  artifact_id: string;
+  artifact_type: string;
+  digest: WorkContentHash;
+  location_ref: string | null;
+};
+
+export type WorkRecoveryPointV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  recovery_point_id: string;
+  request_id: string;
+  status: WorkRecoveryPointStatusV1;
+  reason: WorkRecoveryPointReasonV1;
+  created_at: string;
+  updated_at: string;
+  manifest_hash: WorkContentHash;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  goal_revision: number;
+  criteria_set_revision: number;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+  execution: WorkRecoveryPointExecutionV1;
+  workspace: WorkRecoveryPointWorkspaceV1 | null;
+  artifacts: WorkRecoveryPointArtifactV1[];
+  coverage: WorkRecoveryPointCoverageV1;
+  capabilities: WorkRecoveryPointCapabilitiesV1;
+};
+
+export type WorkRecoveryPointCaptureInputV1 = {
+  requestId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+  reason?: WorkRecoveryPointReasonV1;
+  workspaceArtifactId?: string;
+};
+
+export type WorkWorkspaceRecoveryBasisExpectationV1 = {
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+};
+
+export type WorkWorkspaceRecoveryBasisV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  logical_workspace_id: string;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+};
+
+export type WorkWorkspaceRecoveryArtifactBeginInputV1 = {
+  requestId: string;
+  basis: WorkWorkspaceRecoveryBasisExpectationV1;
+  snapshotManifest: Record<string, unknown>;
+  contentDigest: WorkContentHash;
+  byteSize: number;
+  chunkCount: number;
+};
+
+export type WorkWorkspaceRecoveryChunkV1 = {
+  chunk_index: number;
+  digest: WorkContentHash;
+  byte_size: number;
+};
+
+export type WorkWorkspaceRecoveryArtifactSealInputV1 = {
+  chunks: WorkWorkspaceRecoveryChunkV1[];
+};
+
+export type WorkWorkspaceRecoveryArtifactV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  artifact_id: string;
+  sealed: boolean;
+  verified: boolean;
+  snapshot_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  content_digest: WorkContentHash;
+  byte_size: number;
+  chunk_count: number;
+  snapshot_manifest: Record<string, unknown>;
+  blobs: WorkWorkspaceRecoveryBlobV1[];
+};
+
+export type WorkWorkspaceRecoveryPackageV1 = {
+  artifact: WorkWorkspaceRecoveryArtifactV1;
+  blobs: Array<WorkWorkspaceRecoveryBlobV1 & { bytes: Uint8Array }>;
+};
+
+/** Controls cold workspace package downloads without flooding the runtime. */
+export type WorkWorkspaceRecoveryDownloadOptionsV1 = {
+  /** Maximum number of blob requests in flight. Defaults to four. */
+  concurrency?: number;
+  /** Abort queued and in-flight blob requests. */
+  signal?: AbortSignal;
+};
+
+export type WorkWorkspaceRecoveryChunkReceiptV1 = {
+  schema_version: 1;
+  artifact_id: string;
+  digest: WorkContentHash;
+  byte_size: number;
+  inserted: boolean;
+};
+
+export type WorkWorkspaceRecoveryBlobV1 = {
+  chunk_index: number;
+  blob_ref: string;
+  digest: WorkContentHash;
+  byte_size: number;
+};
+
+export type WorkRecoveryPointCursorV1 = {
+  created_at: string;
+  recovery_point_id: string;
+};
+
+export type WorkRecoveryPointPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  points: WorkRecoveryPointV1[];
+  next_cursor: WorkRecoveryPointCursorV1 | null;
+};
+
 export type WorkCatalogCursorV1 = {
   created_at: string;
   work_id: string;
@@ -2108,6 +2385,14 @@ export type WorkBranchAttachmentV1 = {
   attached_at: string;
   expires_at: string;
 };
+
+export type WorkAttachmentSurface =
+  | "cli"
+  | "tui"
+  | "web"
+  | "app"
+  | "server"
+  | "edge";
 
 export type WorkBranchControlBasisV1 = {
   writer_epoch: number;
@@ -2573,6 +2858,7 @@ export type WorkEventKind =
   | "run_delegated"
   | "run_failed"
   | "run_cancelled"
+  | "recovery_point_captured"
   | "runtime_events_expired";
 
 export type WorkEventRecordV1 = {
@@ -2921,6 +3207,36 @@ export type WorkApiErrorV1 = {
     | "work_attachment_capacity"
     | "attachment_fenced"
     | "attachment_in_use"
+    | "invalid_recovery_point_request"
+    | "invalid_recovery_point_query"
+    | "invalid_recovery_point_cursor"
+    | "invalid_recovery_point_id"
+    | "recovery_point_unavailable"
+    | "recovery_point_not_found"
+    | "recovery_point_request_conflict"
+    | "recovery_point_identity_conflict"
+    | "recovery_point_session_unavailable"
+    | "recovery_point_repair_required"
+    | "recovery_point_run_active"
+    | "recovery_point_turn_active"
+    | "recovery_point_effect_unresolved"
+    | "recovery_point_execution_changing"
+    | "recovery_point_basis_changed"
+    | "recovery_point_verification_unavailable"
+    | "invalid_workspace_recovery_artifact"
+    | "invalid_workspace_recovery_artifact_id"
+    | "invalid_workspace_recovery_artifact_request"
+    | "invalid_workspace_recovery_chunk"
+    | "invalid_workspace_recovery_seal_request"
+    | "invalid_workspace_snapshot_manifest"
+    | "workspace_recovery_artifact_conflict"
+    | "workspace_recovery_artifact_not_found"
+    | "workspace_recovery_artifact_not_sealed"
+    | "workspace_recovery_artifact_unavailable"
+    | "workspace_recovery_basis_mismatch"
+    | "workspace_recovery_basis_unavailable"
+    | "workspace_recovery_chunk_not_found"
+    | "workspace_recovery_package_invalid"
     | "control_operation_terminal"
     | "control_operation_not_found"
     | "control_operation_unavailable"
@@ -2940,6 +3256,7 @@ export type WorkApiErrorV1 = {
     | "retry_read"
     | "retry_write"
     | "retry_attach"
+    | "review_effects"
   )[];
   request_id?: string;
 };

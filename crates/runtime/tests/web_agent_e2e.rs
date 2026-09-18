@@ -1293,7 +1293,7 @@ struct ApprovalIdentity {
 }
 
 async fn wait_for_approval_identity(rx: &mut mpsc::UnboundedReceiver<Value>) -> ApprovalIdentity {
-    let session_info = wait_for_sse(rx, "session_info", 5).await;
+    let session_info = wait_for_sse(rx, "session_info", E2E_WAIT_TIMEOUT_SECS).await;
     ApprovalIdentity {
         session_id: session_info
             .get("session_id")
@@ -1858,6 +1858,10 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+// Model, tool, and status setup can legitimately exceed a cold CI scheduler slice.
+// Keep integration waits bounded while allowing the run to establish.
+const E2E_WAIT_TIMEOUT_SECS: u64 = 30;
+
 /// Spawn a background task that reads SSE events from a streaming body,
 /// sending each event through an unbounded channel for real-time consumption.
 /// Returns (receiver, join_handle). The join handle resolves to all collected events.
@@ -1969,7 +1973,7 @@ async fn execute_mock_tool_turn(
             continue;
         }
         if step.requires_approval {
-            let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
+            let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
             assert_eq!(
                 approval["request_id"].as_str(),
                 Some(step.request_id),
@@ -1982,7 +1986,7 @@ async fn execute_mock_tool_turn(
             assert_eq!(status, StatusCode::OK, "{}: approval accepted", case_name);
         }
 
-        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+        let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
         assert_eq!(
             request["request_id"].as_str(),
             Some(step.request_id),
@@ -2296,7 +2300,7 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     .await;
     let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(approval["tool"].as_str(), Some("bash"));
     let approval_request_id = approval["request_id"]
         .as_str()
@@ -2651,7 +2655,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request event before posting tool result.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Post tool result to the ledger.
     let status = post_tool_result(&app, "tc-read-1", "hello world", "completed").await;
@@ -2727,7 +2731,7 @@ async fn multiple_tool_calls_in_single_round() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request before posting results for both tool calls.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
 
     let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "completed").await;
     assert_eq!(s1, StatusCode::OK);
@@ -2854,11 +2858,11 @@ async fn multi_round_tool_execution() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Post results as tool_request events are emitted.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-read", "fn main() {}", "completed").await;
     assert_eq!(st, 200, "tc-read POST failed");
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "completed").await;
     assert_eq!(st, 200, "tc-list POST failed");
 
@@ -3594,7 +3598,7 @@ async fn tool_call_with_error_result_continues() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-err-1", "status=error: file not found", "failed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3654,11 +3658,11 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
 
     // Wait for the approval_required SSE, then approve, then post tool result.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", 5).await;
+    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_approval_respond(&app, &approval_identity, "tc-approve-1", "allow").await;
     assert_eq!(st, 200, "approval POST failed");
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-approve-1", "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
@@ -3753,7 +3757,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    let approval = wait_for_sse(&mut rx, "approval_batch_required", 5).await;
+    let approval = wait_for_sse(&mut rx, "approval_batch_required", E2E_WAIT_TIMEOUT_SECS).await;
     let approval_ids: Vec<_> = approval["requests"]
         .as_array()
         .expect("approval requests")
@@ -3762,7 +3766,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
         .collect();
     assert_eq!(approval_ids, vec!["tc-write-a", "tc-write-b"]);
 
-    let read_request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let read_request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(
         read_request["request_id"].as_str(),
         Some("tc-read-first"),
@@ -3776,12 +3780,12 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
     let st = post_approval_respond(&app, &approval_identity, "tc-write-b", "allow").await;
     assert_eq!(st, 200, "second approval POST failed");
 
-    let write_request_a = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let write_request_a = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
     let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
-    let write_request_b = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let write_request_b = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
     let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
@@ -3861,7 +3865,7 @@ async fn approval_denied_skips_tool_and_continues() {
 
     // Deny the approval.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", 5).await;
+    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_approval_respond(&app, &approval_identity, "tc-deny-1", "deny").await;
     assert_eq!(st, 200, "approval deny POST failed");
 
@@ -4294,7 +4298,7 @@ async fn many_tool_calls_in_single_round() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request then post all 5 results.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     for i in 0..5 {
         let id = format!("tc-many-{i}");
         post_tool_result(&app, &id, &format!("content of file{i}"), "completed").await;
@@ -4365,7 +4369,7 @@ async fn three_sequential_rounds_all_with_tools() {
         ("tc-r2", "found: main.rs, lib.rs"),
         ("tc-r3", "file content here"),
     ] {
-        wait_for_sse(&mut rx, "tool_request", 5).await;
+        wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
         post_tool_result(&app, id, output, "completed").await;
     }
 
@@ -4430,7 +4434,7 @@ async fn tool_call_with_complex_json_arguments() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-complex", "file content", "completed").await;
     assert_eq!(st, 200);
 
@@ -4479,7 +4483,7 @@ async fn text_then_tool_then_text_interleaved() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-mixed", "info content", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4532,7 +4536,7 @@ async fn reasoning_tokens_with_tool_calls() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-think", "file data", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4586,7 +4590,7 @@ async fn multiple_usage_events_accumulate() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-usage", "file1\nfile2", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4653,7 +4657,7 @@ async fn run_status_queryable_after_stream_completes() {
         .expect("run_id in session_info");
 
     // Poll run status until finalized.
-    let body = poll_run_status(&app, run_id, "completed", 5).await;
+    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
     let status = body["status"].as_str().unwrap_or("");
     assert!(
         status == "completed" || status == "running",
@@ -4690,7 +4694,7 @@ async fn tool_result_with_large_output() {
 
     // Post a large tool result (~50KB).
     let large_output = "y".repeat(50_000);
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-large", &large_output, "completed").await;
     assert_eq!(st, 200);
 
@@ -4736,7 +4740,7 @@ async fn approval_allow_session_approves_tool() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", 5).await;
+    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_approval_respond(
         &app,
         &approval_identity,
@@ -4746,7 +4750,7 @@ async fn approval_allow_session_approves_tool() {
     .await;
     assert_eq!(st, 200);
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-session-approve", "ok", "completed").await;
     assert_eq!(st, 200);
 
@@ -4798,12 +4802,13 @@ async fn get_run_status_with_auth(app: &Router, run_id: &str, auth: &str) -> (St
     (status, json)
 }
 
-/// GET /chat/runs/{run_id}/stream?last_index=N — returns SSE events.
+/// GET /chat/runs/{run_id}/stream?last_index=N&replay_only=true — returns the
+/// durable backlog without the live-attach `session_info` envelope.
 async fn get_run_stream(app: &Router, run_id: &str, last_index: u32) -> (StatusCode, Vec<Value>) {
     let req = Request::builder()
         .method("GET")
         .uri(format!(
-            "/chat/runs/{run_id}/stream?last_index={last_index}"
+            "/chat/runs/{run_id}/stream?last_index={last_index}&replay_only=true"
         ))
         .header("authorization", TOKEN)
         .body(Body::empty())
@@ -4866,7 +4871,7 @@ async fn a1_run_status_all_fields_text_only() {
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    let body = poll_run_status(&app, &run_id, "completed", 5).await;
+    let body = poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Verify ALL RunStatusResponse fields.
     assert_eq!(body["run_id"].as_str().unwrap(), run_id);
@@ -4912,7 +4917,7 @@ async fn a1_run_status_all_fields_after_tool_round() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_tool_result(&app, "tc-a1", "file contents", "completed").await;
     assert_eq!(st, 200);
 
@@ -4925,7 +4930,7 @@ async fn a1_run_status_all_fields_after_tool_round() {
     let run_id = si[0]["run_id"].as_str().unwrap();
     let session_id = si[0]["session_id"].as_str().unwrap();
 
-    let body = poll_run_status(&app, run_id, "completed", 5).await;
+    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(body["run_id"].as_str().unwrap(), run_id);
     assert_eq!(body["session_id"].as_str().unwrap(), session_id);
     assert_eq!(body["status"].as_str().unwrap(), "completed");
@@ -4948,7 +4953,7 @@ async fn a2_transition_running_to_completed_text_only() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    let body = poll_run_status(&app, &run_id, "completed", 5).await;
+    let body = poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(body["status"].as_str().unwrap(), "completed");
 }
 
@@ -4977,7 +4982,7 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-a2-tool", "file.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4988,7 +4993,7 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
     let si = find_events(&events, "session_info");
     let run_id = si[0]["run_id"].as_str().unwrap();
 
-    let body = poll_run_status(&app, run_id, "completed", 5).await;
+    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(body["status"].as_str().unwrap(), "completed");
 }
 
@@ -5019,7 +5024,7 @@ async fn a2_transition_running_to_cancelled() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request to know the stream is running, then get run_id and cancel.
-    let _tool_req = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let _tool_req = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
 
     // We need to cancel — but first we need the run_id. We'll list runs to find it.
     let (_, list_body) = list_runs(&app, 10).await;
@@ -5042,7 +5047,7 @@ async fn a2_transition_running_to_cancelled() {
         .expect("timed out")
         .expect("task panicked");
 
-    let body = poll_run_status(&app, &run_id, "cancelled", 5).await;
+    let body = poll_run_status(&app, &run_id, "cancelled", E2E_WAIT_TIMEOUT_SECS).await;
     let status = body["status"].as_str().unwrap();
     assert!(
         status == "cancelled" || status == "completed",
@@ -5065,7 +5070,7 @@ async fn a3_event_replay_all_events_from_index_zero() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Replay from index 0 — should get all stored events.
     let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
@@ -5099,7 +5104,7 @@ async fn a3_event_replay_partial_from_middle() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Get all externally visible events first. The cursor is over the
     // durable event log, so the public projection may legitimately skip
@@ -5174,7 +5179,7 @@ async fn a3_event_replay_beyond_end_returns_empty() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Replay from a very high index.
     let (status, events) = get_run_stream(&app, &run_id, 9999).await;
@@ -5199,7 +5204,7 @@ async fn a3_event_replay_matches_sse_stream_content() {
     });
 
     let (sse_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
     assert_eq!(status, StatusCode::OK);
@@ -5268,7 +5273,7 @@ async fn a4_ledger_empty_after_tool_run_completes() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc-a4-ledger", "content", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -5322,7 +5327,7 @@ async fn a4_ledger_empty_after_cancelled_run() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request so we know the stream is running, then cancel.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Find running run and cancel it.
     let (_, list_body) = list_runs(&app, 10).await;
@@ -5399,7 +5404,7 @@ async fn a5_run_status_unauthorized() {
         }
     });
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Try with wrong token.
     let (status, _) = get_run_status_with_auth(&app, &run_id, "Bearer wrong-token").await;
@@ -5443,7 +5448,7 @@ async fn a6_session_id_consistent_across_events_and_run() {
     });
 
     let (events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Verify run status session_id matches.
     let (_, body) = get_run_status(&app, &run_id).await;
@@ -5480,7 +5485,7 @@ async fn a6_custom_session_id_preserved() {
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // The session_id in session_info should match our custom ID.
     assert_eq!(
@@ -5509,7 +5514,7 @@ async fn a6_multiple_runs_same_session() {
         }
     });
     let (_, run_id_1, sid_1) = stream_and_get_run_id(&app, payload1).await;
-    poll_run_status(&app, &run_id_1, "completed", 5).await;
+    poll_run_status(&app, &run_id_1, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Second run with same session.
     let payload2 = json!({
@@ -5520,7 +5525,7 @@ async fn a6_multiple_runs_same_session() {
         }
     });
     let (_, run_id_2, sid_2) = stream_and_get_run_id(&app, payload2).await;
-    poll_run_status(&app, &run_id_2, "completed", 5).await;
+    poll_run_status(&app, &run_id_2, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Both should share the same session_id.
     assert_eq!(sid_1, shared_sid);
@@ -5552,7 +5557,7 @@ async fn a6_list_runs_shows_completed_runs() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", 5).await;
+    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     let (status, body) = list_runs(&app, 50).await;
     assert_eq!(status, StatusCode::OK);
@@ -5738,7 +5743,7 @@ async fn hook_db_decision_audit_with_tools() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deliver tool results for tc1.
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -5882,11 +5887,11 @@ async fn hook_db_multiple_tools_selected() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deliver tool results for round 1 (tc1).
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
 
     // Deliver tool results for round 2 (tc2).
-    wait_for_sse(&mut rx, "tool_request", 5).await;
+    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     post_tool_result(&app, "tc2", "main.rs\nlib.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -6218,7 +6223,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         ("tc-guidance-r8b", "Cargo.toml"),
         ("tc-guidance-r9", "[package]\nname = \"astra\""),
     ] {
-        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+        let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
         assert_eq!(request["request_id"].as_str(), Some(id));
         let status = post_tool_result(&app, id, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
@@ -6398,14 +6403,14 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     .await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
     assert_eq!(
         post_tool_result(&app, "tc-budget-r1", "module contents", "completed").await,
         StatusCode::OK
     );
 
-    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
     assert_eq!(
         post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "completed").await,
@@ -6462,7 +6467,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     .await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
     assert_eq!(
         post_tool_result(&app, "tc-hard-limit-r1", "module contents", "completed").await,
@@ -6583,7 +6588,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
     .await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-fail-r1"));
     assert_eq!(
         post_tool_result(
@@ -6596,7 +6601,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
         StatusCode::OK
     );
 
-    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-fail-r2"));
     assert_eq!(
         post_tool_result(&app, "tc-budget-fail-r2", "permission denied", "denied").await,

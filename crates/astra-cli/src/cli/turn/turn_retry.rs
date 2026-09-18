@@ -216,6 +216,7 @@ mod tests {
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
+            turn_usage_sink: None,
         };
         let attempt = TurnAttempt::Completed(Box::new(Err(crate::TurnFailure {
             error: "session not found: sess-stale".into(),

@@ -9,6 +9,9 @@ import {
   type WorkExecutionViewV1,
   type WorkExecutionTargetPageV1,
   type WorkExecutionSwitchOperationV1,
+  type WorkBranchInteractionReceiptV1,
+  type WorkBranchInteractionPageV1,
+  type WorkBranchInteractionResponseInputV1,
   type WorkBranchCreationOperationV1,
   type WorkBranchDeletionOperationV1,
   type WorkBranchRetentionReceiptV1,
@@ -20,6 +23,7 @@ import {
   type WorkCriteriaProposalSummaryV1,
   type WorkReadCursorReceiptV1,
   type WorkTranscriptPageV1,
+  type WorkEventPageV1,
   type WorkPatchArtifactContent,
   type WorkPatchArtifactCursorV1,
   type WorkPatchArtifactPageV1,
@@ -138,6 +142,17 @@ export type RefreshWorkBranchActivityResult =
   | { ok: true; activity: WorkBranchActivityResponseV1 }
   | WorkActionError;
 
+/**
+ * The lightweight live cursor used by the Work detail page.  A Work event
+ * head is the shared cross-surface clock: polling it lets Web notice a turn
+ * started in TUI (or on another Edge) without loading the whole transcript on
+ * every tick.  The event page is read-only and never advances the user's
+ * seen cursor.
+ */
+export type RefreshWorkEventsResult =
+  | { ok: true; page: Pick<WorkEventPageV1, "work_id" | "event_head" | "events"> }
+  | WorkActionError;
+
 export type LoadWorkExecutionResult =
   | { ok: true; execution: WorkExecutionViewV1 }
   | WorkActionError;
@@ -152,6 +167,136 @@ export type SwitchWorkExecutionResult =
 
 export type ObserveWorkExecutionSwitchResult = SwitchWorkExecutionResult;
 export type RetryWorkExecutionSwitchResult = SwitchWorkExecutionResult;
+
+export type RespondWorkBranchInteractionResult =
+  | { ok: true; receipt: WorkBranchInteractionReceiptV1 }
+  | WorkActionError;
+
+export type RefreshWorkBranchInteractionsResult =
+  | { ok: true; page: WorkBranchInteractionPageV1 }
+  | WorkActionError;
+
+type RespondWorkBranchInteractionActionInput = WorkBranchInteractionResponseInputV1 & {
+  workId: string;
+  branchId: string;
+};
+
+function validRespondWorkBranchInteractionInput(
+  input: RespondWorkBranchInteractionActionInput,
+): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  if (
+    Object.keys(object).sort().join("\0") !==
+    "attachmentId\0branchId\0requestId\0response\0runId\0workId"
+  ) {
+    return false;
+  }
+  if (
+    !canonicalWorkIdentity(object.workId) ||
+    !canonicalWorkIdentity(object.branchId) ||
+    !canonicalAttachmentIdentity(object.attachmentId) ||
+    !canonicalInteractionIdentity(object.runId) ||
+    !canonicalInteractionIdentity(object.requestId)
+  ) {
+    return false;
+  }
+  const response = object.response;
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  const responseObject = response as Record<string, unknown>;
+  if (responseObject.kind === "approval") {
+    return (
+      (responseObject.decision === "allow" || responseObject.decision === "deny") &&
+      (responseObject.reason === undefined || typeof responseObject.reason === "string") &&
+      Object.keys(responseObject)
+        .sort()
+        .join("\0")
+        .match(/^decision\0kind(?:\0reason)?$/) !== null
+    );
+  }
+  if (responseObject.kind === "user_prompt") {
+    if (typeof responseObject.cancelled !== "boolean") return false;
+    const keys = Object.keys(responseObject).sort().join("\0");
+    return responseObject.cancelled
+      ? keys === "cancelled\0kind"
+      : keys === "answers\0cancelled\0kind" && responseObject.answers !== undefined;
+  }
+  return false;
+}
+
+/** Answer one Work-scoped pending interaction. This records a response for
+ * the exact durable run and does not transfer branch controller ownership. */
+export async function respondWorkBranchInteractionAction(
+  input: RespondWorkBranchInteractionActionInput,
+): Promise<RespondWorkBranchInteractionResult> {
+  if (!validRespondWorkBranchInteractionInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_interaction_request",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "answer Work interaction",
+    });
+    const { workId, branchId, ...response } = input;
+    return {
+      ok: true,
+      receipt: await runtime.sdk.respondWorkBranchInteraction(workId, branchId, response),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type RefreshWorkBranchInteractionsInput = { workId: string; branchId: string };
+
+function validRefreshWorkBranchInteractionsInput(
+  input: RefreshWorkBranchInteractionsInput,
+): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId)
+  );
+}
+
+/** Read the current pending Work interaction without acquiring control. */
+export async function refreshWorkBranchInteractionsAction(
+  input: RefreshWorkBranchInteractionsInput,
+): Promise<RefreshWorkBranchInteractionsResult> {
+  if (!validRefreshWorkBranchInteractionsInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_interactions_query",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "refresh Work interactions",
+    });
+    return {
+      ok: true,
+      page: await runtime.sdk.getWorkBranchInteractions(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
 
 type RefreshWorkBranchActivityInput = {
   workId: string;
@@ -191,6 +336,59 @@ export async function refreshWorkBranchActivityAction(
     return {
       ok: true,
       activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type RefreshWorkEventsInput = {
+  workId: string;
+  afterEventSeq: number;
+};
+
+function validWorkEventsInput(input: RefreshWorkEventsInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "afterEventSeq\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    Number.isSafeInteger(object.afterEventSeq) &&
+    Number(object.afterEventSeq) >= 1
+  );
+}
+
+/** Read only the Work event head so every surface can converge on live state. */
+export async function refreshWorkEventsAction(
+  input: RefreshWorkEventsInput,
+): Promise<RefreshWorkEventsResult> {
+  if (!validWorkEventsInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_events_query",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "refresh Work events",
+    });
+    const page = await runtime.sdk.listWorkEvents(input.workId, {
+      afterEventSeq: input.afterEventSeq,
+      limit: 1,
+    });
+    return {
+      ok: true,
+      page: {
+        work_id: page.work_id,
+        event_head: page.event_head,
+        events: page.events,
+      },
     };
   } catch (error) {
     const known = classifyWorkActionError(error);
@@ -1187,6 +1385,15 @@ function canonicalAttachmentIdentity(value: unknown): value is string {
     value !== "." &&
     value !== ".." &&
     /^[A-Za-z0-9._:-]+$/.test(value)
+  );
+}
+
+function canonicalInteractionIdentity(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 256 &&
+    !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
   );
 }
 

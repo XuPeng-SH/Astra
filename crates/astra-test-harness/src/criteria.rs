@@ -576,6 +576,11 @@ fn default_cache_read_min_pairs() -> u32 {
 pub enum JournalToolDocument {
     Arguments,
     Result,
+    /// Executor-authored failure evidence for an invocation that did not
+    /// produce a successful result. This is intentionally separate from
+    /// `Result` so a failed command cannot be mistaken for a successful tool
+    /// payload.
+    Error,
     /// Bounded executor-authored outcome fields from the durable call record.
     RuntimeMetadata,
 }
@@ -1092,6 +1097,7 @@ fn journal_tool_document(
     match document {
         JournalToolDocument::Arguments => call.arguments.as_ref(),
         JournalToolDocument::Result => call.result.as_ref(),
+        JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
     }
 }
@@ -2076,16 +2082,13 @@ fn evaluate_one(
                 return missing_required_session(c, "journal_tool_json_contains");
             };
             let calls = session.journal_tool_calls();
-            let passed = calls
-                .iter()
-                .filter(|call| call.name == *name && call.ok == Some(true))
-                .any(|call| {
-                    let value = journal_tool_document(call, *document);
-                    value
-                        .and_then(|value| value.pointer(path))
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|text| text.contains(contains))
-                });
+            let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
+                let value = journal_tool_document(call, *document);
+                value
+                    .and_then(|value| value.pointer(path))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(contains))
+            });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
@@ -5727,6 +5730,86 @@ mod tests {
         assert!(
             !wrong_stage[0].passed,
             "another rejection stage must not match"
+        );
+    }
+
+    #[test]
+    fn durable_tool_json_contains_can_assert_failed_invocation_error() {
+        let sess = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "failed-probe",
+                    "name": "bash",
+                    "ok": false,
+                    "args_full": r#"{"command":"probe"}"#,
+                    "error": "status=failed\nError: bash execution failed (exit code 1)\n(exit code 1)"
+                }]
+            }),
+        )]);
+        let criterion = Criterion::JournalToolJsonContains {
+            name: "bash".into(),
+            document: JournalToolDocument::Error,
+            path: String::new(),
+            contains: "exit code 1".into(),
+        };
+
+        let results = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+        assert!(
+            results[0].passed,
+            "failed invocation error must remain inspectable: {results:?}"
+        );
+    }
+
+    #[test]
+    fn durable_error_criterion_fails_closed_on_conflicting_replay() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "run_id": "run-1",
+                    "tool_calls": [{
+                        "tool_call_id": "probe-1",
+                        "name": "bash",
+                        "ok": false,
+                        "args_full": r#"{"command":"probe"}"#,
+                        "error": "exit code 1"
+                    }]
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "run_id": "run-1",
+                    "tool_calls": [{
+                        "tool_call_id": "probe-1",
+                        "name": "bash",
+                        "ok": false,
+                        "args_full": r#"{"command":"probe"}"#,
+                        "error": "exit code 127"
+                    }]
+                }),
+            ),
+        ]);
+        let criterion = Criterion::JournalToolJsonContains {
+            name: "bash".into(),
+            document: JournalToolDocument::Error,
+            path: String::new(),
+            contains: "exit code".into(),
+        };
+
+        let results = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+        assert!(
+            !results[0].passed,
+            "conflicting replay must not make an error assertion pass: {results:?}"
         );
     }
 

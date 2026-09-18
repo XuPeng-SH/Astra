@@ -2554,6 +2554,13 @@ impl ChatWidget {
         self.explain_analyze_report_format = format;
     }
 
+    #[cfg(test)]
+    pub(crate) fn explain_report_format_for_test(
+        &self,
+    ) -> astra_config::runtime_config::ExplainReportFormat {
+        self.explain_analyze_report_format
+    }
+
     pub(crate) fn explain_analyze_live_lines(
         &self,
         width: u16,
@@ -2759,6 +2766,15 @@ impl ChatWidget {
     pub fn commit_system(&mut self, cell: SystemCell) {
         self.commit_transcript_boundary(); // finalise anything live first
         self.commit_cell(Box::new(cell));
+    }
+
+    /// Commit a complete response produced by the explicit Work continuation
+    /// surface. Work turns have their own canonical transcript and lifecycle;
+    /// this method only projects the final Markdown into the current TUI and
+    /// never changes the local Session identity or runs local tools.
+    pub(crate) fn commit_work_response(&mut self, markdown: impl Into<String>) {
+        self.commit_transcript_boundary();
+        self.commit_cell(Box::new(AssistantCell::from_markdown(markdown)));
     }
 
     /// Append a runtime-owned lifecycle projection without claiming that the

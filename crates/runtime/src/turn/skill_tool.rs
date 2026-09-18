@@ -1809,7 +1809,7 @@ fn execute_skill_with_origin<'a>(
         if resolver.catalog_is_authoritative() && !public_name && !trusted_pipeline_name {
             return SkillCallResult {
                 output: format!(
-                    "`{skill_name}` is not listed in <available_skills>; choose an advertised skill name."
+                    "Unknown skill `{skill_name}`. Choose a skill from the available skills list."
                 ),
                 success: false,
                 activation: None,
@@ -3147,7 +3147,9 @@ mod tests {
         )
         .await;
         assert!(!result.success);
-        assert!(result.output.contains("<available_skills>"));
+        assert!(result.output.contains("Unknown skill `invented-skill`"));
+        assert!(result.output.contains("available skills list"));
+        assert!(!result.output.contains("<available_skills>"));
         assert!(result.activation.is_none());
     }
 

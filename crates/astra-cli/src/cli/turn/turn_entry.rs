@@ -146,6 +146,47 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
+/// Provider usage for the just-settled turn. This is captured from the
+/// canonical StreamResult/partial failure rather than inferred by subtracting
+/// session-lifetime counters, which may be refreshed or advanced by another
+/// executor while the turn is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnUsage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_creation_tokens: u64,
+}
+
+impl TurnUsage {
+    pub(crate) fn from_stream_result(result: &crate::StreamResult) -> Option<Self> {
+        let usage = Self {
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            cache_read_tokens: result.cache_read_tokens,
+            cache_creation_tokens: result.cache_creation_tokens,
+        };
+        (result.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+    }
+
+    pub(crate) fn from_partial(partial: &crate::PartialTurnData) -> Option<Self> {
+        let usage = Self {
+            prompt_tokens: partial.prompt_tokens,
+            completion_tokens: partial.completion_tokens,
+            cache_read_tokens: partial.cache_read_tokens,
+            cache_creation_tokens: partial.cache_creation_tokens,
+        };
+        (partial.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+    }
+
+    fn has_values(self) -> bool {
+        self.prompt_tokens > 0
+            || self.completion_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0
+    }
+}
+
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
     ensure_default_turn_model(state, input.api, input.token).await;
@@ -243,6 +284,7 @@ pub(crate) async fn handle_chat_input(
         &mut crate::cli::ui_adapter::LineUiAdapter,
     )
     .await
+    .map(|_| ())
 }
 
 pub(crate) async fn handle_chat_input_with_ui(
@@ -251,7 +293,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<(), String> {
+) -> Result<Option<TurnUsage>, String> {
     if let Some(decision) = classify_shell_passthrough(&line) {
         match decision {
             ShellPassthroughDecision::Empty => {}
@@ -281,14 +323,14 @@ pub(crate) async fn handle_chat_input_with_ui(
                 }
             }
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Not logged in. Use /login to authenticate.");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -344,6 +386,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(run_control.clone());
     }
+    let turn_usage_sink = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &line,
@@ -357,6 +400,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         semantic_query_override: None,
         turn_start,
         ui,
+        turn_usage_sink: Some(&turn_usage_sink),
     };
 
     let settlement =
@@ -374,7 +418,10 @@ pub(crate) async fn handle_chat_input_with_ui(
             .pending_bg_notifications
             .extend(notifications_arriving_during_settlement);
     }
-    Ok(())
+    Ok(turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take())
 }
 
 /// Resume an idle root from runtime-owned background facts without inventing
@@ -388,15 +435,15 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<(), String> {
+) -> Result<Option<TurnUsage>, String> {
     if state.pending_bg_notifications.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Background work finished, but Astra is not logged in; the update will be kept for your next turn.");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -449,6 +496,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(run_control.clone());
     }
+    let turn_usage_sink = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &logical_user_line,
@@ -462,6 +510,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         semantic_query_override: Some(user_intent.as_str()),
         turn_start,
         ui,
+        turn_usage_sink: Some(&turn_usage_sink),
     };
     let settlement =
         settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
@@ -472,7 +521,10 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         let consumed = notification_count.min(state.pending_bg_notifications.len());
         state.pending_bg_notifications.drain(..consumed);
     }
-    Ok(())
+    Ok(turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take())
 }
 
 pub(super) fn acquire_interactive_turn_admission(

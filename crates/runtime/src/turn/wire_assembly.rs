@@ -802,17 +802,24 @@ pub(crate) fn is_required_runtime_preamble(message: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn is_prompt_visible_under_required_only(message: &Value) -> bool {
+fn is_prompt_visible_under_required_only(
+    message: &Value,
+    placement: astra_turn_core::cache_placement::VolatilePlacement,
+) -> bool {
     // Required-only delivery keeps optional, changing evidence off the wire
-    // while preserving lifecycle authority. ActiveTurnFrame is the one
-    // required-class exception: its exact current/prior text is already in
-    // canonical conversation history. One byte-stable leading policy conveys
-    // the resolution rule without duplicating turn-specific values.
+    // while preserving lifecycle authority. An ActiveTurnFrame is retained
+    // only when the provider explicitly supports append-only user authority;
+    // other strict-history providers already have its exact text in canonical
+    // conversation history and rely on the byte-stable leading policy.
     is_required_runtime_preamble(message)
-        && message
+        && (message
             .get(RUNTIME_VOLATILE_KIND_MARKER)
             .and_then(Value::as_str)
             != Some("active_turn_frame")
+            || matches!(
+                placement,
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+            ))
 }
 
 pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
@@ -1639,7 +1646,8 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         volatile_preamble
             .into_iter()
             .filter(|message| {
-                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
+                !suppress_optional_volatile
+                    || is_prompt_visible_under_required_only(message, cache_cap.volatile_placement)
             })
             .filter_map(runtime_system_context_from_message),
     );
@@ -1647,14 +1655,16 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         render_drained_volatile_messages(&drained_volatile)
             .into_iter()
             .filter(|message| {
-                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
+                !suppress_optional_volatile
+                    || is_prompt_visible_under_required_only(message, cache_cap.volatile_placement)
             }),
     );
     runtime_system_messages.extend(
         take_runtime_system_context_messages(&mut compacted_messages)
             .into_iter()
             .filter(|message| {
-                !suppress_optional_volatile || is_prompt_visible_under_required_only(message)
+                !suppress_optional_volatile
+                    || is_prompt_visible_under_required_only(message, cache_cap.volatile_placement)
             }),
     );
 
@@ -1819,7 +1829,9 @@ fn render_drained_volatile_messages(
             delivery_class: inj.kind.delivery_class(),
             payload: inj.payload.clone(),
             round_index: inj.round_index,
-            authority_lifetime: None,
+            authority_lifetime: (inj.kind
+                == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame)
+                .then_some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
         };
         if let Some(message) = runtime_volatile_preamble_message(&edge_injection) {
             out.push(message);

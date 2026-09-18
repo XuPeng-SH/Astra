@@ -19848,6 +19848,51 @@ async fn server_only_user_prompt_projects_required_event_to_active_stream() {
     assert_eq!(resumed["interaction_outcome"], "cancelled");
 }
 
+#[test]
+fn approval_required_persists_a_bounded_redacted_action_summary() {
+    let svc = test_service();
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "run-1".into(),
+        Some(1),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    );
+    let secret = "super-secret-token-value-1234567890";
+    let event = gate.required_event(
+        "approval-1",
+        "bash",
+        &json!({"command": format!("deploy --token {secret}")}),
+    );
+    let detail = event["data"]["detail"].as_str().expect("action summary");
+    assert!(detail.starts_with("bash arguments:"));
+    assert!(!detail.contains(secret));
+    assert!(detail.contains("REDACTED") || detail.contains("redacted"));
+    assert!(detail.len() <= APPROVAL_ACTION_SUMMARY_MAX_BYTES + "…".len());
+
+    for (field, value) in [
+        ("api_key", "shortsecret"),
+        ("accessToken", "camel-case-secret-value-123456"),
+    ] {
+        let event = gate.required_event(
+            &format!("approval-{field}"),
+            "deploy",
+            &json!({field: value}),
+        );
+        let detail = event["data"]["detail"]
+            .as_str()
+            .expect("structured action summary");
+        assert!(
+            !detail.contains(value),
+            "structured credential leaked in approval detail: {detail}"
+        );
+        assert!(detail.contains("REDACTED"));
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
     let svc = test_service();

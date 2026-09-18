@@ -184,7 +184,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
 | `journal_tool_success_ratio { min, min_calls, allowed_failures? }` | raw and expected-negative-adjusted typed tool success meet the minimum | journal |
 | `journal_tool_json { name, document, path, equals }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value | journal     |
-| `journal_tool_json_contains { name, document, path, contains }` | arguments, result, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
+| `journal_tool_json_contains { name, document, path, contains }` | arguments, result, failure error, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
 | `journal_tool_sequence { tools }` | durable tool calls contain the ordered lifecycle subsequence | journal |
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |
@@ -315,6 +315,54 @@ This builds the current `astra` CLI, audits typed capability anchors, and runs
 exactly the declared model probes. The complete report, structured evaluation,
 and per-case evidence are persisted under
 `target/astra-test-harness/capabilities/` (ignored by git).
+
+## Cross-surface Work journey (TUI + Web)
+
+The YAML harness does not drive a browser or a controlling terminal. To verify
+the user journey across surfaces, run the separate opt-in live harness:
+
+```sh
+# Point this at a disposable owner and a candidate Server built from this checkout.
+ASTRA_HARNESS_ACCESS_TOKEN="$(cat /path/to/disposable-owner-token)" \
+  make test-work-live
+```
+
+The runner starts a real TUI in a `forkpty` terminal and an isolated Web dev
+server. It creates one Work from `/work start`, waits for Web to discover the
+same Work in **Now**, continues it from the TUI, and requires the browser to
+observe the same root Run while it is active. Only then does it send SIGHUP to
+the TUI. The run is a pass only when the same Run ID reports a larger event
+count and a terminal result after the TUI has exited; a page that merely still
+says “working” is insufficient evidence. A successful result must be
+`completed`; failed, cancelled, interrupted, or delegated Runs remain explicit
+failures and cannot satisfy the journey.
+
+The candidate API is never restarted, reused, or cleaned up by this command.
+Before the journey it checks `/health`, interaction protocol 3, the exact
+`build_git_sha`, a valid owner token, and the Work API major. A mismatch is
+reported as **Not tested** rather than silently connecting to an old server.
+Use a disposable owner because the current Work API intentionally retains the
+created Work as evidence. The run directory contains `state.json`, the raw
+PTY/Web/Playwright logs, and screenshots/videos on browser failure; it never
+contains the access token.
+
+`--model` (or `ASTRA_WORK_LIVE_MODEL`) selects the TUI's bootstrap model. The
+Work continuation is a Server-owned turn and therefore uses the candidate
+Server's canonical default model; the live report does not claim that the TUI
+selector changed that Server decision.
+
+This lane intentionally proves one safe cross-surface slice: TUI starts the
+Work, Web observes it, and the Server-owned continuation outlives the TUI. Web
+write control, Web-started Work, Edge or Server placement migration, and
+replacement of a failed task are reported as separate unsupported/not-tested
+coverage until their own deterministic journeys are added.
+
+The browser control file is a one-way coordination handshake. It is not a
+source of truth: Work, branch, run, activity, and post-exit event facts are
+read from the authenticated Server, while the Web assertions come from the
+real `/now` and `/works/<id>` pages. A provider that settles before the Web
+observation window is reported as an unsuccessful/not-tested journey instead
+of being stretched with a fixed sleep.
 
 `--force-model` intentionally makes the probe pack independent of case-local
 model defaults. Model output can drive and assess semantic behavior, but it never

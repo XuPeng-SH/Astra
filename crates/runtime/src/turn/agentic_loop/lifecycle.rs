@@ -1120,6 +1120,8 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
         && record.workspace_mutation_observed != Some(true)
         && ((astra_tools::workspace_observation::is_typed_workspace_observer(&record.name)
             && astra_tools::workspace_observation::is_typed_workspace_observation_receipt(receipt))
+            || (record.name == "bash"
+                && is_authoritative_unchanged_bash_observation_record(record))
             || (record.runtime_args_full.is_some()
                 && astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                     &record.name,
@@ -1130,6 +1132,25 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
                 )))
         && record.workspace_mutation_scope.as_deref()
             == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
+}
+
+/// Return the executor-owned no-change fact for a Bash invocation.  Unlike a
+/// typed observer receipt this helper intentionally accepts an unsuccessful
+/// command: the shell may have failed after proving, under the same owner
+/// lease, that the bound workspace fingerprint did not change.  It is used
+/// only to avoid manufacturing a mutation barrier; it is never a positive
+/// validation receipt.
+pub(crate) fn is_authoritative_unchanged_bash_observation_record(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    record.name == "bash"
+        && record.was_executed()
+        && record.workspace_mutation_observed != Some(true)
+        && record.workspace_mutation_scope.as_deref()
+            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
+        && record.workspace_mutation_receipt.as_ref().is_some_and(
+            astra_tools::workspace_observation::is_authoritative_unchanged_bash_observation_receipt,
+        )
 }
 
 /// An executor-owned Bash verification receipt covers the whole bound
@@ -2246,20 +2267,6 @@ fn simple_bash_mutation_targets(command: &str) -> Option<Vec<String>> {
                 .and_then(|target| static_shell_path_token(&target))
                 .map(|target| vec![target])
         }
-        "sed" if args.iter().any(|token| token.starts_with("-i")) => {
-            if args
-                .iter()
-                .skip(1)
-                .any(|token| token.starts_with('-') && !token.starts_with("-i"))
-            {
-                return None;
-            }
-            positional
-                .into_iter()
-                .last()
-                .and_then(|target| static_shell_path_token(&target))
-                .map(|target| vec![target])
-        }
         _ => None,
     }
 }
@@ -2348,6 +2355,9 @@ pub(crate) fn bash_mutation_is_proven_external_scratch(
         return false;
     }
     let segment = segments.pop().expect("one non-empty segment");
+    if external_scratch_setup(&segment, workspace_root) {
+        return true;
+    }
     let head = segment
         .split_whitespace()
         .next()
@@ -4680,6 +4690,48 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_bash_fingerprint_is_safe_invalidation_evidence() {
+        let fields =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            );
+        let receipt = fields
+            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+            .cloned();
+        let mut failed = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            args_full: Some(json!({"command": "pnpm exec tsc --noEmit"}).to_string()),
+            runtime_args_full: Some(json!({"command": "pnpm exec tsc --noEmit"}).to_string()),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt: receipt.clone(),
+            ..Default::default()
+        };
+
+        assert!(is_authoritative_unchanged_bash_observation_record(&failed));
+        assert!(
+            !record_has_typed_workspace_observation_receipt(&failed),
+            "a failed probe is not a positive observation receipt"
+        );
+
+        failed.ok = true;
+        assert!(record_has_typed_workspace_observation_receipt(&failed));
+
+        let mut weak = failed;
+        weak.workspace_mutation_receipt = Some(
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
+            )
+            .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+            .expect("weak receipt"),
+        );
+        assert!(!is_authoritative_unchanged_bash_observation_record(&weak));
+    }
+
+    #[test]
     fn record_path_uses_live_arguments_before_redacted_projection() {
         let raw_path = "/workspace/password=super_secret_value_123456";
         let mut record = ToolCallRecord {
@@ -4938,6 +4990,9 @@ mod tests {
             "mkdir -p /workspace/review",
             "chmod 644 /workspace/a /tmp/out",
             "sed -i s/a/b/ /workspace/a /tmp/out",
+            "sed -i s/a/b/ /tmp/out /tmp/other",
+            "sed -i 's/a/b/w /workspace/leak' /tmp/out",
+            "sed -i 's/a/b/e touch /workspace/leak' /tmp/out",
             "printf x >/tmp/scratch.txt >/workspace/out.txt",
             "printf x >/tmp/scratch.txt 2>/workspace/error.txt",
             "printf x >/workspace/out.txt >/tmp/scratch.txt",

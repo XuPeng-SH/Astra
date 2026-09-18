@@ -49,11 +49,12 @@ use astra_services::{
         AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
         AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
         DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
-        DurableRunGuidanceAdmissionRecord, DurableRunInteractionKind,
+        DurableRunGuidanceAdmissionRecord, DurableRunInteractionAttachmentGuard,
+        DurableRunInteractionKind, DurableRunInteractionProjection,
         DurableRunInteractionResolveOutcome, DurableRunListPage, DurableRunRecord,
         DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
-        DurableRunUserIntentControlDelta, DurableWorkItemRunBinding, DurableWorkRunBinding,
-        GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
+        DurableRunUserIntentControlDelta, DurableRunWorkScope, DurableWorkItemRunBinding,
+        DurableWorkRunBinding, GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
         RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
         RunExecutionBoundaryAuthorization, RunExecutionBoundaryAuthorizationRequest, RunListCursor,
         RunStateStore, RunStatusCasRequest, RunUsageOwnerUpdateRequest,
@@ -2460,6 +2461,37 @@ impl RunEngine {
         self.store.load_run(user_id, run_id).await
     }
 
+    pub async fn load_run_work_scope(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunWorkScope>, String> {
+        self.store.load_run_work_scope(user_id, run_id).await
+    }
+
+    pub async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        self.store
+            .list_active_work_runs(user_id, session_id, work_id, branch_id)
+            .await
+    }
+
+    pub async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: DurableRunInteractionKind,
+    ) -> Result<Option<DurableRunInteractionProjection>, String> {
+        self.store
+            .load_run_interaction_projection(user_id, run_id, kind)
+            .await
+    }
+
     /// Read only the durable user-intent control plane. Approval and action
     /// fences must not hydrate an entire long-running event history merely to
     /// answer this boolean question.
@@ -2922,6 +2954,29 @@ impl RunEngine {
                 request_id,
                 kind,
                 response_data,
+            )
+            .await
+    }
+
+    pub async fn resolve_run_interaction_with_attachment(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+        attachment: Option<DurableRunInteractionAttachmentGuard>,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        self.store
+            .resolve_run_interaction_with_attachment(
+                user_id,
+                expected_session_id,
+                run_id,
+                request_id,
+                kind,
+                response_data,
+                attachment,
             )
             .await
     }

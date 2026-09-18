@@ -138,6 +138,7 @@ impl WorkspaceObservationFacts {
                 &record.name,
                 args.as_ref(),
             )
+            && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
             && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record);
         if barrier {
             self.barrier = Some(evidence.clone());
@@ -701,6 +702,29 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn authoritative_unchanged_bash_failure_does_not_create_workspace_barrier() {
+        let fields =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            );
+        let mut failed_probe = record("bash", false, "opaque-diagnostic-probe");
+        failed_probe.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        failed_probe.workspace_mutation_receipt = fields
+            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+            .cloned();
+
+        let history = vec![failed_probe];
+        let mut frontier = VerificationFrontier::default();
+        frontier.advance(Some("/app"), &[], &history).unwrap();
+        assert!(
+            frontier
+                .evaluate_workspace_observation(Some("/app"), &[], &history)
+                .unwrap()
+        );
     }
 
     pub(crate) fn restored_read_only_prefix() -> VerificationFrontier {

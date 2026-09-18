@@ -9503,7 +9503,7 @@ impl ServerAgenticLoopHost {
                 {
                     Some((
                         "canonical_work_post_completion_execution_not_allowed",
-                        "The current Work graph is complete. Read-only inspection and verification remain available, but additional workspace, network, or external mutation requires extending canonical Work with a new outcome.",
+                        "No WorkItem is currently authorized for execution in this turn. Read-only inspection and Work recovery remain available; additional workspace, network, or external mutation must use an active WorkItem through run_next_work_item.",
                     ))
                 }
                 _ if coordinator_has_work
@@ -27614,11 +27614,11 @@ mod tests {
             result["error_kind"],
             "canonical_work_post_completion_execution_not_allowed"
         );
-        assert!(
-            result["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("Read-only inspection"))
-        );
+        assert!(result["error"].as_str().is_some_and(|error| {
+            error.contains("Read-only inspection")
+                && error.contains("Work recovery")
+                && !error.contains("graph is complete")
+        }));
     }
 
     #[test]

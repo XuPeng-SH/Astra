@@ -52,7 +52,7 @@ criteria:
     max: 1
   - type: journal_tool_json_contains
     name: bash
-    document: result
+    document: error
     path: ""
     contains: "exit code 1"
   - type: journal_tool_outcome_count

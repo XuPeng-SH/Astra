@@ -4940,7 +4940,38 @@ impl ToolExecutor {
         };
         let after = astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root);
         let after_captured = after.is_some();
-        let workspace_changed = before.changed_from(after);
+        let workspace_comparison = before.compare_with(after.as_ref());
+        let workspace_changed = matches!(
+            workspace_comparison,
+            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Changed
+        );
+        let workspace_unchanged = matches!(
+            workspace_comparison,
+            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unchanged
+        );
+        // A completed owner-side fingerprint is useful even when the shell
+        // exits unsuccessfully.  Preserve the no-change fact separately from
+        // the explicit verify contract so a failed diagnostic probe cannot be
+        // mistaken for a workspace writer, while validation obligations still
+        // remain strict at the runtime boundary.
+        if workspace_unchanged
+            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
+            && observation_lease.is_none_or(
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+        {
+            if let Some(ownership) = scope_ownership {
+                outcome
+                    .tool_result_fields
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(
+                        astra_tools::workspace_observation::
+                            unchanged_bash_observation_receipt_with_ownership(
+                                ownership.as_str(),
+                            ),
+                    );
+            }
+        }
         if explicit_verification
             && !outcome.is_error
             && outcome
@@ -4949,8 +4980,7 @@ impl ToolExecutor {
                 .and_then(|fields| fields.get("exit_code"))
                 .and_then(Value::as_i64)
                 == Some(0)
-            && after_captured
-            && !workspace_changed
+            && workspace_unchanged
             && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
             && observation_lease.is_none_or(
                 astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
@@ -5040,7 +5070,33 @@ impl ToolExecutor {
         .ok()
         .flatten();
         let after_captured = after.is_some();
-        let workspace_changed = before.changed_from(after);
+        let workspace_comparison = before.compare_with(after.as_ref());
+        let workspace_changed = matches!(
+            workspace_comparison,
+            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Changed
+        );
+        let workspace_unchanged = matches!(
+            workspace_comparison,
+            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unchanged
+        );
+        if workspace_unchanged
+            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
+            && observation_lease.is_none_or(
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+        {
+            if let Some(ownership) = scope_ownership {
+                outcome
+                    .tool_result_fields
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(
+                        astra_tools::workspace_observation::
+                            unchanged_bash_observation_receipt_with_ownership(
+                                ownership.as_str(),
+                            ),
+                    );
+            }
+        }
         if explicit_verification
             && !outcome.is_error
             && outcome
@@ -5049,8 +5105,7 @@ impl ToolExecutor {
                 .and_then(|fields| fields.get("exit_code"))
                 .and_then(Value::as_i64)
                 == Some(0)
-            && after_captured
-            && !workspace_changed
+            && workspace_unchanged
             && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
             && observation_lease.is_none_or(
                 astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
@@ -6998,8 +7053,17 @@ mod tests {
         let executor = test_executor_in(dir.path());
         let cancel = tokio_util::sync::CancellationToken::new();
         let trigger = cancel.clone();
+        let generated = dir.path().join("generated.txt");
         let cancel_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
+            // Wait until the command has actually crossed the executor
+            // boundary before cancelling. A fixed short sleep races with
+            // workspace-lease admission when the shell tests run in
+            // parallel, turning a pre-dispatch cancellation into a missing
+            // mutation receipt and making this ownership test flaky.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !generated.is_file() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             trigger.cancel();
         });
         let outcome = executor.bash_outcome_with_cancel(
@@ -7130,6 +7194,30 @@ mod tests {
         assert!(
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path()).is_none()
         );
+    }
+
+    #[test]
+    fn cross_epoch_bash_probe_cannot_mint_unchanged_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let before = astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path())
+            .expect("pre-state");
+        let writer = astra_tools::workspace_observation::begin_workspace_writer(dir.path())
+            .expect("writer registration");
+        drop(writer);
+
+        let outcome = executor.attach_bash_workspace_observation(
+            super::super::ToolExecutionOutcome::error("diagnostic failed".to_string()),
+            Some(before),
+            false,
+            Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
+            false,
+            None,
+        );
+
+        assert!(!outcome.tool_result_fields.as_ref().is_some_and(|fields| {
+            fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+        }));
     }
 
     #[tokio::test]

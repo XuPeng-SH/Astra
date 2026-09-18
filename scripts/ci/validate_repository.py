@@ -65,6 +65,7 @@ def main() -> None:
 
     contract_scripts = [
         Path("scripts/dev/test_setup_contract.sh"),
+        Path("scripts/dev/test_api_lifecycle_contract.sh"),
         Path("scripts/dev/test-memoria-databases.sh"),
         Path("scripts/dev/test-memoria-owner-contract.sh"),
         Path("scripts/dev/test-stack-bootstrap-contract.sh"),

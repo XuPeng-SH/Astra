@@ -382,15 +382,25 @@ dev-api-stop:
 dev-api-start-debug:
 	@BUILD_MODE=debug ./scripts/dev/start-api.sh
 
-.PHONY: dev-api-restart
-dev-api-restart: dev-api-stop
-	@sleep 1
-	@$(MAKE) dev-api-start
+.PHONY: dev-api-restart dev-api-restart-locked
+dev-api-restart:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-locked
 
-.PHONY: dev-api-restart-debug
-dev-api-restart-debug: dev-api-stop
+dev-api-restart-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
 	@sleep 1
-	@$(MAKE) dev-api-start-debug
+	@$(MAKE) --no-print-directory dev-api-start
+
+.PHONY: dev-api-restart-debug dev-api-restart-debug-locked
+dev-api-restart-debug:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-debug-locked
+
+dev-api-restart-debug-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
+	@sleep 1
+	@$(MAKE) --no-print-directory dev-api-start-debug
 
 .PHONY: dev-api-logs
 dev-api-logs:
@@ -428,7 +438,12 @@ dev-sdk-deps:
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
-	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ]; then \
+# The Web app consumes the package's dist entrypoint. Rebuild when source
+# changed so a restarted Web server cannot silently load an older decoder.
+	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ] || \
+		[ -n "$$(find packages/sdk/src -type f -newer packages/sdk/dist/index.js -print -quit 2>/dev/null)" ] || \
+		[ packages/sdk/package.json -nt packages/sdk/dist/index.js ] || \
+		[ packages/sdk/tsup.config.ts -nt packages/sdk/dist/index.js ]; then \
 		echo "Building local @astra/sdk package..."; \
 		cd packages/sdk && npm run build; \
 	else \
@@ -883,11 +898,15 @@ dev-setup-demo:
 # /health can answer. MatrixOne can take several minutes on a cold schema;
 # keep the ordinary API-start timeout unchanged and give only this destructive
 # reseed flow the longer readiness window.
-.PHONY: dev-seed
+.PHONY: dev-seed dev-seed-locked
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-seed-locked
+
+dev-seed-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
 	@echo "Stopping API server before dropping the database..."
 	@$(MAKE) dev-api-stop
 	@$(MAKE) dev-deps-wait
@@ -896,7 +915,7 @@ dev-seed:
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	scripts/dev/mysql-client.sh -e "$$SQL"
-	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug build-cli-debug
+	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug-locked build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./target/debug/astra admin register \
@@ -1613,6 +1632,38 @@ test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, th
 		--report-file target/astra-test-harness/capabilities/report.json \
 		--eval-file target/astra-test-harness/capabilities/eval.json \
 		--parallel "$${PARALLEL:-1}" --runs "$${RUNS:-1}"
+
+# ----------------------------------------------------------------------------
+# Opt-in cross-surface Work journey.
+#
+# This is intentionally outside test-offline and the mocked Web E2E lane. It
+# needs a disposable owner token and an already-running candidate Server whose
+# /health build_git_sha exactly matches this checkout. The runner starts only
+# its own Web and TUI processes, so it cannot restart or stop a developer's
+# shared API process.
+#
+# Variables:
+#   ASTRA_HARNESS_ACCESS_TOKEN — required, never printed or put on argv
+#   ASTRA_API_URL              — candidate Server (default: 127.0.0.1:17001)
+#   ASTRA_WORK_LIVE_MODEL      — TUI bootstrap model selector (the Work turn
+#                                  uses the candidate Server's canonical default)
+#   ASTRA_WORK_LIVE_WEB_PORT   — isolated Web port (default: 3537)
+#   ASTRA_WORK_LIVE_TIMEOUT    — bounded journey deadline in seconds
+#   ASTRA_WORK_LIVE_RUN_DIR    — retain state, PTY, Web, and Playwright evidence
+# ----------------------------------------------------------------------------
+.PHONY: test-work-live
+test-work-live: dev-web-deps ## Run the real TUI → Web Work journey (opt-in; not offline/CI)
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
+	@run_dir="$${ASTRA_WORK_LIVE_RUN_DIR:-$$(mktemp -d -t astra-work-live.XXXXXX)}"; \
+	ASTRA_HARNESS_ACCESS_TOKEN="$${ASTRA_HARNESS_ACCESS_TOKEN:-}" \
+	python3 scripts/harness/work_surface_live.py \
+		--api-url "$${ASTRA_API_URL:-http://127.0.0.1:17001}" \
+		--model "$${ASTRA_WORK_LIVE_MODEL:-deepseek-v4-flash}" \
+		--profile "$${ASTRA_WORK_LIVE_PROFILE:-harness-auto}" \
+		--web-port "$${ASTRA_WORK_LIVE_WEB_PORT:-3537}" \
+		--timeout "$${ASTRA_WORK_LIVE_TIMEOUT:-240}" \
+		--astra-bin "$(CURDIR)/target/debug/astra" \
+		--run-dir "$$run_dir" --keep-artifacts
 
 # ============================================================================
 # Code Quality

@@ -583,6 +583,7 @@ fn health_response_serializes() {
         memoria: "connected".into(),
         interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: "a".repeat(40),
+        build_git_dirty: astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true",
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
@@ -591,6 +592,10 @@ fn health_response_serializes() {
     assert!(v.get("persist_ok").is_none());
     assert!(v.get("persist_fail").is_none());
     assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
+    assert_eq!(
+        v["build_git_dirty"],
+        astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"
+    );
 }
 
 #[test]
@@ -1388,6 +1393,34 @@ fn work_create_request_is_a_strict_typed_command() {
 }
 
 #[test]
+fn work_attachment_request_can_bind_a_stable_surface_client_instance() {
+    let request: WorkBranchAttachRequestV1 = serde_json::from_value(json!({
+        "request_id": "tui-open:client-a:work-1:main",
+        "client_id": "client-a",
+        "surface": "tui"
+    }))
+    .expect("typed Work attachment request");
+    assert_eq!(request.request_id, "tui-open:client-a:work-1:main");
+    assert_eq!(request.client_id.as_deref(), Some("client-a"));
+    assert_eq!(request.surface, astra_turn_types::SessionSurfaceV1::Tui);
+    assert!(
+        serde_json::from_value::<WorkBranchAttachRequestV1>(json!({
+            "request_id": "legacy-open:work-1:main"
+        }))
+        .is_err(),
+        "the attachment actor surface is required"
+    );
+    assert!(
+        serde_json::from_value::<WorkBranchAttachRequestV1>(json!({
+            "request_id": "web-open:browser-a:work-1:main",
+            "client_id": "browser-a",
+            "session_id": "client-controlled-session"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn work_turn_request_cannot_smuggle_runtime_or_session_authority() {
     let request: WorkTurnRequestV1 = serde_json::from_value(json!({
         "request_id": "continue-1",
@@ -1837,4 +1870,35 @@ fn patch_materialization_page_query_is_closed() {
         .expect("query object")
         .insert("include_executor_lease".into(), json!(true));
     assert!(serde_json::from_value::<WorkPatchMaterializationsQueryV1>(widened).is_err());
+}
+
+#[test]
+fn work_interaction_response_body_matches_public_wire_and_rejects_unknown_fields() {
+    let approval = json!({
+        "attachment_id": "attachment-1",
+        "run_id": "run-1",
+        "request_id": "request-1",
+        "kind": "approval",
+        "decision": "allow"
+    });
+    serde_json::from_value::<WorkBranchInteractionResponseRequestV1>(approval.clone())
+        .expect("approval response should decode");
+
+    let prompt = json!({
+        "attachment_id": "attachment-1",
+        "run_id": "run-1",
+        "request_id": "request-2",
+        "kind": "user_prompt",
+        "cancelled": false,
+        "answers": {"answers": [{"question": "Which?", "answers": ["one"]}]}
+    });
+    serde_json::from_value::<WorkBranchInteractionResponseRequestV1>(prompt)
+        .expect("user prompt response should decode");
+
+    let mut widened = approval;
+    widened
+        .as_object_mut()
+        .expect("response object")
+        .insert("unexpected".into(), json!(true));
+    assert!(serde_json::from_value::<WorkBranchInteractionResponseRequestV1>(widened).is_err());
 }

@@ -6,6 +6,8 @@ import type {
   WorkBranchActivityResponseV1,
   WorkBranchComparisonReportV2,
   WorkOverviewV1,
+  WorkBranchInteractionPageV1,
+  WorkRecoveryPointPageV1,
 } from "@astra/sdk";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
@@ -30,8 +32,10 @@ vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
   deleteWorkBranchAction: vi.fn(),
   observeWorkBranchDeletionAction: vi.fn(),
   refreshWorkBranchActivityAction: vi.fn(),
+  refreshWorkEventsAction: vi.fn(),
   refreshWorkTaskGraphAction: vi.fn(),
   loadWorkTaskGraphPageAction: vi.fn(),
+  refreshWorkBranchInteractionsAction: vi.fn(),
 }));
 
 import {
@@ -45,7 +49,9 @@ import {
   observeWorkBranchCreationAction,
   observeWorkBranchDeletionAction,
   refreshWorkBranchActivityAction,
+  refreshWorkEventsAction,
   refreshWorkTaskGraphAction,
+  refreshWorkBranchInteractionsAction,
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
 } from "@/app/(workspace)/works/[workId]/actions";
@@ -137,7 +143,9 @@ const loadArchivedBranches = vi.mocked(loadArchivedWorkBranchesAction);
 const deleteBranch = vi.mocked(deleteWorkBranchAction);
 const observeDeletion = vi.mocked(observeWorkBranchDeletionAction);
 const refreshActivity = vi.mocked(refreshWorkBranchActivityAction);
+const refreshEvents = vi.mocked(refreshWorkEventsAction);
 const refreshTaskGraph = vi.mocked(refreshWorkTaskGraphAction);
+const refreshInteractions = vi.mocked(refreshWorkBranchInteractionsAction);
 
 const idleActivity: WorkBranchActivityResponseV1 = {
   schema_version: 1,
@@ -412,6 +420,72 @@ function committedAttachment(): WorkBranchAttachmentV1 {
   };
 }
 
+function portableRecoveryPointPage(): WorkRecoveryPointPageV1 {
+  return {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    points: [
+      {
+        schema_version: 1,
+        work_id: "work-1",
+        branch_id: "branch-1",
+        recovery_point_id: "recovery-1",
+        request_id: "request-1",
+        status: "captured",
+        reason: "user_requested",
+        created_at: "2026-08-01T00:00:00Z",
+        updated_at: "2026-08-01T00:00:00Z",
+        manifest_hash: `sha256:${"a".repeat(64)}`,
+        work_revision: 2,
+        branch_revision: 1,
+        graph_revision: 1,
+        goal_revision: 1,
+        criteria_set_revision: 1,
+        session_cursor: {
+          completed_turn: 1,
+          journal_event_seq: 2,
+          conversation_seq: 2,
+          canonical_root_hash: `sha256:${"b".repeat(64)}`,
+          compaction_generation: 0,
+        },
+        execution: {
+          placement: "edge",
+          executor_id: "edge-1",
+          binding_generation: 1,
+        },
+        workspace: {
+          snapshot_id: "snapshot-1",
+          logical_workspace_id: "workspace-1",
+          manifest_hash: `sha256:${"c".repeat(64)}`,
+          content_root: `sha256:${"d".repeat(64)}`,
+          byte_size: 12,
+          complete: true,
+          artifact_id: "artifact-1",
+          artifact_type: "workspace_snapshot",
+          content_digest: `sha256:${"e".repeat(64)}`,
+        },
+        artifacts: [],
+        coverage: {
+          session_state: true,
+          work_state: true,
+          workspace: true,
+          run_frontier: false,
+          artifacts: false,
+        },
+        capabilities: {
+          can_restore_conversation: false,
+          can_continue_in_original_environment: false,
+          has_portable_workspace: true,
+          requires_target_environment_check: true,
+          requires_effect_review: false,
+        },
+      },
+    ],
+    next_cursor: null,
+  };
+}
+
 function forkOperation(
   overrides: Partial<WorkBranchCreationOperationV1> = {},
 ): WorkBranchCreationOperationV1 {
@@ -491,6 +565,10 @@ function comparison(
 beforeEach(() => {
   vi.clearAllMocks();
   refreshActivity.mockResolvedValue({ ok: true, activity: idleActivity });
+  refreshEvents.mockResolvedValue({
+    ok: true,
+    page: { work_id: "work-1", event_head: 3, events: [] },
+  });
   refreshTaskGraph.mockResolvedValue({ ok: true, page: snapshot().taskGraph });
   Object.defineProperty(globalThis.crypto, "randomUUID", {
     configurable: true,
@@ -518,6 +596,192 @@ test("discovers activity started on another surface and refreshes this branch's 
     expect(refreshActivity).toHaveBeenCalledWith({ workId: "work-1", branchId: "branch-1" });
     expect(screen.getByRole("status")).toHaveTextContent("Astra is working · Live");
     expect(screen.getByText("Live", { exact: true })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("describes a saved portable workspace package without promising conversation restore", () => {
+  render(
+    <TestWorkOverviewPage
+      initial={snapshot()}
+      recoveryPoints={portableRecoveryPointPage()}
+    />,
+  );
+
+  expect(
+    screen.getByText(
+      "Conversation, Work state, and a verified workspace package are recorded at stable points.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      "The verified workspace package can be downloaded through the Work API. Conversation restore and live environment migration still require an explicit target check.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByText(/Code files are not included yet/u)).not.toBeInTheDocument();
+});
+
+test("starts Work event polling from the applied snapshot cursor", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(refreshEvents).toHaveBeenCalledWith({
+      workId: "work-1",
+      afterEventSeq: 3,
+    });
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("keeps retrying the server projection while an observed event is unapplied", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    refreshEvents.mockResolvedValue({
+      ok: true,
+      page: { work_id: "work-1", event_head: 4, events: [] },
+    });
+    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(refreshEvents).toHaveBeenCalledTimes(2);
+    expect(refresh).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("ignores an old Work event response after navigating to another Work", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  let finishOld!: (result: {
+    ok: true;
+    page: { work_id: string; event_head: number; events: [] };
+  }) => void;
+  refreshEvents.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishOld = resolve;
+      }),
+  );
+  try {
+    const first = snapshot();
+    const rendered = render(
+      <TestWorkOverviewPage initial={first} initialActivity={idleActivity} />,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    const second = snapshot();
+    second.report.overview.work_id = "work-2";
+    second.report.overview.goal.goal = "A separate Work";
+    rendered.rerender(
+      <TestWorkOverviewPage initial={second} initialActivity={idleActivity} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("heading", { name: "A separate Work" })).toBeVisible();
+
+    finishOld?.({ ok: true, page: { work_id: "work-1", event_head: 4, events: [] } });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "A separate Work" })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("ignores an old Work interaction response after navigating to another branch", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  let finishOld!: (result: {
+    ok: true;
+    page: WorkBranchInteractionPageV1;
+  }) => void;
+  refreshInteractions.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishOld = resolve;
+      }),
+  );
+  try {
+    const first = snapshot();
+    const firstInteractions: WorkBranchInteractionPageV1 = {
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      interactions: [
+        {
+          schema_version: 1,
+          work_id: "work-1",
+          branch_id: "branch-1",
+          run_id: "run-a",
+          request_id: "approval-a",
+          kind: "approval",
+          display_label: "A approval",
+        },
+      ],
+    };
+    const rendered = render(
+      <WorkOverviewPage
+        initial={first}
+        {...mainBranchProps(first)}
+        initialActivity={idleActivity}
+        initialInteractions={firstInteractions}
+      />,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    const second = snapshot();
+    const alternative = alternativeBranchProps(second);
+    const secondInteractions: WorkBranchInteractionPageV1 = {
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-2",
+      interactions: [],
+    };
+    expect(refreshInteractions).toHaveBeenCalledTimes(1);
+    rendered.rerender(
+      <WorkOverviewPage
+        initial={second}
+        {...alternative}
+        initialInteractions={secondInteractions}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    finishOld({ ok: true, page: firstInteractions });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("A approval")).not.toBeInTheDocument();
   } finally {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -565,6 +829,57 @@ test("does not present execution completion as verified work", () => {
 
   expect(screen.getByText("Result not reported")).toBeInTheDocument();
   expect(screen.queryByText("Verified")).not.toBeInTheDocument();
+});
+
+test("gives an actionable conversation path when no completion checks exist", () => {
+  render(
+    <TestWorkOverviewPage
+      initial={snapshot({ proposalInbox: [], criteriaCount: 0 })}
+    />,
+  );
+
+  expect(screen.getByText("Ask Astra to define Done when")).toBeVisible();
+  expect(
+    screen.getByRole("link", { name: /continue in conversation/i }),
+  ).toHaveAttribute("href", "#work-conversation");
+  expect(screen.getByText(/no completion checks yet/i)).toBeVisible();
+});
+
+test("does not borrow Main result readiness for an alternative approach", () => {
+  const value = snapshot({ proposalInbox: [], criteriaCount: 1 });
+  const branchProps = alternativeBranchProps(value);
+  render(<WorkOverviewPage initial={value} {...branchProps} />);
+
+  expect(screen.getByText("Compare this approach")).toBeVisible();
+  expect(
+    screen.getByRole("link", { name: /compare with main result/i }),
+  ).toHaveAttribute("href", "#work-approach");
+  expect(screen.queryByText("Review the result")).not.toBeInTheDocument();
+});
+
+test("resets the conversation composer when the selected approach changes", () => {
+  const first = snapshot({ proposalInbox: [] });
+  const { rerender } = render(
+    <TestWorkOverviewPage initial={first} attachment={committedAttachment()} />,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), {
+    target: { value: "Only for the first approach" },
+  });
+
+  const second = snapshot({ proposalInbox: [] });
+  const branchProps = alternativeBranchProps(second);
+  rerender(
+    <WorkOverviewPage
+      initial={second}
+      {...branchProps}
+      attachment={{ ...committedAttachment(), branch_id: "branch-2" }}
+    />,
+  );
+
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toHaveValue(
+    second.report.overview.goal.goal,
+  );
+  expect(screen.queryByDisplayValue("Only for the first approach")).not.toBeInTheDocument();
 });
 
 test("retries a failed lazy detail load without closing the review", async () => {
@@ -660,6 +975,19 @@ test("shows committed continuity without inferring activity from delivery state"
   expect(screen.queryByText(/^Working$/)).not.toBeInTheDocument();
 });
 
+test("explains a Work contract mismatch without hiding the saved Work", () => {
+  render(
+    <TestWorkOverviewPage
+      initial={snapshot()}
+      attachment={null}
+      attachmentNotice="Live Work continuity is unavailable because this Web UI and Astra Server use different Work contracts."
+    />,
+  );
+
+  expect(screen.getByRole("alert")).toHaveTextContent(/different Work contracts/u);
+  expect(screen.getByText("Live continuity unavailable · durable Work facts remain readable")).toBeVisible();
+});
+
 test("reuses the action identity after a retryable failure", async () => {
   loadProposal.mockResolvedValue({ ok: true, detail });
   resolveProposal
@@ -718,7 +1046,7 @@ test("creates an alternative only from the exact durable attachment head", async
   createBranch.mockResolvedValue({ ok: true, operation: forkOperation() });
   render(<TestWorkOverviewPage initial={snapshot()} attachment={attachment} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Try another approach" }));
+  fireEvent.click(screen.getByRole("button", { name: "Start a separate approach" }));
 
   await waitFor(() => expect(createBranch).toHaveBeenCalledTimes(1));
   expect(createBranch).toHaveBeenCalledWith({
@@ -734,7 +1062,7 @@ test("creates an alternative only from the exact durable attachment head", async
 test("does not invent a fork boundary before any turn is committed", () => {
   render(<TestWorkOverviewPage initial={snapshot()} />);
 
-  expect(screen.getByRole("button", { name: "Try another approach" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Start a separate approach" })).toBeDisabled();
   expect(createBranch).not.toHaveBeenCalled();
 });
 
@@ -778,7 +1106,7 @@ test("archives a non-main approach with its exact aggregate and branch revisions
   });
   render(<WorkOverviewPage initial={value} {...branchProps} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archive this approach" }));
 
   await waitFor(() => expect(changeRetention).toHaveBeenCalledTimes(1));
   expect(changeRetention).toHaveBeenCalledWith({
@@ -1157,7 +1485,11 @@ test("keeps a retryable comparison failure local and retryable", async () => {
     screen.getByRole("button", { name: "Compare with Main result" }),
   );
 
-  expect(await screen.findByText(/temporarily unavailable/i)).toBeVisible();
+  expect(
+    await screen.findByText(
+      "The comparison is temporarily unavailable. You can safely try again.",
+    ),
+  ).toBeVisible();
   expect(
     screen.getByRole("button", { name: "Compare with Main result" }),
   ).toBeEnabled();
@@ -1211,7 +1543,7 @@ test("keeps pending creation observable and stops the same durable operation", a
     />,
   );
 
-  fireEvent.click(screen.getByRole("button", { name: "Try another approach" }));
+  fireEvent.click(screen.getByRole("button", { name: "Start a separate approach" }));
   fireEvent.click(await screen.findByRole("button", { name: "Stop creating" }));
 
   await waitFor(() => expect(abortBranch).toHaveBeenCalledTimes(1));
@@ -1241,7 +1573,7 @@ test("bounds background observation when durable creation remains pending", asyn
     );
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try another approach" }));
+      fireEvent.click(screen.getByRole("button", { name: "Start a separate approach" }));
     });
     for (const delay of [500, 1_000, 2_000, 4_000, 4_000, 4_000]) {
       await act(async () => {
@@ -1251,7 +1583,7 @@ test("bounds background observation when durable creation remains pending", asyn
 
     expect(observeBranch).toHaveBeenCalledTimes(6);
     expect(screen.getByText(/taking longer than expected/i)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Try another approach" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Start a separate approach" })).toBeEnabled();
   } finally {
     vi.useRealTimers();
   }

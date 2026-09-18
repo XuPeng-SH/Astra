@@ -65,6 +65,7 @@ import type {
   WorkCatalogCursorV1,
   WorkCatalogPageV1,
   WorkBranchAttachmentV1,
+  WorkAttachmentSurface,
   WorkArchivedBranchListParamsV1,
   WorkArchivedBranchPageV1,
   WorkBranchControlBasisV1,
@@ -112,8 +113,24 @@ import type {
   WorkExecutionViewV1,
   WorkExecutionTargetPageV1,
   WorkExecutionSwitchOperationV1,
+  WorkRecoveryPointCaptureInputV1,
+  WorkRecoveryPointCursorV1,
+  WorkRecoveryPointPageV1,
+  WorkRecoveryPointV1,
+  WorkWorkspaceRecoveryArtifactBeginInputV1,
+  WorkWorkspaceRecoveryArtifactSealInputV1,
+  WorkWorkspaceRecoveryArtifactV1,
+  WorkWorkspaceRecoveryBasisExpectationV1,
+  WorkWorkspaceRecoveryBasisV1,
+  WorkWorkspaceRecoveryDownloadOptionsV1,
+  WorkWorkspaceRecoveryPackageV1,
+  WorkWorkspaceRecoveryChunkV1,
+  WorkWorkspaceRecoveryChunkReceiptV1,
   WorkTurnInput,
   WorkTurnStreamEvent,
+  WorkBranchInteractionPageV1,
+  WorkBranchInteractionReceiptV1,
+  WorkBranchInteractionResponseInputV1,
 } from "./types";
 import {
   ASTRA_EDGE_ID_HEADER,
@@ -186,6 +203,8 @@ import {
   workCriteriaPath,
   workEventsPath,
   workBranchTurnsPath,
+  workBranchInteractionsPath,
+  workBranchInteractionRespondPath,
   workBranchActionsPath,
   workBranchTranscriptPath,
   workBranchAttachmentPath,
@@ -206,6 +225,13 @@ import {
   workBranchExecutionSwitchesPath,
   workBranchExecutionSwitchPath,
   workBranchExecutionSwitchRetryPath,
+  workBranchRecoveryPointsPath,
+  workBranchRecoveryPointPath,
+  workBranchWorkspaceRecoveryArtifactPath,
+  workBranchWorkspaceRecoveryArtifactsPath,
+  workBranchWorkspaceRecoveryBasisPath,
+  workBranchWorkspaceRecoveryChunkPath,
+  workBranchWorkspaceRecoverySealPath,
   workSessionBindingPath,
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
@@ -255,7 +281,14 @@ import {
   decodeWorkExecutionViewV1,
   decodeWorkExecutionTargetPageV1,
   decodeWorkExecutionSwitchOperationV1,
+  decodeWorkRecoveryPointV1,
+  decodeWorkRecoveryPointPageV1,
+  decodeWorkWorkspaceRecoveryArtifactV1,
+  decodeWorkWorkspaceRecoveryBasisV1,
+  decodeWorkWorkspaceRecoveryChunkReceiptV1,
   decodeWorkTurnStreamEventV1,
+  decodeWorkBranchInteractionPageV1,
+  decodeWorkBranchInteractionReceiptV1,
 } from "./work-wire";
 
 type SessionWire = RuntimeSessionResponse;
@@ -267,6 +300,82 @@ function assertWorkRequestId(value: string): void {
     throw new TypeError(
       "requestId must be non-empty, control-free, and at most 256 UTF-8 bytes",
     );
+  }
+}
+
+function assertWorkRecoveryRequestId(value: string): void {
+  assertWorkRequestId(value);
+  if (/\s/u.test(value)) {
+    throw new TypeError("requestId must not contain whitespace for a recovery point");
+  }
+}
+
+function assertWorkContentHash(value: string, field: string): void {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(value)) {
+    throw new TypeError(`${field} must be a canonical SHA-256 content hash`);
+  }
+}
+
+function assertWorkNonNegativeSafeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
+  }
+}
+
+function assertWorkRecoveryBasis(
+  basis: WorkWorkspaceRecoveryBasisExpectationV1,
+): void {
+  assertWorkNonNegativeSafeInteger(basis.work_revision, "basis.work_revision");
+  assertWorkNonNegativeSafeInteger(basis.branch_revision, "basis.branch_revision");
+  assertWorkNonNegativeSafeInteger(basis.graph_revision, "basis.graph_revision");
+  if (basis.work_revision === 0 || basis.branch_revision === 0 || basis.graph_revision === 0) {
+    throw new TypeError("basis revisions must be positive safe integers");
+  }
+  assertWorkContentHash(basis.context_head_hash, "basis.context_head_hash");
+  assertWorkContentHash(basis.execution_binding_hash, "basis.execution_binding_hash");
+}
+
+async function sha256ContentDigest(bytes: Uint8Array): Promise<WorkContentHash> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) {
+    throw new TypeError("workspace recovery verification requires the Web Crypto API");
+  }
+  const digest = await subtle.digest("SHA-256", new Uint8Array(bytes).buffer);
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `sha256:${hex}`;
+}
+
+function createWorkspaceDownloadSignal(external?: AbortSignal): {
+  signal: AbortSignal;
+  abort: () => void;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  if (external === undefined) {
+    return { signal: controller.signal, abort: () => controller.abort(), dispose: () => {} };
+  }
+  const onAbort = () => controller.abort();
+  if (external.aborted) {
+    controller.abort();
+  } else {
+    external.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    abort: () => controller.abort(),
+    dispose: () => external.removeEventListener("abort", onAbort),
+  };
+}
+
+function assertWorkClientId(value: string): void {
+  const bytes = new TextEncoder().encode(value).length;
+  if (
+    bytes === 0 ||
+    bytes > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(value)
+  ) {
+    throw new TypeError("clientId must be non-empty, canonical, and at most 128 UTF-8 bytes");
   }
 }
 
@@ -969,6 +1078,416 @@ export class AstraClient {
     return page;
   }
 
+  /** Record the current stable Work/Session boundary without claiming a restore. */
+  async captureWorkBranchRecoveryPoint(
+    workId: string,
+    branchId: string,
+    input: WorkRecoveryPointCaptureInputV1,
+  ): Promise<WorkRecoveryPointV1> {
+    assertWorkRecoveryRequestId(input.requestId);
+    if (
+      !Number.isSafeInteger(input.expectedWorkRevision) ||
+      input.expectedWorkRevision < 1 ||
+      !Number.isSafeInteger(input.expectedBranchRevision) ||
+      input.expectedBranchRevision < 1
+    ) {
+      throw new TypeError("expected Work and branch revisions must be positive safe integers");
+    }
+    if (
+      input.reason !== undefined &&
+      ![
+        "user_requested",
+        "before_environment_change",
+        "run_settled",
+        "safe_boundary",
+      ].includes(input.reason)
+    ) {
+      throw new TypeError("reason is not a supported recovery point reason");
+    }
+    const body: Record<string, unknown> = {
+      request_id: input.requestId,
+      expected_work_revision: input.expectedWorkRevision,
+      expected_branch_revision: input.expectedBranchRevision,
+      reason: input.reason ?? "user_requested",
+    };
+    if (input.workspaceArtifactId !== undefined) {
+      if (
+        input.workspaceArtifactId.length === 0 ||
+        input.workspaceArtifactId.length > 64 ||
+        !/^[A-Za-z0-9._-]+$/u.test(input.workspaceArtifactId)
+      ) {
+        throw new TypeError("workspaceArtifactId is not a canonical artifact identity");
+      }
+      body.workspace_artifact_id = input.workspaceArtifactId;
+    }
+    const raw = await this.post<unknown>(
+      workBranchRecoveryPointsPath(workId, branchId),
+      body,
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const point = decodeWorkRecoveryPointV1(raw);
+    if (point.work_id !== workId || point.branch_id !== branchId) {
+      throw new TypeError("recovery point identity disagrees with the requested branch");
+    }
+    return point;
+  }
+
+  /** List immutable progress records using the server's keyset cursor. */
+  async listWorkBranchRecoveryPoints(
+    workId: string,
+    branchId: string,
+    options: { cursor?: WorkRecoveryPointCursorV1; limit?: number } = {},
+  ): Promise<WorkRecoveryPointPageV1> {
+    if (
+      options.limit !== undefined &&
+      (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 256)
+    ) {
+      throw new TypeError("limit must be a safe integer between 1 and 256");
+    }
+    if (options.cursor !== undefined) {
+      if (!/^[A-Za-z0-9._-]+$/u.test(options.cursor.recovery_point_id)) {
+        throw new TypeError("cursor.recovery_point_id is not canonical");
+      }
+      if (
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(
+          options.cursor.created_at,
+        ) ||
+        !Number.isFinite(Date.parse(options.cursor.created_at))
+      ) {
+        throw new TypeError("cursor.created_at must be an RFC 3339 UTC timestamp");
+      }
+    }
+    const raw = await this.fetch<unknown>(
+      `${workBranchRecoveryPointsPath(workId, branchId)}${buildQueryString({
+        before_created_at: options.cursor?.created_at,
+        before_recovery_point_id: options.cursor?.recovery_point_id,
+        limit: options.limit,
+      })}`,
+      {
+        cache: "no-store",
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
+    );
+    const page = decodeWorkRecoveryPointPageV1(raw);
+    if (page.work_id !== workId || page.branch_id !== branchId) {
+      throw new TypeError("recovery point page identity disagrees with the requested branch");
+    }
+    return page;
+  }
+
+  /** Read one immutable progress record without changing Work authority. */
+  async getWorkBranchRecoveryPoint(
+    workId: string,
+    branchId: string,
+    recoveryPointId: string,
+  ): Promise<WorkRecoveryPointV1> {
+    const raw = await this.fetch<unknown>(
+      workBranchRecoveryPointPath(workId, branchId, recoveryPointId),
+      { cache: "no-store", headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const point = decodeWorkRecoveryPointV1(raw);
+    if (
+      point.work_id !== workId ||
+      point.branch_id !== branchId ||
+      point.recovery_point_id !== recoveryPointId
+    ) {
+      throw new TypeError("recovery point identity disagrees with the requested resource");
+    }
+    return point;
+  }
+
+  /** Read the canonical Work/Session basis before capturing local files. */
+  async getWorkBranchWorkspaceRecoveryBasis(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkWorkspaceRecoveryBasisV1> {
+    const raw = await this.fetch<unknown>(
+      workBranchWorkspaceRecoveryBasisPath(workId, branchId),
+      { cache: "no-store", headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const basis = decodeWorkWorkspaceRecoveryBasisV1(raw);
+    if (basis.work_id !== workId || basis.branch_id !== branchId) {
+      throw new TypeError("workspace recovery basis identity disagrees with the request");
+    }
+    return basis;
+  }
+
+  /** Begin an immutable, owner-scoped workspace package upload for a Work branch. */
+  async beginWorkBranchWorkspaceRecoveryArtifact(
+    workId: string,
+    branchId: string,
+    input: WorkWorkspaceRecoveryArtifactBeginInputV1,
+  ): Promise<WorkWorkspaceRecoveryArtifactV1> {
+    assertWorkRecoveryRequestId(input.requestId);
+    assertWorkRecoveryBasis(input.basis);
+    assertWorkContentHash(input.contentDigest, "contentDigest");
+    assertWorkNonNegativeSafeInteger(input.byteSize, "byteSize");
+    assertWorkNonNegativeSafeInteger(input.chunkCount, "chunkCount");
+    if (
+      input.snapshotManifest === null ||
+      typeof input.snapshotManifest !== "object" ||
+      Array.isArray(input.snapshotManifest)
+    ) {
+      throw new TypeError("snapshotManifest must be a JSON object");
+    }
+    const raw = await this.post<unknown>(
+      workBranchWorkspaceRecoveryArtifactsPath(workId, branchId),
+      {
+        request_id: input.requestId,
+        // The response basis also carries display and identity fields.  The
+        // begin contract intentionally accepts only the immutable expectation
+        // tuple; serialize that exact shape so passing a fetched basis back is
+        // safe with the server's deny-unknown-fields decoder.
+        basis: {
+          work_revision: input.basis.work_revision,
+          branch_revision: input.basis.branch_revision,
+          graph_revision: input.basis.graph_revision,
+          context_head_hash: input.basis.context_head_hash,
+          execution_binding_hash: input.basis.execution_binding_hash,
+        },
+        snapshot_manifest: input.snapshotManifest,
+        content_digest: input.contentDigest,
+        byte_size: input.byteSize,
+        chunk_count: input.chunkCount,
+      },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const artifact = decodeWorkWorkspaceRecoveryArtifactV1(raw);
+    if (artifact.work_id !== workId || artifact.branch_id !== branchId) {
+      throw new TypeError("workspace recovery artifact identity disagrees with the request");
+    }
+    return artifact;
+  }
+
+  /** Upload one content-addressed workspace blob. Replays are idempotent. */
+  async putWorkBranchWorkspaceRecoveryChunk(
+    workId: string,
+    branchId: string,
+    artifactId: string,
+    digest: WorkWorkspaceRecoveryChunkV1["digest"],
+    bytes: Uint8Array,
+  ): Promise<WorkWorkspaceRecoveryChunkReceiptV1> {
+    assertWorkContentHash(digest, "digest");
+    workBranchWorkspaceRecoveryChunkPath(workId, branchId, artifactId, digest);
+    if (!(bytes instanceof Uint8Array)) {
+      throw new TypeError("bytes must be a Uint8Array");
+    }
+    const raw = await this.request(
+      workBranchWorkspaceRecoveryChunkPath(workId, branchId, artifactId, digest),
+      {
+        method: "PUT",
+        body: bytes as unknown as BodyInit,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR,
+        },
+      },
+    );
+    const receipt = decodeWorkWorkspaceRecoveryChunkReceiptV1(await raw.json());
+    if (
+      receipt.artifact_id !== artifactId ||
+      receipt.digest !== digest ||
+      receipt.byte_size !== bytes.byteLength
+    ) {
+      throw new TypeError("workspace recovery chunk receipt disagrees with the upload");
+    }
+    return receipt;
+  }
+
+  /** Seal a workspace package after every declared blob has been uploaded. */
+  async sealWorkBranchWorkspaceRecoveryArtifact(
+    workId: string,
+    branchId: string,
+    artifactId: string,
+    input: WorkWorkspaceRecoveryArtifactSealInputV1,
+  ): Promise<WorkWorkspaceRecoveryArtifactV1> {
+    if (!Array.isArray(input.chunks)) {
+      throw new TypeError("chunks must be an array");
+    }
+    const chunks = input.chunks.map((chunk, index) => {
+      if (!Number.isSafeInteger(chunk.chunk_index) || chunk.chunk_index !== index) {
+        throw new TypeError("workspace recovery chunks must have contiguous indexes");
+      }
+      assertWorkContentHash(chunk.digest, `chunks[${index}].digest`);
+      assertWorkNonNegativeSafeInteger(chunk.byte_size, `chunks[${index}].byte_size`);
+      return {
+        chunk_index: chunk.chunk_index,
+        digest: chunk.digest,
+        byte_size: chunk.byte_size,
+      };
+    });
+    const raw = await this.post<unknown>(
+      workBranchWorkspaceRecoverySealPath(workId, branchId, artifactId),
+      { chunks },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const artifact = decodeWorkWorkspaceRecoveryArtifactV1(raw);
+    if (
+      artifact.work_id !== workId ||
+      artifact.branch_id !== branchId ||
+      artifact.artifact_id !== artifactId
+    ) {
+      throw new TypeError("sealed workspace recovery artifact identity disagrees with the request");
+    }
+    return artifact;
+  }
+
+  /** Read metadata for a verified workspace package without downloading blobs. */
+  async getWorkBranchWorkspaceRecoveryArtifact(
+    workId: string,
+    branchId: string,
+    artifactId: string,
+    options?: Pick<WorkWorkspaceRecoveryDownloadOptionsV1, "signal">,
+  ): Promise<WorkWorkspaceRecoveryArtifactV1> {
+    const raw = await this.fetch<unknown>(
+      workBranchWorkspaceRecoveryArtifactPath(workId, branchId, artifactId),
+      {
+        cache: "no-store",
+        signal: options?.signal,
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
+    );
+    const artifact = decodeWorkWorkspaceRecoveryArtifactV1(raw);
+    if (
+      artifact.work_id !== workId ||
+      artifact.branch_id !== branchId ||
+      artifact.artifact_id !== artifactId
+    ) {
+      throw new TypeError("workspace recovery artifact identity disagrees with the request");
+    }
+    return artifact;
+  }
+
+  /** Download one verified workspace blob with response metadata checks. */
+  async getWorkBranchWorkspaceRecoveryChunk(
+    workId: string,
+    branchId: string,
+    artifactId: string,
+    digest: WorkWorkspaceRecoveryChunkV1["digest"],
+    options?: Pick<WorkWorkspaceRecoveryDownloadOptionsV1, "signal">,
+  ): Promise<Uint8Array> {
+    const raw = await this.request(
+      workBranchWorkspaceRecoveryChunkPath(workId, branchId, artifactId, digest),
+      {
+        cache: "no-store",
+        signal: options?.signal,
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
+    );
+    const lengthText = raw.headers.get("content-length");
+    const etag = raw.headers.get("etag")?.match(/^"(sha256:[0-9a-f]{64})"$/u)?.[1];
+    const bytes = new Uint8Array(await raw.arrayBuffer());
+    if (
+      lengthText !== null &&
+      (!Number.isSafeInteger(Number(lengthText)) || Number(lengthText) !== bytes.byteLength)
+    ) {
+      throw new TypeError("workspace recovery chunk length disagrees with response metadata");
+    }
+    if (etag !== undefined && etag !== digest) {
+      throw new TypeError("workspace recovery chunk digest disagrees with response metadata");
+    }
+    return bytes;
+  }
+
+  /**
+   * Read a verified package and all of its blobs from a cold client.  The
+   * response contains the manifest and canonical blob order, so no uploader
+   * memory or session-local upload state is needed to reconstruct it.
+   */
+  async downloadWorkBranchWorkspaceRecoveryPackage(
+    workId: string,
+    branchId: string,
+    artifactId: string,
+    options: WorkWorkspaceRecoveryDownloadOptionsV1 = {},
+  ): Promise<WorkWorkspaceRecoveryPackageV1> {
+    const artifact = await this.getWorkBranchWorkspaceRecoveryArtifact(
+      workId,
+      branchId,
+      artifactId,
+      options,
+    );
+    if (!artifact.sealed || !artifact.verified) {
+      throw new TypeError("workspace recovery artifact is not a verified sealed package");
+    }
+    const concurrency = options.concurrency ?? 4;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+      throw new TypeError("workspace recovery download concurrency must be a positive safe integer");
+    }
+    if (options.signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+    const downloadSignal = createWorkspaceDownloadSignal(options.signal);
+    const blobs: Array<WorkWorkspaceRecoveryPackageV1["blobs"][number] | undefined> =
+      new Array(artifact.blobs.length);
+    let nextIndex = 0;
+    let downloadFailed = false;
+    let firstError: unknown;
+    const worker = async (): Promise<void> => {
+      while (!downloadFailed) {
+        if (options.signal?.aborted) {
+          downloadFailed = true;
+          firstError = new DOMException("The operation was aborted", "AbortError");
+          downloadSignal.abort();
+          return;
+        }
+        const index = nextIndex++;
+        const descriptor = artifact.blobs[index];
+        if (descriptor === undefined) return;
+        try {
+          const bytes = await this.getWorkBranchWorkspaceRecoveryChunk(
+            workId,
+            branchId,
+            artifactId,
+            descriptor.digest,
+            { signal: downloadSignal.signal },
+          );
+          if (bytes.byteLength !== descriptor.byte_size) {
+            throw new TypeError(
+              `workspace recovery blob ${descriptor.blob_ref} size disagrees with its layout`,
+            );
+          }
+          const digest = await sha256ContentDigest(bytes);
+          if (digest !== descriptor.digest) {
+            throw new TypeError(
+              `workspace recovery blob ${descriptor.blob_ref} digest disagrees with its layout`,
+            );
+          }
+          blobs[index] = { ...descriptor, bytes };
+        } catch (error) {
+          if (!downloadFailed) {
+            downloadFailed = true;
+            firstError = error;
+            downloadSignal.abort();
+          }
+          return;
+        }
+      }
+    };
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, artifact.blobs.length) }, () => worker()),
+      );
+    } finally {
+      downloadSignal.dispose();
+    }
+    if (downloadFailed) throw firstError;
+    const completedBlobs = blobs as WorkWorkspaceRecoveryPackageV1["blobs"];
+    const totalSize = completedBlobs.reduce((total, blob) => total + blob.bytes.byteLength, 0);
+    if (totalSize !== artifact.byte_size) {
+      throw new TypeError("workspace recovery package size disagrees with its descriptor");
+    }
+    const assembled = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const blob of completedBlobs) {
+      assembled.set(blob.bytes, offset);
+      offset += blob.bytes.byteLength;
+    }
+    if ((await sha256ContentDigest(assembled)) !== artifact.content_digest) {
+      throw new TypeError("workspace recovery package digest disagrees with its descriptor");
+    }
+    return { artifact, blobs: completedBlobs };
+  }
+
   /** Request an Edge→Edge handoff using one controller attachment and CAS generation. */
   async switchWorkBranchExecution(
     workId: string,
@@ -1504,12 +2023,30 @@ export class AstraClient {
   async attachWorkBranch(
     workId: string,
     branchId: string,
-    input: { requestId: string },
+    input: {
+      requestId: string;
+      clientId?: string;
+      surface: WorkAttachmentSurface;
+    },
   ): Promise<WorkBranchAttachmentV1> {
     assertWorkRequestId(input.requestId);
+    if (input.clientId !== undefined) {
+      assertWorkClientId(input.clientId);
+    }
+    const body: {
+      request_id: string;
+      client_id?: string;
+      surface: WorkAttachmentSurface;
+    } = {
+      request_id: input.requestId,
+      surface: input.surface,
+    };
+    if (input.clientId !== undefined) {
+      body.client_id = input.clientId;
+    }
     const raw = await this.post<unknown>(
       workBranchAttachmentsPath(workId, branchId),
-      { request_id: input.requestId },
+      body,
       { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
     );
     const attachment = decodeWorkBranchAttachmentV1(raw);
@@ -2039,6 +2576,68 @@ export class AstraClient {
       headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
     });
     return decodeWorkSessionBindingV1(raw);
+  }
+
+  /** Discover a pending approval or user question for a Work branch.  This
+   * is read-only and can be called by an attached observer while another
+   * surface owns execution. */
+  async getWorkBranchInteractions(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkBranchInteractionPageV1> {
+    const raw = await this.fetch<unknown>(workBranchInteractionsPath(workId, branchId), {
+      cache: "no-store",
+      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+    });
+    const page = decodeWorkBranchInteractionPageV1(raw);
+    if (page.work_id !== workId || page.branch_id !== branchId) {
+      throw new TypeError("Work interaction page belongs to a different Work branch");
+    }
+    return page;
+  }
+
+  /** Answer one exact Work interaction without taking branch controller
+   * ownership.  The run id is mandatory so a retry cannot drift to another
+   * active run after the original one resumes. */
+  async respondWorkBranchInteraction(
+    workId: string,
+    branchId: string,
+    input: WorkBranchInteractionResponseInputV1,
+  ): Promise<WorkBranchInteractionReceiptV1> {
+    assertWorkRequestId(input.requestId);
+    assertWorkRequestId(input.runId);
+    workBranchAttachmentPath(workId, branchId, input.attachmentId);
+    const response = input.response.kind === "approval"
+      ? {
+          kind: "approval" as const,
+          decision: input.response.decision,
+          ...(input.response.reason === undefined ? {} : { reason: input.response.reason }),
+        }
+      : {
+          kind: "user_prompt" as const,
+          cancelled: input.response.cancelled,
+          ...(input.response.answers === undefined ? {} : { answers: input.response.answers }),
+        };
+    const raw = await this.post<unknown>(
+      workBranchInteractionRespondPath(workId, branchId),
+      {
+        attachment_id: input.attachmentId,
+        run_id: input.runId,
+        request_id: input.requestId,
+        ...response,
+      },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const receipt = decodeWorkBranchInteractionReceiptV1(raw);
+    if (
+      receipt.work_id !== workId ||
+      receipt.branch_id !== branchId ||
+      receipt.run_id !== input.runId ||
+      receipt.request_id !== input.requestId
+    ) {
+      throw new TypeError("Work interaction receipt belongs to a different request");
+    }
+    return receipt;
   }
 
   /** Continue one idle Work branch without exposing its backing session. */

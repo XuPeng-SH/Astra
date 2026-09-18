@@ -2459,6 +2459,19 @@ pub struct WorkspaceFingerprint {
     writer_active: usize,
 }
 
+/// Result of comparing two executor-owned workspace snapshots.
+///
+/// `Unknown` is intentionally distinct from `Unchanged`: a missing postimage,
+/// a different writer state, or an epoch transition means the interval cannot
+/// be attributed to the invocation that captured the snapshots. Callers that
+/// mint a no-change receipt must accept only `Unchanged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceFingerprintComparison {
+    Changed,
+    Unchanged,
+    Unknown,
+}
+
 /// Executor-owned preimage for an explicit, bounded set of external state
 /// roots.  This is intentionally opt-in: scanning arbitrary host state is
 /// neither attributable nor affordable, while inferring paths from shell text
@@ -2942,9 +2955,9 @@ impl WorkspaceFingerprint {
         })
     }
 
-    pub fn changed_from(&self, after: Option<Self>) -> bool {
+    pub fn compare_with(&self, after: Option<&Self>) -> WorkspaceFingerprintComparison {
         let Some(after) = after else {
-            return false;
+            return WorkspaceFingerprintComparison::Unknown;
         };
         // A recursive writer may change bytes and then restore them, so a
         // generation mismatch is not positive evidence for Bash.  The
@@ -2955,9 +2968,20 @@ impl WorkspaceFingerprint {
             || after.writer_active != 0
             || self.writer_epoch != after.writer_epoch
         {
-            return false;
+            return WorkspaceFingerprintComparison::Unknown;
         }
-        self.digest != after.digest
+        if self.digest == after.digest {
+            WorkspaceFingerprintComparison::Unchanged
+        } else {
+            WorkspaceFingerprintComparison::Changed
+        }
+    }
+
+    pub fn changed_from(&self, after: Option<Self>) -> bool {
+        matches!(
+            self.compare_with(after.as_ref()),
+            WorkspaceFingerprintComparison::Changed
+        )
     }
 }
 
@@ -3644,6 +3668,51 @@ pub fn changed_receipt_with_ownership(
             }),
         ),
     ])
+}
+
+/// Build an executor-owned observation receipt for a Bash invocation whose
+/// bounded pre/post fingerprints were equal.  This is deliberately a
+/// different source from a typed read observer and from a mutation receipt:
+/// it proves only that the bound workspace was unchanged while the owner held
+/// the observation lease.  The runtime may use it to avoid inventing a
+/// mutation barrier for a failed diagnostic command; it never proves that a
+/// requested validation or task completed.
+pub fn unchanged_bash_observation_receipt_with_ownership(
+    ownership: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        (
+            OBSERVATION_SCOPE_FIELD.to_string(),
+            serde_json::Value::String(BOUND_WORKSPACE_SCOPE.to_string()),
+        ),
+        (
+            OBSERVATION_RECEIPT_FIELD.to_string(),
+            serde_json::json!({
+                "schema": "workspace_observation_receipt.v1",
+                "source": "executor_bash_fingerprint",
+                "scope": BOUND_WORKSPACE_SCOPE,
+                "changed": false,
+                "ownership": ownership,
+            }),
+        ),
+    ])
+}
+
+/// Validate an unchanged Bash fingerprint receipt.  Only invocation-owned
+/// process boundaries are durable proof: a foreground process group can leave
+/// a descendant behind after the leader exits, so that result remains a weak
+/// quarantine and cannot clear a workspace freshness barrier.
+pub fn is_authoritative_unchanged_bash_observation_receipt(receipt: &serde_json::Value) -> bool {
+    receipt.get("schema").and_then(serde_json::Value::as_str)
+        == Some("workspace_observation_receipt.v1")
+        && receipt.get("source").and_then(serde_json::Value::as_str)
+            == Some("executor_bash_fingerprint")
+        && receipt.get("scope").and_then(serde_json::Value::as_str) == Some(BOUND_WORKSPACE_SCOPE)
+        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(false)
+        && matches!(
+            receipt.get("ownership").and_then(serde_json::Value::as_str),
+            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
+        )
 }
 
 /// Build a compact receipt for a successful, structured workspace writer.
@@ -5053,6 +5122,35 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_bash_receipt_requires_authoritative_owner() {
+        let receipt =
+            unchanged_bash_observation_receipt_with_ownership(INVOCATION_CGROUP_OWNERSHIP);
+        assert_eq!(receipt[OBSERVATION_SCOPE_FIELD], BOUND_WORKSPACE_SCOPE);
+        assert_eq!(
+            receipt[OBSERVATION_RECEIPT_FIELD]["source"],
+            "executor_bash_fingerprint"
+        );
+        assert!(is_authoritative_unchanged_bash_observation_receipt(
+            &receipt[OBSERVATION_RECEIPT_FIELD]
+        ));
+
+        let weak =
+            unchanged_bash_observation_receipt_with_ownership(FOREGROUND_PROCESS_GROUP_OWNERSHIP);
+        assert!(!is_authoritative_unchanged_bash_observation_receipt(
+            &weak[OBSERVATION_RECEIPT_FIELD]
+        ));
+        assert!(!is_authoritative_unchanged_bash_observation_receipt(
+            &serde_json::json!({
+                "schema": "workspace_observation_receipt.v1",
+                "source": "executor_bash_fingerprint",
+                "scope": BOUND_WORKSPACE_SCOPE,
+                "changed": true,
+                "ownership": INVOCATION_CGROUP_OWNERSHIP
+            })
+        ));
+    }
+
+    #[test]
     fn desired_state_convergence_is_distinct_target_bound_live_evidence() {
         let workspace = tempfile::tempdir().expect("workspace");
         let target = workspace.path().join("answer.txt");
@@ -5706,6 +5804,11 @@ mod tests {
         // is intentionally not attributed to the surrounding Bash window,
         // even if bytes happen to be restored before the post snapshot.
         assert!(during.is_none());
+        assert_eq!(
+            before.compare_with(Some(&after)),
+            WorkspaceFingerprintComparison::Unknown,
+            "an epoch transition is not authoritative unchanged evidence"
+        );
         assert!(!before.changed_from(Some(after)));
     }
 

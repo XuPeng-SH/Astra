@@ -22,6 +22,15 @@ import type {
   WorkExecutionTargetV1,
   WorkExecutionTargetPageV1,
   WorkExecutionSwitchOperationV1,
+  WorkRecoveryPointV1,
+  WorkRecoveryPointWorkspaceV1,
+  WorkRecoveryPointArtifactV1,
+  WorkRecoveryPointPageV1,
+  WorkWorkspaceRecoveryArtifactV1,
+  WorkWorkspaceRecoveryBlobV1,
+  WorkWorkspaceRecoveryBasisExpectationV1,
+  WorkWorkspaceRecoveryBasisV1,
+  WorkWorkspaceRecoveryChunkReceiptV1,
   WorkBranchControlBasisV1,
   WorkBranchControlOperationV2,
   WorkBranchCreationOperationV1,
@@ -61,6 +70,10 @@ import type {
   WorkTaskGraphItemV2,
   WorkTaskGraphPageV2,
   WorkSessionBindingV1,
+  WorkBranchInteractionV1,
+  WorkBranchInteractionPageV1,
+  WorkBranchInteractionReceiptV1,
+  WorkInteractionResolutionOutcomeV1,
   StreamEventType,
   WorkTurnStreamEvent,
 } from "./types";
@@ -137,6 +150,20 @@ function nullableExecutionIdentity(value: unknown, path: string): string | null 
   return opaqueIdentity(value, path);
 }
 
+// `executor_name` is a human-facing label (for example "My Work Laptop"),
+// not the stable executor identity.  Keep the identity decoder for
+// `executor_id`/operation ids, but do not reject ordinary spaces in a display
+// name: doing so makes an otherwise readable Work execution projection crash
+// the whole Web page.
+function nullableExecutionDisplayName(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  const name = nonEmptyString(value, path);
+  if (name.length > 256 || /[\u0000-\u001f\u007f]/u.test(name)) {
+    throw new TypeError(`${path} must be a bounded control-free display name`);
+  }
+  return name;
+}
+
 function executionFailureCode(value: unknown, path: string): string | null {
   if (value === null) return null;
   const code = nonEmptyString(value, path);
@@ -186,7 +213,7 @@ export function decodeWorkExecutionViewV1(value: unknown): WorkExecutionViewV1 {
     ),
     placement: oneOf(object.placement, ["server", "edge"] as const, `${path}.placement`),
     executor_id: nullableExecutionIdentity(object.executor_id, `${path}.executor_id`),
-    executor_name: nullableExecutionIdentity(object.executor_name, `${path}.executor_name`),
+    executor_name: nullableExecutionDisplayName(object.executor_name, `${path}.executor_name`),
     operation_id: nullableExecutionIdentity(object.operation_id, `${path}.operation_id`),
     attempt,
     failure_code: executionFailureCode(object.failure_code, `${path}.failure_code`),
@@ -220,8 +247,8 @@ export function decodeWorkExecutionTargetPageV1(
     targetIds.add(executorId);
     return {
       executor_id: executorId,
-      display_name: nullableExecutionIdentity(target.display_name, `${targetPath}.display_name`),
-      hostname: nullableExecutionIdentity(target.hostname, `${targetPath}.hostname`),
+      display_name: nullableExecutionDisplayName(target.display_name, `${targetPath}.display_name`),
+      hostname: nullableExecutionDisplayName(target.hostname, `${targetPath}.hostname`),
       capabilities: target.capabilities.map((capability, capabilityIndex) =>
         capabilityIdentity(capability, `${targetPath}.capabilities[${capabilityIndex}]`)),
       connected: booleanValue(target.connected, `${targetPath}.connected`),
@@ -293,7 +320,618 @@ export function decodeWorkExecutionSwitchOperationV1(
   return operation;
 }
 
+function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPointV1 {
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "recovery_point_id",
+      "request_id",
+      "status",
+      "reason",
+      "created_at",
+      "updated_at",
+      "manifest_hash",
+      "work_revision",
+      "branch_revision",
+      "graph_revision",
+      "goal_revision",
+      "criteria_set_revision",
+      "session_cursor",
+      "execution",
+      "workspace",
+      "artifacts",
+      "coverage",
+      "capabilities",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const sessionCursor = exactObject(
+    object.session_cursor,
+    [
+      "completed_turn",
+      "journal_event_seq",
+      "conversation_seq",
+      "canonical_root_hash",
+      "compaction_generation",
+    ],
+    `${path}.session_cursor`,
+  );
+  const execution = exactObject(
+    object.execution,
+    ["placement", "executor_id", "binding_generation"],
+    `${path}.execution`,
+  );
+  const coverage = exactObject(
+    object.coverage,
+    ["session_state", "work_state", "workspace", "run_frontier", "artifacts"],
+    `${path}.coverage`,
+  );
+  const capabilities = exactObject(
+    object.capabilities,
+    [
+      "can_restore_conversation",
+      "can_continue_in_original_environment",
+      "has_portable_workspace",
+      "requires_target_environment_check",
+      "requires_effect_review",
+    ],
+    `${path}.capabilities`,
+  );
+  let workspace: WorkRecoveryPointWorkspaceV1 | null = null;
+  if (object.workspace !== null) {
+    const workspaceObject = exactObject(
+      object.workspace,
+      [
+        "snapshot_id",
+        "logical_workspace_id",
+        "manifest_hash",
+        "content_root",
+        "byte_size",
+        "complete",
+        "artifact_id",
+        "artifact_type",
+        "content_digest",
+      ],
+      `${path}.workspace`,
+    );
+    workspace = {
+      snapshot_id: opaqueIdentity(workspaceObject.snapshot_id, `${path}.workspace.snapshot_id`),
+      logical_workspace_id: opaqueIdentity(
+        workspaceObject.logical_workspace_id,
+        `${path}.workspace.logical_workspace_id`,
+      ),
+      manifest_hash: contentHash(
+        workspaceObject.manifest_hash,
+        `${path}.workspace.manifest_hash`,
+      ),
+      content_root: contentHash(workspaceObject.content_root, `${path}.workspace.content_root`),
+      byte_size: safeIntegerAtLeast(workspaceObject.byte_size, 0, `${path}.workspace.byte_size`),
+      complete: booleanValue(workspaceObject.complete, `${path}.workspace.complete`),
+      artifact_id: opaqueIdentity(workspaceObject.artifact_id, `${path}.workspace.artifact_id`),
+      artifact_type: opaqueIdentity(
+        workspaceObject.artifact_type,
+        `${path}.workspace.artifact_type`,
+      ),
+      content_digest: contentHash(
+        workspaceObject.content_digest,
+        `${path}.workspace.content_digest`,
+      ),
+    };
+  }
+  if (!Array.isArray(object.artifacts) || object.artifacts.length > 256) {
+    throw new TypeError(`${path}.artifacts must contain at most 256 entries`);
+  }
+  const artifacts: WorkRecoveryPointArtifactV1[] = object.artifacts.map((value, index) => {
+    const artifact = exactObject(
+      value,
+      ["artifact_id", "artifact_type", "digest", "location_ref"],
+      `${path}.artifacts[${index}]`,
+    );
+    return {
+      artifact_id: opaqueIdentity(artifact.artifact_id, `${path}.artifacts[${index}].artifact_id`),
+      artifact_type: opaqueIdentity(
+        artifact.artifact_type,
+        `${path}.artifacts[${index}].artifact_type`,
+      ),
+      digest: contentHash(artifact.digest, `${path}.artifacts[${index}].digest`),
+      location_ref: nullableExecutionIdentity(
+        artifact.location_ref,
+        `${path}.artifacts[${index}].location_ref`,
+      ),
+    };
+  });
+  const artifactIds = new Set<string>();
+  for (const artifact of artifacts) {
+    if (artifactIds.has(artifact.artifact_id)) {
+      throw new TypeError(`${path}.artifacts contain a duplicate artifact identity`);
+    }
+    artifactIds.add(artifact.artifact_id);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    recovery_point_id: opaqueIdentity(object.recovery_point_id, `${path}.recovery_point_id`),
+    request_id: opaqueIdentity(object.request_id, `${path}.request_id`),
+    status: oneOf(
+      object.status,
+      ["preparing", "captured", "ready", "failed", "aborted"] as const,
+      `${path}.status`,
+    ),
+    reason: oneOf(
+      object.reason,
+      ["user_requested", "before_environment_change", "run_settled", "safe_boundary"] as const,
+      `${path}.reason`,
+    ),
+    created_at: timestamp(object.created_at, `${path}.created_at`),
+    updated_at: timestamp(object.updated_at, `${path}.updated_at`),
+    manifest_hash: contentHash(object.manifest_hash, `${path}.manifest_hash`),
+    work_revision: positiveRevision(object.work_revision, `${path}.work_revision`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    graph_revision: positiveRevision(object.graph_revision, `${path}.graph_revision`),
+    goal_revision: positiveRevision(object.goal_revision, `${path}.goal_revision`),
+    criteria_set_revision: positiveRevision(
+      object.criteria_set_revision,
+      `${path}.criteria_set_revision`,
+    ),
+    session_cursor: {
+      completed_turn: boundedCount(
+        sessionCursor.completed_turn,
+        Number.MAX_SAFE_INTEGER,
+        `${path}.session_cursor.completed_turn`,
+      ),
+      journal_event_seq: safeIntegerAtLeast(
+        sessionCursor.journal_event_seq,
+        0,
+        `${path}.session_cursor.journal_event_seq`,
+      ),
+      conversation_seq: safeIntegerAtLeast(
+        sessionCursor.conversation_seq,
+        0,
+        `${path}.session_cursor.conversation_seq`,
+      ),
+      canonical_root_hash: conversationRootHash(
+        sessionCursor.canonical_root_hash,
+        `${path}.session_cursor.canonical_root_hash`,
+      ),
+      compaction_generation: safeIntegerAtLeast(
+        sessionCursor.compaction_generation,
+        0,
+        `${path}.session_cursor.compaction_generation`,
+      ),
+    },
+    execution: {
+      placement: oneOf(
+        execution.placement,
+        ["server", "edge"] as const,
+        `${path}.execution.placement`,
+      ),
+      executor_id: opaqueIdentity(execution.executor_id, `${path}.execution.executor_id`),
+      binding_generation: positiveRevision(
+        execution.binding_generation,
+        `${path}.execution.binding_generation`,
+      ),
+    },
+    workspace,
+    artifacts,
+    coverage: {
+      session_state: booleanValue(coverage.session_state, `${path}.coverage.session_state`),
+      work_state: booleanValue(coverage.work_state, `${path}.coverage.work_state`),
+      workspace: booleanValue(coverage.workspace, `${path}.coverage.workspace`),
+      run_frontier: booleanValue(coverage.run_frontier, `${path}.coverage.run_frontier`),
+      artifacts: booleanValue(coverage.artifacts, `${path}.coverage.artifacts`),
+    },
+    capabilities: {
+      can_restore_conversation: booleanValue(
+        capabilities.can_restore_conversation,
+        `${path}.capabilities.can_restore_conversation`,
+      ),
+      can_continue_in_original_environment: booleanValue(
+        capabilities.can_continue_in_original_environment,
+        `${path}.capabilities.can_continue_in_original_environment`,
+      ),
+      has_portable_workspace: booleanValue(
+        capabilities.has_portable_workspace,
+        `${path}.capabilities.has_portable_workspace`,
+      ),
+      requires_target_environment_check: booleanValue(
+        capabilities.requires_target_environment_check,
+        `${path}.capabilities.requires_target_environment_check`,
+      ),
+      requires_effect_review: booleanValue(
+        capabilities.requires_effect_review,
+        `${path}.capabilities.requires_effect_review`,
+      ),
+    },
+  };
+}
+
+export function decodeWorkRecoveryPointV1(value: unknown): WorkRecoveryPointV1 {
+  return decodeWorkRecoveryPoint(value, "work_recovery_point");
+}
+
+/** Strict decoder for the pre-capture Work/Session basis. */
+export function decodeWorkWorkspaceRecoveryBasisV1(
+  value: unknown,
+): WorkWorkspaceRecoveryBasisV1 {
+  const path = "work_workspace_recovery_basis";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "logical_workspace_id",
+      "work_revision",
+      "branch_revision",
+      "graph_revision",
+      "context_head_hash",
+      "execution_binding_hash",
+      "session_cursor",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const sessionCursor = exactObject(
+    object.session_cursor,
+    [
+      "completed_turn",
+      "journal_event_seq",
+      "conversation_seq",
+      "canonical_root_hash",
+      "compaction_generation",
+    ],
+    `${path}.session_cursor`,
+  );
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    logical_workspace_id: opaqueIdentity(
+      object.logical_workspace_id,
+      `${path}.logical_workspace_id`,
+    ),
+    work_revision: positiveRevision(object.work_revision, `${path}.work_revision`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    graph_revision: positiveRevision(object.graph_revision, `${path}.graph_revision`),
+    context_head_hash: contentHash(object.context_head_hash, `${path}.context_head_hash`),
+    execution_binding_hash: contentHash(
+      object.execution_binding_hash,
+      `${path}.execution_binding_hash`,
+    ),
+    session_cursor: {
+      completed_turn: boundedCount(
+        sessionCursor.completed_turn,
+        Number.MAX_SAFE_INTEGER,
+        `${path}.session_cursor.completed_turn`,
+      ),
+      journal_event_seq: safeIntegerAtLeast(
+        sessionCursor.journal_event_seq,
+        0,
+        `${path}.session_cursor.journal_event_seq`,
+      ),
+      conversation_seq: safeIntegerAtLeast(
+        sessionCursor.conversation_seq,
+        0,
+        `${path}.session_cursor.conversation_seq`,
+      ),
+      canonical_root_hash: conversationRootHash(
+        sessionCursor.canonical_root_hash,
+        `${path}.session_cursor.canonical_root_hash`,
+      ),
+      compaction_generation: safeIntegerAtLeast(
+        sessionCursor.compaction_generation,
+        0,
+        `${path}.session_cursor.compaction_generation`,
+      ),
+    },
+  };
+}
+
+/** Strict decoder for a Work-owned, content-addressed workspace package. */
+export function decodeWorkWorkspaceRecoveryArtifactV1(
+  value: unknown,
+): WorkWorkspaceRecoveryArtifactV1 {
+  const path = "work_workspace_recovery_artifact";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "artifact_id",
+      "sealed",
+      "verified",
+      "snapshot_id",
+      "manifest_hash",
+      "content_root",
+      "content_digest",
+      "byte_size",
+      "chunk_count",
+      "snapshot_manifest",
+      "blobs",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const chunkCount = safeIntegerAtLeast(object.chunk_count, 0, `${path}.chunk_count`);
+  const byteSize = safeIntegerAtLeast(object.byte_size, 0, `${path}.byte_size`);
+  if (
+    object.snapshot_manifest === null ||
+    typeof object.snapshot_manifest !== "object" ||
+    Array.isArray(object.snapshot_manifest)
+  ) {
+    throw new TypeError(`${path}.snapshot_manifest must be a JSON object`);
+  }
+  if (!Array.isArray(object.blobs)) {
+    throw new TypeError(`${path}.blobs must be an array`);
+  }
+  const blobs = object.blobs.map((value, index): WorkWorkspaceRecoveryBlobV1 => {
+    const blobPath = `${path}.blobs[${index}]`;
+    const blob = exactObject(
+      value,
+      ["chunk_index", "blob_ref", "digest", "byte_size"],
+      blobPath,
+    );
+    const chunkIndex = safeIntegerAtLeast(blob.chunk_index, 0, `${blobPath}.chunk_index`);
+    const blobRef = opaqueIdentity(blob.blob_ref, `${blobPath}.blob_ref`);
+    if (blobRef.length > 512) {
+      throw new TypeError(`${blobPath}.blob_ref is too long`);
+    }
+    return {
+      chunk_index: chunkIndex,
+      blob_ref: blobRef,
+      digest: contentHash(blob.digest, `${blobPath}.digest`),
+      byte_size: safeIntegerAtLeast(blob.byte_size, 0, `${blobPath}.byte_size`),
+    };
+  });
+  for (let index = 0; index < blobs.length; index += 1) {
+    if (blobs[index]?.chunk_index !== index) {
+      throw new TypeError(`${path}.blobs must have contiguous chunk indexes`);
+    }
+    if (index > 0 && blobs[index - 1]?.blob_ref >= blobs[index]?.blob_ref) {
+      throw new TypeError(`${path}.blobs must be in canonical blob_ref order`);
+    }
+    if (index > 0 && blobs[index - 1]?.digest === blobs[index]?.digest) {
+      throw new TypeError(`${path}.blobs must not repeat a digest`);
+    }
+  }
+  if (blobs.length !== chunkCount) {
+    throw new TypeError(`${path}.blobs must match chunk_count`);
+  }
+  const totalSize = blobs.reduce((total, blob) => {
+    const next = total + blob.byte_size;
+    if (!Number.isSafeInteger(next)) {
+      throw new TypeError(`${path}.blobs total byte size is not a safe integer`);
+    }
+    return next;
+  }, 0);
+  if (totalSize !== byteSize) {
+    throw new TypeError(`${path}.blobs must match byte_size`);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    artifact_id: resourceIdentity(object.artifact_id, `${path}.artifact_id`),
+    sealed: booleanValue(object.sealed, `${path}.sealed`),
+    verified: booleanValue(object.verified, `${path}.verified`),
+    snapshot_id: opaqueIdentity(object.snapshot_id, `${path}.snapshot_id`),
+    manifest_hash: contentHash(object.manifest_hash, `${path}.manifest_hash`),
+    content_root: contentHash(object.content_root, `${path}.content_root`),
+    content_digest: contentHash(object.content_digest, `${path}.content_digest`),
+    byte_size: byteSize,
+    chunk_count: chunkCount,
+    snapshot_manifest: object.snapshot_manifest as Record<string, unknown>,
+    blobs,
+  };
+}
+
+/** Strict decoder for an idempotent workspace package chunk upload receipt. */
+export function decodeWorkWorkspaceRecoveryChunkReceiptV1(
+  value: unknown,
+): WorkWorkspaceRecoveryChunkReceiptV1 {
+  const path = "work_workspace_recovery_chunk_receipt";
+  const object = exactObject(
+    value,
+    ["schema_version", "artifact_id", "digest", "byte_size", "inserted"],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  return {
+    schema_version: 1,
+    artifact_id: resourceIdentity(object.artifact_id, `${path}.artifact_id`),
+    digest: contentHash(object.digest, `${path}.digest`),
+    byte_size: safeIntegerAtLeast(object.byte_size, 0, `${path}.byte_size`),
+    inserted: booleanValue(object.inserted, `${path}.inserted`),
+  };
+}
+
+export function decodeWorkRecoveryPointPageV1(value: unknown): WorkRecoveryPointPageV1 {
+  const path = "work_recovery_point_page";
+  const object = exactObject(
+    value,
+    ["schema_version", "work_id", "branch_id", "points", "next_cursor"],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  if (!Array.isArray(object.points) || object.points.length > 256) {
+    throw new TypeError(`${path}.points must contain at most 256 entries`);
+  }
+  const points = object.points.map((point, index) =>
+    decodeWorkRecoveryPoint(point, `${path}.points[${index}]`),
+  );
+  const pointIds = new Set<string>();
+  for (const point of points) {
+    if (point.work_id !== resourceIdentity(object.work_id, `${path}.work_id`)) {
+      throw new TypeError(`${path}.points contain a different Work identity`);
+    }
+    if (point.branch_id !== resourceIdentity(object.branch_id, `${path}.branch_id`)) {
+      throw new TypeError(`${path}.points contain a different branch identity`);
+    }
+    if (pointIds.has(point.recovery_point_id)) {
+      throw new TypeError(`${path}.points contain a duplicate recovery point`);
+    }
+    pointIds.add(point.recovery_point_id);
+  }
+  const workId = resourceIdentity(object.work_id, `${path}.work_id`);
+  const branchId = resourceIdentity(object.branch_id, `${path}.branch_id`);
+  let nextCursor: WorkRecoveryPointPageV1["next_cursor"] = null;
+  if (object.next_cursor !== null) {
+    const cursor = exactObject(
+      object.next_cursor,
+      ["created_at", "recovery_point_id"],
+      `${path}.next_cursor`,
+    );
+    nextCursor = {
+      created_at: timestamp(cursor.created_at, `${path}.next_cursor.created_at`),
+      recovery_point_id: opaqueIdentity(
+        cursor.recovery_point_id,
+        `${path}.next_cursor.recovery_point_id`,
+      ),
+    };
+  }
+  return {
+    schema_version: 1,
+    work_id: workId,
+    branch_id: branchId,
+    points,
+    next_cursor: nextCursor,
+  };
+}
+
 type WireObject = Record<string, unknown>;
+
+function objectWithAllowedKeys(
+  value: unknown,
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[],
+  path: string,
+): WireObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${path} must be an object`);
+  }
+  const object = value as WireObject;
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  if (Object.keys(object).some((key) => !allowed.has(key))) {
+    throw new TypeError(`${path} has an unsupported field set`);
+  }
+  for (const key of requiredKeys) {
+    if (!Object.prototype.hasOwnProperty.call(object, key)) {
+      throw new TypeError(`${path}.${key} is required`);
+    }
+  }
+  return object;
+}
+
+function decodeWorkBranchInteraction(
+  value: unknown,
+  path: string,
+): WorkBranchInteractionV1 {
+  const object = objectWithAllowedKeys(
+    value,
+    ["schema_version", "work_id", "branch_id", "run_id", "request_id", "kind"],
+    ["tool", "approval_kind", "path", "detail", "display_label", "prompt"],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const kind = object.kind;
+  if (kind !== "approval" && kind !== "user_prompt") {
+    throw new TypeError(`${path}.kind is unsupported`);
+  }
+  const decodeOptionalString = (key: string): string | undefined => {
+    const value = object[key];
+    if (value === undefined) return undefined;
+    return nonEmptyString(value, `${path}.${key}`);
+  };
+  const interaction: WorkBranchInteractionV1 = {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    run_id: opaqueIdentity(object.run_id, `${path}.run_id`),
+    request_id: opaqueIdentity(object.request_id, `${path}.request_id`),
+    kind,
+  };
+  for (const key of ["tool", "approval_kind", "path", "detail", "display_label"] as const) {
+    const decoded = decodeOptionalString(key);
+    if (decoded !== undefined) interaction[key] = decoded;
+  }
+  if (Object.prototype.hasOwnProperty.call(object, "prompt")) {
+    interaction.prompt = object.prompt;
+  }
+  if (kind === "approval" && (!interaction.tool || !interaction.approval_kind)) {
+    throw new TypeError(`${path} approval is missing tool or approval_kind`);
+  }
+  if (kind === "user_prompt" && interaction.prompt === undefined) {
+    throw new TypeError(`${path} user_prompt is missing prompt`);
+  }
+  return interaction;
+}
+
+export function decodeWorkBranchInteractionPageV1(
+  value: unknown,
+): WorkBranchInteractionPageV1 {
+  const path = "work_branch_interactions";
+  const object = exactObject(value, ["schema_version", "work_id", "branch_id", "interactions"], path);
+  if (object.schema_version !== 1) throw new TypeError(`${path}.schema_version must be 1`);
+  if (!Array.isArray(object.interactions)) throw new TypeError(`${path}.interactions must be an array`);
+  const workId = resourceIdentity(object.work_id, `${path}.work_id`);
+  const branchId = resourceIdentity(object.branch_id, `${path}.branch_id`);
+  const interactions = object.interactions.map((item, index) => {
+    const interaction = decodeWorkBranchInteraction(item, `${path}.interactions[${index}]`);
+    if (interaction.work_id !== workId || interaction.branch_id !== branchId) {
+      throw new TypeError(`${path}.interactions[${index}] belongs to a different Work branch`);
+    }
+    return interaction;
+  });
+  return { schema_version: 1, work_id: workId, branch_id: branchId, interactions };
+}
+
+export function decodeWorkBranchInteractionReceiptV1(
+  value: unknown,
+): WorkBranchInteractionReceiptV1 {
+  const path = "work_interaction_receipt";
+  const object = exactObject(
+    value,
+    ["schema_version", "work_id", "branch_id", "run_id", "request_id", "outcome"],
+    path,
+  );
+  if (object.schema_version !== 1) throw new TypeError(`${path}.schema_version must be 1`);
+  const outcome = object.outcome;
+  if (
+    outcome !== "resolved" &&
+    outcome !== "idempotent" &&
+    outcome !== "queued" &&
+    outcome !== "authority_lost" &&
+    outcome !== "superseded"
+  ) {
+    throw new TypeError(`${path}.outcome is unsupported`);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    run_id: opaqueIdentity(object.run_id, `${path}.run_id`),
+    request_id: opaqueIdentity(object.request_id, `${path}.request_id`),
+    outcome: outcome as WorkInteractionResolutionOutcomeV1,
+  };
+}
 
 function exactObject(
   value: unknown,
@@ -390,6 +1028,14 @@ function contentHash(value: unknown, path: string): WorkContentHash {
     throw new TypeError(`${path} must be a canonical SHA-256 content hash`);
   }
   return parsed as WorkContentHash;
+}
+
+function conversationRootHash(value: unknown, path: string): string {
+  const parsed = nonEmptyString(value, path);
+  if (!/^[0-9a-f]{64}$/u.test(parsed)) {
+    throw new TypeError(`${path} must be a canonical conversation root hash`);
+  }
+  return parsed;
 }
 
 function timestamp(value: unknown, path: string): string {
@@ -1131,6 +1777,7 @@ const EVENT_KINDS = [
   "run_delegated",
   "run_failed",
   "run_cancelled",
+  "recovery_point_captured",
   "runtime_events_expired",
 ] as const satisfies readonly WorkEventKind[];
 
@@ -4297,6 +4944,8 @@ const WORK_TURN_RUNTIME_EVENT_TYPES: Record<
   agent_interrupted: true,
   task_board_snapshot: true,
   tool_approval_request: true,
+  approval_required: true,
+  user_prompt_required: true,
   ping: true,
   device_revoked: true,
   device_lease_expired: true,

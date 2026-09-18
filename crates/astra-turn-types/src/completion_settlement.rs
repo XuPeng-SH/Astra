@@ -36,7 +36,10 @@ pub struct CompletionSettlementState {
     /// checkpoints default to zero so they never gain repair authority.
     #[serde(default)]
     pub outcome_reconciliation_schema_corrections_remaining: u8,
-    /// Evidence-linked model interpretation accepted for the active boundary.
+    /// Structurally valid evidence-linked model interpretation observed for the
+    /// active boundary.  Executor evidence validation may still reject it;
+    /// retaining that candidate lets the terminal coverage reducer expose the
+    /// exact rejection instead of reporting a misleading missing assessment.
     /// This does not replace execution facts or deterministic verifier receipts.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub outcome_reconciliation_assessment: Option<crate::task_resolution::TaskResolutionAssessment>,

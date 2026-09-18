@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
@@ -2232,12 +2232,27 @@ pub(crate) async fn accept_task_resolution_after_tool_round(
     {
         return;
     }
-    let Some(assessment) = submission.result_full.as_deref().and_then(|payload| {
+    let Some(assessment) = [
+        submission.result_full.as_deref(),
+        submission.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|payload| {
         serde_json::from_str::<astra_turn_types::task_resolution::TaskResolutionAssessment>(payload)
             .ok()
     }) else {
         return;
     };
+    // Keep a structurally valid submission in the settlement state even when
+    // the executor rejects one of its evidence references.  Coverage performs
+    // the same validation at the terminal boundary and can then report the
+    // precise rejection (for example, `evidence_not_later_execution`) instead
+    // of collapsing a submitted assessment into `missing_assessment`.
+    state
+        .hooks
+        .completion_settlement
+        .outcome_reconciliation_assessment = Some(assessment.clone());
     let evidence = state
         .stall
         .runtime_policy_evaluation
@@ -2267,10 +2282,6 @@ pub(crate) async fn accept_task_resolution_after_tool_round(
                 "remaining_gaps": assessment.remaining_gaps,
                 "instruction": "The referenced execution evidence passed integrity validation. This remains your task assessment, not a machine verification receipt. Give the user an accurate final report and retain any remaining gaps; runtime checks final coverage separately.",
             }));
-            state
-                .hooks
-                .completion_settlement
-                .outcome_reconciliation_assessment = Some(assessment);
         }
         Err(error) => {
             tracing::warn!(
@@ -2354,6 +2365,101 @@ impl TaskResolutionCoverage {
     }
 }
 
+/// Project the full outcome ledger into the subset that can change the
+/// authority of a completed turn.  The policy ledger deliberately retains
+/// every unresolved outcome for audit and model explanation; completion must
+/// apply a narrower semantic rule so an optional diagnostic probe cannot make
+/// an otherwise useful answer resumably incomplete.
+///
+/// This is intentionally based on executor-owned records and shared command
+/// classifiers, rather than a list of command names.  A failure remains
+/// terminally relevant when its invocation may have changed the bound
+/// workspace, is a recognized validation operation, targets declared external
+/// state, represents unfinished orchestration, or cannot be joined back to a
+/// durable invocation record.  Everything else remains visible evidence but
+/// is advisory for completion settlement.
+fn terminally_relevant_unresolved_tool_outcomes(
+    state: &AgenticLoopState,
+) -> BTreeMap<
+    astra_turn_core::evaluation::EvaluationOutcomeKey,
+    astra_turn_core::evaluation::UnresolvedToolOutcome,
+> {
+    state
+        .stall
+        .runtime_policy_evaluation
+        .unresolved_tool_outcomes()
+        .into_iter()
+        .filter(|(_, failure)| unresolved_tool_outcome_is_terminally_relevant(state, failure))
+        .collect()
+}
+
+fn unresolved_tool_outcome_is_terminally_relevant(
+    state: &AgenticLoopState,
+    failure: &astra_turn_core::evaluation::UnresolvedToolOutcome,
+) -> bool {
+    if matches!(
+        failure.result_class.as_str(),
+        astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE
+            | astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_FANOUT_INCOMPLETE
+    ) {
+        return true;
+    }
+
+    // A missing execution reference means the runtime cannot prove what
+    // failed or whether a later record superseded it.  Completion therefore
+    // fails closed instead of guessing that the outcome was incidental.
+    let Some(reference) = failure.invocation.as_ref() else {
+        return true;
+    };
+    let Some(record) = state
+        .stall
+        .tool_call_records
+        .iter()
+        .find(|record| record.execution_completion.as_ref() == Some(reference))
+    else {
+        return true;
+    };
+
+    if astra_turn_core::evaluation::normalize_validation_prefix(
+        &record.name,
+        record.authoritative_args_full().unwrap_or(""),
+    )
+    .is_some()
+    {
+        return true;
+    }
+
+    // The shared action-aware classifier is the canonical mutation boundary:
+    // memory writes, direct/provider writers, and opaque tools fail closed.
+    // Only an executor-owned proof that every target is external scratch can
+    // downgrade that mutation risk for this completion projection.
+    let external_scratch = record_is_proven_external_scratch_mutation(
+        state.hooks.workspace_root_hint.as_deref(),
+        record,
+    );
+    if astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
+        record,
+        &failure.result_class,
+    ) && !external_scratch
+    {
+        return true;
+    }
+
+    if tool_record_may_have_mutated_bound_workspace(
+        state.hooks.workspace_root_hint.as_deref(),
+        record,
+    ) {
+        return true;
+    }
+
+    // External state has its own completion receipt.  A failed invocation in
+    // that scope cannot be treated like a harmless local observation even when
+    // the provider returned a generic execution error.
+    record.external_effect_scope.as_deref()
+        == Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
+        || external_effect_scope_from_record(record).is_some()
+}
+
 async fn task_resolution_covers_current_outcomes(
     state: &AgenticLoopState,
     current_boundary: Option<&str>,
@@ -2379,10 +2485,7 @@ async fn task_resolution_covers_current_outcomes(
             "task resolution boundary is stale");
         return TaskResolutionCoverage::StaleBoundary;
     }
-    let failures = state
-        .stall
-        .runtime_policy_evaluation
-        .unresolved_tool_outcomes();
+    let failures = terminally_relevant_unresolved_tool_outcomes(state);
     if failures.is_empty() {
         return TaskResolutionCoverage::NoUnresolvedFailures;
     }
@@ -2486,21 +2589,60 @@ async fn task_resolution_covers_current_outcomes(
 
 /// Give a candidate final answer one bounded rewrite when the structured
 /// execution ledger still reports a persistent unresolved outcome.
+///
+/// Read-only exploratory work (for example a code review or diagnosis) may
+/// legitimately contain a failed probe.  The probe remains durable evidence
+/// and the model must report it, but it is not an execution contract that can
+/// safely turn a normal answer into `ExecutionIncomplete`.  Mutating work and
+/// explicit verification contracts retain the stricter reconciliation path,
+/// including when their profile is also marked exploratory.
+fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool {
+    !state.task_profile.exploratory_task
+        || state.task_profile.mutates_workspace
+        || state.task_profile.verification_required
+        || requires_external_effect_completion(state)
+        || state
+            .turn_intent
+            .as_ref()
+            .is_some_and(|intent| intent.browser_verification_required)
+}
+
 fn enforce_outcome_reconciliation_before_text_completion(
     state: &mut AgenticLoopState,
     current_boundary: Option<&str>,
 ) -> bool {
+    let all_failures = state
+        .stall
+        .runtime_policy_evaluation
+        .unresolved_tool_outcomes();
+    let terminal_failures = terminally_relevant_unresolved_tool_outcomes(state);
+    let has_reconciliation_signal = if all_failures.is_empty() {
+        // A stale policy signal without retained records cannot be classified;
+        // preserve the existing fail-closed behavior until the ledger is
+        // available again.
+        crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
+            &state.stall.active_policy_feedback,
+        ) || state
+            .stall
+            .runtime_policy_evaluation
+            .has_task_resolution_candidate()
+    } else if terminal_failures.is_empty() {
+        false
+    } else {
+        crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
+            &state.stall.active_policy_feedback,
+        ) || state
+            .stall
+            .runtime_policy_evaluation
+            .has_task_resolution_candidate_for(&terminal_failures)
+    };
     if state
         .hooks
         .completion_settlement
         .outcome_reconciliation_retries
         > 0
-        || !(crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
-            &state.stall.active_policy_feedback,
-        ) || state
-            .stall
-            .runtime_policy_evaluation
-            .has_task_resolution_candidate())
+        || !outcome_reconciliation_required_for_profile(state)
+        || !has_reconciliation_signal
     {
         return false;
     }
@@ -2587,6 +2729,7 @@ fn enforce_persistent_unresolved_outcome_terminal(
     state: &mut AgenticLoopState,
     coverage: &TaskResolutionCoverage,
 ) -> bool {
+    let terminal_failures = terminally_relevant_unresolved_tool_outcomes(state);
     if state
         .hooks
         .completion_settlement
@@ -2594,11 +2737,7 @@ fn enforce_persistent_unresolved_outcome_terminal(
         == 0
         || coverage.is_covered()
         || state.interruption.is_some()
-        || state
-            .stall
-            .runtime_policy_evaluation
-            .unresolved_tool_outcomes()
-            .is_empty()
+        || terminal_failures.is_empty()
     {
         return false;
     }
@@ -2607,11 +2746,7 @@ fn enforce_persistent_unresolved_outcome_terminal(
         target: "astra::task_resolution",
         run_id = ?state.current_run_id,
         coverage_reason = coverage.reason_code(),
-        unresolved_count = state
-            .stall
-            .runtime_policy_evaluation
-            .unresolved_tool_outcomes()
-            .len(),
+        unresolved_count = terminal_failures.len(),
         "persistent tool outcome remains uncovered at completion"
     );
 
@@ -7097,6 +7232,7 @@ pub(crate) fn completion_action_hint_for_state(
 ) -> serde_json::Value {
     let mut hint = completion_action_hint(action);
     if matches!(action, CompletionAction::OutcomeReconciliation { .. }) {
+        let terminal_failures = terminally_relevant_unresolved_tool_outcomes(state);
         hint["carrier"] = serde_json::json!({
             "tool": astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
             "name": "submit_task_resolution",
@@ -7107,16 +7243,10 @@ pub(crate) fn completion_action_hint_for_state(
         hint["execution_evidence"] = state
             .stall
             .runtime_policy_evaluation
-            .task_resolution_hint_evidence();
-        hint["unresolved_count"] = serde_json::json!(
-            state
-                .stall
-                .runtime_policy_evaluation
-                .unresolved_tool_outcomes()
-                .len()
-        );
+            .task_resolution_hint_evidence_for(&terminal_failures);
+        hint["unresolved_count"] = serde_json::json!(terminal_failures.len());
         hint["coverage_requirement"] = serde_json::json!(
-            "Each displayed execution list is bounded to 32, not necessarily complete. A supported submission must cover every unresolved failure; otherwise use partial or unknown and retain the remaining gaps."
+            "Each displayed execution list is bounded to 32, not necessarily complete. A supported submission must cover every terminally relevant unresolved failure; advisory diagnostic failures remain in the execution evidence and final report but do not block completion."
         );
     }
     if matches!(action, CompletionAction::RequiredExternalEffect)
@@ -15162,7 +15292,7 @@ mod tests {
 
     #[test]
     fn active_external_effect_window_accepts_typed_memory_receipt_capability() {
-        use astra_config::user_profile::{TurnIntent, TurnIntentDomain};
+        use astra_config::user_profile::TurnIntent;
 
         let mut state = external_effect_admission_state(
             astra_config::user_profile::MutationCompletionScope::External,
@@ -16102,8 +16232,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let name = if ok { "read_file" } else { "grep" };
-            let args = serde_json::json!({"path": target});
+            let name = if ok { "read_file" } else { "bash" };
+            let args = if ok {
+                serde_json::json!({"path": target})
+            } else {
+                // A failed validation command is a completion-critical
+                // outcome; a generic read-only probe is intentionally not.
+                serde_json::json!({"command": "cargo test --test artifact"})
+            };
             let identity =
                 ToolInvocationIdentity::new("user", "session", "run", "chain", id).unwrap();
             let decision =
@@ -16213,6 +16349,34 @@ mod tests {
                 &state.stall.active_policy_feedback
             )
         );
+        let original_profile = state.task_profile;
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        assert!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .has_task_resolution_candidate(),
+            "the producer must expose the later observation candidate"
+        );
+        assert!(
+            !enforce_outcome_reconciliation_before_text_completion(&mut state, Some(&boundary)),
+            "a read-only exploratory candidate remains advisory"
+        );
+        assert_eq!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .len(),
+            1,
+            "advisory handling must retain the failed execution fact"
+        );
+        state.task_profile = original_profile;
         assert!(
             enforce_outcome_reconciliation_before_text_completion(&mut state, Some(&boundary)),
             "changed-command success must open assessment even with Observe feedback"
@@ -16228,6 +16392,64 @@ mod tests {
             .as_str()
             .expect("the submission surface must expose a usable evidence identity");
         assert_eq!(candidate_id, "later");
+
+        // A syntactically valid submission can still fail evidence validation.
+        // Keep that interpretation available to the terminal reducer so the
+        // user gets the actual coverage reason instead of `missing_assessment`.
+        let invalid_assessment = TaskResolutionAssessment {
+            scope: "chain".into(),
+            boundary_id: boundary.clone(),
+            verification_target: "artifact".into(),
+            failed_call_ids: vec!["unknown-failure".into()],
+            evidence_call_ids: vec![candidate_id.into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "The evidence reference is intentionally invalid for this regression test."
+                .into(),
+            remaining_gaps: vec![],
+        };
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: CompletionAction::OutcomeReconciliation {
+                    boundary_id: boundary.clone(),
+                },
+                consumed: true,
+                matched: true,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 1,
+            });
+        let invalid_submission_start = state.stall.tool_call_records.len();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "submit_task_resolution".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            // The full result can be absent after a lossy transport/replay;
+            // an exact, bounded preview is still a valid structured carrier.
+            result_preview: Some(serde_json::to_string(&invalid_assessment).unwrap()),
+            ..Default::default()
+        });
+        accept_task_resolution_after_tool_round(
+            &mut state,
+            invalid_submission_start,
+            Some(&boundary),
+        )
+        .await;
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_assessment
+                .is_some()
+        );
+        let invalid_coverage =
+            task_resolution_covers_current_outcomes(&state, Some(&boundary)).await;
+        assert_eq!(invalid_coverage.reason_code(), "failure_not_covered");
+        assert!(!invalid_coverage.is_covered());
+        state.stall.tool_call_records.pop();
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_assessment = None;
+
         let assessment = TaskResolutionAssessment {
             scope: "chain".into(),
             boundary_id: boundary.clone(),
@@ -16612,6 +16834,367 @@ mod tests {
         assert!(!enforce_outcome_reconciliation_before_text_completion(
             &mut state, None
         ));
+    }
+
+    #[test]
+    fn exploratory_diagnostic_failure_remains_advisory_without_execution_warning() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(!enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            0,
+            "a read-only diagnostic must not spend an execution-reconciliation retry"
+        );
+        assert!(state.interruption.is_none());
+    }
+
+    #[test]
+    fn strict_profile_keeps_read_only_probe_advisory_when_ledger_is_complete() {
+        use astra_turn_types::ToolInvocationIdentity;
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+
+        fn edge_reference(id: &str) -> ToolExecutionEvidenceRef {
+            ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+                identity: ToolInvocationIdentity::new("user", "session", "run", "chain", id)
+                    .expect("valid test invocation identity"),
+                edge_agent_id: "edge-1".into(),
+                result_hash: format!("hash-{id}"),
+            })
+        }
+
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(serde_json::json!({"command": "lsof -p 1"}).to_string()),
+                round: Some(1),
+                execution_completion: Some(edge_reference("probe")),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                args_full: Some(serde_json::json!({"path": "README.md"}).to_string()),
+                round: Some(2),
+                execution_completion: Some(edge_reference("read")),
+                disposition: Some(ToolCallDisposition::Executed),
+                result_class: Some("success".into()),
+                exit_semantics: Some("success".into()),
+                ..Default::default()
+            },
+        ];
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            2,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap();
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 2,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 2,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert_eq!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .len(),
+            1,
+            "the failed probe remains durable evidence"
+        );
+        assert!(!enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            0,
+            "an incidental read-only probe must not block a strict task"
+        );
+    }
+
+    #[test]
+    fn memory_mutation_failure_remains_terminal_after_prior_success() {
+        use astra_config::user_profile::TurnIntent;
+        use astra_turn_types::ToolInvocationIdentity;
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+
+        fn edge_reference(id: &str) -> ToolExecutionEvidenceRef {
+            ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+                identity: ToolInvocationIdentity::new("user", "session", "run", "chain", id)
+                    .expect("valid test invocation identity"),
+                edge_agent_id: "edge-1".into(),
+                result_hash: format!("hash-{id}"),
+            })
+        }
+
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        // Deliberately omit the Memory routing domain: mutation criticality
+        // comes from the canonical action-aware tool classifier, not a
+        // caller-provided domain label.
+        state.turn_intent = Some(TurnIntent::default());
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "memory".into(),
+                ok: true,
+                args_full: Some(
+                    serde_json::json!({"action": "remember", "content": "fact"}).to_string(),
+                ),
+                round: Some(1),
+                execution_completion: Some(edge_reference("remember")),
+                disposition: Some(ToolCallDisposition::Executed),
+                result_class: Some("success".into()),
+                exit_semantics: Some("success".into()),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "memory".into(),
+                ok: false,
+                args_full: Some(
+                    serde_json::json!({"action": "forget", "query": "fact"}).to_string(),
+                ),
+                round: Some(2),
+                execution_completion: Some(edge_reference("forget")),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+        ];
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            2,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap();
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 2,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 2,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "a failed external memory mutation cannot be discharged by an earlier success"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_mutation_failure_fails_closed_for_completion() {
+        use astra_turn_types::ToolInvocationIdentity;
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+
+        let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+            identity: ToolInvocationIdentity::new(
+                "user",
+                "session",
+                "run",
+                "chain",
+                "provider-write",
+            )
+            .expect("valid test invocation identity"),
+            edge_agent_id: "edge-1".into(),
+            result_hash: "hash-provider-write".into(),
+        });
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "mcp__service__write".into(),
+            ok: false,
+            args_full: Some(serde_json::json!({"value": "fact"}).to_string()),
+            round: Some(1),
+            execution_completion: Some(reference),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            1,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap();
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 1,
+            "evaluated_at_round": 1,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 1,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "unknown/provider mutation must remain fail-closed without a receipt"
+        );
+    }
+
+    #[test]
+    fn mutating_exploratory_failure_keeps_terminal_reconciliation() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "a mutating task keeps the strict terminal evidence path"
+        );
+    }
+
+    #[test]
+    fn external_mutation_exploration_keeps_terminal_reconciliation() {
+        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
+
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(MutationCompletionScope::External),
+        );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "external mutation remains an execution contract even in exploratory mode"
+        );
     }
 
     #[tokio::test]
@@ -19691,6 +20274,35 @@ mod tests {
 
         assert!(!has_executed_positive_workspace_mutation(&state));
         assert_eq!(pending_completion_action(&state).unwrap(), None);
+    }
+
+    #[test]
+    fn unchanged_bash_receipt_does_not_prove_external_persistent_write_is_scratch() {
+        let receipt =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            )
+            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+            .cloned();
+        let command = "printf x >> /outside/persistent-state; exit 1";
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            args_full: Some(serde_json::json!({"command": command}).to_string()),
+            runtime_args_full: Some(serde_json::json!({"command": command}).to_string()),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt: receipt,
+            ..ToolCallRecord::default()
+        };
+
+        assert!(crate::turn::agentic_loop::lifecycle::is_authoritative_unchanged_bash_observation_record(&record));
+        assert!(
+            !record_is_proven_external_scratch_mutation(Some("/workspace"), &record),
+            "a bound-workspace no-change fact cannot clear an untracked persistent external effect"
+        );
     }
 
     #[test]

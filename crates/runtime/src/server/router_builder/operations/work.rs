@@ -33,6 +33,42 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::work_handlers::get_work_branch_execution_handler),
         )
         .route(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points",
+            get(crate::server::work_handlers::get_work_branch_recovery_points_handler)
+                .post(crate::server::work_handlers::post_work_branch_recovery_point_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts",
+            post(crate::server::work_handlers::post_work_workspace_recovery_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-basis",
+            get(crate::server::work_handlers::get_work_workspace_recovery_basis_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}",
+            get(crate::server::work_handlers::get_work_workspace_recovery_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/chunks/{digest}",
+            get(crate::server::work_handlers::get_work_workspace_recovery_chunk_handler)
+                .put(crate::server::work_handlers::put_work_workspace_recovery_chunk_handler)
+                // The workspace snapshot contract uploads one complete file
+                // blob per request. Override the process-wide JSON limit for
+                // this route with the same bound enforced by the manifest.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    astra_runtime_env::WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES,
+                )),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/workspace-recovery-artifacts/{artifact_id}/seal",
+            post(crate::server::work_handlers::post_work_workspace_recovery_artifact_seal_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}",
+            get(crate::server::work_handlers::get_work_branch_recovery_point_handler),
+        )
+        .route(
             "/v1/works/{work_id}/branches/{branch_id}/execution/targets",
             get(crate::server::work_handlers::get_work_branch_execution_targets_handler),
         )
@@ -71,6 +107,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/v1/works/{work_id}/branches/{branch_id}/turns",
             post(crate::server::work_handlers::post_work_branch_turn_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/interactions",
+            get(crate::server::work_handlers::get_work_branch_interactions_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/interactions/respond",
+            post(crate::server::work_handlers::post_work_branch_interaction_handler),
         )
         .route(
             "/v1/works/{work_id}/branches/{branch_id}/actions",
