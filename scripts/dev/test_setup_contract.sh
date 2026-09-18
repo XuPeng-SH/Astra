@@ -8,6 +8,8 @@ test_root="$(mktemp -d "${TMPDIR:-/tmp}/astra-setup-contract.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
 # shellcheck source=../lib/api_identity.sh
 . "$repo_root/scripts/lib/api_identity.sh"
+# shellcheck source=../lib/api_process_identity.sh
+. "$repo_root/scripts/lib/api_process_identity.sh"
 
 # Keep the contract deterministic when a developer's shell already exports
 # stack configuration. Individual precedence cases set their own overrides.
@@ -204,6 +206,7 @@ if PATH="$test_root:$PATH" api_health_identity_mismatch_from_url "$identity_sha"
     exit 1
 fi
 stop_api="$repo_root/scripts/dev/stop-api.sh"
+process_identity="$repo_root/scripts/lib/api_process_identity.sh"
 if ! grep -Fq 'process_is_this_checkout' "$start_api" ||
     ! grep -Fq 'checkout_is_clean' "$start_api" ||
     grep -Fq 'pgrep -x "astra-server"' "$stop_api" ||
@@ -214,6 +217,41 @@ fi
 if ! grep -Fq 'ASTRA_ENV_FILE' "$stop_api" ||
     ! grep -Fq 'ASTRA_API_PORT' "$stop_api"; then
     echo "setup contract failed: API stop does not resolve the same configured port as start" >&2
+    exit 1
+fi
+if ! grep -Fq 'api_process_identity.sh' "$stop_api" ||
+    ! grep -Fq 'lsof -a -p "$pid" -d txt' "$process_identity" ||
+    ! grep -Fq 'basename "$executable"' "$process_identity" ||
+    ! grep -Fq 'ps -p "$pid" -o command=' "$process_identity"; then
+    echo "setup contract failed: API stop cannot identify macOS astra-server executables after a branch switch" >&2
+    exit 1
+fi
+fake_process_bin="$test_root/fake-process-bin"
+mkdir -p "$fake_process_bin"
+cat > "$fake_process_bin/lsof" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_LSOF_EXECUTABLE:-}" ]]; then
+    printf 'n%s\n' "$FAKE_LSOF_EXECUTABLE"
+fi
+EOF
+cat > "$fake_process_bin/ps" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_PS_COMMAND:-}"
+EOF
+chmod +x "$fake_process_bin/lsof" "$fake_process_bin/ps"
+if ! PATH="$fake_process_bin:$PATH" FAKE_LSOF_EXECUTABLE=/tmp/target/debug/astra-server \
+    api_process_is_astra_server 999999; then
+    echo "setup contract failed: an executable astra-server path was not recognized" >&2
+    exit 1
+fi
+if PATH="$fake_process_bin:$PATH" FAKE_PS_COMMAND='python3 unrelated_server.py --label astra-server' \
+    api_process_is_astra_server 999999; then
+    echo "setup contract failed: an unrelated command argument was treated as the API executable" >&2
+    exit 1
+fi
+if ! PATH="$fake_process_bin:$PATH" FAKE_PS_COMMAND='/tmp/other-checkout/target/debug/astra-server --port 17001' \
+    api_process_is_astra_server 999999; then
+    echo "setup contract failed: a full astra-server executable path was not recognized" >&2
     exit 1
 fi
 

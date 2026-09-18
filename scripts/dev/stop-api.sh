@@ -5,6 +5,8 @@
 
 PID_FILE="api_server.pid"
 REPO_ROOT="$(pwd -P)"
+# shellcheck source=../lib/api_process_identity.sh
+. "$REPO_ROOT/scripts/lib/api_process_identity.sh"
 STOPPED=0
 ENV_FILE="${ASTRA_ENV_FILE:-.env}"
 if [ -f "$ENV_FILE" ]; then
@@ -16,12 +18,7 @@ fi
 API_PORT="${ASTRA_API_PORT:-17001}"
 
 _is_astra_server() {
-    local pid=$1
-    local comm
-    # /proc/$pid/comm is Linux-only (truncated to 15 chars; "astra-server" is
-    # 12 so safe); falls back to ps(1) on macOS/BSD.
-    comm=$(cat "/proc/$pid/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null)
-    [[ "$comm" == "astra-server" ]]
+    api_process_is_astra_server "$1"
 }
 
 _is_current_checkout() {
