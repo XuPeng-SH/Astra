@@ -872,6 +872,7 @@ pub struct WorkItemRuntimeBindingRequest {
 pub enum RunStartIdempotencyKind {
     ProviderTask,
     WorkTurn,
+    EvaluationTrial,
 }
 
 /// Selects who owns model choice for one internal run-start request.

@@ -3613,6 +3613,7 @@ async fn ensure_core_schema_while_leased(
             metadata JSON NULL,
             project_id VARCHAR(128) NULL,
             provider_creation_hash CHAR(64) NULL,
+            bootstrap_creation_hash CHAR(64) NULL,
             project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session',
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
