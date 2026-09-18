@@ -268,6 +268,13 @@ CARGO_INCREMENTAL=0 cargo test -p astra-runtime --features live-provider-tests -
   live_work_admission_provider_contract -- --ignored --nocapture
 ```
 
+The real-provider token-usage harness uses the same explicit build boundary:
+`make harness-live-llm` enables `live-provider-tests` for
+`live_token_usage_e2e`. Normal offline/online builds do not include this harness
+code. Provider credentials or inherited environment settings cannot enable
+paid calls in those lanes. Ordinary integration coverage uses controlled mock
+providers.
+
 Both paid checks require `live-provider-tests` and `--ignored`; default
 MatrixOne CI can run ignored tests without a paid key. Do not enable this
 feature in the generic online lane.
