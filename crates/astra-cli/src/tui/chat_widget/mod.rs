@@ -2554,6 +2554,13 @@ impl ChatWidget {
         self.explain_analyze_report_format = format;
     }
 
+    #[cfg(test)]
+    pub(crate) fn explain_report_format_for_test(
+        &self,
+    ) -> astra_config::runtime_config::ExplainReportFormat {
+        self.explain_analyze_report_format
+    }
+
     pub(crate) fn explain_analyze_live_lines(
         &self,
         width: u16,

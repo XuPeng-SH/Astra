@@ -4175,6 +4175,22 @@ fn explain_mode_observes_graph(mode: crate::cli::session::session_state::Explain
     mode != crate::cli::session::session_state::ExplainMode::Off
 }
 
+/// Keep every freshly replayed ChatWidget on the same Explain presentation
+/// snapshot as SessionState. Resume and Work/session rebinding construct a new
+/// widget, so setting only the mode or live-row count would otherwise silently
+/// restore the renderer's default report format.
+fn sync_explain_presentation(
+    chat_widget: &mut chat_widget::ChatWidget,
+    state: &crate::cli::session::session_state::SessionState,
+) {
+    chat_widget.set_explain_verbose(matches!(
+        state.explain,
+        crate::cli::session::session_state::ExplainMode::Verbose
+    ));
+    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
+    chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
+}
+
 #[derive(Debug)]
 enum AgentWorkbenchOutcome {
     Clipboard {
@@ -6700,9 +6716,7 @@ pub(crate) async fn run_tui_session(
         }
         _ => chat_widget::ChatWidget::new(String::new()),
     };
-    chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
-    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
-    chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
+    sync_explain_presentation(&mut chat_widget, &state);
 
     if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
         use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -6974,13 +6988,7 @@ pub(crate) async fn run_tui_session(
                         state.explain != crate::ExplainMode::Off,
                     )
                     .await;
-                    chat_widget.set_explain_verbose(matches!(
-                        state.explain,
-                        crate::ExplainMode::Verbose
-                    ));
-                    chat_widget.set_explain_live_rows(
-                        state.runtime_config.explain.effective_live_rows(),
-                    );
+                    sync_explain_presentation(&mut chat_widget, &state);
                     rebind_workbench_observers(
                         Some(session_id),
                         &task_board,
@@ -7760,16 +7768,7 @@ pub(crate) async fn run_tui_session(
                                                 state.explain != crate::ExplainMode::Off,
                                             )
                                             .await;
-                                            chat_widget.set_explain_verbose(matches!(
-                                                state.explain,
-                                                crate::ExplainMode::Verbose
-                                            ));
-                                            chat_widget.set_explain_live_rows(
-                                                state.runtime_config.explain.effective_live_rows(),
-                                            );
-                                            chat_widget.set_explain_report_format(
-                                                state.runtime_config.explain.effective_report_format(),
-                                            );
+                                            sync_explain_presentation(&mut chat_widget, &state);
                                             rebind_workbench_observers(
                                                 Some(new_sid),
                                                 &task_board,
@@ -10060,11 +10059,9 @@ pub(crate) async fn run_tui_session(
                                                     state.config_version_id =
                                                         Some(save.new_version_id.clone());
                                                     state.reload_runtime_config();
-                                                    chat_widget.set_explain_live_rows(
-                                                        state.runtime_config.explain.effective_live_rows(),
-                                                    );
-                                                    chat_widget.set_explain_report_format(
-                                                        state.runtime_config.explain.effective_report_format(),
+                                                    sync_explain_presentation(
+                                                        &mut chat_widget,
+                                                        &state,
                                                     );
                                                 }
                                                 history_cell::system::SystemCell::response(outcome.message)
@@ -10388,6 +10385,7 @@ pub(crate) async fn run_tui_session(
                                                 state.explain != crate::ExplainMode::Off,
                                             )
                                             .await;
+                                            sync_explain_presentation(&mut chat_widget, &state);
                                             rebind_workbench_observers(
                                                 Some(new_sid),
                                                 &task_board,
@@ -12153,6 +12151,24 @@ mod tests {
         ));
         let event = TuiAppEvent::ExplainAnalyze(explain_analyze_fact());
         assert!(matches!(event, TuiAppEvent::ExplainAnalyze(_)));
+    }
+
+    #[test]
+    fn rebound_chat_widget_keeps_the_session_explain_report_format() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_explain_report_format_override(
+            astra_config::runtime_config::ExplainReportFormat::Markdown,
+        );
+        state.explain = crate::cli::session::session_state::ExplainMode::On;
+
+        let mut widget = chat_widget::ChatWidget::new("");
+        sync_explain_presentation(&mut widget, &state);
+
+        assert_eq!(
+            widget.explain_report_format_for_test(),
+            astra_config::runtime_config::ExplainReportFormat::Markdown,
+            "a Work/session rebound must not restore the HTML default"
+        );
     }
 
     #[test]
