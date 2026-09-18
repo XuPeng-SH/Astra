@@ -10,7 +10,9 @@ mod artifact_publication;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod judgment;
 pub use judgment::{
-    JudgmentAnswer, JudgmentQuestion, JudgmentRequest, JudgmentResponse, NoulCriteria,
+    JudgmentAnswer, JudgmentCodecError, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
+    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
+    normalize_judgment_response,
 };
 mod canonical_tool_pairing;
 mod completion_settlement;

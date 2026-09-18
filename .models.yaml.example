@@ -205,7 +205,7 @@
   max_completion_tokens: 8192
   supported_parameters: [tools]
 
-# Optional memory judgment pilot (not a chat/reasoning/extraction model).
+# Optional memory and request judgments (not a chat/reasoning/extraction model).
 # Set judgment_default: true on one model to enable it automatically after
 # model load (including make dev-seed). Load checks connectivity before binding.
 # To switch an already active model manually:

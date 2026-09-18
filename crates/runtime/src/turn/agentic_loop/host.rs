@@ -115,29 +115,6 @@ fn now_us() -> u64 {
     wall_us.saturating_add(monotonic_anchor.elapsed().as_micros() as u64)
 }
 
-pub(crate) fn record_trace_span(
-    buf: &mut astra_services::session_journal::TurnEventBuffer,
-    span_id: String,
-    name: &str,
-    started_at: Instant,
-    parent_span_id: Option<String>,
-    attrs: Option<&HashMap<String, String>>,
-    trace_id: Option<&str>,
-) {
-    let end_us = now_us();
-    let start_us = end_us.saturating_sub(started_at.elapsed().as_micros() as u64);
-    buf.record_trace_span_v2(
-        TraceSpanBuilder::default()
-            .span_id(span_id)
-            .name(name.to_string())
-            .start_us(start_us)
-            .end_us(end_us)
-            .parent_span_id(parent_span_id)
-            .attrs(attrs)
-            .trace_id(trace_id.map(str::to_string)),
-    );
-}
-
 // ─── Host turn result ────────────────────────────────────────────────────────
 
 /// Result from one host-executed turn (payload prep + HTTP + SSE consumption).
@@ -272,6 +249,8 @@ pub enum TurnIntentJudgeOutcome {
     /// server turn. This is distinct from `FixedDefault`: no local decision
     /// was made, and the remote lifecycle owns the outcome.
     Delegated,
+    /// The host started asynchronous admission and owns its terminal receipt.
+    Pending,
     Unavailable,
 }
 
@@ -322,14 +301,15 @@ impl TurnPhaseOutcome {
     }
 }
 
-impl From<&TurnIntentJudgeOutcome> for TurnPhaseOutcome {
-    fn from(value: &TurnIntentJudgeOutcome) -> Self {
-        match value {
-            TurnIntentJudgeOutcome::Intent(_) => Self::Decided,
-            TurnIntentJudgeOutcome::FixedDefault => Self::FixedDefault,
-            TurnIntentJudgeOutcome::Delegated => Self::Delegated,
-            TurnIntentJudgeOutcome::Unavailable => Self::Unavailable,
-        }
+impl TurnIntentJudgeOutcome {
+    pub(super) fn terminal_phase_outcome(&self) -> Option<TurnPhaseOutcome> {
+        Some(match self {
+            Self::Intent(_) => TurnPhaseOutcome::Decided,
+            Self::FixedDefault => TurnPhaseOutcome::FixedDefault,
+            Self::Delegated => TurnPhaseOutcome::Delegated,
+            Self::Unavailable => TurnPhaseOutcome::Unavailable,
+            Self::Pending => return None,
+        })
     }
 }
 
@@ -363,22 +343,42 @@ pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
     outcome: TurnPhaseOutcome,
     span_id: String,
 ) -> TurnPhaseReceipt {
+    complete_turn_phase_at(
+        host,
+        state,
+        TurnPhaseReceipt {
+            phase,
+            round_index,
+            attempt_index,
+            started_at,
+            finished_at: Instant::now(),
+            duration_ms: 0,
+            outcome,
+        },
+        span_id,
+    )
+}
+
+pub(crate) fn complete_turn_phase_at<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    mut receipt: TurnPhaseReceipt,
+    span_id: String,
+) -> TurnPhaseReceipt {
     // The default host hook is intentionally a no-op. Production hosts start
     // stages at their actual boundary; this call supplies a reconstructable
     // start for hosts that only provide terminal receipts.
-    host.on_turn_phase_started(state, phase, round_index, attempt_index, started_at);
-    let finished_at = Instant::now();
-    let receipt = TurnPhaseReceipt {
-        phase,
-        round_index,
-        attempt_index,
-        started_at,
-        finished_at,
-        duration_ms: finished_at
-            .saturating_duration_since(started_at)
-            .as_millis() as u64,
-        outcome,
-    };
+    host.on_turn_phase_started(
+        state,
+        receipt.phase,
+        receipt.round_index,
+        receipt.attempt_index,
+        receipt.started_at,
+    );
+    receipt.duration_ms = receipt
+        .finished_at
+        .saturating_duration_since(receipt.started_at)
+        .as_millis() as u64;
     let mut attrs = HashMap::new();
     attrs.insert("outcome".to_string(), receipt.outcome.as_str().to_string());
     attrs.insert("round_index".to_string(), receipt.round_index.to_string());
@@ -399,14 +399,21 @@ pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
         "turn phase completed"
     );
     if let Some(buf) = state.turn_event_buffer.as_mut() {
-        record_trace_span(
-            buf,
-            span_id,
-            receipt.phase.as_str(),
-            started_at,
-            None,
-            Some(&attrs),
-            state.current_run_id.as_deref(),
+        let end_us = now_us().saturating_sub(receipt.finished_at.elapsed().as_micros() as u64);
+        let start_us = end_us.saturating_sub(
+            receipt
+                .finished_at
+                .saturating_duration_since(receipt.started_at)
+                .as_micros() as u64,
+        );
+        buf.record_trace_span_v2(
+            TraceSpanBuilder::default()
+                .span_id(span_id)
+                .name(receipt.phase.as_str().to_string())
+                .start_us(start_us)
+                .end_us(end_us)
+                .attrs(Some(&attrs))
+                .trace_id(state.current_run_id.clone()),
         );
     }
     host.on_turn_phase(receipt);
@@ -718,6 +725,11 @@ pub trait AgenticLoopHost: Send {
     /// Analyze. The receipt is observational evidence only, never a second
     /// source of control state.
     fn on_turn_phase(&mut self, _receipt: TurnPhaseReceipt) {}
+
+    /// Asynchronous hosts publish admission at the background task's boundary.
+    fn owns_semantic_admission_timing(&self) -> bool {
+        false
+    }
 
     /// Publish a meaningful lifecycle stage as it begins. `started_at` comes
     /// from the owner that measures the corresponding terminal receipt, so a
@@ -8948,8 +8960,8 @@ pub(crate) mod tests {
     #[test]
     fn turn_intent_phase_distinguishes_delegated_from_fixed_default() {
         assert_eq!(
-            TurnPhaseOutcome::from(&TurnIntentJudgeOutcome::Delegated),
-            TurnPhaseOutcome::Delegated
+            TurnIntentJudgeOutcome::Delegated.terminal_phase_outcome(),
+            Some(TurnPhaseOutcome::Delegated)
         );
         assert_eq!(TurnPhaseOutcome::Delegated.as_str(), "delegated");
         assert_ne!(

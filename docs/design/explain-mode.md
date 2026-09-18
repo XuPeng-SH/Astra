@@ -85,6 +85,14 @@ separate, explicitly requested product action and view. It must point back to
 the graph facts it used, label uncertainty, and stay visually distinct from
 the measured execution record.
 
+Asynchronous request admission is one measured stage, not an unavailable
+placeholder followed by another attempt. Its terminal timestamp is captured
+by the background owner before the main loop consumes the result. A separately
+measured wait may show how long the main loop actually blocked on that result;
+the full background duration must not be labeled added latency. Cancellation
+closes outstanding admission observations. Classification and any required
+Work plan retain distinct auxiliary inference identities and usage.
+
 Web and TUI preserve the execution tree and the
 information density of the README demonstration: context budget and source
 costs, tool selection, memory selection, model attempts, tool calls, and usage.

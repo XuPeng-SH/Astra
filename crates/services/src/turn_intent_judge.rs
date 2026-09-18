@@ -531,7 +531,7 @@ fn serialize_judge_context(
     .expect("typed judge context must serialize")
 }
 
-fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> String {
+pub(crate) fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> String {
     // Workflow prose belongs to the primary agent's data plane.  Admission is
     // a control-plane decision, so it receives only the immutable topology
     // fact extracted from the trusted invocation ledger.  Otherwise a skill's

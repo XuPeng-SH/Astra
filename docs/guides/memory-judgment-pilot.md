@@ -1,10 +1,9 @@
-# Optional memory judgment backend pilot
+# Optional judgment backends
 
-Memory candidate relevance and explicit lesson dismissal can use a registered
-TypeSafe System One Offering instead of the usual selector LLM. This is an
-opt-in deployment setting for evaluation. Unset configuration preserves the
-ordinary selector. It does not change main-agent rounds, tool permissions,
-memory extraction, or task completion rules.
+Memory relevance, lesson dismissal, and request classification can use a
+registered TypeSafe System One Offering or an ordinary LLM selected with
+`judgment_model`. This selects a model for judgments, not the main agent model.
+Tool permissions and execution authority still belong to the runtime.
 
 ## Configure
 
@@ -31,7 +30,9 @@ needed.
    resolved against the deployment catalog; ambiguous names are rejected.
    The server still stores only the canonical Offering ID and validates
    activity and credentials before changing the binding.
-4. Start a new Session to refresh the CLI's cached judgment Offering.
+4. Start a new Session to refresh the CLI's cached memory judgment Offering.
+   Server request classification resolves the configured Offering for each
+   new judgment, under the requesting user's model-access policy.
 
 The binding can also select an ordinary LLM Offering. It is an Offering routing
 mechanism, not a separate registry or agent lifecycle. The requesting user's
@@ -43,6 +44,34 @@ To disable the pilot, run
 `astra admin config unset judgment_model`, then start a new Session.
 Existing sessions retain their cached Offering selection. Other server instances
 share the admin configuration and model registry through the database.
+
+## Request classification and Work
+
+Request classification uses one batched `JudgmentRequest` for both TypeSafe and
+ordinary LLMs. The model name and provider are Offering configuration, not
+business rules. With no judgment binding, the request's admitted main model
+performs classification using the same typed protocol.
+
+The result distinguishes ordinary requests from explicitly requested durable
+Work, requested state changes, and execution topology. Only fields that affect
+the current decision must be confident and consistent. For example, an ordinary
+read-only request does not fail because a Work activation or external-effect
+owner question is uncertain. An unknown critical answer does not authorize
+execution or become a `not_required` decision; the existing admission degradation
+and primary-model recovery rules apply.
+
+Ordinary requests require no task graph generation. When durable Work is
+required, the main generation model builds its task graph under the locked
+classification. Graph repair cannot downgrade the lifecycle or change mutation
+scope. Jet is never asked to generate free-form tasks. Both calls retain their
+own Offering, durable inference identity and reported usage.
+
+Classification may overlap the primary model request. Explain shows one
+`Determine request requirements` interval through classification and any required
+planning, ending when the background task actually finishes. A separate
+`Wait for request requirements` interval appears only when the main path waits
+for the result. Delayed consumption is not added to judgment duration, and
+pending work is not reported as unavailable. Cancellation closes the live span.
 
 ## Behavior and limits
 
@@ -57,8 +86,13 @@ keyed Noul questions. Memory code constructs the relevance/dismissal questions;
 the TypeSafe adapter only encodes the provider protocol. It preserves every
 probability and actual model identity in a typed response, with usage in the
 existing completion envelope. Memory code applies separate relevance/dismissal
-policies (currently each uses the provisional 0.5 threshold). Ordinary LLMs
-return selected question indices; normalization belongs to the memory owner.
+policies. Ordinary LLMs return fixed question IDs in `true` and `uncertain`
+lists. Memory, request classification, and the comparison command share the
+message formatter and strict response normalization in `astra-turn-types`.
+Unknown or repeated IDs are invalid, not silently discarded. Native provider
+probabilities remain probabilities; discrete LLM decisions are never displayed
+as calibrated confidence. Uncertain memory decisions do not select or dismiss
+candidates. Business owners retain their thresholds and fallback behavior.
 Choice and Score can be added when a concrete caller needs them.
 
 One Jet Offering contains the connection and encrypted key. Future operations

@@ -77,6 +77,7 @@ pub mod turn_intent_judge;
 pub mod verification;
 pub mod weighted_admission;
 pub mod work;
+pub mod work_admission_judgment;
 pub mod workflows;
 pub mod workspace_records;
 
@@ -425,4 +426,10 @@ pub use workspace_records::{
     DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,
     WorkspaceCleanupDebtStore, WorkspaceCleanupDebtStoreError, WorkspaceRecordEntry,
     WorkspaceRecordStore, WorkspaceRecordStoreError, WorkspaceStateStore,
+};
+
+pub use work_admission_judgment::{
+    WorkAdmissionClassification, parse_work_admission_classification,
+    work_admission_classification_messages, work_admission_classification_request,
+    work_admission_plan_messages,
 };

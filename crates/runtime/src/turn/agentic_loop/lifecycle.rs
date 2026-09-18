@@ -3588,27 +3588,35 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // first round. A resumed non-zero round preserves the restored state.
     if turn_index == 0 {
         let admission_started_at = Instant::now();
-        host.on_turn_phase_started(
-            state,
-            TurnPhaseKind::SemanticAdmission,
-            0,
-            0,
-            admission_started_at,
-        );
+        if !host.owns_semantic_admission_timing() {
+            host.on_turn_phase_started(
+                state,
+                TurnPhaseKind::SemanticAdmission,
+                0,
+                0,
+                admission_started_at,
+            );
+        }
         let outcome = host.judge_turn_intent(state).await;
         // This is emitted before an unavailable admission can terminate the
         // turn, so a slow or unavailable decision remains visible.
-        complete_turn_phase(
-            host,
-            state,
-            admission_started_at,
-            TurnPhaseKind::SemanticAdmission,
-            0,
-            0,
-            TurnPhaseOutcome::from(&outcome),
-            "turn_intent_admission_0".to_string(),
-        );
+        if let Some(phase_outcome) = outcome.terminal_phase_outcome() {
+            complete_turn_phase(
+                host,
+                state,
+                admission_started_at,
+                TurnPhaseKind::SemanticAdmission,
+                0,
+                0,
+                phase_outcome,
+                "turn_intent_admission_0".to_string(),
+            );
+        }
         match outcome {
+            TurnIntentJudgeOutcome::Pending => {
+                // The host publishes the eventual decision; pending is not failure.
+                state.turn_intent = None;
+            }
             TurnIntentJudgeOutcome::Intent(intent) => {
                 let record_feedback = record_current_user_turn_semantics(state, &intent);
                 apply_judged_turn_intent_to_observability(state, &intent, record_feedback);

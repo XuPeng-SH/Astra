@@ -529,26 +529,16 @@ pub async fn get_memory_model_handler(
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     if query.judgment_binding()
-        && let Some(offering_id) = state
-            .admin
-            .config_service
-            .get(astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING)
-            .await
-            .map_err(internal_error)?
+        && let Some(admitted) = astra_services::admin_config::resolve_judgment_offering(
+            state.admin.config_service.as_ref(),
+            state.model_service.as_ref(),
+            &user.user_id,
+        )
+        .await?
     {
-        let admitted = state
-            .model_service
-            .admit_model_offering(user.user_id.clone(), offering_id.clone())
-            .await?;
-        if admitted.provider == "typesafe" && admitted.api_key.trim().is_empty() {
-            return Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Configured TypeSafe judgment Offering has no API key",
-            ));
-        }
         return Ok(Json(MemoryInferenceOfferingsResponse {
             offerings: vec![MemoryInferenceOfferingResponse {
-                offering_id,
+                offering_id: admitted.offering_id,
                 model_name: admitted.model_name,
                 thinking_capability: admitted.thinking_capability,
             }],
