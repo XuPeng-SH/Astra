@@ -111,12 +111,19 @@ remain encrypted and server-owned. This binding never selects a memory extractio
 model or changes agent/tool policy. See [the pilot guide](../guides/memory-judgment-pilot.md)
 for configuration, fallback and validation limitations.
 
-## Evidence-backed lifecycle (Phase 1)
+## Evidence-backed evaluation and Skillify adapter
 
-The first product slice is deliberately bounded to private, prompt-only skills
-whose task outputs can be checked without mutating an external system. It
-extends the existing personal-skill version store and Skillify harness; it does
-not create a second skill registry or a second execution loop.
+Evaluation is a shared capability for prompts, skills, routing, provider/model
+bindings, memory policies, and workflows. The first product slice is
+deliberately bounded to private, prompt-only comparisons whose task outputs can
+be checked without mutating an external system. Skillify is the first adapter:
+it turns selected work evidence into a candidate revision and citations, then
+hands the candidate to the shared evaluation owner. It does not own trial
+identity, assessment, or report semantics.
+
+The Skillify adapter extends the existing personal-skill version store and
+Skillify harness; it does not create a second skill registry, local adoption
+authority, or execution loop.
 
 Creation and optimization consume selected conversation evidence (Context,
 Trace, and Journal facts). A source range, evidence watermark, redaction
