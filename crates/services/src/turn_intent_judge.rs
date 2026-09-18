@@ -91,6 +91,13 @@ pub enum TurnIntentJudgeError {
     /// as a typed product limitation, never silently projected to one fact.
     #[error("unsupported execution contract: {0}")]
     UnsupportedCombination(String),
+
+    /// A trusted, already-loaded workflow requires a topology that the
+    /// durable Work lifecycle cannot represent. Unlike a model-authored
+    /// classification conflict, this is an execution contract owned by the
+    /// runtime and must remain fail-closed.
+    #[error("trusted workflow topology is unsupported: {0}")]
+    TrustedWorkflowTopologyConflict(String),
 }
 
 /// Trait for LLM-based turn intent judging.

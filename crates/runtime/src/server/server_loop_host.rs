@@ -2394,7 +2394,7 @@ fn reconcile_trusted_workflow_topology(
             Ok(decision)
         }
         astra_services::WorkAdmissionDecision::Required { .. } => Err(
-            astra_services::TurnIntentJudgeError::UnsupportedCombination(
+            astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(
                 "durable Work and trusted workflow parallel sub-runs require a task-to-slot settlement protocol"
                     .to_string(),
             ),
@@ -2503,12 +2503,11 @@ impl SummaryClientWorkAdmissionJudge {
         };
         let repair_allowed = match &decision {
             Err(astra_services::TurnIntentJudgeError::Malformed { .. }) => true,
-            Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(_)) => {
-                // A conflict introduced by a trusted loaded workflow remains a
-                // typed product limitation; it is not model ambiguity that a
-                // semantic repair may override.
-                ctx.loaded_workflow_execution_topology.is_none()
-            }
+            Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(_)) => true,
+            // A conflict introduced by a trusted loaded workflow remains a
+            // typed product limitation; it is not model ambiguity that a
+            // semantic repair may override.
+            Err(astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(_)) => false,
             _ => false,
         };
         if repair_allowed {
@@ -7976,14 +7975,17 @@ impl ServerAgenticLoopHost {
                     astra_services::TurnIntentJudgeError::UnsupportedCombination(_) => {
                         WorkAdmissionUnavailableReason::UnsupportedCombination
                     }
+                    astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(_) => {
+                        WorkAdmissionUnavailableReason::UnsupportedCombination
+                    }
                     astra_services::TurnIntentJudgeError::Inference(detail) => {
                         WorkAdmissionUnavailableReason::from_inference_error(detail)
                     }
                 });
                 self.work_admission_conflict = match &error {
-                    astra_services::TurnIntentJudgeError::UnsupportedCombination(detail) => {
-                        Some(detail.clone())
-                    }
+                    astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(
+                        detail,
+                    ) => Some(detail.clone()),
                     _ => None,
                 };
                 self.pending_work_admission = None;
@@ -8258,6 +8260,23 @@ impl ServerAgenticLoopHost {
         provider_tool_calls: &[Value],
     ) -> Option<(&'static str, &'static str, bool)> {
         let (_, provider_activation) = provider_batch_valid_work_carrier(provider_tool_calls)?;
+
+        // A trusted loaded workflow owns its execution topology independently
+        // of the optional semantic judge. A primary `start_work` carrier is
+        // therefore an unsupported durable-plus-parallel combination even
+        // when classification is malformed, unavailable, or timed out. Do
+        // this structural check before any auxiliary-policy bypass so an
+        // unhealthy judge cannot erase runtime-owned topology authority.
+        if crate::turn::agentic::turn_intent::trusted_loaded_workflow_execution_topology(
+            &state.skills.execution.invoked,
+        ) == Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+        {
+            return Some((
+                "work_lifecycle_topology_conflict",
+                "A trusted workflow requires parallel sub-runs; durable Work and that topology cannot be settled together.",
+                false,
+            ));
+        }
         if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
             return None;
         }
@@ -8268,6 +8287,23 @@ impl ServerAgenticLoopHost {
         // lifecycle and effect validation still apply below.
         if self.work_admission_unavailable_reason
             == Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
+        {
+            return None;
+        }
+
+        // The classifier is an optimization layer.  If it produced no
+        // usable decision, an explicit typed `start_work` carrier remains a
+        // valid primary request and must continue through the canonical
+        // lifecycle/effect checks below.  A trusted workflow topology conflict
+        // is different: `work_admission_conflict` is populated only for that
+        // runtime-owned contract failure and is still handled fail-closed by
+        // the terminal guard.
+        let classifier_unavailable =
+            self.work_admission_unavailable || self.work_admission_unavailable_reason.is_some();
+        if classifier_unavailable
+            && self.work_admission_conflict.is_none()
+            && self.work_admission_unavailable_reason
+                != Some(WorkAdmissionUnavailableReason::Disabled)
         {
             return None;
         }
@@ -24154,7 +24190,7 @@ mod tests {
             .expect_err("trusted durable-plus-parallel topology remains unsupported");
         assert!(matches!(
             error,
-            astra_services::TurnIntentJudgeError::UnsupportedCombination(_)
+            astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(_)
         ));
         assert_eq!(requests.lock().expect("requests").len(), 1);
     }
@@ -35717,7 +35753,7 @@ mod tests {
         .build();
         host.pending_work_admission_judge =
             Some(pending_work_admission_judge_for_test(tokio::spawn(async {
-                (Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(
+                (Err(astra_services::TurnIntentJudgeError::TrustedWorkflowTopologyConflict(
                 "durable Work and parallel sub-runs require a task-to-slot settlement protocol"
                     .to_string(),
             )), WorkAdmissionUsage::default())
@@ -36967,9 +37003,35 @@ mod tests {
                         std::slice::from_ref(&carrier)
                     )
                     .map(|(kind, _, retryable)| (kind, retryable)),
-                    Some(("work_admission_unavailable", false)),
+                    None,
                 );
             }
+        }
+        let mut trusted_parallel_state = create_test_state();
+        trusted_parallel_state.skills.execution.invoked.insert(
+            "parallel-review".to_string(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "parallel-review".to_string(),
+                content: "trusted parallel workflow".to_string(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+                execution_topology: Some(astra_services::WorkExecutionTopology::ParallelSubruns),
+            },
+        );
+        for reason in [
+            WorkAdmissionUnavailableReason::Malformed,
+            WorkAdmissionUnavailableReason::Timeout,
+        ] {
+            host.work_admission_unavailable_reason = Some(reason);
+            assert_eq!(
+                host.provider_work_carrier_rejection(
+                    &trusted_parallel_state,
+                    std::slice::from_ref(&carrier),
+                )
+                .map(|(kind, _, retryable)| (kind, retryable)),
+                Some(("work_lifecycle_topology_conflict", false)),
+                "trusted topology remains fail-closed when the auxiliary judge is {reason:?}"
+            );
         }
         host.work_admission_unavailable_reason = Some(WorkAdmissionUnavailableReason::Disabled);
         assert_eq!(
