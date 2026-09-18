@@ -95,12 +95,18 @@ The Agent interprets the impact on the user's task. A later unrelated success
 must not clear a failure, and changing a command does not prove equivalence.
 
 At completion, an unresolved failure with a later-round observation candidate,
-or the existing repeated-failure signal, permits
-one evidence-linked `submit_task_resolution` proposal through the existing
-`invoke_tool` carrier. Its full schema is supplied only in that boundary's hint,
-not added to resident tools. The proposal identifies the verification target,
-failed and later evidence calls, `supported`/`partial`/`unknown`, rationale, and
-remaining gaps. This is a model assessment, not a verification receipt.
+or the existing repeated-failure signal, permits one evidence-linked
+`submit_task_resolution` proposal through the existing `invoke_tool` carrier
+when the task has a real execution contract. Mutating work, explicit
+verification (including external or browser-scoped obligations), and ordinary
+non-exploratory work retain this strict terminal path. A read-only exploratory
+task such as a review or diagnosis keeps a failed probe as durable evidence
+for the final explanation, but treats it as advisory and does not turn the
+whole answer into `ExecutionIncomplete` merely because a later observation
+exists. Its full schema is supplied only in that boundary's hint, not added to
+resident tools. The proposal identifies the verification target, failed and
+later evidence calls, `supported`/`partial`/`unknown`, rationale, and remaining
+gaps. This is a model assessment, not a verification receipt.
 The wire contract bounds the target and each gap to 256 characters, rationale to
 1024 characters, and each evidence list to 32 call IDs; runtime validation uses
 the same character-count limits as the provider schema.

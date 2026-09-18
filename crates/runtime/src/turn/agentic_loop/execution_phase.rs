@@ -2232,12 +2232,27 @@ pub(crate) async fn accept_task_resolution_after_tool_round(
     {
         return;
     }
-    let Some(assessment) = submission.result_full.as_deref().and_then(|payload| {
+    let Some(assessment) = [
+        submission.result_full.as_deref(),
+        submission.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|payload| {
         serde_json::from_str::<astra_turn_types::task_resolution::TaskResolutionAssessment>(payload)
             .ok()
     }) else {
         return;
     };
+    // Keep a structurally valid submission in the settlement state even when
+    // the executor rejects one of its evidence references.  Coverage performs
+    // the same validation at the terminal boundary and can then report the
+    // precise rejection (for example, `evidence_not_later_execution`) instead
+    // of collapsing a submitted assessment into `missing_assessment`.
+    state
+        .hooks
+        .completion_settlement
+        .outcome_reconciliation_assessment = Some(assessment.clone());
     let evidence = state
         .stall
         .runtime_policy_evaluation
@@ -2267,10 +2282,6 @@ pub(crate) async fn accept_task_resolution_after_tool_round(
                 "remaining_gaps": assessment.remaining_gaps,
                 "instruction": "The referenced execution evidence passed integrity validation. This remains your task assessment, not a machine verification receipt. Give the user an accurate final report and retain any remaining gaps; runtime checks final coverage separately.",
             }));
-            state
-                .hooks
-                .completion_settlement
-                .outcome_reconciliation_assessment = Some(assessment);
         }
         Err(error) => {
             tracing::warn!(
@@ -2486,6 +2497,24 @@ async fn task_resolution_covers_current_outcomes(
 
 /// Give a candidate final answer one bounded rewrite when the structured
 /// execution ledger still reports a persistent unresolved outcome.
+///
+/// Read-only exploratory work (for example a code review or diagnosis) may
+/// legitimately contain a failed probe.  The probe remains durable evidence
+/// and the model must report it, but it is not an execution contract that can
+/// safely turn a normal answer into `ExecutionIncomplete`.  Mutating work and
+/// explicit verification contracts retain the stricter reconciliation path,
+/// including when their profile is also marked exploratory.
+fn outcome_reconciliation_required_for_profile(state: &AgenticLoopState) -> bool {
+    !state.task_profile.exploratory_task
+        || state.task_profile.mutates_workspace
+        || state.task_profile.verification_required
+        || requires_external_effect_completion(state)
+        || state
+            .turn_intent
+            .as_ref()
+            .is_some_and(|intent| intent.browser_verification_required)
+}
+
 fn enforce_outcome_reconciliation_before_text_completion(
     state: &mut AgenticLoopState,
     current_boundary: Option<&str>,
@@ -2495,6 +2524,7 @@ fn enforce_outcome_reconciliation_before_text_completion(
         .completion_settlement
         .outcome_reconciliation_retries
         > 0
+        || !outcome_reconciliation_required_for_profile(state)
         || !(crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
             &state.stall.active_policy_feedback,
         ) || state
@@ -16213,6 +16243,34 @@ mod tests {
                 &state.stall.active_policy_feedback
             )
         );
+        let original_profile = state.task_profile;
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        assert!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .has_task_resolution_candidate(),
+            "the producer must expose the later observation candidate"
+        );
+        assert!(
+            !enforce_outcome_reconciliation_before_text_completion(&mut state, Some(&boundary)),
+            "a read-only exploratory candidate remains advisory"
+        );
+        assert_eq!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .len(),
+            1,
+            "advisory handling must retain the failed execution fact"
+        );
+        state.task_profile = original_profile;
         assert!(
             enforce_outcome_reconciliation_before_text_completion(&mut state, Some(&boundary)),
             "changed-command success must open assessment even with Observe feedback"
@@ -16228,6 +16286,64 @@ mod tests {
             .as_str()
             .expect("the submission surface must expose a usable evidence identity");
         assert_eq!(candidate_id, "later");
+
+        // A syntactically valid submission can still fail evidence validation.
+        // Keep that interpretation available to the terminal reducer so the
+        // user gets the actual coverage reason instead of `missing_assessment`.
+        let invalid_assessment = TaskResolutionAssessment {
+            scope: "chain".into(),
+            boundary_id: boundary.clone(),
+            verification_target: "artifact".into(),
+            failed_call_ids: vec!["unknown-failure".into()],
+            evidence_call_ids: vec![candidate_id.into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "The evidence reference is intentionally invalid for this regression test."
+                .into(),
+            remaining_gaps: vec![],
+        };
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: CompletionAction::OutcomeReconciliation {
+                    boundary_id: boundary.clone(),
+                },
+                consumed: true,
+                matched: true,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 1,
+            });
+        let invalid_submission_start = state.stall.tool_call_records.len();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "submit_task_resolution".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            // The full result can be absent after a lossy transport/replay;
+            // an exact, bounded preview is still a valid structured carrier.
+            result_preview: Some(serde_json::to_string(&invalid_assessment).unwrap()),
+            ..Default::default()
+        });
+        accept_task_resolution_after_tool_round(
+            &mut state,
+            invalid_submission_start,
+            Some(&boundary),
+        )
+        .await;
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_assessment
+                .is_some()
+        );
+        let invalid_coverage =
+            task_resolution_covers_current_outcomes(&state, Some(&boundary)).await;
+        assert_eq!(invalid_coverage.reason_code(), "failure_not_covered");
+        assert!(!invalid_coverage.is_covered());
+        state.stall.tool_call_records.pop();
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_assessment = None;
+
         let assessment = TaskResolutionAssessment {
             scope: "chain".into(),
             boundary_id: boundary.clone(),
@@ -16612,6 +16728,128 @@ mod tests {
         assert!(!enforce_outcome_reconciliation_before_text_completion(
             &mut state, None
         ));
+    }
+
+    #[test]
+    fn exploratory_diagnostic_failure_remains_advisory_without_execution_warning() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(!enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            0,
+            "a read-only diagnostic must not spend an execution-reconciliation retry"
+        );
+        assert!(state.interruption.is_none());
+    }
+
+    #[test]
+    fn mutating_exploratory_failure_keeps_terminal_reconciliation() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "a mutating task keeps the strict terminal evidence path"
+        );
+    }
+
+    #[test]
+    fn external_mutation_exploration_keeps_terminal_reconciliation() {
+        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
+
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(MutationCompletionScope::External),
+        );
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": 2,
+            "revision": 2,
+            "evaluated_at_round": 4,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "unresolved_tool_outcomes",
+                "stage": "converge",
+                "observed_at_round": 4,
+                "evidence_count": 1,
+                "recommendation": "diagnose_tool_outcomes"
+            }]
+        }))
+        .expect("valid policy feedback");
+
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state, None,
+        ));
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_retries,
+            1,
+            "external mutation remains an execution contract even in exploratory mode"
+        );
     }
 
     #[tokio::test]
