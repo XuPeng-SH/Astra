@@ -41,7 +41,9 @@ const SIMPLE_READ_ONLY_COMMANDS: &[&str] = &[
     "cat", "head", "tail", "wc", "stat", "ls", "ll", // Search tools
     "grep", "find", "fd", "rg", "ag", "ack", "locate", // System info
     "pwd", "which", "type", "uname", "id", "df", "du", "free", "uptime", "whoami", "env",
-    "printenv", "cal", "nproc", // Text processing (no output redirection)
+    "printenv", "cal", "nproc", // Process/network diagnostics
+    "ps", "pgrep", "pidof", "netstat", "top",
+    "vmstat", // Text processing (no output redirection)
     "cut", "paste", "tr", "nl", "column", "fmt", "fold", "expand", // Path tools
     "basename", "dirname", "realpath", "readlink", // Misc safe
     "echo", "true", "false", "test", "expr", "seq", "sleep", "cd",
@@ -321,6 +323,8 @@ fn argv_family_is_read_only(words: &[String]) -> bool {
         Some("uniq") => uniq_argv_is_read_only(&words[1..]),
         Some("date") => date_argv_is_read_only(&words[1..]),
         Some("hostname") => hostname_argv_is_read_only(&words[1..]),
+        Some("lsof") => lsof_argv_is_read_only(&words[1..]),
+        Some("ss") => ss_argv_is_read_only(&words[1..]),
         Some("git") => git_argv_is_read_only(words),
         // Build tools may execute project-controlled plugins, build scripts,
         // proc macros or formatter hooks even when their subcommand sounds
@@ -336,6 +340,175 @@ fn argv_family_is_read_only(words: &[String]) -> bool {
         Some(command) => SIMPLE_READ_ONLY_COMMANDS.contains(&command),
         None => false,
     }
+}
+
+/// `lsof -D` controls the device-cache file and may create/update it on
+/// platforms where the cache feature is enabled. Reject every spelling of
+/// that option, including compact and separated values; the remaining lsof
+/// selectors are observational.
+fn lsof_argv_is_read_only(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        // lsof accepts compact short-option groups (`-nDb/cache`).  Scan
+        // option letters until one consumes the remainder as its value;
+        // otherwise a command selector such as `-cDocker` would be mistaken
+        // for the device-cache option merely because its value contains `D`.
+        (arg.starts_with('-') && {
+            let mut chars = arg[1..].chars();
+            let mut device_cache = false;
+            while let Some(flag) = chars.next() {
+                if flag == 'D' {
+                    device_cache = true;
+                    break;
+                }
+                // These lsof options may consume an attached value. Only
+                // stop when the remainder matches that option's grammar;
+                // optional numeric values (`-o`, `-r`, `-S`) otherwise fall
+                // through so a following `D` is still recognized as an
+                // option rather than silently treated as a value.
+                if lsof_attached_value_is_valid(flag, chars.as_str()) {
+                    break;
+                }
+            }
+            device_cache
+        }) || arg == "--device-cache"
+            || arg.starts_with("--device-cache=")
+    })
+}
+
+fn lsof_attached_value_is_valid(flag: char, value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    match flag {
+        // Free-form values whose first byte is unambiguously owned by the
+        // option (`-cDocker`, `-e/tmp/skip`, `-m/path`, `-uuser`).
+        'c' | 'e' | 'F' | 'm' | 'u' => true,
+        // PID/FD/offset/repeat/timeout values are numeric sets. A nonnumeric
+        // remainder must be scanned as another option (`-oDb`, `-rDb`).
+        'd' | 'g' | 'o' | 'r' | 'S' => {
+            value
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || matches!(ch, ',' | '^' | '-'))
+                && value.chars().any(|ch| ch.is_ascii_digit())
+        }
+        'f' => value.chars().all(|ch| matches!(ch, 'g' | 'G')),
+        'x' => value.chars().all(|ch| matches!(ch, 'f' | 'l')),
+        // Common attached network selectors. Unknown forms remain fail-closed
+        // and are not auto-approved.
+        'i' => {
+            let lower = value.to_ascii_lowercase();
+            matches!(lower.as_str(), "4" | "6" | "46")
+                || lower.starts_with("tcp")
+                || lower.starts_with("udp")
+                || lower.starts_with("sctp")
+                || lower.starts_with('@')
+                || lower.starts_with(':')
+        }
+        's' => {
+            let lower = value.to_ascii_lowercase();
+            lower.starts_with("tcp") || lower.starts_with("udp")
+        }
+        _ => false,
+    }
+}
+
+/// Validate the option surface of `ss`. Most options only change displayed
+/// socket fields, but `-K`/`--kill` terminates sockets and `-D`/`--diag` writes
+/// a diagnostic file. Compact short-option groups must be parsed so `-lK`
+/// cannot bypass the mutating-option check.
+fn ss_argv_is_read_only(args: &[String]) -> bool {
+    const FLAGS: &str = "aAbcehijlmnopstuvwx46rzZ";
+    const VALUE_OPTIONS: &[char] = &['f', 'F'];
+    let mut index = 0;
+    let mut options_done = false;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if options_done || !arg.starts_with('-') || arg == "-" {
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline_value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if matches!(
+                name,
+                "all"
+                    | "autobound"
+                    | "bpf"
+                    | "cgroup"
+                    | "context"
+                    | "extended"
+                    | "fastopen"
+                    | "memory"
+                    | "info"
+                    | "listening"
+                    | "numeric"
+                    | "options"
+                    | "processes"
+                    | "summary"
+                    | "tcp"
+                    | "udp"
+                    | "unix"
+                    | "version"
+                    | "help"
+                    | "resolve"
+                    | "ipv4"
+                    | "ipv6"
+                    | "xdp"
+                    | "sockopt"
+            ) {
+                if inline_value.is_some() {
+                    return false;
+                }
+                // Keep scanning the rest of the argv. A harmless long flag
+                // must not short-circuit a later `--kill`/`--diag`.
+                index += 1;
+                continue;
+            }
+            if matches!(name, "family" | "filter") {
+                if inline_value.is_some() {
+                    index += 1;
+                    continue;
+                }
+                if index + 1 >= args.len() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            // Includes --kill, --diag, and unknown/abbreviated options.
+            return false;
+        }
+
+        let short = &arg[1..];
+        let mut chars = short.chars().peekable();
+        while let Some(flag) = chars.next() {
+            if flag == 'K' || flag == 'D' {
+                return false;
+            }
+            if VALUE_OPTIONS.contains(&flag) {
+                if chars.peek().is_some() {
+                    break;
+                }
+                if index + 1 >= args.len() {
+                    return false;
+                }
+                index += 1;
+                break;
+            }
+            if !FLAGS.contains(flag) {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
 }
 
 /// Validate a conventional option grammar. Unknown options fail closed;
@@ -1436,6 +1609,36 @@ mod tests {
         assert!(bash_command_is_read_only("date -d yesterday +%F"));
         assert!(bash_command_is_read_only("hostname"));
         assert!(bash_command_is_read_only("hostname -f"));
+        assert!(bash_command_is_read_only("lsof -p 1"));
+        assert!(bash_command_is_read_only("lsof -iTCP -sTCP:LISTEN"));
+        assert!(bash_command_is_read_only("ps -ef"));
+        assert!(bash_command_is_read_only("ss -ltnp"));
+        assert!(!bash_command_is_read_only("lsof -D /tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -Db/tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -D b/tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -nDb/tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -nD b/tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -oDb/tmp/lsof.cache"));
+        assert!(!bash_command_is_read_only("lsof -SDu"));
+        assert!(!bash_command_is_read_only("lsof -rDb"));
+        assert!(bash_command_is_read_only("lsof -cDocker"));
+        assert!(bash_command_is_read_only("lsof -FD"));
+        assert!(bash_command_is_read_only("lsof -pcDocker"));
+        assert!(!bash_command_is_read_only(
+            "lsof -cDocker -D /tmp/lsof.cache"
+        ));
+        assert!(!bash_command_is_read_only(
+            "lsof --device-cache=/tmp/lsof.cache"
+        ));
+        assert!(bash_command_is_read_only("lsof +D /tmp"));
+        assert!(!bash_command_is_read_only("ss -K dst 127.0.0.1:443"));
+        assert!(!bash_command_is_read_only("ss -lK"));
+        assert!(!bash_command_is_read_only("ss --kill"));
+        assert!(!bash_command_is_read_only("ss -D /tmp/ss.diag"));
+        assert!(!bash_command_is_read_only("ss --diag=/tmp/ss.diag"));
+        assert!(!bash_command_is_read_only("ss --numeric --kill"));
+        assert!(!bash_command_is_read_only("ss --listening -K"));
+        assert!(!bash_command_is_read_only("ss --tcp --diag=/tmp/ss.diag"));
         assert!(bash_command_is_read_only(r"echo \*"));
         assert!(bash_command_is_read_only(
             "echo \"reading artifact via introspect is not available as bash; using web_fetch again won't help. I'll note the key metadata.\""

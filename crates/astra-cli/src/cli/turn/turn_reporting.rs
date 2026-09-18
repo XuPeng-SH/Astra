@@ -195,7 +195,7 @@ pub(crate) fn print_turn_status_line(
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     if let Some(notice) =
-        evaluation.and_then(astra_turn_core::evaluation::turn_evaluation_status_notice)
+        evaluation.and_then(|evaluation| evaluation_status_notice_for_result(result, evaluation))
     {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
@@ -205,6 +205,24 @@ pub(crate) fn print_turn_status_line(
         .map(|(columns, _)| columns as usize)
         .unwrap_or(80);
     eprintln!("{}", "─".repeat(width.min(72)).dim());
+}
+
+/// A typed terminal result owns the user-visible completion state.  The raw
+/// tool ledger remains useful evidence, but it must not reopen a completed
+/// assessment after runtime reconciliation has already accepted it.  When a
+/// turn is interrupted or explicitly marked unverified, use the semantic
+/// record-aware evaluator to explain the remaining obligation.
+fn evaluation_status_notice_for_result(
+    result: &StreamResult,
+    evaluation: &TurnEvaluation,
+) -> Option<String> {
+    if result.final_state == "completed" && !result.server_terminal_unverified {
+        return None;
+    }
+    astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
+        evaluation,
+        &result.tool_call_records,
+    )
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -268,7 +286,7 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 mod tests {
     use super::{
         build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
-        interruption_status_notice,
+        evaluation_status_notice_for_result, interruption_status_notice,
     };
     use astra_services::session_journal;
     use astra_turn_core::evaluation::{
@@ -317,6 +335,58 @@ mod tests {
         };
 
         assert!(turn_evaluation_status_notice(&eval).is_none());
+    }
+
+    #[test]
+    fn completed_typed_terminal_does_not_reopen_assessment_failure() {
+        let mut result = crate::tests::stub_stream_result("");
+        result.final_state = "completed".into();
+        result.server_terminal_unverified = false;
+        let mut failed = make_record("bash", false, None);
+        failed.args_full =
+            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
+        failed.result_class = Some("test_failure".into());
+        result.tool_call_records = vec![failed];
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.9,
+            signals: vec![EvalSignal::ToolOutcomeFailure {
+                class: "test_failure".to_string(),
+                count: 1,
+            }],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert!(
+            evaluation_status_notice_for_result(&result, &eval).is_none(),
+            "accepted runtime settlement must not be reclassified from raw evidence"
+        );
+    }
+
+    #[test]
+    fn interrupted_unverified_terminal_keeps_validation_failure_visible() {
+        let mut result = crate::tests::stub_stream_result("");
+        result.final_state = "interrupted".into();
+        result.server_terminal_unverified = true;
+        let mut failed = make_record("bash", false, None);
+        failed.args_full =
+            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
+        failed.result_class = Some("test_failure".into());
+        result.tool_call_records = vec![failed];
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.9,
+            signals: vec![EvalSignal::ToolOutcomeFailure {
+                class: "test_failure".to_string(),
+                count: 1,
+            }],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let notice = evaluation_status_notice_for_result(&result, &eval).expect("notice");
+        assert!(notice.contains("test_failure x1"));
     }
 
     #[test]

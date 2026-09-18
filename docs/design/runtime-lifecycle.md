@@ -97,16 +97,20 @@ must not clear a failure, and changing a command does not prove equivalence.
 At completion, an unresolved failure with a later-round observation candidate,
 or the existing repeated-failure signal, permits one evidence-linked
 `submit_task_resolution` proposal through the existing `invoke_tool` carrier
-when the task has a real execution contract. Mutating work, explicit
-verification (including external or browser-scoped obligations), and ordinary
-non-exploratory work retain this strict terminal path. A read-only exploratory
-task such as a review or diagnosis keeps a failed probe as durable evidence
-for the final explanation, but treats it as advisory and does not turn the
-whole answer into `ExecutionIncomplete` merely because a later observation
-exists. Its full schema is supplied only in that boundary's hint, not added to
-resident tools. The proposal identifies the verification target, failed and
-later evidence calls, `supported`/`partial`/`unknown`, rationale, and remaining
-gaps. This is a model assessment, not a verification receipt.
+when the task has a real execution contract. The completion path first
+projects the retained failures into terminally relevant obligations: possible
+bound-workspace mutation, a recognized validation command, declared external
+state, unfinished child/fanout execution, or an invocation that cannot be
+rejoined to durable authority. Ordinary diagnostic probes remain in the full
+ledger and final explanation, but do not turn the answer into
+`ExecutionIncomplete` merely because a later observation exists. This keeps
+the rule semantic rather than tied to one command name. If the runtime cannot
+classify a failed invocation because its authority is missing, it fails closed
+and retains the strict path. The full schema is supplied only in that
+boundary's hint, not added to resident tools. The proposal identifies the
+verification target, failed and later evidence calls,
+`supported`/`partial`/`unknown`, rationale, and remaining gaps. This is a model
+assessment, not a verification receipt.
 The wire contract bounds the target and each gap to 256 characters, rationale to
 1024 characters, and each evidence list to 32 call IDs; runtime validation uses
 the same character-count limits as the provider schema.
@@ -143,9 +147,11 @@ ambiguous outcome remains unknown. Explicit local-only hosts can still execute
 through guarded callback delivery without gaining durable assessment authority.
 HTTP callback replay compares original callback content, not the Server's added
 provenance, and never upgrades or overwrites the first delivered reference.
-Task-level resolution requires coverage of all current
+Task-level resolution requires coverage of all current terminally relevant
 unresolved failures and must not reuse stale workspace evidence after a later
-writer. Missing, ambiguous, foreign, or unavailable evidence remains unresolved.
+writer. Advisory failures remain observable evidence and are not silently
+dropped from the journal or answer context. Missing, ambiguous, foreign, or
+unavailable evidence remains unresolved.
 The bounded policy window retains original references across checkpoint recovery;
 local display text and absence from a recovered suffix are not authority.
 Edge workspace evidence without a retained trustworthy ordering relative to a

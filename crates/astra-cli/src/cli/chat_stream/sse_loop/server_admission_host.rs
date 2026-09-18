@@ -23,8 +23,9 @@ use astra_runtime::{
     },
 };
 use astra_turn_core::{
-    compaction_types::CompactionEvent, orchestration::agent_result_wire::render_agent_tool_error,
-    sse_stream_host::EdgeToolExecResult, tool::schema::tool_names_from_schemas,
+    chat_turn_sse_dispatch::ServerLoopExecutionSummary, compaction_types::CompactionEvent,
+    orchestration::agent_result_wire::render_agent_tool_error, sse_stream_host::EdgeToolExecResult,
+    tool::schema::tool_names_from_schemas,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -51,6 +52,10 @@ const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const TERMINAL_STREAM_EVENT_RESERVE: usize = 3;
 const TERMINAL_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TERMINAL_STREAM_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn server_terminal_requires_unverified(summary: Option<&ServerLoopExecutionSummary>) -> bool {
+    summary.is_some_and(|summary| !summary.has_complete_tool_ledger())
+}
 
 fn terminal_stream_projection_warning(
     pending_ordered: &std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
@@ -1407,20 +1412,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         if turn_result.core.server_loop_terminal {
             // Server-owned runs execute their tools remotely, so the thin
             // client has no local ToolCallRecord ledger to re-evaluate at the
-            // final boundary. Preserve the server's typed policy fact as an
-            // observation for the terminal disposition; it is deliberately
-            // not an execution veto or automatic retry trigger.
-            state.stall.server_terminal_unverified = turn_result
-                .core
-                .server_execution_summary
-                .as_ref()
-                .is_some_and(|summary| {
-                    !summary.has_complete_tool_ledger()
-                        || summary
-                            .runtime_feedback
-                            .as_ref()
-                            .is_some_and(|frame| frame.has_unresolved_tool_outcomes())
-                });
+            // final boundary. Receipt closure is the terminal integrity fact;
+            // runtime policy feedback remains evidence for the next request
+            // and cannot downgrade an accepted completed terminal.
+            state.stall.server_terminal_unverified = server_terminal_requires_unverified(
+                turn_result.core.server_execution_summary.as_ref(),
+            );
             state.telemetry.terminal_execution_authority =
                 Some(TerminalExecutionAuthority::RemoteServer);
 
@@ -2294,7 +2291,8 @@ mod tests {
         plan_mode_restriction_names, reconcile_terminal_stream_projection,
         record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
         request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
-        stream_event_requires_ordered_delivery, user_intent_stream_event,
+        server_terminal_requires_unverified, stream_event_requires_ordered_delivery,
+        user_intent_stream_event,
     };
 
     #[test]
@@ -2322,6 +2320,92 @@ mod tests {
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn server_terminal_uses_receipt_integrity_not_policy_quality_feedback() {
+        let feedback = astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+            schema_version: astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+            identity: astra_turn_core::context_feedback::RuntimeFeedbackIdentity {
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                agent_id: "agent-1".into(),
+                model_id: "deepseek-v4-flash".into(),
+                topology: astra_services::ModelRequestTopology::ServerOnly,
+                request: None,
+            },
+            progress: astra_turn_core::context_feedback::RuntimeFeedbackProgress {
+                session_turn: 1,
+                agentic_round_index: 0,
+                llm_rounds_completed: 1,
+                slice_round_limit: 1,
+                slice_rounds_remaining: 0,
+                absolute_round_ceiling: None,
+            },
+            context: astra_turn_core::context_feedback::RuntimeContextFeedback {
+                prompt_cache_identity: None,
+                model_context_window_tokens: Some(1_000),
+                effective_input_limit_tokens: Some(800),
+                estimated_input_tokens: Some(10),
+                estimated_cache_eligible_tokens: Some(10),
+                token_pressure: Some(0.1),
+                compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
+            },
+            request_usage: None,
+            run_usage: None,
+            was_truncated: false,
+            cache_break_detected: None,
+            policy_feedback:
+                astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::Evaluated {
+                    schema_version: 2,
+                    revision: 1,
+                    evaluated_at_round: 1,
+                    subject: astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                    entries: vec![
+                        astra_turn_core::context_feedback::RuntimePolicyFeedbackEntry {
+                            signal: astra_turn_core::context_feedback::RuntimePolicySignal::UnresolvedToolOutcomes,
+                            stage: astra_turn_core::context_feedback::RuntimePolicyStage::Converge,
+                            observed_at_round: 1,
+                            evidence_count: 1,
+                            recommendation: astra_turn_core::context_feedback::RuntimePolicyRecommendation::DiagnoseToolOutcomes,
+                        },
+                    ],
+                },
+        };
+        let receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
+            "run-1",
+            1,
+            1,
+            1,
+            0,
+            astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                succeeded: 1,
+                ..Default::default()
+            },
+            1,
+            astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+            true,
+        );
+        let summary = astra_turn_core::chat_turn_sse_dispatch::ServerLoopExecutionSummary {
+            tool_calls_count: 1,
+            tool_ledger_receipt: receipt,
+            // Runtime feedback may contain a converged advisory from a
+            // diagnostic probe. It is evidence, not terminal authority.
+            runtime_feedback: Some(feedback),
+            ..Default::default()
+        };
+
+        assert!(
+            !server_terminal_requires_unverified(Some(&summary)),
+            "a closed receipt must remain completed even when policy feedback is retained"
+        );
+
+        let mut incomplete = summary;
+        incomplete.tool_ledger_receipt.unresolved = 1;
+        incomplete.tool_ledger_receipt.terminal = 0;
+        incomplete.tool_ledger_receipt.result_classes = Default::default();
+        incomplete.tool_ledger_receipt.digest = incomplete.tool_ledger_receipt.canonical_digest();
+        assert!(server_terminal_requires_unverified(Some(&incomplete)));
+    }
 
     #[test]
     fn mixed_workspace_claim_frame_with_physical_run_is_not_pre_admission() {

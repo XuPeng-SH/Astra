@@ -56,6 +56,10 @@ pub struct JournalToolCall {
     pub ok: Option<bool>,
     pub arguments: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
+    /// Executor-authored failure evidence. A failed invocation has no
+    /// successful `result`; keeping its error separately prevents criteria
+    /// and judges from confusing an execution failure with a tool result.
+    pub error: Option<serde_json::Value>,
     pub result_artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
 }
 
@@ -688,6 +692,7 @@ impl SessionCapture {
                     ok: record.get("ok").and_then(|value| value.as_bool()),
                     arguments,
                     result,
+                    error: record.get("error").cloned(),
                     result_artifact,
                 });
             }
@@ -1210,6 +1215,7 @@ fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
                 "result": embedded_json(
                     record.get("result_full").or_else(|| record.get("result")),
                 ),
+                "error": record.get("error"),
             }))
             .unwrap_or_default();
             let identity = nested_tool_identity(event, call_id);
@@ -3534,6 +3540,51 @@ mod tests {
             capture.tools_invoked().is_empty(),
             "the simpler tool-name projection must fail closed on the same conflict"
         );
+    }
+
+    #[test]
+    fn journal_tool_calls_reject_error_drift_for_reused_identity() {
+        let capture = SessionCapture {
+            session_id: "error-drift".into(),
+            journal_path: PathBuf::from("/tmp/error-drift.jsonl"),
+            events: vec![
+                JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({
+                        "run_id": "run-1",
+                        "tool_calls": [{
+                            "tool_call_id": "probe-1",
+                            "name": "bash",
+                            "ok": false,
+                            "args_full": r#"{"command":"probe"}"#,
+                            "error": "exit code 1"
+                        }]
+                    }),
+                },
+                JournalEvent {
+                    event_type: "llm_round".into(),
+                    raw: serde_json::json!({
+                        "run_id": "run-1",
+                        "tool_calls": [{
+                            "tool_call_id": "probe-1",
+                            "name": "bash",
+                            "ok": false,
+                            "args_full": r#"{"command":"probe"}"#,
+                            "error": "exit code 127"
+                        }]
+                    }),
+                },
+            ],
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        };
+
+        assert!(
+            capture.journal_tool_calls().is_empty(),
+            "same invocation with different failure evidence must fail closed"
+        );
+        assert!(capture.tools_invoked().is_empty());
     }
 
     #[test]

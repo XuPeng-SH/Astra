@@ -184,7 +184,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
 | `journal_tool_success_ratio { min, min_calls, allowed_failures? }` | raw and expected-negative-adjusted typed tool success meet the minimum | journal |
 | `journal_tool_json { name, document, path, equals }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value | journal     |
-| `journal_tool_json_contains { name, document, path, contains }` | arguments, result, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
+| `journal_tool_json_contains { name, document, path, contains }` | arguments, result, failure error, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
 | `journal_tool_sequence { tools }` | durable tool calls contain the ordered lifecycle subsequence | journal |
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |

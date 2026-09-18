@@ -2634,10 +2634,13 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     }
     if !sr.server_terminal_authoritative
         && sr.tool_call_records.iter().any(&is_error)
-        && sr
-            .tool_call_records
-            .last()
-            .is_none_or(|record| is_error(record))
+        && sr.tool_call_records.last().is_none_or(|record| {
+            is_error(record)
+                && astra_turn_core::evaluation::tool_outcome_requires_terminal_attention(
+                    record,
+                    record.result_class.as_deref().unwrap_or("execution_error"),
+                )
+        })
     {
         return ExitCode::ToolFailure;
     }
@@ -2662,7 +2665,7 @@ fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static st
     if sr.server_terminal_authoritative {
         return "completed";
     }
-    let unresolved = !astra_turn_core::evaluation::active_execution_failure_operation_keys(
+    let unresolved = !astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(
         &sr.tool_call_records,
     )
     .is_empty()
@@ -3505,6 +3508,26 @@ mod exit_code_tests {
     }
 
     #[test]
+    fn exit_code_ignores_failed_read_only_process_probe() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(serde_json::json!({"command": "lsof -p 1"}).to_string()),
+                result_class: Some("execution_error".into()),
+                error: Some("permission denied".into()),
+                ..Default::default()
+            });
+
+        assert_eq!(
+            compute_exit_code(&sr),
+            ExitCode::Success,
+            "an expected diagnostic probe failure must not fail the CLI turn"
+        );
+    }
+
+    #[test]
     fn exit_code_unknown_semantics_falls_back_to_legacy_failure() {
         let mut sr = empty_stream_result();
         sr.tool_call_records.push(tool_call_record(
@@ -3932,6 +3955,25 @@ mod final_json_output_tests {
         assert_eq!(output["completion_disposition"], "responded_unverified");
         assert_eq!(output["success"], false);
         assert_eq!(output["exit_code"], 0);
+    }
+
+    #[test]
+    fn final_json_output_keeps_read_only_probe_advisory() {
+        let mut sr = stream_result_for_json();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(serde_json::json!({"command": "lsof -p 1"}).to_string()),
+                result_class: Some("execution_error".into()),
+                error: Some("permission denied".into()),
+                ..Default::default()
+            });
+
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["completion_disposition"], "completed");
+        assert_eq!(output["success"], true);
     }
 
     #[test]

@@ -248,21 +248,35 @@ pub struct TurnEvaluation {
     pub thresholds: EvaluationThresholds,
 }
 
-pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
-    let outcome_failures = eval
-        .signals
+fn outcome_failure_labels(eval: &TurnEvaluation) -> Vec<String> {
+    eval.signals
         .iter()
         .filter_map(|signal| match signal {
             EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
             EvalSignal::BlockedToolCall { count } => Some(format!("blocked_tool x{count}")),
             _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn unresolved_outcome_notice(labels: &[String]) -> String {
+    format!(
+        "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
+        labels.join(", ")
+    )
+}
+
+pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
+    let outcome_failures = outcome_failure_labels(eval);
     if !outcome_failures.is_empty() {
-        return Some(format!(
-            "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
-            outcome_failures.join(", ")
-        ));
+        if turn_evaluation_has_unresolved_execution_failure(eval) {
+            return Some(unresolved_outcome_notice(&outcome_failures));
+        }
+        // A minority failure is retained in the evaluation signals and
+        // journal, but it is not a user-facing incomplete state. Review and
+        // diagnosis turns routinely contain optional probes that can fail
+        // while the requested evidence is still sufficient.
+        return None;
     }
 
     if eval.success {
@@ -278,6 +292,70 @@ pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
         "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
         eval.quality
     ))
+}
+
+/// Whether a retained failed record represents a completion-critical outcome.
+/// This shared semantic predicate is used by the CLI status surface and by
+/// runtime lifecycle projection. A read-only probe stays advisory even when
+/// it is the only failed record; mutating tools, recognized validation, and
+/// unfinished child execution remain strict.
+pub fn tool_outcome_requires_terminal_attention(
+    record: &ToolCallRecord,
+    result_class: &str,
+) -> bool {
+    if matches!(
+        result_class,
+        RESULT_CLASS_AGENT_INCOMPLETE | RESULT_CLASS_FANOUT_INCOMPLETE
+    ) {
+        return true;
+    }
+    let args = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    if normalize_validation_prefix(&record.name, record.authoritative_args_full().unwrap_or(""))
+        .is_some()
+    {
+        return true;
+    }
+    crate::tool::categories::classify(&record.name, args.as_ref())
+        .category
+        .is_mutating()
+}
+
+/// Build a user-facing evaluation notice with the source records available.
+/// The aggregate evaluator intentionally retains a coverage-rate fallback for
+/// external callers that only have signals. The CLI has the authoritative
+/// records, so it uses semantic criticality instead of treating a 1/2 split
+/// as incomplete merely because a diagnostic probe failed.
+pub fn turn_evaluation_status_notice_for_records(
+    eval: &TurnEvaluation,
+    records: &[ToolCallRecord],
+) -> Option<String> {
+    let labels = outcome_failure_labels(eval);
+    if labels.is_empty() {
+        return turn_evaluation_status_notice(eval);
+    }
+
+    let facts = records
+        .iter()
+        .map(ToolEvaluationFact::from_record)
+        .collect::<Vec<_>>();
+    let unresolved = unresolved_tool_outcome_facts(&facts);
+    if unresolved.is_empty() {
+        // No source records means this caller cannot establish that an
+        // aggregate failure was advisory. Preserve the conservative fallback.
+        return turn_evaluation_status_notice(eval);
+    }
+    let has_terminal_failure = unresolved.values().any(|failure| {
+        records.get(failure.fact_index).is_none_or(|record| {
+            tool_outcome_requires_terminal_attention(record, &failure.result_class)
+        })
+    });
+    if has_terminal_failure {
+        Some(unresolved_outcome_notice(&labels))
+    } else {
+        None
+    }
 }
 
 /// Whether the turn contains unresolved execution evidence for diagnostics.
@@ -1157,6 +1235,40 @@ pub fn active_execution_failure_operation_keys(
             operation_identity_key(record),
         )
     }))
+}
+
+/// Return active failures that are strong enough to affect a terminal CLI
+/// outcome.  The ordinary active-failure projection intentionally preserves
+/// every unresolved execution observation for audit and policy feedback.  A
+/// process exit code and completion disposition need a narrower projection so
+/// an expected read-only probe failure does not turn an otherwise completed
+/// turn into a failed process.
+pub fn active_terminal_execution_failure_operation_keys(
+    records: &[ToolCallRecord],
+) -> std::collections::BTreeSet<String> {
+    let mut unresolved = std::collections::BTreeSet::new();
+    for (index, record) in records.iter().enumerate() {
+        if !record_was_executed(record) {
+            continue;
+        }
+
+        let stable_key = operation_identity_key(record);
+        let key = stable_key
+            .clone()
+            .unwrap_or_else(|| format!("opaque-terminal::{index}"));
+        if !record.ok && !record_is_non_failure_outcome(record) {
+            let result_class = effective_tool_result_class(record)
+                .unwrap_or_else(|| "execution_error".to_string());
+            if tool_outcome_requires_terminal_attention(record, &result_class) {
+                unresolved.insert(key);
+            }
+        } else if let Some(stable_key) = stable_key {
+            // A matching successful execution resolves only the same stable
+            // operation; opaque records never authorize cross-call recovery.
+            unresolved.remove(&stable_key);
+        }
+    }
+    unresolved
 }
 
 fn active_failure_keys<K: Ord>(
@@ -3536,6 +3648,24 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_projection_keeps_diagnostic_probe_advisory() {
+        let mut probe = journal_ok_call("bash");
+        probe.ok = false;
+        probe.args_full = Some(serde_json::json!({"command": "lsof -p 1"}).to_string());
+        probe.result_class = Some("execution_error".into());
+        assert!(active_terminal_execution_failure_operation_keys(&[probe]).is_empty());
+
+        let mut validation = journal_ok_call("bash");
+        validation.ok = false;
+        validation.args_full = Some(serde_json::json!({"command": "cargo test"}).to_string());
+        validation.result_class = Some("test_failure".into());
+        assert_eq!(
+            active_terminal_execution_failure_operation_keys(&[validation]).len(),
+            1
+        );
+    }
+
+    #[test]
     fn rejected_typed_agent_result_is_not_an_unresolved_execution() {
         let mut record = journal_ok_call("agent");
         record.ok = false;
@@ -4193,8 +4323,7 @@ mod tests {
     #[test]
     fn minority_optional_probe_failure_is_not_unresolved_execution_evidence() {
         let mut failed_probe = journal_ok_call("bash");
-        failed_probe.args_full =
-            Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
+        failed_probe.args_full = Some(serde_json::json!({"command": "lsof -p 1"}).to_string());
         failed_probe.ok = false;
         failed_probe.result_class = Some("execution_error".to_string());
 
@@ -4222,6 +4351,72 @@ mod tests {
         assert!(
             !turn_evaluation_has_unresolved_execution_failure(&eval),
             "the failed probe remains advisory evidence without erasing the productive evidence"
+        );
+        assert!(
+            turn_evaluation_status_notice(&eval).is_none(),
+            "a minority probe failure must not render the user-facing turn incomplete"
+        );
+        assert!(
+            turn_evaluation_status_notice_for_records(&eval, &records).is_none(),
+            "record-aware status must keep a read-only probe advisory even at 1/4"
+        );
+    }
+
+    #[test]
+    fn record_aware_status_keeps_diagnostic_probes_neutral_without_recovery() {
+        let mut first = journal_ok_call("bash");
+        first.ok = false;
+        first.args_full = Some(serde_json::json!({"command": "lsof -p 1"}).to_string());
+        first.result_class = Some("execution_error".into());
+        let mut second = first.clone();
+        second.tool_call_id = Some("probe-2".into());
+        second.args_full = Some(serde_json::json!({"command": "ps -p 1"}).to_string());
+
+        let eval = evaluate_tool_call_records(
+            "inspect process state",
+            &[],
+            &[first.clone(), second.clone()],
+            0,
+            false,
+            0.2,
+        );
+        assert!(
+            turn_evaluation_status_notice_for_records(&eval, &[first, second]).is_none(),
+            "diagnostic probe failures remain evidence rather than an incomplete execution"
+        );
+    }
+
+    #[test]
+    fn record_aware_status_keeps_real_validation_failure_strict() {
+        let mut failed = journal_ok_call("bash");
+        failed.ok = false;
+        failed.args_full =
+            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
+        failed.result_class = Some("test_failure".into());
+        let mut read = journal_ok_call("read_file");
+        read.args_full = Some(serde_json::json!({"path": "README.md"}).to_string());
+        let records = vec![failed, read];
+        let eval =
+            evaluate_tool_call_records("validate the artifact", &[], &records, 0, false, 0.2);
+        let notice = turn_evaluation_status_notice_for_records(&eval, &records)
+            .expect("validation failures remain visible as incomplete");
+        assert!(notice.contains("test_failure x1"));
+        assert!(notice.contains("incomplete"));
+    }
+
+    #[test]
+    fn record_aware_status_fails_closed_for_opaque_shell_failure() {
+        let mut failed = journal_ok_call("bash");
+        failed.ok = false;
+        failed.args_full =
+            Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
+        failed.result_class = Some("execution_error".into());
+        let records = vec![failed];
+        let eval =
+            evaluate_tool_call_records("inspect the environment", &[], &records, 0, false, 0.2);
+        assert!(
+            turn_evaluation_status_notice_for_records(&eval, &records).is_some(),
+            "an opaque shell command is not proof of a harmless diagnostic probe"
         );
     }
 

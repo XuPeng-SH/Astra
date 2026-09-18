@@ -385,7 +385,22 @@ impl RuntimePolicyEvaluationState {
     /// Candidate evidence opens one terminal assessment, never clears failures
     /// or increases scheduling pressure. Same-round siblings are not later.
     pub(crate) fn has_task_resolution_candidate(&self) -> bool {
-        self.unresolved_tool_outcomes().values().any(|failure| {
+        let failures = self.unresolved_tool_outcomes();
+        self.has_task_resolution_candidate_for(&failures)
+    }
+
+    /// Return whether any of the supplied unresolved outcomes has a later
+    /// observation candidate.  Completion settlement supplies a semantically
+    /// filtered failure projection here: advisory probes remain in the raw
+    /// policy window, but cannot open a terminal reconciliation on their own.
+    pub(crate) fn has_task_resolution_candidate_for(
+        &self,
+        failures: &BTreeMap<
+            astra_turn_core::evaluation::EvaluationOutcomeKey,
+            astra_turn_core::evaluation::UnresolvedToolOutcome,
+        >,
+    ) -> bool {
+        failures.values().any(|failure| {
             let Some(failed_round) = self
                 .record_window
                 .get(failure.fact_index)
@@ -414,11 +429,26 @@ impl RuntimePolicyEvaluationState {
     /// Bounded labels for the terminal assessment prompt. These are hints to
     /// select existing execution references; the assessment validator remains
     /// the authority for relevance, chronology, and terminal integrity.
+    #[cfg(test)]
     pub(crate) fn task_resolution_hint_evidence(&self) -> serde_json::Value {
-        let mut failures = self
-            .unresolved_tool_outcomes()
-            .into_values()
+        let failures = self.unresolved_tool_outcomes();
+        self.task_resolution_hint_evidence_for(&failures)
+    }
+
+    /// Render task-resolution evidence for an explicit failure projection.
+    /// The full policy window remains available to diagnostics; this method
+    /// only controls which outcomes are presented as completion obligations.
+    pub(crate) fn task_resolution_hint_evidence_for(
+        &self,
+        unresolved: &BTreeMap<
+            astra_turn_core::evaluation::EvaluationOutcomeKey,
+            astra_turn_core::evaluation::UnresolvedToolOutcome,
+        >,
+    ) -> serde_json::Value {
+        let mut failures = unresolved
+            .values()
             .filter(|failure| failure.invocation.is_some())
+            .cloned()
             .collect::<Vec<_>>();
         failures.sort_by_key(|failure| failure.fact_index);
 
