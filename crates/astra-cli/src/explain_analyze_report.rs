@@ -99,6 +99,11 @@ pub(crate) fn render(
         lines.push(format!("  {summary}"));
     }
 
+    lines.extend(
+        auxiliary_usage_lines(&graph)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
     append_diagnostics(&graph, &mut lines);
     lines.join("\n")
 }
@@ -482,6 +487,7 @@ mod tests {
         outcome: Option<ExplainAnalyzeOutcomeV1>,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: id.to_string(),
             run_id: "run-1".to_string(),
@@ -524,6 +530,52 @@ mod tests {
         start.duration_ms = Some(duration);
         start.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         start
+    }
+
+    #[test]
+    fn auxiliary_jet_usage_is_separate_and_missing_lanes_remain_unknown() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: "aux-1".into(),
+                provider: "typesafe".into(),
+                offering_id: "jet-1".into(),
+                model_name: "jev1".into(),
+                purpose: "memory_retrieval_rerank".into(),
+                operation_id: "relevance".into(),
+                usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial,
+                usage: Some(ExplainAnalyzeTokenUsageV1 {
+                    basis: ExplainAnalyzeUsageBasisV1::ProviderPartial,
+                    fresh_input_tokens: Some(42),
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
+            }],
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_usage_lines(&graph).join("\n");
+        assert!(output.contains("Jet"), "{output}");
+        assert!(output.contains("in 42"), "{output}");
+        assert!(output.contains("out unknown"), "{output}");
+        assert!(output.contains("partial"), "{output}");
     }
 
     #[test]
@@ -741,4 +793,90 @@ mod tests {
             "{output}"
         );
     }
+}
+
+/// Same separately attributed auxiliary usage section for text, TUI and HTML.
+pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
+    use std::collections::BTreeMap;
+    type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+    type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
+    let mut groups: BTreeMap<GroupKey<'_>, Attempts<'_>> = BTreeMap::new();
+    for attempt in graph.auxiliary_attempts() {
+        groups
+            .entry((
+                &attempt.provider,
+                &attempt.offering_id,
+                &attempt.model_name,
+                &attempt.purpose,
+            ))
+            .or_default()
+            .push(attempt);
+    }
+    let mut lines = Vec::new();
+    for ((provider, _, model, purpose), attempts) in groups {
+        let provider = if provider == "typesafe" {
+            "Jet"
+        } else {
+            provider
+        };
+        let purpose = match purpose {
+            "memory_retrieval_rerank" => "Memory judgment",
+            "memory_extraction" => "Memory extraction",
+            "introspection" => "Request decisions",
+            "verification_judge" => "Verification",
+            "reflection" => "Reflection",
+            "required_compaction" => "Context summary",
+            _ => "Auxiliary inference",
+        };
+        let reported = attempts
+            .iter()
+            .filter_map(|a| a.usage.as_ref())
+            .collect::<Vec<_>>();
+        let values = if reported.is_empty() {
+            "usage unavailable".into()
+        } else {
+            let lanes = [
+                (
+                    "in",
+                    reported
+                        .iter()
+                        .map(|u| u.fresh_input_tokens)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "cache read",
+                    reported.iter().map(|u| u.cache_read_tokens).collect(),
+                ),
+                (
+                    "cache write",
+                    reported.iter().map(|u| u.cache_creation_tokens).collect(),
+                ),
+                ("out", reported.iter().map(|u| u.output_tokens).collect()),
+            ];
+            lanes
+                .into_iter()
+                .map(|(name, counts)| {
+                    let known = counts.into_iter().flatten().collect::<Vec<_>>();
+                    if known.is_empty() {
+                        format!("{name} unknown")
+                    } else {
+                        format!("{name} {}", known.into_iter().map(u128::from).sum::<u128>())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        let partial = if attempts.iter().any(|a| {
+            a.usage_status != astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+        }) {
+            " · partial"
+        } else {
+            ""
+        };
+        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · {values} · {}/{} requests reported{partial}",reported.len(),attempts.len()));
+    }
+    if graph.auxiliary_usage_unavailable() {
+        lines.push("Auxiliary tokens · capture unavailable".into());
+    }
+    lines
 }

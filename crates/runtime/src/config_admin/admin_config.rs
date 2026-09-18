@@ -88,14 +88,30 @@ pub async fn set_admin_config_handler(
     Json(request): Json<AdminConfigSetRequest>,
 ) -> Result<Json<AdminConfigEntry>, (StatusCode, Json<ErrorResponse>)> {
     let admin = state.admin.authorizer.require_admin(&headers).await?;
-    if key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING {
+    if key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING
+        || key == astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING
+    {
         // Fail at configuration time, while the operator still has the
         // relevant context, instead of breaking every later background
         // inference with a stale or misspelled identity.
-        state
+        let offering = state
             .model_service
             .resolve_model_offering(request.value.clone())
             .await?;
+        if offering.model.provider == "typesafe" {
+            if key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "TypeSafe supports memory judgments, not reasoning",
+                ));
+            }
+            if offering.model.api_key.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "TypeSafe API key is not configured",
+                ));
+            }
+        }
     }
     state
         .admin

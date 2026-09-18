@@ -97,7 +97,7 @@ async fn maybe_load_memory_inference_offering(
     if state.memory_inference_offering.is_some() {
         return;
     }
-    match super::session_memory_inference::fetch_memory_inference_offerings(api, token).await {
+    match super::session_memory_inference::fetch_memory_judgment_offerings(api, token).await {
         Ok(offerings) => {
             state.memory_inference_offering = offerings.into_iter().next();
         }

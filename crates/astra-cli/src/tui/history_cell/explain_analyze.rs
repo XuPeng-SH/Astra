@@ -671,6 +671,17 @@ fn render_graph(
             );
         }
     }
+    if !live {
+        for summary in crate::explain_analyze_report::auxiliary_usage_lines(graph) {
+            let _ = push_wrapped_detail(
+                &mut lines,
+                &summary,
+                width,
+                Style::default().fg(Color::DarkGray),
+                content_limit,
+            );
+        }
+    }
     if !graph.diagnostics().is_empty() && !truncated && !live {
         let summary = graph
             .diagnostics()
@@ -1199,6 +1210,7 @@ mod tests {
     ) -> ExplainAnalyzeEventV1 {
         let is_provider = kind == ExplainAnalyzeNodeKindV1::ProviderAttempt;
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.into(),
             run_id: "run-1".into(),

@@ -269,7 +269,7 @@ impl InferenceProviderWireIdentity {
         let protocol = protocol.into();
         if !matches!(
             protocol.as_str(),
-            "openai_compatible" | "anthropic_messages" | "bedrock_converse"
+            "openai_compatible" | "anthropic_messages" | "bedrock_converse" | "typesafe_systemone"
         ) {
             return Err(ServiceError::invalid(
                 "provider_protocol must be one of the typed transport protocols",
@@ -7453,6 +7453,102 @@ pub async fn finish_inference_invocation(
     Ok(())
 }
 
+/// Read-only auxiliary usage from physical attempts, scoped to one authenticated
+/// owner/session/turn. Invocation totals are never added to attempt totals.
+pub async fn load_explain_auxiliary_usage(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    turn: u32,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    use astra_turn_types::{
+        ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1,
+        ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+    };
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let rows = sqlx::query("SELECT a.attempt_id, a.provider, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
+        .bind(user_id).bind(session_id).bind(i64::from(turn))
+        .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid Explain capture budget"))?).fetch_all(pool.get()).await
+        .map_err(|e| ServiceError::internal(format!("load auxiliary Explain usage: {e}")))?;
+    if rows.len() > max_attempts {
+        return Ok(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: false,
+            attempts: Vec::new(),
+        });
+    }
+    let mut attempts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let status: String = row
+            .try_get("usage_status")
+            .map_err(|e| ServiceError::internal(e.to_string()))?;
+        let usage = match status.as_str() {
+            "unavailable" => None,
+            "provider_exact" | "provider_partial" => {
+                let count = |column: &str| -> ServiceResult<Option<u64>> {
+                    let n: i64 = row
+                        .try_get(column)
+                        .map_err(|e| ServiceError::internal(e.to_string()))?;
+                    u64::try_from(n)
+                        .map(|n| {
+                            if status == "provider_partial" && n == 0 {
+                                None
+                            } else {
+                                Some(n)
+                            }
+                        })
+                        .map_err(|_| ServiceError::internal("negative inference usage"))
+                };
+                Some(ExplainAnalyzeTokenUsageV1 {
+                    basis: if status == "provider_exact" {
+                        ExplainAnalyzeUsageBasisV1::ProviderExact
+                    } else {
+                        ExplainAnalyzeUsageBasisV1::ProviderPartial
+                    },
+                    fresh_input_tokens: count("input_tokens")?,
+                    output_tokens: count("output_tokens")?,
+                    cache_read_tokens: count("cache_read_tokens")?,
+                    cache_creation_tokens: count("cache_creation_tokens")?,
+                })
+            }
+            _ => return Err(ServiceError::internal("invalid inference usage status")),
+        };
+        let text = |column: &str| {
+            row.try_get::<String, _>(column)
+                .map_err(|e| ServiceError::internal(e.to_string()))
+        };
+        attempts.push(ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: text("attempt_id")?,
+            provider: text("provider")?,
+            offering_id: text("offering_id")?,
+            model_name: text("upstream_model_name")?,
+            purpose: text("purpose")?,
+            operation_id: text("operation_id")?,
+            usage: usage.filter(astra_turn_types::ExplainAnalyzeTokenUsageV1::is_valid),
+            usage_status: match status.as_str() {
+                "provider_exact" => {
+                    astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+                }
+                "provider_partial" => {
+                    astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial
+                }
+                _ => astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            },
+        });
+    }
+    let result = ExplainAnalyzeAuxiliaryUsageV1 {
+        available: true,
+        attempts,
+    };
+    if !result.is_valid() {
+        return Err(ServiceError::internal(
+            "invalid auxiliary inference usage fact",
+        ));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7932,6 +8028,8 @@ mod tests {
     #[test]
     fn provider_wire_identity_rejects_ambiguous_or_fabricated_values() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(InferenceProviderWireIdentity::new("typesafe_systemone", hash, 1).is_ok());
+        assert!(InferenceProviderWireIdentity::new("unknown_protocol", hash, 1).is_err());
         assert!(InferenceProviderWireIdentity::new("", hash, 1).is_err());
         assert!(InferenceProviderWireIdentity::new("openai compatible", hash, 1).is_err());
         assert!(

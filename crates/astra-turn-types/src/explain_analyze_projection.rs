@@ -39,6 +39,7 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
+    pub auxiliary_usage: Option<Box<crate::ExplainAnalyzeAuxiliaryUsageV1>>,
     pub coverage_gaps: Vec<crate::ExplainAnalyzeCoverageGapV1>,
     pub start_observed: bool,
     pub terminal_observed: bool,
@@ -251,6 +252,38 @@ pub struct ExplainAnalyzeGraphV1 {
 }
 
 impl ExplainAnalyzeGraphV1 {
+    /// Deduplicate physical attempts across repeated turn segments.
+    pub fn auxiliary_attempts(&self) -> Vec<&crate::ExplainAnalyzeAuxiliaryAttemptV1> {
+        let mut attempts = BTreeMap::new();
+        for attempt in self
+            .nodes
+            .iter()
+            .filter(|n| n.terminal_observed && !n.conflicted)
+            .filter_map(|n| n.auxiliary_usage.as_ref())
+            .flat_map(|u| &u.attempts)
+        {
+            let entry = attempts.entry(&attempt.attempt_id).or_insert(attempt);
+            let rank = |status| match status {
+                crate::ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable => 0,
+                crate::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial => 1,
+                crate::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact => 2,
+            };
+            if rank(attempt.usage_status) > rank(entry.usage_status)
+                || (attempt.usage_status == entry.usage_status
+                    && entry.usage.is_none()
+                    && attempt.usage.is_some())
+            {
+                *entry = attempt;
+            }
+        }
+        attempts.into_values().collect()
+    }
+    pub fn auxiliary_usage_unavailable(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| !u.available))
+    }
+
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
     }
@@ -515,6 +548,7 @@ impl ExplainAnalyzeGraphV1 {
             outcome: event.outcome,
             usage: event.usage.clone(),
             context: event.context.clone(),
+            auxiliary_usage: event.auxiliary_usage.clone(),
             coverage_gaps: event.coverage_gaps.clone(),
             start_observed: event.transition == ExplainAnalyzeTransitionV1::Started,
             terminal_observed: terminal,
@@ -658,6 +692,7 @@ impl ExplainAnalyzeGraphV1 {
                     || node.duration_ms != event.duration_ms
                     || node.outcome != event.outcome
                     || node.usage != event.usage
+                    || node.auxiliary_usage != event.auxiliary_usage
                     || node.context != event.context
                     || node.coverage_gaps != event.coverage_gaps
                 {
@@ -676,6 +711,7 @@ impl ExplainAnalyzeGraphV1 {
                 node.outcome = event.outcome;
                 node.usage = event.usage.clone();
                 node.context = event.context.clone();
+                node.auxiliary_usage = event.auxiliary_usage.clone();
                 node.coverage_gaps = event.coverage_gaps.clone();
                 node.terminal_observed = true;
             }
@@ -892,6 +928,7 @@ mod tests {
         elapsed_ms: u64,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: crate::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{node_id}/started"),
             run_id: "run-1".to_owned(),
@@ -930,6 +967,66 @@ mod tests {
         event.duration_ms = Some(end_elapsed_ms - start_elapsed_ms);
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         event
+    }
+
+    #[test]
+    fn auxiliary_snapshots_upgrade_status_without_double_counting_attempts() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for (index, status) in [
+            ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = finished(
+                started(
+                    &format!("segment-{index}"),
+                    ExplainAnalyzeNodeKindV1::Turn,
+                    None,
+                    "clock",
+                    0,
+                ),
+                0,
+                10,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "aux-1".into(),
+                    provider: "typesafe".into(),
+                    offering_id: "jet-1".into(),
+                    model_name: "jev1".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "verification_judge".into(),
+                    usage_status: status,
+                    usage: (status == ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact)
+                        .then_some(ExplainAnalyzeTokenUsageV1 {
+                            basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                            fresh_input_tokens: Some(100),
+                            output_tokens: Some(0),
+                            cache_read_tokens: None,
+                            cache_creation_tokens: None,
+                        }),
+                }],
+            }));
+            graph.apply(event);
+            assert_eq!(graph.auxiliary_attempts().len(), 1);
+            assert_eq!(graph.auxiliary_attempts()[0].usage_status, status);
+        }
+        assert_eq!(
+            graph.auxiliary_attempts()[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .fresh_input_tokens,
+            Some(100)
+        );
     }
 
     fn is_diagnostic(

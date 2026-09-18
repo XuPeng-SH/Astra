@@ -503,11 +503,57 @@ pub async fn get_model_handler(
     Ok(Json(ModelResponse::from(model)))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCatalogOperation {
+    #[default]
+    Extraction,
+    Judgment,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryModelQuery {
+    #[serde(default)]
+    pub operation: MemoryCatalogOperation,
+}
+impl MemoryModelQuery {
+    fn judgment_binding(&self) -> bool {
+        self.operation == MemoryCatalogOperation::Judgment
+    }
+}
+
 pub async fn get_memory_model_handler(
     State(state): State<AppState>,
+    Query(query): Query<MemoryModelQuery>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if query.judgment_binding()
+        && let Some(offering_id) = state
+            .admin
+            .config_service
+            .get(astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING)
+            .await
+            .map_err(internal_error)?
+    {
+        let admitted = state
+            .model_service
+            .admit_model_offering(user.user_id.clone(), offering_id.clone())
+            .await?;
+        if admitted.provider == "typesafe" && admitted.api_key.trim().is_empty() {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Configured TypeSafe judgment Offering has no API key",
+            ));
+        }
+        return Ok(Json(MemoryInferenceOfferingsResponse {
+            offerings: vec![MemoryInferenceOfferingResponse {
+                offering_id,
+                model_name: admitted.model_name,
+                thinking_capability: admitted.thinking_capability,
+            }],
+        }));
+    }
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -752,5 +798,22 @@ mod tests {
             .expect_err("duplicate identity cannot be split across pages");
 
         assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod memory_catalog_query_tests {
+    use super::*;
+    #[test]
+    fn judgment_binding_is_explicit_and_extraction_is_default() {
+        let default: MemoryModelQuery = serde_json::from_str("{}").unwrap();
+        assert!(!default.judgment_binding());
+        let extraction: MemoryModelQuery =
+            serde_json::from_str(r#"{"operation":"extraction"}"#).unwrap();
+        assert!(!extraction.judgment_binding());
+        let judgment: MemoryModelQuery =
+            serde_json::from_str(r#"{"operation":"judgment"}"#).unwrap();
+        assert!(judgment.judgment_binding());
+        assert!(serde_json::from_str::<MemoryModelQuery>(r#"{"operation":"other"}"#).is_err());
     }
 }

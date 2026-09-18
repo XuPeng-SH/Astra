@@ -433,6 +433,14 @@ export type ExplainAnalyzeContextMetricsV1 = {
 
 /** One versioned, bounded execution fact. Missing token lanes are unavailable,
  * not zero; indexes are explicit and are never parsed from labels. */
+export type ExplainAnalyzeAuxiliaryUsageV1 = {
+  available: boolean;
+  attempts: {
+    attempt_id: string; usage_status: "provider_exact" | "provider_partial" | "unavailable"; provider: string; offering_id: string; model_name: string;
+    purpose: string; operation_id: string; usage?: ExplainAnalyzeUsageV1;
+  }[];
+};
+
 export type ExplainAnalyzeEventV1 = {
   type: "explain_analyze";
   schema_version: 1;
@@ -454,6 +462,7 @@ export type ExplainAnalyzeEventV1 = {
   duration_ms?: number;
   outcome?: ExplainAnalyzeOutcomeV1;
   usage?: ExplainAnalyzeUsageV1;
+  auxiliary_usage?: ExplainAnalyzeAuxiliaryUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
   coverage_gaps?: ExplainAnalyzeCoverageGapV1[];
 };

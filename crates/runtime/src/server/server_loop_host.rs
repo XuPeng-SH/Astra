@@ -3337,6 +3337,7 @@ impl ExplainAnalyzeContext {
             }
         };
         let fact = astra_turn_types::ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: self.next_event_id(),
             run_id: self.run_id.clone(),
@@ -16812,7 +16813,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ));
     }
 
-    fn on_turn_terminal(
+    async fn on_turn_terminal(
         &mut self,
         state: &AgenticLoopState,
         result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
@@ -16857,6 +16858,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             Err(_) => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
         };
         let finished_at = Instant::now();
+        // Supplemental observability must not turn a successful request into
+        // a failure or stall final delivery indefinitely.
+        let auxiliary_usage = match self.shared_pool.as_ref() {
+            Some(pool) => match tokio::time::timeout(
+                Duration::from_secs(1),
+                astra_services::inference_execution::load_explain_auxiliary_usage(
+                    pool,
+                    &self.user_id,
+                    &self.session_id,
+                    state.session_turn,
+                    crate::server::run::lifecycle::run_state::MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(facts)) => facts,
+                _ => astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                    available: false,
+                    attempts: Vec::new(),
+                },
+            },
+            None => astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                attempts: Vec::new(),
+            },
+        };
+
         let unfinished_context_assemblies = self
             .explain_analyze_open_nodes
             .iter()
@@ -16965,7 +16993,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
             astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
         ];
-        if let Some(event) = context.event_with_context_and_coverage(
+        if let Some(mut event) = context.event_with_context_and_coverage(
             &root,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
             finished_at,
@@ -16975,6 +17003,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             None,
             coverage_gaps,
         ) {
+            event["auxiliary_usage"] =
+                serde_json::to_value(auxiliary_usage).expect("typed auxiliary usage serialization");
             self.emit_progress_event(event);
         }
         self.explain_analyze_admission_nodes.clear();
@@ -31702,7 +31732,8 @@ mod tests {
             outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
         });
         host.on_final_output_ready(&state).await;
-        host.on_turn_terminal(&state, &Ok(AgenticLoopOutcome::Completed));
+        host.on_turn_terminal(&state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
 
         let explain_facts = host
             .take_emitted_events()
@@ -31856,8 +31887,8 @@ mod tests {
         assert_eq!(terminals[1]["context"]["budget"]["visible_tool_count"], 3);
     }
 
-    #[test]
-    fn failed_or_cancelled_context_assembly_closes_without_partial_metrics() {
+    #[tokio::test]
+    async fn failed_or_cancelled_context_assembly_closes_without_partial_metrics() {
         for (suffix, error_kind, expected_outcome) in [
             ("cancel", astra_core::ErrorKind::Cancelled, "cancelled"),
             (
@@ -31899,7 +31930,7 @@ mod tests {
                 .expect("Explain Analyze context should be active");
 
             let error = astra_core::ClassifiedError::new(error_kind, "test early exit");
-            host.on_turn_terminal(&state, &Err(error));
+            host.on_turn_terminal(&state, &Err(error)).await;
 
             let events = host.take_emitted_events();
             let terminal = events
@@ -33801,7 +33832,8 @@ mod tests {
             .unwrap(),
             outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
         });
-        host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+        host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
 
         let explain_facts = host
             .emitted_events
@@ -34004,7 +34036,8 @@ mod tests {
             assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
             assert_eq!(outcome.results.len(), 1);
             assert_eq!(outcome.results[0].status, "completed");
-            host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+            host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed))
+                .await;
             let tool_terminal = host
                 .emitted_events
                 .iter()

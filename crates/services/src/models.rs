@@ -1953,9 +1953,13 @@ pub async fn resolve_reasoning_offering(
         .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_OFFERING)
         .await?
     {
-        return resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
+        let offering = resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())?;
+        if offering.model.provider == "typesafe" {
+            return Err("TypeSafe is judgment-only and cannot be a reasoning Offering".into());
+        }
+        return Ok(offering);
     }
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
@@ -1963,7 +1967,7 @@ pub async fn resolve_reasoning_offering(
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
     ))
     .fetch_all(&pool)
     .await
@@ -2115,7 +2119,7 @@ pub async fn resolve_memory_offerings(
     }
 
     let rows = sqlx::query(&format!(
-        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
     ))
     .fetch_all(&pool)
     .await
@@ -3967,6 +3971,7 @@ pub fn resolve_provider_base_url(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com/v1".to_string()),
         "anthropic" => None,
+        "typesafe" => Some("https://api.typesafe.ai".to_string()),
         _ => None,
     }
 }
@@ -4141,7 +4146,21 @@ pub async fn validate_connectivity(
         Err(e) => return Some(format!("Client error: {}", e)),
     };
 
-    let result = if provider == "anthropic" {
+    let result = if provider == "typesafe" {
+        if api_key.trim().is_empty() {
+            return Some("TypeSafe API key is not configured".into());
+        }
+        let base = base_url
+            .unwrap_or("https://api.typesafe.ai")
+            .trim_end_matches('/')
+            .trim_end_matches("/v1");
+        let probe = format!("{base}/v1/systemone");
+        let send_result = client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
+            "model": model_name, "state": "Astra connectivity probe",
+            "questions": {"connected": {"type": "noul", "instructions": "Does the state mention Astra?"}}
+        })).send().await;
+        (send_result, probe)
+    } else if provider == "anthropic" {
         let probe = anthropic_messages_probe_url(base_url);
         let mut req = client
             .post(&probe)
@@ -4320,7 +4339,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
     base_url: Option<&str>,
     protocol_override: Option<ThinkingProtocol>,
 ) -> ThinkingProbeResult {
-    if provider == "mock" {
+    if provider == "mock" || provider == "typesafe" {
         return ThinkingProbeResult {
             capability: ThinkingCapability::None,
             error: None,
@@ -5406,9 +5425,9 @@ fn resolve_model_default(
             }
         }
         Some(candidate)
-            if offerings
-                .iter()
-                .any(|offering| offering.offering_id == candidate.offering_id) =>
+            if offerings.iter().any(|offering| {
+                offering.offering_id == candidate.offering_id && offering.provider != "typesafe"
+            }) =>
         {
             ModelDefaultResolution::Selected {
                 offering_id: candidate.offering_id,
@@ -5419,7 +5438,10 @@ fn resolve_model_default(
         Some(_) => ModelDefaultResolution::Invalid {
             reason: ModelDefaultInvalidReason::NotEffectiveOffering,
         },
-        None => match offerings.first() {
+        None => match offerings
+            .iter()
+            .find(|offering| offering.provider != "typesafe")
+        {
             Some(offering) => ModelDefaultResolution::Selected {
                 offering_id: offering.offering_id.clone(),
                 source: ModelDefaultSource::Astra,

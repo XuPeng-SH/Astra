@@ -245,6 +245,67 @@ impl ExplainAnalyzeTokenUsageV1 {
     }
 }
 
+/// Read-only physical-attempt usage snapshot for auxiliary inference in one turn.
+/// No timing interval is inferred from ledger timestamps.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryUsageV1 {
+    pub available: bool,
+    pub attempts: Vec<ExplainAnalyzeAuxiliaryAttemptV1>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryAttemptV1 {
+    pub attempt_id: String,
+    pub usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1,
+    pub provider: String,
+    pub offering_id: String,
+    pub model_name: String,
+    pub purpose: String,
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAnalyzeAuxiliaryUsageStatusV1 {
+    ProviderExact,
+    ProviderPartial,
+    Unavailable,
+}
+
+impl ExplainAnalyzeAuxiliaryUsageV1 {
+    pub fn is_valid(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        (self.available || self.attempts.is_empty())
+            && self.attempts.iter().all(|a| {
+                valid_id(&a.attempt_id)
+                    && seen.insert(&a.attempt_id)
+                    && valid_id(&a.provider)
+                    && valid_id(&a.offering_id)
+                    && valid_id(&a.purpose)
+                    && valid_id(&a.operation_id)
+                    && match a.usage_status {
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact => a
+                            .usage
+                            .as_ref()
+                            .is_some_and(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderExact),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial => a
+                            .usage
+                            .as_ref()
+                            .is_none_or(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderPartial),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable => a.usage.is_none(),
+                    }
+                    && !a.model_name.trim().is_empty()
+                    && a.model_name.len() <= 255
+                    && !a.model_name.chars().any(char::is_control)
+                    && a.usage.as_ref().is_none_or(|u| {
+                        u.is_valid() && u.basis != ExplainAnalyzeUsageBasisV1::RuntimeEstimated
+                    })
+            })
+    }
+}
+
 /// One idempotent fact about a node in a run/turn execution graph.
 ///
 /// `elapsed_ms` is measured in `clock_domain_id` from the producer's turn
@@ -283,6 +344,9 @@ pub struct ExplainAnalyzeEventV1 {
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+    /// Auxiliary usage is separate from timed provider-attempt node usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_usage: Option<Box<ExplainAnalyzeAuxiliaryUsageV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     /// Known boundaries without a measured graph interval. Only terminal turn
@@ -294,6 +358,13 @@ pub struct ExplainAnalyzeEventV1 {
 impl ExplainAnalyzeEventV1 {
     /// Validate a decoded/public event before projection or graph mutation.
     pub fn is_valid(&self) -> bool {
+        if self.auxiliary_usage.as_ref().is_some_and(|a| {
+            self.kind != ExplainAnalyzeNodeKindV1::Turn
+                || self.transition != ExplainAnalyzeTransitionV1::Finished
+                || !a.is_valid()
+        }) {
+            return false;
+        }
         if self.schema_version != EXPLAIN_ANALYZE_SCHEMA_VERSION
             || !valid_id(&self.event_id)
             || !valid_id(&self.run_id)
@@ -395,6 +466,7 @@ mod tests {
 
     fn started() -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "turn-1/provider/0/started".to_string(),
             run_id: "run-1".to_string(),

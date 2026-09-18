@@ -445,3 +445,22 @@ trace payloads.
   durable append failure, slow/full consumers, reconnect at each structural
   boundary, and the replay-to-live handoff. No case may yield a complete graph
   with invented timing or missing execution nodes.
+
+### Auxiliary provider usage
+
+A terminal turn fact can carry a read-only `auxiliary_usage` snapshot of physical
+provider attempts in the authenticated user's Session and turn. It records
+attempt identity, provider, Offering, requested upstream model, purpose/operation and
+reported token lanes. Invocation totals are not added to attempt totals.
+Repeated turn segments deduplicate attempt IDs. Missing usage remains unknown;
+partial provider usage is labeled partial. A failed or timed-out snapshot is
+marked unavailable and does not fail the user's turn. Collection has a one-second
+best-effort budget and runs only when Explain capture is enabled. The snapshot
+uses the existing durable-event batch row budget; overflow is marked unavailable
+instead of reporting a silently truncated total. The requested model comes from
+the immutable route and is not an assertion about the provider-returned model.
+
+These facts are separate from timed main-model nodes: no interval is invented
+from database timestamps. TUI, text, HTML and Web show Jet auxiliary tokens
+separately from the main model's tokens. The snapshot is complete only as a
+query at terminal time; auxiliary calls performed after capture are not included.

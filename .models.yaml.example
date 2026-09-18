@@ -203,3 +203,22 @@
   context_window: 65536
   max_completion_tokens: 8192
   supported_parameters: [tools]
+
+# Optional memory judgment pilot (not a chat/reasoning/extraction model).
+# Register with a real api_key, run `astra admin model check`, then bind its
+# exact Offering ID with:
+#   astra admin config set judgment_offering_id <offering-id>
+# Unset to use the ordinary selector in newly started sessions:
+#   astra admin config unset judgment_offering_id
+# Credentials are stored encrypted through the existing model registry.
+# An empty api_key is unusable; no JET_KEY environment variable is required.
+# - name: jev-1.13.0
+#   provider: typesafe
+#   base_url: https://api.typesafe.ai
+#   api_key: ""
+#   context_window: 64000
+#   max_completion_tokens: 50
+#   pricing_prompt: 0.000000042
+#   pricing_completion: 0
+#   tags: []
+#   supported_parameters: []

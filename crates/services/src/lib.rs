@@ -118,8 +118,9 @@ pub use admin::{
     AdminUserRoleRequestData, AuthenticatedUser,
 };
 pub use admin_config::{
-    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_OFFERING, AdminConfigService,
-    DatabaseAdminConfigService, UnconfiguredAdminConfigService,
+    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_JUDGMENT_OFFERING,
+    ADMIN_CONFIG_KEY_REASONING_OFFERING, AdminConfigService, DatabaseAdminConfigService,
+    UnconfiguredAdminConfigService,
 };
 pub use agent_bindings::{
     AgentBindingCreateRequestData, AgentBindingOwnerScope, AgentBindingPayload, AgentBindingRecord,

@@ -25,6 +25,7 @@ export type ExplainAnalyzeNodeV1 = {
   outcome?: ExplainAnalyzeEventV1["outcome"];
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
+  auxiliaryUsage?: ExplainAnalyzeEventV1["auxiliary_usage"];
   coverageGaps: ExplainAnalyzeCoverageGapV1[];
   startObserved: boolean;
   terminalObserved: boolean;
@@ -108,7 +109,7 @@ const allowedEventKeys = new Set([
   "outcome",
   "usage",
   "context",
-  "coverage_gaps",
+  "coverage_gaps", "auxiliary_usage",
 ]);
 const coverageGaps = new Set<ExplainAnalyzeCoverageGapV1>([
   "user_input_wait_intervals",
@@ -147,6 +148,8 @@ export function isExplainAnalyzeEventV1(
   ) {
     return false;
   }
+  if (value.auxiliary_usage !== undefined &&
+      (value.kind !== "turn" || value.transition !== "finished" || !isAuxiliaryUsage(value.auxiliary_usage))) return false;
   if (value.coverage_gaps !== undefined &&
     (value.kind !== "turn" || value.transition !== "finished" ||
       !isCoverageGapList(value.coverage_gaps))) {
@@ -180,6 +183,60 @@ export function isExplainAnalyzeEventV1(
   return (value.usage === undefined || isExplainAnalyzeUsage(value.usage)) &&
     (value.context === undefined ||
       (value.usage === undefined && (value.kind === "context_assembly" || value.kind === "preparation") && isExplainContext(value.context, value.kind)));
+}
+
+function isAuxiliaryUsage(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).some(k => !["available", "attempts"].includes(k)) ||
+      typeof value.available !== "boolean" || !Array.isArray(value.attempts) || (!value.available && value.attempts.length > 0)) return false;
+  const seen = new Set<string>();
+  return value.attempts.every(a => {
+    if (!isRecord(a) || Object.keys(a).some(k => !["attempt_id","usage_status","provider","offering_id","model_name","purpose","operation_id","usage"].includes(k))) return false;
+    for (const key of ["attempt_id","provider","offering_id","purpose","operation_id"]) {
+      if (!nonEmptyString(a[key],512) || /[\s\u0000-\u001f\u007f]/u.test(a[key] as string)) return false;
+    }
+    if (!nonEmptyString(a.model_name,255) || /[\u0000-\u001f\u007f]/u.test(a.model_name) || seen.has(a.attempt_id as string)) return false;
+    seen.add(a.attempt_id as string);
+    if (!["provider_exact","provider_partial","unavailable"].includes(a.usage_status as string)) return false;
+    if (a.usage_status === "unavailable") return a.usage === undefined;
+    if (a.usage === undefined) return a.usage_status === "provider_partial";
+    return isExplainAnalyzeUsage(a.usage) && a.usage.basis === a.usage_status;
+  });
+}
+
+/** Auxiliary physical attempts are separate from timed main-model node usage. */
+export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1): string[] {
+  type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
+  const attempts = new Map<string, Attempt>();
+  let unavailable = false;
+  for (const node of graph.nodes) {
+    if (!node.terminalObserved || node.conflicted || !node.auxiliaryUsage) continue;
+    unavailable ||= !node.auxiliaryUsage.available;
+    for (const attempt of node.auxiliaryUsage.attempts) {
+      const existing = attempts.get(attempt.attempt_id);
+      const rank = { unavailable: 0, provider_partial: 1, provider_exact: 2 };
+      if (!existing || rank[attempt.usage_status] > rank[existing.usage_status] ||
+        (attempt.usage_status === existing.usage_status && !existing.usage && attempt.usage)) attempts.set(attempt.attempt_id, attempt);
+    }
+  }
+  const groups = new Map<string, Attempt[]>();
+  for (const attempt of attempts.values()) {
+    const key = JSON.stringify([attempt.provider,attempt.offering_id,attempt.model_name,attempt.purpose]);
+    const group = groups.get(key) ?? []; group.push(attempt); groups.set(key,group);
+  }
+  const purposeLabels: Record<string,string> = { memory_retrieval_rerank:"Memory judgment", memory_extraction:"Memory extraction", introspection:"Request decisions", verification_judge:"Verification", reflection:"Reflection", required_compaction:"Context summary" };
+  const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
+    const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
+    const provider = first.provider === "typesafe" ? "Jet" : first.provider;
+    const lanes = [["in","fresh_input_tokens"],["cache read","cache_read_tokens"],["cache write","cache_creation_tokens"],["out","output_tokens"]] as const;
+    const values = reported.length === 0 ? "usage unavailable" : lanes.map(([name,key]) => {
+      const counters = reported.flatMap(u => u[key] === undefined ? [] : [BigInt(u[key])]);
+      return `${name} ${counters.length === 0 ? "unknown" : counters.reduce((a,b)=>a+b,0n).toString()}`;
+    }).join(" · ");
+    const partial = reported.length !== group.length || group.some(a => a.usage_status === "provider_partial") ? " · partial" : "";
+    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${purposeLabels[first.purpose] ?? "Auxiliary inference"} · ${values} · ${reported.length}/${group.length} requests reported${partial}`;
+  });
+  if (unavailable) lines.push("Auxiliary tokens · capture unavailable");
+  return lines;
 }
 
 function isCoverageGapList(value: unknown): value is ExplainAnalyzeCoverageGapV1[] {
@@ -341,6 +398,7 @@ export function reduceExplainAnalyzeEvents(
               outcome: value.outcome,
               ...(value.usage ? { usage: value.usage } : {}),
               ...(value.context ? { context: value.context } : {}),
+              ...(value.auxiliary_usage ? { auxiliaryUsage: value.auxiliary_usage } : {}),
             }
           : {}),
         startObserved: value.transition === "started",
@@ -383,6 +441,7 @@ export function reduceExplainAnalyzeEvents(
         node.outcome !== value.outcome ||
         stableJson(node.usage ?? null) !== stableJson(value.usage ?? null) ||
         stableJson(node.context ?? null) !== stableJson(value.context ?? null) ||
+        stableJson(node.auxiliaryUsage ?? null) !== stableJson(value.auxiliary_usage ?? null) ||
         stableJson(node.coverageGaps) !== stableJson(value.coverage_gaps ?? [])
       ) {
         node.conflicted = true;
@@ -398,6 +457,7 @@ export function reduceExplainAnalyzeEvents(
       node.outcome = value.outcome;
       node.usage = value.usage;
       node.context = value.context;
+      node.auxiliaryUsage = value.auxiliary_usage;
       node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
@@ -644,7 +704,7 @@ export function renderExplainAnalyzeHtml(
     : "";
   const statusClass = isDegraded || statusLabel === "Mixed outcomes" ? "state-running" : status === "failed" || status === "interrupted" ? "state-failed" : status === "waiting" ? "state-running" : "state-complete";
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${explainAnalyzeAuxiliaryUsageLines(graph).length ? `<section class="panel"><h2>Auxiliary model usage</h2>${explainAnalyzeAuxiliaryUsageLines(graph).map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
 }
 
 function renderHtmlTokenSummary(

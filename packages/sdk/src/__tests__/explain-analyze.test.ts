@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   explainAnalyzeFactFingerprint,
+  explainAnalyzeAuxiliaryUsageLines,
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
   isExplainAnalyzeEventV1,
@@ -609,4 +610,48 @@ it("keeps external delivery gaps inside the HTML report's copyable text", () => 
   const copyable = html.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/)?.[1];
   expect(copyable).toContain("Incomplete observation: delivery gap");
   expect(copyable).toContain("No execution facts recorded");
+});
+
+
+describe("auxiliary provider usage", () => {
+  const auxiliary = {
+    available: true,
+    attempts: [{attempt_id: "aux-1", provider: "typesafe", offering_id: "jet-1", model_name: "jev1", purpose: "memory_retrieval_rerank", operation_id: "relevance", usage_status: "provider_partial" as const, usage: {basis: "provider_partial" as const, fresh_input_tokens: 42}}],
+  };
+  it("exports Jet separately, deduplicates physical attempts across segments, and preserves unknown lanes", () => {
+    const first = finished("turn", "turn", 0, 100, {auxiliary_usage: auxiliary});
+    const second = finished("segment", "turn", 100, 200, {auxiliary_usage: auxiliary});
+    expect(isExplainAnalyzeEventV1(first)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([first, second]);
+    const lines = explainAnalyzeAuxiliaryUsageLines(graph);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Jet");
+    expect(lines[0]).toContain("in 42");
+    expect(lines[0]).toContain("out unknown");
+    expect(lines[0]).toContain("1/1 requests reported · partial");
+    expect(renderExplainAnalyzeHtml([first, second])).toContain("Auxiliary tokens");
+  });
+  it("rejects usage facts on nonterminal events and duplicated physical identities", () => {
+    expect(isExplainAnalyzeEventV1(started("turn", "turn", 0, {auxiliary_usage: auxiliary}))).toBe(false);
+    expect(isExplainAnalyzeEventV1(finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [auxiliary.attempts[0], auxiliary.attempts[0]]}}))).toBe(false);
+  });
+  it("keeps unavailable and all-zero partial usage distinct from known zero", () => {
+    const partial = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [{...auxiliary.attempts[0], usage: undefined}]}});
+    expect(isExplainAnalyzeEventV1(partial)).toBe(true);
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([partial]))[0]).toContain("usage unavailable");
+    const unavailable = finished("turn", "turn", 0, 100, {auxiliary_usage: {available: false, attempts: []}});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([unavailable]))).toEqual(["Auxiliary tokens · capture unavailable"]);
+  });
+});
+
+it("upgrades auxiliary usage from unavailable through partial to exact across segments", () => {
+  const attempt = {attempt_id: "aux-1", provider: "typesafe", offering_id: "jet-1", model_name: "jev1", purpose: "verification_judge", operation_id: "verification_judge"};
+  const missing = finished("one", "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "unavailable"}]}});
+  const partial = finished("two", "turn", 10, 20, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_partial"}]}});
+  expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial]))[0]).toContain("partial");
+  const exact = finished("three", "turn", 20, 30, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_exact", usage: {basis: "provider_exact", fresh_input_tokens: 100, output_tokens: 0}}]}});
+  const output = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial, exact]))[0];
+  expect(output).toContain("in 100");
+  expect(output).toContain("out 0");
+  expect(output).not.toContain("partial");
 });

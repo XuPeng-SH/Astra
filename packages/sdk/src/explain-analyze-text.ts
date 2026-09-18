@@ -1,5 +1,6 @@
 import {
   explainAnalyzeCoverageGapLabel,
+  explainAnalyzeAuxiliaryUsageLines,
   formatMs,
   reduceExplainAnalyzeEvents,
 } from "./explain-analyze";
@@ -66,6 +67,8 @@ export function renderExplainAnalyzeText(
       state,
     );
   }
+
+  for (const line of explainAnalyzeAuxiliaryUsageLines(graph)) appendLine(lines, cleanText(line), state);
 
   if (graph.nodes.length === 0) {
     appendLine(lines, "", state);

@@ -8,6 +8,10 @@ mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
+mod judgment;
+pub use judgment::{
+    JudgmentAnswer, JudgmentQuestion, JudgmentRequest, JudgmentResponse, NoulCriteria,
+};
 mod canonical_tool_pairing;
 mod completion_settlement;
 #[doc(hidden)]
@@ -66,12 +70,13 @@ pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTo
 pub use deferred_tool::DeferredToolActivation;
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
-    ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
-    ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
-    ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
-    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
-    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
-    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+    ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeContextAssemblyBasisV1,
+    ExplainAnalyzeContextAssemblyV1, ExplainAnalyzeContextBudgetBasisV1,
+    ExplainAnalyzeContextBudgetV1, ExplainAnalyzeContextMetricsV1,
+    ExplainAnalyzeContextSourceKindV1, ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1,
+    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,

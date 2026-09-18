@@ -16,7 +16,11 @@ use astra_core::{MatrixOneSettings, SharedPool};
 pub const ADMIN_CONFIG_KEY_REASONING_OFFERING: &str = "reasoning_offering_id";
 
 /// Whitelist of admin config keys the server will accept.
-pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[ADMIN_CONFIG_KEY_REASONING_OFFERING];
+pub const ADMIN_CONFIG_KEY_JUDGMENT_OFFERING: &str = "judgment_offering_id";
+pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[
+    ADMIN_CONFIG_KEY_REASONING_OFFERING,
+    ADMIN_CONFIG_KEY_JUDGMENT_OFFERING,
+];
 
 #[async_trait]
 pub trait AdminConfigService: Send + Sync {
@@ -47,9 +51,11 @@ fn validate_key(key: &str) -> Result<(), String> {
 fn validate_value(key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
     match key {
-        ADMIN_CONFIG_KEY_REASONING_OFFERING => crate::models::validate_model_offering_id(value)
-            .map(|_| ())
-            .map_err(|_| "reasoning_offering_id must be an exact Offering ID".to_string()),
+        ADMIN_CONFIG_KEY_REASONING_OFFERING | ADMIN_CONFIG_KEY_JUDGMENT_OFFERING => {
+            crate::models::validate_model_offering_id(value)
+                .map(|_| ())
+                .map_err(|_| format!("{key} must be an exact Offering ID"))
+        }
         _ => Err(format!("admin config key '{key}' has no value contract")),
     }
 }

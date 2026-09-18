@@ -738,7 +738,7 @@ pub trait AgenticLoopHost: Send {
     fn on_turn_started(&mut self, _state: &AgenticLoopState) {}
 
     /// Close the Explain Analyze turn root with the lifecycle-owned outcome.
-    fn on_turn_terminal(
+    async fn on_turn_terminal(
         &mut self,
         _state: &AgenticLoopState,
         _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,

@@ -554,7 +554,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
-    host.on_turn_terminal(state, &result);
+    host.on_turn_terminal(state, &result).await;
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
     #[cfg(feature = "harness")]
