@@ -1,7 +1,9 @@
 //! TypeSafe System One protocol adapter. Business questions and policies belong to callers.
 use super::client::LlmCallResult;
 use astra_core::{ClassifiedError, ErrorKind};
-use astra_turn_types::{JudgmentAnswer, JudgmentRequest, JudgmentResponse};
+use astra_turn_types::{
+    JudgmentAnswer, JudgmentRequest, JudgmentResponse, judgment_request_from_messages,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -12,38 +14,13 @@ fn invalid(message: &'static str) -> ClassifiedError {
 }
 
 pub(super) fn request(messages: &[Value], model: &str) -> Result<Value, ClassifiedError> {
-    // The existing completion transport carries one explicit typed user payload,
-    // optionally accompanied by system instructions for the ordinary LLM backend.
-    if messages.iter().any(|m| {
-        !matches!(
-            m.get("role").and_then(Value::as_str),
-            Some("system" | "user")
-        )
-    }) {
-        return Err(invalid("TypeSafe requires a typed judgment payload"));
-    }
-    if messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-        .count()
-        > 1
-    {
-        return Err(invalid("TypeSafe allows at most one system message"));
-    }
-    let users = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .collect::<Vec<_>>();
-    if users.len() != 1 {
-        return Err(invalid("TypeSafe requires one typed judgment payload"));
-    }
-    let content = users[0]
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("Missing typed judgment content"))?;
     let judgment: JudgmentRequest =
-        serde_json::from_str(content).map_err(|_| invalid("Invalid typed judgment schema"))?;
-    judgment.validate().map_err(invalid)?;
+        judgment_request_from_messages(messages).map_err(|error| match error {
+            astra_turn_types::JudgmentCodecError::Json(_) => {
+                invalid("Invalid typed judgment schema")
+            }
+            astra_turn_types::JudgmentCodecError::Invalid(reason) => invalid(reason),
+        })?;
     Ok(json!({"model": model, "state": judgment.state, "questions": judgment.questions}))
 }
 
@@ -313,10 +290,10 @@ mod tests {
         assert!(seen[0].get("messages").is_none());
         assert!(seen[0].get("tools").is_none());
         assert!(
-            seen[1]["questions"]["0"]["instructions"]
+            seen[1]["state"]["policy"]
                 .as_str()
                 .unwrap()
-                .contains("explicitly reject")
+                .contains("explicitly rejects")
         );
     }
     #[tokio::test]

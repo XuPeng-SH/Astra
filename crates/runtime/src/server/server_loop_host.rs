@@ -2147,6 +2147,15 @@ struct SummaryClientWorkAdmissionJudge {
     usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JudgmentClientUnavailable {
+    InvalidRequest,
+    NoOffering,
+    OutputBudget,
+    RouteUnavailable,
+    DurableMaterialUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WorkAdmissionUsage {
     usage: crate::turn::token_usage::TokenUsage,
@@ -2163,6 +2172,7 @@ struct WorkAdmissionUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkAdmissionUnavailableReason {
     Disabled,
+    NoJudgmentOffering,
     AdmissionMaterialUnavailable,
     Malformed,
     ProviderRejected,
@@ -2185,6 +2195,7 @@ impl WorkAdmissionUnavailableReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::NoJudgmentOffering => "no_judgment_offering",
             Self::AdmissionMaterialUnavailable => "admission_material_unavailable",
             Self::Malformed => "malformed",
             Self::ProviderRejected => "provider_rejected",
@@ -2206,7 +2217,7 @@ impl WorkAdmissionUnavailableReason {
 
     fn error_kind(self) -> astra_core::ErrorKind {
         match self {
-            Self::Disabled | Self::AdmissionMaterialUnavailable => {
+            Self::Disabled | Self::NoJudgmentOffering | Self::AdmissionMaterialUnavailable => {
                 astra_core::ErrorKind::ToolUnavailable
             }
             Self::Malformed | Self::UnsupportedCombination => {
@@ -2232,6 +2243,7 @@ impl WorkAdmissionUnavailableReason {
         !matches!(
             self,
             Self::Disabled
+                | Self::NoJudgmentOffering
                 | Self::AdmissionMaterialUnavailable
                 | Self::ProviderRejected
                 | Self::UnsupportedCombination
@@ -7545,16 +7557,34 @@ impl ServerAgenticLoopHost {
         })
     }
 
+    /// Whether an unavailable semantic admission must hold back the primary
+    /// response until an authoritative outcome is settled. Missing the
+    /// optional judgment Offering is an explicit no-classifier policy: the
+    /// primary model remains authoritative and ordinary streaming must stay on
+    /// its normal fast path.
+    fn work_admission_requires_settlement(&self) -> bool {
+        self.work_admission_unavailable
+            && self.work_admission_unavailable_reason
+                != Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
+    }
+
     fn work_admission_unavailable_error(&self) -> Option<astra_core::ClassifiedError> {
         self.work_admission_unavailable.then(|| {
             let reason = self
                 .work_admission_unavailable_reason
                 .unwrap_or(WorkAdmissionUnavailableReason::ContractViolation);
             let disabled = reason == WorkAdmissionUnavailableReason::Disabled;
+            let no_classifier = matches!(
+                reason,
+                WorkAdmissionUnavailableReason::Disabled
+                    | WorkAdmissionUnavailableReason::NoJudgmentOffering
+            );
             astra_core::ClassifiedError::new(
                 reason.error_kind(),
                 if disabled {
                     "Work admission is disabled for this Auto turn; no requested action was executed. Use the explicit FixedDefault execution policy to omit semantic classification"
+                } else if reason == WorkAdmissionUnavailableReason::NoJudgmentOffering {
+                    "No judgment Offering is configured; the primary typed Work carrier remains available without an auxiliary classifier"
                 } else if matches!(reason, WorkAdmissionUnavailableReason::Malformed) {
                     "Work admission returned an invalid typed decision; no requested action was executed"
                 } else if matches!(
@@ -7574,7 +7604,7 @@ impl ServerAgenticLoopHost {
                     "unavailable_reason": reason.as_str(),
                     "retryable": reason.retryable(),
                     "executed": false,
-                    "no_classifier_policy": disabled.then_some("fixed_default"),
+                    "no_classifier_policy": no_classifier.then_some("fixed_default"),
                 })
                 .to_string(),
             )
@@ -7708,22 +7738,34 @@ impl ServerAgenticLoopHost {
             &state.skills.execution.invoked,
         );
         let classification = astra_services::work_admission_classification_request(&context);
-        let Some(client) = self
+        let client = match self
             .judgment_summary_client(state, "request_judgment", &classification)
             .await
-        else {
-            self.work_admission_unavailable = true;
-            self.work_admission_unavailable_reason =
-                Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
-            tracing::info!(
-                target: "astra::turn_intent",
-                operation = "turn_intent.judge",
-                source = "work_admission_judge",
-                status = "unavailable",
-                reason = "admission_material_unavailable",
-                "Work admission preflight could not be started"
-            );
-            return false;
+        {
+            Ok(client) => client,
+            Err(unavailable) => {
+                self.work_admission_unavailable = true;
+                self.work_admission_unavailable_reason = Some(match unavailable {
+                    JudgmentClientUnavailable::NoOffering => {
+                        WorkAdmissionUnavailableReason::NoJudgmentOffering
+                    }
+                    JudgmentClientUnavailable::InvalidRequest
+                    | JudgmentClientUnavailable::OutputBudget
+                    | JudgmentClientUnavailable::RouteUnavailable
+                    | JudgmentClientUnavailable::DurableMaterialUnavailable => {
+                        WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable
+                    }
+                });
+                tracing::info!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    source = "work_admission_judge",
+                    status = "unavailable",
+                    reason = ?unavailable,
+                    "Work admission preflight could not be started"
+                );
+                return false;
+            }
         };
         let judge = SummaryClientWorkAdmissionJudge::new(client);
         let Some(planner_client) = self
@@ -8217,6 +8259,16 @@ impl ServerAgenticLoopHost {
     ) -> Option<(&'static str, &'static str, bool)> {
         let (_, provider_activation) = provider_batch_valid_work_carrier(provider_tool_calls)?;
         if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
+            return None;
+        }
+
+        // An absent optional judgment Offering is an explicit no-classifier
+        // policy, not a failed semantic decision. The primary model's typed
+        // Work carrier remains the user-visible way to start Work; runtime
+        // lifecycle and effect validation still apply below.
+        if self.work_admission_unavailable_reason
+            == Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
+        {
             return None;
         }
 
@@ -9864,14 +9916,15 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         operation_id: &'static str,
         request: &astra_turn_types::JudgmentRequest,
-    ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+    ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
+    {
         if let Err(reason) = request.validate() {
             tracing::warn!(
                 operation_id,
                 reason,
                 "invalid judgment request; no inference dispatched"
             );
-            return None;
+            return Err(JudgmentClientUnavailable::InvalidRequest);
         }
         let max_output_tokens = request.output_token_budget();
         if let Some(pool) = &self.shared_pool {
@@ -9890,6 +9943,16 @@ impl ServerAgenticLoopHost {
             .await
             {
                 Ok(Some(execution)) => {
+                    if !request.output_budget_fits_completion_cap(execution.max_completion_tokens) {
+                        tracing::warn!(
+                            operation_id,
+                            model_name = %execution.model_name,
+                            configured_max_completion_tokens = ?execution.max_completion_tokens,
+                            required_output_tokens = max_output_tokens,
+                            "judgment route cannot emit a complete typed answer; no provider request dispatched"
+                        );
+                        return Err(JudgmentClientUnavailable::OutputBudget);
+                    }
                     let route = match resolve_llm_model_for_turn(
                         &self.matrixone,
                         &self.encryptor,
@@ -9902,7 +9965,7 @@ impl ServerAgenticLoopHost {
                         Ok(route) => route,
                         Err(error) => {
                             tracing::warn!(operation_id, %error, "configured judgment route unavailable");
-                            return None;
+                            return Err(JudgmentClientUnavailable::RouteUnavailable);
                         }
                     };
                     return self
@@ -9913,17 +9976,27 @@ impl ServerAgenticLoopHost {
                             operation_id,
                             Some(&execution),
                         )
-                        .map(|client| Box::new(client) as Box<_>);
+                        .map(|client| Box::new(client) as Box<_>)
+                        .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    tracing::debug!(
+                        operation_id,
+                        "no judgment Offering is configured; the primary typed Work carrier remains the explicit no-classifier path"
+                    );
+                    return Err(JudgmentClientUnavailable::NoOffering);
+                }
                 Err((status, _)) => {
                     tracing::warn!(operation_id, %status, "configured judgment Offering cannot be admitted");
-                    return None;
+                    return Err(JudgmentClientUnavailable::RouteUnavailable);
                 }
             }
         }
-        self.turn_intent_summary_client(state, operation_id, max_output_tokens)
-            .await
+        tracing::debug!(
+            operation_id,
+            "judgment inference unavailable without an explicit judgment Offering"
+        );
+        Err(JudgmentClientUnavailable::NoOffering)
     }
 
     async fn turn_intent_summary_client(
@@ -17465,7 +17538,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             };
             let client = self
                 .judgment_summary_client(state, "skill_auto_route", &request)
-                .await?;
+                .await
+                .ok()?;
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
         };
@@ -18531,9 +18605,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // typed decision is reconciled: if the judge requires a graph, no
         // provider prose/tool call may leak before the server-owned
         // `start_work` boundary; if it does not, the buffered response is
-        // projected normally. An admission attempt that was already known
-        // unavailable must buffer too: its final typed error, rather than
-        // provisional model prose, is the only user-visible outcome.
+        // projected normally. A genuinely unresolved admission attempt must
+        // buffer too: its final typed error, rather than provisional model
+        // prose, is the only user-visible outcome. NoJudgmentOffering is
+        // different: it is the explicit no-classifier policy and leaves the
+        // primary stream live.
         // A provider-selected establishment that already failed is the same
         // unresolved lifecycle boundary even though it is not a synthetic
         // semantic-admission retry. Keep the next provider response buffered
@@ -18544,7 +18620,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ) || canonical_work_establishment_pending
             || self.pending_work_establishment.is_some()
             || semantic_admission_pending
-            || self.work_admission_unavailable;
+            || self.work_admission_requires_settlement();
         let started_with_action_window = self.terminal_handoff_window.is_open();
         let mut action_window_updates = Vec::new();
         let mut canonical_work_establishment_retries = state
@@ -20036,7 +20112,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &logical_provider_tool_calls,
             self.pending_work_admission.is_some(),
             self.pending_work_admission_judge.is_some(),
-            self.work_admission_unavailable,
+            self.work_admission_requires_settlement(),
         );
         let topology_before_settlement = (
             self.work_admission_topology_authoritative,
@@ -36863,10 +36939,12 @@ mod tests {
         .build();
         let state = create_test_state();
 
+        host.work_admission_unavailable_reason =
+            Some(WorkAdmissionUnavailableReason::NoJudgmentOffering);
         assert_eq!(
             host.provider_work_carrier_rejection(&state, std::slice::from_ref(&carrier))
                 .map(|(kind, _, retryable)| (kind, retryable)),
-            Some(("work_admission_unavailable", false))
+            None
         );
         for reason in [
             WorkAdmissionUnavailableReason::Malformed,
@@ -42860,6 +42938,63 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn missing_judgment_offering_keeps_primary_text_streaming() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-no-judgment-stream";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let (gateway_url, provider_completed, _requests, server) = spawn_delayed_streaming_gateway(
+            Duration::from_millis(750),
+            vec![json!({"choices":[{"delta":{"content":"visible first"}}]})],
+            vec![
+                json!({"choices":[{"delta":{"content":" tail"}}]}),
+                json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":8,"completion_tokens":4}
+                }),
+            ],
+        )
+        .await;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-no-judgment-stream".to_string(),
+            session_id.to_string(),
+        )
+        .with_test_inference_ledger(inference_ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(tx);
+        let mut state = create_durable_execution_test_state(session_id);
+        state.message = "answer normally".to_string();
+        state.user_intent = state.message.clone();
+
+        let observe_first_text = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                    .await
+                    .expect("text delta must arrive before delayed provider completion")
+                    .expect("event channel remains open");
+                if event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                    assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "missing optional judgment must not buffer primary text"
+                    );
+                    break;
+                }
+            }
+        };
+
+        let (result, ()) = tokio::join!(host.execute_turn(&mut state), observe_first_text);
+        let result = result.expect("ordinary primary turn");
+        assert_eq!(result.accum.full_text, "visible first tail");
+        inference_ledger.assert_quiescent();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn provisional_work_admission_keeps_reasoning_preview_live() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-admission-reasoning";
@@ -46694,24 +46829,8 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn builtin_work_admission_persists_an_explicit_typed_graph_at_the_lifecycle_boundary()
-        {
+        async fn builtin_work_admission_requires_an_explicit_judgment_offering() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-            let inference_ledger =
-                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-            let (gateway_url, requests, server) = spawn_gateway(
-                axum::http::StatusCode::OK,
-                json!([{"choices":[{"message":{"content":classification_response(true)},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":12}}, {
-                    "choices": [{
-                        "message": {
-                            "content": "{\"work_lifecycle\":\"required\",\"workspace_mutation\":\"read_only\",\"activation\":\"start\",\"goal\":\"Produce two separately verifiable findings\",\"initial_tasks\":[{\"objective\":\"Inspect source A\",\"expected_result\":\"One cited finding from A\"},{\"objective\":\"Inspect source B\",\"expected_result\":\"One cited finding from B\"}]}"
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 8, "completion_tokens": 24}
-                }]),
-            )
-            .await;
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -46721,8 +46840,6 @@ mod tests {
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 true, false,
             ))
-            .with_test_inference_ledger(inference_ledger.clone())
-            .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
             .build();
             let mut state = create_durable_execution_test_state("s-semantic-work");
             state.session_turn = 2;
@@ -46731,43 +46848,52 @@ mod tests {
 
             assert_eq!(
                 host.judge_turn_intent(&state).await,
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending,
-                "the built-in judge runs concurrently and leaves primary admission alive"
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable,
+                "the built-in judge must not borrow the primary model implicitly"
             );
-            assert!(
-                host.resolve_pending_work_admission(true).await,
-                "the gateway response must produce a typed Work decision"
-            );
-            let call = host
-                .take_admitted_work_establishment_call(&state)
-                .expect("a required semantic decision must become a server-owned start_work call");
-            assert_eq!(call["function"]["name"].as_str(), Some("start_work"));
-            let arguments: Value = serde_json::from_str(
-                call["function"]["arguments"]
-                    .as_str()
-                    .expect("start_work arguments"),
-            )
-            .expect("valid start_work JSON");
-            assert_eq!(arguments["tasks"].as_array().map(Vec::len), Some(2));
-
-            let requests = requests.lock().await.clone();
+            assert!(host.work_admission_unavailable);
             assert_eq!(
-                requests.len(),
-                2,
-                "required Work classifies once, then generates its graph"
+                host.work_admission_unavailable_reason,
+                Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
+            );
+            assert!(host.pending_work_admission_judge.is_none());
+
+            let carrier = json!({
+                "id": "provider-work",
+                "type": "function",
+                "function": {
+                    "name": "start_work",
+                    "arguments": r#"{"activation":"start","goal":"one graph","tasks":[{"objective":"one task","expected_result":"one result"}]}"#
+                }
+            });
+            assert!(
+                host.provider_work_carrier_rejection(&state, std::slice::from_ref(&carrier))
+                    .is_none(),
+                "an absent optional judgment Offering must keep the explicit primary Work carrier available"
             );
             assert!(
-                requests[1]["messages"]
-                    .as_array()
-                    .is_some_and(|messages| messages.iter().any(|message| {
-                        message["content"]
-                            .as_str()
-                            .is_some_and(|content| content.contains("expected_result"))
-                    })),
-                "the sidecar must use the closed Work-admission contract"
+                !host.work_admission_requires_settlement(),
+                "an absent optional judgment Offering must preserve primary streaming"
             );
-            inference_ledger.assert_quiescent();
-            server.abort();
+        }
+
+        #[test]
+        fn unavailable_judgment_only_buffers_when_it_can_change_the_outcome() {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-buffer-policy".to_string(),
+                "s-buffer-policy".to_string(),
+            )
+            .build();
+            host.work_admission_unavailable = true;
+            host.work_admission_unavailable_reason =
+                Some(WorkAdmissionUnavailableReason::NoJudgmentOffering);
+            assert!(!host.work_admission_requires_settlement());
+
+            host.work_admission_unavailable_reason =
+                Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
+            assert!(host.work_admission_requires_settlement());
         }
 
         #[tokio::test]
@@ -46938,7 +47064,7 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn explicit_always_work_admission_starts_when_provider_admission_is_enabled() {
+        async fn explicit_always_without_judgment_offering_preserves_primary_path() {
             use axum::{Router, routing::post};
             use tokio::net::TcpListener;
 
@@ -47001,13 +47127,18 @@ mod tests {
 
             assert_eq!(
                 host.judge_turn_intent(&state).await,
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
             );
-            assert!(
-                host.pending_work_admission_judge.is_some(),
-                "the explicit always policy must start the classifier when durable provider admission is available"
+            assert!(host.pending_work_admission_judge.is_none());
+            assert_eq!(
+                host.work_admission_unavailable_reason,
+                Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
             );
-            host.abort_pending_work_admission().await;
+            assert_eq!(
+                request_count.load(AtomicOrdering::SeqCst),
+                0,
+                "missing judgment configuration must not borrow the primary provider"
+            );
 
             server.abort();
         }

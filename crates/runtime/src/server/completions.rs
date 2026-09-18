@@ -79,6 +79,33 @@ pub(super) async fn completions_handler(
             "invalid_completion_request",
         )
     })?;
+    // Typed operations carry a canonical batched judgment payload. Derive the
+    // minimum answer budget from that payload before model admission; a caller
+    // supplied `max_tokens` that cannot hold every question identity is a
+    // malformed request, not a provider failure.
+    let typed_judgment = if request.operation.is_typed_judgment() {
+        let judgment = astra_turn_types::judgment_request_from_messages(&request.messages)
+            .map_err(|_| {
+                crate::error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "Typed judgment operations require one valid canonical judgment payload",
+                    "invalid_completion_request",
+                )
+            })?;
+        if astra_turn_types::output_budget_exceeds_completion_cap(
+            judgment.output_token_budget(),
+            Some(request.max_tokens),
+        ) {
+            return Err(crate::error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "max_tokens is below the complete typed judgment answer budget",
+                "invalid_completion_request",
+            ));
+        }
+        Some(judgment)
+    } else {
+        None
+    };
     let provider_timeout = completion_timeout(request.timeout_ms)?;
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
@@ -144,6 +171,20 @@ pub(super) async fn completions_handler(
             .admit_model_offering(user.user_id.clone(), offering_id)
             .await?
     };
+
+    // Typed responses are batched judgments. Their requested output size is a
+    // minimum wire budget, so an Offering with a smaller catalog limit must be
+    // rejected before durable admission and provider I/O. This keeps the
+    // proxy and direct Server memory path on the same contract.
+    if let Some(judgment) = typed_judgment.as_ref()
+        && !judgment.output_budget_fits_completion_cap(admitted.max_completion_tokens)
+    {
+        return Err(crate::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Selected Offering cannot emit the complete typed judgment within its output limit",
+            "model_output_budget_unavailable",
+        ));
+    }
 
     // 3. Durably admit the logical invocation before provider I/O. Auxiliary
     // work is often session-scoped; callers must not invent an agent run just
@@ -449,7 +490,11 @@ mod tests {
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(32_000),
-                    max_completion_tokens: Some(4_096),
+                    max_completion_tokens: Some(if self.provider == "cap-limited" {
+                        64
+                    } else {
+                        4_096
+                    }),
                     request_headers: (self.provider != "typesafe").then(|| {
                         serde_json::Map::from_iter([(
                             "x-offering-route".into(),
@@ -495,6 +540,30 @@ mod tests {
             temperature: 0.0,
             timeout_ms: 120_000,
         }
+    }
+
+    fn typed_completion_request(
+        offering_id: &str,
+        operation: CompletionOperation,
+    ) -> CompletionRequest {
+        let judgment = astra_turn_types::JudgmentRequest {
+            schema_version: 1,
+            state: json!({"evidence":"bounded"}),
+            questions: [(
+                "evidence".to_string(),
+                astra_turn_types::JudgmentQuestion::Noul {
+                    instructions: "Does the evidence support this conclusion?".to_string(),
+                    criteria: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut request = explicit_completion_request(offering_id);
+        request.operation = operation;
+        request.max_tokens = 512;
+        request.messages = astra_turn_types::judgment_messages(&judgment);
+        request
     }
 
     fn completion_headers() -> HeaderMap {
@@ -670,6 +739,53 @@ mod tests {
         let error = completions_handler(State(state), completion_headers(), Json(request))
             .await
             .expect_err("output budget must be rejected before model admission");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.error_code.as_deref(),
+            Some("invalid_completion_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_judgment_rejects_an_offering_cap_before_provider_dispatch() {
+        for operation in [
+            CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::TurnIntent,
+            CompletionOperation::SkillAutoRoute,
+            CompletionOperation::VerificationJudge,
+        ] {
+            let state = AppState::new(Default::default(), Arc::new(Healthy))
+                .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+                .with_model_service(Arc::new(CompletionModelService {
+                    provider: "cap-limited",
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                }));
+            let request = typed_completion_request("offer-completion", operation);
+
+            let error = completions_handler(State(state), completion_headers(), Json(request))
+                .await
+                .expect_err("typed judgment must not exceed the admitted Offering cap");
+
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("model_output_budget_unavailable")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_judgment_rejects_a_caller_budget_below_the_complete_answer() {
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService));
+        let mut request =
+            typed_completion_request("offer-completion", CompletionOperation::VerificationJudge);
+        request.max_tokens = 1;
+
+        let error = completions_handler(State(state), completion_headers(), Json(request))
+            .await
+            .expect_err("a typed answer must fit the caller's requested output budget");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -1180,6 +1296,8 @@ mod tests {
             request.operation = CompletionOperation::VerificationJudge;
             request.session_id = session_id.clone();
             request.logical_attempt = index as u32;
+            request.max_tokens = u32::try_from(judgment.output_token_budget())
+                .expect("test judgment budget fits u32");
             request.messages =
                 vec![json!({"role":"user","content":serde_json::to_string(&judgment).unwrap()})];
             let response =

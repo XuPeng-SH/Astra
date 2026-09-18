@@ -12,7 +12,8 @@ mod judgment;
 pub use judgment::{
     JudgmentAnswer, JudgmentCodecError, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
     JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
-    normalize_judgment_response,
+    judgment_request_from_messages, normalize_judgment_response,
+    output_budget_exceeds_completion_cap,
 };
 mod canonical_tool_pairing;
 mod completion_settlement;
