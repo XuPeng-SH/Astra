@@ -7,6 +7,8 @@ PID_FILE="api_server.pid"
 REPO_ROOT="$(pwd -P)"
 # shellcheck source=../lib/api_process_identity.sh
 . "$REPO_ROOT/scripts/lib/api_process_identity.sh"
+# shellcheck source=../lib/api_lifecycle_lock.sh
+. "$REPO_ROOT/scripts/lib/api_lifecycle_lock.sh"
 STOPPED=0
 ENV_FILE="${ASTRA_ENV_FILE:-.env}"
 if [ -f "$ENV_FILE" ]; then
@@ -16,6 +18,14 @@ if [ -f "$ENV_FILE" ]; then
     set +a
 fi
 API_PORT="${ASTRA_API_PORT:-17001}"
+API_PORT="$(api_lifecycle_effective_port)"
+if ! api_lifecycle_lock_is_held "$API_PORT"; then
+    exec "$REPO_ROOT/scripts/dev/with-api-lifecycle-lock.sh" "$0" "$@"
+fi
+if ! command -v lsof >/dev/null 2>&1; then
+    echo "❌ lsof is required to verify that API port $API_PORT is safe to stop" >&2
+    exit 1
+fi
 
 _is_astra_server() {
     api_process_is_astra_server "$1"
@@ -44,12 +54,18 @@ _kill_and_wait() {
 # Try PID file first — verify it's actually an astra-server process
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
-    rm -f "$PID_FILE"
     if kill -0 "$PID" 2>/dev/null && _is_astra_server "$PID" && _is_current_checkout "$PID"; then
         _kill_and_wait "$PID"
+        if [ "$(cat "$PID_FILE" 2>/dev/null || true)" = "$PID" ]; then
+            rm -f "$PID_FILE"
+        fi
         STOPPED=1
     elif kill -0 "$PID" 2>/dev/null && _is_astra_server "$PID"; then
         echo "⚠️  Left API server PID $PID running: it belongs to another checkout or its owner cannot be proven"
+    else
+        # The file is stale when the PID is dead or has been reused by an
+        # unrelated executable. Removing it cannot affect the live process.
+        rm -f "$PID_FILE"
     fi
 fi
 
@@ -57,23 +73,60 @@ fi
 # checkout's configured port and only when its process cwd is this checkout.
 # Never use a global `pgrep astra-server` fallback: two worktrees commonly run
 # independent local Servers and one stop command must not kill both.
+_listeners_on_port() {
+    local error_file output result
+    error_file=$(mktemp "${TMPDIR:-/tmp}/astra-api-lsof.XXXXXX") || return 1
+    output=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>"$error_file")
+    result=$?
+    case "$result" in
+        0) ;;
+        1)
+            if [ -s "$error_file" ]; then
+                cat "$error_file" >&2
+                rm -f "$error_file"
+                return 1
+            fi
+            ;;
+        *)
+            cat "$error_file" >&2
+            rm -f "$error_file"
+            return 1
+            ;;
+    esac
+    rm -f "$error_file"
+    printf '%s\n' "$output"
+}
+
 PIDS=""
-LISTENERS=""
-if command -v lsof >/dev/null 2>&1; then
-    LISTENERS=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null || true)
-    for pid in $LISTENERS; do
-        if _is_astra_server "$pid" && _is_current_checkout "$pid"; then
-            PIDS="${PIDS:+$PIDS }$pid"
-        fi
-    done
+if ! LISTENERS=$(_listeners_on_port); then
+    echo "❌ Could not verify listeners on API port $API_PORT" >&2
+    exit 1
 fi
+for pid in $LISTENERS; do
+    if _is_astra_server "$pid" && _is_current_checkout "$pid"; then
+        PIDS="${PIDS:+$PIDS }$pid"
+    fi
+done
 if [ -n "$PIDS" ]; then
     for pid in $PIDS; do
         _kill_and_wait "$pid"
         STOPPED=1
     done
 elif [ -n "$LISTENERS" ]; then
-    echo "⚠️  Left API listener on port $API_PORT: it belongs to another checkout or process"
+    echo "❌ API listener on port $API_PORT belongs to another checkout or process" >&2
+    echo "   Refusing to continue because this checkout cannot safely stop it." >&2
+    exit 1
+fi
+
+# A successful stop means the port is actually free. This closes the gap where
+# a process ignored the signal or a concurrent launcher rebound the port.
+if ! REMAINING_LISTENERS=$(_listeners_on_port); then
+    echo "❌ Could not verify API port $API_PORT after stop" >&2
+    exit 1
+fi
+if [ -n "$REMAINING_LISTENERS" ]; then
+    echo "❌ API port $API_PORT is still in use after stop" >&2
+    exit 1
 fi
 
 if [ "$STOPPED" -eq 1 ]; then

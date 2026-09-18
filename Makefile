@@ -382,15 +382,25 @@ dev-api-stop:
 dev-api-start-debug:
 	@BUILD_MODE=debug ./scripts/dev/start-api.sh
 
-.PHONY: dev-api-restart
-dev-api-restart: dev-api-stop
-	@sleep 1
-	@$(MAKE) dev-api-start
+.PHONY: dev-api-restart dev-api-restart-locked
+dev-api-restart:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-locked
 
-.PHONY: dev-api-restart-debug
-dev-api-restart-debug: dev-api-stop
+dev-api-restart-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
 	@sleep 1
-	@$(MAKE) dev-api-start-debug
+	@$(MAKE) --no-print-directory dev-api-start
+
+.PHONY: dev-api-restart-debug dev-api-restart-debug-locked
+dev-api-restart-debug:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-debug-locked
+
+dev-api-restart-debug-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
+	@sleep 1
+	@$(MAKE) --no-print-directory dev-api-start-debug
 
 .PHONY: dev-api-logs
 dev-api-logs:
@@ -888,11 +898,15 @@ dev-setup-demo:
 # /health can answer. MatrixOne can take several minutes on a cold schema;
 # keep the ordinary API-start timeout unchanged and give only this destructive
 # reseed flow the longer readiness window.
-.PHONY: dev-seed
+.PHONY: dev-seed dev-seed-locked
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-seed-locked
+
+dev-seed-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
 	@echo "Stopping API server before dropping the database..."
 	@$(MAKE) dev-api-stop
 	@$(MAKE) dev-deps-wait
@@ -901,7 +915,7 @@ dev-seed:
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	scripts/dev/mysql-client.sh -e "$$SQL"
-	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug build-cli-debug
+	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug-locked build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./target/debug/astra admin register \

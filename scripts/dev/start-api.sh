@@ -8,6 +8,19 @@ LOG_FILE="api_server.log"
 REPO_ROOT="$(pwd -P)"
 # shellcheck source=../lib/api_identity.sh
 . "$REPO_ROOT/scripts/lib/api_identity.sh"
+# shellcheck source=../lib/api_lifecycle_lock.sh
+. "$REPO_ROOT/scripts/lib/api_lifecycle_lock.sh"
+
+# Resolve configuration before entering the shared lifecycle lock so callers
+# from different worktrees serialize on the actual host port they mutate.
+ENV_FILE="${ASTRA_ENV_FILE:-.env}"
+if [ -f "$ENV_FILE" ]; then
+    set -a; source "$ENV_FILE"; set +a
+fi
+API_PORT="$(api_lifecycle_effective_port)"
+if ! api_lifecycle_lock_is_held "$API_PORT"; then
+    exec "$REPO_ROOT/scripts/dev/with-api-lifecycle-lock.sh" "$0" "$@"
+fi
 
 BUILD_MODE="${BUILD_MODE:-release}"
 if [ "$BUILD_MODE" = "debug" ]; then
@@ -43,11 +56,6 @@ esac
 # Load the selected env file early so DB host/port are available for the
 # readiness check. ASTRA_ENV_FILE lets cross-repository local harnesses use an
 # isolated configuration without rewriting a developer's normal .env.
-ENV_FILE="${ASTRA_ENV_FILE:-.env}"
-if [ -f "$ENV_FILE" ]; then
-    set -a; source "$ENV_FILE"; set +a
-fi
-
 # A caller-selected env file is an explicit configuration boundary. Prevent
 # the server's own config loader from filling missing values from the repo
 # .env or user/system config after this script has deliberately omitted them.
@@ -67,7 +75,6 @@ if [[ -n "${MEMORIA_MASTER_KEY:-}" && -z "${MEMORIA_WEB_URL:-}" && "${MEMORIA_SE
     echo "⚠️  Memoria is configured but local user memory is disabled. Set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in $ENV_FILE for self-hosted Memoria 0.5.2+."
 fi
 
-API_PORT="${ASTRA_API_PORT:-17001}"
 DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 HEALTH_URL="http://127.0.0.1:${API_PORT}/health"
@@ -381,7 +388,9 @@ if kill -0 "$PID" 2>/dev/null; then
 else
     echo "❌ API server failed to start"
 fi
-rm -f "$PID_FILE"
+if [ "$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)" = "$PID" ]; then
+    rm -f "$PID_FILE"
+fi
 echo ""
 echo "Troubleshooting:"
 echo "  1. Check if port $API_PORT is in use: lsof -i :$API_PORT"
