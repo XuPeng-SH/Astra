@@ -221,10 +221,11 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
   }
   const groups = new Map<string, Attempt[]>();
   for (const attempt of attempts.values()) {
-    const key = JSON.stringify([attempt.provider,attempt.offering_id,attempt.model_name,attempt.purpose]);
+    const key = JSON.stringify([attempt.provider,attempt.offering_id,attempt.model_name,attempt.purpose,attempt.operation_id]);
     const group = groups.get(key) ?? []; group.push(attempt); groups.set(key,group);
   }
-  const purposeLabels: Record<string,string> = { memory_retrieval_rerank:"Memory judgment", memory_extraction:"Memory extraction", introspection:"Request decisions", verification_judge:"Verification", reflection:"Reflection", required_compaction:"Context summary" };
+  const purposeLabels = new Map<string,string>([["memory_retrieval_rerank","Memory judgment"], ["memory_extraction","Memory extraction"], ["introspection","Request analysis"], ["verification_judge","Verification"], ["reflection","Reflection"], ["required_compaction","Context summary"]]);
+  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"]]);
   const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
     const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
     const provider = first.provider === "typesafe" ? "Jet" : first.provider;
@@ -234,7 +235,7 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
       return `${name} ${counters.length === 0 ? "unknown" : counters.reduce((a,b)=>a+b,0n).toString()}`;
     }).join(" · ");
     const partial = reported.length !== group.length || group.some(a => a.usage_status === "provider_partial") ? " · partial" : "";
-    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${purposeLabels[first.purpose] ?? "Auxiliary inference"} · ${values} · ${reported.length}/${group.length} requests reported${partial}`;
+    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${operationLabels.get(first.operation_id) ?? purposeLabels.get(first.purpose) ?? "Auxiliary inference"} · ${values} · ${reported.length}/${group.length} requests reported${partial}`;
   });
   if (unavailable) lines.push("Auxiliary tokens · capture unavailable");
   return lines;

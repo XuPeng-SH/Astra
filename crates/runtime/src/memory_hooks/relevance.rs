@@ -416,12 +416,7 @@ async fn run_selector_prompt(
             messages: &messages,
             // Budget for every fixed ID plus the two result lists, rather than
             // truncating a valid batched decision at a fixed candidate count.
-            max_output_tokens: judgment
-                .questions
-                .keys()
-                .map(|id| id.len() + 4)
-                .sum::<usize>()
-                + 64,
+            max_output_tokens: judgment.output_token_budget(),
             temperature: 0.0,
             deadline: Duration::from_secs(3),
         })

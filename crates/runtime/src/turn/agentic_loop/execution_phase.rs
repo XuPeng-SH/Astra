@@ -22921,6 +22921,24 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_totals_do_not_change_primary_context_or_round_usage() {
+        let mut state = make_state();
+        // Auxiliary usage was settled by its host before primary ingestion.
+        state.total_prompt = 1_000;
+        state.total_completion = 3;
+        let mut result = text_result("answer", 100, 10, Some(7));
+        result.accum.cache_read_tokens = 900;
+        record_superseded_llm_round(&mut state, &result, Instant::now());
+        assert_eq!(state.provider_input_tokens(), 2_000);
+        assert_eq!(state.provider_total_tokens(), 2_013);
+        assert_eq!(state.last_measured_prompt_tokens, Some(1_000));
+        let round = state.recent_rounds.last().unwrap();
+        assert_eq!(round.prompt_tokens, 100);
+        assert_eq!(round.cache_read_tokens, 900);
+        assert_eq!(round.completion_tokens, 10);
+    }
+
+    #[test]
     fn superseded_remote_summary_keeps_deduplicated_accounting_without_actions() {
         let mut state = make_state();
         state.current_run_id = Some("parent-run".into());

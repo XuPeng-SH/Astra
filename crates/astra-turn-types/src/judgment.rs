@@ -51,6 +51,18 @@ pub struct JudgmentResponse {
     pub answers: BTreeMap<String, JudgmentAnswer>,
 }
 impl JudgmentRequest {
+    /// Conservative allowance for the compact final answer: every escaped ID
+    /// can occur once, plus the two list keys and formatting. This grows with
+    /// the batch instead of inheriting a content-generation budget.
+    #[must_use]
+    pub fn output_token_budget(&self) -> usize {
+        let ids = self.questions.keys().collect::<Vec<_>>();
+        serde_json::to_vec(&ids)
+            .expect("judgment IDs serialize")
+            .len()
+            .saturating_add(64)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != 1 {
             return Err("unsupported judgment version");
@@ -209,6 +221,29 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn output_budget_covers_escaped_batch_ids_without_scaling_with_evidence() {
+        let mut request = request();
+        let original = request.output_token_budget();
+        request.state = serde_json::json!({"evidence":"long context ".repeat(1_000)});
+        assert_eq!(request.output_token_budget(), original);
+        for i in 0..100 {
+            request.questions.insert(
+                format!("question\"\\{i}中文"),
+                JudgmentQuestion::Noul {
+                    instructions: "Satisfied?".into(),
+                    criteria: None,
+                },
+            );
+        }
+        let ids = request.questions.keys().collect::<Vec<_>>();
+        for (yes, uncertain) in [(&ids[..], &ids[..0]), (&ids[..0], &ids[..])] {
+            let answer = serde_json::json!({"true":yes,"uncertain":uncertain}).to_string();
+            assert!(request.output_token_budget() >= answer.len());
+        }
+        assert!(request.output_token_budget() > original);
     }
 
     #[test]

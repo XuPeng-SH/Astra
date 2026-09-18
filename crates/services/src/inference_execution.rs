@@ -781,6 +781,7 @@ fn model_request_event(
             model: input.resolved_model_name.clone(),
             offering_id: input.offering_id.clone(),
             inference_purpose: input.purpose.as_str().to_string(),
+            operation_id: input.scope.operation_id().to_string(),
             provider_protocol: attempt.wire.protocol.clone(),
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: attempt.wire.provider_wire_bytes,
@@ -872,7 +873,7 @@ fn apply_model_request_terminal_usage(
                 (estimated > 0).then_some(error as f64 / estimated as f64);
         }
         event.cache.cache_read_share =
-            (measured > 0).then_some(usage.input.cache_read_tokens as f64 / measured as f64);
+            projected_cache_read_share(&event.identity.provider_protocol, usage_status, &usage);
     }
     event.usage = Some(usage);
     Ok(())
@@ -7453,6 +7454,59 @@ pub async fn finish_inference_invocation(
     Ok(())
 }
 
+// System One's current usage contract reports input/output only. Normalized
+// ledger cache zeros support accounting; they are not reported cache evidence.
+fn projected_cache_read_share(
+    protocol: &str,
+    status: &str,
+    usage: &ModelRequestUsage,
+) -> Option<f64> {
+    let total = usage.total_input_tokens();
+    (protocol != "typesafe_systemone" && status == "provider_exact" && total > 0)
+        .then(|| usage.input.cache_read_tokens as f64 / total as f64)
+}
+
+fn projected_auxiliary_usage(
+    protocol: &str,
+    status: &str,
+    counts: [i64; 4],
+) -> ServiceResult<Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>> {
+    use astra_turn_types::{ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1};
+    let basis = match status {
+        "unavailable" => return Ok(None),
+        "provider_exact" => ExplainAnalyzeUsageBasisV1::ProviderExact,
+        "provider_partial" => ExplainAnalyzeUsageBasisV1::ProviderPartial,
+        _ => return Err(ServiceError::internal("invalid inference usage status")),
+    };
+    if counts.iter().any(|value| *value < 0) {
+        return Err(ServiceError::internal("negative inference usage"));
+    }
+    let count = |value| -> ServiceResult<Option<u64>> {
+        let value =
+            u64::try_from(value).map_err(|_| ServiceError::internal("negative inference usage"))?;
+        Ok(if status == "provider_partial" && value == 0 {
+            None
+        } else {
+            Some(value)
+        })
+    };
+    Ok(Some(ExplainAnalyzeTokenUsageV1 {
+        basis,
+        fresh_input_tokens: count(counts[0])?,
+        output_tokens: count(counts[1])?,
+        cache_read_tokens: if protocol == "typesafe_systemone" {
+            None
+        } else {
+            count(counts[2])?
+        },
+        cache_creation_tokens: if protocol == "typesafe_systemone" {
+            None
+        } else {
+            count(counts[3])?
+        },
+    }))
+}
+
 /// Read-only auxiliary usage from physical attempts, scoped to one authenticated
 /// owner/session/turn. Invocation totals are never added to attempt totals.
 pub async fn load_explain_auxiliary_usage(
@@ -7462,13 +7516,10 @@ pub async fn load_explain_auxiliary_usage(
     turn: u32,
     max_attempts: usize,
 ) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
-    use astra_turn_types::{
-        ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1,
-        ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
-    };
+    use astra_turn_types::{ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1};
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
-    let rows = sqlx::query("SELECT a.attempt_id, a.provider, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
+    let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
         .bind(user_id).bind(session_id).bind(i64::from(turn))
         .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid Explain capture budget"))?).fetch_all(pool.get()).await
         .map_err(|e| ServiceError::internal(format!("load auxiliary Explain usage: {e}")))?;
@@ -7483,37 +7534,21 @@ pub async fn load_explain_auxiliary_usage(
         let status: String = row
             .try_get("usage_status")
             .map_err(|e| ServiceError::internal(e.to_string()))?;
-        let usage = match status.as_str() {
-            "unavailable" => None,
-            "provider_exact" | "provider_partial" => {
-                let count = |column: &str| -> ServiceResult<Option<u64>> {
-                    let n: i64 = row
-                        .try_get(column)
-                        .map_err(|e| ServiceError::internal(e.to_string()))?;
-                    u64::try_from(n)
-                        .map(|n| {
-                            if status == "provider_partial" && n == 0 {
-                                None
-                            } else {
-                                Some(n)
-                            }
-                        })
-                        .map_err(|_| ServiceError::internal("negative inference usage"))
-                };
-                Some(ExplainAnalyzeTokenUsageV1 {
-                    basis: if status == "provider_exact" {
-                        ExplainAnalyzeUsageBasisV1::ProviderExact
-                    } else {
-                        ExplainAnalyzeUsageBasisV1::ProviderPartial
-                    },
-                    fresh_input_tokens: count("input_tokens")?,
-                    output_tokens: count("output_tokens")?,
-                    cache_read_tokens: count("cache_read_tokens")?,
-                    cache_creation_tokens: count("cache_creation_tokens")?,
-                })
-            }
-            _ => return Err(ServiceError::internal("invalid inference usage status")),
-        };
+        let protocol: String = row
+            .try_get("provider_protocol")
+            .map_err(|e| ServiceError::internal(e.to_string()))?;
+        let mut counts = [0; 4];
+        for (count, column) in counts.iter_mut().zip([
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+        ]) {
+            *count = row
+                .try_get(column)
+                .map_err(|e| ServiceError::internal(e.to_string()))?;
+        }
+        let usage = projected_auxiliary_usage(&protocol, &status, counts)?;
         let text = |column: &str| {
             row.try_get::<String, _>(column)
                 .map_err(|e| ServiceError::internal(e.to_string()))
@@ -8100,6 +8135,98 @@ mod tests {
     }
 
     #[test]
+    fn projected_usage_does_not_invent_system_one_cache_counters() {
+        let jet = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [100, 4, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(jet.fresh_input_tokens, Some(100));
+        assert_eq!(jet.output_tokens, Some(4));
+        assert_eq!(jet.cache_read_tokens, None);
+        assert_eq!(jet.cache_creation_tokens, None);
+        let zero = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [0, 0, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero.fresh_input_tokens, Some(0));
+        assert_eq!(zero.output_tokens, Some(0));
+        let llm = projected_auxiliary_usage("openai_compatible", "provider_exact", [40, 8, 60, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(llm.cache_read_tokens, Some(60));
+        assert_eq!(llm.cache_creation_tokens, Some(0));
+        assert!(
+            projected_auxiliary_usage("openai_compatible", "unavailable", [0; 4])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            projected_auxiliary_usage("openai_compatible", "provider_exact", [-1, 0, 0, 0])
+                .is_err()
+        );
+        let usage = ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(40, 60, 0),
+            output_tokens: 8,
+        };
+        assert_eq!(
+            projected_cache_read_share("typesafe_systemone", "provider_exact", &usage),
+            None
+        );
+        assert_eq!(
+            projected_cache_read_share("openai_compatible", "provider_exact", &usage),
+            Some(0.6)
+        );
+        assert_eq!(
+            projected_cache_read_share("openai_compatible", "provider_partial", &usage),
+            None
+        );
+    }
+
+    #[test]
+    fn system_one_trace_keeps_operation_and_unknown_cache_share() {
+        let mut input = input();
+        input.provider = "typesafe".into();
+        input.purpose = InferencePurpose::Introspection;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: "session-1".into(),
+            turn: 3,
+            round: 0,
+            operation_id: "request_judgment".into(),
+            logical_attempt: 0,
+        };
+        input.run_authority = None;
+        let invocation = plan_inference_invocation(input).unwrap();
+        let wire = InferenceProviderWireIdentity::new(
+            "typesafe_systemone",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+        )
+        .unwrap();
+        let attempt = plan_inference_provider_attempt_with_context(
+            &invocation,
+            0,
+            wire,
+            ModelRequestContextSeed::server_default(),
+        );
+        let terminal = InferenceInvocationTerminal::succeeded(
+            InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(100, 0, 0),
+                output_tokens: 4,
+            },
+            None,
+        );
+        let (_, json, event) =
+            model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
+                .unwrap();
+        assert_eq!(event.identity.operation_id, "request_judgment");
+        assert_eq!(event.identity.provider_protocol, "typesafe_systemone");
+        assert_eq!(event.cache.cache_read_share, None);
+        assert_eq!(event.usage.unwrap().input.fresh_input_tokens, 100);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["identity"]["operation_id"],
+            "request_judgment"
+        );
+    }
+
+    #[test]
     fn model_request_event_uses_exact_causal_facts_and_partitions_usage() {
         let invocation = plan_inference_invocation(input()).expect("invocation");
         let mut seed = ModelRequestContextSeed::server_default();
@@ -8150,6 +8277,8 @@ mod tests {
         assert!(accepted.usage.is_none());
         assert!(accepted.usage_status.is_none());
         assert_eq!(terminal_event.identity.physical_attempt, 2);
+        assert_eq!(accepted.identity.operation_id, "agent_turn");
+        assert_eq!(terminal_event.identity.operation_id, "agent_turn");
         assert_eq!(
             terminal_event.identity.provider_wire_hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

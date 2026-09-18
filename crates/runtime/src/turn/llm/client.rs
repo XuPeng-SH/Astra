@@ -4764,11 +4764,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     // Reuse the provider-attempt deadline owner. Do not put a second timeout
     // around the durable invocation, which would lose terminal settlement.
-    let total_budget = bounded_auxiliary_budget(
-        call.purpose,
-        llm_total_budget(),
-        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
-    );
+    let total_budget = auxiliary_execution_budget(call.purpose, llm_total_budget());
     call_llm_and_collect_with_total_budget(
         call,
         cancel,
@@ -4784,6 +4780,18 @@ pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+    )
+}
+
+/// Shared deadline policy for streaming LLM and nonstream judgment adapters.
+pub(crate) fn auxiliary_execution_budget(
+    purpose: astra_turn_types::InferencePurpose,
+    global: std::time::Duration,
+) -> std::time::Duration {
+    bounded_auxiliary_budget(
+        purpose,
+        global,
+        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
     )
 }
 

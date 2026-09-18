@@ -10,7 +10,7 @@ use astra_turn_types::InferencePurpose;
 use super::client::{LlmCall, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
 
-use super::client::{global_llm_client, llm_nonstream_timeout};
+use super::client::{auxiliary_execution_budget, global_llm_client, llm_nonstream_timeout};
 
 #[derive(Clone)]
 struct DurableSummaryExecution {
@@ -406,7 +406,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                                 global_llm_client(),
                                 scope,
                                 call,
-                                llm_nonstream_timeout(),
+                                auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
                             )
                             .await
                     } else {
@@ -440,7 +440,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         has_fallback: false,
                         thinking,
                     },
-                    llm_nonstream_timeout(),
+                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
                 )
                 .await
             }

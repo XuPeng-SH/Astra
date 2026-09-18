@@ -359,7 +359,7 @@ pub use session_identity::{MAX_PERSISTED_SESSION_ID_BYTES, validate_persisted_se
 pub use skill_auto_route_judge::{
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
     SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
-    skill_auto_route_judge_messages,
+    skill_auto_route_judge_messages, skill_auto_route_judgment_request,
 };
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,

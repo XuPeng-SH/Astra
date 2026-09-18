@@ -1,6 +1,6 @@
 # Optional judgment backends
 
-Memory relevance, lesson dismissal, and request classification can use a
+Memory relevance, lesson dismissal, request classification, and skill selection can use a
 registered TypeSafe System One Offering or an ordinary LLM selected with
 `judgment_model`. This selects a model for judgments, not the main agent model.
 Tool permissions and execution authority still belong to the runtime.
@@ -31,7 +31,7 @@ needed.
    The server still stores only the canonical Offering ID and validates
    activity and credentials before changing the binding.
 4. Start a new Session to refresh the CLI's cached memory judgment Offering.
-   Server request classification resolves the configured Offering for each
+   Server request classification and skill selection resolve the configured Offering for each
    new judgment, under the requesting user's model-access policy.
 
 The binding can also select an ordinary LLM Offering. It is an Offering routing
@@ -73,6 +73,34 @@ planning, ending when the background task actually finishes. A separate
 for the result. Delayed consumption is not added to judgment duration, and
 pending work is not reported as unavailable. Cancellation closes the live span.
 
+## Skill selection and inference cost
+
+Skill selection sends one batch containing the visible catalog and the user's
+request. It selects a workflow only when exactly one candidate is confidently
+appropriate and its competitors are confidently excluded. Ambiguous, conflicting,
+truncated or unavailable judgments leave selection to the main assistant; there
+is no format-repair call or highest-score shortcut.
+
+Judgment output allowances scale with the question IDs in the batch, rather than
+the main model's content-generation allowance or evidence length. Introspection
+uses the same existing execution deadline for Jet and ordinary LLMs. Free-form
+Work planning and memory extraction remain content-generation operations.
+
+Explain groups auxiliary input, output and cache tokens by actual provider,
+Offering, model and operation: request classification, skill selection and Work
+planning appear separately even when they use the same model. Jet appears as
+`Jet`; ordinary LLM calls retain their provider name. Trace model-request events
+carry the same actual identities and operation. Explain keeps unreported Jet
+cache counts unknown. Trace does not derive a cache hit rate from the normalized
+accounting buckets' cache zeros, which are not provider-reported cache evidence.
+Request classification and Work planning contribute once to the runtime run
+total, but never to a primary request's context-size estimate or per-request
+cache hit rate. This total is marked `runtime_accounted_usage`, without a
+single model cache ratio. It is not an all-provider billing total: other
+auxiliary callers have their own accounting boundaries. Use the canonical
+physical-request ledger and Explain auxiliary groups for provider/operation
+detail, including skill selection and memory judgments.
+
 ## Behavior and limits
 
 The existing `/models/memory` catalog defaults to extraction candidates.
@@ -87,7 +115,7 @@ the TypeSafe adapter only encodes the provider protocol. It preserves every
 probability and actual model identity in a typed response, with usage in the
 existing completion envelope. Memory code applies separate relevance/dismissal
 policies. Ordinary LLMs return fixed question IDs in `true` and `uncertain`
-lists. Memory, request classification, and the comparison command share the
+lists. Memory, request classification, skill selection, and the comparison command share the
 message formatter and strict response normalization in `astra-turn-types`.
 Unknown or repeated IDs are invalid, not silently discarded. Native provider
 probabilities remain probabilities; discrete LLM decisions are never displayed
@@ -138,8 +166,7 @@ question IDs, and a probability threshold. All task criteria belong in the share
 questions/state. The LLM system message only specifies output formatting, so both
 Offerings evaluate the same input. The example uses `verification_judge`; other
 supported completion operations include `turn_intent` and `skill_auto_route`.
-They are comparison entrypoints, not automatic enablement of Jet in those
-production features.
+Comparison requests do not change the deployment's judgment binding.
 
 `manifest.json` records the binary hash/version, normalized fixture hash, exact
 Offerings, shared instructions and deadline. `results.jsonl` is flushed after each

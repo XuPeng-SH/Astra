@@ -367,20 +367,9 @@ fn attach_work_admission_usage(
     let object = details
         .as_object_mut()
         .expect("object fallback guarantees work-admission usage details");
-    let existing = object
-        .get("usage")
-        .and_then(Value::as_object)
-        .map(crate::turn::token_usage::TokenUsage::from_partial_json_map)
-        .unwrap_or_default();
-    object.insert(
-        "usage".to_string(),
-        json!({
-            "input_tokens": existing.input_tokens.saturating_add(auxiliary.usage.input_tokens),
-            "cached_input_tokens": existing.cached_input_tokens.saturating_add(auxiliary.usage.cached_input_tokens),
-            "cache_creation_tokens": existing.cache_creation_tokens.saturating_add(auxiliary.usage.cache_creation_tokens),
-            "output_tokens": existing.output_tokens.saturating_add(auxiliary.usage.output_tokens),
-        }),
-    );
+    // Primary error usage belongs to the failed primary request. Auxiliary
+    // usage is already settled into run totals and must not be folded again
+    // by the provider error path or used to calibrate its context size.
     object.insert(
         "work_admission_usage".to_string(),
         json!({
@@ -1000,7 +989,6 @@ const MAX_CANONICAL_WORK_ESTABLISHMENT_RETRIES: u32 = 1;
 /// makes the handler's request idempotent across a transient execution error.
 const MAX_WORK_ESTABLISHMENT_ATTEMPTS: u32 =
     MAX_CANONICAL_WORK_ESTABLISHMENT_RETRIES.saturating_add(1);
-const SKILL_AUTO_ROUTE_JUDGE_MAX_OUTPUT_TOKENS: usize = 64;
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 /// Immutable built-in authority contracts shared by schema construction and
@@ -2590,17 +2578,17 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
         ctx: &astra_services::SkillAutoRouteJudgeContext,
     ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
         let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
-        let allowed = ctx
-            .visible_skills
-            .iter()
-            .map(|skill| skill.name.clone())
-            .collect::<Vec<_>>();
         let response = self
             .client
             .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(SkillAutoRouteJudgeError::Inference)?;
-        astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
+        if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
+            return Err(SkillAutoRouteJudgeError::Rejected(
+                "skill judgment did not finish normally".into(),
+            ));
+        }
+        astra_services::parse_skill_auto_route_response(response.text.as_str(), ctx)
     }
 }
 
@@ -7712,7 +7700,18 @@ impl ServerAgenticLoopHost {
         let turn_count = state.current_session_turn_number();
         let user_intent = state.runtime_decision_user_intent();
         let user_intent_chars = user_intent.chars().count();
-        let Some(client) = self.request_judgment_summary_client(state).await else {
+        let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
+            &state.messages,
+            &user_intent,
+            turn_count,
+            &state.recent_tools,
+            &state.skills.execution.invoked,
+        );
+        let classification = astra_services::work_admission_classification_request(&context);
+        let Some(client) = self
+            .judgment_summary_client(state, "request_judgment", &classification)
+            .await
+        else {
             self.work_admission_unavailable = true;
             self.work_admission_unavailable_reason =
                 Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
@@ -7741,13 +7740,6 @@ impl ServerAgenticLoopHost {
             usage: Arc::clone(&judge.usage),
         };
         let judge_usage = judge.usage.clone();
-        let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
-            &state.messages,
-            &user_intent,
-            turn_count,
-            &state.recent_tools,
-            &state.skills.execution.invoked,
-        );
         let has_prior_assistant_turn = context.has_prior_assistant_turn;
         let started_at = Instant::now();
         self.on_turn_phase_started(
@@ -9867,10 +9859,21 @@ impl ServerAgenticLoopHost {
         self.resolved_llm_config_at = Some(Instant::now());
     }
 
-    async fn request_judgment_summary_client(
+    async fn judgment_summary_client(
         &mut self,
         state: &AgenticLoopState,
+        operation_id: &'static str,
+        request: &astra_turn_types::JudgmentRequest,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        if let Err(reason) = request.validate() {
+            tracing::warn!(
+                operation_id,
+                reason,
+                "invalid judgment request; no inference dispatched"
+            );
+            return None;
+        }
+        let max_output_tokens = request.output_token_budget();
         if let Some(pool) = &self.shared_pool {
             let config = astra_services::DatabaseAdminConfigService::new(self.matrixone.clone())
                 .with_pool(pool.clone());
@@ -9898,33 +9901,29 @@ impl ServerAgenticLoopHost {
                     {
                         Ok(route) => route,
                         Err(error) => {
-                            tracing::warn!(%error, "configured request judgment route unavailable");
+                            tracing::warn!(operation_id, %error, "configured judgment route unavailable");
                             return None;
                         }
                     };
                     return self
                         .durable_summary_client_for_execution(
                             &route,
-                            TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS,
+                            max_output_tokens,
                             state,
-                            "request_judgment",
+                            operation_id,
                             Some(&execution),
                         )
                         .map(|client| Box::new(client) as Box<_>);
                 }
                 Ok(None) => {}
                 Err((status, _)) => {
-                    tracing::warn!(%status, "configured request judgment Offering cannot be admitted");
+                    tracing::warn!(operation_id, %status, "configured judgment Offering cannot be admitted");
                     return None;
                 }
             }
         }
-        self.turn_intent_summary_client(
-            state,
-            "request_judgment",
-            TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS,
-        )
-        .await
+        self.turn_intent_summary_client(state, operation_id, max_output_tokens)
+            .await
     }
 
     async fn turn_intent_summary_client(
@@ -16607,29 +16606,24 @@ impl ServerAgenticLoopHost {
         for attempt in 0..auxiliary.attempts {
             state.record_local_usage_coverage(attempt < auxiliary.provider_reported);
         }
-        match &mut outcome {
-            Ok(result) => {
-                result.accum.prompt_tokens = result
-                    .accum
-                    .prompt_tokens
-                    .saturating_add(auxiliary.usage.input_tokens);
-                result.accum.cache_read_tokens = result
-                    .accum
-                    .cache_read_tokens
-                    .saturating_add(auxiliary.usage.cached_input_tokens);
-                result.accum.cache_creation_tokens = result
-                    .accum
-                    .cache_creation_tokens
-                    .saturating_add(auxiliary.usage.cache_creation_tokens);
-                result.accum.completion_tokens = result
-                    .accum
-                    .completion_tokens
-                    .saturating_add(auxiliary.usage.output_tokens);
-                result.accum.has_usage |= !auxiliary.usage.is_empty();
-            }
-            Err(error) => {
-                *error = attach_work_admission_usage(error.clone(), auxiliary);
-            }
+        // Settle into the existing run accounting owner once. The primary
+        // accumulator remains a measurement of one model request, used for
+        // per-round cache statistics and context-window calibration.
+        state.total_prompt = state
+            .total_prompt
+            .saturating_add(auxiliary.usage.input_tokens);
+        state.total_cache_read = state
+            .total_cache_read
+            .saturating_add(auxiliary.usage.cached_input_tokens);
+        state.total_cache_creation = state
+            .total_cache_creation
+            .saturating_add(auxiliary.usage.cache_creation_tokens);
+        state.total_completion = state
+            .total_completion
+            .saturating_add(auxiliary.usage.output_tokens);
+        state.has_any_usage |= auxiliary.provider_reported > 0;
+        if let Err(error) = &mut outcome {
+            *error = attach_work_admission_usage(error.clone(), auxiliary);
         }
         outcome
     }
@@ -17462,12 +17456,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 return None;
             }
+            let request = match astra_services::skill_auto_route_judgment_request(&service_ctx) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
+                    return None;
+                }
+            };
             let client = self
-                .turn_intent_summary_client(
-                    state,
-                    "skill_auto_route",
-                    SKILL_AUTO_ROUTE_JUDGE_MAX_OUTPUT_TOKENS,
-                )
+                .judgment_summary_client(state, "skill_auto_route", &request)
                 .await?;
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
@@ -23037,6 +23034,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn skill_judgment_shared_adapter_accepts_both_backends_without_repair() {
+        let ctx = astra_services::SkillAutoRouteJudgeContext {
+            query: "Review my changes".into(),
+            visible_skills: vec![astra_services::SkillAutoRouteCandidate {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                when_to_use: None,
+                aliases: vec![],
+            }],
+        };
+        for raw in [
+            json!({"true":["0"],"uncertain":[]}),
+            json!({"schema_version":1,"model":"jet","answers":{"0":{"type":"noul","noul":0.95}}}),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let judge = SummaryClientSkillAutoRouteJudge {
+                client: Box::new(SequencedSummaryClient {
+                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                        raw.to_string()
+                    ])),
+                    requests: requests.clone(),
+                }),
+            };
+            assert_eq!(
+                judge.judge(&ctx).await.unwrap().as_deref(),
+                Some("review-changes")
+            );
+            let calls = requests.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let sent: astra_turn_types::JudgmentRequest =
+                serde_json::from_str(calls[0][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                sent,
+                astra_services::skill_auto_route_judgment_request(&ctx).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_judgment_rejects_truncated_or_failed_decisions() {
+        let ctx = astra_services::SkillAutoRouteJudgeContext {
+            query: "Review changes".into(),
+            visible_skills: vec![astra_services::SkillAutoRouteCandidate {
+                name: "review".into(),
+                description: "Review changes".into(),
+                when_to_use: None,
+                aliases: vec![],
+            }],
+        };
+        for (is_ptl_error, finish_reason) in
+            [(false, Some("length")), (true, Some("stop")), (false, None)]
+        {
+            let judge = SummaryClientSkillAutoRouteJudge {
+                client: Box::new(UsageSequencedSummaryClient {
+                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
+                        astra_turn_core::cloud_summary::SummaryResponse {
+                            text: r#"{"true":["0"],"uncertain":[]}"#.into(),
+                            is_ptl_error,
+                            finish_reason: finish_reason.map(str::to_string),
+                            usage: serde_json::Map::new(),
+                        },
+                    )])),
+                }),
+            };
+            assert!(matches!(
+                judge.judge(&ctx).await,
+                Err(SkillAutoRouteJudgeError::Rejected(_))
+            ));
+        }
+    }
+
     fn summary_response_with_usage(
         text: &str,
         input_tokens: u64,
@@ -23519,13 +23588,18 @@ mod tests {
             )
             .await
             .expect("success");
-        assert_eq!(success.accum.prompt_tokens, 18);
-        assert_eq!(success.accum.cache_read_tokens, 9);
-        assert_eq!(success.accum.cache_creation_tokens, 3);
-        assert_eq!(success.accum.completion_tokens, 8);
+        assert_eq!(success.accum.prompt_tokens, 11);
+        assert_eq!(success.accum.cache_read_tokens, 4);
+        assert_eq!(success.accum.cache_creation_tokens, 0);
+        assert_eq!(success.accum.completion_tokens, 6);
+        assert_eq!(success_state.total_prompt, 7);
+        assert_eq!(success_state.total_cache_read, 5);
+        assert_eq!(success_state.total_cache_creation, 3);
+        assert_eq!(success_state.total_completion, 2);
+        assert!(success_state.has_any_usage);
         assert!(
             !success.accum.usage_is_run_total,
-            "admission sidecar usage is part of this turn's increment"
+            "the primary accumulator still describes one request"
         );
         assert_eq!(success_state.token_usage_coverage().attempts, 2);
 
@@ -23533,7 +23607,11 @@ mod tests {
             .finalize_work_admission_usage_at_turn_exit(&mut success_state, Ok(success))
             .await
             .expect("second finalization");
-        assert_eq!(second.accum.prompt_tokens, 18);
+        assert_eq!(second.accum.prompt_tokens, 11);
+        assert_eq!(
+            success_state.total_prompt, 7,
+            "auxiliary usage is consumed once"
+        );
         assert_eq!(success_state.token_usage_coverage().attempts, 2);
 
         let mut error_host = ServerAgenticLoopHostBuilder::new(
@@ -23558,8 +23636,12 @@ mod tests {
             .err()
             .expect("error");
         let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
-        assert_eq!(details["usage"]["input_tokens"], 18);
+        assert_eq!(details["usage"]["input_tokens"], 11);
         assert_eq!(details["work_admission_usage"]["attempts"], 2);
+        assert_eq!(error_state.total_prompt, 7);
+        assert_eq!(error_state.total_cache_read, 5);
+        assert_eq!(error_state.total_cache_creation, 3);
+        assert_eq!(error_state.total_completion, 2);
         assert_eq!(error_state.token_usage_coverage().attempts, 2);
     }
 

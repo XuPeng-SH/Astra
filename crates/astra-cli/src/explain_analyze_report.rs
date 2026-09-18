@@ -597,6 +597,192 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_usage_keeps_request_classification_skill_selection_and_work_planning_separate() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        let operations = [
+            ("request_judgment", "Request classification", 10),
+            ("skill_auto_route", "Skill selection", 20),
+            ("work_plan", "Work planning", 30),
+        ];
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            attempts: operations
+                .iter()
+                .map(|(operation, _, tokens)| ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: format!("aux-{operation}"),
+                    provider: "openai".into(),
+                    offering_id: "same-offering".into(),
+                    model_name: "same-model".into(),
+                    purpose: "introspection".into(),
+                    operation_id: (*operation).into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(*tokens),
+                        output_tokens: Some(1),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                })
+                .collect(),
+        }));
+        let output = render(&[start, end], false, false);
+        let lines = output
+            .lines()
+            .filter(|line| line.contains("Auxiliary tokens"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for (_, label, tokens) in operations {
+            let line = lines.iter().find(|line| line.contains(label)).unwrap();
+            assert!(line.contains(&format!("in {tokens} ·")), "{line}");
+            assert!(line.contains("1/1 requests reported"), "{line}");
+            assert!(line.contains("cache read unknown"), "{line}");
+        }
+        assert_eq!(
+            auxiliary_usage_label("completion_proxy:verification_judge", "verification_judge"),
+            "Verification"
+        );
+        assert_eq!(
+            auxiliary_usage_label("completion_proxy:introspection", "introspection"),
+            "Request analysis"
+        );
+        assert_eq!(
+            auxiliary_usage_label("unrecognized", "introspection"),
+            "Request analysis"
+        );
+        assert_eq!(
+            auxiliary_usage_label("unrecognized", "unrecognized"),
+            "Auxiliary inference"
+        );
+    }
+
+    #[test]
+    fn mixed_jet_and_llm_usage_remains_isolated_across_repeated_capture_segments() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let attempts = [
+            (
+                "jet-decision",
+                "typesafe",
+                "jet-model",
+                "request_judgment",
+                100,
+                3,
+                None,
+                None,
+            ),
+            (
+                "llm-decision",
+                "openai",
+                "llm-model",
+                "request_judgment",
+                40,
+                5,
+                Some(60),
+                Some(0),
+            ),
+            (
+                "llm-plan",
+                "openai",
+                "llm-model",
+                "work_plan",
+                200,
+                20,
+                Some(10),
+                Some(7),
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(id, provider, model, operation, input, output, read, write)| {
+                ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: id.into(),
+                    provider: provider.into(),
+                    offering_id: format!("offering-{provider}"),
+                    model_name: model.into(),
+                    purpose: "introspection".into(),
+                    operation_id: operation.into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(input),
+                        output_tokens: Some(output),
+                        cache_read_tokens: read,
+                        cache_creation_tokens: write,
+                    }),
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for (segment, offset) in [("first", 0), ("second", 100)] {
+            let start = fact(
+                &format!("{segment}-start"),
+                segment,
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                ExplainAnalyzeTransitionV1::Started,
+                offset,
+                None,
+                None,
+            );
+            let mut end = finished(start.clone(), 100);
+            end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                attempts: attempts.clone(),
+            }));
+            events.extend([start, end]);
+        }
+        let output = render(&events, false, false);
+        let lines = output
+            .lines()
+            .filter(|line| line.contains("Auxiliary tokens"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for (identity, label, counts) in [
+            (
+                "Jet (jet-model)",
+                "Request classification",
+                "in 100 · cache read unknown · cache write unknown · out 3",
+            ),
+            (
+                "openai (llm-model)",
+                "Request classification",
+                "in 40 · cache read 60 · cache write 0 · out 5",
+            ),
+            (
+                "openai (llm-model)",
+                "Work planning",
+                "in 200 · cache read 10 · cache write 7 · out 20",
+            ),
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(identity) && line.contains(label))
+                .unwrap();
+            assert!(line.contains(counts), "{line}");
+            assert!(line.contains("1/1 requests reported"), "{line}");
+            assert!(!line.contains("partial"), "{line}");
+        }
+    }
+
+    #[test]
     fn renders_canonical_tree_timing_usage_and_context_without_trace_prose() {
         let mut turn_start = fact(
             "turn-start",
@@ -834,7 +1020,7 @@ mod tests {
 /// Same separately attributed auxiliary usage section for text, TUI and HTML.
 pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
     use std::collections::BTreeMap;
-    type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+    type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
     type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
     let mut groups: BTreeMap<GroupKey<'_>, Attempts<'_>> = BTreeMap::new();
     for attempt in graph.auxiliary_attempts() {
@@ -844,26 +1030,19 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
                 &attempt.offering_id,
                 &attempt.model_name,
                 &attempt.purpose,
+                &attempt.operation_id,
             ))
             .or_default()
             .push(attempt);
     }
     let mut lines = Vec::new();
-    for ((provider, _, model, purpose), attempts) in groups {
+    for ((provider, _, model, purpose, operation), attempts) in groups {
         let provider = if provider == "typesafe" {
             "Jet"
         } else {
             provider
         };
-        let purpose = match purpose {
-            "memory_retrieval_rerank" => "Memory judgment",
-            "memory_extraction" => "Memory extraction",
-            "introspection" => "Request decisions",
-            "verification_judge" => "Verification",
-            "reflection" => "Reflection",
-            "required_compaction" => "Context summary",
-            _ => "Auxiliary inference",
-        };
+        let purpose = auxiliary_usage_label(operation, purpose);
         let reported = attempts
             .iter()
             .filter_map(|a| a.usage.as_ref())
@@ -915,4 +1094,21 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
         lines.push("Auxiliary tokens · capture unavailable".into());
     }
     lines
+}
+
+fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
+    match operation {
+        "request_judgment" => "Request classification",
+        "skill_auto_route" => "Skill selection",
+        "work_plan" => "Work planning",
+        _ => match purpose {
+            "memory_retrieval_rerank" => "Memory judgment",
+            "memory_extraction" => "Memory extraction",
+            "introspection" => "Request analysis",
+            "verification_judge" => "Verification",
+            "reflection" => "Reflection",
+            "required_compaction" => "Context summary",
+            _ => "Auxiliary inference",
+        },
+    }
 }

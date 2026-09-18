@@ -1764,6 +1764,7 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             offering_id: "offering-1".into(),
             inference_purpose: "primary_agent".into(),
+            operation_id: "agent_turn".into(),
             provider_protocol: "openai".into(),
             provider_wire_hash: "hash".into(),
             provider_wire_bytes: 100,

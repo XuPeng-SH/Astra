@@ -655,6 +655,75 @@ describe("auxiliary provider usage", () => {
     expect(lines[0]).toContain("1/1 requests reported · partial");
     expect(renderExplainAnalyzeHtml([first, second])).toContain("Auxiliary tokens");
   });
+  it("keeps same-model request classification, skill selection, and Work planning usage separate", () => {
+    const operations = [
+      ["request_judgment", "Request classification", 10],
+      ["skill_auto_route", "Skill selection", 20],
+      ["work_plan", "Work planning", 30],
+    ] as const;
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
+      available: true,
+      attempts: operations.map(([operation, , tokens]) => ({
+        attempt_id: `aux-${operation}`, provider: "openai", offering_id: "same-offering", model_name: "same-model",
+        purpose: "introspection", operation_id: operation, usage_status: "provider_exact" as const,
+        usage: {basis: "provider_exact" as const, fresh_input_tokens: tokens, output_tokens: 1},
+      })),
+    }});
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]));
+    expect(lines).toHaveLength(3);
+    const html = renderExplainAnalyzeHtml([event]);
+    for (const [, label, tokens] of operations) {
+      const line = lines.find(line => line.includes(label));
+      expect(line).toContain(`in ${tokens} ·`);
+      expect(line).toContain("1/1 requests reported");
+      expect(line).toContain("cache read unknown");
+      expect(html).toContain(label);
+    }
+  });
+  it("isolates Jet and LLM counters and deduplicates repeated capture segments in text and HTML", () => {
+    const usage = {
+      available: true,
+      attempts: [
+        {attempt_id:"jet-decision", provider:"typesafe", offering_id:"jet-offering", model_name:"jet-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:100, output_tokens:3}},
+        {attempt_id:"llm-decision", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:40, cache_read_tokens:60, cache_creation_tokens:0, output_tokens:5}},
+        {attempt_id:"llm-plan", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"work_plan", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:200, cache_read_tokens:10, cache_creation_tokens:7, output_tokens:20}},
+      ],
+    };
+    const events = [
+      finished("first", "turn", 0, 100, {auxiliary_usage:usage}),
+      finished("second", "turn", 100, 200, {auxiliary_usage:usage}),
+    ];
+    expect(events.every(isExplainAnalyzeEventV1)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(events));
+    expect(lines).toHaveLength(3);
+    const html = renderExplainAnalyzeHtml(events);
+    for (const [identity, label, counts] of [
+      ["Jet (jet-model)", "Request classification", "in 100 · cache read unknown · cache write unknown · out 3"],
+      ["openai (llm-model)", "Request classification", "in 40 · cache read 60 · cache write 0 · out 5"],
+      ["openai (llm-model)", "Work planning", "in 200 · cache read 10 · cache write 7 · out 20"],
+    ]) {
+      const line = lines.find(line => line.includes(identity) && line.includes(label));
+      expect(line).toContain(counts);
+      expect(line).toContain("1/1 requests reported");
+      expect(line).not.toContain("partial");
+      expect(html).toContain(line);
+    }
+  });
+  it("uses purpose for completion proxy and a neutral label for unknown operations", () => {
+    for (const [operation, purpose, label] of [
+      ["completion_proxy:verification_judge", "verification_judge", "Verification"],
+      ["completion_proxy:introspection", "introspection", "Request analysis"],
+      ["unrecognized", "introspection", "Request analysis"],
+      ["__proto__", "introspection", "Request analysis"],
+      ["unrecognized", "unrecognized", "Auxiliary inference"],
+    ]) {
+      const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [{...auxiliary.attempts[0], operation_id: operation, purpose}]}});
+      const line = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]))[0];
+      expect(line).toContain(label);
+      expect(line).not.toContain("Request decisions");
+    }
+  });
   it("rejects usage facts on nonterminal events and duplicated physical identities", () => {
     expect(isExplainAnalyzeEventV1(started("turn", "turn", 0, {auxiliary_usage: auxiliary}))).toBe(false);
     expect(isExplainAnalyzeEventV1(finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [auxiliary.attempts[0], auxiliary.attempts[0]]}}))).toBe(false);

@@ -296,7 +296,10 @@ pub(super) async fn run(
                 )
                 .with_offering_id(id)
                 .with_timeout(Duration::from_millis(DEADLINE_MS));
-                request.max_tokens = 512;
+                request.max_tokens =
+                    u32::try_from(case.request.output_token_budget()).map_err(|_| {
+                        "Judgment output budget exceeds the completion protocol".to_string()
+                    })?;
                 request.temperature = 0.0;
                 let started = Instant::now();
                 let mut row = json!({"repeat":repetition+1,"case_id":case.id,"backend":if backend==0 {"baseline"} else {"candidate"},"offering_id":id,"input_hash":input_hash,"operation":case.operation,"session_id":session_id,"logical_attempt":sequence,"threshold":case.threshold});
