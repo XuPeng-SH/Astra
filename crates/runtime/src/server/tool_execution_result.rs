@@ -25,6 +25,53 @@ fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Ma
     }
 }
 
+/// Carry a producer-owned control execution fact through the server tool
+/// boundary.  Control tools may reject a request after inspecting durable
+/// state (for example, a duplicate fanout start) while returning a structured
+/// error that still contains the existing group.  The JSON fact must reach the
+/// journal as `Rejected`; otherwise the record fallback promotes the request
+/// to `Executed` and completion policy treats a request that never ran as a
+/// failed execution.
+fn insert_parsed_execution_fact(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
+    let Some(executed) = parsed.and_then(|value| {
+        value
+            .get("executed")
+            .or_else(|| value.pointer("/advisory/executed"))
+    }) else {
+        return;
+    };
+    match executed {
+        Value::Bool(false) => {
+            metadata.insert("execution_started".to_string(), Value::Bool(false));
+            metadata.insert(
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            );
+            metadata.insert(
+                "execution_fact".to_string(),
+                Value::String("not_executed".to_string()),
+            );
+        }
+        Value::Bool(true) => {
+            metadata.insert("execution_started".to_string(), Value::Bool(true));
+            metadata.insert(
+                "execution_fact".to_string(),
+                Value::String("executed".to_string()),
+            );
+        }
+        Value::Null => {
+            // `null` is an explicit outcome-unknown fact. Do not turn it into
+            // `execution_started=false`: the operation may already have had
+            // side effects and must remain fail-closed for settlement.
+            metadata.insert(
+                "execution_fact".to_string(),
+                Value::String("unknown".to_string()),
+            );
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed
@@ -54,6 +101,10 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
             "error_kind".to_string(),
             Value::String(error_kind.to_string()),
         );
+    }
+    if parsed.is_some() {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        insert_parsed_execution_fact(parsed.as_ref(), metadata);
     }
     if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
         let metadata = result.metadata.get_or_insert_with(Map::new);
@@ -152,6 +203,11 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     {
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
+    // Waiting/interrupted agent results take a specialized metadata path, but
+    // their producer-owned execution fact must still reach the canonical
+    // invocation ledger. In particular, `executed=null` remains outcome
+    // unknown and `executed=false` remains a pre-dispatch rejection.
+    insert_parsed_execution_fact(parsed.as_ref(), &mut metadata);
     insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     if let Some(result_class) = result_class {
         metadata.insert(
@@ -352,5 +408,51 @@ mod tests {
             result_metadata_str(&result, "result_class"),
             Some("fanout_incomplete")
         );
+    }
+
+    #[test]
+    fn fanout_rejection_preserves_not_executed_fact_for_the_journal() {
+        let result = agent_tool_result_from_output(
+            serde_json::json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "error": "the parent already owns a group",
+                "executed": false,
+                "group_id": "existing-group"
+            })
+            .to_string(),
+        );
+
+        let metadata = result.metadata.expect("control metadata");
+        assert_eq!(metadata.get("execution_started"), Some(&Value::Bool(false)));
+        assert_eq!(
+            metadata.get("disposition"),
+            Some(&Value::String("rejected".into()))
+        );
+        assert_eq!(
+            metadata.get("execution_fact"),
+            Some(&Value::String("not_executed".into()))
+        );
+    }
+
+    #[test]
+    fn fanout_unknown_execution_fact_does_not_become_rejection() {
+        let result = agent_tool_result_from_output(
+            serde_json::json!({
+                "status": "unknown",
+                "error_kind": "action_outcome_unknown",
+                "error": "the dispatch acknowledgement was lost",
+                "executed": null
+            })
+            .to_string(),
+        );
+
+        let metadata = result.metadata.expect("control metadata");
+        assert_eq!(
+            metadata.get("execution_fact"),
+            Some(&Value::String("unknown".into()))
+        );
+        assert!(!metadata.contains_key("execution_started"));
+        assert!(!metadata.contains_key("disposition"));
     }
 }

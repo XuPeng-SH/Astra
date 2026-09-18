@@ -4140,6 +4140,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_rejection_stays_advisory_through_record_and_policy_projection() {
+        let mut harness = PipelineHarness::new();
+        let args = json!({"action": "start", "target_count": 2});
+        let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "test-run",
+            "test-turn",
+            "call-fanout-duplicate",
+        )
+        .unwrap();
+        let decision =
+            astra_turn_types::ToolInvocationDecision::new(&json!({"decision": "test-fanout"}))
+                .unwrap();
+        let fingerprint = astra_turn_types::ToolInvocationFingerprint::new(
+            astra_turn_types::DurableToolReference::built_in("agent_fanout", "v1").unwrap(),
+            &args,
+            &decision.decision_id,
+        )
+        .unwrap();
+        let owner = match ledger
+            .begin(&identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap()
+        {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(_) => {
+                panic!("fresh fanout invocation must be admitted")
+            }
+        };
+        let finished = ledger
+            .finish(
+                &identity,
+                &owner,
+                crate::server::tool_execution_result::agent_tool_result_from_output(
+                    json!({
+                        "status": "failed",
+                        "error_kind": "fanout_group_already_started",
+                        "error": "the existing group is still active",
+                        "executed": false,
+                        "group_id": "existing-group"
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            finished.record.as_deref().map(|record| record.state),
+            Some(astra_turn_types::ToolInvocationState::Rejected)
+        );
+        let result = match ledger
+            .begin(&identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap()
+        {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(result) => {
+                result.result
+            }
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                ..
+            } => {
+                panic!("rejected fanout invocation must replay, not execute")
+            }
+        };
+        let mut pipeline = harness.pipeline();
+        pipeline
+            .record_execution(ExecutedExecution {
+                execution: HeadlessResolvedExecution {
+                    id: "call-fanout-duplicate".into(),
+                    name: "agent_fanout".into(),
+                    args: args.clone(),
+                    result_str: result.output,
+                    tool_result_fields: result.metadata,
+                    authoritative_is_error: Some(result.is_error),
+                    pending_runtime_completion: None,
+                    confirmed_invocation: None,
+                    edge_duration_ms: 1,
+                    is_edge_tool: false,
+                    edge_result_missing: false,
+                    edge_terminal_authority: false,
+                    early_exit_ms: 0,
+                },
+                idem_key: IdempotencyKey::semantic("agent_fanout", &args),
+                pre_tool_context: None,
+                is_err: result.is_error,
+                error_kind: None,
+                executed_ms: 1,
+            })
+            .await;
+        drop(pipeline);
+
+        let record = harness
+            .tool_call_records
+            .last()
+            .expect("fanout result must be journaled");
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        );
+        let fact = astra_turn_core::evaluation::ToolEvaluationFact::from_record(record);
+        assert!(
+            astra_turn_core::evaluation::unresolved_tool_outcome_facts(&[fact]).is_empty(),
+            "a pre-dispatch duplicate must not become an unresolved execution failure"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_edge_status_remains_authoritative_over_success_looking_output() {
         let mut harness = PipelineHarness::new();
         let args = json!({

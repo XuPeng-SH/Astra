@@ -1272,10 +1272,25 @@ fn rejection_evidence(result: &astra_tools::ToolResult) -> Option<(Option<String
         .and_then(|value| value.as_str().map(str::to_string));
     let error_kind =
         structured_field(result, "error_kind").and_then(|value| value.as_str().map(str::to_string));
+    let execution_fact = structured_field(result, "execution_fact")
+        .and_then(|value| value.as_str().map(str::to_string));
+    let execution_started =
+        structured_field(result, "execution_started").and_then(|value| value.as_bool());
+    let disposition = structured_field(result, "disposition")
+        .and_then(|value| value.as_str().map(str::to_string));
     let reason_kind = structured_field(result, "reason_kind")
         .and_then(|value| value.as_str().map(str::to_string));
     let capability_denial = structured_field(result, "capability_denial").is_some();
-    let explicitly_rejected = rejection_code.is_some()
+    // Control tools may return a structured error after inspecting durable
+    // state without ever entering their executor (for example a duplicate
+    // fanout start).  Preserve that producer-owned fact in the canonical
+    // invocation state; otherwise the ledger records a failed execution and
+    // later policy treats an advisory admission result as unfinished work.
+    let explicitly_not_executed = execution_fact.as_deref() == Some("not_executed")
+        || disposition.as_deref() == Some("rejected")
+        || (execution_started == Some(false) && disposition.is_none());
+    let explicitly_rejected = explicitly_not_executed
+        || rejection_code.is_some()
         || capability_denial
         || matches!(
             error_kind.as_deref(),
@@ -1312,6 +1327,9 @@ fn result_side_effects_maybe(result: &astra_tools::ToolResult) -> bool {
     structured_field(result, "side_effects_maybe")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+        || structured_field(result, "execution_fact")
+            .and_then(|value| value.as_str().map(|fact| fact == "unknown"))
+            .unwrap_or(false)
 }
 
 fn replay_terminal_record(
@@ -2732,6 +2750,108 @@ mod tests {
                 ..
             } if code == "tenant_policy"
         ));
+    }
+
+    #[test]
+    fn control_execution_fact_reaches_canonical_terminal_classification() {
+        let result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "error": "the existing group is still active",
+                "executed": false,
+                "group_id": "existing-group"
+            })
+            .to_string(),
+        );
+
+        assert!(matches!(
+            terminal_outcome_from_result(&result),
+            ToolInvocationTerminalOutcome::Rejected {
+                rejection_code: Some(code),
+                ..
+            } if code == "fanout_group_already_started"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fanout_rejection_and_unknown_facts_survive_finish_and_replay() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+
+        let rejected_identity = identity("fanout-rejected");
+        let rejected_fingerprint = fingerprint(&json!({"action": "start"}));
+        let rejected_owner = execute_owner(
+            begin(&ledger, &rejected_identity, &rejected_fingerprint)
+                .await
+                .unwrap(),
+        );
+        let rejected_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "error": "the existing group is still active",
+                "executed": false,
+                "group_id": "existing-group"
+            })
+            .to_string(),
+        );
+        let rejected = ledger
+            .finish(&rejected_identity, &rejected_owner, rejected_result)
+            .await;
+        assert_eq!(
+            rejected.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::Rejected)
+        );
+        let rejected_replay = match begin(&ledger, &rejected_identity, &rejected_fingerprint)
+            .await
+            .unwrap()
+        {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("a rejected control invocation must replay its rejection")
+            }
+        };
+        assert_eq!(
+            rejected_replay.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::Rejected)
+        );
+
+        let unknown_identity = identity("fanout-unknown");
+        let unknown_fingerprint = fingerprint(&json!({"action": "start"}));
+        let unknown_owner = execute_owner(
+            begin(&ledger, &unknown_identity, &unknown_fingerprint)
+                .await
+                .unwrap(),
+        );
+        let unknown_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            json!({
+                "status": "unknown",
+                "error_kind": "action_outcome_unknown",
+                "error": "dispatch acknowledgement was lost",
+                "executed": null
+            })
+            .to_string(),
+        );
+        let unknown = ledger
+            .finish(&unknown_identity, &unknown_owner, unknown_result)
+            .await;
+        assert_eq!(
+            unknown.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::OutcomeUnknown)
+        );
+        let unknown_replay = match begin(&ledger, &unknown_identity, &unknown_fingerprint)
+            .await
+            .unwrap()
+        {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("an unknown control invocation must not be replayed as executable")
+            }
+        };
+        assert_eq!(
+            unknown_replay.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::OutcomeUnknown)
+        );
     }
 
     #[tokio::test]

@@ -20277,6 +20277,35 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_bash_receipt_does_not_prove_external_persistent_write_is_scratch() {
+        let receipt =
+            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            )
+            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+            .cloned();
+        let command = "printf x >> /outside/persistent-state; exit 1";
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            args_full: Some(serde_json::json!({"command": command}).to_string()),
+            runtime_args_full: Some(serde_json::json!({"command": command}).to_string()),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt: receipt,
+            ..ToolCallRecord::default()
+        };
+
+        assert!(crate::turn::agentic_loop::lifecycle::is_authoritative_unchanged_bash_observation_record(&record));
+        assert!(
+            !record_is_proven_external_scratch_mutation(Some("/workspace"), &record),
+            "a bound-workspace no-change fact cannot clear an untracked persistent external effect"
+        );
+    }
+
+    #[test]
     fn historical_review_diff_scratch_snapshot_does_not_create_global_mutation_obligation() {
         let mut state = make_state();
         state.hooks.workspace_root_hint = Some("/workspace/astra".into());
