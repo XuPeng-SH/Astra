@@ -24,6 +24,29 @@ const identity = {
 };
 
 describe("ExplainAnalyzePanel", () => {
+  it("shows memory candidate decisions and distinguishes selection from injection", () => {
+    const consoleError = vi.spyOn(console, "error");
+    render(<ExplainAnalyzePanel events={[{
+      ...identity, event_id: "context:finish", node_id: "context", kind: "context_assembly",
+      label: "Assemble context sources", transition: "finished", elapsed_ms: 20,
+      start_elapsed_ms: 0, duration_ms: 20, outcome: "completed",
+      context: { assembly: { basis: "runtime_text_estimate", sources: [], edge_memory_selection: [{
+        session_id: "s", turn: 1, operation: "relevance", method: "model", reason: "completed",
+        model: "jev-test", elapsed_ms: 398, selection_order: [0], candidates: [
+          { index: 0, selected: true, probability_bps: 9000 },
+          { index: 1, selected: false, probability_bps: 1000 },
+        ],
+      }] } },
+    }]} />);
+    expect(screen.getAllByText(/2 candidates → 1 selected/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Inspect Assemble context sources/ }));
+    expect(screen.getByText("Candidate 1")).toBeTruthy();
+    expect(screen.getByText(/selected · model score 90.00%/)).toBeTruthy();
+    expect(screen.getByText(/final prompt injection not measured/)).toBeTruthy();
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
   it("distinguishes live approval and dispatch waits from running work", () => {
     renderTimeline(<ExplainAnalyzePanel live events={[
       { ...identity, event_id: "turn:start", node_id: "turn", kind: "turn", label: "User turn", transition: "started", elapsed_ms: 0 },

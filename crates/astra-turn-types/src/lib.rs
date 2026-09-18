@@ -20,6 +20,8 @@ mod context_identity;
 mod context_window;
 mod deferred_tool;
 mod explain_analyze;
+mod memory_selection;
+pub use memory_selection::*;
 mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;

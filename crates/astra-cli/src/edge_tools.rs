@@ -1441,6 +1441,7 @@ pub struct ToolExecutor {
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
     session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
+    memory_selection_reports: std::sync::Mutex<Vec<astra_turn_types::MemorySelectionReport>>,
     /// P3.3 seam: latest auto-invoked diagnostic skill output.
     /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
     /// the next `build_self_model_snapshot` injects it into the prompt and
@@ -1579,6 +1580,7 @@ impl ToolExecutor {
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
             current_context_window_tokens: std::sync::RwLock::new(None),
             session_lessons: std::sync::Mutex::new(Vec::new()),
+            memory_selection_reports: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
@@ -2450,6 +2452,23 @@ impl ToolExecutor {
         self.session_lessons
             .lock()
             .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_memory_selection_reports(
+        &self,
+        report: Vec<astra_turn_types::MemorySelectionReport>,
+    ) {
+        if let Ok(mut slot) = self.memory_selection_reports.lock() {
+            *slot = report;
+        }
+    }
+
+    pub fn memory_selection_reports(&self) -> Vec<astra_turn_types::MemorySelectionReport> {
+        self.memory_selection_reports
+            .lock()
+            .ok()
+            .map(|slot| slot.clone())
             .unwrap_or_default()
     }
 

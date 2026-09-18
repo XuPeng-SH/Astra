@@ -423,6 +423,30 @@ describe("context facts", () => {
     expect(html).toContain("Not billed usage");
   });
 
+  it("preserves memory decisions in replay and renders their limits without private text", () => {
+    const report = { session_id: "s", turn: 1, operation: "relevance" as const,
+      method: "model" as const, reason: "completed" as const, model: "jev-test", elapsed_ms: 398, selection_order: [0],
+      candidates: [{ index: 0, selected: true, probability_bps: 9000 }, { index: 1, selected: false, probability_bps: 1000 }] };
+    const event = finished("context", "context_assembly", 0, 10, { context: { assembly: { ...assembly, edge_memory_selection: [report] } } });
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([event, event]);
+    expect(graph.nodes[0].context?.assembly?.edge_memory_selection).toEqual([report]);
+    const html = renderExplainAnalyzeHtml([event]);
+    expect(html).toContain("2 candidates → 1 selected");
+    expect(html).toContain("90.00%");
+    expect(html).toContain("final prompt injection not measured");
+    for (const bad of [
+      { ...report, reason: "no_candidates" }, { ...report, method: "lexical" },
+      { ...report, session_id: "" }, { ...report, turn: 0 },
+      { ...report, candidates: [{ index: 0, selected: true, probability_bps: 10001 }] },
+      { ...report, candidates: [{ index: 1, selected: true, probability_bps: 9000 }] },
+      { ...report, raw_response: "private memory" },
+      { ...report, selection_order: [1] }, { ...report, selection_order: [0, 0] },
+    ]) {
+      expect(isExplainAnalyzeEventV1({ ...event, context: { assembly: { ...assembly, edge_memory_selection: [bad] } } })).toBe(false);
+    }
+  });
+
   it.each([
     { budget: { ...budget, raw_prompt: "private" } },
     { budget: { ...budget, estimated_input_tokens: Number.MAX_SAFE_INTEGER + 1 } },

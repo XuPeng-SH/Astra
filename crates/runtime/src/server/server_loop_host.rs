@@ -10687,7 +10687,7 @@ impl ServerAgenticLoopHost {
             assembly.map(
                 |assembly| astra_turn_types::ExplainAnalyzeContextMetricsV1 {
                     budget: None,
-                    assembly: Some(assembly),
+                    assembly: Some(Box::new(assembly)),
                 },
             );
         self.finish_explain_analyze_node_at(

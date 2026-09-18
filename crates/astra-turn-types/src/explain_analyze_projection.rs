@@ -1485,14 +1485,15 @@ mod tests {
         );
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(ExplainAnalyzeContextAssemblyV1 {
+            assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
+                edge_memory_selection: Vec::new(),
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,
                     section_count: 2,
                     estimated_tokens: 55,
                 }],
-            }),
+            })),
         });
         let mut graph = ExplainAnalyzeGraphV1::default();
         graph.apply(event);

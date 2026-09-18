@@ -183,12 +183,20 @@ pub struct ExplainAnalyzeContextSourceV1 {
 pub struct ExplainAnalyzeContextAssemblyV1 {
     pub basis: ExplainAnalyzeContextAssemblyBasisV1,
     pub sources: Vec<ExplainAnalyzeContextSourceV1>,
+    /// Selected CLI/Edge reports selection, not proof of final prompt injection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_memory_selection: Vec<crate::MemorySelectionReport>,
 }
 
 impl ExplainAnalyzeContextAssemblyV1 {
     pub fn is_valid(&self) -> bool {
         let mut kinds = HashSet::with_capacity(self.sources.len());
-        self.sources.len() <= 15
+        self.edge_memory_selection.len() <= 2
+            && self
+                .edge_memory_selection
+                .iter()
+                .all(crate::MemorySelectionReport::is_valid)
+            && self.sources.len() <= 15
             && self.sources.iter().all(|source| {
                 source.estimated_tokens <= EXPLAIN_ANALYZE_MAX_SAFE_INTEGER
                     && kinds.insert(source.kind)
@@ -205,7 +213,7 @@ pub struct ExplainAnalyzeContextMetricsV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<ExplainAnalyzeContextBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assembly: Option<ExplainAnalyzeContextAssemblyV1>,
+    pub assembly: Option<Box<ExplainAnalyzeContextAssemblyV1>>,
 }
 
 impl ExplainAnalyzeContextMetricsV1 {
@@ -650,6 +658,7 @@ mod tests {
 
     fn context_assembly() -> ExplainAnalyzeContextAssemblyV1 {
         ExplainAnalyzeContextAssemblyV1 {
+            edge_memory_selection: Vec::new(),
             basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
             sources: vec![ExplainAnalyzeContextSourceV1 {
                 kind: ExplainAnalyzeContextSourceKindV1::Identity,
@@ -673,7 +682,7 @@ mod tests {
         assembly.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(assembly.is_valid());
 
@@ -693,7 +702,7 @@ mod tests {
 
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: Some(context_budget()),
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(!assembly.is_valid());
 
@@ -748,7 +757,7 @@ mod tests {
         event.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
 
         let encoded = serde_json::to_string(&event).unwrap();

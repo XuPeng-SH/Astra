@@ -422,6 +422,20 @@ export type ExplainAnalyzeContextSourceV1 = {
 export type ExplainAnalyzeContextAssemblyV1 = {
   basis: "runtime_text_estimate";
   sources: ExplainAnalyzeContextSourceV1[];
+  edge_memory_selection?: MemorySelectionReport[];
+};
+
+/** CLI/Edge decision facts, not proof of final prompt injection. Indices are batch-local. */
+export type MemorySelectionReport = {
+  session_id: string;
+  turn: number;
+  operation: "relevance" | "dismissal" | "reuse";
+  method: "model" | "lexical" | "none" | "reuse";
+  reason: "completed" | "no_candidates" | "no_selector" | "call_unavailable" | "invalid_response" | "retrieval_unavailable" | "retrieval_timeout" | "reused";
+  model: string | null;
+  candidates: Array<{ index: number; selected: boolean; probability_bps: number | null }>;
+  selection_order: number[];
+  elapsed_ms: number;
 };
 
 /** Assembly observations and final request estimates have different scopes.

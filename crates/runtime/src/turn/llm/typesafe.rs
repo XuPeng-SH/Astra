@@ -286,10 +286,22 @@ mod tests {
         let (base,seen)=mock(200,json!({"model":"jev-1.13.0","answers":{"0":{"type":"noul","noul":0.9},"1":{"type":"noul","noul":0.1}},"usage":{"input_tokens":123,"output_tokens":8}}),std::time::Duration::ZERO).await;
         let c = client(base, "mock-key".into());
         let items = vec!["Prefer cargo test".into(), "I like coffee".into()];
+        let report = crate::memory_hooks::relevance::select_memories(
+            Some(&c),
+            Some(&scope()),
+            "Run Rust tests",
+            &items,
+            false,
+        )
+        .await;
+        assert_eq!(report.selected_indices(), vec![0]);
         assert_eq!(
-            filter_memories(&c, &scope(), "Run Rust tests", &items).await,
-            vec![items[0].clone()]
+            report.method,
+            astra_turn_types::MemorySelectionMethod::Model
         );
+        assert_eq!(report.candidates[0].probability_bps, Some(9000));
+        assert_eq!(report.candidates[1].probability_bps, Some(1000));
+        assert!(report.is_valid());
         assert_eq!(
             select_dismissed_memory_indices(&c, &scope(), "The first lesson is wrong", &items)
                 .await,
