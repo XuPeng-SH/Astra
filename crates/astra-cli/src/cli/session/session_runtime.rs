@@ -321,6 +321,7 @@ fn create_pipeline_modules_inner(
 pub(crate) struct ServerModelSelection {
     pub name: String,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub offering_id: String,
 }
 
@@ -346,6 +347,30 @@ pub(crate) fn model_list_entry_context_window(entry: &ModelListItemResponse) -> 
         .filter(|value| *value > 0)
 }
 
+pub(crate) fn model_list_entry_completion_limit(entry: &ModelListItemResponse) -> Option<u32> {
+    entry
+        .max_completion_tokens
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+/// Resolve local session settings at the CLI model-selection boundary.
+/// Server admission supplies its own authoritative policy through context_meta.
+pub(crate) fn resolve_session_context_budget(
+    runtime: &astra_config::RuntimeConfig,
+    context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
+) -> astra_runtime::prompts::ContextBudget {
+    astra_runtime::prompts::ContextBudget::resolve(
+        context_window,
+        max_completion_tokens,
+        runtime.compression.compression_threshold,
+        runtime.compression.preserve_recent_turns as usize,
+        (runtime.memory.max_memory_tokens as usize).saturating_mul(4),
+        astra_runtime::prompts::CompactConfig::default(),
+    )
+}
+
 fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<ServerModelSelection> {
     let offering_id = entry.offering_id.as_str();
     if offering_id.is_empty() || offering_id.trim() != offering_id {
@@ -354,6 +379,7 @@ fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<Serv
     Some(ServerModelSelection {
         name: model_list_entry_name(entry)?.to_string(),
         context_window: model_list_entry_context_window(entry),
+        max_completion_tokens: model_list_entry_completion_limit(entry),
         offering_id: offering_id.to_string(),
     })
 }
@@ -700,6 +726,11 @@ fn model_selection_from_exact_response(
     Ok(ServerModelSelection {
         name: name.to_string(),
         context_window,
+        max_completion_tokens: response
+            .get("max_completion_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
         offering_id: offering_id.to_string(),
     })
 }
@@ -768,10 +799,10 @@ pub(crate) async fn ensure_state_default_model(
                     selection.offering_id,
                 ));
                 if let Some(context_window) = selection.context_window {
-                    state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+                    state.context_budget = resolve_session_context_budget(
                         &state.runtime_config,
-                        Some(&model),
                         Some(context_window),
+                        selection.max_completion_tokens,
                     );
                 }
             }
@@ -794,12 +825,11 @@ pub(crate) async fn ensure_state_default_model(
                 selection.offering_id.clone(),
             ));
             if let Some(context_window) = selection.context_window {
-                state.context_budget =
-                    astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
-                        &state.runtime_config,
-                        Some(&selection.name),
-                        Some(context_window),
-                    );
+                state.context_budget = resolve_session_context_budget(
+                    &state.runtime_config,
+                    Some(context_window),
+                    selection.max_completion_tokens,
+                );
             } else {
                 tracing::warn!(
                     target: "astra_cli::model_selection",
@@ -2275,12 +2305,13 @@ mod tests {
     fn exact_model_selection_requires_canonical_active_identity() {
         let resolved = model_selection_from_exact_response(
             "overflow-model",
-            r#"{"name":"overflow-model","model_id":"offer-201","is_active":true,"context_window":200000}"#,
+            r#"{"name":"overflow-model","model_id":"offer-201","is_active":true,"context_window":200000,"max_completion_tokens":32000}"#,
         )
         .expect("active exact model should resolve");
         assert_eq!(resolved.name, "overflow-model");
         assert_eq!(resolved.offering_id, "offer-201");
         assert_eq!(resolved.context_window, Some(200_000));
+        assert_eq!(resolved.max_completion_tokens, Some(32_000));
 
         let inactive = model_selection_from_exact_response(
             "overflow-model",
@@ -2414,6 +2445,7 @@ mod tests {
             ServerDefaultModel::Selected(super::ServerModelSelection {
                 name: "beta-model".to_string(),
                 context_window: Some(128_000),
+                max_completion_tokens: None,
                 offering_id: "offer-beta".to_string(),
             })
         );
@@ -2446,16 +2478,16 @@ mod tests {
     #[tokio::test]
     async fn ensure_state_default_model_updates_budget_for_explicit_model() {
         let mock = MockServer::start().await;
+        let mut entry = catalog_entry(
+            "offer-deepseek",
+            "deepseek-v4-pro-official",
+            true,
+            1_000_000,
+        );
+        entry.max_completion_tokens = Some(32_000);
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
-                catalog_entry(
-                    "offer-deepseek",
-                    "deepseek-v4-pro-official",
-                    true,
-                    1_000_000,
-                ),
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![entry])))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -2464,6 +2496,9 @@ mod tests {
             ..SessionState::default()
         };
 
+        state.runtime_config.compression.compression_threshold = 0.6;
+        state.runtime_config.compression.preserve_recent_turns = 9;
+        state.runtime_config.memory.max_memory_tokens = 1_000;
         let selected = ensure_state_default_model(&api, "token", &mut state).await;
 
         assert_eq!(
@@ -2472,9 +2507,15 @@ mod tests {
             "explicit model selection should be preserved"
         );
         assert_eq!(
-            state.context_budget.model_limit, 1_000_000,
+            state.context_budget.model_limit(),
+            1_000_000,
             "state diagnostics must reflect the server model context_window, not the client default"
         );
+        assert_eq!(state.context_budget.capped_output_tokens(), 32_000);
+        assert_eq!(state.context_budget.effective_input_limit(), 947_700);
+        assert_eq!(state.context_budget.compact_trigger(), 568_620);
+        assert_eq!(state.context_budget.keep_recent_turns, 9);
+        assert_eq!(state.context_budget.memory_budget_chars, 4_000);
     }
 
     #[test]

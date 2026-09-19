@@ -80,6 +80,13 @@ pub(super) async fn completions_handler(
         )
     })?;
     let provider_timeout = completion_timeout(request.timeout_ms)?;
+    let transport = crate::turn::llm::client::shared_llm_transport().map_err(|error| {
+        crate::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error,
+            "llm_transport_unavailable",
+        )
+    })?;
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
     // as durable chat runs; omission invokes the Server-owned default policy.
@@ -184,9 +191,9 @@ pub(super) async fn completions_handler(
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
     let parsed = durable_ledger
         .execute_nonstream(
-            &state.http_client,
             invocation_scope,
             crate::turn::llm::client::LlmCall {
+                transport: &transport,
                 purpose,
                 messages: &messages,
                 tools: &[],

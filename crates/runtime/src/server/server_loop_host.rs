@@ -2070,6 +2070,8 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    context_budget: crate::prompts::ContextBudget,
+    memoria_config: astra_turn_types::context_execution::MemoriaCompactConfig,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
     /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
@@ -2604,6 +2606,13 @@ async fn resolve_llm_model_for_turn(
             );
         }
         return Ok(ResolvedTurnLlmConfig {
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::load(),
+                execution.context_window,
+                execution.max_completion_tokens,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
             model_name: execution.model_name.clone(),
             wire_model_name: execution.wire_model_name.clone(),
             api_key: execution.api_key.clone(),
@@ -2628,6 +2637,13 @@ async fn resolve_llm_model_for_turn(
         astra_services::resolve_active_llm_model(matrixone, encryptor, preferred_model, pool)
             .await?;
     Ok(ResolvedTurnLlmConfig {
+        context_budget: crate::turn::execution_config::resolve_context_budget(
+            &astra_config::runtime_config::RuntimeConfig::load(),
+            resolved.context_window,
+            resolved.max_completion_tokens,
+            crate::prompts::CompactConfig::default(),
+        ),
+        memoria_config: Default::default(),
         model_name: resolved.model_name,
         wire_model_name: resolved.wire_model_name,
         api_key: resolved.api_key,
@@ -3403,6 +3419,7 @@ pub struct ServerAgenticLoopHost {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
     inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
@@ -4957,6 +4974,7 @@ pub struct ServerAgenticLoopHostBuilder {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
     inference_owner_pod_id: Option<String>,
     execution_time_budget: Option<RunExecutionTimeBudget>,
     edge_tools: Vec<Value>,
@@ -5037,6 +5055,7 @@ impl ServerAgenticLoopHostBuilder {
             inference_ledger_persistence: None,
             model_override: None,
             admitted_model_execution: None,
+            llm_transport: crate::turn::llm::client::shared_llm_transport(),
             inference_owner_pod_id: None,
             execution_time_budget: None,
             edge_tools: Vec::new(),
@@ -5673,6 +5692,7 @@ impl ServerAgenticLoopHostBuilder {
             inference_ledger_persistence: self.inference_ledger_persistence,
             model_override: self.model_override,
             admitted_model_execution: self.admitted_model_execution,
+            llm_transport: self.llm_transport,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
@@ -9808,7 +9828,15 @@ impl ServerAgenticLoopHost {
                 logical_attempt: 0,
             },
         };
+        let transport = match self.llm_transport.as_ref() {
+            Ok(transport) => transport.clone(),
+            Err(error) => {
+                tracing::warn!(operation_id, error = %error, "auxiliary inference transport unavailable");
+                return None;
+            }
+        };
         Some(RuntimeSummaryClient::new_with_attempt_allocator(
+            transport,
             config.execution_route(),
             max_output_tokens,
             ledger,
@@ -11734,6 +11762,13 @@ impl ServerAgenticLoopHost {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         };
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
@@ -15775,7 +15810,12 @@ impl ServerAgenticLoopHost {
             provider,
             model_name,
             model_context_window,
-            None,
+            &crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                model_context_window,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability,
             session_memory_entry,
             memory_entries,
@@ -15791,7 +15831,7 @@ impl ServerAgenticLoopHost {
         provider: &str,
         model_name: &str,
         model_context_window: Option<u32>,
-        model_max_completion_tokens: Option<u32>,
+        context_budget: &crate::prompts::ContextBudget,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
@@ -15887,8 +15927,7 @@ impl ServerAgenticLoopHost {
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
-                context_window: model_context_window,
-                max_completion_tokens: model_max_completion_tokens,
+                context_budget,
                 cache_capability,
                 user_content,
                 query_source: "agentic_loop",
@@ -15909,17 +15948,16 @@ impl ServerAgenticLoopHost {
         tier: CompactionTier,
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
-        let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = self.durable_summary_client(
             llm_cfg,
-            compact_config.summary_token_budget,
+            llm_cfg.context_budget.compact_config.summary_token_budget,
             state,
             "required_compaction",
         );
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
-            model_name: &llm_cfg.model_name,
-            context_window: llm_cfg.context_window,
+            context_budget: &llm_cfg.context_budget,
+            memoria_config: &llm_cfg.memoria_config,
             memoria_client: self.memoria_client.as_deref(),
             summary_client: summary_client
                 .as_ref()
@@ -16033,12 +16071,10 @@ impl ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
             );
-            let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            let candidate_status = crate::turn::wire_assembly::wire_budget_status(
                 &wire_messages,
                 final_tools,
-                &llm_cfg.model_name,
-                llm_cfg.context_window,
-                llm_cfg.max_completion_tokens,
+                &llm_cfg.context_budget,
                 requested_output_tokens,
             );
             let available_output_tokens = candidate_status
@@ -17560,6 +17596,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return Err(error);
         }
 
+        let transport = self.llm_transport.clone().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+        })?;
+
         // ── 1. Resolve LLM model ────────────────────────────────────────
         let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
@@ -17795,7 +17835,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.context_window,
-            llm_cfg.max_completion_tokens,
+            &llm_cfg.context_budget,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
             &memoria_prefetch_entries,
@@ -17878,14 +17918,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &compact_result,
             &compaction_fixed_context,
             context_tool_surface,
-            Some(
-                crate::prompts::budget_for_model_with_metadata(
-                    Some(&llm_cfg.model_name),
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
-                )
-                .window_policy(),
-            ),
+            Some(llm_cfg.context_budget.window_policy()),
         )
         .into_iter()
         .collect::<Vec<_>>();
@@ -17907,7 +17940,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &llm_cfg.provider,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     llm_cfg.cache_capability,
                     session_memory_entry,
                     memory_entries,
@@ -18020,12 +18053,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
-        let budget = crate::prompts::budget_for_model_with_metadata(
-            Some(&llm_cfg.model_name),
-            llm_cfg.context_window,
-            llm_cfg.max_completion_tokens,
-        );
-        let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
+        let max_output_tokens = llm_cfg.context_budget.capped_output_tokens();
         // Tool annotations are part of the same provider-visible schema
         // surface used by the final budget owner below.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
@@ -18110,22 +18138,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         crate::turn::llm::context::WireTraceDetail::MetricsOnly
                     },
                 );
-                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
+                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
                     trace,
                     &llm_messages,
                     &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     max_output_tokens,
                 )
             } else {
-                crate::turn::wire_assembly::wire_budget_status_with_metadata(
+                crate::turn::wire_assembly::wire_budget_status(
                     &llm_messages,
                     &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
+                    &llm_cfg.context_budget,
                     max_output_tokens,
                 )
             };
@@ -18904,6 +18928,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     };
                     let execution_route = llm_cfg.execution_route();
                     let call = LlmCall {
+                        transport: &transport,
                         purpose: state.inference_purpose,
                         messages: attempt_llm_messages,
                         tools: &final_tools,
@@ -20226,7 +20251,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &config.provider,
             &config.model_name,
             config.context_window,
-            config.max_completion_tokens,
+            &config.context_budget,
             Some(cache_capability),
             None,
             &[],
@@ -24252,6 +24277,13 @@ mod tests {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         }
     }
 
@@ -32337,6 +32369,13 @@ mod tests {
             request_timeout: None,
             context_window: None,
             max_completion_tokens: None,
+            context_budget: crate::turn::execution_config::resolve_context_budget(
+                &astra_config::runtime_config::RuntimeConfig::default(),
+                None,
+                None,
+                crate::prompts::CompactConfig::default(),
+            ),
+            memoria_config: Default::default(),
         };
         let msgs = host
             .assemble_llm_messages(
@@ -43316,6 +43355,7 @@ mod tests {
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             OwnedLlmExecutionRoute {
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,

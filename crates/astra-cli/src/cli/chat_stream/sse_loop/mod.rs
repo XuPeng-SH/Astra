@@ -205,10 +205,12 @@ pub(crate) async fn stream_chat_sse(
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
     let mut model_context_window = None;
+    let mut model_completion_limit = None;
     let default_model = if p.model.is_none() {
         match session_runtime::resolve_server_default_model(p.api, p.token).await {
             ServerDefaultModel::Selected(selection) => {
                 model_context_window = selection.context_window;
+                model_completion_limit = selection.max_completion_tokens;
                 p.offering_id = Some(selection.offering_id);
                 Some(selection.name)
             }
@@ -251,6 +253,7 @@ pub(crate) async fn stream_chat_sse(
             Ok(selection) => {
                 p.offering_id = Some(selection.offering_id);
                 model_context_window = selection.context_window;
+                model_completion_limit = selection.max_completion_tokens;
             }
             Err(error) => {
                 tracing::error!(
@@ -303,6 +306,11 @@ pub(crate) async fn stream_chat_sse(
             },
         });
     }
+    let local_context_budget = session_runtime::resolve_session_context_budget(
+        &astra_config::RuntimeConfig::load(),
+        model_context_window,
+        model_completion_limit,
+    );
     let effective_max_turn_input_tokens = RuntimeLimits::global()
         .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
     // This value governs CLI-owned preparation and recovery state only.  Do
@@ -706,6 +714,7 @@ pub(crate) async fn stream_chat_sse(
         model: p.model,
         offering_id: p.offering_id.clone(),
         context_window_tokens,
+        compaction_thresholds: local_context_budget.compaction_thresholds(),
         explain: p.explain,
         render_md: p.render_md,
         term_width,

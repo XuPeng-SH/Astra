@@ -263,6 +263,9 @@ pub struct AgentContext {
 /// ordinary per-turn prose.
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext {
+    /// Admitted tier policy; runtime assembly supplies the resolved budget's
+    /// thresholds together with its usable input and output reserves.
+    pub compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
     pub session_id: String,
     pub run_id: String,
     pub model_id: String,

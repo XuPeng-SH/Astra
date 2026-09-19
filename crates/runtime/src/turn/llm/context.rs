@@ -317,8 +317,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
-    pub context_window: Option<u32>,
-    pub max_completion_tokens: Option<u32>,
+    pub context_budget: &'a crate::prompts::ContextBudget,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
@@ -1461,14 +1460,9 @@ pub(crate) fn assemble_context_pipeline(
     };
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
-    // `SessionContext::model_limit` is different: it must be the concrete
-    // model context window used for section budgeting and pressure planning.
-    let window_policy = crate::prompts::budget_for_model_with_metadata(
-        Some(input.model_name),
-        input.context_window,
-        input.max_completion_tokens,
-    )
-    .window_policy();
+    // `SessionContext::model_limit` instead receives the resolved usable input
+    // limit, after output and summary reserves, for budgeting and pressure.
+    let window_policy = input.context_budget.window_policy();
     let model_context_limit =
         u64::try_from(window_policy.usable_input_limit_tokens).unwrap_or(u64::MAX);
     let session_current_date = resolve_pipeline_session_current_date(
@@ -1487,6 +1481,7 @@ pub(crate) fn assemble_context_pipeline(
         Some(cache_cap),
         &session_current_date,
         state.context_manifest_user_id.as_deref(),
+        input.context_budget.compaction_thresholds(),
     );
     session_ctx.pre_reserved_output_tokens =
         u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX);
@@ -2771,13 +2766,43 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
-            context_window: Some(1_000_000),
-            max_completion_tokens: Some(64_000),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(1_000_000),
+                Some(64_000),
+                0.6,
+                9,
+                4_000,
+                crate::prompts::CompactConfig {
+                    summary_token_budget: 3_000,
+                    ..Default::default()
+                },
+            ),
             cache_capability: Some(strict_history),
             user_content: "which model are you?",
             query_source: "test",
         })
         .expect("context pipeline should assemble");
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .reserved_output_tokens,
+            64_000
+        );
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .reserved_summary_tokens,
+            3_000
+        );
+        assert_eq!(
+            output
+                .manifest_trace
+                .context_window_policy
+                .auto_compact_trigger_tokens,
+            559_620
+        );
 
         let primary_text = output
             .system_messages
@@ -2936,8 +2961,14 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "gpt-4",
-            context_window: Some(200_000),
-            max_completion_tokens: Some(16_384),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability: None,
             user_content: "hello",
             query_source: "test",
@@ -3549,8 +3580,14 @@ mod context_cache_contract_tests {
                 cache_cfg: &cache_cfg,
                 provider: "openai",
                 model_name: "deepseek-v4-flash",
-                context_window: Some(200_000),
-                max_completion_tokens: Some(16_384),
+                context_budget: &crate::prompts::ContextBudget::resolve(
+                    Some(200_000),
+                    Some(16_384),
+                    0.75,
+                    6,
+                    8_000,
+                    crate::prompts::CompactConfig::default(),
+                ),
                 cache_capability: Some(strict_history),
                 user_content: "summarize it",
                 query_source: "test",

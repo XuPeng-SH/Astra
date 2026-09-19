@@ -13,7 +13,7 @@ use astra_services::{
 use astra_turn_core::thinking_config::ThinkingConfig;
 
 use crate::turn::llm::{
-    client::{LlmCall, LlmExecutionRoute, global_llm_client, llm_nonstream_timeout},
+    client::{LlmCall, LlmExecutionRoute, shared_llm_transport},
     durable::DurableInferenceLedger,
 };
 
@@ -82,12 +82,13 @@ impl RuntimeSkillifyAgentExecutor {
             json!({"role": "system", "content": system_prompt}),
             json!({"role": "user", "content": user_prompt}),
         ];
+        let transport = shared_llm_transport()?;
         let result = execution
             .ledger
             .execute_nonstream(
-                global_llm_client(),
                 scope,
                 LlmCall {
+                    transport: &transport,
                     purpose: astra_turn_types::InferencePurpose::SkillSynthesis,
                     messages: &messages,
                     tools: &[],
@@ -98,7 +99,7 @@ impl RuntimeSkillifyAgentExecutor {
                     has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 },
-                llm_nonstream_timeout(),
+                std::time::Duration::from_millis(transport.config().nonstream_timeout_ms),
             )
             .await
             .into_result()

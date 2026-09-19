@@ -4,23 +4,14 @@
 //! and [`crate::server::server_loop_host::ServerAgenticLoopHost`] can call LLMs
 //! without duplicating the retry/backoff/parsing logic.
 //!
-//! # Proxy invariant
-//!
-//! [`astra_core::net::apply_env_proxy`] is the **only** place in the codebase
-//! that honours `HTTPS_PROXY` / `ALL_PROXY` env vars. It is called from the
-//! LLM client here and from `validate_connectivity` in `astra-services`
-//! (both reach external provider endpoints). All other `reqwest` clients
-//! (durable bridge, skill HTTP, server tool executor, summary client, …)
-//! must call `.no_proxy()` — their traffic is local/intranet and should
-//! not be routed through a user's LLM proxy.
-//!
-//! Re-exported as [`apply_env_proxy`] for in-crate call sites.
+//! Provider proxy configuration is captured by the canonical `astra_core::net`
+//! owner. Every logical call carries the immutable transport that owns its client.
 
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::OnceLock,
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -158,14 +149,11 @@ pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// intentionally exhaust retries to assert error-surface behavior).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 
-pub(crate) fn llm_retry_base_ms() -> u64 {
-    static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *VAL.get_or_init(|| {
-        std::env::var("ASTRA_LLM_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(LLM_RETRY_BASE_MS)
-    })
+fn llm_retry_base_ms() -> u64 {
+    std::env::var("ASTRA_LLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LLM_RETRY_BASE_MS)
 }
 /// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
 /// TPM limits typically reset after 60 seconds, so we wait longer.
@@ -726,79 +714,110 @@ pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
     astra_turn_core::thinking_config::provider_may_think_natively(provider)
 }
 
-/// Global HTTP client for LLM requests (connection pooling, reuse).
-pub(crate) fn global_llm_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let connect = llm_connect_timeout();
-        // This client-level ceiling is only a transport backstop. Derive it
-        // from the same effective provider-attempt configuration so an
-        // operator override cannot be silently capped by the compiled 300s
-        // default. Per-request deadlines remain authoritative below.
-        let total = llm_total_budget().saturating_add(std::time::Duration::from_secs(60));
-        let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4usize);
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(connect)
-            // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(total)
-            .pool_max_idle_per_host(pool_idle);
-        // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
-        // does not auto-read system proxy, so we wire it up explicitly).
-        builder = apply_env_proxy(builder);
-        match builder.build()
-        {
-            Ok(client) => {
-                tracing::info!(
-                    target: "astra_runtime::llm_client",
-                    pool_max_idle_per_host = pool_idle,
-                    connect_timeout_s = connect.as_secs(),
-                    total_timeout_s = total.as_secs(),
-                    "global LLM HTTP client built"
-                );
-                client
-            }
-            Err(e) => {
-                // audit-C1: TLS / HTTP stack init failure should not crash the process.
-                // Retry with the same timeouts but without pool tuning so we still bound
-                // hung-upstream risk if this tier succeeds.
-                tracing::error!(
-                    target: "astra_runtime::llm_client",
-                    error = %e,
-                    "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
-                );
-                let mut fallback_builder = reqwest::Client::builder()
-                    .connect_timeout(connect)
-                    .timeout(total);
-                fallback_builder = apply_env_proxy(fallback_builder);
-                match fallback_builder.build() {
-                    Ok(client) => client,
-                    Err(e2) => {
-                        tracing::error!(
-                            target: "astra_runtime::llm_client",
-                            error = %e2,
-                            "failed to build minimal global LLM HTTP client; retrying with proxy-aware reqwest::Client::new() equivalent"
-                        );
-                        let mut last_chance_builder = reqwest::Client::builder();
-                        last_chance_builder = apply_env_proxy(last_chance_builder);
-                        match last_chance_builder.build() {
-                            Ok(client) => client,
-                            Err(e3) => {
-                                tracing::error!(
-                                    target: "astra_runtime::llm_client",
-                                    error = %e3,
-                                    "failed to build last-chance proxy-aware LLM HTTP client; using reqwest::Client::new()"
-                                );
-                                reqwest::Client::new()
-                            }
-                        }
-                    }
-                }
-            }
+/// The effective settings and the client built from them travel together.
+pub(crate) struct LlmTransport {
+    config: astra_turn_types::LlmTransportConfig,
+    proxy: astra_core::net::ResolvedProxyConfig,
+    client: reqwest::Client,
+    #[cfg(test)]
+    flat_retry_backoff_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for LlmTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmTransport")
+            .field("config", &self.config)
+            .field("proxy", &self.proxy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LlmTransport {
+    pub(crate) fn capture() -> Result<Self, String> {
+        Self::build(
+            capture_transport_config(),
+            astra_core::net::ResolvedProxyConfig::capture(),
+        )
+    }
+
+    pub(crate) fn build(
+        config: astra_turn_types::LlmTransportConfig,
+        proxy: astra_core::net::ResolvedProxyConfig,
+    ) -> Result<Self, String> {
+        if config.policy_version != astra_turn_types::LLM_TRANSPORT_POLICY_VERSION {
+            return Err("unsupported LLM transport policy version".into());
         }
-    })
+        if [
+            config.connect_timeout_ms,
+            config.nonstream_timeout_ms,
+            config.total_budget_ms,
+            config.introspection_budget_ms,
+            config.stream_idle_ms,
+            config.stream_idle_after_progress_ms,
+            config.semantic_progress_ms,
+        ]
+        .contains(&0)
+        {
+            return Err("LLM transport deadlines must be positive".into());
+        }
+        let client = proxy
+            .apply(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+                    .timeout(
+                        Duration::from_millis(config.total_budget_ms)
+                            .saturating_add(Duration::from_secs(60)),
+                    )
+                    .pool_max_idle_per_host(config.pool_max_idle_per_host),
+            )
+            .build()
+            .map_err(|_| "failed to build configured LLM transport".to_string())?;
+        Ok(Self {
+            config,
+            proxy,
+            client,
+            #[cfg(test)]
+            flat_retry_backoff_ms: TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow()),
+        })
+    }
+
+    pub(crate) fn config(&self) -> &astra_turn_types::LlmTransportConfig {
+        &self.config
+    }
+}
+
+pub(crate) fn shared_llm_transport() -> Result<Arc<LlmTransport>, String> {
+    static TRANSPORT: OnceLock<Result<Arc<LlmTransport>, String>> = OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| LlmTransport::capture().map(Arc::new))
+        .clone()
+}
+
+pub(crate) fn capture_transport_config() -> astra_turn_types::LlmTransportConfig {
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    astra_turn_types::LlmTransportConfig {
+        policy_version: astra_turn_types::LLM_TRANSPORT_POLICY_VERSION,
+        connect_timeout_ms: millis(llm_connect_timeout()),
+        nonstream_timeout_ms: millis(llm_nonstream_timeout()),
+        total_budget_ms: millis(llm_total_budget()),
+        introspection_budget_ms: millis(Duration::from_secs(llm_secs_from_env(
+            "ASTRA_INTROSPECTION_TOTAL_BUDGET_S",
+            8,
+        ))),
+        stream_idle_ms: millis(stream_idle_timeout()),
+        stream_idle_after_progress_ms: millis(stream_idle_timeout_after_progress()),
+        semantic_progress_ms: millis(llm_semantic_progress_timeout()),
+        retry_base_ms: llm_retry_base_ms(),
+        pool_max_idle_per_host: std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_llm_transport() -> LlmTransport {
+    LlmTransport::capture().expect("test LLM transport")
 }
 
 #[cfg(test)]
@@ -1102,6 +1121,7 @@ impl std::fmt::Debug for LlmExecutionRoute<'_> {
 
 /// Canonical runtime input for one logical model call.
 pub(crate) struct LlmCall<'a> {
+    pub transport: &'a LlmTransport,
     pub purpose: astra_turn_types::InferencePurpose,
     pub messages: &'a [Value],
     pub tools: &'a [Value],
@@ -1739,12 +1759,15 @@ thread_local! {
 
 /// Compute the between-attempts backoff in ms. `attempt` is 1-indexed (the
 /// first retry after the initial failure has attempt=1).
-fn retry_backoff_ms(attempt: u32) -> u64 {
+fn retry_backoff_ms(transport: &LlmTransport, attempt: u32) -> u64 {
     #[cfg(test)]
-    if let Some(ms) = TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
+    if let Some(ms) = transport.flat_retry_backoff_ms {
         return ms;
     }
-    llm_retry_base_ms() * (1 << (attempt - 1))
+    transport
+        .config
+        .retry_base_ms
+        .saturating_mul(1 << (attempt - 1))
 }
 
 /// Override the between-retry backoff to `ms` for the duration of a test.
@@ -1763,21 +1786,6 @@ pub(crate) fn set_test_retry_backoff_ms(ms: u64) -> impl Drop {
     }
     Guard
 }
-
-/// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
-///
-/// reqwest is built with `default-features = false`, so it does not auto-read
-/// the system proxy env vars. We wire them up explicitly here and honour
-/// `NO_PROXY` via `reqwest::NoProxy::from_env()`.
-///
-/// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
-/// `all_proxy`. For `HTTPS_PROXY`/`https_proxy` we register an HTTPS-scheme
-/// proxy; for `ALL_PROXY`/`all_proxy` we register an all-scheme proxy so that
-/// `socks5://` URLs (which only make sense as all-scheme) are honoured.
-pub(crate) use astra_core::net::apply_env_proxy;
-
-// Tests for `apply_env_proxy` live with its authoritative implementation in
-// `astra_core::net`. Do not duplicate them here.
 
 /// Resolve an LLM duration-in-seconds constant, consulting its env-var
 /// override and falling back to the compile-time default. Used by
@@ -4738,8 +4746,8 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice
     // around the durable invocation, which would lose terminal settlement.
     let total_budget = bounded_auxiliary_budget(
         call.purpose,
-        llm_total_budget(),
-        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
+        Duration::from_millis(call.transport.config.total_budget_ms),
+        Duration::from_millis(call.transport.config.introspection_budget_ms),
     );
     call_llm_and_collect_with_total_budget(
         call,
@@ -4784,13 +4792,14 @@ async fn call_llm_and_collect_with_stream_callback_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let budget = Duration::from_millis(call.transport.config.total_budget_ms);
     call_llm_and_collect_with_total_budget(
         call,
         cancel,
         stream_callback,
         attempt_observer,
         tool_choice,
-        llm_total_budget(),
+        budget,
     )
     .await
 }
@@ -4807,6 +4816,7 @@ async fn call_llm_and_collect_with_total_budget(
     let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
     let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
     let LlmCall {
+        transport,
         purpose,
         messages,
         tools,
@@ -4861,7 +4871,7 @@ async fn call_llm_and_collect_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
+    let client = &transport.client;
 
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
@@ -4941,8 +4951,8 @@ async fn call_llm_and_collect_with_total_budget(
     let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
     // parallel tests (and to ensure consistent timeouts across retries).
-    let idle_pre = stream_idle_timeout();
-    let idle_post = stream_idle_timeout_after_progress();
+    let idle_pre = Duration::from_millis(transport.config.stream_idle_ms);
+    let idle_post = Duration::from_millis(transport.config.stream_idle_after_progress_ms);
     let attach_partial_details =
         |error: astra_core::ClassifiedError,
          partial: &LlmCallResult|
@@ -4971,7 +4981,7 @@ async fn call_llm_and_collect_with_total_budget(
             // rate-limit response from sleeping in both places.
             let delay = retry_delay_override_ms
                 .take()
-                .unwrap_or_else(|| retry_backoff_ms(attempt));
+                .unwrap_or_else(|| retry_backoff_ms(transport, attempt));
             let remaining = total_budget.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Err(astra_core::ClassifiedError::new(
@@ -5207,6 +5217,7 @@ async fn call_llm_and_collect_with_total_budget(
                 match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
                     response,
                     model_name,
+                    &transport.config,
                     started,
                     total_budget,
                     cancel,
@@ -5443,6 +5454,7 @@ async fn call_llm_and_collect_with_total_budget(
                 collect_anthropic_llm_stream_for_wire(
                     byte_stream,
                     model_name,
+                    &transport.config,
                     started,
                     total_budget,
                     cancel,
@@ -5456,6 +5468,7 @@ async fn call_llm_and_collect_with_total_budget(
                 collect_llm_stream_for_wire(
                     byte_stream,
                     model_name,
+                    &transport.config,
                     started,
                     total_budget,
                     cancel,
@@ -5904,6 +5917,7 @@ async fn collect_llm_stream(
 async fn collect_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
+    transport_config: &astra_turn_types::LlmTransportConfig,
     started: Instant,
     provider_work_budget: std::time::Duration,
     cancel: LlmCancel<'_>,
@@ -5920,7 +5934,7 @@ async fn collect_llm_stream_for_wire(
         cancel,
         idle_pre,
         idle_post,
-        llm_semantic_progress_timeout(),
+        Duration::from_millis(transport_config.semantic_progress_ms),
         Some(authorized_tool_names),
         stream_callback,
     )
@@ -6558,6 +6572,7 @@ async fn collect_anthropic_llm_stream(
 async fn collect_anthropic_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
+    transport_config: &astra_turn_types::LlmTransportConfig,
     started: Instant,
     provider_work_budget: std::time::Duration,
     cancel: LlmCancel<'_>,
@@ -6574,7 +6589,7 @@ async fn collect_anthropic_llm_stream_for_wire(
         cancel,
         idle_pre,
         idle_post,
-        llm_semantic_progress_timeout(),
+        Duration::from_millis(transport_config.semantic_progress_ms),
         Some(authorized_tool_names),
         stream_callback,
     )
@@ -7169,12 +7184,10 @@ enum StreamCollectError {
 
 #[cfg(test)]
 pub(crate) async fn call_llm_nonstream(
-    client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     call_llm_nonstream_with_attempt_observer_and_tool_choice(
-        client,
         call,
         timeout,
         None,
@@ -7185,12 +7198,10 @@ pub(crate) async fn call_llm_nonstream(
 
 #[cfg(test)]
 pub(crate) async fn call_llm_nonstream_no_tool_choice(
-    client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     call_llm_nonstream_with_attempt_observer_and_tool_choice(
-        client,
         call,
         timeout,
         None,
@@ -7200,13 +7211,11 @@ pub(crate) async fn call_llm_nonstream_no_tool_choice(
 }
 
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
-    client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     call_llm_nonstream_with_attempt_observer_and_tool_choice(
-        client,
         call,
         timeout,
         attempt_observer,
@@ -7216,15 +7225,16 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
 }
 
 async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
-    client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let client = &call.transport.client;
     let logical_timeout = timeout;
     let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
     let LlmCall {
+        transport: _,
         purpose,
         messages,
         tools,
@@ -8069,6 +8079,7 @@ mod tests {
                     request_timeout: None,
                 };
                 let call = LlmCall {
+                    transport: &test_llm_transport(),
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &[json!({"role":"user","content":"hello"})],
                     tools: &[],
@@ -8089,13 +8100,9 @@ mod tests {
                     .await
                     .unwrap();
                 } else {
-                    call_llm_nonstream(
-                        global_llm_client(),
-                        call,
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
-                    .unwrap();
+                    call_llm_nonstream(call, std::time::Duration::from_secs(10))
+                        .await
+                        .unwrap();
                 }
                 let body = captured.lock().unwrap().last().unwrap().clone();
                 assert_eq!(body["model"], "upstream-fixture");
@@ -8147,6 +8154,7 @@ mod tests {
                     request_timeout: None,
                 };
                 let call = LlmCall {
+                    transport: &test_llm_transport(),
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &[],
                     tools: &[],
@@ -8166,12 +8174,7 @@ mod tests {
                     )
                     .await
                 } else {
-                    call_llm_nonstream(
-                        global_llm_client(),
-                        call,
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
+                    call_llm_nonstream(call, std::time::Duration::from_secs(10)).await
                 };
                 assert!(result.unwrap_err().message.contains("finite non-negative"));
             }
@@ -8223,6 +8226,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let call = LlmCall {
+            transport: &test_llm_transport(),
             purpose: astra_turn_types::InferencePurpose::Introspection,
             messages: &[json!({"role":"user","content":"hello"})],
             tools: &[],
@@ -8303,6 +8307,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"hello"})];
         for streaming in [false, true] {
             let call = LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8328,12 +8333,7 @@ mod tests {
             let result = if streaming {
                 call_llm_and_collect(call, LlmCancel::None).await
             } else {
-                call_llm_nonstream(
-                    global_llm_client(),
-                    call,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
+                call_llm_nonstream(call, std::time::Duration::from_secs(10)).await
             };
             let error = result.expect_err("private endpoint must fail before network I/O");
             assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
@@ -8514,6 +8514,28 @@ mod tests {
     // ── Timeout configuration tests ─────────────────────────────────────────
 
     #[test]
+    fn captured_transport_keeps_deadlines_after_ambient_override_changes() {
+        let transport = {
+            let _guard = set_test_stream_timeouts(123, Some(456));
+            test_llm_transport()
+        };
+        let _changed = set_test_stream_timeouts(789, Some(987));
+        assert_eq!(transport.config().stream_idle_ms, 123);
+        assert_eq!(transport.config().stream_idle_after_progress_ms, 456);
+        assert_eq!(capture_transport_config().stream_idle_ms, 789);
+        let serialized = serde_json::to_value(transport.config()).unwrap();
+        let config =
+            serde_json::from_value::<astra_turn_types::LlmTransportConfig>(serialized).unwrap();
+        assert_eq!(&config, transport.config());
+        let mut unsupported = config;
+        unsupported.policy_version += 1;
+        assert!(
+            LlmTransport::build(unsupported, astra_core::net::ResolvedProxyConfig::capture())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn connect_timeout_default_is_30s() {
         // Ensure no env override interferes.
         let dur = llm_connect_timeout();
@@ -8553,9 +8575,14 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let observer = RecordingAttemptObserver::default();
+        let mut config = capture_transport_config();
+        config.total_budget_ms = 30;
+        let transport =
+            LlmTransport::build(config, astra_core::net::ResolvedProxyConfig::capture()).unwrap();
         let started = Instant::now();
-        let error = call_llm_and_collect_with_total_budget(
+        let error = call_llm_and_collect_with_stream_callback(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8581,8 +8608,6 @@ mod tests {
             LlmCancel::None,
             None,
             Some(&observer),
-            RuntimeToolChoice::Auto,
-            std::time::Duration::from_millis(30),
         )
         .await
         .expect_err("one provider request must not outlive the total LLM budget");
@@ -8602,6 +8627,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8669,6 +8695,7 @@ mod tests {
 
         let result = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8729,6 +8756,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8788,6 +8816,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8864,8 +8893,10 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let observer = RecordingAttemptObserver::default();
         let cancel = CancellationToken::new();
+        let transport = test_llm_transport();
         let call = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8933,8 +8964,10 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let observer = RecordingAttemptObserver::default();
         let cancel = CancellationToken::new();
+        let transport = test_llm_transport();
         let call = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -8999,8 +9032,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let observer = RecordingAttemptObserver::default();
         let started = Instant::now();
+        let transport = test_llm_transport();
         let call = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -9072,8 +9107,10 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let cancel = CancellationToken::new();
+        let transport = test_llm_transport();
         let call = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -9137,8 +9174,10 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let observer = PendingAttemptObserver::default();
         let cancel = CancellationToken::new();
+        let transport = test_llm_transport();
         let cancelled = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -9183,6 +9222,7 @@ mod tests {
         let budget_observer = PendingAttemptObserver::default();
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &transport,
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -9231,6 +9271,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -9288,16 +9329,12 @@ mod tests {
             }),
         );
         let base = spawn_local_http_server(app).await;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("build client");
         // Use a very short timeout — should fail before the 5s delay completes.
         let timeout = std::time::Duration::from_millis(100);
         let observer = RecordingAttemptObserver::default();
         let result = call_llm_nonstream_with_attempt_observer(
-            &client,
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"x"})],
                 tools: &[],
@@ -9390,6 +9427,7 @@ mod tests {
 
         let result = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
@@ -9463,6 +9501,7 @@ mod tests {
 
         let result = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -10048,18 +10087,23 @@ mod tests {
         assert!(!text_has_actionable_content(" \n\t"));
         assert!(text_has_actionable_content(" answer "));
 
+        let mut config = capture_transport_config();
+        config.semantic_progress_ms = 20;
+        let authorized = HashSet::new();
         let openai = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
             "data: {\"choices\":[{\"delta\":{\"content\":\" \\n\\t\"}}]}\n\n",
         ))])
         .chain(stream::pending());
-        let openai_error = collect_llm_stream_with_semantic_progress_deadline(
+        let openai_error = collect_llm_stream_for_wire(
             openai,
             "test-model",
+            &config,
             Instant::now(),
+            std::time::Duration::from_secs(1),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(20),
+            &authorized,
             None,
         )
         .await
@@ -10073,14 +10117,16 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\n\\t\"}}\n\n",
         ))])
         .chain(stream::pending());
-        let anthropic_error = collect_anthropic_llm_stream_with_semantic_progress_deadline(
+        let anthropic_error = collect_anthropic_llm_stream_for_wire(
             anthropic,
             "test-model",
+            &config,
             Instant::now(),
+            std::time::Duration::from_secs(1),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(20),
+            &authorized,
             None,
         )
         .await
@@ -11042,6 +11088,7 @@ mod tests {
         let result = collect_llm_stream_for_wire(
             stream::iter(vec![Ok(Bytes::from(body.clone()))]),
             "deepseek-test",
+            &capture_transport_config(),
             Instant::now(),
             llm_total_budget(),
             LlmCancel::None,
@@ -11059,6 +11106,7 @@ mod tests {
         let result = collect_llm_stream_for_wire(
             stream::iter(vec![Ok(Bytes::from(body))]),
             "deepseek-test",
+            &capture_transport_config(),
             Instant::now(),
             llm_total_budget(),
             LlmCancel::None,
@@ -11552,6 +11600,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -11610,6 +11659,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_total_budget(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
@@ -12206,6 +12256,7 @@ mod tests {
         for tools in [&tools_first[..], &tools_second[..]] {
             call_llm_and_collect_with_stream_callback(
                 LlmCall {
+                    transport: &test_llm_transport(),
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools,
@@ -13838,6 +13889,7 @@ mod tests {
         let observer = RecordingAttemptObserver::default();
         let res = call_llm_and_collect_with_stream_callback(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -13900,6 +13952,7 @@ mod tests {
 
         let error = call_llm_and_collect_with_stream_callback(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -13948,6 +14001,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             call_llm_and_collect(
                 LlmCall {
+                    transport: &test_llm_transport(),
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
@@ -13993,6 +14047,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14035,6 +14090,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14080,6 +14136,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             call_llm_and_collect(
                 LlmCall {
+                    transport: &test_llm_transport(),
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
@@ -14155,6 +14212,7 @@ mod tests {
         // First call: finish_reason=length
         let res1 = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14187,6 +14245,7 @@ mod tests {
         // Second call (escalated): finish_reason=stop
         let res2 = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14240,6 +14299,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14307,6 +14367,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14356,6 +14417,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14409,6 +14471,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14456,6 +14519,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let err = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14503,6 +14567,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"hello"})];
         for streaming in [false, true] {
             let call = LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14530,7 +14595,7 @@ mod tests {
                     .await
                     .unwrap_err()
             } else {
-                call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                call_llm_nonstream(call, std::time::Duration::from_secs(5))
                     .await
                     .unwrap_err()
             };
@@ -14632,6 +14697,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14677,6 +14743,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -14802,6 +14869,7 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
         let err = call_llm_and_collect(
             LlmCall {
+                transport: &test_llm_transport(),
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
@@ -16597,13 +16665,6 @@ mod tests {
         assert!(!log_line.contains("sk-abc12345"));
         assert!(log_line.contains("[REDACTED]"));
     }
-
-    /// audit-C1: global_llm_client must not use .expect() — a TLS backend
-    /// failure should not crash the entire process.
-
-    /// Regression: external LLM traffic must keep honoring env proxy policy even
-    /// on fallback builds; silently downgrading to `.no_proxy()` makes
-    /// region-gated upstreams flap between working and unsupported-region 400s.
 
     /// P1-E: llm_client must NOT define its own rate_limit_cooldown singleton.
     /// There must be exactly one PerModelCooldown singleton shared across all

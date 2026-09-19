@@ -25,7 +25,6 @@ use astra_runtime::{
     turn::chat_turn_api_error::{
         CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
     },
-    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_input_budget,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS,
@@ -290,6 +289,7 @@ struct PrepareChatTurnRequest<'a> {
     model: Option<&'a str>,
     context_window_tokens: u32,
     effective_input_budget_tokens: u64,
+    compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
     explain: AgenticChatExplainFlags,
     project_root: &'a Path,
     message: &'a str,
@@ -467,13 +467,29 @@ fn chat_turn_budget_pressure(
     messages: &[Value],
     registry: &ToolRegistry,
     effective_input_budget_tokens: u64,
+    compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
 ) -> f64 {
     let schema_tokens = registry.total_always_load_token_cost();
-    budget_pressure_for_chat_turn_with_input_budget(
-        messages,
-        schema_tokens as usize,
-        effective_input_budget_tokens,
-    )
+    let estimated = prompts::estimate_tokens(messages, schema_tokens as usize, 0);
+    // This is the CLI's already-net preparation limit, not the Server's raw
+    // model window. Classify it directly with the shared pipeline selector;
+    // resolving a ContextBudget here would deduct reserves a second time.
+    let pressure = if effective_input_budget_tokens == 0 {
+        f64::INFINITY
+    } else {
+        estimated as f64 / effective_input_budget_tokens as f64
+    };
+    let relative =
+        astra_turn_core::context_budget::select_compaction_tier(pressure, compaction_thresholds)
+            .budget_pressure();
+    // Preserve the absolute latency floors for large local preparation loads.
+    let absolute: f64 = match estimated {
+        320_000.. => 0.9,
+        200_000.. => 0.6,
+        128_000.. => 0.3,
+        _ => 0.0,
+    };
+    relative.max(absolute)
 }
 
 struct PreparedChatTurnPayload {
@@ -814,6 +830,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         &prompt_messages,
         ctx.registry,
         ctx.effective_input_budget_tokens,
+        ctx.compaction_thresholds,
     );
 
     let memory_retrieval_decision =
@@ -1420,6 +1437,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub model: Option<&'a str>,
     pub context_window_tokens: u32,
     pub effective_input_budget_tokens: u64,
+    pub compaction_thresholds: astra_turn_types::context_execution::CompactionThresholds,
     pub explain: ExplainMode,
     pub render_md: bool,
     pub term_width: usize,
@@ -1671,6 +1689,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         model,
         context_window_tokens,
         effective_input_budget_tokens,
+        compaction_thresholds,
         explain,
         render_md,
         term_width,
@@ -1775,6 +1794,7 @@ pub(crate) async fn fetch_chat_turn_sse(
                 model,
                 context_window_tokens,
                 effective_input_budget_tokens,
+                compaction_thresholds,
                 explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
                     ExplainMode::Off => AgenticExplainUiMode::Off,
                     ExplainMode::On => AgenticExplainUiMode::On,
@@ -2216,6 +2236,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message,
@@ -2410,6 +2431,7 @@ mod tests {
                 model: None,
                 context_window_tokens: 200_000,
                 effective_input_budget_tokens: 200_000,
+                compaction_thresholds: Default::default(),
                 explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
                 project_root: temp_dir.path(),
                 message: "continue",
@@ -2567,10 +2589,7 @@ mod tests {
 
     #[test]
     fn chat_turn_budget_pressure_uses_effective_input_budget_for_large_context_models() {
-        use astra_runtime::{
-            tool_registry::ToolRegistry,
-            turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_context_window,
-        };
+        use astra_runtime::tool_registry::ToolRegistry;
 
         let mut registry = ToolRegistry::new(Vec::new());
         let large_description = "x".repeat(360_000);
@@ -2581,9 +2600,10 @@ mod tests {
         let messages: Vec<Value> = Vec::new();
         let schema_tokens = registry.total_always_load_token_cost() as usize;
 
-        let effective_budget_pressure = chat_turn_budget_pressure(&messages, &registry, 100_000);
+        let effective_budget_pressure =
+            chat_turn_budget_pressure(&messages, &registry, 100_000, Default::default());
         let raw_context_window_pressure =
-            budget_pressure_for_chat_turn_with_context_window(&messages, schema_tokens, 800_000);
+            chat_turn_budget_pressure(&messages, &registry, 800_000, Default::default());
 
         assert!(
             effective_budget_pressure >= 0.6,
@@ -2596,6 +2616,62 @@ mod tests {
         assert!(
             effective_budget_pressure > raw_context_window_pressure,
             "turn preparation must be governed by effective input budget, not raw context window"
+        );
+    }
+
+    #[test]
+    fn chat_turn_budget_pressure_does_not_reserve_against_a_net_limit() {
+        use astra_runtime::tool_registry::ToolRegistry;
+        let mut registry = ToolRegistry::new(Vec::new());
+        registry.inject_schema_always_load(
+            schema_with_description("large_always_load", &"x".repeat(22_000)),
+            true,
+        );
+        let estimate = astra_runtime::prompts::estimate_tokens(
+            &[],
+            registry.total_always_load_token_cost() as usize,
+            0,
+        );
+        // Keep the fixture below the absolute latency floor. Derive net limits
+        // from its measured size instead of assuming a tokenizer density.
+        assert!(estimate > 100 && estimate < 128_000);
+        let net_limit_at = |percent: u64| (estimate as u64 * 100).div_ceil(percent);
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, net_limit_at(55), Default::default()),
+            0.0
+        );
+        let mut runtime = astra_config::RuntimeConfig::default();
+        runtime.compression.compression_threshold = 0.6;
+        let thresholds = crate::cli::session::session_runtime::resolve_session_context_budget(
+            &runtime,
+            Some(800_000),
+            Some(32_000),
+        )
+        .compaction_thresholds();
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, net_limit_at(55), thresholds),
+            0.3
+        );
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, net_limit_at(65), Default::default()),
+            0.3
+        );
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, net_limit_at(80), Default::default()),
+            0.6
+        );
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, net_limit_at(92), Default::default()),
+            0.9
+        );
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &registry, 0, Default::default()),
+            0.9
+        );
+        assert_eq!(
+            chat_turn_budget_pressure(&[], &ToolRegistry::new(Vec::new()), 0, Default::default()),
+            // Empty history still includes system-prompt and framing tokens.
+            0.9
         );
     }
 
@@ -3171,6 +3247,7 @@ mod tests {
             model: Some("qwen3.7-max"),
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
@@ -3352,6 +3429,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
@@ -3501,6 +3579,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
@@ -3628,6 +3707,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
@@ -3723,6 +3803,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repository",
@@ -3845,6 +3926,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "run make check",
@@ -3997,6 +4079,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message,
@@ -4156,6 +4239,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "implement the approved plan",
@@ -4287,6 +4371,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "remember this",
@@ -4414,6 +4499,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "no deferred tools",
@@ -4524,6 +4610,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "delegate review with parallel agents",
@@ -4642,6 +4729,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fan out this work",
@@ -4756,6 +4844,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
@@ -4827,6 +4916,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
@@ -4934,6 +5024,7 @@ mod tests {
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
+            compaction_thresholds: Default::default(),
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fix the bug",

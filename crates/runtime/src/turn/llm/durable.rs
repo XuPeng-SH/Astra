@@ -3122,7 +3122,6 @@ impl DurableInferenceLedger {
 
     pub(crate) async fn execute_nonstream(
         &self,
-        client: &reqwest::Client,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
         timeout: std::time::Duration,
@@ -3151,7 +3150,6 @@ impl DurableInferenceLedger {
             let attempt_observer = invocation.attempt_observer_arc();
             let settlement = NonstreamInvocationSupervisor::start(Arc::new(invocation));
             let provider = crate::turn::llm::client::call_llm_nonstream_with_attempt_observer(
-                client,
                 call,
                 timeout,
                 Some(attempt_observer.as_ref()),
@@ -4727,8 +4725,13 @@ mod tests {
         }
     }
 
-    fn test_call<'a>(base_url: &'a str, messages: &'a [serde_json::Value]) -> LlmCall<'a> {
+    fn test_call<'a>(
+        transport: &'a crate::turn::llm::client::LlmTransport,
+        base_url: &'a str,
+        messages: &'a [serde_json::Value],
+    ) -> LlmCall<'a> {
         LlmCall {
+            transport,
             purpose: astra_turn_types::InferencePurpose::SubAgent,
             messages,
             tools: &[],
@@ -4781,17 +4784,16 @@ mod tests {
         let base = spawn_test_server(app).await;
         let (ledger, persistence) = test_ledger(&base);
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
         let started = std::time::Instant::now();
 
         let error = ledger
             .execute_nonstream(
-                &client,
                 test_scope("nonstream_timeout"),
-                test_call(&base, &messages),
+                test_call(
+                    &crate::turn::llm::client::test_llm_transport(),
+                    &base,
+                    &messages,
+                ),
                 std::time::Duration::from_millis(30),
             )
             .await
@@ -4827,15 +4829,14 @@ mod tests {
         let (ledger, persistence) = test_ledger(&base);
         let caller = tokio::spawn(async move {
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
             ledger
                 .execute_nonstream(
-                    &client,
                     test_scope("nonstream_caller_drop"),
-                    test_call(&base, &messages),
+                    test_call(
+                        &crate::turn::llm::client::test_llm_transport(),
+                        &base,
+                        &messages,
+                    ),
                     std::time::Duration::from_secs(30),
                 )
                 .await
@@ -4890,7 +4891,11 @@ mod tests {
         let error = ledger
             .execute_stream_with_total_budget_for_test(
                 test_scope("stream_timeout"),
-                test_call(&base, &messages),
+                test_call(
+                    &crate::turn::llm::client::test_llm_transport(),
+                    &base,
+                    &messages,
+                ),
                 std::time::Duration::from_millis(40),
             )
             .await
@@ -4923,16 +4928,15 @@ mod tests {
         let persistence = Arc::new(DelayedTrackedTerminalPersistence::default());
         let ledger = test_ledger_with_persistence(&base, persistence.clone());
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
 
         let error = ledger
             .execute_nonstream(
-                &client,
                 test_scope("nonstream_ledger_timeout"),
-                test_call(&base, &messages),
+                test_call(
+                    &crate::turn::llm::client::test_llm_transport(),
+                    &base,
+                    &messages,
+                ),
                 std::time::Duration::from_millis(100),
             )
             .await
@@ -6475,20 +6479,19 @@ mod tests {
             let mut ledger = test_ledger_with_persistence(&base, persistence.clone());
             ledger.settlement_coordinator = coordinator.clone();
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
 
             let result = ledger
                 .execute_nonstream(
-                    &client,
                     test_scope(if commit_before_ack_loss {
                         "logical_commit_ack_lost"
                     } else {
                         "logical_rollback_ack_lost"
                     }),
-                    test_call(&base, &messages),
+                    test_call(
+                        &crate::turn::llm::client::test_llm_transport(),
+                        &base,
+                        &messages,
+                    ),
                     std::time::Duration::from_secs(1),
                 )
                 .await

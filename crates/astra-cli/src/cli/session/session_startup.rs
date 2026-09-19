@@ -796,12 +796,11 @@ pub(crate) async fn complete_session_startup(
         } else {
             match session_runtime::resolve_server_default_model(api, token).await {
                 session_runtime::ServerDefaultModel::Selected(selection) => {
-                    state.context_budget =
-                        astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
-                            &state.runtime_config,
-                            Some(&selection.name),
-                            selection.context_window,
-                        );
+                    state.context_budget = session_runtime::resolve_session_context_budget(
+                        &state.runtime_config,
+                        selection.context_window,
+                        selection.max_completion_tokens,
+                    );
                     crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
                         selection.offering_id,
                     ));
