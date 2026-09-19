@@ -89,6 +89,24 @@ as successful completion or bypass provider and permission boundaries.
 
 ### Execution failures and task resolution
 
+Semantic request classification distinguishes valid decisions, unresolved
+necessary facts, conflicting facts, malformed responses, and provider failures.
+A successful provider invocation is not proof of a usable admission decision.
+Uncertainty retains bounded field evidence and may receive one clarification
+on the explicitly configured judgment Offering within the existing admission
+deadline. This per-turn budget is not reset by trusted skill loading. The
+complete clarification must satisfy the same confidence and dependency rules
+and preserve already determined necessary facts; partial evidence is never
+merged into execution authority. No implicit main-model fallback is permitted.
+
+Unavailable classification blocks dependent parallel creation, not unrelated
+tools that the runtime can independently admit. Its rejection carries the
+typed cause, semantic evidence when available, and clarification state. A
+valid negative topology decision remains distinct from unavailable authority.
+Diagnostics must not claim that no work happened earlier in the turn merely
+because the current dependent call was rejected. Raw classification payloads
+remain opt-in debug material rather than ordinary lifecycle facts.
+
 Tool results retain their source status, exit semantics, output, and invocation
 identity. Classification uses supported evidence; an unknown cause stays unknown.
 The Agent interprets the impact on the user's task. A later unrelated success

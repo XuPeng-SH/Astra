@@ -45,7 +45,11 @@ fixed true/uncertain IDs and Jev returns native probabilities. The CLI returns
 normalized answers and their provenance. The harness requires one confident
 rubric category (fully yes, substantially yes, partial, or no), then maps it to
 1.0, 0.7, 0.4, or 0.0. Probabilities are never scores; uncertain, conflicting,
-and malformed judgments fail without format repair. Criterion thresholds and
+and malformed judgments fail without format repair. Rubric wire IDs are
+descriptive strings (`rubric_fully_yes`, `rubric_substantially_yes`,
+`rubric_partial`, `rubric_no`), not numeric indices. Sparse chat answers contain
+only `true` and `uncertain`; false answers are omitted. Numeric IDs and an extra
+`false` field remain invalid, not coerced. Criterion thresholds and
 quorum aggregation remain unchanged. Each judgment and quorum vote creates its own
 session; its real usage is separate from the measured agent session. The CLI
 closes the evaluation session after a completed response or client-error rejection.

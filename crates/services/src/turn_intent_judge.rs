@@ -80,6 +80,18 @@ pub enum TurnIntentJudgeError {
     #[error("LLM returned malformed response ({detail}): {raw}")]
     Malformed { raw: String, detail: String },
 
+    /// Valid classification evidence abstained on necessary control fields.
+    /// Only this class is eligible for one same-Offering clarification.
+    #[error("work classification uncertain: {fields:?}", fields = .diagnostics.uncertain_fields)]
+    Uncertain {
+        diagnostics: Box<crate::work_admission_judgment::WorkAdmissionUncertainty>,
+    },
+
+    /// Valid wire data violates a semantic invariant or a clarification lock.
+    /// A conflict must not be retried as ordinary uncertainty.
+    #[error("work classification conflict ({detail}): {fields:?}")]
+    Conflicting { fields: Vec<String>, detail: String },
+
     /// The judge is configured but the model was rejected (e.g. moderation
     /// flag, unsupported region). Caller should log and continue without
     /// explicit turn intent.

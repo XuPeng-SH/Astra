@@ -145,6 +145,23 @@ pub(crate) async fn judge_turn_intent_with_llm(
             // parser). Rejections are the model refusing to answer and are
             // expected to be rare but non-fatal.
             match &error {
+                TurnIntentJudgeError::Uncertain { diagnostics } => tracing::info!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    status = "uncertain",
+                    duration_ms,
+                    diagnostics = ?diagnostics,
+                    "turn intent is semantically unresolved; no explicit intent granted"
+                ),
+                TurnIntentJudgeError::Conflicting { fields, detail } => tracing::warn!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    status = "conflicting",
+                    duration_ms,
+                    fields = ?fields,
+                    detail = %detail,
+                    "turn intent contains conflicting semantic decisions"
+                ),
                 TurnIntentJudgeError::Inference(detail) => tracing::warn!(
                     target: "astra::turn_intent",
                     operation = "turn_intent.judge",

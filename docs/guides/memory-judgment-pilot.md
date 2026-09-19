@@ -84,6 +84,29 @@ planning, ending when the background task actually finishes. A separate
 for the result. Delayed consumption is not added to judgment duration, and
 pending work is not reported as unavailable. Cancellation closes the live span.
 
+Semantic uncertainty is not a malformed provider response. Request admission
+retains bounded question-level evidence separately from provider transport
+success. A valid probability in the abstention band does not authorize an
+action; the confidence thresholds and required-field dependencies remain the
+same for native probabilistic and ordinary chat judgments.
+
+An unresolved semantic classification may receive at most one clarification
+on the already selected judgment Offering during a turn. This is not a main
+model fallback. Clarification shares the admission deadline, cancellation and
+usage owner; loading another skill does not refill its budget. It must return
+a complete valid classification and preserve previously determined necessary
+answers, including negative answers. Malformed responses and infrastructure
+failures do not start semantic clarification. Work graph generation and its
+existing repair remain separate from this classification recovery.
+
+If classification remains unresolved, dependent parallel calls stay rejected.
+Their structured diagnostic distinguishes uncertainty from a valid decision
+against parallelism and identifies whether clarification was attempted. An
+in-turn non-retryable rejection does not mean that a new user turn or changed
+context can never be reassessed. Ordinary independently admitted primary tools
+retain their existing degradation behavior. Raw prompts and provider responses
+are not added to normal diagnostics.
+
 ## Skill selection and inference cost
 
 Skill selection sends one batch containing the visible catalog and the user's

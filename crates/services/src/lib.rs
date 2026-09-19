@@ -429,7 +429,9 @@ pub use workspace_records::{
 };
 
 pub use work_admission_judgment::{
-    WorkAdmissionClassification, parse_work_admission_classification,
+    WorkAdmissionClassification, WorkAdmissionFieldEvidence, WorkAdmissionTruth,
+    WorkAdmissionUncertainty, parse_work_admission_clarification,
+    parse_work_admission_classification, work_admission_clarification_request,
     work_admission_classification_messages, work_admission_classification_request,
     work_admission_plan_messages,
 };
