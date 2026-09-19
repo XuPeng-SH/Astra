@@ -5969,7 +5969,7 @@ async fn hook_db_multiple_tools_selected() {
 
 #[tokio::test]
 async fn mock_llm_tool_flow_scenario_matrix() {
-    let cases = vec![
+    let cases = [
         MockToolScenario {
             name: "text_only",
             message: "hello".to_string(),
