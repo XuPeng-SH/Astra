@@ -630,9 +630,13 @@ pub async fn run(
         }
         Command::Model(ModelCmd::List) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = session_runtime::load_server_model_catalog_json(&api, &token)
-                .await
-                .map_err(|error| error.to_string())?;
+            let body = session_runtime::load_server_model_catalog_json(
+                &api,
+                &token,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::All,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         }

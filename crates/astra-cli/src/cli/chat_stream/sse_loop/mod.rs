@@ -246,7 +246,13 @@ pub(crate) async fn stream_chat_sse(
     };
     p.model = Some(selected_model);
     if model_context_window.is_none() {
-        match session_runtime::resolve_server_model_selection(p.api, p.token, selected_model).await
+        match session_runtime::resolve_server_model_selection(
+            p.api,
+            p.token,
+            selected_model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
         {
             Ok(selection) => {
                 p.offering_id = Some(selection.offering_id);

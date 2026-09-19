@@ -107,6 +107,11 @@ pub(super) async fn completions_handler(
         None
     };
     let provider_timeout = completion_timeout(request.timeout_ms)?;
+    let purpose = if typed_judgment.is_some() {
+        astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment
+    } else {
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+    };
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
     // as durable chat runs; omission invokes the Server-owned default policy.
@@ -116,6 +121,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            purpose,
             &user.user_id,
             &selection,
             None,
@@ -171,6 +177,8 @@ pub(super) async fn completions_handler(
             .admit_model_offering(user.user_id.clone(), offering_id)
             .await?
     };
+
+    astra_services::models::validate_model_execution_purpose(&admitted, purpose)?;
 
     // Typed responses are batched judgments. Their requested output size is a
     // minimum wire budget, so an Offering with a smaller catalog limit must be

@@ -223,7 +223,12 @@ pub(super) async fn run(
         .filter(|n| *n <= u64::from(u32::MAX))
         .ok_or("Comparison exceeds the inference coordinate range.")?;
     let catalog: Value = serde_json::from_str(
-        &super::session_runtime::load_server_model_catalog_json(api, token).await?,
+        &super::session_runtime::load_server_model_catalog_json(
+            api,
+            token,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
+        )
+        .await?,
     )
     .map_err(|e| e.to_string())?;
     let items = catalog["items"]
@@ -425,7 +430,7 @@ mod tests {
         };
         let server = MockServer::start().await;
         let item = |id: &str, provider: &str| json!({"offering_id":id,"access_id":format!("access-{id}"),"access_kind":"self_hosted","access_label":"test","execution_placement":"server","name":id,"provider":provider,"description":null,"is_active":true,"context_window":64000,"max_completion_tokens":512,"architecture":null,"thinking_capability":null});
-        Mock::given(method("GET")).and(path("/models")).and(header("authorization", "Bearer sentinel-token"))
+        Mock::given(method("GET")).and(path("/models")).and(header("authorization", "Bearer sentinel-token")).and(wiremock::matchers::query_param("purpose", "typed_judgment"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[item("offer-baseline","openai"),item("offer-jev","typesafe")],"total":2,"limit":200,"next_cursor":null,"catalog_revision":"test-revision"})))
             .expect(2).mount(&server).await;
         Mock::given(method("POST"))

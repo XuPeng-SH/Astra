@@ -6,6 +6,25 @@ use astra_thin_client::{
 use astra_turn_types::{JudgmentRequest, judgment_messages, normalize_judgment_response};
 use serde_json::{Value, json};
 
+/// The command's model selector uses the same catalog resolver as chat, with
+/// the typed judgment purpose retained on every catalog page.
+pub(crate) async fn execute_for_model(
+    api: &ThinClient,
+    token: &str,
+    model: &str,
+    message: &str,
+    timeout_seconds: u64,
+) -> Result<Value, String> {
+    let selection = super::session::session_runtime::resolve_server_model_selection(
+        api,
+        token,
+        model,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
+    )
+    .await?;
+    Ok(execute(api, token, &selection.offering_id, message, timeout_seconds).await)
+}
+
 pub(crate) async fn execute(
     api: &ThinClient,
     token: &str,
@@ -147,6 +166,42 @@ mod tests {
     };
 
     const SESSION: &str = "6bca9f9c-6d18-4579-bce1-2b45f573a098";
+
+    #[tokio::test]
+    async fn session_judge_resolves_typesafe_through_typed_catalog_before_execution() {
+        let server = session_server(completion_with_finish_reason("stop"), Some(200)).await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(wiremock::matchers::query_param("purpose", "typed_judgment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"offering_id":"offering-1","access_id":"self-hosted",
+                    "access_kind":"self_hosted","access_label":"Self-hosted",
+                    "execution_placement":"server","name":"jev","provider":"typesafe",
+                    "description":null,"is_active":true,"context_window":64000,
+                    "max_completion_tokens":512,"architecture":null,"thinking_capability":null}],
+                "total":1,"limit":50,"next_cursor":null,"catalog_revision":"judgment-only"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let result = execute_for_model(&api, "test-token", "jev", &judgment_input(), 37)
+            .await
+            .expect("CLI judge model selection");
+        assert_eq!(result["ok"], true, "{result}");
+        let requests = server.received_requests().await.unwrap();
+        let completion = requests
+            .iter()
+            .find(|request| request.url.path() == "/v1/chat/completions")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&completion.body).unwrap();
+        assert_eq!(body["model_selection"]["offering_id"], "offering-1");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.path() == "/chat/stream")
+        );
+    }
 
     async fn session_server(completion: ResponseTemplate, close_status: Option<u16>) -> MockServer {
         let server = MockServer::start().await;

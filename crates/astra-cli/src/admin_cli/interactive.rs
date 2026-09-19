@@ -285,9 +285,13 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             Ok(())
         } else if line.eq("model list") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let body = session_runtime::load_server_model_catalog_json(api, &token)
-                .await
-                .map_err(|error| error.to_string())?;
+            let body = session_runtime::load_server_model_catalog_json(
+                api,
+                &token,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::All,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         } else if let Some(model_name) = line.strip_prefix("model check ") {

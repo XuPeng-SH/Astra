@@ -10261,6 +10261,11 @@ impl ServerAgenticLoopHost {
             .await
             .map_err(|error| error.to_string())?
         };
+        astra_services::models::validate_model_execution_purpose(
+            &execution,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        )
+        .map_err(|(_, body)| body.0.detail)?;
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
         Ok(())

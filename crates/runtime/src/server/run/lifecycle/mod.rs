@@ -9928,7 +9928,10 @@ impl AgenticRunLifecycleService {
                 .model_service
                 .user_model_catalog(user_id.to_string())
                 .await?;
-            let offerings = catalog.items;
+            let offerings = astra_services::models::model_catalog_for_purpose(
+                catalog.items,
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            );
             let declared = astra_services::models::server_model_access_declarations(
                 catalog.allows_deployment,
                 offerings.iter().map(|item| item.access_kind),
@@ -9969,6 +9972,7 @@ impl AgenticRunLifecycleService {
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                 user_id,
                 &selection,
                 None,
@@ -10024,6 +10028,7 @@ impl AgenticRunLifecycleService {
             request.admitted_model_execution = Some(
                 crate::server::model_execution_admission::admit_model_execution(
                     &self.model_service,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
                     user_id,
                     selection,
                     Some(resolved),
@@ -10044,6 +10049,7 @@ impl AgenticRunLifecycleService {
         }
         let admitted = crate::server::model_execution_admission::admit_model_execution(
             &self.model_service,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             user_id,
             selection,
             None,

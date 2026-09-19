@@ -217,9 +217,13 @@ async fn authenticate_with_retry(
 }
 
 async fn active_model_names(api: &ThinClient, token: &str) -> Result<Vec<String>, String> {
-    let (items, _) = session_runtime::load_server_model_catalog(api, token)
-        .await
-        .map_err(|error| format!("could not inspect current model catalog: {error}"))?;
+    let (items, _) = session_runtime::load_server_model_catalog(
+        api,
+        token,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::All,
+    )
+    .await
+    .map_err(|error| format!("could not inspect current model catalog: {error}"))?;
     let mut names = items
         .into_iter()
         .filter(|item| item.is_active)
