@@ -161,8 +161,8 @@ impl JudgmentUsageSummary {
                 exact_usage_attempts: 0,
                 known_input_tokens: 0,
                 known_output_tokens: 0,
-                input_incomplete: false,
-                output_incomplete: false,
+                input_incomplete: facts.truncated,
+                output_incomplete: facts.truncated,
             });
             group.attempts += 1;
             if attempt.usage_status
@@ -196,32 +196,50 @@ impl JudgmentUsageSummary {
             }
         }
         Self {
-            coverage: "available".into(),
+            coverage: if facts.truncated {
+                "capture_truncated"
+            } else {
+                "available"
+            }
+            .into(),
             groups: groups.into_values().collect(),
             omitted_groups: 0,
         }
     }
 
     fn render(&self) -> String {
-        if self.coverage != "available" {
+        let truncated = self.coverage == "capture_truncated";
+        if self.coverage != "available" && !truncated {
             return "Judgment physical-attempt usage unavailable; no token total inferred.".into();
         }
-        if self.groups.is_empty() {
+        if self.groups.is_empty() && self.omitted_groups == 0 {
+            if truncated {
+                return "Judgment physical-attempt capture truncated; no supported judgment rows captured; total usage unknown, not zero.".into();
+            }
             return "Judgment physical-attempt ledger: no supported judgment operations observed in the bounded session view.".into();
         }
         let mut lines = Vec::with_capacity(self.groups.len());
         for group in &self.groups {
-            let input = if group.input_incomplete {
+            let input = if truncated || group.input_incomplete {
                 format!("at least {}", group.known_input_tokens)
             } else {
                 group.known_input_tokens.to_string()
             };
-            let output = if group.output_incomplete {
+            let output = if truncated || group.output_incomplete {
                 format!("at least {}", group.known_output_tokens)
             } else {
                 group.known_output_tokens.to_string()
             };
-            lines.push(format!("{} ({}, offering {}) {}: {} physical call(s), {}/{} exact usage; input {input}, output {output} tokens", group.provider, group.model, group.offering_id, group.operation, group.attempts, group.exact_usage_attempts, group.attempts));
+            lines.push(format!("{} ({}, offering {}) {}: {} captured physical call(s), {}/{} captured calls with exact usage; input {input}, output {output} tokens", group.provider, group.model, group.offering_id, group.operation, group.attempts, group.exact_usage_attempts, group.attempts));
+        }
+        if truncated {
+            lines.push("capture truncated; counts cover captured calls only; all token sums are lower bounds".into());
+        }
+        if self.omitted_groups > 0 {
+            lines.push(format!(
+                "{} captured group(s) omitted from display",
+                self.omitted_groups
+            ));
         }
         format!("Judgment physical-attempt ledger: {}.", lines.join("; "))
     }
@@ -1935,6 +1953,7 @@ mod tests {
         };
         let facts = ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
+            truncated: false,
             attempts: vec![
                 exact,
                 missing,
@@ -1957,10 +1976,82 @@ mod tests {
         let unavailable =
             JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
                 available: false,
+                truncated: false,
                 attempts: vec![],
             });
         assert_eq!(unavailable.coverage, "unavailable");
         assert!(unavailable.render().contains("unavailable"));
+    }
+
+    #[test]
+    fn judgment_rollup_truncated_capture_retains_facts_and_bounds_every_group() {
+        let attempt = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            provider: "typesafe".into(),
+            offering_id: "offering".into(),
+            model_name: "model".into(),
+            purpose: "introspection".into(),
+            operation_id: "work_direction".into(),
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(2),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_creation_tokens: Some(0),
+            }),
+        };
+        // Model an over-limit ledger's retained 512-row capture, not a
+        // display-limited list. Projection overflow is tested by its owner.
+        let ledger: Vec<_> = (0..513)
+            .map(|i| ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: format!("attempt-{i}"),
+                offering_id: format!("offering-{}", i % 2),
+                ..attempt.clone()
+            })
+            .collect();
+        let facts = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: ledger.len() > 512,
+            attempts: ledger.into_iter().take(512).collect(),
+        };
+        let summary = JudgmentUsageSummary::from_physical_attempts(&facts);
+        assert_eq!(summary.coverage, "capture_truncated");
+        assert_eq!(summary.groups.len(), 2);
+        for group in &summary.groups {
+            assert_eq!(group.attempts, 256);
+            assert_eq!(group.exact_usage_attempts, 256);
+            assert_eq!(
+                (group.known_input_tokens, group.known_output_tokens),
+                (512, 768)
+            );
+            assert!(group.input_incomplete && group.output_incomplete);
+        }
+        let output = summary.render();
+        assert!(
+            output.contains("input at least 512, output at least 768"),
+            "{output}"
+        );
+        assert!(output.contains("capture truncated"));
+        assert!(!output.contains("unavailable"));
+
+        let empty = JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: true,
+            attempts: vec![],
+        });
+        assert!(empty.render().contains("total usage unknown, not zero"));
+        let mut display_only =
+            JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![attempt],
+            });
+        display_only.omitted_groups = 2;
+        let output = display_only.render();
+        assert!(output.contains("2 captured group(s) omitted from display"));
+        assert!(!output.contains("capture truncated"));
+        assert!(!output.contains("at least"));
     }
     use crate::model_request_context::{
         ModelRequestCache, ModelRequestCompaction, ModelRequestContextEvent,

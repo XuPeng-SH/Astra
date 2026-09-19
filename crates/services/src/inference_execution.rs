@@ -7551,14 +7551,9 @@ fn project_auxiliary_usage_rows(
     max_attempts: usize,
 ) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
     use astra_turn_types::{ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1};
-    if rows.len() > max_attempts {
-        return Ok(ExplainAnalyzeAuxiliaryUsageV1 {
-            available: false,
-            attempts: Vec::new(),
-        });
-    }
-    let mut attempts = Vec::with_capacity(rows.len());
-    for row in rows {
+    let truncated = rows.len() > max_attempts;
+    let mut attempts = Vec::with_capacity(rows.len().min(max_attempts));
+    for row in rows.into_iter().take(max_attempts) {
         let status: String = row
             .try_get("usage_status")
             .map_err(|e| ServiceError::internal(e.to_string()))?;
@@ -7602,6 +7597,7 @@ fn project_auxiliary_usage_rows(
     }
     let result = ExplainAnalyzeAuxiliaryUsageV1 {
         available: true,
+        truncated,
         attempts,
     };
     if !result.is_valid() {

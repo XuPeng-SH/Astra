@@ -449,6 +449,8 @@ export type ExplainAnalyzeContextMetricsV1 = {
  * not zero; indexes are explicit and are never parsed from labels. */
 export type ExplainAnalyzeAuxiliaryUsageV1 = {
   available: boolean;
+  /** Captured counts and sums are lower bounds when physical rows were omitted. */
+  truncated?: boolean;
   attempts: {
     attempt_id: string; usage_status: "provider_exact" | "provider_partial" | "unavailable"; provider: string; offering_id: string; model_name: string;
     purpose: string; operation_id: string; usage?: ExplainAnalyzeUsageV1;

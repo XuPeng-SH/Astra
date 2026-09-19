@@ -115,6 +115,7 @@ pub struct IntrospectSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum JudgmentUsageCoverage {
     Available,
+    CaptureTruncated,
     #[default]
     NotObserved,
     NoPool,
@@ -193,8 +194,8 @@ impl JudgmentUsageSnapshot {
             .count();
         let mut known_input_tokens = 0_u128;
         let mut known_output_tokens = 0_u128;
-        let mut input_complete = true;
-        let mut output_complete = true;
+        let mut input_complete = !facts.truncated;
+        let mut output_complete = !facts.truncated;
         let mut groups = std::collections::BTreeMap::new();
         for attempt in &facts.attempts {
             let group = groups
@@ -212,8 +213,8 @@ impl JudgmentUsageSnapshot {
                     attempts: 0,
                     known_input_tokens: 0,
                     known_output_tokens: 0,
-                    input_complete: true,
-                    output_complete: true,
+                    input_complete: !facts.truncated,
+                    output_complete: !facts.truncated,
                 });
             group.attempts += 1;
             let usage = attempt.usage.as_ref();
@@ -239,7 +240,11 @@ impl JudgmentUsageSnapshot {
             }
         }
         Self {
-            coverage: JudgmentUsageCoverage::Available,
+            coverage: if facts.truncated {
+                JudgmentUsageCoverage::CaptureTruncated
+            } else {
+                JudgmentUsageCoverage::Available
+            },
             observed_attempts: Some(facts.attempts.len()),
             attempts_without_complete_usage: Some(incomplete),
             known_input_tokens: Some(known_input_tokens),
@@ -316,6 +321,9 @@ impl JudgmentUsageSnapshot {
             self.omitted_attempts,
             self.truncated_identity_fields,
         );
+        if self.coverage == JudgmentUsageCoverage::CaptureTruncated {
+            out.push_str(" capture_truncated=true; attempt counts cover captured rows only; additional physical attempts were omitted (count unknown)");
+        }
         let total = |known: Option<u128>, complete: bool| match known {
             None => "unknown".into(),
             Some(value) if complete => value.to_string(),
@@ -1565,6 +1573,7 @@ mod tests {
         use astra_turn_types::*;
         ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
+            truncated: false,
             attempts: (0..count)
                 .map(|index| ExplainAnalyzeAuxiliaryAttemptV1 {
                     attempt_id: format!("attempt-{index}"),
@@ -1764,10 +1773,53 @@ mod tests {
     }
 
     #[test]
+    fn judgment_usage_capture_overflow_retains_exact_facts_as_lower_bounds() {
+        use astra_turn_types::{ExplainAnalyzeAuxiliaryUsageStatusV1, ExplainAnalyzeUsageBasisV1};
+        let mut facts = judgment_facts(1);
+        facts.truncated = true;
+        facts.attempts[0].usage_status = ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact;
+        let usage = facts.attempts[0].usage.as_mut().unwrap();
+        usage.basis = ExplainAnalyzeUsageBasisV1::ProviderExact;
+        usage.cache_creation_tokens = Some(0);
+        let snapshot = JudgmentUsageSnapshot::from_ledger(facts);
+        assert_eq!(snapshot.coverage, JudgmentUsageCoverage::CaptureTruncated);
+        assert_eq!(snapshot.observed_attempts, Some(1));
+        assert_eq!(snapshot.attempts_without_complete_usage, Some(0));
+        assert_eq!(snapshot.known_input_tokens, Some(30));
+        assert_eq!(snapshot.known_output_tokens, Some(5));
+        assert!(!snapshot.input_complete && !snapshot.output_complete);
+        assert!(!snapshot.groups[0].input_complete && !snapshot.groups[0].output_complete);
+        assert_eq!(
+            snapshot.omitted_attempts, 0,
+            "capture omissions have unknown count"
+        );
+        assert!(snapshot.render().contains("total_output=at_least_5"));
+        let report = build_introspect_report(
+            &IntrospectSnapshot {
+                judgment_usage: Some(snapshot),
+                ..Default::default()
+            },
+            &IntrospectRequest::from_args(&serde_json::json!({"depth":"hint", "format":"json"})),
+        );
+        assert_eq!(
+            report.data_coverage.providers["judgment_inference_ledger"].status,
+            "partial"
+        );
+
+        let mut empty = judgment_facts(0);
+        empty.truncated = true;
+        let empty = JudgmentUsageSnapshot::from_ledger(empty);
+        assert_eq!(empty.coverage, JudgmentUsageCoverage::CaptureTruncated);
+        assert!(!empty.output_complete);
+        assert!(empty.render().contains("total_output=at_least_0"));
+    }
+
+    #[test]
     fn judgment_usage_distinguishes_unavailable_empty_and_truncated_identities() {
         let unavailable =
             JudgmentUsageSnapshot::from_ledger(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available: false,
+                truncated: false,
                 attempts: vec![],
             });
         assert_eq!(unavailable.observed_attempts, None);

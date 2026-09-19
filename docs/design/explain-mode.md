@@ -484,13 +484,20 @@ Repeated turn segments deduplicate attempt IDs. Missing usage remains unknown;
 partial provider usage is labeled partial. A failed or timed-out snapshot is
 marked unavailable and does not fail the user's turn. Collection has a one-second
 best-effort budget and runs only when Explain capture is enabled. The snapshot
-uses the existing durable-event batch row budget; overflow is marked unavailable
-instead of reporting a silently truncated total. The requested model comes from
+uses the existing durable-event batch row budget; overflow retains bounded rows
+with `truncated=true`. Counts then describe captured attempts and token sums are
+lower bounds, including fully reported lanes. An omitted `truncated` field means
+the capture did not overflow, preserving existing facts. The requested model comes from
 the immutable route and is not an assertion about the provider-returned model.
 The text/TUI/HTML projection keeps Offering and operation visible (including
 request classification and Work next-direction judgment). When only some
 attempts report a token lane, its sum is explicitly a lower bound; it is not
 presented as the total consumption of that group.
+
+Consumers validate fields strictly. Deploy the updated Rust/SDK readers before
+upgrading the server in a mixed-version deployment: older readers do
+not recognize `truncated=true` and reject that terminal fact. Non-overflow facts
+omit the field and retain their existing wire representation.
 
 These facts are separate from timed main-model nodes: no interval is invented
 from database timestamps. TUI, text, HTML and Web show Jev auxiliary tokens

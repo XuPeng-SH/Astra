@@ -642,6 +642,33 @@ describe("auxiliary provider usage", () => {
     available: true,
     attempts: [{attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "memory_retrieval_rerank", operation_id: "relevance", usage_status: "provider_partial" as const, usage: {basis: "provider_partial" as const, fresh_input_tokens: 42}}],
   };
+  it("keeps overflowing captures visible with explicit lower-bound totals", () => {
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, truncated: true}});
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]));
+    expect(lines[0]).toContain("in at least 42");
+    expect(lines[1]).toContain("capture truncated");
+    expect(lines[1]).toContain("counts cover captured attempts only");
+    expect(renderExplainAnalyzeHtml([event])).toContain("in at least 42");
+    expect(isExplainAnalyzeEventV1(finished("bad", "turn", 0, 100, {
+      auxiliary_usage: {available: false, truncated: true, attempts: []},
+    }))).toBe(false);
+    const empty = finished("empty", "turn", 0, 100, {
+      auxiliary_usage: {available: true, truncated: true, attempts: []},
+    });
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([empty]))).toEqual([
+      "Auxiliary tokens · capture truncated; request counts cover captured attempts only; token sums are lower bounds",
+    ]);
+  });
+  it("treats token lanes as lower bounds when a captured peer or segment has unknown usage", () => {
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
+      ...auxiliary, attempts: [...auxiliary.attempts, {...auxiliary.attempts[0], attempt_id: "aux-2", usage_status: "unavailable", usage: undefined}],
+    }});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]))[0]).toContain("in at least 42");
+    const missing = finished("missing", "turn", 100, 200, {auxiliary_usage: {available: false, attempts: []}});
+    const known = finished("known", "turn", 0, 100, {auxiliary_usage: auxiliary});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([known, missing]))[0]).toContain("in at least 42");
+  });
   it("exports Jev separately, deduplicates physical attempts across segments, and preserves unknown lanes", () => {
     const first = finished("turn", "turn", 0, 100, {auxiliary_usage: auxiliary});
     const second = finished("segment", "turn", 100, 200, {auxiliary_usage: auxiliary});
@@ -660,6 +687,7 @@ describe("auxiliary provider usage", () => {
       ["request_judgment", "Request classification", 10],
       ["skill_auto_route", "Skill selection", 20],
       ["work_plan", "Work planning", 30],
+      ["work_direction", "Work next direction", 40],
     ] as const;
     const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
       available: true,
@@ -671,10 +699,11 @@ describe("auxiliary provider usage", () => {
     }});
     expect(isExplainAnalyzeEventV1(event)).toBe(true);
     const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]));
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(4);
     const html = renderExplainAnalyzeHtml([event]);
-    for (const [, label, tokens] of operations) {
+    for (const [operation, label, tokens] of operations) {
       const line = lines.find(line => line.includes(label));
+      expect(line).toContain(`operation ${operation} · offering same-offering`);
       expect(line).toContain(`in ${tokens} ·`);
       expect(line).toContain("1/1 requests reported");
       expect(line).toContain("cache read unknown");

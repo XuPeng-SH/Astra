@@ -17430,11 +17430,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Ok(Ok(facts)) => facts,
                 _ => astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                     available: false,
+                    truncated: false,
                     attempts: Vec::new(),
                 },
             },
             None => astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available: false,
+                truncated: false,
                 attempts: Vec::new(),
             },
         };

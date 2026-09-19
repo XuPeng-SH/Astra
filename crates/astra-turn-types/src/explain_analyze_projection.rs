@@ -284,6 +284,12 @@ impl ExplainAnalyzeGraphV1 {
             .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| !u.available))
     }
 
+    pub fn auxiliary_usage_truncated(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| u.truncated))
+    }
+
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
     }
@@ -997,6 +1003,7 @@ mod tests {
             );
             event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
                 available: true,
+                truncated: false,
                 attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
                     attempt_id: "aux-1".into(),
                     provider: "typesafe".into(),

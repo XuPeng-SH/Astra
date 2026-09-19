@@ -1623,6 +1623,7 @@ mod tests {
         let empty = bounded_introspect_judgment_usage(async {
             Ok(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available: true,
+                truncated: false,
                 attempts: vec![],
             })
         })

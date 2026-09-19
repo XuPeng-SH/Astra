@@ -569,6 +569,7 @@ mod tests {
         let mut end = finished(start.clone(), 100);
         end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
+            truncated: false,
             attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
                 attempt_id: "aux-1".into(),
                 provider: "typesafe".into(),
@@ -633,6 +634,7 @@ mod tests {
         };
         end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
+            truncated: false,
             attempts: vec![
                 exact.clone(),
                 ExplainAnalyzeAuxiliaryAttemptV1 {
@@ -651,6 +653,98 @@ mod tests {
         assert!(output.contains("in at least 40"), "{output}");
         assert!(output.contains("out at least 5"), "{output}");
         assert!(output.contains("1/2 requests reported"), "{output}");
+    }
+
+    #[test]
+    fn auxiliary_capture_truncation_and_partial_turn_coverage_preserve_lower_bounds() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let attempt = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt".into(),
+            provider: "typesafe".into(),
+            offering_id: "offering".into(),
+            model_name: "model".into(),
+            purpose: "introspection".into(),
+            operation_id: "work_direction".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(2),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_creation_tokens: Some(1),
+            }),
+        };
+        let ledger: Vec<_> = (0..129)
+            .map(|i| ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: format!("attempt-{i}"),
+                ..attempt.clone()
+            })
+            .collect();
+        let captured = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: ledger.len() > 128,
+            attempts: ledger.into_iter().take(128).collect(),
+        };
+        let graph_for = |captures: Vec<ExplainAnalyzeAuxiliaryUsageV1>| {
+            let mut graph = ExplainAnalyzeGraphV1::default();
+            for (i, capture) in captures.into_iter().enumerate() {
+                let start = fact(
+                    &format!("start-{i}"),
+                    &format!("turn-{i}"),
+                    None,
+                    ExplainAnalyzeNodeKindV1::Turn,
+                    ExplainAnalyzeTransitionV1::Started,
+                    0,
+                    None,
+                    None,
+                );
+                let mut end = finished(start.clone(), 100);
+                end.auxiliary_usage = Some(Box::new(capture));
+                graph.apply(start);
+                graph.apply(end);
+            }
+            graph
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![captured])).join("\n");
+        for expected in [
+            "in at least 256",
+            "out at least 384",
+            "cache read at least 0",
+            "cache write at least 128",
+            "128/128 captured requests reported",
+            "capture truncated",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("capture unavailable"));
+        let complete = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![attempt],
+        };
+        let unavailable = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: false,
+            truncated: false,
+            attempts: vec![],
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![complete, unavailable])).join("\n");
+        assert!(output.contains("in at least 2"), "{output}");
+        assert!(output.contains("out at least 3"));
+        assert!(output.contains("1/1 captured requests reported"));
+        assert!(output.contains("capture unavailable"));
+        assert!(!output.contains("capture truncated"));
+        let empty = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: true,
+            attempts: vec![],
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![empty])).join("\n");
+        assert!(output.contains("full usage unknown"));
+        assert!(!output.contains("in 0"));
+        assert!(!output.contains("0/0"));
     }
 
     #[test]
@@ -677,6 +771,7 @@ mod tests {
         ];
         end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
+            truncated: false,
             attempts: operations
                 .iter()
                 .map(|(operation, _, tokens)| ExplainAnalyzeAuxiliaryAttemptV1 {
@@ -806,6 +901,7 @@ mod tests {
             let mut end = finished(start.clone(), 100);
             end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
                 available: true,
+                truncated: false,
                 attempts: attempts.clone(),
             }));
             events.extend([start, end]);
@@ -1084,6 +1180,8 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
     type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
     type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
     let mut groups: BTreeMap<GroupKey<'_>, Attempts<'_>> = BTreeMap::new();
+    let truncated = graph.auxiliary_usage_truncated();
+    let incomplete_capture = truncated || graph.auxiliary_usage_unavailable();
     for attempt in graph.auxiliary_attempts() {
         groups
             .entry((
@@ -1137,7 +1235,9 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
                     if known.is_empty() {
                         format!("{name} unknown")
                     } else {
-                        let qualifier = if known.len() == total && reported.len() == attempts.len()
+                        let qualifier = if !incomplete_capture
+                            && known.len() == total
+                            && reported.len() == attempts.len()
                         {
                             ""
                         } else {
@@ -1159,7 +1259,11 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
         } else {
             ""
         };
-        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · operation {operation} · offering {offering} · {values} · {}/{} requests reported{partial}",reported.len(),attempts.len()));
+        let scope = if incomplete_capture { " captured" } else { "" };
+        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · operation {operation} · offering {offering} · {values} · {}/{}{scope} requests reported{partial}",reported.len(),attempts.len()));
+    }
+    if truncated {
+        lines.push("Auxiliary tokens · capture truncated · counts cover captured requests only; all token sums are lower bounds; full usage unknown".into());
     }
     if graph.auxiliary_usage_unavailable() {
         lines.push("Auxiliary tokens · capture unavailable".into());

@@ -187,8 +187,10 @@ export function isExplainAnalyzeEventV1(
 }
 
 function isAuxiliaryUsage(value: unknown): boolean {
-  if (!isRecord(value) || Object.keys(value).some(k => !["available", "attempts"].includes(k)) ||
-      typeof value.available !== "boolean" || !Array.isArray(value.attempts) || (!value.available && value.attempts.length > 0)) return false;
+  if (!isRecord(value) || Object.keys(value).some(k => !["available", "truncated", "attempts"].includes(k)) ||
+      typeof value.available !== "boolean" ||
+      (value.truncated !== undefined && typeof value.truncated !== "boolean") ||
+      !Array.isArray(value.attempts) || (!value.available && (value.attempts.length > 0 || value.truncated === true))) return false;
   const seen = new Set<string>();
   return value.attempts.every(a => {
     if (!isRecord(a) || Object.keys(a).some(k => !["attempt_id","usage_status","provider","offering_id","model_name","purpose","operation_id","usage"].includes(k))) return false;
@@ -209,9 +211,11 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
   type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
   const attempts = new Map<string, Attempt>();
   let unavailable = false;
+  let truncated = false;
   for (const node of graph.nodes) {
     if (!node.terminalObserved || node.conflicted || !node.auxiliaryUsage) continue;
     unavailable ||= !node.auxiliaryUsage.available;
+    truncated ||= node.auxiliaryUsage.truncated === true;
     for (const attempt of node.auxiliaryUsage.attempts) {
       const existing = attempts.get(attempt.attempt_id);
       const rank = { unavailable: 0, provider_partial: 1, provider_exact: 2 };
@@ -225,19 +229,22 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
     const group = groups.get(key) ?? []; group.push(attempt); groups.set(key,group);
   }
   const purposeLabels = new Map<string,string>([["memory_retrieval_rerank","Memory judgment"], ["memory_extraction","Memory extraction"], ["introspection","Request analysis"], ["verification_judge","Verification"], ["reflection","Reflection"], ["required_compaction","Context summary"]]);
-  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"]]);
+  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"], ["work_direction","Work next direction"]]);
   const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
     const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
     const provider = first.provider === "typesafe" ? "Jev" : first.provider;
     const lanes = [["in","fresh_input_tokens"],["cache read","cache_read_tokens"],["cache write","cache_creation_tokens"],["out","output_tokens"]] as const;
     const values = reported.length === 0 ? "usage unavailable" : lanes.map(([name,key]) => {
       const counters = reported.flatMap(u => u[key] === undefined ? [] : [BigInt(u[key])]);
-      return `${name} ${counters.length === 0 ? "unknown" : counters.reduce((a,b)=>a+b,0n).toString()}`;
+      const qualifier = truncated || unavailable || counters.length !== group.length ? "at least " : "";
+      return `${name} ${counters.length === 0 ? "unknown" : qualifier + counters.reduce((a,b)=>a+b,0n).toString()}`;
     }).join(" · ");
     const partial = reported.length !== group.length || group.some(a => a.usage_status === "provider_partial") ? " · partial" : "";
-    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${operationLabels.get(first.operation_id) ?? purposeLabels.get(first.purpose) ?? "Auxiliary inference"} · ${values} · ${reported.length}/${group.length} requests reported${partial}`;
+    const scope = truncated || unavailable ? " captured" : "";
+    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${operationLabels.get(first.operation_id) ?? purposeLabels.get(first.purpose) ?? "Auxiliary inference"} · operation ${first.operation_id} · offering ${first.offering_id} · ${values} · ${reported.length}/${group.length}${scope} requests reported${partial}`;
   });
   if (unavailable) lines.push("Auxiliary tokens · capture unavailable");
+  if (truncated) lines.push("Auxiliary tokens · capture truncated; request counts cover captured attempts only; token sums are lower bounds");
   return lines;
 }
 

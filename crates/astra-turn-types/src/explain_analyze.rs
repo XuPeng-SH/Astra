@@ -259,7 +259,15 @@ impl ExplainAnalyzeTokenUsageV1 {
 #[serde(deny_unknown_fields)]
 pub struct ExplainAnalyzeAuxiliaryUsageV1 {
     pub available: bool,
+    /// The bounded capture omitted physical attempts. Counts and token sums
+    /// describe captured evidence only, not complete turn/session totals.
+    #[serde(default, skip_serializing_if = "auxiliary_capture_not_truncated")]
+    pub truncated: bool,
     pub attempts: Vec<ExplainAnalyzeAuxiliaryAttemptV1>,
+}
+
+fn auxiliary_capture_not_truncated(value: &bool) -> bool {
+    !value
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -285,7 +293,7 @@ pub enum ExplainAnalyzeAuxiliaryUsageStatusV1 {
 impl ExplainAnalyzeAuxiliaryUsageV1 {
     pub fn is_valid(&self) -> bool {
         let mut seen = std::collections::HashSet::new();
-        (self.available || self.attempts.is_empty())
+        (self.available || (self.attempts.is_empty() && !self.truncated))
             && self.attempts.iter().all(|a| {
                 valid_id(&a.attempt_id)
                     && seen.insert(&a.attempt_id)
@@ -470,6 +478,22 @@ fn valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auxiliary_capture_overflow_is_partial_evidence_not_unavailability() {
+        use super::ExplainAnalyzeAuxiliaryUsageV1;
+        let legacy = r#"{"available":true,"attempts":[]}"#;
+        let mut facts: ExplainAnalyzeAuxiliaryUsageV1 = serde_json::from_str(legacy).unwrap();
+        assert!(!facts.truncated);
+        assert_eq!(serde_json::to_string(&facts).unwrap(), legacy);
+        facts.truncated = true;
+        assert!(facts.is_valid());
+        let roundtrip: ExplainAnalyzeAuxiliaryUsageV1 =
+            serde_json::from_value(serde_json::to_value(&facts).unwrap()).unwrap();
+        assert!(roundtrip.truncated);
+        facts.available = false;
+        assert!(!facts.is_valid());
+    }
+
     use super::*;
 
     fn started() -> ExplainAnalyzeEventV1 {

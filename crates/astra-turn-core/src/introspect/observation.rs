@@ -383,7 +383,9 @@ fn introspect_data_coverage(
         providers.insert(
             "judgment_inference_ledger".into(),
             ObservationProviderCoverage {
-                status: if usage.coverage != super::JudgmentUsageCoverage::Available {
+                status: if usage.coverage == super::JudgmentUsageCoverage::CaptureTruncated {
+                    "partial"
+                } else if usage.coverage != super::JudgmentUsageCoverage::Available {
                     "missing"
                 } else if usage.attempts_without_complete_usage.is_some_and(|n| n > 0) {
                     "partial"

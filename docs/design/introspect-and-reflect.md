@@ -52,8 +52,11 @@ judgment operations in the session at ledger-read time, independently of the
 live runtime snapshot's earlier cutoff and the requested recent/turn horizon.
 
 The optional read has a two-second deadline and a 128-attempt capture cap.
-Capture overflow follows the service's unavailable projection; it never claims
-partial rows are a complete ledger. No pool, timeout, query failure, unavailable
+Capture overflow retains the bounded physical attempts with `capture_truncated`
+coverage. Captured attempt counts and token sums remain lower bounds; omitted
+capture rows have an unknown count, distinct from exact display-omission counts.
+Even fully reported captured attempts cannot establish complete session totals.
+No pool, timeout, query failure, unavailable
 capture, and an excluded durable source are typed coverage states and do not
 fail introspection. `live_only` and `local_only` skip this durable read.
 Missing token buckets stay unknown, including unreported cache inputs; text
