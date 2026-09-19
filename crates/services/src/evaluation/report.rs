@@ -388,6 +388,7 @@ mod tests {
                 trial_id: trial.trial_id.clone(),
                 session_id: format!("session-{index}"),
                 execution_run_id: format!("run-{index}"),
+                admission_run_generation: 1,
                 execution_run_generation: 1,
                 observation: TrialObservation {
                     experiment_fingerprint: fingerprint.clone(),

@@ -28,12 +28,12 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             kind: EvaluationTargetKind::Skill,
             baseline: RevisionRef {
                 revision_id: "skill-v1".to_string(),
-                content_hash: "sha256:baseline".to_string(),
+                content_hash: format!("sha256:{}", "b".repeat(64)),
                 content: None,
             },
             candidate: RevisionRef {
                 revision_id: "skill-v2".to_string(),
-                content_hash: "sha256:candidate".to_string(),
+                content_hash: format!("sha256:{}", "c".repeat(64)),
                 content: None,
             },
             skill_name: Some("sample-skill".to_string()),
@@ -41,7 +41,7 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
         cases: vec![EvaluationCase {
             case_id: "case-a".to_string(),
             input_snapshot_ref: "input-snapshot-a".to_string(),
-            input_content_hash: "sha256:input-a".to_string(),
+            input_content_hash: format!("sha256:{}", "a".repeat(64)),
             verifier_id: "verifier-a".to_string(),
             verifier_version: "1".to_string(),
             holdout: false,
@@ -118,23 +118,7 @@ async fn insert_evaluation_admitted_event(
         "idempotency_key": format!("evaluation-admitted:{run_id}:{generation}"),
         "data": {"admission": admission},
     });
-    sqlx::query(
-        "INSERT INTO agent_run_events
-         (id, run_id, event_idx, user_id, session_id, event_type, event_id,
-          idempotency_key, event_hash, payload_json, created_at)
-         VALUES (?, ?, 0, ?, ?, 'evaluation_admitted', ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(format!("eval-event-{}", Uuid::new_v4()))
-    .bind(run_id)
-    .bind(owner)
-    .bind(session_id)
-    .bind(Uuid::new_v4().to_string())
-    .bind(format!("evaluation-admitted:{run_id}:{generation}"))
-    .bind("test-event-hash")
-    .bind(serde_json::to_string(&payload).expect("serialize evaluation admission event"))
-    .execute(pool.get())
-    .await
-    .expect("insert evaluation admission event");
+    insert_run_event(pool, owner, session_id, run_id, 0, &payload).await;
 }
 
 async fn insert_run_settlement_finished_event(
@@ -150,24 +134,40 @@ async fn insert_run_settlement_finished_event(
         "idempotency_key": format!("run-settlement-finished:{generation}"),
         "data": {"owner_generation": generation},
     });
+    insert_run_event(pool, owner, session_id, run_id, event_idx, &payload).await;
+}
+
+async fn insert_run_event(
+    pool: &SharedPool,
+    owner: &str,
+    session_id: &str,
+    run_id: &str,
+    event_idx: i64,
+    payload: &serde_json::Value,
+) {
+    use sha2::{Digest, Sha256};
+    let payload_json = serde_json::to_string(payload).expect("serialize run event");
     sqlx::query(
         "INSERT INTO agent_run_events
          (id, run_id, event_idx, user_id, session_id, event_type, event_id,
           idempotency_key, event_hash, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, 'run_settlement_finished', ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
     )
-    .bind(format!("settlement-event-{}", Uuid::new_v4()))
+    .bind(format!("eval-event-{}", Uuid::new_v4()))
     .bind(run_id)
     .bind(event_idx)
     .bind(owner)
     .bind(session_id)
+    .bind(payload["event_type"].as_str().unwrap())
     .bind(Uuid::new_v4().to_string())
-    .bind(format!("run-settlement-finished:{generation}"))
-    .bind("test-settlement-hash")
-    .bind(serde_json::to_string(&payload).expect("serialize settlement event"))
+    .bind(payload["idempotency_key"].as_str())
+    .bind(format!("{:x}", Sha256::digest(payload_json.as_bytes())))
+    .bind(payload_json)
     .execute(pool.get())
     .await
-    .expect("insert settlement finished event");
+    .expect("insert run event");
+    sqlx::query("UPDATE agent_runs SET last_event_idx = GREATEST(last_event_idx, ?) WHERE user_id = ? AND run_id = ?")
+        .bind(event_idx).bind(owner).bind(run_id).execute(pool.get()).await.expect("advance test event watermark");
 }
 
 async fn cleanup(pool: &SharedPool, owner: &str) {
@@ -176,6 +176,7 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
         ("evaluation_materialization_receipts", "owner_user_id"),
         ("evaluation_trial_bindings", "owner_user_id"),
         ("evaluation_experiments", "owner_user_id"),
+        ("agent_run_events", "user_id"),
         ("agent_runs", "user_id"),
         ("agent_sessions", "user_id"),
     ] {
@@ -546,7 +547,11 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             trial_id: binding_a.trial_id.clone(),
             input_content_hash: format!("sha256:{}", "a".repeat(64)),
             revision_content_hash: format!("sha256:{}", "b".repeat(64)),
-            skill_revision: None,
+            skill_revision: Some(astra_services::EvaluationSkillRevision {
+                skill_name: "sample-skill".into(),
+                revision_id: "skill-v1".into(),
+                content_hash: experiment.spec.target.baseline.content_hash.clone(),
+            }),
             receipt_ids: vec![
                 context_receipt.receipt_id.clone(),
                 policy_receipt.receipt_id.clone(),
@@ -560,7 +565,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         .await
         .expect("load bounded evaluation marker")
         .expect("evaluation marker exists");
-    assert_eq!(marker.execution_run_generation, 0);
+    assert_eq!(marker.admission_run_generation, 0);
     assert!(!marker.settlement_finished);
     insert_run_settlement_finished_event(&pool, &owner, &session_a, &run_a, 0, 1).await;
     assert!(
@@ -574,6 +579,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
     let request_a = EvaluationObservationRequest {
         session_id: session_a.clone(),
         execution_run_id: run_a.clone(),
+        admission_run_generation: 0,
         execution_run_generation: 0,
         observation: TrialObservation {
             experiment_fingerprint: experiment.spec_fingerprint.clone(),
@@ -646,6 +652,61 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         .bind_trial_run(&owner, &trials[1].trial_id, &session_b, &run_b)
         .await
         .expect("bind second observation trial");
+    let envelope_b = SnapshotEnvelope::new(
+        &owner,
+        &experiment.experiment_id,
+        Some(binding_b.trial_id.clone()),
+        CompositeSnapshot {
+            snapshot_id: format!("observation-envelope-{}", Uuid::new_v4()),
+            session_id: session_b.clone(),
+            ..envelope.composite.clone()
+        },
+        &experiment.spec.conditions.context_snapshot_hash,
+        &experiment.spec.conditions.tool_policy_hash,
+    )
+    .expect("build original-generation recovery envelope");
+    let trusted_b = TrustedMaterializerContext {
+        execution_run_id: Some(run_b.clone()),
+        ..trusted.clone()
+    };
+    let context_request_b = MaterializationReceiptRequest {
+        trial_id: binding_b.trial_id.clone(),
+        session_id: session_b.clone(),
+        envelope: envelope_b.clone(),
+        component_kind: MaterializationComponentKind::Context,
+        component_snapshot_ref: Some("context://observation-b".into()),
+        component_base_snapshot_ref: None,
+        component_content_fingerprint: Some(
+            experiment.spec.conditions.context_snapshot_hash.clone(),
+        ),
+        outcome: MaterializationOutcome::Available,
+        failure_code: None,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        idempotency_key: "observation-b-context".into(),
+    };
+    let context_receipt_b = receipt_store
+        .record_receipt(&trusted_b, &context_request_b)
+        .await
+        .expect("materialize recovery trial context at original generation");
+    let policy_receipt_b = receipt_store
+        .record_receipt(
+            &trusted_b,
+            &MaterializationReceiptRequest {
+                component_kind: MaterializationComponentKind::Policy,
+                component_snapshot_ref: Some("policy://observation-b".into()),
+                component_content_fingerprint: Some(
+                    experiment.spec.conditions.tool_policy_hash.clone(),
+                ),
+                idempotency_key: "observation-b-policy".into(),
+                ..context_request_b.clone()
+            },
+        )
+        .await
+        .expect("materialize recovery trial policy at original generation");
+    let receipt_ids_b = vec![
+        context_receipt_b.receipt_id.clone(),
+        policy_receipt_b.receipt_id.clone(),
+    ];
     sqlx::query(
         "UPDATE agent_runs SET status = 'failed'
          WHERE user_id = ? AND run_id = ?",
@@ -658,6 +719,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
     let request_b = EvaluationObservationRequest {
         session_id: session_b.clone(),
         execution_run_id: run_b.clone(),
+        admission_run_generation: 0,
         execution_run_generation: 0,
         observation: TrialObservation {
             experiment_fingerprint: experiment.spec_fingerprint.clone(),
@@ -669,13 +731,280 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             measurements: Vec::new(),
             evidence: Vec::new(),
         },
-        materialization_receipt_ids: Vec::new(),
+        materialization_receipt_ids: receipt_ids_b.clone(),
         idempotency_key: "observation-b".to_string(),
     };
+    let admission_b = EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: binding_b.trial_id.clone(),
+        input_content_hash: experiment.spec.cases[0].input_content_hash.clone(),
+        revision_content_hash: experiment.spec.target.candidate.content_hash.clone(),
+        skill_revision: Some(astra_services::EvaluationSkillRevision {
+            skill_name: "sample-skill".into(),
+            revision_id: "skill-v2".into(),
+            content_hash: experiment.spec.target.candidate.content_hash.clone(),
+        }),
+        receipt_ids: receipt_ids_b.clone(),
+        snapshot_envelope: Some(envelope_b.clone()),
+    };
+    insert_evaluation_admitted_event(&pool, &owner, &session_b, &run_b, 0, &admission_b).await;
+    // Repair after two ownership transfers must preserve original admission,
+    // even when settlement history extends well beyond the old 128-row window.
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation = 2, last_event_idx = 3,
+        error_message = 'recovered from crash', error_code = 'crash_recovery'
+        WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run_b)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    // Model the pre-bind crash window using this same planned trial fixture.
+    sqlx::query(
+        "UPDATE evaluation_trial_bindings SET binding_status = 'planned',
+        session_id = NULL, run_id = NULL, run_generation = NULL
+        WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&binding_b.trial_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let mut recovered = request_b.clone();
+    recovered.execution_run_generation = 2;
+    let terminal = astra_services::runs::RunRecoveryTerminal {
+        user_id: owner.clone(),
+        session_id: session_b.clone(),
+        run_id: run_b.clone(),
+        owner_generation: 2,
+        outcome: astra_services::runs::RunRecoveryTerminalOutcome::Failed,
+    }
+    .event();
+    insert_run_event(&pool, &owner, &session_b, &run_b, 3, &terminal).await;
+    let custody = |from: u64, to: u64| {
+        serde_json::json!({
+            "event_type": "run_recovery_claimed",
+            "idempotency_key": format!("run-recovery-claimed:{to}"),
+            "data": {"user_id": owner, "session_id": session_b, "run_id": run_b,
+                "from_generation": from, "to_generation": to},
+        })
+    };
+    insert_run_event(&pool, &owner, &session_b, &run_b, 2, &custody(1, 2)).await;
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "a missing first custody link must fail closed"
+    );
+    assert_eq!(
+        plan_store
+            .load_trial(&owner, &binding_b.trial_id)
+            .await
+            .unwrap()
+            .binding_status,
+        "planned",
+        "a failed proof must not leave a repaired binding"
+    );
+    insert_run_event(&pool, &owner, &session_b, &run_b, 1, &custody(0, 1)).await;
+    let mut wrong_generation = recovered.clone();
+    wrong_generation.admission_run_generation = 1;
+    assert!(
+        observation_store
+            .record_observation(&owner, &wrong_generation)
+            .await
+            .is_err()
+    );
+    assert!(
+        observation_store
+            .record_observation(&owner, &request_b)
+            .await
+            .is_err(),
+        "old writer cannot write a new observation"
+    );
+    let mut wrong_session = recovered.clone();
+    wrong_session.session_id = session_a.clone();
+    assert!(
+        observation_store
+            .record_observation(&owner, &wrong_session)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+        .bind(&session_a).bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "custody with the wrong session cannot authorize repair"
+    );
+    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+        .bind(&session_b).bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
+    for index in 4..=134 {
+        insert_run_settlement_finished_event(
+            &pool,
+            &owner,
+            &session_b,
+            &run_b,
+            index as u64,
+            index,
+        )
+        .await;
+    }
+    let old_admission = observation_store
+        .load_admission_marker_for_run(&owner, &run_b, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_admission.admission_run_generation, 0);
+    assert_eq!(old_admission.admission_event_idx, 0);
+    assert!(!old_admission.settlement_finished);
+    sqlx::query("UPDATE agent_run_events SET event_hash = 'tampered' WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+        .bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "admission hash must be revalidated before pre-bind repair"
+    );
+    // A discovery marker is not write authorization: changing the durable
+    // admission after discovery must still be rejected in the write transaction.
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+        .bind(&owner)
+        .bind(&run_b)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "discovered admission cannot substitute for a missing durable admission"
+    );
+    let mut wrong_admission = admission_b.clone();
+    wrong_admission.revision_content_hash = format!("sha256:{}", "d".repeat(64));
+    wrong_admission
+        .skill_revision
+        .as_mut()
+        .unwrap()
+        .content_hash = wrong_admission.revision_content_hash.clone();
+    insert_evaluation_admitted_event(&pool, &owner, &session_b, &run_b, 0, &wrong_admission).await;
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "durable admission must match the frozen revision"
+    );
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+        .bind(&owner)
+        .bind(&run_b)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    insert_evaluation_admitted_event(&pool, &owner, &session_b, &run_b, 0, &admission_b).await;
+    sqlx::query("UPDATE agent_runs SET last_event_idx = -1 WHERE user_id = ? AND run_id = ?")
+        .bind(&owner)
+        .bind(&run_b)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .is_err(),
+        "admission beyond canonical Run watermark cannot authorize repair"
+    );
+    sqlx::query("UPDATE agent_runs SET last_event_idx = 134 WHERE user_id = ? AND run_id = ?")
+        .bind(&owner)
+        .bind(&run_b)
+        .execute(pool.get())
+        .await
+        .unwrap();
     let second = observation_store
-        .record_observation(&owner, &request_b)
+        .record_observation(&owner, &recovered)
         .await
         .expect("record second-session observation");
+    assert_eq!(second.admission_run_generation, 0);
+    assert_eq!(second.execution_run_generation, 2);
+    assert_eq!(second.materialization_receipt_ids, receipt_ids_b);
+    for original in [&context_receipt_b, &policy_receipt_b] {
+        let persisted = receipt_store
+            .load_receipt(
+                &owner,
+                &original.receipt_id,
+                &binding_b.trial_id,
+                &session_b,
+                &envelope_b,
+            )
+            .await
+            .expect("original admission receipt remains readable after recovery settlement");
+        assert_eq!(persisted.execution_run_generation, Some(0));
+        assert_eq!(
+            &persisted, original,
+            "terminal generation must not rewrite original receipt provenance"
+        );
+    }
+    let stale_request_b = MaterializationReceiptRequest {
+        idempotency_key: "observation-b-stale-materializer".into(),
+        ..context_request_b.clone()
+    };
+    assert!(
+        matches!(
+            receipt_store
+                .record_receipt(&trusted_b, &stale_request_b)
+                .await,
+            Err(MaterializationReceiptError::Persistence(
+                EvaluationPersistenceError::Conflict(_)
+            ))
+        ),
+        "observation recovery must not authorize new receipts from the original materializer"
+    );
+    let rejected_receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM evaluation_materialization_receipts WHERE owner_user_id = ? AND idempotency_key = ?",
+    ).bind(&owner).bind(&stale_request_b.idempotency_key).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(rejected_receipt_count, 0);
+    assert_eq!(
+        receipt_store
+            .record_receipt(&trusted_b, &context_request_b)
+            .await
+            .unwrap(),
+        context_receipt_b,
+        "an exact original receipt retry remains immutable"
+    );
+    let repaired = plan_store
+        .load_trial(&owner, &binding_b.trial_id)
+        .await
+        .unwrap();
+    assert_eq!(repaired.run_generation, Some(0));
+    assert!(
+        plan_store
+            .bind_trial_run(&owner, &binding_b.trial_id, &session_b, &run_b)
+            .await
+            .is_err(),
+        "ordinary bind remains strictly current-generation"
+    );
+    assert_eq!(
+        plan_store
+            .list_trial_run_statuses(&owner, &experiment_id)
+            .await
+            .unwrap()
+            .get(&binding_b.trial_id)
+            .map(String::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        observation_store
+            .record_observation(&owner, &recovered)
+            .await
+            .unwrap(),
+        second
+    );
     assert_eq!(second.session_id, session_b);
     assert_eq!(
         observation_store
@@ -698,6 +1027,44 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
     .execute(pool.get())
     .await
     .expect("advance observation run generation");
+    let mut cross_generation_completed = request_a.clone();
+    cross_generation_completed.execution_run_generation = 1;
+    cross_generation_completed.idempotency_key = "observation-cross-generation-completed".into();
+    assert!(
+        observation_store
+            .record_observation(&owner, &cross_generation_completed)
+            .await
+            .is_err(),
+        "a current Completed row never authorizes cross-generation success"
+    );
+    assert!(
+        plan_store
+            .bind_trial_run(&owner, &binding_a.trial_id, &session_a, &run_a)
+            .await
+            .is_err()
+    );
+    let stale_receipt = receipt_store
+        .record_receipt(
+            &trusted,
+            &MaterializationReceiptRequest {
+                trial_id: binding_a.trial_id.clone(),
+                session_id: session_a.clone(),
+                envelope: envelope.clone(),
+                component_kind: MaterializationComponentKind::Context,
+                component_snapshot_ref: Some("context://observation".into()),
+                component_base_snapshot_ref: None,
+                component_content_fingerprint: Some("sha256:context".into()),
+                outcome: MaterializationOutcome::Available,
+                failure_code: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                idempotency_key: "observation-stale-receipt".into(),
+            },
+        )
+        .await;
+    assert!(
+        stale_receipt.is_err(),
+        "new receipts remain strictly current-generation"
+    );
     let mut stale = request_a.clone();
     stale.idempotency_key = "observation-stale".to_string();
     assert!(matches!(
