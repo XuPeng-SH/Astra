@@ -1040,7 +1040,58 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    persist_server_loop_canonical_append_inner(pool, append, state, Some(settlement)).await
+    let mut events = Vec::with_capacity(settlement.events.len() + 1);
+    if let Some(receipt) =
+        terminal_output_receipt_event(&append, state, settlement.expected_owner_generation)
+    {
+        events.push(receipt);
+    }
+    events.extend_from_slice(settlement.events);
+    persist_server_loop_canonical_append_inner(
+        pool,
+        append,
+        state,
+        Some(CanonicalTerminalSettlement {
+            events: &events,
+            ..settlement
+        }),
+    )
+    .await
+}
+
+/// Address the exact assistant content committed by the terminal transaction.
+/// This is a persistence receipt, not a claim that the task or model completed
+/// successfully. Empty/unpersisted output deliberately has no receipt.
+fn terminal_output_receipt_event(
+    append: &CanonicalLoopAppend<'_>,
+    state: &AgenticLoopState,
+    generation: u64,
+) -> Option<Value> {
+    if !append.include_terminal_assistant {
+        return None;
+    }
+    let item = terminal_assistant_transcript_item(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.trace_context.as_ref(),
+        append.user_message,
+        state,
+    )?;
+    Some(json!({
+        "event_type": "run_output_recorded",
+        "idempotency_key": format!("run-output-recorded:{generation}"),
+        "data": {
+            "schema_version": 1,
+            "owner_user_id": append.user_id,
+            "session_id": append.session_id,
+            "run_id": append.run_id,
+            "run_generation": generation,
+            "source_event_id": item.source_event_id,
+            "content_hash": astra_services::evaluation::content_fingerprint(&item.content),
+            "content_bytes": item.content.len(),
+        },
+    }))
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -3702,6 +3753,23 @@ mod tests {
                 .iter()
                 .any(|item| { item.role == "assistant" && item.content == "durable final answer" })
         );
+        let receipt = terminal_output_receipt_event(&append, &state, 7).unwrap();
+        let assistant = items.iter().find(|item| item.role == "assistant").unwrap();
+        assert_eq!(
+            receipt["data"]["source_event_id"],
+            assistant.source_event_id
+        );
+        assert_eq!(
+            receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint(&assistant.content)
+        );
+        assert_eq!(receipt["data"]["run_generation"], 7);
+        assert_ne!(
+            receipt,
+            terminal_output_receipt_event(&append, &state, 8).unwrap()
+        );
+        state.final_text.clear();
+        assert!(terminal_output_receipt_event(&append, &state, 7).is_none());
     }
 
     #[tokio::test]
@@ -6954,6 +7022,21 @@ mod tests {
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
             .await
             .expect("owner transcript persist");
+
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect("identical transcript replay");
+        let conflict = [TranscriptPersistItem {
+            run_id: Some(run_id.clone()),
+            role: "assistant",
+            content: "conflicting answer".into(),
+            payload: None,
+            source_event_id: items[2].source_event_id.clone(),
+        }];
+        let error = persist_session_transcript_items(&pool, &owner_user_id, &session_id, &conflict)
+            .await
+            .expect_err("conflicting transcript replay");
+        assert!(error.contains("conflicts with persisted content"));
 
         let owner_rows = sqlx::query(
             "SELECT role, content

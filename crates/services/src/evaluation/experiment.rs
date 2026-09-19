@@ -331,9 +331,8 @@ pub struct ExperimentSpec {
     /// this spec. Raw registration intentionally has no preparation marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_profile_version: Option<String>,
-    /// Absent on legacy plans; omission preserves their exact content identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measurement_profile: Option<super::measurement_profile::MeasurementProfile>,
+    /// Frozen metric requirements for every planned trial.
+    pub measurement_profile: super::measurement_profile::MeasurementProfile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,8 +933,18 @@ mod tests {
                 max_wall_time_secs: 300,
             },
             adapter_profile_version: None,
-            measurement_profile: None,
+            measurement_profile:
+                crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
         }
+    }
+
+    #[test]
+    fn requires_a_supported_measurement_profile() {
+        let mut value = serde_json::to_value(spec(TrialOrder::BaselineFirst)).unwrap();
+        value.as_object_mut().unwrap().remove("measurement_profile");
+        assert!(serde_json::from_value::<ExperimentSpec>(value.clone()).is_err());
+        value["measurement_profile"] = serde_json::json!("unsupported");
+        assert!(serde_json::from_value::<ExperimentSpec>(value).is_err());
     }
 
     #[test]
