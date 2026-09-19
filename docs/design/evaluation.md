@@ -150,6 +150,18 @@ not complete cost. Until trusted assessment and collector receipts are wired
 in, these gaps remain open; no verifier execution or monetary estimate is
 implied by freezing a profile.
 
+The prepare API may freeze `case.verifier_config.expected` for the
+`json_value_equals` verifier version `1`. The server records the implementation
+manifest, fixed rubric, and canonical configuration hashes in the case; these
+are part of the experiment identity. The expected value is evaluator input,
+never trial prompt content. A changed configuration conflicts on submission
+retry. Legacy cases omit this optional contract. The shared pure JSON criterion
+is also used by the test harness: it consumes the complete document and uses
+JSON value equality, without extracting code fences or interpreting prose.
+This freezes a verification criterion only; it does not yet produce a durable
+assessment. Verification still requires a trusted generation-bound output
+receipt and an append-only assessment before a report may claim task success.
+
 ## Durable registration boundary
 
 The first durable Eval boundary is intentionally small. An owner-scoped

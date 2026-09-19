@@ -1339,6 +1339,7 @@ mod tests {
                 verifier_id: "verifier-a".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                task_verifier: None,
                 input_content: None,
             }],
             repetitions: 1,

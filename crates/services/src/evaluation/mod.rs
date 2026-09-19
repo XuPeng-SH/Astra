@@ -11,6 +11,7 @@ pub mod noop;
 pub mod projection;
 pub mod report;
 pub mod service;
+pub mod task_verifier;
 pub mod types;
 pub mod utils;
 

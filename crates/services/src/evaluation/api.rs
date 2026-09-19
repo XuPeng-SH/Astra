@@ -55,6 +55,8 @@ pub struct EvaluationPrepareCase {
     pub verifier_version: String,
     #[serde(default)]
     pub holdout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_config: Option<super::task_verifier::JsonValueEqualsConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
