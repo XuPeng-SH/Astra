@@ -136,13 +136,11 @@ with no measurements or no evidence references remain explicitly incomplete
 in both structured coverage and Markdown. These basic checks do not prove
 that every evaluation dimension has been measured or that a task verifier ran.
 
-New prepared experiments freeze `measurement_profile: "instruction-only.v1"`.
+Every experiment requires `measurement_profile: "instruction-only.v1"`.
 This immutable version defines the required task, tool, context, provider,
-safety, reliability, and cost metrics and their units. Legacy specifications
-omit the field, retaining their original fingerprints and trial identities;
-submission retries preserve that original specification rather than adopting
-the current preparation defaults. Reports identify legacy dimension coverage
-as unknown. Profiled reports enumerate gaps for every planned trial and metric,
+safety, reliability, and cost metrics and their units. Missing or unsupported
+profiles are rejected. Submission retries return the frozen specification.
+Reports enumerate gaps for every planned trial and metric,
 including trials without observations. Numeric measurements and textual basis
 labels alone do not prove scoped assessment or complete collection. Existing
 token measurements are reported subtotals with unknown request/lane coverage,
@@ -155,12 +153,16 @@ The prepare API may freeze `case.verifier_config.expected` for the
 manifest, fixed rubric, and canonical configuration hashes in the case; these
 are part of the experiment identity. The expected value is evaluator input,
 never trial prompt content. A changed configuration conflicts on submission
-retry. Legacy cases omit this optional contract. The shared pure JSON criterion
+retry. Cases may omit this optional verifier contract. The shared pure JSON criterion
 is also used by the test harness: it consumes the complete document and uses
 JSON value equality, without extracting code fences or interpreting prose.
-This freezes a verification criterion only; it does not yet produce a durable
-assessment. Verification still requires a trusted generation-bound output
-receipt and an append-only assessment before a report may claim task success.
+Canonical atomic terminal settlement now writes `run_output_recorded` in the
+same transaction, binding the output to its owner, Session, Run, generation,
+and transcript `source_event_id`, with a content-only hash and byte count.
+No output means no output receipt. This receipt proves recorded output identity,
+not task success. The verifier execution path is not yet fully integrated:
+a trusted assessment must consume this output evidence and persist an
+append-only assessment before a report may claim task success.
 
 ## Durable registration boundary
 

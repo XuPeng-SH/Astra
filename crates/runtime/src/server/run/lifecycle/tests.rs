@@ -10663,7 +10663,8 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             max_wall_time_secs: 60,
         },
         adapter_profile_version: None,
-        measurement_profile: None,
+        measurement_profile:
+            astra_services::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
     };
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
     let experiment = plan_store
@@ -11328,7 +11329,8 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             max_wall_time_secs: 60,
         },
         adapter_profile_version: None,
-        measurement_profile: None,
+        measurement_profile:
+            astra_services::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
     };
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
     let experiment = plan_store

@@ -539,7 +539,8 @@ mod tests {
                 max_wall_time_secs: 60,
             },
             adapter_profile_version: None,
-            measurement_profile: None,
+            measurement_profile:
+                crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
         }
     }
 

@@ -1021,7 +1021,58 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    persist_server_loop_canonical_append_inner(pool, append, state, Some(settlement)).await
+    let mut events = Vec::with_capacity(settlement.events.len() + 1);
+    if let Some(receipt) =
+        terminal_output_receipt_event(&append, state, settlement.expected_owner_generation)
+    {
+        events.push(receipt);
+    }
+    events.extend_from_slice(settlement.events);
+    persist_server_loop_canonical_append_inner(
+        pool,
+        append,
+        state,
+        Some(CanonicalTerminalSettlement {
+            events: &events,
+            ..settlement
+        }),
+    )
+    .await
+}
+
+/// Address the exact assistant content committed by the terminal transaction.
+/// This is a persistence receipt, not a claim that the task or model completed
+/// successfully. Empty/unpersisted output deliberately has no receipt.
+fn terminal_output_receipt_event(
+    append: &CanonicalLoopAppend<'_>,
+    state: &AgenticLoopState,
+    generation: u64,
+) -> Option<Value> {
+    if !append.include_terminal_assistant {
+        return None;
+    }
+    let item = terminal_assistant_transcript_item(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.trace_context.as_ref(),
+        append.user_message,
+        state,
+    )?;
+    Some(json!({
+        "event_type": "run_output_recorded",
+        "idempotency_key": format!("run-output-recorded:{generation}"),
+        "data": {
+            "schema_version": 1,
+            "owner_user_id": append.user_id,
+            "session_id": append.session_id,
+            "run_id": append.run_id,
+            "run_generation": generation,
+            "source_event_id": item.source_event_id,
+            "content_hash": astra_services::evaluation::content_fingerprint(&item.content),
+            "content_bytes": item.content.len(),
+        },
+    }))
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -3373,7 +3424,7 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
 
     for item in items {
         let existing = sqlx::query(
-            "SELECT 1 AS existing
+            "SELECT run_id, role, content
              FROM session_transcript_items
              WHERE session_id = ? AND user_id = ? AND source_event_id = ?
              LIMIT 1",
@@ -3383,7 +3434,16 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
         .bind(&item.source_event_id)
         .fetch_optional(&mut **tx)
         .await?;
-        if existing.is_some() {
+        if let Some(existing) = existing {
+            if existing.try_get::<Option<String>, _>("run_id")? != item.run_id
+                || existing.try_get::<String, _>("role")? != item.role
+                || existing.try_get::<String, _>("content")? != item.content
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "transcript source {} conflicts with persisted content",
+                    item.source_event_id
+                )));
+            }
             continue;
         }
 
@@ -3863,8 +3923,7 @@ mod tests {
     use tokio::sync::Notify;
     use uuid::Uuid;
 
-    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
-        tokio::sync::OnceCell::const_new();
+    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
     fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
         astra_services::runs::AtomicRunTerminalSettlementCommit {
@@ -3928,20 +3987,19 @@ mod tests {
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
+        let settings = astra_core::MatrixOneSettings::from_env();
         SHARED_BOOTSTRAP
             .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_string());
                 astra_services::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure_core_schema");
-                astra_core::SharedPool::new(&settings)
-                    .await
-                    .expect("SharedPool::new")
             })
+            .await;
+        astra_core::SharedPool::new(&settings)
             .await
-            .clone()
+            .expect("SharedPool::new")
     }
 
     #[derive(Default)]
@@ -4002,6 +4060,23 @@ mod tests {
                 .iter()
                 .any(|item| { item.role == "assistant" && item.content == "durable final answer" })
         );
+        let receipt = terminal_output_receipt_event(&append, &state, 7).unwrap();
+        let assistant = items.iter().find(|item| item.role == "assistant").unwrap();
+        assert_eq!(
+            receipt["data"]["source_event_id"],
+            assistant.source_event_id
+        );
+        assert_eq!(
+            receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint(&assistant.content)
+        );
+        assert_eq!(receipt["data"]["run_generation"], 7);
+        assert_ne!(
+            receipt,
+            terminal_output_receipt_event(&append, &state, 8).unwrap()
+        );
+        state.final_text.clear();
+        assert!(terminal_output_receipt_event(&append, &state, 7).is_none());
     }
 
     #[tokio::test]
@@ -5875,40 +5950,110 @@ mod tests {
                 "data": { "status": astra_core::STATUS_COMPLETED }
             }),
         ];
-        let commit = persist_server_loop_canonical_terminal_settlement(
-            &pool,
-            CanonicalLoopAppend {
-                user_id: &user_id,
-                session_id: &session_id,
-                run_id: &run_id,
-                expected_owner_generation: Some(authority.owner_generation),
-                owner_lease_duration: Some(Duration::from_secs(45)),
-                parent_run_id: None,
-                parent_event_id: None,
-                agent_id: Some("root-agent"),
-                parent_agent_id: None,
-                trace_context: None,
-                user_message: "produce an answer",
-                model_name: Some("test-model"),
-                include_terminal_assistant: true,
-            },
+        let append = || CanonicalLoopAppend {
+            user_id: &user_id,
+            session_id: &session_id,
+            run_id: &run_id,
+            expected_owner_generation: Some(authority.owner_generation),
+            owner_lease_duration: Some(Duration::from_secs(45)),
+            parent_run_id: None,
+            parent_event_id: None,
+            agent_id: Some("root-agent"),
+            parent_agent_id: None,
+            trace_context: None,
+            user_message: "produce an answer",
+            model_name: Some("test-model"),
+            include_terminal_assistant: true,
+        };
+        let settlement = CanonicalTerminalSettlement {
+            expected_statuses: &[astra_core::STATUS_RUNNING],
+            expected_owner_generation: authority.owner_generation,
+            status: astra_core::STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &terminal_events,
+            prompt_tokens: 37,
+            completion_tokens: 17,
+            tool_calls: 6,
+        };
+        let mut conflicting_output = terminal_assistant_transcript_item(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "produce an answer",
             &state,
-            CanonicalTerminalSettlement {
-                expected_statuses: &[astra_core::STATUS_RUNNING],
-                expected_owner_generation: authority.owner_generation,
-                status: astra_core::STATUS_COMPLETED,
-                waiting_for: None,
-                error_message: None,
-                events: &terminal_events,
-                prompt_tokens: 37,
-                completion_tokens: 17,
-                tool_calls: 6,
-            },
+        )
+        .expect("terminal output");
+        conflicting_output.content = "previously persisted different answer".into();
+        persist_session_transcript_items(
+            &pool,
+            &user_id,
+            &session_id,
+            std::slice::from_ref(&conflicting_output),
         )
         .await
-        .expect("commit canonical terminal settlement");
-        assert_eq!(commit.terminal_events, terminal_events);
+        .expect("seed conflicting output");
+        let error =
+            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+                .await
+                .expect_err("receipt must match persisted output");
+        assert!(
+            error.contains("conflicts with persisted content"),
+            "{error}"
+        );
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_output_recorded'",
+        )
+        .bind(&user_id).bind(&run_id).fetch_one(&db).await.unwrap();
+        assert_eq!(receipt_count, 0);
+        for table in ["transcript_pages", "session_transcript_items"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(&db)
+            .await
+            .expect("remove conflicting transcript fixture");
+        }
+        let commit =
+            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+                .await
+                .expect("commit canonical terminal settlement");
+        let replay =
+            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+                .await
+                .expect("resolve identical terminal replay");
+        assert_eq!(replay.terminal_events, commit.terminal_events);
+        let original_output = state.final_text.clone();
+        state.final_text = "changed replay output".into();
+        persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+            .await
+            .expect_err("reject changed terminal output");
+        state.final_text = original_output;
+        assert_eq!(&commit.terminal_events[1..], terminal_events.as_slice());
+        let output_receipt = &commit.terminal_events[0];
+        assert_eq!(output_receipt["event_type"], "run_output_recorded");
+        assert_eq!(
+            output_receipt["data"]["run_generation"],
+            authority.owner_generation
+        );
+        assert_eq!(
+            output_receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint(&state.final_text)
+        );
         assert!(commit.terminal_assistant_source_event_id.is_some());
+        assert_eq!(
+            output_receipt["data"]["source_event_id"].as_str(),
+            commit.terminal_assistant_source_event_id.as_deref()
+        );
+
+        let output_receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_output_recorded'",
+        )
+        .bind(&user_id).bind(&run_id).fetch_one(&db).await.expect("persisted output receipt");
+        assert_eq!(output_receipt_count, 1);
 
         let canonical_event_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
@@ -6060,6 +6205,21 @@ mod tests {
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
             .await
             .expect("owner transcript persist");
+
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect("identical transcript replay");
+        let conflict = [TranscriptPersistItem {
+            run_id: Some(run_id.clone()),
+            role: "assistant",
+            content: "conflicting answer".into(),
+            payload: None,
+            source_event_id: items[2].source_event_id.clone(),
+        }];
+        let error = persist_session_transcript_items(&pool, &owner_user_id, &session_id, &conflict)
+            .await
+            .expect_err("conflicting transcript replay");
+        assert!(error.contains("conflicts with persisted content"));
 
         let page = sqlx::query(
             "SELECT user_id, start_item_seq, end_item_seq, item_count

@@ -158,6 +158,7 @@ fn generic_experiment_create_value() -> serde_json::Value {
         "spec": {
             "schema_version": 1,
             "experiment_id": "contract-experiment",
+            "measurement_profile": "instruction-only.v1",
             "target": {
                 "kind": "prompt",
                 "baseline": {"revision_id": "base", "content_hash": hash('a')},
