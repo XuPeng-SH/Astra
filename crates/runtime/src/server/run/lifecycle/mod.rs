@@ -4604,6 +4604,32 @@ struct AdmittedEvaluationTrial {
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 }
 
+/// Select process-local memory dependencies once at composition boundaries.
+/// Evaluation currently admits only disabled memory; it must not inherit the
+/// owner's production recall, extraction, or observer services.
+#[derive(Clone, Copy)]
+enum RuntimeMemoryPolicy {
+    Enabled,
+    Disabled,
+}
+
+impl RuntimeMemoryPolicy {
+    fn for_request(request: &ChatRequestData) -> Self {
+        if request.evaluation_admission.is_some() {
+            Self::Disabled
+        } else {
+            Self::Enabled
+        }
+    }
+
+    fn select<T>(self, service: Option<T>) -> Option<T> {
+        match self {
+            Self::Enabled => service,
+            Self::Disabled => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PreparedAgentBindingLoopContext {
     bindings: Vec<astra_services::AgentBindingRecord>,
@@ -9605,7 +9631,10 @@ impl AgenticRunLifecycleService {
             self.validate_runtime_process_authorization_executor(request)
                 .await?;
         }
-        if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
+        if request.evaluation_admission.is_none()
+            && !request.has_agent_binding_runtime()
+            && request.runtime_skill_binding.is_none()
+        {
             let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
             apply_normalized_skill_allowlist(resolver, &request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
@@ -12762,8 +12791,8 @@ impl AgenticRunLifecycleService {
         }
 
         builder = builder.with_memoria_client(
-            self.memory_extraction_service
-                .as_ref()
+            RuntimeMemoryPolicy::for_request(request)
+                .select(self.memory_extraction_service.as_ref())
                 .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
         );
 
@@ -13319,8 +13348,20 @@ impl AgenticRunLifecycleService {
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         execution_owner_generation: Option<u64>,
     ) -> LoopEnvironment {
-        let (skill_registry, skill_resolver) = if let Some(binding_context) = agent_binding_context
+        let (skill_registry, skill_resolver) = if let Some(admission) =
+            &request.evaluation_admission
         {
+            // A Prompt trial has no Skill catalog. A Skill trial receives only
+            // the immutable resolver constructed by admission, never the
+            // owner's mutable catalog or an Agent Binding catalog.
+            (
+                None,
+                admission
+                    .skill_revision
+                    .as_ref()
+                    .and(request_scoped_skill_resolver),
+            )
+        } else if let Some(binding_context) = agent_binding_context {
             (None, binding_context.skill_resolver.clone())
         } else if let Some(skill_resolver) = request_scoped_skill_resolver {
             (None, Some(skill_resolver))
@@ -13368,10 +13409,8 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override.cloned().unwrap_or_else(|| {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
-        let memory_extraction_service = if request.evaluation_admission.is_some() {
-            None
-        } else {
-            self.memory_extraction_service.as_ref().and_then(|svc| {
+        let memory_extraction_service = RuntimeMemoryPolicy::for_request(request)
+            .select(self.memory_extraction_service.as_ref()).and_then(|svc| {
                 match svc.scoped_to_owner(user_id) {
                     Ok(scoped) => Some(scoped),
                     Err(error) => {
@@ -13384,8 +13423,7 @@ impl AgenticRunLifecycleService {
                         None
                     }
                 }
-            })
-        };
+            });
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -15881,7 +15919,8 @@ impl AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: self.observer_worker.clone(),
+            observer_worker: RuntimeMemoryPolicy::for_request(&request)
+                .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -17815,14 +17854,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             );
-            if !evaluation_mode {
-                if let Some(memoria_port) = self
-                    .memory_extraction_service
-                    .as_ref()
-                    .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
-                {
-                    executor = executor.with_memoria_port(memoria_port);
-                }
+            if let Some(memoria_port) = RuntimeMemoryPolicy::for_request(&request)
+                .select(self.memory_extraction_service.as_ref())
+                .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
+            {
+                executor = executor.with_memoria_port(memoria_port);
             }
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(loop_state.cancellation.token.clone());
@@ -19306,9 +19342,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "runtime executor authorization was validated before streaming run start",
                 ),
             );
-            if let Some(memoria_port) = self
-                .memory_extraction_service
-                .as_ref()
+            if let Some(memoria_port) = RuntimeMemoryPolicy::for_request(&request)
+                .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
             {
                 executor = executor.with_memoria_port(memoria_port);
@@ -19588,7 +19623,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: self.observer_worker.clone(),
+            observer_worker: RuntimeMemoryPolicy::for_request(&request)
+                .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
