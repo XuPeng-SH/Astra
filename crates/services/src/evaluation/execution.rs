@@ -14,7 +14,7 @@ use super::durable::{
     DatabaseEvaluationPlanStore, EvaluationPersistenceError, EvaluationTrialBindingRecord,
     is_duplicate_key,
 };
-use super::experiment::{ExperimentSpec, SnapshotEnvelope};
+use super::experiment::{EvaluationTargetKind, ExperimentSpec, SnapshotEnvelope};
 use astra_core::composite_snapshot::CompositeSnapshot;
 use astra_core::{SharedPool, canonical_json_string};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const EVALUATION_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATION_EXECUTION_SCHEMA_VERSION: u32 = 2;
 const MAX_ID_BYTES: usize = 128;
 const MAX_SESSION_ID_BYTES: usize = 64;
 const MAX_RUN_ID_BYTES: usize = 128;
@@ -108,6 +108,9 @@ impl EvaluationRunAdmission {
 pub struct EvaluationObservationRequest {
     pub session_id: String,
     pub execution_run_id: String,
+    /// Generation that admitted the immutable trial and its receipts.
+    pub admission_run_generation: u64,
+    /// Current canonical Run generation that produced the terminal fact.
     pub execution_run_generation: u64,
     pub observation: TrialObservation,
     #[serde(default)]
@@ -125,6 +128,9 @@ pub struct EvaluationObservationRecord {
     pub trial_id: String,
     pub session_id: String,
     pub execution_run_id: String,
+    /// Generation that admitted the immutable trial and its receipts.
+    pub admission_run_generation: u64,
+    /// Current canonical Run generation that produced the terminal fact.
     pub execution_run_generation: u64,
     pub observation: TrialObservation,
     pub materialization_receipt_ids: Vec<String>,
@@ -134,14 +140,14 @@ pub struct EvaluationObservationRecord {
     pub updated_at: String,
 }
 
-/// Bounded marker proof used by status/projection repair before hydrating a
-/// canonical Run event stream.  The admission marker identifies the exact
-/// trial and generation; the settlement bit proves that terminal accounting
-/// and the durable settlement fence have both been committed.
+/// Bounded discovery metadata for status/projection repair. Admission carries
+/// its original generation and event index; settlement refers to the requested
+/// terminal generation. This marker alone never authorizes cross-generation writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvaluationAdmissionMarker {
     pub admission: EvaluationRunAdmission,
-    pub execution_run_generation: u64,
+    pub admission_run_generation: u64,
+    pub admission_event_idx: i64,
     pub settlement_finished: bool,
 }
 
@@ -217,16 +223,71 @@ impl DatabaseEvaluationObservationStore {
             return Ok(existing);
         }
 
-        let (experiment, binding) = DatabaseEvaluationPlanStore::lock_bound_trial_for_receipt(
+        let (experiment, mut binding, current_generation) =
+            DatabaseEvaluationPlanStore::lock_trial_run(
+                &mut tx,
+                owner_user_id,
+                &request.observation.trial_id,
+                &request.session_id,
+                &request.execution_run_id,
+            )
+            .await?;
+        if current_generation != request.execution_run_generation {
+            return Err(EvaluationPersistenceError::Conflict(
+                "observation terminal generation is stale".into(),
+            )
+            .into());
+        }
+        let (marker, enriched) = load_admission_tx(
             &mut tx,
             owner_user_id,
-            &request.observation.trial_id,
-            &request.session_id,
+            &request.execution_run_id,
+            Some(&request.session_id),
         )
-        .await
-        .map_err(EvaluationExecutionError::Persistence)?;
+        .await?
+        .ok_or_else(|| {
+            EvaluationExecutionError::Conflict("observation has no durable admission".into())
+        })?;
+        validate_admission_for_observation(
+            &experiment.spec,
+            &binding,
+            owner_user_id,
+            request,
+            &marker,
+        )?;
+        let needs_binding = binding.binding_status == "planned"
+            && binding.session_id.is_none()
+            && binding.run_id.is_none()
+            && binding.run_generation.is_none();
+        if needs_binding {
+            // Validate the proposed original binding before persisting it. All
+            // authorization and its CAS remain in this observation transaction.
+            binding.session_id = Some(request.session_id.clone());
+            binding.run_id = Some(request.execution_run_id.clone());
+            binding.run_generation = Some(marker.admission_run_generation);
+            binding.binding_status = "bound".into();
+        }
         validate_binding_for_observation(&experiment.spec, &binding, request)?;
-        validate_canonical_run_and_receipts(&mut tx, owner_user_id, &binding, request).await?;
+        validate_canonical_run_and_receipts(
+            &mut tx,
+            owner_user_id,
+            &binding,
+            request,
+            &marker,
+            enriched,
+        )
+        .await?;
+        if needs_binding {
+            binding = DatabaseEvaluationPlanStore::bind_locked_trial(
+                &mut tx,
+                owner_user_id,
+                &binding.trial_id,
+                &request.session_id,
+                &request.execution_run_id,
+                marker.admission_run_generation,
+            )
+            .await?;
+        }
 
         let observation_id = Uuid::now_v7().to_string();
         let observation_json = serde_json::to_string(&request.observation).map_err(|source| {
@@ -251,10 +312,10 @@ impl DatabaseEvaluationObservationStore {
         let result = sqlx::query(
             "INSERT INTO evaluation_trial_observations
              (schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-              session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+              session_id, execution_run_id, admission_run_generation, execution_run_generation, spec_fingerprint,
               observation_json, materialization_receipt_ids_json, request_fingerprint,
               idempotency_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
         .bind(i64::from(EVALUATION_EXECUTION_SCHEMA_VERSION))
         .bind(owner_user_id)
@@ -263,6 +324,9 @@ impl DatabaseEvaluationObservationStore {
         .bind(&binding.trial_id)
         .bind(&request.session_id)
         .bind(&request.execution_run_id)
+        .bind(i64::try_from(request.admission_run_generation).map_err(|_| {
+            EvaluationExecutionError::InvalidInput("admission run generation exceeds BIGINT".into())
+        })?)
         .bind(
             i64::try_from(request.execution_run_generation).map_err(|_| {
                 EvaluationExecutionError::InvalidInput(
@@ -361,7 +425,7 @@ impl DatabaseEvaluationObservationStore {
             .map_err(EvaluationExecutionError::InvalidInput)?;
         let row = sqlx::query(
             "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-                    session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+                    session_id, execution_run_id, admission_run_generation, execution_run_generation, spec_fingerprint,
                     observation_json, materialization_receipt_ids_json, request_fingerprint,
                     idempotency_key, CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -396,139 +460,41 @@ impl DatabaseEvaluationObservationStore {
             .map_err(EvaluationExecutionError::InvalidInput)?;
         validate_id("run_id", run_id, MAX_RUN_ID_BYTES)
             .map_err(EvaluationExecutionError::InvalidInput)?;
-        let rows = sqlx::query(
-            "SELECT event_type, idempotency_key, payload_json
-             FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx)
-             WHERE user_id = ? AND run_id = ?
-               AND event_type IN ('evaluation_admitted', 'run_started',
-                                  'run_settlement_finished')
-             ORDER BY event_idx DESC
-             LIMIT 128",
+        let mut tx =
+            self.pool
+                .get()
+                .begin()
+                .await
+                .map_err(|source| EvaluationExecutionError::Database {
+                    operation: "begin_load_evaluation_admission_marker",
+                    source,
+                })?;
+        let marker = load_admission_tx(&mut tx, owner_user_id, run_id, None).await?;
+        let Some((mut marker, _)) = marker else {
+            return Ok(None);
+        };
+        marker.settlement_finished = sqlx::query_scalar::<_, i64>(
+            "SELECT event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_type = 'run_settlement_finished'
+               AND idempotency_key = ? LIMIT 1",
         )
         .bind(owner_user_id)
         .bind(run_id)
-        .fetch_all(self.pool.get())
+        .bind(format!("run-settlement-finished:{expected_run_generation}"))
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|source| EvaluationExecutionError::Database {
-            operation: "load_evaluation_admission_marker_for_run",
+            operation: "load_evaluation_settlement_marker",
             source,
-        })?;
-
-        let mut settlement_generations = HashSet::new();
-        let mut enriched = None;
-        let mut fallback = None;
-        for row in rows {
-            let event_type: String =
-                row.try_get("event_type")
-                    .map_err(|source| EvaluationExecutionError::Database {
-                        operation: "decode_evaluation_marker_event_type",
-                        source,
-                    })?;
-            match event_type.as_str() {
-                "run_settlement_finished" => {
-                    let key = row
-                        .try_get::<Option<String>, _>("idempotency_key")
-                        .map_err(|source| EvaluationExecutionError::Database {
-                            operation: "decode_evaluation_settlement_marker_key",
-                            source,
-                        })?;
-                    if let Some(generation) = key
-                        .as_deref()
-                        .and_then(|key| key.strip_prefix("run-settlement-finished:"))
-                        .and_then(|generation| generation.parse::<u64>().ok())
-                    {
-                        settlement_generations.insert(generation);
-                    }
-                }
-                "evaluation_admitted" | "run_started" => {
-                    let payload: String = row.try_get("payload_json").map_err(|source| {
-                        EvaluationExecutionError::Database {
-                            operation: "decode_evaluation_admission_marker_payload",
-                            source,
-                        }
-                    })?;
-                    let event: Value = serde_json::from_str(&payload).map_err(|source| {
-                        EvaluationExecutionError::Json {
-                            operation: "decode_evaluation_admission_marker_payload",
-                            source,
-                        }
-                    })?;
-                    let (generation, admission_value) = if event_type == "evaluation_admitted" {
-                        (
-                            Some(
-                                event
-                                    .get("run_generation")
-                                    .and_then(Value::as_u64)
-                                    .ok_or_else(|| {
-                                        EvaluationExecutionError::Conflict(
-                                            "evaluation admission marker has no execution generation"
-                                                .to_string(),
-                                        )
-                                    })?,
-                            ),
-                            event.pointer("/data/admission"),
-                        )
-                    } else {
-                        (None, event.pointer("/data/evaluation_admission"))
-                    };
-                    let Some(admission_value) = admission_value else {
-                        continue;
-                    };
-                    let admission =
-                        serde_json::from_value::<EvaluationRunAdmission>(admission_value.clone())
-                            .map_err(|source| EvaluationExecutionError::Json {
-                            operation: "deserialize_evaluation_admission_marker",
-                            source,
-                        })?;
-                    admission
-                        .validate_shape()
-                        .map_err(EvaluationExecutionError::Conflict)?;
-                    if event_type == "evaluation_admitted" {
-                        if enriched.is_none() {
-                            let generation = generation.ok_or_else(|| {
-                                EvaluationExecutionError::Conflict(
-                                    "evaluation admission marker has no execution generation"
-                                        .to_string(),
-                                )
-                            })?;
-                            enriched = Some((generation, admission));
-                        }
-                    } else if fallback.is_none() {
-                        let generation = event
-                            .pointer("/data/owner_generation")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| {
-                                EvaluationExecutionError::Conflict(
-                                    "run_started evaluation admission has no owner generation"
-                                        .to_string(),
-                                )
-                            })?;
-                        fallback = Some((generation, admission));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let (execution_run_generation, admission) = if let Some((generation, admission)) = enriched
-        {
-            if generation != expected_run_generation {
-                return Ok(None);
-            }
-            (generation, admission)
-        } else if let Some((generation, admission)) = fallback {
-            if generation != expected_run_generation {
-                return Ok(None);
-            }
-            (generation, admission)
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(EvaluationAdmissionMarker {
-            admission,
-            execution_run_generation,
-            settlement_finished: settlement_generations.contains(&expected_run_generation),
-        }))
+        })?
+        .is_some();
+        tx.commit()
+            .await
+            .map_err(|source| EvaluationExecutionError::Database {
+                operation: "commit_load_evaluation_admission_marker",
+                source,
+            })?;
+        Ok(Some(marker))
     }
 
     pub async fn load_by_idempotency(
@@ -542,7 +508,7 @@ impl DatabaseEvaluationObservationStore {
             .map_err(EvaluationExecutionError::InvalidInput)?;
         let row = sqlx::query(
             "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-                    session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+                    session_id, execution_run_id, admission_run_generation, execution_run_generation, spec_fingerprint,
                     observation_json, materialization_receipt_ids_json, request_fingerprint,
                     idempotency_key, CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -573,7 +539,7 @@ async fn list_observations_tx(
         .map_err(EvaluationExecutionError::InvalidInput)?;
     let rows = sqlx::query(
         "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-                session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+                session_id, execution_run_id, admission_run_generation, execution_run_generation, spec_fingerprint,
                 observation_json, materialization_receipt_ids_json, request_fingerprint,
                 idempotency_key, CAST(created_at AS CHAR) AS created_at,
                 CAST(updated_at AS CHAR) AS updated_at
@@ -593,6 +559,210 @@ async fn list_observations_tx(
     rows.into_iter().map(decode_observation).collect()
 }
 
+/// Read admission independently of settlement/recovery tails. The earliest event of
+/// each admission type is immutable identity, not a recent-generation override.
+async fn load_admission_tx(
+    tx: &mut Transaction<'_, MySql>,
+    owner_user_id: &str,
+    run_id: &str,
+    expected_session_id: Option<&str>,
+) -> Result<Option<(EvaluationAdmissionMarker, bool)>, EvaluationExecutionError> {
+    let mut started: Option<EvaluationAdmissionMarker> = None;
+    let mut enriched: Option<EvaluationAdmissionMarker> = None;
+    for event_type in ["run_started", "evaluation_admitted"] {
+        // Discovery takes a consistent read; the observation writer already
+        // holds Session -> Run -> Trial and re-reads these facts under lock.
+        let lock = if expected_session_id.is_some() {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT e.session_id, e.event_idx, e.payload_json, e.event_hash,
+                    r.session_id AS run_session_id, r.last_event_idx
+             FROM agent_run_events e FORCE INDEX (idx_agent_run_events_control_type_idx)
+             JOIN agent_runs r ON r.user_id = e.user_id AND r.run_id = e.run_id
+             WHERE e.user_id = ? AND e.run_id = ? AND e.event_type = ?
+             ORDER BY e.event_idx ASC LIMIT 1{lock}"
+        );
+        let row = sqlx::query(&sql)
+            .bind(owner_user_id)
+            .bind(run_id)
+            .bind(event_type)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| EvaluationExecutionError::Database {
+                operation: "load_evaluation_admission_fact",
+                source,
+            })?;
+        let Some(row) = row else {
+            continue;
+        };
+        let session_id = row_string(&row, "session_id")?;
+        if session_id != row_string(&row, "run_session_id")?
+            || expected_session_id.is_some_and(|expected| session_id != expected)
+        {
+            return Err(EvaluationExecutionError::Conflict(
+                "admission belongs to another session".into(),
+            ));
+        }
+        let event: Value =
+            serde_json::from_str(&row_string(&row, "payload_json")?).map_err(|source| {
+                EvaluationExecutionError::Json {
+                    operation: "decode_evaluation_admission_fact",
+                    source,
+                }
+            })?;
+        let event_json =
+            serde_json::to_string(&event).map_err(|source| EvaluationExecutionError::Json {
+                operation: "serialize_evaluation_admission_hash",
+                source,
+            })?;
+        if row_string(&row, "event_hash")? != format!("{:x}", Sha256::digest(event_json.as_bytes()))
+        {
+            return Err(EvaluationExecutionError::Conflict(
+                "admission event hash mismatch".into(),
+            ));
+        }
+        if event.get("event_type").and_then(Value::as_str) != Some(event_type) {
+            return Err(EvaluationExecutionError::Conflict(
+                "admission event type mismatch".into(),
+            ));
+        }
+        let pointer = if event_type == "run_started" {
+            "/data/evaluation_admission"
+        } else {
+            "/data/admission"
+        };
+        let Some(value) = event.pointer(pointer).filter(|value| !value.is_null()) else {
+            if event_type == "run_started" {
+                continue;
+            }
+            return Err(EvaluationExecutionError::Conflict(
+                "evaluation admission payload is missing".into(),
+            ));
+        };
+        let admission: EvaluationRunAdmission =
+            serde_json::from_value(value.clone()).map_err(|source| {
+                EvaluationExecutionError::Json {
+                    operation: "deserialize_evaluation_admission_fact",
+                    source,
+                }
+            })?;
+        admission
+            .validate_shape()
+            .map_err(EvaluationExecutionError::Conflict)?;
+        let admission_run_generation = if event_type == "run_started" {
+            event.pointer("/data/owner_generation")
+        } else {
+            event.get("run_generation")
+        }
+        .and_then(Value::as_u64)
+        .ok_or_else(|| EvaluationExecutionError::Conflict("admission has no generation".into()))?;
+        let event_idx: i64 =
+            row.try_get("event_idx")
+                .map_err(|source| EvaluationExecutionError::Database {
+                    operation: "decode_evaluation_admission_event_idx",
+                    source,
+                })?;
+        let last_event_idx: i64 =
+            row.try_get("last_event_idx")
+                .map_err(|source| EvaluationExecutionError::Database {
+                    operation: "decode_evaluation_admission_run_watermark",
+                    source,
+                })?;
+        if event_idx < 0 || event_idx > last_event_idx {
+            return Err(EvaluationExecutionError::Conflict(
+                "admission event is outside the canonical Run watermark".into(),
+            ));
+        }
+        let marker = EvaluationAdmissionMarker {
+            admission,
+            admission_run_generation,
+            admission_event_idx: event_idx,
+            settlement_finished: false,
+        };
+        if event_type == "run_started" {
+            started = Some(marker);
+        } else {
+            enriched = Some(marker);
+        }
+    }
+    if let (Some(started), Some(enriched)) = (&started, &enriched) {
+        let original = &started.admission;
+        let admitted = &enriched.admission;
+        if started.admission_run_generation != enriched.admission_run_generation
+            || started.admission_event_idx >= enriched.admission_event_idx
+            || original.experiment_id != admitted.experiment_id
+            || original.trial_id != admitted.trial_id
+            || original.input_content_hash != admitted.input_content_hash
+            || original.revision_content_hash != admitted.revision_content_hash
+            || original.skill_revision != admitted.skill_revision
+        {
+            return Err(EvaluationExecutionError::Conflict(
+                "run start and evaluation admission disagree".into(),
+            ));
+        }
+    }
+    Ok(enriched
+        .map(|marker| (marker, true))
+        .or_else(|| started.map(|marker| (marker, false))))
+}
+
+fn validate_admission_for_observation(
+    spec: &ExperimentSpec,
+    binding: &EvaluationTrialBindingRecord,
+    owner_user_id: &str,
+    request: &EvaluationObservationRequest,
+    marker: &EvaluationAdmissionMarker,
+) -> Result<(), EvaluationExecutionError> {
+    let admission = &marker.admission;
+    let revision = match binding.trial.arm {
+        ComparisonArm::Baseline => &spec.target.baseline,
+        ComparisonArm::Candidate => &spec.target.candidate,
+    };
+    if marker.admission_run_generation != request.admission_run_generation
+        || admission.experiment_id != binding.experiment_id
+        || admission.trial_id != binding.trial_id
+        || admission.input_content_hash != binding.trial.input_content_hash
+        || admission.revision_content_hash != revision.content_hash
+    {
+        return Err(EvaluationExecutionError::Conflict(
+            "durable admission disagrees with frozen trial or original generation".into(),
+        ));
+    }
+    match (&spec.target.kind, &admission.skill_revision) {
+        (EvaluationTargetKind::Prompt, None) => {}
+        (EvaluationTargetKind::Skill, Some(skill))
+            if Some(skill.skill_name.as_str()) == spec.target.skill_name.as_deref()
+                && skill.revision_id == revision.revision_id
+                && skill.content_hash == revision.content_hash => {}
+        _ => {
+            return Err(EvaluationExecutionError::Conflict(
+                "durable admission revision identity differs from frozen target".into(),
+            ));
+        }
+    }
+    if let Some(envelope) = &admission.snapshot_envelope {
+        envelope
+            .validate_for(
+                owner_user_id,
+                &binding.experiment_id,
+                Some(&binding.trial_id),
+                Some(&request.session_id),
+            )
+            .map_err(EvaluationExecutionError::Conflict)?;
+        if envelope.context_snapshot_hash != spec.conditions.context_snapshot_hash
+            || envelope.policy_snapshot_hash != spec.conditions.tool_policy_hash
+        {
+            return Err(EvaluationExecutionError::Conflict(
+                "durable admission envelope differs from frozen conditions".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_binding_for_observation(
     spec: &ExperimentSpec,
     binding: &EvaluationTrialBindingRecord,
@@ -608,9 +778,10 @@ fn validate_binding_for_observation(
             "trial binding does not match its frozen experiment".to_string(),
         ));
     }
-    if binding.session_id.as_deref() != Some(request.session_id.as_str())
+    if binding.binding_status != "bound"
+        || binding.session_id.as_deref() != Some(request.session_id.as_str())
         || binding.run_id.as_deref() != Some(request.execution_run_id.as_str())
-        || binding.run_generation != Some(request.execution_run_generation)
+        || binding.run_generation != Some(request.admission_run_generation)
     {
         return Err(EvaluationExecutionError::Conflict(
             "observation execution identity does not match the current trial binding".to_string(),
@@ -643,6 +814,8 @@ async fn validate_canonical_run_and_receipts(
     owner_user_id: &str,
     binding: &EvaluationTrialBindingRecord,
     request: &EvaluationObservationRequest,
+    marker: &EvaluationAdmissionMarker,
+    enriched: bool,
 ) -> Result<(), EvaluationExecutionError> {
     let status = sqlx::query_scalar::<_, String>(
         "SELECT status FROM agent_runs
@@ -687,85 +860,56 @@ async fn validate_canonical_run_and_receipts(
             request.observation.status
         )));
     }
-    let admitted_event = sqlx::query_scalar::<_, String>(
-        "SELECT payload_json FROM agent_run_events
-         WHERE user_id = ? AND run_id = ? AND session_id = ?
-           AND event_type = 'evaluation_admitted'
-         ORDER BY event_idx DESC LIMIT 1 FOR UPDATE",
-    )
-    .bind(owner_user_id)
-    .bind(&request.execution_run_id)
-    .bind(&request.session_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| EvaluationExecutionError::Database {
-        operation: "load_evaluation_admission_marker",
-        source,
-    })?;
-    let admitted = admitted_event
-        .map(|payload| {
-            let event: Value = serde_json::from_str(&payload).map_err(|source| {
-                EvaluationExecutionError::Json {
-                    operation: "decode_evaluation_admission_marker",
-                    source,
-                }
-            })?;
-            let marker_generation = event
-                .get("run_generation")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    EvaluationExecutionError::Conflict(
-                        "evaluation admission marker has no execution generation".to_string(),
-                    )
-                })?;
-            if marker_generation != request.execution_run_generation {
-                return Err(EvaluationExecutionError::Conflict(
-                    "evaluation admission marker belongs to another execution generation"
-                        .to_string(),
-                ));
-            }
-            let value = event.pointer("/data/admission").ok_or_else(|| {
-                EvaluationExecutionError::Conflict(
-                    "evaluation admission marker has no admission payload".to_string(),
-                )
-            })?;
-            let admission = serde_json::from_value::<EvaluationRunAdmission>(value.clone())
-                .map_err(|source| EvaluationExecutionError::Json {
-                    operation: "deserialize_evaluation_admission_marker",
-                    source,
-                })?;
-            admission
-                .validate_shape()
-                .map_err(EvaluationExecutionError::Conflict)?;
-            Ok::<_, EvaluationExecutionError>(admission)
-        })
-        .transpose()?;
-    if expected_status == TrialStatus::Completed && admitted.is_none() {
+    if request.admission_run_generation != request.execution_run_generation {
+        if !matches!(
+            request.observation.status,
+            TrialStatus::Failed | TrialStatus::Cancelled
+        ) {
+            return Err(EvaluationExecutionError::Conflict(
+                "recovery cannot authorize a successful or delegated observation".into(),
+            ));
+        }
+        let proof = crate::runs::validate_run_recovery_terminal_in_transaction(
+            tx,
+            owner_user_id,
+            &request.session_id,
+            &request.execution_run_id,
+            request.admission_run_generation,
+            request.execution_run_generation,
+            marker.admission_event_idx,
+        )
+        .await
+        .map_err(EvaluationExecutionError::Conflict)?
+        .ok_or_else(|| {
+            EvaluationExecutionError::Conflict(
+                "recovery observation lacks complete custody and terminal proof".into(),
+            )
+        })?;
+        if proof.status != status || proof.generation != request.execution_run_generation {
+            return Err(EvaluationExecutionError::Conflict(
+                "recovery terminal proof disagrees with observation".into(),
+            ));
+        }
+    }
+    let admitted = &marker.admission;
+    if expected_status == TrialStatus::Completed && !enriched {
         return Err(EvaluationExecutionError::Conflict(
-            "completed evaluation run has no durable admission marker".to_string(),
+            "completed evaluation run has no durable enriched admission".into(),
         ));
     }
-    if let Some(admitted) = admitted.as_ref() {
-        if admitted.experiment_id != binding.experiment_id || admitted.trial_id != binding.trial_id
-        {
-            return Err(EvaluationExecutionError::Conflict(
-                "durable admission marker does not match the bound trial".to_string(),
-            ));
-        }
-        let mut expected_receipts = admitted.receipt_ids.clone();
-        expected_receipts.sort_unstable();
-        let mut actual_receipts = request.materialization_receipt_ids.clone();
-        actual_receipts.sort_unstable();
-        if expected_receipts != actual_receipts {
-            return Err(EvaluationExecutionError::Conflict(
-                "observation receipt set does not match the durable admission".to_string(),
-            ));
-        }
+    let mut expected_receipts = admitted.receipt_ids.clone();
+    expected_receipts.sort_unstable();
+    let mut actual_receipts = request.materialization_receipt_ids.clone();
+    actual_receipts.sort_unstable();
+    if expected_receipts != actual_receipts {
+        return Err(EvaluationExecutionError::Conflict(
+            "observation receipt set does not match the durable admission".into(),
+        ));
     }
     if request.materialization_receipt_ids.is_empty() {
         return Ok(());
     }
-    let expected_generation = i64::try_from(request.execution_run_generation).map_err(|_| {
+    let expected_generation = i64::try_from(request.admission_run_generation).map_err(|_| {
         EvaluationExecutionError::InvalidInput(
             "execution run generation exceeds BIGINT".to_string(),
         )
@@ -842,9 +986,7 @@ async fn validate_canonical_run_and_receipts(
                     source,
                 }
             })?;
-        let expected_envelope = admitted
-            .as_ref()
-            .and_then(|admission| admission.snapshot_envelope.as_ref());
+        let expected_envelope = admitted.snapshot_envelope.as_ref();
         if trial_id != binding.trial_id
             || session_id != request.session_id
             || execution_run_id.as_deref() != Some(request.execution_run_id.as_str())
@@ -877,6 +1019,13 @@ fn validate_request_shape(
     .map_err(EvaluationExecutionError::InvalidInput)?;
     validate_id("idempotency_key", &request.idempotency_key, MAX_ID_BYTES)
         .map_err(EvaluationExecutionError::InvalidInput)?;
+    if request.admission_run_generation > request.execution_run_generation
+        || request.execution_run_generation > i64::MAX as u64
+    {
+        return Err(EvaluationExecutionError::InvalidInput(
+            "invalid admission/terminal generation order".into(),
+        ));
+    }
     validate_receipt_ids(&request.materialization_receipt_ids)?;
     if request.observation.trial_id.trim().is_empty()
         || request.observation.case_id.trim().is_empty()
@@ -959,6 +1108,7 @@ fn request_fingerprint(
         "owner_user_id": owner_user_id,
         "session_id": request.session_id,
         "execution_run_id": request.execution_run_id,
+        "admission_run_generation": request.admission_run_generation,
         "execution_run_generation": request.execution_run_generation,
         "observation": request.observation,
         "materialization_receipt_ids": request.materialization_receipt_ids,
@@ -1023,7 +1173,7 @@ async fn load_observation_by_id_tx(
 fn observation_select_sql(predicate: &str) -> String {
     format!(
         "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-                session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+                session_id, execution_run_id, admission_run_generation, execution_run_generation, spec_fingerprint,
                 observation_json, materialization_receipt_ids_json, request_fingerprint,
                 idempotency_key, CAST(created_at AS CHAR) AS created_at,
                 CAST(updated_at AS CHAR) AS updated_at
@@ -1075,6 +1225,15 @@ fn decode_observation(
             source,
         }
     })?;
+    let admission_generation: i64 = row.try_get("admission_run_generation").map_err(|source| {
+        EvaluationExecutionError::Database {
+            operation: "decode_evaluation_observation_admission_generation",
+            source,
+        }
+    })?;
+    let admission_run_generation = u64::try_from(admission_generation).map_err(|_| {
+        EvaluationExecutionError::Conflict("invalid admission run generation".into())
+    })?;
     let owner_user_id = row_string(&row, "owner_user_id")?;
     let session_id = row_string(&row, "session_id")?;
     let execution_run_id = row_string(&row, "execution_run_id")?;
@@ -1086,6 +1245,7 @@ fn decode_observation(
     let reconstructed_request = EvaluationObservationRequest {
         session_id: session_id.clone(),
         execution_run_id: execution_run_id.clone(),
+        admission_run_generation,
         execution_run_generation: u64::try_from(generation).map_err(|_| {
             EvaluationExecutionError::Conflict(
                 "evaluation observation has an invalid run generation".to_string(),
@@ -1115,6 +1275,7 @@ fn decode_observation(
         trial_id,
         session_id,
         execution_run_id,
+        admission_run_generation,
         execution_run_generation: u64::try_from(generation).map_err(|_| {
             EvaluationExecutionError::Conflict(
                 "evaluation observation has an invalid run generation".to_string(),
@@ -1388,6 +1549,7 @@ mod tests {
         let mut request = EvaluationObservationRequest {
             session_id: "session".into(),
             execution_run_id: "run".into(),
+            admission_run_generation: 1,
             execution_run_generation: 1,
             observation: terminal_run_observation(
                 "fingerprint".into(),
@@ -1405,6 +1567,26 @@ mod tests {
             idempotency_key: "observation".into(),
         };
         validate_request_shape(&request).expect("real zero and missing usage are valid");
+        let mut wire = serde_json::to_value(&request).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .remove("admission_run_generation");
+        assert!(
+            serde_json::from_value::<EvaluationObservationRequest>(wire).is_err(),
+            "original admission generation is required, never defaulted"
+        );
+        let fingerprint = request_fingerprint("owner", &request).unwrap();
+        let mut recovery = request.clone();
+        recovery.admission_run_generation = 0;
+        assert_ne!(
+            request_fingerprint("owner", &recovery).unwrap(),
+            fingerprint
+        );
+        recovery.admission_run_generation = 2;
+        assert!(
+            validate_request_shape(&recovery).is_err(),
+            "admission cannot follow terminal generation"
+        );
         request.observation.measurements[0].value = None;
         assert!(validate_request_shape(&request).is_err());
         request.observation.measurements[0].value = Some(0.0);

@@ -100,41 +100,6 @@ fn evaluation_trial_status_keeps_terminal_run_meanings_distinct() {
 }
 
 #[test]
-fn evaluation_crash_recovery_requires_current_generation_and_terminal_match() {
-    let old_generation = json!({
-        "event_type": "run_finished",
-        "data": {
-            "status": STATUS_FAILED,
-            "source": "crash_recovery",
-            "owner_generation": 2,
-        }
-    });
-    let current_generation = json!({
-        "event_type": "run_finished",
-        "data": {
-            "status": STATUS_FAILED,
-            "source": "crash_recovery",
-            "owner_generation": 3,
-        }
-    });
-    assert!(!evaluation_crash_recovery_is_current_generation(
-        std::slice::from_ref(&old_generation),
-        STATUS_FAILED,
-        3,
-    ));
-    assert!(evaluation_crash_recovery_is_current_generation(
-        std::slice::from_ref(&current_generation),
-        STATUS_FAILED,
-        3,
-    ));
-    assert!(!evaluation_crash_recovery_is_current_generation(
-        std::slice::from_ref(&current_generation),
-        STATUS_COMPLETED,
-        3,
-    ));
-}
-
-#[test]
 fn evaluation_skill_invocation_evidence_requires_the_admitted_revision() {
     let svc = test_service();
     let request = test_request("invoke the pinned skill");
@@ -11103,6 +11068,192 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .get_run_status(cancel_run.run_id.clone(), owner.clone())
         .await
         .expect("repeated status repair remains idempotent");
+
+    // Crash after canonical Run creation but before trial binding. A claim
+    // itself can also crash: two real claims must preserve the original
+    // admission identity and settle one observation without invoking a model.
+    let mut recovery_spec = spec.clone();
+    recovery_spec.experiment_id = format!("eval-recovery-exp-{}", Uuid::new_v4());
+    let recovery_experiment = plan_store
+        .register_experiment(&owner, &recovery_spec, "runtime-eval-recovery-submit")
+        .await
+        .unwrap();
+    let recovery_trial = plan_store
+        .list_trials(&owner, &recovery_experiment.experiment_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .unwrap();
+    let recovery_session = format!("eval-recovery-session-{}", Uuid::new_v4());
+    let recovery_run_id = format!("eval-recovery-run-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &recovery_session).await;
+    let recovery_store =
+        Arc::new(DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("eval-recovery-pod"));
+    let recovery_engine = RunEngine::new(recovery_store.clone());
+    let mut metadata = Map::new();
+    metadata.insert(
+        "evaluation_admission".into(),
+        serde_json::to_value(EvaluationRunAdmission {
+            experiment_id: recovery_experiment.experiment_id.clone(),
+            trial_id: recovery_trial.trial_id.clone(),
+            input_content_hash: recovery_trial.trial.input_content_hash.clone(),
+            revision_content_hash: recovery_spec.target.baseline.content_hash.clone(),
+            skill_revision: None,
+            receipt_ids: Vec::new(),
+            snapshot_envelope: None,
+        })
+        .unwrap(),
+    );
+    let authority = recovery_engine
+        .start_run_with_context(
+            &recovery_run_id,
+            &owner,
+            &recovery_session,
+            crate::server::run::engine::RunStartContext {
+                execution_metadata: Some(metadata),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let claims = recovery_store
+        .claim_recoverable_active_runs(100)
+        .await
+        .unwrap();
+    let first_claim = claims
+        .iter()
+        .find(|claim| claim.run.run_id == recovery_run_id)
+        .unwrap();
+    assert_eq!(
+        first_claim.claimed_from_generation,
+        authority.owner_generation
+    );
+    let recovered = recovery_engine.recover_active_runs().await.unwrap();
+    let recovered = recovered
+        .iter()
+        .find(|run| run.run_id == recovery_run_id)
+        .unwrap();
+    assert_eq!(recovered.run_generation, authority.owner_generation + 2);
+    assert_eq!(recovered.status, STATUS_FAILED);
+    assert_eq!(
+        plan_store
+            .load_trial(&owner, &recovery_trial.trial_id)
+            .await
+            .unwrap()
+            .binding_status,
+        "planned"
+    );
+    let provider_calls_before_recovery = llm.requests.load(Ordering::SeqCst);
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    let recovered_observation = observation_store
+        .load_by_trial(&owner, &recovery_trial.trial_id)
+        .await
+        .unwrap()
+        .expect("pre-bind crash must settle through verified recovery custody");
+    assert_eq!(
+        recovered_observation.admission_run_generation,
+        authority.owner_generation
+    );
+    assert_eq!(
+        recovered_observation.execution_run_generation,
+        recovered.run_generation
+    );
+    assert_eq!(
+        recovered_observation.observation.status,
+        TrialStatus::Failed
+    );
+    assert!(recovered_observation.materialization_receipt_ids.is_empty());
+    assert!(
+        recovered_observation
+            .observation
+            .measurements
+            .iter()
+            .all(|measurement| {
+                measurement.value.is_none()
+                    && measurement.status == astra_services::evaluation::MeasurementStatus::Missing
+            })
+    );
+    assert!(
+        recovered_observation
+            .observation
+            .evidence
+            .iter()
+            .any(|evidence| {
+                evidence.kind == EvidenceKind::Trace
+                    && evidence.availability == EvidenceAvailability::Available
+            })
+    );
+    let projection =
+        astra_services::evaluation::DatabaseEvaluationProjectionStore::new(pool.clone())
+            .load_experiment(&owner, &recovery_experiment.experiment_id)
+            .await
+            .expect("projection accepts original admission and verified terminal generations");
+    assert_eq!(projection.observed_trial_count, 1);
+    let projected = projection
+        .trials
+        .iter()
+        .find(|trial| trial.binding.trial_id == recovery_trial.trial_id)
+        .unwrap();
+    assert_eq!(
+        projected.binding.run_generation,
+        Some(authority.owner_generation)
+    );
+    assert_eq!(projected.run_status.as_deref(), Some(STATUS_FAILED));
+    recovery_engine
+        .append_events_batch(
+            &owner,
+            &recovery_session,
+            &recovery_run_id,
+            &[json!({"event_type": "projection_checked", "data": {}})],
+        )
+        .await
+        .unwrap();
+    // Rebuild again after a later event to exercise the terminal evidence cut,
+    // rather than only taking the existing-observation fast path.
+    sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&recovery_trial.trial_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    let repaired_recovery = observation_store
+        .load_by_trial(&owner, &recovery_trial.trial_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repaired_recovery.request_fingerprint,
+        recovered_observation.request_fingerprint
+    );
+    restarted
+        .get_run_status(recovery_run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        observation_store
+            .load_by_trial(&owner, &recovery_trial.trial_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observation_id,
+        repaired_recovery.observation_id
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_recovery
+    );
+    cleanup_lifecycle_run_fixture(&pool, &owner, &recovery_run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &recovery_session).await;
 
     for (table, column) in [
         ("evaluation_trial_observations", "owner_user_id"),

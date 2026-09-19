@@ -257,11 +257,26 @@ Control cancellation still requires its own drain/settlement fence.
 The clean-session check is scoped to the derived Run identity: the first
 request must see no prior session state, while a concurrent retry may observe
 that same Run's in-flight rows. A different Run or pre-existing session state
-still makes the trial unavailable. Recovery can read trusted admission intent
-from the canonical `run_started` event, but generation takeover is not yet fully
-reconciled with Evaluation observations. This window can leave a trial unavailable
-or awaiting observation; recovery must be completed against canonical Run lineage
-without authorizing stale-generation writes or creating a replacement Run.
+still makes the trial unavailable. Each canonical recovery claim records its
+generation transition in the same transaction as ownership and the event
+watermark. Evaluation verifies a complete owner/Session/Run custody chain from
+the original admission to a failed or cancelled recovery terminal. That terminal
+has its own generation-scoped, hashed receipt committed with the Run status;
+it does not claim accounting or executor drain has finished.
+
+Trial binding, admission, and materialization receipts retain the original
+generation. Observations separately persist `admission_run_generation` and the
+terminal `execution_run_generation`. The observation write transaction verifies
+both identities, the admission, and the custody/terminal evidence. It can repair
+an unbound trial after a crash using the original `run_started` intent, without
+inventing materialization receipts or rewriting an existing binding. Ordinary
+binding and materializer writes retain their current-generation fence.
+
+Recovery evidence stops at the verified terminal event, so later status events
+do not change the observation fingerprint. Without finalized accounting for
+that terminal generation, usage remains unknown. Custody does not authorize a
+cross-generation successful evaluation or a replacement Run. Resuming successful
+evaluations across execution generations remains unsupported.
 
 The API accepts client intent only. It never accepts client-supplied
 observations and never starts a provider from a read request. Every read uses

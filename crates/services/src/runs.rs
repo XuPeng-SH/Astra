@@ -1601,6 +1601,91 @@ pub struct ExecutionHandoffRecovery {
     pub recovered_generation: u64,
 }
 
+/// Ownership transfer committed by the canonical recovery claim, independent
+/// of whether this Run has an execution-handoff checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRecoveryCustody {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    from_generation: u64,
+    to_generation: u64,
+}
+
+impl RunRecoveryCustody {
+    fn for_claim(run: &DurableRunRecord, from_generation: u64) -> Self {
+        Self {
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            from_generation,
+            to_generation: from_generation + 1,
+        }
+    }
+
+    fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "run_recovery_claimed",
+            "idempotency_key": format!("run-recovery-claimed:{}", self.to_generation),
+            "data": self,
+        })
+    }
+}
+
+/// Recovery can prove failure or cancellation, never successful execution or
+/// complete usage. The event remains part of the ordinary status transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RunRecoveryTerminalOutcome {
+    Failed,
+    Cancelled {
+        cancellation_origin: DurableCancellationOrigin,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecoveryTerminal {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub owner_generation: u64,
+    #[serde(flatten)]
+    pub outcome: RunRecoveryTerminalOutcome,
+}
+
+impl RunRecoveryTerminal {
+    pub fn event(&self) -> serde_json::Value {
+        let mut data = serde_json::to_value(self).expect("recovery terminal is serializable");
+        data["source"] = serde_json::json!("crash_recovery");
+        match self.outcome {
+            RunRecoveryTerminalOutcome::Failed => {
+                data["error"] = serde_json::json!("recovered from crash");
+                data["error_code"] = serde_json::json!("crash_recovery");
+                data["error_kind"] = serde_json::json!("crash_recovery");
+            }
+            RunRecoveryTerminalOutcome::Cancelled { .. } => {
+                data["cancelled"] = serde_json::json!(true);
+                data["reason"] = serde_json::json!("recovered durable cancellation control");
+            }
+        }
+        serde_json::json!({
+            "event_type": "run_finished",
+            "idempotency_key": format!("run-recovery-terminal:{}", self.owner_generation),
+            "data": data,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecoveryTerminalProof {
+    pub terminal_event_idx: i64,
+    pub terminal_event_id: String,
+    pub terminal_event_hash: String,
+    pub status: String,
+    pub generation: u64,
+}
+
 /// Checkpoint custody inherited atomically with a recovery ownership claim.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2551,7 +2636,8 @@ pub enum ExecutionOwnerCancellationOrigin {
 /// This type intentionally lives in the durable store layer so lineage
 /// control reads do not need to hydrate a run's complete event history or
 /// depend on runtime orchestration types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DurableCancellationOrigin {
     User,
     Runtime,
@@ -4693,6 +4779,164 @@ fn classify_atomic_run_terminal_facts(
         return AtomicRunTerminalFactMatch::Conflict("terminal error code mismatch");
     }
     AtomicRunTerminalFactMatch::Exact
+}
+
+/// Validate recovery lineage and its failure/cancellation terminal cut while
+/// the caller owns the canonical observation transaction. The caller obtains
+/// the admission generation/index from its verified admission marker. No
+/// accounting is implied, and custody cannot authorize execution success.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn validate_run_recovery_terminal_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    admission_generation: u64,
+    terminal_generation: u64,
+    admission_event_idx: i64,
+) -> Result<Option<RunRecoveryTerminalProof>, String> {
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+        WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let run = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(run_record_from_row)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let Some(run) = run else { return Ok(None) };
+    if run.run_generation != terminal_generation
+        || !matches!(run.status.as_str(), STATUS_FAILED | STATUS_CANCELLED)
+    {
+        return Ok(None);
+    }
+    if admission_generation >= terminal_generation || admission_event_idx < 0 {
+        return Err("recovery proof requires an earlier admission generation and event".into());
+    }
+    let terminal_key = format!("run-recovery-terminal:{terminal_generation}");
+    let rows = sqlx::query(
+        "SELECT user_id, session_id, run_id, event_idx, event_type, event_id,
+                idempotency_key, event_hash, request_id, payload_json
+         FROM agent_run_events WHERE user_id = ? AND run_id = ?
+           AND event_idx > ? AND event_idx <= ?
+           AND (event_type = 'run_recovery_claimed'
+                OR idempotency_key LIKE 'run-recovery-claimed:%'
+                OR idempotency_key = ?)
+         ORDER BY event_idx ASC FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(run_id)
+    .bind(admission_event_idx)
+    .bind(run.last_event_idx)
+    .bind(terminal_key)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            if row
+                .try_get::<String, _>("user_id")
+                .map_err(|error| error.to_string())?
+                != user_id
+                || row
+                    .try_get::<String, _>("session_id")
+                    .map_err(|error| error.to_string())?
+                    != session_id
+                || row
+                    .try_get::<String, _>("run_id")
+                    .map_err(|error| error.to_string())?
+                    != run_id
+            {
+                return Err("recovery event does not belong to the canonical Run identity".into());
+            }
+            decode_atomic_terminal_event_row(row, run_id)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_run_recovery_terminal_rows(&run, admission_generation, admission_event_idx, &rows)
+}
+
+fn validate_run_recovery_terminal_rows(
+    run: &DurableRunRecord,
+    admission_generation: u64,
+    admission_event_idx: i64,
+    rows: &[AtomicTerminalEventRow],
+) -> Result<Option<RunRecoveryTerminalProof>, String> {
+    let terminal_key = format!("run-recovery-terminal:{}", run.run_generation);
+    let Some((terminal_receipt, terminal_event)) = rows
+        .iter()
+        .find(|(receipt, _)| receipt.idempotency_key.as_deref() == Some(terminal_key.as_str()))
+    else {
+        return Ok(None);
+    };
+    let mut generation = admission_generation;
+    let mut previous_idx = admission_event_idx;
+    for (receipt, event) in rows {
+        if receipt.event_idx <= previous_idx
+            || receipt.event_idx > run.last_event_idx
+            || receipt.event_type != extract_event_type(event)
+            || receipt.idempotency_key != extract_optional_string(event, "idempotency_key")
+            || !atomic_terminal_event_hash_is_valid(receipt, event)
+        {
+            return Err("recovery event identity, order or hash mismatch".into());
+        }
+        if receipt.idempotency_key.as_deref() == Some(terminal_key.as_str()) {
+            if receipt.event_idx != terminal_receipt.event_idx || generation != run.run_generation {
+                return Err("recovery terminal has no complete preceding custody chain".into());
+            }
+        } else {
+            let custody: RunRecoveryCustody = serde_json::from_value(event["data"].clone())
+                .map_err(|error| format!("invalid recovery custody: {error}"))?;
+            if custody.user_id != run.user_id
+                || custody.session_id != run.session_id
+                || custody.run_id != run.run_id
+                || custody.from_generation != generation
+                || generation.checked_add(1) != Some(custody.to_generation)
+                || receipt.event_idx >= terminal_receipt.event_idx
+                || custody.event() != *event
+            {
+                return Err("recovery custody identity or generation chain mismatch".into());
+            }
+            generation = custody.to_generation;
+        }
+        previous_idx = receipt.event_idx;
+    }
+    let terminal: RunRecoveryTerminal = serde_json::from_value(terminal_event["data"].clone())
+        .map_err(|error| format!("invalid recovery terminal: {error}"))?;
+    if terminal.user_id != run.user_id
+        || terminal.session_id != run.session_id
+        || terminal.run_id != run.run_id
+        || terminal.owner_generation != run.run_generation
+        || terminal.event() != *terminal_event
+        || terminal_event
+            .pointer("/data/status")
+            .and_then(serde_json::Value::as_str)
+            != Some(run.status.as_str())
+        || run.waiting_for.is_some()
+        || terminal_event
+            .pointer("/data/error")
+            .and_then(serde_json::Value::as_str)
+            != run.error_message.as_deref()
+        || terminal_error_code_from_transition(
+            &run.status,
+            run.error_message.as_deref(),
+            std::slice::from_ref(terminal_event),
+        ) != run.error_code
+    {
+        return Err("recovery terminal does not match canonical Run facts".into());
+    }
+    Ok(Some(RunRecoveryTerminalProof {
+        terminal_event_idx: terminal_receipt.event_idx,
+        terminal_event_id: terminal_receipt.event_id.clone(),
+        terminal_event_hash: terminal_receipt.event_hash.clone(),
+        status: run.status.clone(),
+        generation: run.run_generation,
+    }))
 }
 
 /// Validate restart-readable facts without inventing the original CAS preconditions.
@@ -10188,11 +10432,11 @@ impl RunStateStore for InMemoryRunStateStore {
                 && let Some(event) =
                     execution_handoff_claim_event(run, checkpoint, run.events.last(), None)?
             {
-                run.last_event_idx
-                    .checked_add(1)
-                    .ok_or_else(|| "run recovery event sequence exhausted".to_string())?;
                 claim_events.insert(run_id.clone(), event);
             }
+            run.last_event_idx
+                .checked_add(1 + i64::from(claim_events.contains_key(run_id)))
+                .ok_or("run recovery event sequence exhausted")?;
         }
         let mut claimed = Vec::with_capacity(candidates.len());
         for (_, user_id, run_id, generation) in candidates {
@@ -10202,11 +10446,11 @@ impl RunStateStore for InMemoryRunStateStore {
                 && (matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
                     || (run.status == STATUS_PAUSED && run.waiting_for.is_some()))
             {
+                let mut events = vec![RunRecoveryCustody::for_claim(run, generation).event()];
+                events.extend(claim_events.remove(&run_id));
                 run.run_generation = generation + 1;
-                if let Some(event) = claim_events.remove(&run_id) {
-                    run.events.push(event);
-                    run.last_event_idx += 1;
-                }
+                run.last_event_idx += events.len() as i64;
+                run.events.extend(events);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
                 claimed.push(RecoveryClaim {
                     run: run.clone(),
@@ -11378,6 +11622,38 @@ impl DatabaseRunStateStore {
             last_event_idx: next_last_event_idx,
             latest_event_type: event_rows.last().map(|event| event.event_type.clone()),
         }))
+    }
+
+    /// Discover a stable recovery terminal cut. Observation writers must
+    /// repeat the same validation in their own transaction before authorizing it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_verified_recovery_terminal(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        admission_generation: u64,
+        terminal_generation: u64,
+        admission_event_idx: i64,
+    ) -> Result<Option<RunRecoveryTerminalProof>, String> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        let proof = validate_run_recovery_terminal_in_transaction(
+            &mut tx,
+            user_id,
+            session_id,
+            run_id,
+            admission_generation,
+            terminal_generation,
+            admission_event_idx,
+        )
+        .await?;
+        tx.commit().await.map_err(|error| error.to_string())?;
+        Ok(proof)
     }
 
     /// Read a completed atomic batch in one database snapshot. A plain terminal
@@ -14036,89 +14312,94 @@ impl DatabaseRunStateStore {
             .collect::<Result<Vec<_>, String>>()?;
         for receipt in &mut records {
             let run = &mut receipt.run;
-            let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
-                continue;
-            };
-            let row = sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
-                 checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
-                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints WHERE user_id = ? AND run_id = ?
-                 AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
-            )
-            .bind(&run.user_id)
-            .bind(&run.run_id)
-            .bind(identity)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| error.to_string())?;
-            let Some(row) = row else { continue };
-            let checkpoint =
-                decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
-            let payload: Option<String> = sqlx::query_scalar(
-                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
-            ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
-                .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
-            let tail = payload.and_then(|payload| match serde_json::from_str::<serde_json::Value>(&payload) {
-                Ok(event) => Some(event),
-                Err(_) => {
-                    tracing::warn!(run_id = %run.run_id, "invalid event tail cannot establish recovery custody");
-                    None
-                }
-            });
-            let predecessor = candidates
-                .binary_search_by(|previous| {
-                    (&previous.user_id, &previous.session_id, &previous.run_id).cmp(&(
-                        &run.user_id,
-                        &run.session_id,
-                        &run.run_id,
-                    ))
-                })
-                .map_err(|_| "recovery predecessor disappeared")?;
-            let previous = &candidates[predecessor];
-            let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
-            let verified_adoption = if let Some(adoption) = adoption.as_ref() {
-                if crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
-                    &mut tx, previous, adoption,
+            let handoff = async {
+                let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
+                    return Ok::<_, String>(None);
+                };
+                let row = sqlx::query(
+                    "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+                     checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                     FROM run_checkpoints WHERE user_id = ? AND run_id = ?
+                     AND checkpoint_kind = 'execution_handoff' AND idempotency_key = ? FOR UPDATE",
                 )
+                .bind(&run.user_id)
+                .bind(&run.run_id)
+                .bind(identity)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|error| error.to_string())?
-                {
-                    Some(adoption)
+                .map_err(|error| error.to_string())?;
+                let Some(row) = row else { return Ok(None) };
+                let checkpoint =
+                    decode_run_checkpoint_record_from_row(&row).map_err(|error| error.to_string())?;
+                let payload: Option<String> = sqlx::query_scalar(
+                    "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ? FOR UPDATE",
+                ).bind(&run.user_id).bind(&run.run_id).bind(run.last_event_idx)
+                    .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
+                let tail = payload.and_then(|payload| match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(event) => Some(event),
+                    Err(_) => {
+                        tracing::warn!(run_id = %run.run_id, "invalid event tail cannot establish recovery custody");
+                        None
+                    }
+                });
+                let predecessor = candidates
+                    .binary_search_by(|previous| {
+                        (&previous.user_id, &previous.session_id, &previous.run_id).cmp(&(
+                            &run.user_id,
+                            &run.session_id,
+                            &run.run_id,
+                        ))
+                    })
+                    .map_err(|_| "recovery predecessor disappeared")?;
+                let previous = &candidates[predecessor];
+                let adoption = tail.as_ref().and_then(ExecutionHandoffAdoption::from_event);
+                let verified_adoption = if let Some(adoption) = adoption.as_ref() {
+                    if crate::session_context_coordinator::execution_adoption_receipt_matches_tx(
+                        &mut tx, previous, adoption,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    {
+                        Some(adoption)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            let Some(event) = execution_handoff_claim_event(
-                previous,
-                &checkpoint,
-                tail.as_ref(),
-                verified_adoption,
-            )?
-            else {
-                continue;
-            };
+                };
+                execution_handoff_claim_event(
+                    previous, &checkpoint, tail.as_ref(), verified_adoption,
+                )
+            }.await?;
+            let mut events =
+                vec![RunRecoveryCustody::for_claim(run, receipt.claimed_from_generation).event()];
+            events.extend(handoff);
             let next_idx = run
                 .last_event_idx
-                .checked_add(1)
+                .checked_add(events.len() as i64)
                 .ok_or("run recovery event sequence exhausted")?;
-            let event_row = build_run_event_insert_row(
-                &run.user_id,
-                &run.run_id,
-                &run.session_id,
-                run.agent_id.as_deref(),
-                next_idx,
-                &self.owner_pod_id,
-                &event,
-            )
-            .map_err(|error| error.to_string())?;
+            let event_rows = events
+                .iter()
+                .enumerate()
+                .map(|(offset, event)| {
+                    build_run_event_insert_row(
+                        &run.user_id,
+                        &run.run_id,
+                        &run.session_id,
+                        run.agent_id.as_deref(),
+                        run.last_event_idx + 1 + offset as i64,
+                        &self.owner_pod_id,
+                        event,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
                 &run.run_id,
-                &[event_row],
-                "insert_recovery_claim_event",
+                &event_rows,
+                "insert_recovery_claim_events",
             )
             .await?;
             let updated = sqlx::query(
@@ -26737,6 +27018,129 @@ mod tests {
     }
 
     #[test]
+    fn recovery_terminal_proof_requires_exact_custody_and_terminal_facts() {
+        let mut run = durable_run_record("recovery-proof");
+        run.status = STATUS_FAILED.into();
+        run.error_message = Some("recovered from crash".into());
+        run.error_code = Some("crash_recovery".into());
+        run.run_generation = 2;
+        run.last_event_idx = 12;
+        let terminal = RunRecoveryTerminal {
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            owner_generation: 2,
+            outcome: RunRecoveryTerminalOutcome::Failed,
+        };
+        let rows = vec![
+            atomic_terminal_test_row(2, RunRecoveryCustody::for_claim(&run, 0).event(), ""),
+            atomic_terminal_test_row(5, RunRecoveryCustody::for_claim(&run, 1).event(), ""),
+            atomic_terminal_test_row(9, terminal.event(), ""),
+        ];
+        let proof = validate_run_recovery_terminal_rows(&run, 0, 0, &rows)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.terminal_event_idx, 9,
+            "later events do not move the terminal cut"
+        );
+        assert_eq!(proof.generation, 2);
+        assert_eq!(proof.status, STATUS_FAILED);
+        assert!(
+            validate_run_recovery_terminal_rows(&run, 0, 0, &rows[..2])
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_run_recovery_terminal_rows(&run, 0, 0, &rows[1..]).is_err());
+        assert!(validate_run_recovery_terminal_rows(&run, 0, 3, &rows).is_err());
+        for field in [
+            "user_id",
+            "session_id",
+            "run_id",
+            "from_generation",
+            "to_generation",
+        ] {
+            let mut wrong = rows.clone();
+            let mut payload = wrong[1].1.clone();
+            payload["data"][field] = if field.ends_with("generation") {
+                json!(8)
+            } else {
+                json!("other")
+            };
+            wrong[1] = atomic_terminal_test_row(5, payload, "");
+            assert!(
+                validate_run_recovery_terminal_rows(&run, 0, 0, &wrong).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["hash", "key", "type", "after_terminal"] {
+            let mut wrong = rows.clone();
+            match field {
+                "hash" => wrong[1].0.event_hash = "bad".into(),
+                "key" => wrong[1].0.idempotency_key = Some("wrong".into()),
+                "type" => wrong[2].0.event_type = "other".into(),
+                _ => {
+                    wrong[1].0.event_idx = 10;
+                    wrong.swap(1, 2);
+                }
+            }
+            assert!(
+                validate_run_recovery_terminal_rows(&run, 0, 0, &wrong).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["status", "generation", "error", "error_code"] {
+            let mut wrong = run.clone();
+            match field {
+                "status" => wrong.status = STATUS_COMPLETED.into(),
+                "generation" => wrong.run_generation = 3,
+                "error" => wrong.error_message = None,
+                _ => wrong.error_code = None,
+            }
+            assert!(
+                !matches!(
+                    validate_run_recovery_terminal_rows(&wrong, 0, 0, &rows),
+                    Ok(Some(_))
+                ),
+                "{field}"
+            );
+        }
+        for origin in [
+            DurableCancellationOrigin::User,
+            DurableCancellationOrigin::Runtime,
+            DurableCancellationOrigin::Unverified,
+        ] {
+            let mut cancelled = run.clone();
+            cancelled.status = STATUS_CANCELLED.into();
+            cancelled.error_message = None;
+            cancelled.error_code = None;
+            let mut rows = rows.clone();
+            rows[2] = atomic_terminal_test_row(
+                9,
+                RunRecoveryTerminal {
+                    outcome: RunRecoveryTerminalOutcome::Cancelled {
+                        cancellation_origin: origin,
+                    },
+                    ..terminal.clone()
+                }
+                .event(),
+                "",
+            );
+            assert_eq!(
+                validate_run_recovery_terminal_rows(&cancelled, 0, 0, &rows)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                STATUS_CANCELLED
+            );
+            assert_eq!(
+                DurableCancellationOrigin::from_terminal_event(&rows[2].1),
+                Some(origin)
+            );
+        }
+    }
+
+    #[test]
     fn atomic_terminal_restart_proof_binds_durable_facts_and_accounting() {
         let events = [
             json!({"event_type": "run_finished", "data": {"status": STATUS_COMPLETED}}),
@@ -30177,6 +30581,25 @@ mod tests {
                 .chain(&right)
                 .all(|claim| claim.run.run_generation == 1 && claim.claimed_from_generation == 0)
         );
+        for claim in left.iter().chain(&right) {
+            let durable = store
+                .load_run(&user_id, &claim.run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.last_event_idx, claim.run.last_event_idx);
+            assert_eq!(
+                durable
+                    .events
+                    .iter()
+                    .filter(|event| event["event_type"] == "run_recovery_claimed")
+                    .count(),
+                1
+            );
+            let mut custody = RunRecoveryCustody::for_claim(&durable, 0).event();
+            custody["index"] = serde_json::json!(durable.last_event_idx);
+            assert_eq!(durable.events.last(), Some(&custody));
+        }
         let refreshed = left
             .iter()
             .chain(&right)
@@ -31032,6 +31455,14 @@ mod tests {
             assert_eq!(proof.checkpoint_id, receipt.checkpoint_id);
             assert_eq!(proof.producer_generation, 0);
             assert_eq!(proof.claimed_generation, generation);
+            let custody: String = sqlx::query_scalar(
+                "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?",
+            ).bind(&user_id).bind(&run_id).bind(claim.run.last_event_idx - 1)
+                .fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&custody).unwrap(),
+                RunRecoveryCustody::for_claim(&claim.run, generation - 1).event()
+            );
             last_claim = Some(claim);
         }
         let claim = last_claim.unwrap();
@@ -31093,6 +31524,89 @@ mod tests {
         assert_eq!(
             store.load_run(&user_id, &run_id).await.unwrap().unwrap(),
             before
+        );
+        let terminal = RunRecoveryTerminal {
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            owner_generation: 3,
+            outcome: RunRecoveryTerminalOutcome::Failed,
+        }
+        .event();
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_PAUSED],
+                    Some(3),
+                    STATUS_FAILED,
+                    None,
+                    Some("recovered from crash"),
+                    &[terminal],
+                )
+                .await
+                .unwrap()
+        );
+        let proof = store
+            .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.status, STATUS_FAILED);
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({"event_type": "agent_progress", "data": {"later": true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+                .await
+                .unwrap(),
+            Some(proof.clone())
+        );
+        let mut tx = pool.get().begin().await.unwrap();
+        assert_eq!(
+            validate_run_recovery_terminal_in_transaction(
+                &mut tx,
+                &user_id,
+                &session_id,
+                &run_id,
+                0,
+                3,
+                0
+            )
+            .await
+            .unwrap(),
+            Some(proof)
+        );
+        tx.rollback().await.unwrap();
+        for (owner, session, generation) in [
+            ("other", session_id.as_str(), 3),
+            (user_id.as_str(), "other", 3),
+            (user_id.as_str(), session_id.as_str(), 2),
+        ] {
+            assert!(
+                store
+                    .load_verified_recovery_terminal(owner, session, &run_id, 0, generation, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        sqlx::query("UPDATE agent_run_events SET event_hash = 'corrupted' WHERE user_id = ? AND run_id = ? AND idempotency_key = 'run-recovery-claimed:2'")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
+                .await
+                .is_err()
         );
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
@@ -35057,7 +35571,11 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(latest.run.run_generation, 2);
-        assert_eq!(latest.run.events.last(), Some(&activity));
+        assert_eq!(latest.run.events[latest.run.events.len() - 2], activity);
+        assert_eq!(
+            latest.run.events.last(),
+            Some(&RunRecoveryCustody::for_claim(&latest.run, 1).event())
+        );
         let before = store.load_run("u1", run_id).await.unwrap().unwrap();
         for claim in [&original, &latest] {
             assert!(
@@ -35103,6 +35621,15 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(abandoned.run.run_generation, generation);
+            let events = &abandoned.run.events;
+            assert_eq!(
+                extract_event_type(events.last().unwrap()),
+                "execution_handoff_claimed"
+            );
+            assert_eq!(
+                events[events.len() - 2],
+                RunRecoveryCustody::for_claim(&abandoned.run, generation - 1).event()
+            );
             // The process dies here: no reconciliation and no in-process receipt survives.
         }
         let claim = store
@@ -40231,6 +40758,19 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.len() + second.len(), 1);
+        let durable = store
+            .load_run("u1", "overlapping-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_recovery_claimed")
+                .count(),
+            1
+        );
         assert_eq!(
             store
                 .load_run("u1", "overlapping-recovery")
@@ -40291,7 +40831,11 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.run_generation, 1);
-        assert!(run.events.is_empty());
+        assert_eq!(
+            run.events,
+            vec![RunRecoveryCustody::for_claim(&run, 0).event()],
+            "the winning claim records custody; stale cancellation adds no terminal event"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

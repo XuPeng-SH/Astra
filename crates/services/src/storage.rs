@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-19-v86";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-19-v87";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4480,13 +4480,14 @@ async fn ensure_core_schema_while_leased(
         pool,
         "evaluation_trial_observations",
         "CREATE TABLE IF NOT EXISTS evaluation_trial_observations (
-            schema_version INT NOT NULL DEFAULT 1,
+            schema_version INT NOT NULL DEFAULT 2,
             owner_user_id VARCHAR(128) NOT NULL,
             observation_id VARCHAR(64) NOT NULL,
             experiment_id VARCHAR(128) NOT NULL,
             trial_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             execution_run_id VARCHAR(128) NOT NULL,
+            admission_run_generation BIGINT NOT NULL,
             execution_run_generation BIGINT NOT NULL,
             spec_fingerprint VARCHAR(128) NOT NULL,
             observation_json LONGTEXT NOT NULL,

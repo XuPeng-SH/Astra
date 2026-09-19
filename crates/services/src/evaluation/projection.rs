@@ -145,7 +145,7 @@ impl EvaluationExperimentProjection {
                 if binding.binding_status != "bound"
                     || binding.session_id.as_deref() != Some(observation.session_id.as_str())
                     || binding.run_id.as_deref() != Some(observation.execution_run_id.as_str())
-                    || binding.run_generation != Some(observation.execution_run_generation)
+                    || binding.run_generation != Some(observation.admission_run_generation)
                 {
                     return Err(EvaluationProjectionError::Conflict(format!(
                         "observation {} is not tied to the persisted trial run identity",
@@ -409,13 +409,14 @@ mod tests {
         generation: u64,
     ) -> EvaluationObservationRecord {
         EvaluationObservationRecord {
-            schema_version: 1,
+            schema_version: super::super::EVALUATION_EXECUTION_SCHEMA_VERSION,
             owner_user_id: experiment.owner_user_id.clone(),
             observation_id: format!("observation-{}", binding.trial_id),
             experiment_id: experiment.experiment_id.clone(),
             trial_id: binding.trial_id.clone(),
             session_id: session_id.to_string(),
             execution_run_id: run_id.to_string(),
+            admission_run_generation: generation,
             execution_run_generation: generation,
             observation: TrialObservation {
                 experiment_fingerprint: experiment.spec_fingerprint.clone(),
@@ -467,13 +468,14 @@ mod tests {
     fn projection_rejects_foreign_observation_and_conflicting_duplicates() {
         let (experiment, bindings, _) = fixture();
         let observation = EvaluationObservationRecord {
-            schema_version: 1,
+            schema_version: super::super::EVALUATION_EXECUTION_SCHEMA_VERSION,
             owner_user_id: "other-owner".to_string(),
             observation_id: "observation".to_string(),
             experiment_id: experiment.experiment_id.clone(),
             trial_id: bindings[0].trial_id.clone(),
             session_id: "session".to_string(),
             execution_run_id: "run".to_string(),
+            admission_run_generation: 1,
             execution_run_generation: 1,
             observation: TrialObservation {
                 experiment_fingerprint: experiment.spec_fingerprint.clone(),
@@ -545,6 +547,28 @@ mod tests {
         )
         .expect_err("foreign execution identity must be rejected");
         assert!(error.to_string().contains("run identity"));
+        let mut recovered = observation_for(&experiment, &bindings[0], "session-0", "run-0", 1);
+        recovered.execution_run_generation = 3;
+        recovered.observation.status = TrialStatus::Failed;
+        let projection = EvaluationExperimentProjection::from_records(
+            experiment.clone(),
+            bindings.clone(),
+            BTreeMap::new(),
+            vec![recovered.clone()],
+        )
+        .expect("persisted recovery observation binds to original admission generation");
+        assert_eq!(projection.observed_trial_count, 1);
+        recovered.admission_run_generation = 2;
+        assert!(
+            EvaluationExperimentProjection::from_records(
+                experiment.clone(),
+                bindings.clone(),
+                BTreeMap::new(),
+                vec![recovered],
+            )
+            .is_err(),
+            "terminal generation cannot replace the immutable binding generation"
+        );
 
         let mut statuses = BTreeMap::new();
         statuses.insert(bindings[0].trial_id.clone(), "future_status".to_string());

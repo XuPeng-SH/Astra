@@ -14692,32 +14692,26 @@ impl AgenticRunLifecycleService {
             // owner generation or a different terminal transition.
             return;
         }
-        let crash_recovered = evaluation_crash_recovery_is_current_generation(
-            &run.events,
-            &run.status,
-            run.run_generation,
-        );
         let Some(status) = RunStatus::from_durable_status(durable_status) else {
             return;
         };
         if evaluation_trial_status(status).is_none() {
             return;
         }
-        // A terminal status alone is not evidence readiness. Normal atomic
-        // settlement commits accounting with the output and terminal facts,
-        // so a restart can verify that batch even if the later drain marker
-        // was never written. Control cancellation retains its drain fence.
-        if !marker.settlement_finished && !crash_recovered {
-            match astra_services::runs::DatabaseRunStateStore::new(pool.clone())
-                .load_committed_atomic_terminal_settlement(
+        let run_store = astra_services::runs::DatabaseRunStateStore::new(pool.clone());
+        let recovery_terminal_event_idx = if marker.admission_run_generation != run_generation {
+            match run_store
+                .load_verified_recovery_terminal(
                     user_id,
                     session_id,
                     run_id,
+                    marker.admission_run_generation,
                     run_generation,
+                    marker.admission_event_idx,
                 )
                 .await
             {
-                Ok(Some(_)) => {}
+                Ok(Some(proof)) => Some(proof.terminal_event_idx),
                 Ok(None) => return,
                 Err(error) => {
                     tracing::warn!(
@@ -14726,35 +14720,51 @@ impl AgenticRunLifecycleService {
                         run_id,
                         run_generation,
                         error = %error,
-                        "evaluation recovery could not verify atomic terminal evidence"
+                        "evaluation recovery could not verify canonical recovery evidence"
                     );
                     return;
                 }
             }
-        }
-        let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
-        if let Err(error) = plan_store
-            .bind_trial_run(user_id, &marker.admission.trial_id, session_id, run_id)
-            .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id = user_id,
-                session_id,
-                run_id,
-                trial_id = %marker.admission.trial_id,
-                error = %error,
-                "evaluation recovery could not bind the canonical Run to its trial"
-            );
-            return;
-        }
+        } else {
+            // Same-generation normal settlement needs either its drain fence
+            // or the committed atomic batch. Recovery custody is not authority
+            // to continue an execution or to claim a successful task outcome.
+            if !marker.settlement_finished {
+                match run_store
+                    .load_committed_atomic_terminal_settlement(
+                        user_id,
+                        session_id,
+                        run_id,
+                        run_generation,
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            owner_user_id = user_id,
+                            run_id,
+                            run_generation,
+                            error = %error,
+                            "evaluation recovery could not verify atomic terminal evidence"
+                        );
+                        return;
+                    }
+                }
+            }
+            None
+        };
         persist_evaluation_observation_after_settlement(
             &self.run_engine,
             Some(&pool),
             user_id,
             session_id,
             run_id,
-            marker.execution_run_generation,
+            run_generation,
+            marker.admission_run_generation,
+            recovery_terminal_event_idx,
             Some(&marker.admission),
             status,
             true,
@@ -14809,44 +14819,6 @@ impl AgenticRunLifecycleService {
         runs.get(run_id)
             .map(|r| r.pause_flag.load(Ordering::Acquire))
     }
-}
-
-fn evaluation_crash_recovery_is_current_generation(
-    events: &[Value],
-    terminal_status: &str,
-    owner_generation: u64,
-) -> bool {
-    if terminal_status != STATUS_FAILED && terminal_status != STATUS_CANCELLED {
-        return false;
-    }
-    events.iter().any(|event| {
-        let event_type = event.get("event_type").and_then(Value::as_str);
-        let data = event.get("data").and_then(Value::as_object);
-        let same_generation = data
-            .and_then(|data| data.get("owner_generation"))
-            .and_then(Value::as_u64)
-            == Some(owner_generation);
-        if !same_generation {
-            return false;
-        }
-        match event_type {
-            Some("run_error") => {
-                data.and_then(|data| data.get("error_code"))
-                    .and_then(Value::as_str)
-                    == Some("crash_recovery")
-            }
-            Some("run_finished") => {
-                data.and_then(|data| data.get("source"))
-                    .and_then(Value::as_str)
-                    == Some("crash_recovery")
-                    && data
-                        .and_then(|data| data.get("status"))
-                        .and_then(Value::as_str)
-                        == Some(terminal_status)
-            }
-            _ => false,
-        }
-    })
 }
 
 fn should_allow_empty_delta(
@@ -15563,9 +15535,11 @@ async fn persist_evaluation_observation_after_settlement(
     session_id: &str,
     run_id: &str,
     run_generation: u64,
+    admission_run_generation: u64,
+    recovery_terminal_event_idx: Option<i64>,
     admission: Option<&EvaluationRunAdmission>,
     persisted_status: RunStatus,
-    durable_fence_closed: bool,
+    settlement_evidence_ready: bool,
 ) {
     let Some(admission) = admission else {
         return;
@@ -15573,14 +15547,14 @@ async fn persist_evaluation_observation_after_settlement(
     let Some(status) = evaluation_trial_status(persisted_status) else {
         return;
     };
-    if !durable_fence_closed {
+    if !settlement_evidence_ready {
         tracing::warn!(
             target: "astra_runtime::run_lifecycle",
             owner_user_id,
             session_id,
             run_id,
             run_generation,
-            "evaluation observation deferred because canonical settlement is not closed"
+            "evaluation observation deferred because canonical terminal evidence is not ready"
         );
         return;
     }
@@ -15669,10 +15643,16 @@ async fn persist_evaluation_observation_after_settlement(
         }
     };
     let accounting_key = format!("run-accounting-finalized:{run_generation}");
-    let accounting_index = canonical_events.iter().rposition(|event| {
-        event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
-            && event.get("idempotency_key").and_then(Value::as_str) == Some(accounting_key.as_str())
-    });
+    let accounting_index = recovery_terminal_event_idx
+        .is_none()
+        .then(|| {
+            canonical_events.iter().rposition(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
+                    && event.get("idempotency_key").and_then(Value::as_str)
+                        == Some(accounting_key.as_str())
+            })
+        })
+        .flatten();
     let (prompt_tokens, completion_tokens, tool_calls) = accounting_index
         .and_then(|index| canonical_events.get(index))
         .map(|event| {
@@ -15694,15 +15674,25 @@ async fn persist_evaluation_observation_after_settlement(
             )
         })
         .unwrap_or((None, None, None));
-    let evidence_available = accounting_index.is_some();
-    let evidence_events = accounting_index
+    let evidence_index = if let Some(terminal_event_idx) = recovery_terminal_event_idx {
+        let Some(index) = canonical_events.iter().position(|event| {
+            event.get("index").and_then(Value::as_i64) == Some(terminal_event_idx)
+        }) else {
+            return;
+        };
+        Some(index)
+    } else {
+        accounting_index
+    };
+    let evidence_available = evidence_index.is_some();
+    let evidence_events = evidence_index
         .map(|index| canonical_events[..=index].to_vec())
         .unwrap_or_default();
     let evidence_payload = json!({
         "run_id": run_id,
         "run_generation": run_generation,
         "status": persisted_status.as_str(),
-        "event_watermark": accounting_index,
+        "event_watermark": evidence_index,
         "events": evidence_events,
     });
     let evidence_json = serde_json::to_string(&evidence_payload).ok();
@@ -15721,10 +15711,11 @@ async fn persist_evaluation_observation_after_settlement(
         locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
     }];
     if let Some(skill_revision) = admission.skill_revision.as_ref() {
-        let skill_event = accounting_index.and_then(|index| {
+        let skill_event = evidence_index.and_then(|index| {
             canonical_events[..=index].iter().find(|event| {
                 event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
-                    && event.get("run_generation").and_then(Value::as_u64) == Some(run_generation)
+                    && event.get("run_generation").and_then(Value::as_u64)
+                        == Some(admission_run_generation)
                     && event.pointer("/data/skill_name").and_then(Value::as_str)
                         == Some(skill_revision.skill_name.as_str())
                     && event.pointer("/data/revision_id").and_then(Value::as_str)
@@ -15735,7 +15726,7 @@ async fn persist_evaluation_observation_after_settlement(
         });
         let skill_event_json = skill_event.and_then(|event| serde_json::to_string(event).ok());
         evidence.push(EvidenceRef {
-            evidence_id: format!("skill-invocation:{run_id}:{run_generation}"),
+            evidence_id: format!("skill-invocation:{run_id}:{admission_run_generation}"),
             kind: EvidenceKind::Trace,
             availability: if skill_event_json.is_some() {
                 EvidenceAvailability::Available
@@ -15762,6 +15753,7 @@ async fn persist_evaluation_observation_after_settlement(
         session_id: session_id.to_string(),
         execution_run_id: run_id.to_string(),
         execution_run_generation: run_generation,
+        admission_run_generation,
         observation,
         materialization_receipt_ids: admission.receipt_ids.clone(),
         idempotency_key: format!("eval-observation:{run_id}:{run_generation}"),
@@ -16817,6 +16809,8 @@ impl AgenticRunLifecycleService {
                     &bg_session_id,
                     &bg_run_id,
                     execution_owner_generation,
+                    execution_owner_generation,
+                    None,
                     bg_eval_admission.as_ref(),
                     persisted_status,
                     durable_fence_closed,
