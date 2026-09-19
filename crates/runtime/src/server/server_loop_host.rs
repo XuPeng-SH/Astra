@@ -3721,9 +3721,6 @@ pub struct ServerAgenticLoopHost {
     /// Runtime-owned memory provider used consistently for prompt recall,
     /// current-session snapshots, compaction, and server-only/subrun paths.
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
-    /// Typed recall latched for one user turn so every tool round observes the
-    /// same evidence and the dynamic prompt bytes do not churn mid-turn.
-    prompt_memory_recall_cache: Option<PromptMemoryRecallCache>,
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
@@ -4172,20 +4169,10 @@ fn replay_execution_handoff(
     Ok(payload)
 }
 
-#[derive(Clone)]
-struct PromptMemoryRecallCache {
-    session_turn: u32,
-    user_content: String,
-    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
-    outcome: astra_turn_types::MemoryRetrievalOutcome,
-    fetch_ms: u64,
-}
-
 struct PromptMemoryRecall {
     entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
     outcome: astra_turn_types::MemoryRetrievalOutcome,
     fetch_ms: u64,
-    fresh: bool,
 }
 
 #[derive(Clone)]
@@ -5925,7 +5912,6 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             memoria_client: self.memoria_client,
-            prompt_memory_recall_cache: None,
             #[cfg(feature = "e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "e2e-hooks")]
@@ -16164,17 +16150,6 @@ impl ServerAgenticLoopHost {
         session_turn: u32,
         user_content: &str,
     ) -> PromptMemoryRecall {
-        if let Some(cached) = self.prompt_memory_recall_cache.as_ref().filter(|cached| {
-            cached.session_turn == session_turn && cached.user_content == user_content
-        }) {
-            return PromptMemoryRecall {
-                entries: cached.entries.clone(),
-                outcome: cached.outcome,
-                fetch_ms: cached.fetch_ms,
-                fresh: false,
-            };
-        }
-
         let started = Instant::now();
         let (entries, outcome) = if let Some(client) = self.memoria_client.as_deref() {
             let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
@@ -16219,18 +16194,10 @@ impl ServerAgenticLoopHost {
             )
         };
         let fetch_ms = started.elapsed().as_millis() as u64;
-        self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
-            session_turn,
-            user_content: user_content.to_string(),
-            entries: entries.clone(),
-            outcome,
-            fetch_ms,
-        });
         PromptMemoryRecall {
             entries,
             outcome,
             fetch_ms,
-            fresh: true,
         }
     }
 
@@ -16280,7 +16247,7 @@ impl ServerAgenticLoopHost {
     }
 
     fn record_prompt_memory_trace(state: &AgenticLoopState, recall: &PromptMemoryRecall) {
-        if !recall.fresh || !recall.outcome.was_attempted() {
+        if !recall.outcome.was_attempted() {
             return;
         }
         if let Some(collector) = state.telemetry.turn_trace_collector.as_ref() {
@@ -25989,11 +25956,25 @@ mod tests {
     #[derive(Default)]
     struct ServerOnlyPromptMemory {
         calls: std::sync::atomic::AtomicUsize,
+        denied: std::sync::atomic::AtomicBool,
+        admission_failed: std::sync::atomic::AtomicBool,
+        admission_stalled: std::sync::atomic::AtomicBool,
+        revision: std::sync::atomic::AtomicUsize,
         scopes: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
     impl crate::turn::cloud::memoria_compact::MemoriaPort for ServerOnlyPromptMemory {
+        async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
+            if self.admission_stalled.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.admission_failed.load(Ordering::SeqCst) {
+                return Err("test authority unavailable".into());
+            }
+            Ok(!self.denied.load(Ordering::SeqCst))
+        }
+
         async fn retrieve_for_prompt(
             &self,
             _query: &str,
@@ -26007,7 +25988,7 @@ mod tests {
                 .expect("scopes")
                 .push((user_id.to_string(), session_id.to_string()));
             Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
-                memory_id: "server-memory-1".into(),
+                memory_id: format!("server-memory-{}", self.revision.load(Ordering::SeqCst) + 1),
                 content: astra_prompts::memory_proto::MemoryEntry::new(
                     astra_prompts::memory_proto::NS_KNOWLEDGE,
                     astra_prompts::memory_proto::ST_ACTIVE,
@@ -26145,7 +26126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_only_prompt_recall_needs_no_edge_profile_and_is_latched_per_turn() {
+    async fn server_only_prompt_recall_reauthorizes_each_request_without_hiding_candidates() {
         let provider = Arc::new(ServerOnlyPromptMemory::default());
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -26166,8 +26147,6 @@ mod tests {
             .prompt_memory_entries_for_turn(2, "review astra memory #42")
             .await;
         assert_eq!(first.entries, same_turn.entries);
-        assert!(first.fresh);
-        assert!(!same_turn.fresh);
         assert_eq!(
             first.outcome,
             astra_turn_types::MemoryRetrievalOutcome::Complete
@@ -26179,15 +26158,15 @@ mod tests {
         );
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            1,
-            "one complete semantic query owns per-turn prompt recall"
+            2,
+            "each provider request retrieves under current authority"
         );
 
         let next_turn = host
             .prompt_memory_entries_for_turn(3, "review astra memory #42")
             .await;
         assert_eq!(next_turn.entries.len(), 1);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         assert!(
             provider
                 .scopes
@@ -26196,6 +26175,81 @@ mod tests {
                 .iter()
                 .all(|(user, session)| user == "server-user" && session == "server-session")
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_recall_cache_does_not_republish_after_consent_revocation() {
+        let provider = Arc::new(ServerOnlyPromptMemory::default());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "revocation-user".into(),
+            "revocation-session".into(),
+        )
+        .with_memoria_client(Some(
+            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
+        ))
+        .build();
+
+        let first = host.prompt_memory_entries_for_turn(2, "same request").await;
+        assert_eq!(first.entries.len(), 1);
+        provider.denied.store(true, Ordering::SeqCst);
+
+        let revoked = host.prompt_memory_entries_for_turn(2, "same request").await;
+        assert!(
+            revoked.entries.is_empty(),
+            "a matching turn and query must not authorize replay of revoked memory"
+        );
+        assert_eq!(
+            revoked.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        provider.revision.store(1, Ordering::SeqCst);
+        provider.denied.store(false, Ordering::SeqCst);
+        let reconnected = host.prompt_memory_entries_for_turn(2, "same request").await;
+        assert_eq!(reconnected.entries.len(), 1);
+        assert_eq!(
+            reconnected.entries[0].memory_id.as_deref(),
+            Some("server-memory-2"),
+            "reconnection must retrieve current candidates, not restore the old snapshot"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_recall_authority_failure_never_restores_previous_candidates() {
+        for stalled in [false, true] {
+            let provider = Arc::new(ServerOnlyPromptMemory::default());
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "failure-user".into(),
+                "failure-session".into(),
+            )
+            .with_memoria_client(Some(
+                Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
+            ))
+            .build();
+            let first = host.prompt_memory_entries_for_turn(2, "same request").await;
+            assert_eq!(first.entries.len(), 1);
+            provider.admission_failed.store(!stalled, Ordering::SeqCst);
+            provider.admission_stalled.store(stalled, Ordering::SeqCst);
+
+            let unavailable = tokio::time::timeout(
+                Duration::from_secs(2),
+                host.prompt_memory_entries_for_turn(2, "same request"),
+            )
+            .await
+            .expect("authorization remains inside the bounded recall deadline");
+            assert!(unavailable.entries.is_empty());
+            assert_eq!(
+                unavailable.outcome,
+                astra_turn_types::MemoryRetrievalOutcome::Unavailable
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
@@ -26261,7 +26315,6 @@ mod tests {
             ],
             outcome: astra_turn_types::MemoryRetrievalOutcome::Partial,
             fetch_ms: 37,
-            fresh: true,
         };
 
         ServerAgenticLoopHost::record_prompt_memory_trace(&state, &recall);
