@@ -204,6 +204,20 @@ Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph
 inspection. This is progressive disclosure, not a usage quota or tool disablement.
 Server-backed and local-journal reflection share the same report projection.
 
+CLI reflection also projects typed semantic judgment traces from an explicitly
+owner-local journal window through the shared strict decoder/projector. The
+scope is `local_journal_at_read`, not server history or the requested time
+horizon. Reads retain at most 512 journal records and read at most 256 KiB;
+boundary records may be conservatively omitted. Truncation, malformed records,
+and session/turn mismatches remain coverage gaps. Missing or unreadable journals
+have unavailable counts, not known zero judgments. Even an empty existing
+journal cannot establish that no judgments occurred upstream.
+
+`local_only` CLI reflection bypasses cloud restoration entirely. Local physical
+judgment usage remains explicitly unavailable: generic LLM-round totals are not
+a substitute for attributed physical attempts. This does not yet add local
+introspect wiring or an adapter for typed Explain usage artifacts.
+
 Reflection may produce:
 
 - uncertainty assessment;

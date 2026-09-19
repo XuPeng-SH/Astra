@@ -575,6 +575,63 @@ pub struct SemanticJudgmentStageCounts {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticJudgmentScope {
     SessionTraceAtRead,
+    LocalJournalAtRead,
+}
+
+/// Project an owner-authorized journal window through the canonical trace decoder.
+/// Local identity comes from the selected artifact store, never from trace attributes.
+pub fn project_local_semantic_judgments(
+    window: &crate::session_journal::JournalObservationWindow,
+    owner: &crate::OwnerScope,
+    session_id: &str,
+    depth: astra_core::ObservationDepth,
+) -> SemanticJudgmentView {
+    use crate::session_journal::JournalEventType;
+    let rows = window
+        .events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == JournalEventType::TraceSpan)
+        .map(|event| {
+            let metadata_json = event.metadata.as_ref().map(Value::to_string);
+            // Reuse the canonical decoder, including its size/strict-schema checks.
+            // Missing or conflicting journal turns cannot authenticate a typed fact.
+            let turn_mismatch = metadata_json
+                .as_deref()
+                .and_then(|raw| decode_semantic_judgment_trace(raw).ok().flatten())
+                .is_some_and(|fact| event.turn != Some(fact.observation.correlation.turn));
+            SemanticJudgmentTraceRow {
+                user_id: owner.id().to_string(),
+                session_id: if turn_mismatch {
+                    String::new()
+                } else {
+                    event.session_id.clone().unwrap_or_default()
+                },
+                metadata_json,
+                metadata_oversized: false,
+            }
+        });
+    let mut capture = if window.available {
+        project_semantic_judgment_observations(rows, owner.id(), session_id, 512, 32)
+    } else {
+        SemanticJudgmentCapture::unavailable()
+    };
+    if window.truncated {
+        capture.truncated = true;
+        capture
+            .gaps
+            .push(SemanticJudgmentCaptureGap::CandidateLimit);
+    }
+    if window.malformed_records > 0 {
+        capture
+            .gaps
+            .push(SemanticJudgmentCaptureGap::InvalidObservation);
+    }
+    capture.gaps.sort();
+    capture.gaps.dedup();
+    let mut view = SemanticJudgmentView::from_capture(capture).bounded(depth);
+    view.scope = SemanticJudgmentScope::LocalJournalAtRead;
+    view
 }
 
 /// The same bounded semantic view for introspection and reflection. Counts
@@ -676,7 +733,15 @@ impl SemanticJudgmentView {
     }
 
     pub fn render(&self) -> String {
-        let boundary = "Semantic judgments: session trace at read time (independent of requested horizon); capture incomplete; classification is not execution authority or model adoption. Stage observations are not physical calls or usage.";
+        let source = match self.scope {
+            SemanticJudgmentScope::SessionTraceAtRead => "session trace at read time",
+            SemanticJudgmentScope::LocalJournalAtRead => {
+                "bounded owner-local journal at read time (not server history)"
+            }
+        };
+        let boundary = format!(
+            "Semantic judgments: {source} (independent of requested horizon); capture incomplete; classification is not execution authority or model adoption. Stage observations are not physical calls or usage."
+        );
         let Some(c) = &self.counts else {
             return format!(
                 "{boundary} Coverage={:?}; counts unavailable, not zero.",
@@ -999,6 +1064,78 @@ mod tests {
             metadata_json: Some(metadata.to_string()),
             metadata_oversized: false,
         }
+    }
+
+    #[test]
+    fn local_journal_uses_canonical_projection_and_exposes_window_loss() {
+        let fact = observation();
+        let event = semantic_judgment_trace("local", &fact, 100)
+            .unwrap()
+            .session_id(Some("session-1"))
+            .build();
+        let expected = project(vec![row(event.metadata.clone().unwrap())], 512, 32);
+        let owner = crate::OwnerScope::user("owner").unwrap();
+        let mut window = crate::session_journal::JournalObservationWindow {
+            events: vec![event.clone(), event],
+            available: true,
+            truncated: true,
+            malformed_records: 1,
+        };
+        let view = project_local_semantic_judgments(
+            &window,
+            &owner,
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert_eq!(view.observations, expected.observations);
+        assert_eq!(view.scope, SemanticJudgmentScope::LocalJournalAtRead);
+        assert!(view.capture_truncated && view.capture_incomplete);
+        assert!(
+            view.capture_gaps
+                .contains(&SemanticJudgmentCaptureGap::InvalidObservation)
+        );
+        assert!(view.render().contains("not server history"));
+        let other = project_local_semantic_judgments(
+            &window,
+            &owner,
+            "another-session",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert!(other.observations.is_empty());
+        assert!(
+            other
+                .capture_gaps
+                .contains(&SemanticJudgmentCaptureGap::ScopeMismatch)
+        );
+        for turn in [None, Some(fact.correlation.turn + 1)] {
+            for event in &mut window.events {
+                event.turn = turn;
+            }
+            let inconsistent = project_local_semantic_judgments(
+                &window,
+                &owner,
+                "session-1",
+                astra_core::ObservationDepth::Diagnostic,
+            );
+            assert!(inconsistent.observations.is_empty());
+            assert!(
+                inconsistent
+                    .capture_gaps
+                    .contains(&SemanticJudgmentCaptureGap::ScopeMismatch)
+            );
+        }
+        window.available = false;
+        let missing = project_local_semantic_judgments(
+            &window,
+            &owner,
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert!(missing.counts.is_none());
+        assert_eq!(
+            missing.coverage,
+            SemanticJudgmentCoverage::SourceUnavailable
+        );
     }
 
     fn project(
