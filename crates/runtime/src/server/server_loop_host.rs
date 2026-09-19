@@ -23605,6 +23605,123 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn work_direction_executor_assignment_respects_fresh_turn_floor() {
+        use crate::server::runtime_tool_executor::{ActivePrimaryWorkAttempt, WorkRuntimeBinding};
+        use crate::turn::agentic_loop::guards::judge_work_direction;
+        use astra_services::work::{InternalSessionId, WorkBranchId, WorkId, WorkOwnerId};
+
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut executor = runtime_tool_executor_with_agent_context(dir.path());
+        // The concrete executor binding requires SharedPool, which has no
+        // offline constructor. The regression itself does not query or mutate it.
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let _ = dotenvy::dotenv();
+        let pool = SharedPool::new(&MatrixOneSettings::from_env())
+            .await
+            .expect("connect to MatrixOne");
+        executor.set_work_binding(WorkRuntimeBinding::new(
+            pool,
+            WorkOwnerId::parse("user1").unwrap(),
+            InternalSessionId::parse("sess1").unwrap(),
+            WorkId::parse("work-direction-floor").unwrap(),
+            WorkBranchId::parse("branch-direction-floor").unwrap(),
+        ));
+        executor
+            .install_active_primary_work_attempt(ActivePrimaryWorkAttempt {
+                attempt_id: "attempt-direction-floor".into(),
+                executor_run_id: "run1".into(),
+                item_id: "item-direction-floor".into(),
+                item_revision: 1,
+                objective: "Inspect the result".into(),
+                expected_result: "A verified result".into(),
+            })
+            .expect("active assignment");
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("user1".into());
+        state.current_session_id = Some("sess1".into());
+        state.current_run_id = Some("run1".into());
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        state.llm_rounds_completed = 0;
+        state.remaining_turns = 10;
+        let record = |round, id: &str| astra_services::session_journal::ToolCallRecord {
+            name: "read_file".into(),
+            round: Some(round),
+            tool_call_id: Some(id.into()),
+            ok: true,
+            result_full: Some("Verified result".into()),
+            ..Default::default()
+        };
+        state
+            .stall
+            .tool_call_records
+            .push(record(100, "previous-turn"));
+        state.stall.begin_fresh_user_turn();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".into(),
+            "sess1".into(),
+        )
+        .build();
+
+        // Exercise assignment initialization, not a manually initialized gate.
+        judge_work_direction(&mut host, &mut state).await;
+        let gate = &state.provider_adaptation.work_direction;
+        assert!(gate.binding_key.is_some());
+        assert_eq!(
+            gate.first_round, 0,
+            "older turn round 100 is not comparable"
+        );
+        assert!(gate.attempted.is_empty());
+        assert!(!gate.disabled);
+
+        state
+            .stall
+            .tool_call_records
+            .extend([record(0, "current-read"), record(1, "current-verification")]);
+        judge_work_direction(&mut host, &mut state).await;
+        let gate = &state.provider_adaptation.work_direction;
+        assert_eq!(gate.attempted.len(), 1, "current-turn evidence is eligible");
+        assert!(
+            gate.disabled,
+            "eligible snapshot reaches the real no-offering hook"
+        );
+        assert!(
+            gate.cached.is_none(),
+            "no offering grants no advice or authority"
+        );
+
+        state.provider_adaptation.work_direction = Default::default();
+        state.stall.tool_call_records.extend([
+            record(10, "pre-assignment-read"),
+            record(11, "pre-assignment-verify"),
+        ]);
+        for _ in 0..40 {
+            state
+                .stall
+                .tool_call_records
+                .extend([record(2, "old-read"), record(3, "old-verify")]);
+        }
+        judge_work_direction(&mut host, &mut state).await;
+        assert_eq!(state.provider_adaptation.work_direction.first_round, 12);
+        judge_work_direction(&mut host, &mut state).await;
+        assert!(
+            state
+                .provider_adaptation
+                .work_direction
+                .attempted
+                .is_empty()
+        );
+        state
+            .stall
+            .tool_call_records
+            .extend([record(12, "fresh-read"), record(13, "fresh-verify")]);
+        judge_work_direction(&mut host, &mut state).await;
+        assert_eq!(state.provider_adaptation.work_direction.attempted.len(), 1);
+    }
+
+    #[tokio::test]
     async fn work_direction_no_offering_does_not_borrow_primary_model() {
         use crate::turn::agentic_loop::host::WorkDirectionOutcome;
         let mut host = ServerAgenticLoopHostBuilder::new(

@@ -286,19 +286,59 @@ judgment Offering, never the primary model as an implicit fallback. The owner,
 session, run and current attempt are captured together with bounded objective
 and expected-result text. On first observing an assignment the loop establishes
 a journal-round floor; older results are excluded and unattributed results mark
-evidence incomplete. A missing lifecycle boundary also marks it incomplete.
+evidence incomplete. Journal lifecycle requests, including successful ones,
+are not typed committed attempt transitions and never cut off earlier observations.
+The validated binding owns the task and expected result; the journal projection
+does not prove settlement readiness. Its omission flag records actual projection
+loss (including truncation, unavailable content and bounded-history eviction),
+not the absence of a lifecycle tool name.
+The evidence binding includes the canonical item revision/attempt and executor
+run, not the current lease owner generation. That same binding preserves its
+round floor across ownership changes; a changed attempt cannot reuse it.
+The original-facts continuation carries this gate, not the raw tool-call journal.
+Available restored observations are revalidated; absent journal evidence cannot
+be manufactured from the cached hint and leaves advice ineligible.
+Owner generation and session turn instead participate in the advisory snapshot
+key, invalidating cached advice across ownership changes without discarding
+same-attempt evidence. Provider-boundary reauthorization remains required.
 At least two distinct executable observations are required. Discovery, Work control and
-diagnostic calls do not trigger this adviser. At most four sanitized excerpts
-of 768 characters are sent, from a scan of at most 32 records. Results or arguments
-over 16 KiB cause abstention before hashing or sanitization. Full-result and argument
-digests, round and call identity participate in causal-order snapshot identity
+diagnostic calls do not trigger this adviser. The latest four distinct observations
+are selected by persisted model round, with at most 768 sanitized characters each.
+A metadata scan of the current-turn journal retains at most 32 distinct invocation
+candidates before bounded result hashing and sanitization. Selection is not an
+append-position window: replayed older invocations cannot evict newer executions.
+This is a stateless linear scan, not a second persisted evidence index. Comparing
+duplicate candidates inspects only bounded documents; conflicting revisions under
+one invocation identity become outcome-only observations. Results over 16 KiB remain execution-outcome-only
+observations; they do not suppress later recovery evidence. Oversized documents
+are neither hashed nor sanitized, and prefixes never imply full-document identity
+or coverage. Complete bounded result/argument digests, available matching immutable
+artifact digests, round and call identity participate in causal-order snapshot identity
 without entering the prompt; exact invocation replays do not trigger inference,
 but a repeated mutation with a new invocation identity invalidates earlier advice.
 Applied newer user guidance is included in full up to 1024 characters and 16
 events; exceeding either bound causes abstention. Without a reconciliation
 watermark, all applied directives are conservatively retained. Original task text
 is not duplicated as guidance: the assignment objective and expected result bind it.
-Incomplete evidence cannot produce a prepare-settlement hint.
+Journal append position is not execution order: flooding the journal with old
+successes cannot supersede a higher-round failure. Same-round
+receipt identities do not establish causal order. Round comparisons first respect
+the runtime's existing current-user-turn journal floor, because round numbers
+from earlier turns are not comparable. Prepare-settlement advice
+requires exactly one distinct execution in the newest observed round, providing
+a complete successful result, with no unattributed record in the current-turn scan. Ambiguous
+ordering withholds closure advice only, including same-round executions outside
+the retained candidates; newest-round ambiguity is tracked across the full
+eligible metadata scan. Earlier
+opaque failures do not veto a subsequent compact repair and verification; the
+judge must still find direct support for every material expected-result requirement.
+An opaque, failed or unattributed newest result blocks closure advice.
+Omitted older history remains explicit but does not veto a judgment that the
+supplied results support the expected result. Every hint identifies this scoped
+evidence basis and reports settlement readiness as unknown; it grants no
+settlement authority and leaves admission and expected-result coverage with their
+existing owners. Prefixes, previews and outcome-only records cannot supply the
+latest complete support candidate.
 
 The versioned evidence/intent/assignment digest is reserved before inference.
 Each snapshot is attempted once, with at most three reservations per run-local

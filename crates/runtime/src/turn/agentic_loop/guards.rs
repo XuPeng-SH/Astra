@@ -270,6 +270,9 @@ pub(crate) fn evaluate_guards(
 pub(crate) struct WorkDirectionSnapshot {
     pub key: String,
     pub evidence: astra_services::work_direction_judgment::WorkDirectionEvidence,
+    /// Whether the displayed evidence can be assessed for support, not proof
+    /// of complete attempt coverage or permission to settle.
+    pub support_basis_available: bool,
 }
 
 fn direction_hash(value: &serde_json::Value) -> String {
@@ -318,12 +321,26 @@ fn direction_assignment(state: &AgenticLoopState) -> Option<(String, String, Str
             state.current_session_id.as_deref()?,
             state.current_run_id.as_deref()?,
         )?;
-    let key = direction_hash(&serde_json::json!({
-        "binding": binding, "run": state.current_run_id,
-        "generation": state.current_run_owner_generation,
-        "turn": state.session_turn, "objective": objective, "expected": expected,
-    }));
+    let key = direction_assignment_key(
+        &binding,
+        state.current_run_id.as_deref(),
+        &objective,
+        &expected,
+    );
     Some((key, objective, expected))
+}
+
+fn direction_assignment_key(
+    binding: &astra_services::runs::WorkRuntimeBindingRequest,
+    run: Option<&str>,
+    objective: &str,
+    expected: &str,
+) -> String {
+    // Evidence custody follows the exact attempt, not the worker holding its
+    // lease. Ownership still fences advice via the snapshot key below.
+    direction_hash(&serde_json::json!({
+        "binding": binding, "run": run, "objective": objective, "expected": expected,
+    }))
 }
 
 /// Only observations produced after this loop saw the exact assignment are
@@ -377,36 +394,41 @@ fn work_direction_snapshot_for_assignment(
     let current_guidance = direction_current_guidance(state)?;
     let mut observations = Vec::new();
     let records = &state.stall.tool_call_records;
-    let suffix_start = records.len().saturating_sub(32);
-    let boundary = records[suffix_start..]
-        .iter()
-        .rposition(|record| {
-            matches!(
-                record.name.as_str(),
-                "start_work" | "run_next_work_item" | "settle_work_item"
-            )
-        })
-        .map(|index| suffix_start + index);
-    let mut omitted =
-        boundary.is_none_or(|index| !records[index].was_executed() || !records[index].ok);
-    let mut seen = HashSet::new();
+    // Rounds are turn-local. The journal retains older turns for audit, so
+    // compare rounds only inside the existing runtime-owned turn boundary.
+    let turn_floor = state.stall.observation_reuse_record_floor;
+    if turn_floor > records.len() {
+        return None;
+    }
+    // The validated assignment and its round floor fence this projection.
+    // Journal tool names are not committed transitions: even a successful
+    // run_next_work_item may resume the same attempt. No journal field proves
+    // complete attempt custody. Omission tracks projection loss, not settlement
+    // readiness; the advisory only assesses the supplied results.
+    let mut omitted = false;
+    let mut unattributed = false;
+    let mut displayed_complete = Vec::new();
     let mut revisions = Vec::new();
-    // Traverse chronologically: a replay cannot move an earlier mutation
-    // after its verification, while a new execution must retain that order.
-    for record in &records[boundary.map_or(suffix_start, |index| index + 1)..] {
+    // Select from canonical metadata before truncation. An append-position
+    // window lets old replays evict a newer failure. Keep bounded candidates,
+    // not another persisted index or checkpoint authority.
+    let mut ordered = std::collections::BTreeMap::<
+        (u32, &str),
+        (&astra_services::session_journal::ToolCallRecord, bool),
+    >::new();
+    let mut latest_round = None;
+    let mut latest_call_id = None;
+    let mut latest_round_ambiguous = false;
+    for record in &records[turn_floor..] {
         if !record.was_executed() {
-            continue;
-        }
-        let Some(round) = record.round else {
-            omitted = true;
-            continue;
-        };
-        if round < gate.first_round {
             continue;
         }
         if matches!(
             record.name.as_str(),
             "tool_search"
+                | "start_work"
+                | "run_next_work_item"
+                | "settle_work_item"
                 | "inspect_work_plan"
                 | "propose_work_plan"
                 | "inspect_work_criteria"
@@ -416,43 +438,146 @@ fn work_direction_snapshot_for_assignment(
         ) {
             continue;
         }
-        let Some(raw) = record
-            .result_full
-            .as_deref()
-            .or(record.result_preview.as_deref())
-        else {
+        let Some(round) = record.round else {
             omitted = true;
+            unattributed = true;
             continue;
         };
-        let args = record.args_full.as_deref().unwrap_or("");
-        // No partial digest masquerades as the identity of complete evidence.
-        // Oversized input disables this snapshot, including reuse of its hint.
-        if raw.len() > 16_384 || args.len() > 16_384 || record.name.len() > 128 {
+        if round < gate.first_round {
+            continue;
+        }
+        if record.name.len() > 128 {
             return None;
         }
         let call_id = record.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
         if call_id.len() > 128 {
             return None;
         }
+        if latest_round.is_none_or(|latest| round > latest) {
+            latest_round = Some(round);
+            latest_call_id = Some(call_id);
+            latest_round_ambiguous = false;
+        } else if latest_round == Some(round) && latest_call_id != Some(call_id) {
+            latest_round_ambiguous = true;
+        }
+        let key = (round, call_id);
+        if let Some((previous, conflicting)) = ordered.get_mut(&key) {
+            if *conflicting {
+                continue;
+            }
+            // A reused identity with inconsistent bounded content is not a
+            // new execution or a trustworthy replacement. Opaque documents
+            // cannot supply closure support in either case. Never compare
+            // arbitrarily large strings while detecting duplicate revisions.
+            let same_document = |left: Option<&str>, right: Option<&str>| match (left, right) {
+                (Some(left), Some(right)) if left.len() <= 16_384 && right.len() <= 16_384 => {
+                    left == right
+                }
+                // Both are opaque in this projection. Unknown equivalence is
+                // not evidence of a conflict, nor of complete result support.
+                (Some(left), Some(right)) if left.len() > 16_384 && right.len() > 16_384 => true,
+                (None, None) => true,
+                _ => false,
+            };
+            let same_artifact = match (&previous.result_artifact, &record.result_artifact) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    [left, right].into_iter().all(|artifact| {
+                        artifact.call_id.len() <= 128
+                            && artifact.run_id.len() <= 128
+                            && artifact.content_sha256.len() <= 64
+                    }) && left == right
+                }
+                _ => false,
+            };
+            *conflicting |= previous.name != record.name
+                || previous.ok != record.ok
+                || !same_artifact
+                || !same_document(
+                    previous.result_full.as_deref(),
+                    record.result_full.as_deref(),
+                )
+                || !same_document(
+                    previous.result_preview.as_deref(),
+                    record.result_preview.as_deref(),
+                )
+                || !same_document(previous.args_full.as_deref(), record.args_full.as_deref());
+            continue;
+        }
+        if ordered.len() == 32 {
+            omitted = true;
+            if ordered
+                .first_key_value()
+                .is_some_and(|(oldest, _)| key <= *oldest)
+            {
+                continue;
+            }
+            ordered.pop_first();
+        }
+        ordered.insert(key, (record, false));
+    }
+    for ((round, call_id), (record, conflicting)) in ordered {
+        let raw = (!conflicting).then_some(record).and_then(|record| {
+            record
+                .result_full
+                .as_deref()
+                .or(record.result_preview.as_deref())
+        });
+        let args = record.args_full.as_deref().unwrap_or("");
         use sha2::{Digest, Sha256};
+        // Hash only complete, bounded documents; never hash a prefix as if it
+        // identified the full result. Large/missing documents remain an opaque
+        // outcome linked to the existing invocation, not evidence of coverage.
+        // An out-of-line document's immutable digest can still invalidate the
+        // projection without fetching or traversing its contents.
+        let bounded_raw = raw.filter(|raw| raw.len() <= 16_384);
+        let bounded_args = (args.len() <= 16_384).then_some(args);
+        omitted |= bounded_args.is_none();
+        let artifact_digest = record.result_artifact.as_ref().and_then(|artifact| {
+            (artifact.call_id == call_id
+                && Some(artifact.run_id.as_str()) == state.current_run_id.as_deref()
+                && artifact.content_sha256.len() == 64
+                && artifact
+                    .content_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
+            .then_some(artifact.content_sha256.as_str())
+        });
         let revision = (
             record.name.clone(),
             record.ok,
-            format!("{:x}", Sha256::digest(raw.as_bytes())),
-            format!("{:x}", Sha256::digest(args.as_bytes())),
+            conflicting,
+            bounded_raw.map(|raw| format!("{:x}", Sha256::digest(raw.as_bytes()))),
+            bounded_args.map(|args| format!("{:x}", Sha256::digest(args.as_bytes()))),
+            artifact_digest,
+            raw.map(str::len),
+            args.len(),
         );
-        if !seen.insert((round, call_id, revision.clone())) {
-            continue;
-        }
         revisions.push((round, call_id, revision));
-        // Sanitize before truncation, including secrets crossing the boundary.
-        let safe = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(raw);
-        let excerpt: String = safe.content.chars().take(768).collect();
-        omitted |= safe.content.chars().count() > 768 || record.result_full.is_none();
+        // Do not sanitize an unbounded document or expose an unsanitized
+        // prefix. The execution outcome itself remains useful for recovery.
+        let (excerpt, complete) = if let Some(raw) = bounded_raw {
+            let safe = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(raw);
+            let complete = safe.content.chars().count() <= 768
+                && record.result_full.is_some()
+                && bounded_args.is_some()
+                && record.result_artifact.is_none();
+            omitted |= !complete;
+            (safe.content.chars().take(768).collect(), complete)
+        } else {
+            omitted = true;
+            (
+                "Result content unavailable in this bounded projection; execution outcome only."
+                    .into(),
+                false,
+            )
+        };
         if observations.len() == 4 {
             omitted = true;
-            continue;
+            observations.remove(0);
+            displayed_complete.remove(0);
         }
+        displayed_complete.push((complete, record.ok));
         observations.push(WorkDirectionObservation {
             tool: record.name.chars().take(128).collect(),
             disposition: if record.ok {
@@ -468,6 +593,16 @@ fn work_direction_snapshot_for_assignment(
     if observations.len() < 2 {
         return None;
     }
+    // The latest execution must supply a complete successful result, not just
+    // a status or prefix. Earlier failed/opaque observations remain explicit
+    // context; they cannot permanently veto a later repair and verification.
+    // This only admits a semantic support judgment: the judge still must find
+    // direct support for every material expected-result requirement.
+    let support_basis_available = !unattributed
+        && !latest_round_ambiguous
+        && displayed_complete
+            .last()
+            .is_some_and(|(complete, ok)| *complete && *ok);
     let evidence = WorkDirectionEvidence {
         objective,
         expected_result,
@@ -478,10 +613,32 @@ fn work_direction_snapshot_for_assignment(
     let request =
         astra_services::work_direction_judgment::work_direction_judgment_request(&evidence);
     let key = direction_hash(&serde_json::json!({
-        "version": 2, "binding": binding, "request": request, "evidence_revisions": revisions,
+        "version": 5, "binding": binding, "request": request, "evidence_revisions": revisions,
+        "generation": state.current_run_owner_generation, "turn": state.session_turn,
+        "support_basis_available": support_basis_available,
         "guidance_cursor": state.user_intents.applied_user_intents().last().map(|intent| intent.event_index),
     }));
-    Some(WorkDirectionSnapshot { key, evidence })
+    Some(WorkDirectionSnapshot {
+        key,
+        evidence,
+        support_basis_available,
+    })
+}
+
+fn direction_assignment_first_round(state: &AgenticLoopState) -> Option<u32> {
+    // Match the projection's runtime-owned turn boundary: retained audit
+    // rounds from earlier turns are not comparable to the current counter.
+    let current_turn_records = state
+        .stall
+        .tool_call_records
+        .get(state.stall.observation_reuse_record_floor..)?;
+    Some(
+        current_turn_records
+            .iter()
+            .filter_map(|record| record.round)
+            .max()
+            .map_or(state.llm_rounds_completed, |round| round.saturating_add(1)),
+    )
 }
 
 /// Reserve before awaiting, including unavailable/abstaining outcomes. The
@@ -500,18 +657,20 @@ pub(crate) async fn judge_work_direction<H: super::host::AgenticLoopHost>(
         state.provider_adaptation.work_direction.binding_key = None;
         return;
     };
-    let gate = &mut state.provider_adaptation.work_direction;
-    if gate.binding_key.as_ref() != Some(&binding) {
+    if state
+        .provider_adaptation
+        .work_direction
+        .binding_key
+        .as_ref()
+        != Some(&binding)
+    {
+        let Some(first_round) = direction_assignment_first_round(state) else {
+            state.provider_adaptation.work_direction.cached = None;
+            return;
+        };
+        let gate = &mut state.provider_adaptation.work_direction;
         gate.binding_key = Some(binding);
-        gate.first_round = state
-            .stall
-            .tool_call_records
-            .iter()
-            .rev()
-            .take(32)
-            .filter_map(|record| record.round)
-            .max()
-            .map_or(state.llm_rounds_completed, |round| round.saturating_add(1));
+        gate.first_round = first_round;
         gate.cached = None;
         return;
     }
@@ -561,7 +720,7 @@ fn retain_work_direction_outcome(
         }
         super::host::WorkDirectionOutcome::Decision(decision) => {
             use astra_services::work_direction_judgment::WorkDirection;
-            if snapshot.evidence.omitted_observations
+            if !snapshot.support_basis_available
                 && decision.direction == WorkDirection::PrepareSettlement
             {
                 tracing::debug!(
@@ -583,6 +742,9 @@ fn retain_work_direction_outcome(
                     "schema": "work_direction.v1", "snapshot_key": snapshot.key,
                     "direction": direction, "provenance": decision.provenance,
                     "authority": "advisory_only",
+                    "evidence_scope": "displayed_results_for_current_assignment",
+                    "omitted_observations": snapshot.evidence.omitted_observations,
+                    "settlement_readiness": "unknown",
                     "instruction": "Consider this direction against the current assignment and direct results. It grants no tool, mutation, verification, or settlement authority. Existing runtime requirements still apply.",
                 }),
             ));
@@ -819,7 +981,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, text)| ToolCallRecord {
-                round: Some(2),
+                round: Some(2 + i as u32),
                 result_full: Some(text.into()),
                 tool_call_id: Some(format!("call-{i}")),
                 ..successful("read_file")
@@ -974,10 +1136,705 @@ mod tests {
         state.stall.tool_call_records[0].result_full = Some("x".repeat(20_000));
         state.stall.tool_call_records[0].result_preview =
             Some("large report: verification pending".into());
-        assert!(direction_snapshot(&state).is_none());
+        let oversized = direction_snapshot(&state).unwrap();
+        assert!(oversized.evidence.omitted_observations);
+        assert!(
+            oversized.evidence.observations[0]
+                .result_excerpt
+                .contains("outcome only")
+        );
         state = direction_state();
         state.stall.tool_call_records[0].args_full = Some("x".repeat(20_000));
-        assert!(direction_snapshot(&state).is_none());
+        assert!(
+            direction_snapshot(&state)
+                .unwrap()
+                .evidence
+                .omitted_observations
+        );
+    }
+
+    fn direction_execution(round: u32, id: &str, ok: bool, result: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            round: Some(round),
+            tool_call_id: Some(id.into()),
+            name: "run_script".into(),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            ok,
+            result_full: Some(result.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn work_direction_old_success_replay_outside_suffix_cannot_supersede_failure() {
+        let mut state = direction_state();
+        let old = direction_execution(2, "old-verification", true, "old verification passed");
+        state.stall.tool_call_records = vec![old.clone()];
+        for round in 3..=36 {
+            state.stall.tool_call_records.push(direction_execution(
+                round,
+                &format!("failure-{round}"),
+                false,
+                "newer verification failed",
+            ));
+        }
+        state.stall.tool_call_records.push(old);
+        for restored in [false, true] {
+            if restored {
+                // Exercise the durable journal representation, including the
+                // persisted round; live-only completion references are absent.
+                state.stall.tool_call_records = serde_json::from_value(
+                    serde_json::to_value(&state.stall.tool_call_records).unwrap(),
+                )
+                .unwrap();
+            }
+            let snapshot = direction_snapshot(&state).unwrap();
+            assert!(!snapshot.support_basis_available);
+            assert_eq!(
+                snapshot
+                    .evidence
+                    .observations
+                    .last()
+                    .unwrap()
+                    .result_excerpt,
+                "newer verification failed"
+            );
+            prepare_direction(&mut state, snapshot);
+            assert!(state.provider_adaptation.work_direction.cached.is_none());
+        }
+        // A genuinely later verification recovers without an append-order
+        // anomaly permanently poisoning otherwise usable evidence.
+        state.stall.tool_call_records.push(direction_execution(
+            37,
+            "fresh",
+            true,
+            "new verification passed",
+        ));
+        let snapshot = direction_snapshot(&state).unwrap();
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
+    }
+
+    #[test]
+    fn work_direction_replay_flood_cannot_evict_newer_failure_before_first_judgment() {
+        let mut state = direction_state();
+        let old = state.stall.tool_call_records.clone();
+        state.stall.tool_call_records.push(direction_execution(
+            4,
+            "failure",
+            false,
+            "verification failed",
+        ));
+        for _ in 0..32 {
+            state.stall.tool_call_records.extend(old.clone());
+        }
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(!snapshot.support_basis_available);
+        assert_eq!(
+            snapshot
+                .evidence
+                .observations
+                .last()
+                .unwrap()
+                .result_excerpt,
+            "verification failed"
+        );
+        let key = snapshot.key.clone();
+        state.stall.tool_call_records.extend(old);
+        assert_eq!(key, direction_snapshot(&state).unwrap().key);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state.stall.tool_call_records.push(direction_execution(
+            5,
+            "recovered",
+            true,
+            "new verification passed",
+        ));
+        let snapshot = direction_snapshot(&state).unwrap();
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
+    }
+
+    #[test]
+    fn work_direction_same_round_ambiguity_survives_candidate_eviction() {
+        let mut state = direction_state();
+        state.stall.tool_call_records.push(direction_execution(
+            4,
+            "a-failure",
+            false,
+            "verification failed",
+        ));
+        for index in 0..40 {
+            state.stall.tool_call_records.push(direction_execution(
+                4,
+                &format!("z-success-{index:02}"),
+                true,
+                "observation succeeded",
+            ));
+        }
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(
+            snapshot
+                .evidence
+                .observations
+                .iter()
+                .all(|observation| observation.disposition == "executed_success")
+        );
+        assert!(!snapshot.support_basis_available);
+        state.stall.tool_call_records.push(direction_execution(
+            5,
+            "verified",
+            true,
+            "verification passed after batch",
+        ));
+        assert!(direction_snapshot(&state).unwrap().support_basis_available);
+    }
+
+    #[test]
+    fn work_direction_conflicting_replay_is_opaque_until_new_execution() {
+        let mut state = direction_state();
+        let before = direction_snapshot(&state).unwrap();
+        let mut conflicting = state.stall.tool_call_records.last().unwrap().clone();
+        conflicting.result_full =
+            Some("different result under the same invocation identity".into());
+        state.stall.tool_call_records.push(conflicting);
+        let after = direction_snapshot(&state).unwrap();
+        assert_ne!(before.key, after.key);
+        assert!(!after.support_basis_available);
+        state.stall.tool_call_records.push(direction_execution(
+            4,
+            "fresh",
+            true,
+            "fresh verification passed",
+        ));
+        assert!(direction_snapshot(&state).unwrap().support_basis_available);
+    }
+
+    #[test]
+    #[ignore = "manual metadata-scan scaling measurement; no live services"]
+    fn work_direction_metadata_scan_scaling() {
+        for count in [100_u32, 10_000, 100_000] {
+            let mut state = direction_state();
+            state.stall.tool_call_records = (2..count + 2)
+                .map(|round| direction_execution(round, &format!("call-{round}"), true, "verified"))
+                .collect();
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                let snapshot = std::hint::black_box(direction_snapshot(&state).unwrap());
+                assert_eq!(snapshot.evidence.observations.len(), 4);
+            }
+            eprintln!(
+                "work_direction metadata records={count} mean_us={}",
+                started.elapsed().as_micros() / 10
+            );
+        }
+    }
+
+    #[test]
+    fn work_direction_opaque_replay_does_not_manufacture_conflict() {
+        let mut state = direction_state();
+        state.stall.tool_call_records[1].result_full = Some("x".repeat(20_000));
+        let before = direction_snapshot(&state).unwrap();
+        state
+            .stall
+            .tool_call_records
+            .push(state.stall.tool_call_records[1].clone());
+        let after = direction_snapshot(&state).unwrap();
+        assert_eq!(before.key, after.key);
+        assert!(!after.support_basis_available);
+    }
+
+    #[test]
+    fn work_direction_artifact_custody_conflict_invalidates_cached_support() {
+        use astra_services::session_journal::{
+            ToolResultArtifactDescriptor, ToolResultDocumentKind,
+        };
+        for reverse in [false, true] {
+            let mut state = direction_state();
+            state.current_run_id = Some("run".into());
+            let before = direction_snapshot(&state).unwrap();
+            prepare_direction(&mut state, before);
+            assert!(state.provider_adaptation.work_direction.cached.is_some());
+            let original = state.stall.tool_call_records[1].clone();
+            let mut artifact = original.clone();
+            artifact.result_artifact = Some(ToolResultArtifactDescriptor {
+                document_kind: ToolResultDocumentKind::Result,
+                version: 1,
+                call_id: "call-1".into(),
+                run_id: "run".into(),
+                byte_len: 20_000,
+                content_sha256: "a".repeat(64),
+            });
+            state.stall.tool_call_records.truncate(1);
+            state.stall.tool_call_records.extend(if reverse {
+                [artifact, original]
+            } else {
+                [original, artifact]
+            });
+            let snapshot = direction_snapshot(&state).unwrap();
+            assert!(!snapshot.support_basis_available);
+            publish_work_direction_for_key(&mut state, Some(snapshot.key));
+            assert!(state.provider_adaptation.work_direction.cached.is_none());
+            state.stall.tool_call_records.push(direction_execution(
+                4,
+                "fresh",
+                true,
+                "new verification passed",
+            ));
+            assert!(direction_snapshot(&state).unwrap().support_basis_available);
+        }
+    }
+
+    #[test]
+    fn work_direction_same_round_order_is_unknown_even_without_parallel_flag() {
+        for reverse in [false, true] {
+            let mut state = direction_state();
+            let mut batch = vec![
+                direction_execution(4, "failure", false, "verification failed"),
+                direction_execution(4, "success", true, "verification passed"),
+            ];
+            if reverse {
+                batch.reverse();
+            }
+            state.stall.tool_call_records.extend(batch);
+            let snapshot = direction_snapshot(&state).unwrap();
+            assert!(!snapshot.support_basis_available);
+            prepare_direction(&mut state, snapshot);
+            assert!(state.provider_adaptation.work_direction.cached.is_none());
+            state.stall.tool_call_records.push(direction_execution(
+                5,
+                "later",
+                true,
+                "verified after batch",
+            ));
+            let snapshot = direction_snapshot(&state).unwrap();
+            assert!(snapshot.support_basis_available);
+            // An exact duplicate does not manufacture a second execution.
+            state
+                .stall
+                .tool_call_records
+                .push(state.stall.tool_call_records.last().unwrap().clone());
+            assert_eq!(snapshot.key, direction_snapshot(&state).unwrap().key);
+        }
+    }
+
+    #[test]
+    fn work_direction_hidden_same_round_failure_still_blocks_closure() {
+        let mut state = direction_state();
+        state.stall.tool_call_records.push(direction_execution(
+            4,
+            "failure",
+            false,
+            "verification failed",
+        ));
+        for index in 0..5 {
+            state.stall.tool_call_records.push(direction_execution(
+                4,
+                &format!("success-{index}"),
+                true,
+                "observation succeeded",
+            ));
+        }
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(
+            snapshot
+                .evidence
+                .observations
+                .iter()
+                .all(|observation| observation.disposition == "executed_success")
+        );
+        assert!(snapshot.evidence.omitted_observations);
+        assert!(!snapshot.support_basis_available);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+    }
+
+    #[test]
+    fn work_direction_assignment_floor_initialization_excludes_prior_turn() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.llm_rounds_completed = 0;
+        state.stall.tool_call_records.push(direction_execution(
+            100,
+            "prior-turn",
+            true,
+            "old result",
+        ));
+        state.stall.begin_fresh_user_turn();
+        assert_eq!(direction_assignment_first_round(&state), Some(0));
+
+        state.stall.tool_call_records.push(direction_execution(
+            1,
+            "current-turn",
+            true,
+            "current result",
+        ));
+        assert_eq!(direction_assignment_first_round(&state), Some(2));
+
+        state.stall.tool_call_records.push(direction_execution(
+            11,
+            "newest",
+            true,
+            "newest result",
+        ));
+        for _ in 0..40 {
+            state.stall.tool_call_records.push(direction_execution(
+                2,
+                "old-replay",
+                true,
+                "old result",
+            ));
+        }
+        assert_eq!(direction_assignment_first_round(&state), Some(12));
+
+        // An invalid/restored boundary must abstain, not fall back to old rounds.
+        state.stall.observation_reuse_record_floor = state.stall.tool_call_records.len() + 1;
+        assert_eq!(direction_assignment_first_round(&state), None);
+    }
+
+    #[test]
+    fn work_direction_round_order_respects_runtime_user_turn_boundary() {
+        let mut state = direction_state();
+        state.stall.tool_call_records.push(direction_execution(
+            100,
+            "prior-turn",
+            true,
+            "old verification passed",
+        ));
+        state.stall.begin_fresh_user_turn();
+        state.stall.tool_call_records.push(direction_execution(
+            2,
+            "repair",
+            true,
+            "repair applied",
+        ));
+        state.stall.tool_call_records.push(direction_execution(
+            3,
+            "failure",
+            false,
+            "new verification failed",
+        ));
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_eq!(snapshot.evidence.observations.len(), 2);
+        assert!(!snapshot.evidence.omitted_observations);
+        assert!(!snapshot.support_basis_available);
+        assert_eq!(
+            snapshot
+                .evidence
+                .observations
+                .last()
+                .unwrap()
+                .result_excerpt,
+            "new verification failed"
+        );
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state.stall.tool_call_records.push(direction_execution(
+            4,
+            "fresh",
+            true,
+            "new verification passed",
+        ));
+        assert!(direction_snapshot(&state).unwrap().support_basis_available);
+    }
+
+    #[test]
+    fn work_direction_original_continuation_capture_does_not_restore_missing_journal() {
+        use super::super::host::OriginalLoopExecutionFacts;
+        let mut state = direction_state();
+        let snapshot = direction_snapshot(&state).unwrap();
+        prepare_direction(&mut state, snapshot);
+        let captured = OriginalLoopExecutionFacts::capture(&state).unwrap();
+        let restored: OriginalLoopExecutionFacts =
+            serde_json::from_value(serde_json::to_value(captured).unwrap()).unwrap();
+        let mut resumed = crate::turn::agentic_loop::host::make_test_loop_state();
+        resumed.provider_adaptation = restored.provider_adaptation;
+        resumed.current_run_owner_generation = Some(2);
+        assert_eq!(resumed.provider_adaptation.work_direction.first_round, 2);
+        assert!(resumed.stall.tool_call_records.is_empty());
+        assert!(direction_snapshot(&resumed).is_none());
+        publish_work_direction_for_key(&mut resumed, None);
+        assert!(resumed.provider_adaptation.work_direction.cached.is_none());
+    }
+
+    #[test]
+    fn work_direction_latest_observations_preserve_recovery_order() {
+        let mut state = direction_state();
+        for index in 0..4 {
+            state.stall.tool_call_records.push(direction_execution(
+                4 + index,
+                &format!("earlier-{index}"),
+                true,
+                "earlier observation",
+            ));
+        }
+        let before = direction_snapshot(&state).unwrap().key;
+        for (round, id, ok, text) in [
+            (8, "failure", false, "validation failed"),
+            (9, "repair", true, "repair applied"),
+            (10, "verification", true, "verification passed"),
+        ] {
+            state
+                .stall
+                .tool_call_records
+                .push(direction_execution(round, id, ok, text));
+        }
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_ne!(snapshot.key, before);
+        assert_eq!(
+            snapshot
+                .evidence
+                .observations
+                .iter()
+                .map(|o| o.result_excerpt.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "earlier observation",
+                "validation failed",
+                "repair applied",
+                "verification passed"
+            ]
+        );
+        assert_eq!(
+            snapshot.evidence.observations[1].disposition,
+            "executed_failure"
+        );
+        assert!(snapshot.evidence.omitted_observations);
+        // Replayed older invocations must not displace current recovery facts.
+        state
+            .stall
+            .tool_call_records
+            .push(state.stall.tool_call_records[2].clone());
+        assert_eq!(direction_snapshot(&state).unwrap().key, snapshot.key);
+        prepare_direction(&mut state, snapshot);
+        let (_, advice) = state
+            .provider_adaptation
+            .work_direction
+            .cached
+            .as_ref()
+            .unwrap();
+        assert_eq!(advice["direction"], "prepare_settlement");
+        assert_eq!(advice["omitted_observations"], true);
+        assert_eq!(advice["settlement_readiness"], "unknown");
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn work_direction_large_documents_do_not_poison_recovery() {
+        let mut state = direction_state();
+        let mut failure = direction_execution(4, "failure", false, &"界".repeat(20_000));
+        failure.args_full = Some("x".repeat(20_000));
+        failure.result_preview = Some("a prefix must not stand in for complete evidence".into());
+        state.stall.tool_call_records.push(failure);
+        state.stall.tool_call_records.push(direction_execution(
+            5,
+            "repair",
+            true,
+            "repair applied",
+        ));
+        state.stall.tool_call_records.push(direction_execution(
+            6,
+            "verification",
+            true,
+            "verification passed",
+        ));
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_eq!(snapshot.evidence.observations.len(), 4);
+        assert_eq!(
+            snapshot.evidence.observations[1].disposition,
+            "executed_failure"
+        );
+        assert!(
+            snapshot.evidence.observations[1]
+                .result_excerpt
+                .contains("outcome only")
+        );
+        assert_eq!(
+            snapshot.evidence.observations[2].result_excerpt,
+            "repair applied"
+        );
+        assert_eq!(
+            snapshot.evidence.observations[3].result_excerpt,
+            "verification passed"
+        );
+        assert!(snapshot.evidence.omitted_observations);
+        assert!(snapshot.support_basis_available);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
+        // No filler calls were needed to age out the opaque failure. But a
+        // newest result with unavailable content must invalidate that advice.
+        state.stall.tool_call_records.push(direction_execution(
+            7,
+            "newest",
+            true,
+            &"x".repeat(20_000),
+        ));
+        let opaque = direction_snapshot(&state).unwrap();
+        assert!(!opaque.support_basis_available);
+        prepare_direction(&mut state, opaque);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state
+            .stall
+            .tool_call_records
+            .last_mut()
+            .unwrap()
+            .result_full = Some("validation failed again".into());
+        state.stall.tool_call_records.last_mut().unwrap().ok = false;
+        let failed = direction_snapshot(&state).unwrap();
+        assert!(!failed.support_basis_available);
+        prepare_direction(&mut state, failed);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+    }
+
+    #[test]
+    fn work_direction_display_prefixes_and_artifacts_do_not_mint_support() {
+        use astra_services::session_journal::{
+            ToolResultArtifactDescriptor, ToolResultDocumentKind,
+        };
+        let mut state = direction_state();
+        state.current_run_id = Some("run".into());
+        state.stall.tool_call_records[1].result_full = None;
+        state.stall.tool_call_records[1].result_preview = Some("verification passed".into());
+        let preview = direction_snapshot(&state).unwrap();
+        assert!(preview.evidence.omitted_observations);
+        assert!(!preview.support_basis_available);
+        prepare_direction(&mut state, preview);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state.stall.tool_call_records[1].result_full = Some("x".repeat(769));
+        assert!(!direction_snapshot(&state).unwrap().support_basis_available);
+        state.stall.tool_call_records[1].result_full = Some("artifact display envelope".into());
+        state.stall.tool_call_records[1].result_artifact = Some(ToolResultArtifactDescriptor {
+            document_kind: ToolResultDocumentKind::Result,
+            version: 1,
+            call_id: "call-1".into(),
+            run_id: "run".into(),
+            byte_len: 20_000,
+            content_sha256: "a".repeat(64),
+        });
+        let artifact = direction_snapshot(&state).unwrap();
+        assert!(!artifact.support_basis_available);
+        state.stall.tool_call_records[1]
+            .result_artifact
+            .as_mut()
+            .unwrap()
+            .content_sha256 = "b".repeat(64);
+        let changed = direction_snapshot(&state).unwrap();
+        assert_eq!(artifact.evidence, changed.evidence);
+        assert_ne!(artifact.key, changed.key);
+        prepare_direction(&mut state, changed);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+    }
+
+    #[test]
+    fn work_direction_lifecycle_requests_do_not_erase_attempt_observations() {
+        use astra_services::session_journal::ToolCallDisposition;
+        for disposition in [ToolCallDisposition::Rejected, ToolCallDisposition::Executed] {
+            let mut state = direction_state();
+            state.stall.tool_call_records.push(direction_execution(
+                4,
+                "failure",
+                false,
+                "validation failed",
+            ));
+            let before = direction_snapshot(&state).unwrap();
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "settle_work_item".into(),
+                disposition: Some(disposition),
+                ..direction_execution(5, "lifecycle", false, "settlement rejected")
+            });
+            // Even a successful lifecycle call may only resume the same attempt.
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "run_next_work_item".into(),
+                ..direction_execution(6, "resume", true, "assigned existing attempt")
+            });
+            assert_eq!(direction_snapshot(&state).unwrap().key, before.key);
+            state.stall.tool_call_records.push(direction_execution(
+                7,
+                "repair",
+                true,
+                "repair applied",
+            ));
+            state.stall.tool_call_records.push(direction_execution(
+                8,
+                "verification",
+                true,
+                "verification passed",
+            ));
+            let snapshot = direction_snapshot(&state).unwrap();
+            assert_eq!(
+                snapshot.evidence.observations[1].result_excerpt,
+                "validation failed"
+            );
+            assert_eq!(
+                snapshot.evidence.observations[2].result_excerpt,
+                "repair applied"
+            );
+            assert_eq!(
+                snapshot.evidence.observations[3].result_excerpt,
+                "verification passed"
+            );
+            assert!(snapshot.evidence.omitted_observations);
+            prepare_direction(&mut state, snapshot);
+            assert!(state.provider_adaptation.work_direction.cached.is_some());
+        }
+    }
+
+    #[test]
+    fn work_direction_owner_change_retains_available_same_attempt_evidence_but_fences_advice() {
+        let binding = astra_services::runs::WorkRuntimeBindingRequest {
+            work_id: "work".into(),
+            branch_id: "branch".into(),
+            item: Some(astra_services::runs::WorkItemRuntimeBindingRequest {
+                item_id: "item".into(),
+                item_revision: 2,
+                attempt_id: "attempt".into(),
+            }),
+        };
+        let assignment = direction_assignment_key(&binding, Some("run"), "objective", "expected");
+        let snapshot = |state: &AgenticLoopState, key: &str| {
+            work_direction_snapshot_for_assignment(
+                state,
+                (key.into(), "objective".into(), "expected".into()),
+            )
+        };
+        let mut state = direction_state();
+        state.current_run_id = Some("run".into());
+        state.current_run_owner_generation = Some(1);
+        state.provider_adaptation.work_direction.binding_key = Some(assignment.clone());
+        let before = snapshot(&state, &assignment).unwrap();
+        state.provider_adaptation.work_direction.cached = Some((
+            before.key.clone(),
+            serde_json::json!({"direction": "focused_verification"}),
+        ));
+        // This tests ownership fencing when evidence is available, not a
+        // promise that the continuation protocol restores the journal.
+        state.current_run_owner_generation = Some(2);
+        let after = snapshot(&state, &assignment).unwrap();
+        assert_eq!(before.evidence, after.evidence);
+        assert_ne!(before.key, after.key);
+        assert_eq!(state.provider_adaptation.work_direction.first_round, 2);
+        publish_work_direction_for_key(&mut state, Some(after.key));
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+
+        // Neither a successor attempt, an item revision, nor another executor
+        // run may reuse this floor/evidence even when task text is unchanged.
+        let mut successor = binding.clone();
+        successor.item.as_mut().unwrap().attempt_id = "successor".into();
+        let mut revised = binding.clone();
+        revised.item.as_mut().unwrap().item_revision += 1;
+        for changed in [
+            direction_assignment_key(&successor, Some("run"), "objective", "expected"),
+            direction_assignment_key(&revised, Some("run"), "objective", "expected"),
+            direction_assignment_key(&binding, Some("another-run"), "objective", "expected"),
+        ] {
+            assert_ne!(assignment, changed);
+            assert!(snapshot(&state, &changed).is_none());
+        }
     }
 
     #[test]
@@ -997,7 +1854,7 @@ mod tests {
         prepare_direction(&mut state, first);
         assert!(state.provider_adaptation.work_direction.cached.is_some());
         let mut mutation = state.stall.tool_call_records[1].clone();
-        mutation.round = Some(3);
+        mutation.round = Some(4);
         mutation.tool_call_id = Some("second-mutation".into());
         state.stall.tool_call_records.push(mutation.clone());
         let next = direction_snapshot(&state).unwrap();
@@ -1058,12 +1915,12 @@ mod tests {
     }
 
     #[test]
-    fn work_direction_missing_round_or_boundary_prevents_prepare_settlement() {
+    fn work_direction_missing_round_prevents_support_but_lifecycle_name_is_not_custody() {
         let mut state = direction_state();
         let snapshot = direction_snapshot(&state).unwrap();
-        assert!(snapshot.evidence.omitted_observations);
+        assert!(!snapshot.evidence.omitted_observations);
         prepare_direction(&mut state, snapshot);
-        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
         state.stall.tool_call_records.insert(
             0,
             ToolCallRecord {
@@ -1072,6 +1929,7 @@ mod tests {
             },
         );
         let snapshot = direction_snapshot(&state).unwrap();
+        // A successful lifecycle request is not a typed custody boundary.
         assert!(!snapshot.evidence.omitted_observations);
         prepare_direction(&mut state, snapshot);
         assert!(state.provider_adaptation.work_direction.cached.is_some());
@@ -1086,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn work_direction_old_assignments_do_not_imply_omitted_current_evidence() {
+    fn work_direction_round_floor_excludes_old_evidence_without_claiming_custody() {
         let mut state = direction_state();
         let current = std::mem::take(&mut state.stall.tool_call_records);
         state.stall.tool_call_records = vec![
@@ -1118,15 +1976,15 @@ mod tests {
             astra_services::work_direction_judgment::WorkDirection::PrepareSettlement
         );
 
-        // Without a visible boundary the bounded scan cannot claim coverage,
-        // even if the repeated observations deduplicate to two results.
+        // Exact replay introduces no projection loss: selection occurs before
+        // truncation. Tool names still do not establish evidence custody.
         let repeated = state.stall.tool_call_records.last().unwrap().clone();
         state
             .stall
             .tool_call_records
             .splice(40..41, std::iter::repeat_n(repeated, 32));
         assert!(
-            direction_snapshot(&state)
+            !direction_snapshot(&state)
                 .unwrap()
                 .evidence
                 .omitted_observations
