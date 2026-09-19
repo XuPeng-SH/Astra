@@ -487,6 +487,10 @@ best-effort budget and runs only when Explain capture is enabled. The snapshot
 uses the existing durable-event batch row budget; overflow is marked unavailable
 instead of reporting a silently truncated total. The requested model comes from
 the immutable route and is not an assertion about the provider-returned model.
+The text/TUI/HTML projection keeps Offering and operation visible (including
+request classification and Work next-direction judgment). When only some
+attempts report a token lane, its sum is explicitly a lower bound; it is not
+presented as the total consumption of that group.
 
 These facts are separate from timed main-model nodes: no interval is invented
 from database timestamps. TUI, text, HTML and Web show Jev auxiliary tokens

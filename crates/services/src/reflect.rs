@@ -136,6 +136,7 @@ impl JudgmentUsageSummary {
                 attempt.operation_id.as_str(),
                 "request_judgment"
                     | "skill_auto_route"
+                    | "work_direction"
                     | "memory_relevance"
                     | "memory_feedback"
                     | "verification_judge"
@@ -1927,12 +1928,23 @@ mod tests {
             offering_id: "offering-2".into(),
             ..exact.clone()
         };
+        let work_direction = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-5".into(),
+            operation_id: "work_direction".into(),
+            ..exact.clone()
+        };
         let facts = ExplainAnalyzeAuxiliaryUsageV1 {
             available: true,
-            attempts: vec![exact, missing, extraction, different_offering],
+            attempts: vec![
+                exact,
+                missing,
+                extraction,
+                different_offering,
+                work_direction,
+            ],
         };
         let summary = JudgmentUsageSummary::from_physical_attempts(&facts);
-        assert_eq!(summary.groups.len(), 2);
+        assert_eq!(summary.groups.len(), 3);
         let group = &summary.groups[0];
         assert_eq!(group.offering_id, "offering-1");
         assert_eq!((group.attempts, group.exact_usage_attempts), (2, 1));

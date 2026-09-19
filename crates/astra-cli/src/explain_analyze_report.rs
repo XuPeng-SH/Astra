@@ -594,6 +594,63 @@ mod tests {
         assert!(output.contains("in 42"), "{output}");
         assert!(output.contains("out unknown"), "{output}");
         assert!(output.contains("partial"), "{output}");
+        assert!(output.contains("offering jev-1"), "{output}");
+        assert!(output.contains("operation relevance"), "{output}");
+    }
+
+    #[test]
+    fn auxiliary_known_tokens_are_lower_bounds_when_a_peer_attempt_is_unreported() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        let exact = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "reported".into(),
+            provider: "typesafe".into(),
+            offering_id: "jev-1".into(),
+            model_name: "jev1".into(),
+            purpose: "introspection".into(),
+            operation_id: "work_direction".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(40),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        };
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            attempts: vec![
+                exact.clone(),
+                ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "missing".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+                    usage: None,
+                    ..exact
+                },
+            ],
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_usage_lines(&graph).join("\n");
+        assert!(output.contains("Work next direction"), "{output}");
+        assert!(output.contains("in at least 40"), "{output}");
+        assert!(output.contains("out at least 5"), "{output}");
+        assert!(output.contains("1/2 requests reported"), "{output}");
     }
 
     #[test]
@@ -667,6 +724,10 @@ mod tests {
         assert_eq!(
             auxiliary_usage_label("unrecognized", "unrecognized"),
             "Auxiliary inference"
+        );
+        assert_eq!(
+            auxiliary_usage_label("work_direction", "introspection"),
+            "Work next direction"
         );
     }
 
@@ -1036,7 +1097,7 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
             .push(attempt);
     }
     let mut lines = Vec::new();
-    for ((provider, _, model, purpose, operation), attempts) in groups {
+    for ((provider, offering, model, purpose, operation), attempts) in groups {
         let provider = if provider == "typesafe" {
             "Jev"
         } else {
@@ -1071,11 +1132,21 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
             lanes
                 .into_iter()
                 .map(|(name, counts)| {
+                    let total = counts.len();
                     let known = counts.into_iter().flatten().collect::<Vec<_>>();
                     if known.is_empty() {
                         format!("{name} unknown")
                     } else {
-                        format!("{name} {}", known.into_iter().map(u128::from).sum::<u128>())
+                        let qualifier = if known.len() == total && reported.len() == attempts.len()
+                        {
+                            ""
+                        } else {
+                            "at least "
+                        };
+                        format!(
+                            "{name} {qualifier}{}",
+                            known.into_iter().map(u128::from).sum::<u128>()
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1088,7 +1159,7 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
         } else {
             ""
         };
-        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · {values} · {}/{} requests reported{partial}",reported.len(),attempts.len()));
+        lines.push(format!("Auxiliary tokens · {provider} ({model}) · {purpose} · operation {operation} · offering {offering} · {values} · {}/{} requests reported{partial}",reported.len(),attempts.len()));
     }
     if graph.auxiliary_usage_unavailable() {
         lines.push("Auxiliary tokens · capture unavailable".into());
@@ -1100,6 +1171,7 @@ fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
     match operation {
         "request_judgment" => "Request classification",
         "skill_auto_route" => "Skill selection",
+        "work_direction" => "Work next direction",
         "work_plan" => "Work planning",
         _ => match purpose {
             "memory_retrieval_rerank" => "Memory judgment",

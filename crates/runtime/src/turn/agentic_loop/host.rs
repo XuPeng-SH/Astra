@@ -720,6 +720,16 @@ pub trait AgenticLoopHost: Send {
         TurnIntentJudgeOutcome::Unavailable
     }
 
+    /// Optional advisory judgment. No host may borrow the primary model when
+    /// an explicit judgment Offering is absent.
+    async fn judge_work_direction(
+        &mut self,
+        _state: &AgenticLoopState,
+        _evidence: &astra_services::work_direction_judgment::WorkDirectionEvidence,
+    ) -> WorkDirectionOutcome {
+        WorkDirectionOutcome::Disabled
+    }
+
     /// Observe a completed lifecycle phase. The default preserves lightweight
     /// hosts; production hosts project the supplied receipt into Explain
     /// Analyze. The receipt is observational evidence only, never a second
@@ -1403,6 +1413,7 @@ fn build_introspect_snapshot_with_tool_admission(
         tool_admission,
         semantic_cache_decisions,
         invocation_lifecycle: None,
+        judgment_usage: None,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()
@@ -2306,6 +2317,9 @@ pub struct ErrorRecoveryState {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderAdaptationState {
+    /// Bounded auxiliary decisions survive the existing continuation snapshot.
+    #[serde(default)]
+    pub(crate) work_direction: WorkDirectionState,
     /// The prior logical response reached the provider output cap before it
     /// produced a tool call, then produced that tool call in the one bounded
     /// continuation. The next eligible execution round receives one concise
@@ -2317,6 +2331,30 @@ pub struct ProviderAdaptationState {
     pub action_convergence_attempted: bool,
     /// One-shot wire adaptation consumed by the next primary provider call.
     pub force_next_thinking_off: bool,
+}
+
+pub enum WorkDirectionOutcome {
+    Disabled,
+    Unavailable,
+    Abstained,
+    Decision(astra_services::work_direction_judgment::WorkDirectionDecision),
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkDirectionState {
+    pub attempted: BTreeSet<String>,
+    pub disabled: bool,
+    /// New assignments start observing at the next executable model round;
+    /// old journal entries can never become evidence for a successor.
+    pub binding_key: Option<String>,
+    pub first_round: u32,
+    pub cached: Option<(String, Value)>,
+}
+
+impl WorkDirectionState {
+    pub(crate) fn reserve(&mut self, key: &str) -> bool {
+        !self.disabled && self.attempted.len() < 3 && self.attempted.insert(key.to_owned())
+    }
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
@@ -2668,6 +2706,8 @@ pub enum VolatileKind {
     /// Bounded execution observations and requirements for the next Work
     /// decision. Observational only; settlement admission retains authority.
     WorkEvidenceContext,
+    /// Semantic next-direction advice, never settlement authority.
+    WorkDirection,
     /// A provider response completed after newer durable user guidance was
     /// accepted. The stale response is not executable; this singleton tells
     /// the next request to re-evaluate from the applied control epoch.
@@ -2735,7 +2775,8 @@ impl VolatileKind {
                 | Self::ActiveTurnFrame
                 | Self::ActiveWorkSnapshot
                 | Self::CanonicalWorkState
-                | Self::WorkEvidenceContext,
+                | Self::WorkEvidenceContext
+                | Self::WorkDirection,
         )
     }
 
@@ -2762,9 +2803,10 @@ impl VolatileKind {
             | Self::SessionHookContext
             | Self::PlanModeMarker
             | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
-            Self::PolicyAdvisory | Self::BehaviorAdvisory | Self::SourceRecoveryAdvisory => {
-                VolatileDeliveryClass::DecisionFeedback
-            }
+            Self::PolicyAdvisory
+            | Self::BehaviorAdvisory
+            | Self::SourceRecoveryAdvisory
+            | Self::WorkDirection => VolatileDeliveryClass::DecisionFeedback,
             Self::SelfStatus => VolatileDeliveryClass::TelemetryOnly,
             Self::StallNudge
             | Self::ExecutionEscalation
@@ -14109,6 +14151,41 @@ mod parallel_execution_tests {
             "work_evidence_context"
         ));
         assert!(state.restricted_tools.is_empty());
+    }
+
+    #[test]
+    fn work_direction_is_singleton_advice_on_the_wire() {
+        let mut state = make_state();
+        state.push_volatile_payload(VolatileKind::WorkDirection, json!({"direction":"old"}));
+        state.push_volatile_payload(
+            VolatileKind::WorkDirection,
+            json!({"direction":"focused_verification", "authority":"advisory_only"}),
+        );
+        let wire = runtime_volatile_injections_edge_profile_value(&state.volatile_pending).unwrap();
+        assert_eq!(wire.as_array().unwrap().len(), 1);
+        assert_eq!(wire[0]["delivery_class"], "decision_feedback");
+        assert_eq!(wire[0]["kind"], "work_direction");
+        let injection = serde_json::from_value::<
+            astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
+        >(wire[0].clone())
+        .unwrap();
+        let preamble =
+            crate::turn::wire_assembly::runtime_volatile_preamble_message(&injection).unwrap();
+        assert!(
+            preamble["content"]
+                .as_str()
+                .unwrap()
+                .contains("focused_verification")
+        );
+        assert!(VolatileKind::wire_kind_is_singleton("work_direction"));
+        assert!(state.restricted_tools.is_empty());
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
     }
 
     #[test]

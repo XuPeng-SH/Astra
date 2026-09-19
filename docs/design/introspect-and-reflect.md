@@ -42,6 +42,35 @@ skill routing, memory relevance/feedback, verification, and completion-proxy
 turn intent), not every auxiliary model call. Routine hint/summary projections
 bound group detail and report how many groups were omitted.
 
+Runtime introspection also exposes typed `judgment_usage` in its snapshot and
+session/overview/recent/trace reports, using the same owner/session-scoped
+service ledger projection. These are individual physical attempts with actual
+provider, offering, model and operation identities, provider usage status and
+nullable input/cache/output buckets. They are not invocation totals, primary
+model usage, a judgment result, or permission to act. Their scope is supported
+judgment operations in the session at ledger-read time, independently of the
+live runtime snapshot's earlier cutoff and the requested recent/turn horizon.
+
+The optional read has a two-second deadline and a 128-attempt capture cap.
+Capture overflow follows the service's unavailable projection; it never claims
+partial rows are a complete ledger. No pool, timeout, query failure, unavailable
+capture, and an excluded durable source are typed coverage states and do not
+fail introspection. `live_only` and `local_only` skip this durable read.
+Missing token buckets stay unknown, including unreported cache inputs; text
+reports known input subtotals as incomplete.
+Aggregate known input/output lower bounds and independent completeness flags
+cover all captured attempts before display truncation, including omitted detail.
+The same full capture is grouped by provider/offering/model/operation, with
+physical attempt counts, known input/output subtotals and independent
+completeness flags. Group detail uses the same depth limits and reports
+`omitted_groups`; no displayed group's totals are computed from the truncated
+attempt list. Mixed providers therefore never become a claimed Jev-only total.
+Unavailable ledger totals remain null; missing usage contributes no known tokens
+and marks the corresponding total incomplete. Hint/summary/diagnostic/forensic
+retain at most 2/8/16/32 attempts with explicit omitted counts. Identity display
+fields are capped at 128 characters and truncation is reported; these display
+identities are never execution references. Other facets do not load this data.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.

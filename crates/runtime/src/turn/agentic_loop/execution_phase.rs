@@ -4531,6 +4531,44 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state
     );
 
+    let direction_attempts = state.provider_adaptation.work_direction.attempted.len();
+    super::guards::judge_work_direction(host, state).await;
+    if state.provider_adaptation.work_direction.attempted.len() != direction_attempts {
+        // Auxiliary inference is an await boundary: guidance, pause, cancel,
+        // or lease loss accepted meanwhile must precede the primary request.
+        if state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            || state
+                .cancellation
+                .token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "run cancelled during optional Work direction judgment",
+            ));
+        }
+        loop {
+            inject_polled_user_intents_before_provider(host, state).await?;
+            match authorize_provider_boundary(state).await? {
+                ProviderBoundaryGate::Authorized => break,
+                ProviderBoundaryGate::Paused if wait_for_pause_clear_or_cancel(state).await => {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Cancelled,
+                        "run cancelled during optional Work direction judgment",
+                    ));
+                }
+                ProviderBoundaryGate::Paused => {}
+            }
+        }
+        super::guards::refresh_work_evidence_context(state);
+    }
+    super::guards::publish_work_direction(state);
+
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::AgenticRequestSnapshot,
         &state.messages,

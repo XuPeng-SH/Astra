@@ -78,6 +78,7 @@ pub mod verification;
 pub mod weighted_admission;
 pub mod work;
 pub mod work_admission_judgment;
+pub mod work_direction_judgment;
 pub mod workflows;
 pub mod workspace_records;
 

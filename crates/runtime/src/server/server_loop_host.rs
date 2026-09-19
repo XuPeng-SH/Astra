@@ -17749,6 +17749,73 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
+    async fn judge_work_direction(
+        &mut self,
+        state: &AgenticLoopState,
+        evidence: &astra_services::work_direction_judgment::WorkDirectionEvidence,
+    ) -> crate::turn::agentic_loop::host::WorkDirectionOutcome {
+        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
+        use astra_services::work_direction_judgment::{
+            parse_work_direction_judgment, work_direction_judgment_request,
+        };
+        if state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            || state
+                .cancellation
+                .token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        {
+            return WorkDirectionOutcome::Unavailable;
+        }
+        if should_skip_auxiliary_llm_for_capacity().is_some() {
+            return WorkDirectionOutcome::Unavailable;
+        }
+        let request = work_direction_judgment_request(evidence);
+        let messages = astra_turn_types::judgment_messages(&request);
+        let cancel = state.cancellation.token.clone();
+        let operation = async {
+            let client = match self
+                .judgment_summary_client(state, "work_direction", &request)
+                .await
+            {
+                Ok(client) => client,
+                Err(JudgmentClientUnavailable::NoOffering) => {
+                    return WorkDirectionOutcome::Disabled;
+                }
+                Err(_) => return WorkDirectionOutcome::Unavailable,
+            };
+            let Ok(response) = client
+                .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
+                .await
+            else {
+                return WorkDirectionOutcome::Unavailable;
+            };
+            if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
+                return WorkDirectionOutcome::Unavailable;
+            }
+            parse_work_direction_judgment(&request, &response.text).map_or(
+                WorkDirectionOutcome::Abstained,
+                WorkDirectionOutcome::Decision,
+            )
+        };
+        // Includes catalog resolution; never let optional advice consume the
+        // primary model's normal inference deadline. Durable inference owns
+        // physical-attempt settlement even if this waiting future is dropped.
+        tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(3), operation) => {
+                result.unwrap_or(WorkDirectionOutcome::Unavailable)
+            }
+            _ = async {
+                if let Some(token) = cancel { token.cancelled().await; }
+                else { std::future::pending::<()>().await; }
+            } => WorkDirectionOutcome::Unavailable,
+        }
+    }
+
     async fn judge_skill_auto_route(
         &mut self,
         state: &AgenticLoopState,
@@ -23474,6 +23541,129 @@ mod tests {
             };
             assert_eq!(tasks[0].objective, text);
             assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    fn work_direction_test_evidence()
+    -> astra_services::work_direction_judgment::WorkDirectionEvidence {
+        astra_services::work_direction_judgment::WorkDirectionEvidence {
+            objective: "Check report".into(),
+            expected_result: "Validated report".into(),
+            current_guidance: None,
+            observations: vec![],
+            omitted_observations: true,
+        }
+    }
+
+    struct PendingWorkDirectionClient;
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for PendingWorkDirectionClient {
+        async fn summarize(
+            &self,
+            _: astra_turn_types::InferencePurpose,
+            _: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_direction_deadline_and_cancellation_are_optional() {
+        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".into(),
+            "s".into(),
+        )
+        .with_test_judgment_clients([
+            Box::new(PendingWorkDirectionClient) as Box<dyn SummaryLlmClient>
+        ])
+        .build();
+        let mut state = create_test_state();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            host.judge_work_direction(&state, &work_direction_test_evidence())
+                .await,
+            WorkDirectionOutcome::Unavailable
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        token.cancel();
+        state.cancellation.token = Some(token);
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            host.judge_work_direction(&state, &work_direction_test_evidence())
+                .await,
+            WorkDirectionOutcome::Unavailable
+        ));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn work_direction_no_offering_does_not_borrow_primary_model() {
+        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".into(),
+            "s".into(),
+        )
+        .build();
+        let state = create_test_state();
+        assert!(matches!(
+            host.judge_work_direction(&state, &work_direction_test_evidence())
+                .await,
+            WorkDirectionOutcome::Disabled
+        ));
+        assert!(host.test_judgment_clients.is_empty());
+        assert!(state.restricted_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_direction_shared_judge_uses_exact_request_and_abstains() {
+        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
+        for (raw, definitive) in [
+            (r#"{"true":["verify"],"uncertain":[]}"#, true),
+            (
+                r#"{"schema_version":1,"model":"jev","answers":{"supported":{"type":"noul","noul":0.1},"verify":{"type":"noul","noul":0.9}}}"#,
+                true,
+            ),
+            (r#"{"true":[],"uncertain":["supported"]}"#, false),
+            ("invalid", false),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".into(),
+                "s".into(),
+            )
+            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([raw.into()])),
+                requests: requests.clone(),
+            }) as Box<dyn SummaryLlmClient>])
+            .build();
+            let evidence = work_direction_test_evidence();
+            let result = host
+                .judge_work_direction(&create_test_state(), &evidence)
+                .await;
+            assert_eq!(
+                matches!(result, WorkDirectionOutcome::Decision(_)),
+                definitive
+            );
+            let calls = requests.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0],
+                astra_turn_types::judgment_messages(
+                    &astra_services::work_direction_judgment::work_direction_judgment_request(
+                        &evidence
+                    )
+                )
+            );
         }
     }
 

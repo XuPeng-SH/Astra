@@ -280,6 +280,45 @@ The projection makes the requirement and reusable observations available before
 a rejected settlement or another inspection; it neither auto-settles nor promises
 that the model will avoid all redundant calls.
 
+An optional `work_direction` judgment can advise the next primary-model
+decision after the pre-request harness gate. It uses only an explicitly bound
+judgment Offering, never the primary model as an implicit fallback. The owner,
+session, run and current attempt are captured together with bounded objective
+and expected-result text. On first observing an assignment the loop establishes
+a journal-round floor; older results are excluded and unattributed results mark
+evidence incomplete. A missing lifecycle boundary also marks it incomplete.
+At least two distinct executable observations are required. Discovery, Work control and
+diagnostic calls do not trigger this adviser. At most four sanitized excerpts
+of 768 characters are sent, from a scan of at most 32 records. Results or arguments
+over 16 KiB cause abstention before hashing or sanitization. Full-result and argument
+digests, round and call identity participate in causal-order snapshot identity
+without entering the prompt; exact invocation replays do not trigger inference,
+but a repeated mutation with a new invocation identity invalidates earlier advice.
+Applied newer user guidance is included in full up to 1024 characters and 16
+events; exceeding either bound causes abstention. Without a reconciliation
+watermark, all applied directives are conservatively retained. Original task text
+is not duplicated as guidance: the assignment objective and expected result bind it.
+Incomplete evidence cannot produce a prepare-settlement hint.
+
+The versioned evidence/intent/assignment digest is reserved before inference.
+Each snapshot is attempted once, with at most three reservations per run-local
+continuation state, including failures and abstentions. This state follows the
+existing continuation checkpoint; it does not promise exactly-once external
+dispatch across a crash before checkpoint persistence. An absent Offering
+disables further direction inference in that continuation. Catalog resolution
+and evidence preprocessing are skipped when disabled; a spent budget only permits
+bounded revalidation of an existing cached hint. Catalog resolution
+and inference share a three-second optional deadline and cancellation; physical
+usage remains owned by the existing durable inference ledger. After awaiting,
+the loop polls user guidance and reauthorizes the provider boundary, then checks
+the snapshot again. Changed assignment, intent, evidence, or completion policy
+discards the hint. Unchanged snapshots reuse their cached hint without inference.
+Direction is advisory only: it neither authorizes settlement or mutation nor
+changes tool visibility, completion-action windows, or execution budgets.
+Fixed trace statuses report eligibility, reservation, answer/abstention,
+application and stale-result rejection, with a hashed snapshot correlation key
+and no raw task/evidence text.
+
 Tasks are durable work items projected into UI boards.
 
 ```text

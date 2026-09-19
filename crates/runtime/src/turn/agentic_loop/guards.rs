@@ -267,6 +267,350 @@ pub(crate) fn evaluate_guards(
 // Individual guard implementations
 // ═══════════════════════════════════════════════════════════════════════
 
+pub(crate) struct WorkDirectionSnapshot {
+    pub key: String,
+    pub evidence: astra_services::work_direction_judgment::WorkDirectionEvidence,
+}
+
+fn direction_hash(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// Preserve all current guidance, or abstain. Check byte/count bounds before
+/// trimming, cloning or traversing an arbitrarily large input/history.
+fn direction_current_guidance(state: &AgenticLoopState) -> Option<Option<String>> {
+    let applied = state.user_intents.applied_user_intents();
+    if applied.len() > 16 {
+        return None;
+    }
+    // Assignment objective/expected_result already carry the original task.
+    // Applied directives have no reconciliation watermark, so retain all of
+    // them conservatively; never drop a newer constraint to fit the original.
+    let mut guidance = String::new();
+    for intent in applied {
+        if intent.content.len() > 4096 {
+            return None;
+        }
+        let content = intent.content.trim();
+        if !content.is_empty() {
+            if !guidance.is_empty() {
+                guidance.push_str("\n\n");
+            }
+            guidance.push_str(content);
+        }
+        if guidance.chars().take(1025).count() > 1024 {
+            return None;
+        }
+    }
+    if guidance.chars().take(1025).count() > 1024 {
+        return None;
+    }
+    Some((!guidance.is_empty()).then_some(guidance))
+}
+
+fn direction_assignment(state: &AgenticLoopState) -> Option<(String, String, String)> {
+    let (binding, objective, expected) = state
+        .runtime_tool_executor
+        .as_deref()?
+        .work_direction_assignment(
+            state.context_manifest_user_id.as_deref()?,
+            state.current_session_id.as_deref()?,
+            state.current_run_id.as_deref()?,
+        )?;
+    let key = direction_hash(&serde_json::json!({
+        "binding": binding, "run": state.current_run_id,
+        "generation": state.current_run_owner_generation,
+        "turn": state.session_turn, "objective": objective, "expected": expected,
+    }));
+    Some((key, objective, expected))
+}
+
+/// Only observations produced after this loop saw the exact assignment are
+/// eligible. A missing round identity never manufactures attribution.
+pub(crate) fn current_work_direction_snapshot(
+    state: &AgenticLoopState,
+) -> Option<WorkDirectionSnapshot> {
+    let gate = &state.provider_adaptation.work_direction;
+    if gate.disabled || (gate.attempted.len() >= 3 && gate.cached.is_none()) {
+        return None;
+    }
+    work_direction_snapshot_for_assignment(state, direction_assignment(state)?)
+}
+
+fn work_direction_snapshot_for_assignment(
+    state: &AgenticLoopState,
+    assignment: (String, String, String),
+) -> Option<WorkDirectionSnapshot> {
+    use astra_services::work_direction_judgment::{
+        WorkDirectionEvidence, WorkDirectionObservation,
+    };
+    if state.remaining_turns == 0
+        || state.provider_adaptation.work_direction.disabled
+        || (state.provider_adaptation.work_direction.attempted.len() >= 3
+            && state.provider_adaptation.work_direction.cached.is_none())
+        || state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        || state
+            .cancellation
+            .token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        || state.hooks.completion_settlement.text_only
+        || state.hooks.completion_settlement.work_settlement_only
+        || state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .is_some()
+    {
+        return None;
+    }
+    let (binding, objective, expected_result) = assignment;
+    let gate = &state.provider_adaptation.work_direction;
+    if gate.binding_key.as_ref() != Some(&binding) {
+        return None;
+    }
+    let current_guidance = direction_current_guidance(state)?;
+    let mut observations = Vec::new();
+    let records = &state.stall.tool_call_records;
+    let suffix_start = records.len().saturating_sub(32);
+    let boundary = records[suffix_start..]
+        .iter()
+        .rposition(|record| {
+            matches!(
+                record.name.as_str(),
+                "start_work" | "run_next_work_item" | "settle_work_item"
+            )
+        })
+        .map(|index| suffix_start + index);
+    let mut omitted =
+        boundary.is_none_or(|index| !records[index].was_executed() || !records[index].ok);
+    let mut seen = HashSet::new();
+    let mut revisions = Vec::new();
+    // Traverse chronologically: a replay cannot move an earlier mutation
+    // after its verification, while a new execution must retain that order.
+    for record in &records[boundary.map_or(suffix_start, |index| index + 1)..] {
+        if !record.was_executed() {
+            continue;
+        }
+        let Some(round) = record.round else {
+            omitted = true;
+            continue;
+        };
+        if round < gate.first_round {
+            continue;
+        }
+        if matches!(
+            record.name.as_str(),
+            "tool_search"
+                | "inspect_work_plan"
+                | "propose_work_plan"
+                | "inspect_work_criteria"
+                | "propose_work_criteria"
+                | "introspect"
+                | "reflect"
+        ) {
+            continue;
+        }
+        let Some(raw) = record
+            .result_full
+            .as_deref()
+            .or(record.result_preview.as_deref())
+        else {
+            omitted = true;
+            continue;
+        };
+        let args = record.args_full.as_deref().unwrap_or("");
+        // No partial digest masquerades as the identity of complete evidence.
+        // Oversized input disables this snapshot, including reuse of its hint.
+        if raw.len() > 16_384 || args.len() > 16_384 || record.name.len() > 128 {
+            return None;
+        }
+        let call_id = record.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
+        if call_id.len() > 128 {
+            return None;
+        }
+        use sha2::{Digest, Sha256};
+        let revision = (
+            record.name.clone(),
+            record.ok,
+            format!("{:x}", Sha256::digest(raw.as_bytes())),
+            format!("{:x}", Sha256::digest(args.as_bytes())),
+        );
+        if !seen.insert((round, call_id, revision.clone())) {
+            continue;
+        }
+        revisions.push((round, call_id, revision));
+        // Sanitize before truncation, including secrets crossing the boundary.
+        let safe = astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(raw);
+        let excerpt: String = safe.content.chars().take(768).collect();
+        omitted |= safe.content.chars().count() > 768 || record.result_full.is_none();
+        if observations.len() == 4 {
+            omitted = true;
+            continue;
+        }
+        observations.push(WorkDirectionObservation {
+            tool: record.name.chars().take(128).collect(),
+            disposition: if record.ok {
+                "executed_success"
+            } else {
+                "executed_failure"
+            }
+            .into(),
+            result_excerpt: excerpt,
+        });
+    }
+    // Exact replays do not count as new evidence. Distinct executions do.
+    if observations.len() < 2 {
+        return None;
+    }
+    let evidence = WorkDirectionEvidence {
+        objective,
+        expected_result,
+        current_guidance,
+        observations,
+        omitted_observations: omitted,
+    };
+    let request =
+        astra_services::work_direction_judgment::work_direction_judgment_request(&evidence);
+    let key = direction_hash(&serde_json::json!({
+        "version": 2, "binding": binding, "request": request, "evidence_revisions": revisions,
+        "guidance_cursor": state.user_intents.applied_user_intents().last().map(|intent| intent.event_index),
+    }));
+    Some(WorkDirectionSnapshot { key, evidence })
+}
+
+/// Reserve before awaiting, including unavailable/abstaining outcomes. The
+/// caller polls durable user guidance again before publishing the result.
+pub(crate) async fn judge_work_direction<H: super::host::AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    state.clear_volatile(VolatileKind::WorkDirection);
+    let gate = &state.provider_adaptation.work_direction;
+    if gate.disabled || gate.attempted.len() >= 3 {
+        return;
+    }
+    let Some((binding, _, _)) = direction_assignment(state) else {
+        state.provider_adaptation.work_direction.cached = None;
+        state.provider_adaptation.work_direction.binding_key = None;
+        return;
+    };
+    let gate = &mut state.provider_adaptation.work_direction;
+    if gate.binding_key.as_ref() != Some(&binding) {
+        gate.binding_key = Some(binding);
+        gate.first_round = state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .take(32)
+            .filter_map(|record| record.round)
+            .max()
+            .map_or(state.llm_rounds_completed, |round| round.saturating_add(1));
+        gate.cached = None;
+        return;
+    }
+    let Some(snapshot) = current_work_direction_snapshot(state) else {
+        tracing::debug!(operation = "work_direction", status = "ineligible");
+        return;
+    };
+    tracing::debug!(operation = "work_direction", status = "eligible", snapshot_key = %snapshot.key);
+    if !state
+        .provider_adaptation
+        .work_direction
+        .reserve(&snapshot.key)
+    {
+        tracing::debug!(
+            operation = "work_direction",
+            status = "skipped",
+            reason = "reserved_disabled_or_budget"
+        );
+        return;
+    }
+    tracing::debug!(operation = "work_direction", status = "attempted", snapshot_key = %snapshot.key);
+    let outcome = host.judge_work_direction(state, &snapshot.evidence).await;
+    retain_work_direction_outcome(state, snapshot, outcome);
+}
+
+fn retain_work_direction_outcome(
+    state: &mut AgenticLoopState,
+    snapshot: WorkDirectionSnapshot,
+    outcome: super::host::WorkDirectionOutcome,
+) {
+    let gate = &mut state.provider_adaptation.work_direction;
+    gate.cached = None;
+    match outcome {
+        super::host::WorkDirectionOutcome::Disabled => {
+            gate.disabled = true;
+            tracing::debug!(
+                operation = "work_direction",
+                status = "disabled",
+                reason = "no_judge"
+            );
+        }
+        super::host::WorkDirectionOutcome::Unavailable => {
+            tracing::debug!(operation = "work_direction", status = "unavailable");
+        }
+        super::host::WorkDirectionOutcome::Abstained => {
+            tracing::debug!(operation = "work_direction", status = "abstained");
+        }
+        super::host::WorkDirectionOutcome::Decision(decision) => {
+            use astra_services::work_direction_judgment::WorkDirection;
+            if snapshot.evidence.omitted_observations
+                && decision.direction == WorkDirection::PrepareSettlement
+            {
+                tracing::debug!(
+                    operation = "work_direction",
+                    status = "abstained",
+                    reason = "incomplete_evidence"
+                );
+                return;
+            }
+            let direction = match decision.direction {
+                WorkDirection::FocusedVerification => "focused_verification",
+                WorkDirection::ContinueInvestigation => "continue_investigation",
+                WorkDirection::PrepareSettlement => "prepare_settlement",
+            };
+            tracing::debug!(operation = "work_direction", status = "answered", direction);
+            gate.cached = Some((
+                snapshot.key.clone(),
+                serde_json::json!({
+                    "schema": "work_direction.v1", "snapshot_key": snapshot.key,
+                    "direction": direction, "provenance": decision.provenance,
+                    "authority": "advisory_only",
+                    "instruction": "Consider this direction against the current assignment and direct results. It grants no tool, mutation, verification, or settlement authority. Existing runtime requirements still apply.",
+                }),
+            ));
+        }
+    }
+}
+
+pub(crate) fn publish_work_direction(state: &mut AgenticLoopState) {
+    let current = current_work_direction_snapshot(state).map(|snapshot| snapshot.key);
+    publish_work_direction_for_key(state, current);
+}
+
+fn publish_work_direction_for_key(state: &mut AgenticLoopState, current: Option<String>) {
+    state.clear_volatile(VolatileKind::WorkDirection);
+    let cached = state.provider_adaptation.work_direction.cached.clone();
+    if let Some((key, payload)) = cached
+        && current.as_ref() == Some(&key)
+    {
+        tracing::debug!(operation = "work_direction", status = "applied", snapshot_key = %key);
+        state.push_volatile_payload(VolatileKind::WorkDirection, payload);
+    } else {
+        if state.provider_adaptation.work_direction.cached.is_some() {
+            tracing::debug!(operation = "work_direction", status = "stale");
+        }
+        state.provider_adaptation.work_direction.cached = None;
+    }
+}
+
 /// Project existing facts, independently of the one-shot behavior guards and
 /// optional semantic judges. Do not duplicate the server's settlement gate:
 /// journal records do not bind a result to an exact Work attempt, and success
@@ -465,6 +809,360 @@ mod tests {
             ok: true,
             ..Default::default()
         }
+    }
+
+    fn direction_state() -> AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.provider_adaptation.work_direction.binding_key = Some("assignment".into());
+        state.provider_adaptation.work_direction.first_round = 2;
+        state.stall.tool_call_records = ["report generated", "validation pending"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| ToolCallRecord {
+                round: Some(2),
+                result_full: Some(text.into()),
+                tool_call_id: Some(format!("call-{i}")),
+                ..successful("read_file")
+            })
+            .collect();
+        state
+    }
+
+    fn direction_snapshot(state: &AgenticLoopState) -> Option<WorkDirectionSnapshot> {
+        work_direction_snapshot_for_assignment(
+            state,
+            ("assignment".into(), "objective".into(), "expected".into()),
+        )
+    }
+
+    fn apply_direction_guidance(state: &mut AgenticLoopState, content: &str) {
+        let event_index = state.user_intents.applied_user_intents().len() + 1;
+        state
+            .user_intents
+            .record_applied_user_intents(&[super::super::host::AppliedUserIntent {
+                intent_id: format!("guidance-{event_index}"),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index,
+                content: content.into(),
+            }]);
+    }
+
+    fn prepare_direction(state: &mut AgenticLoopState, snapshot: WorkDirectionSnapshot) {
+        use astra_services::work_direction_judgment::{
+            parse_work_direction_judgment, work_direction_judgment_request,
+        };
+        let request = work_direction_judgment_request(&snapshot.evidence);
+        let decision =
+            parse_work_direction_judgment(&request, r#"{"true":["supported"],"uncertain":[]}"#)
+                .unwrap();
+        retain_work_direction_outcome(
+            state,
+            snapshot,
+            super::super::host::WorkDirectionOutcome::Decision(decision),
+        );
+    }
+
+    #[test]
+    fn work_direction_snapshot_deduplicates_rounds_and_rejects_stale_intent() {
+        let mut state = direction_state();
+        let first = direction_snapshot(&state).unwrap();
+        state.llm_rounds_completed += 5;
+        state
+            .stall
+            .tool_call_records
+            .push(state.stall.tool_call_records[0].clone());
+        assert_eq!(direction_snapshot(&state).unwrap().key, first.key);
+        state.provider_adaptation.work_direction.cached = Some((
+            first.key.clone(),
+            serde_json::json!({"direction":"focused_verification"}),
+        ));
+        publish_work_direction_for_key(&mut state, Some(first.key));
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|item| item.kind == VolatileKind::WorkDirection)
+        );
+        apply_direction_guidance(&mut state, "Stop investigating; give the current status");
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_eq!(
+            snapshot.evidence.current_guidance.as_deref(),
+            Some("Stop investigating; give the current status")
+        );
+        let current = snapshot.key;
+        publish_work_direction_for_key(&mut state, Some(current));
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        assert!(
+            !state
+                .volatile_pending
+                .iter()
+                .any(|item| item.kind == VolatileKind::WorkDirection)
+        );
+        assert!(state.restricted_tools.is_empty());
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn work_direction_snapshot_excludes_old_unexecuted_and_changed_assignments() {
+        let mut state = direction_state();
+        state.stall.tool_call_records[0].round = Some(1);
+        assert!(direction_snapshot(&state).is_none());
+        state.stall.tool_call_records[0].round = Some(2);
+        state.stall.tool_call_records[0].disposition =
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        assert!(direction_snapshot(&state).is_none());
+        state = direction_state();
+        state.provider_adaptation.work_direction.binding_key = Some("successor".into());
+        assert!(direction_snapshot(&state).is_none());
+        state = direction_state();
+        state.hooks.completion_settlement.text_only = true;
+        assert!(direction_snapshot(&state).is_none());
+    }
+
+    #[test]
+    fn work_direction_bounds_excerpts_and_preserves_run_budget_on_restore() {
+        let mut state = direction_state();
+        state.stall.tool_call_records[0].result_full = Some("界".repeat(1000));
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(snapshot.evidence.omitted_observations);
+        assert!(
+            snapshot
+                .evidence
+                .observations
+                .iter()
+                .all(|item| item.result_excerpt.chars().count() <= 768)
+        );
+        let gate = &mut state.provider_adaptation.work_direction;
+        assert!(gate.reserve(&snapshot.key));
+        assert!(!gate.reserve(&snapshot.key));
+        assert!(gate.reserve("second"));
+        let encoded = serde_json::to_value(&state.provider_adaptation).unwrap();
+        let mut restored: super::super::host::ProviderAdaptationState =
+            serde_json::from_value(encoded).unwrap();
+        assert!(!restored.work_direction.reserve(&snapshot.key));
+        assert!(restored.work_direction.reserve("third"));
+        assert!(!restored.work_direction.reserve("fourth"));
+        let mut disabled = super::super::host::WorkDirectionState {
+            disabled: true,
+            ..Default::default()
+        };
+        assert!(!disabled.reserve("first"));
+    }
+
+    #[test]
+    fn work_direction_full_digest_detects_changes_beyond_prompt_excerpt() {
+        let mut state = direction_state();
+        let prefix = "x".repeat(800);
+        state.stall.tool_call_records[0].result_full = Some(format!("{prefix}old"));
+        let first = direction_snapshot(&state).unwrap();
+        state.stall.tool_call_records[0].result_full = Some(format!("{prefix}new"));
+        let changed = direction_snapshot(&state).unwrap();
+        assert_eq!(first.evidence, changed.evidence);
+        assert_ne!(first.key, changed.key);
+        state
+            .stall
+            .tool_call_records
+            .push(state.stall.tool_call_records[0].clone());
+        assert_eq!(direction_snapshot(&state).unwrap().key, changed.key);
+        state.stall.tool_call_records[0].result_full = Some("x".repeat(20_000));
+        state.stall.tool_call_records[0].result_preview =
+            Some("large report: verification pending".into());
+        assert!(direction_snapshot(&state).is_none());
+        state = direction_state();
+        state.stall.tool_call_records[0].args_full = Some("x".repeat(20_000));
+        assert!(direction_snapshot(&state).is_none());
+    }
+
+    #[test]
+    fn work_direction_repeated_mutation_invalidates_verified_snapshot() {
+        let mut state = direction_state();
+        state.stall.tool_call_records[0].name = "write_file".into();
+        state.stall.tool_call_records[1].result_full = Some("verified".into());
+        state.stall.tool_call_records.insert(
+            0,
+            ToolCallRecord {
+                round: Some(1),
+                ..successful("start_work")
+            },
+        );
+        let first = direction_snapshot(&state).unwrap();
+        let key = first.key.clone();
+        prepare_direction(&mut state, first);
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
+        let mut mutation = state.stall.tool_call_records[1].clone();
+        mutation.round = Some(3);
+        mutation.tool_call_id = Some("second-mutation".into());
+        state.stall.tool_call_records.push(mutation.clone());
+        let next = direction_snapshot(&state).unwrap();
+        assert_ne!(next.key, key);
+        assert_eq!(
+            next.evidence
+                .observations
+                .iter()
+                .map(|o| o.tool.as_str())
+                .collect::<Vec<_>>(),
+            ["write_file", "read_file", "write_file"]
+        );
+        publish_work_direction_for_key(&mut state, Some(next.key.clone()));
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state.stall.tool_call_records.push(mutation);
+        assert_eq!(direction_snapshot(&state).unwrap().key, next.key);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn work_direction_new_guidance_is_bounded_without_original_task() {
+        let mut state = direction_state();
+        let original_key = direction_snapshot(&state).unwrap().key;
+        state.user_intent = "long original task".repeat(10_000);
+        state.message = state.user_intent.clone();
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_eq!(snapshot.key, original_key);
+        assert_eq!(snapshot.evidence.current_guidance, None);
+        apply_direction_guidance(&mut state, "Do not mutate");
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_ne!(snapshot.key, original_key);
+        let request = astra_services::work_direction_judgment::work_direction_judgment_request(
+            &snapshot.evidence,
+        );
+        assert!(
+            serde_json::to_string(&request)
+                .unwrap()
+                .contains("Do not mutate")
+        );
+        apply_direction_guidance(&mut state, &"界".repeat(1024));
+        assert!(direction_snapshot(&state).is_none());
+        state = direction_state();
+        apply_direction_guidance(&mut state, &"界".repeat(1024));
+        assert!(direction_snapshot(&state).is_some());
+        apply_direction_guidance(&mut state, "x");
+        assert!(direction_snapshot(&state).is_none());
+        state = direction_state();
+        for _ in 0..17 {
+            apply_direction_guidance(&mut state, "x");
+        }
+        assert!(direction_snapshot(&state).is_none());
+    }
+
+    #[test]
+    fn work_direction_missing_round_or_boundary_prevents_prepare_settlement() {
+        let mut state = direction_state();
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(snapshot.evidence.omitted_observations);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+        state.stall.tool_call_records.insert(
+            0,
+            ToolCallRecord {
+                round: Some(1),
+                ..successful("start_work")
+            },
+        );
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(!snapshot.evidence.omitted_observations);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_some());
+        state.stall.tool_call_records.push(ToolCallRecord {
+            result_full: Some("unattributed mutation".into()),
+            ..successful("write_file")
+        });
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert!(snapshot.evidence.omitted_observations);
+        prepare_direction(&mut state, snapshot);
+        assert!(state.provider_adaptation.work_direction.cached.is_none());
+    }
+
+    #[test]
+    fn work_direction_old_assignments_do_not_imply_omitted_current_evidence() {
+        let mut state = direction_state();
+        let current = std::mem::take(&mut state.stall.tool_call_records);
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                round: Some(0),
+                result_full: Some("old assignment".into()),
+                ..successful("read_file")
+            };
+            40
+        ];
+        state.stall.tool_call_records.push(ToolCallRecord {
+            round: Some(1),
+            ..successful("settle_work_item")
+        });
+        state.stall.tool_call_records.extend(current);
+        let snapshot = direction_snapshot(&state).unwrap();
+        assert_eq!(snapshot.evidence.observations.len(), 2);
+        assert!(!snapshot.evidence.omitted_observations);
+        let request = astra_services::work_direction_judgment::work_direction_judgment_request(
+            &snapshot.evidence,
+        );
+        assert_eq!(
+            astra_services::work_direction_judgment::parse_work_direction_judgment(
+                &request,
+                r#"{"true":["supported"],"uncertain":[]}"#,
+            )
+            .unwrap()
+            .direction,
+            astra_services::work_direction_judgment::WorkDirection::PrepareSettlement
+        );
+
+        // Without a visible boundary the bounded scan cannot claim coverage,
+        // even if the repeated observations deduplicate to two results.
+        let repeated = state.stall.tool_call_records.last().unwrap().clone();
+        state
+            .stall
+            .tool_call_records
+            .splice(40..41, std::iter::repeat_n(repeated, 32));
+        assert!(
+            direction_snapshot(&state)
+                .unwrap()
+                .evidence
+                .omitted_observations
+        );
+    }
+
+    #[tokio::test]
+    async fn work_direction_no_judge_preserves_primary_path() {
+        use super::super::host::{AgenticLoopHost, WorkDirectionOutcome};
+        let mut host = super::super::host::tests::MockHost::new(vec![]);
+        let mut state = direction_state();
+        let evidence = direction_snapshot(&state).unwrap().evidence;
+        assert!(matches!(
+            host.judge_work_direction(&state, &evidence).await,
+            WorkDirectionOutcome::Disabled
+        ));
+        let snapshot = direction_snapshot(&state).unwrap();
+        retain_work_direction_outcome(&mut state, snapshot, WorkDirectionOutcome::Disabled);
+        assert!(state.provider_adaptation.work_direction.disabled);
+        assert!(direction_snapshot(&state).is_none());
+        judge_work_direction(&mut host, &mut state).await;
+        assert!(
+            state
+                .provider_adaptation
+                .work_direction
+                .attempted
+                .is_empty()
+        );
+        assert!(state.restricted_tools.is_empty());
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
     }
 
     fn successful_observation(name: &str, args: serde_json::Value) -> ToolCallRecord {
