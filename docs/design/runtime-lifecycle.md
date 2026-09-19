@@ -108,6 +108,16 @@ unknown. Effect-owner domain is independent of this scope. Read-only references
 create no mutation obligation. All judgment carriers share this semantic
 contract; the existing typed receipt checks still own completion evidence.
 
+Mutation classification concerns requested task-resource effects, not runtime
+checkpoint, audit, trace, usage or scheduling writes. Explicit Astra Work
+tracking, board and graph changes remain obligations of the Work lifecycle and
+plan, verified by their existing Work owners; they do not by themselves require
+a workspace or external task-resource mutation. Read-only verification plus a
+requested Work board can therefore be both `read_only` and Work `required`.
+Separately requested workspace or external changes retain their mutation and
+scope obligations, with or without Work. This producer distinction does not
+change unresolved-scope completion handling or any authorization/receipt gate.
+
 The auxiliary classifier is optional. With no configured judgment Offering,
 the primary model uses normal typed admission carriers without an auxiliary
 call. An explicitly configured ordinary LLM or Jev uses the same existing
