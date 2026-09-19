@@ -3853,6 +3853,22 @@ async fn ensure_core_schema_while_leased(
     .await?;
     core_schema_create!(
         pool,
+        "evaluation_task_assessments",
+        "CREATE TABLE IF NOT EXISTS evaluation_task_assessments (
+            owner_user_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            assessment_id VARCHAR(128) NOT NULL,
+            assessment_json LONGTEXT NOT NULL,
+            PRIMARY KEY (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_task_assessment_id (owner_user_id, assessment_id),
+            INDEX idx_eval_task_assessment_experiment (owner_user_id, experiment_id, trial_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
         "evaluation_trial_observations",
         "CREATE TABLE IF NOT EXISTS evaluation_trial_observations (
             schema_version INT NOT NULL DEFAULT 2,
