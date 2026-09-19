@@ -904,11 +904,9 @@ fn validate_request_shape(
                 "duplicate measurement name".to_string(),
             ));
         }
-        if measurement.value.is_some_and(|value| !value.is_finite()) {
-            return Err(EvaluationExecutionError::InvalidInput(
-                "measurement values must be finite when present".to_string(),
-            ));
-        }
+        measurement
+            .validate_value_status()
+            .map_err(EvaluationExecutionError::InvalidInput)?;
     }
     let mut evidence_ids = HashSet::new();
     for evidence in &request.observation.evidence {
@@ -1384,6 +1382,35 @@ pub fn terminal_run_observation(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn observation_boundary_rejects_contradictory_measurement_values() {
+        let mut request = EvaluationObservationRequest {
+            session_id: "session".into(),
+            execution_run_id: "run".into(),
+            execution_run_generation: 1,
+            observation: terminal_run_observation(
+                "fingerprint".into(),
+                "trial".into(),
+                "case".into(),
+                ComparisonArm::Baseline,
+                0,
+                TrialStatus::Completed,
+                Some(0),
+                None,
+                Some(0),
+                vec![],
+            ),
+            materialization_receipt_ids: vec![],
+            idempotency_key: "observation".into(),
+        };
+        validate_request_shape(&request).expect("real zero and missing usage are valid");
+        request.observation.measurements[0].value = None;
+        assert!(validate_request_shape(&request).is_err());
+        request.observation.measurements[0].value = Some(0.0);
+        request.observation.measurements[1].value = Some(0.0);
+        assert!(validate_request_shape(&request).is_err());
+    }
 
     #[test]
     fn context_fingerprint_excludes_revision_but_changes_with_input() {

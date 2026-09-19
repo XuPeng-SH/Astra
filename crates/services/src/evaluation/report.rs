@@ -13,7 +13,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 1;
-pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v1";
+pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v2";
 const MAX_REPORT_LABEL_BYTES: usize = 256;
 
 pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
@@ -380,6 +380,45 @@ mod tests {
         assert_eq!(
             first.manifest.observation_refs,
             second.manifest.observation_refs
+        );
+    }
+
+    #[test]
+    fn completed_runs_without_measurements_or_evidence_are_incomplete() {
+        for missing_measurements in [true, false] {
+            let (experiment, mut observations) = fixture();
+            for record in &mut observations {
+                if missing_measurements {
+                    record.observation.measurements.clear();
+                } else {
+                    record.observation.evidence.clear();
+                }
+            }
+            let artifact =
+                build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
+                    .expect("missing evidence stays reportable");
+            assert!(artifact.manifest.coverage.evidence_incomplete);
+            assert_eq!(artifact.manifest.coverage.observed_trial_count, 2);
+            assert!(artifact.markdown.contains(if missing_measurements {
+                "has no measurements"
+            } else {
+                "has no evidence references"
+            }));
+            assert_eq!(
+                artifact.report.causal_strength,
+                super::super::assessment::CausalStrength::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn report_rejects_observed_measurement_without_a_value() {
+        let (experiment, mut observations) = fixture();
+        observations[0].observation.measurements[0].value = None;
+        assert!(
+            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand",)
+                .expect_err("invalid observed fact")
+                .contains("must have a finite value")
         );
     }
 
