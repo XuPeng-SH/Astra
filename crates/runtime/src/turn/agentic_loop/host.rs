@@ -2336,8 +2336,7 @@ pub struct ProviderAdaptationState {
 pub enum WorkDirectionOutcome {
     Disabled,
     Unavailable,
-    Abstained,
-    Decision(astra_services::work_direction_judgment::WorkDirectionDecision),
+    Evaluated(astra_services::work_direction_judgment::WorkDirectionSemanticResult),
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

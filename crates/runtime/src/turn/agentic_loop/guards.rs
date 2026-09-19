@@ -701,6 +701,7 @@ fn retain_work_direction_outcome(
     snapshot: WorkDirectionSnapshot,
     outcome: super::host::WorkDirectionOutcome,
 ) {
+    use astra_services::work_direction_judgment::WorkDirectionSemanticResult;
     let gate = &mut state.provider_adaptation.work_direction;
     gate.cached = None;
     match outcome {
@@ -715,10 +716,22 @@ fn retain_work_direction_outcome(
         super::host::WorkDirectionOutcome::Unavailable => {
             tracing::debug!(operation = "work_direction", status = "unavailable");
         }
-        super::host::WorkDirectionOutcome::Abstained => {
-            tracing::debug!(operation = "work_direction", status = "abstained");
+        super::host::WorkDirectionOutcome::Evaluated(WorkDirectionSemanticResult::Abstained {
+            reason,
+            assessment,
+        }) => {
+            tracing::debug!(operation = "work_direction", status = "abstained", ?reason,
+                supported = assessment.supported, verify = assessment.verify, provenance = ?assessment.provenance);
         }
-        super::host::WorkDirectionOutcome::Decision(decision) => {
+        super::host::WorkDirectionOutcome::Evaluated(WorkDirectionSemanticResult::Invalid {
+            reason,
+        }) => {
+            tracing::debug!(operation = "work_direction", status = "invalid", ?reason);
+        }
+        super::host::WorkDirectionOutcome::Evaluated(WorkDirectionSemanticResult::Decision {
+            decision,
+            assessment,
+        }) => {
             use astra_services::work_direction_judgment::WorkDirection;
             if !snapshot.support_basis_available
                 && decision.direction == WorkDirection::PrepareSettlement
@@ -735,7 +748,8 @@ fn retain_work_direction_outcome(
                 WorkDirection::ContinueInvestigation => "continue_investigation",
                 WorkDirection::PrepareSettlement => "prepare_settlement",
             };
-            tracing::debug!(operation = "work_direction", status = "answered", direction);
+            tracing::debug!(operation = "work_direction", status = "answered", direction,
+                supported = assessment.supported, verify = assessment.verify, provenance = ?assessment.provenance);
             gate.cached = Some((
                 snapshot.key.clone(),
                 serde_json::json!({
@@ -1016,12 +1030,15 @@ mod tests {
         };
         let request = work_direction_judgment_request(&snapshot.evidence);
         let decision =
-            parse_work_direction_judgment(&request, r#"{"true":["supported"],"uncertain":[]}"#)
-                .unwrap();
+            parse_work_direction_judgment(&request, r#"{"true":["supported"],"uncertain":[]}"#);
+        assert!(matches!(
+            decision,
+            astra_services::work_direction_judgment::WorkDirectionSemanticResult::Decision { .. }
+        ));
         retain_work_direction_outcome(
             state,
             snapshot,
-            super::super::host::WorkDirectionOutcome::Decision(decision),
+            super::super::host::WorkDirectionOutcome::Evaluated(decision),
         );
     }
 
@@ -1966,15 +1983,20 @@ mod tests {
         let request = astra_services::work_direction_judgment::work_direction_judgment_request(
             &snapshot.evidence,
         );
-        assert_eq!(
+        assert!(matches!(
             astra_services::work_direction_judgment::parse_work_direction_judgment(
                 &request,
                 r#"{"true":["supported"],"uncertain":[]}"#,
-            )
-            .unwrap()
-            .direction,
-            astra_services::work_direction_judgment::WorkDirection::PrepareSettlement
-        );
+            ),
+            astra_services::work_direction_judgment::WorkDirectionSemanticResult::Decision {
+                decision: astra_services::work_direction_judgment::WorkDirectionDecision {
+                    direction:
+                        astra_services::work_direction_judgment::WorkDirection::PrepareSettlement,
+                    ..
+                },
+                ..
+            }
+        ));
 
         // Exact replay introduces no projection loss: selection occurs before
         // truncation. Tool names still do not establish evidence custody.

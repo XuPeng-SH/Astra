@@ -17799,10 +17799,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
                 return WorkDirectionOutcome::Unavailable;
             }
-            parse_work_direction_judgment(&request, &response.text).map_or(
-                WorkDirectionOutcome::Abstained,
-                WorkDirectionOutcome::Decision,
-            )
+            WorkDirectionOutcome::Evaluated(parse_work_direction_judgment(&request, &response.text))
         };
         // Includes catalog resolution; never let optional advice consume the
         // primary model's normal inference deadline. Durable inference owns
@@ -23770,7 +23767,7 @@ mod tests {
                 .judge_work_direction(&create_test_state(), &evidence)
                 .await;
             assert_eq!(
-                matches!(result, WorkDirectionOutcome::Decision(_)),
+                matches!(result, WorkDirectionOutcome::Evaluated(astra_services::work_direction_judgment::WorkDirectionSemanticResult::Decision { .. })),
                 definitive
             );
             let calls = requests.lock().unwrap();

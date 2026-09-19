@@ -349,6 +349,15 @@ settlement authority and leaves admission and expected-result coverage with thei
 existing owners. Prefixes, previews and outcome-only records cannot supply the
 latest complete support candidate.
 
+Direction response parsing distinguishes a decision, uncertain or conflicting
+answers, and malformed JSON or an invalid response contract. Valid assessments
+retain the normalized `supported` and `verify` values and their provenance;
+discrete false/uncertain/true encodings are not calibrated confidence. These
+diagnostics do not change the decision thresholds, grant authority, or imply
+that a recommendation was published or adopted by the primary model. Invalid
+responses retain a closed reason only, never provider response text or parser
+error messages.
+
 The versioned evidence/intent/assignment digest is reserved before inference.
 Each snapshot is attempted once, with at most three reservations per run-local
 continuation state, including failures and abstentions. This state follows the
