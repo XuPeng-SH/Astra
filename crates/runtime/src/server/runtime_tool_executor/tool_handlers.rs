@@ -1671,7 +1671,7 @@ mod tests {
             assert!(report["judgment_usage"]["observed_attempts"].is_null());
             assert_eq!(report["semantic_judgments"]["coverage"], expected);
             assert!(report["semantic_judgments"]["counts"].is_null());
-            assert_eq!(report["semantic_judgments"]["model_adoption"], "unknown");
+            assert!(report["semantic_judgments"].get("model_adoption").is_none());
         }
     }
 

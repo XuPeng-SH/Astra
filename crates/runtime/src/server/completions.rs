@@ -1380,7 +1380,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!overflow.available && overflow.attempts.is_empty());
+        assert!(overflow.available && overflow.truncated && overflow.is_valid());
+        assert_eq!(overflow.attempts.len(), 2);
+        assert_eq!(overflow.attempts, snapshot.attempts[..2]);
         for (user, turn) in [("other-user", 1), ("test-user", 2)] {
             assert!(
                 astra_services::inference_execution::load_explain_auxiliary_usage(

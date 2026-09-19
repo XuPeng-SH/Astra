@@ -1236,44 +1236,83 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires live MatrixOne: ASTRA_TEST_DB_IT=1, ASTRA_TEST_SESSION_ID and ASTRA_TEST_USER_ID"]
-    async fn semantic_judgment_live_public_loader_retained_session_is_owner_scoped() {
-        let settings = live_settings();
-        let session = std::env::var("ASTRA_TEST_SESSION_ID")
-            .expect("set ASTRA_TEST_SESSION_ID to an existing retained session");
-        let user = std::env::var("ASTRA_TEST_USER_ID")
-            .expect("set ASTRA_TEST_USER_ID to that session's authenticated owner");
-        assert!(
-            !session.trim().is_empty(),
-            "ASTRA_TEST_SESSION_ID is required"
-        );
-        assert!(!user.trim().is_empty(), "ASTRA_TEST_USER_ID is required");
-        let pool = SharedPool::new(&settings)
+    #[ignore = "requires live MatrixOne: ASTRA_TEST_DB_IT=1; existing schema"]
+    async fn semantic_judgment_live_public_loader_synthetic_sessions_are_owner_scoped() {
+        let pool = SharedPool::new(&live_settings())
             .await
             .expect("test database connection");
+        let user = format!("semantic-test-{}", uuid::Uuid::new_v4());
+        let other_user = format!("semantic-other-{}", uuid::Uuid::new_v4());
+        // Same-owner/different-session and different-owner decoys must not leak
+        // into the requested capture. All identities are unique to this test.
+        let fixtures = [&user, &user, &other_user].map(|owner| {
+            let session = uuid::Uuid::new_v4().to_string();
+            let event = uuid::Uuid::new_v4().to_string();
+            let mut fact = observation();
+            fact.correlation.run_id = format!("run-{session}");
+            let trace = semantic_judgment_trace(&event, &fact, 100)
+                .unwrap()
+                .session_id(Some(&session))
+                .build();
+            (owner, session, event, fact, trace.metadata.unwrap())
+        });
+        // Public loaders acquire their own connection. Commit the complete
+        // fixture first; an uncommitted transaction cannot exercise that path.
+        let mut tx = pool.get().begin().await.unwrap();
+        for (owner, session, event, _, metadata) in &fixtures {
+            sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?,?,'active',1,'session',NOW(6),NOW(6),NOW(6))")
+                .bind(session).bind(*owner).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,metadata,created_at) VALUES (?,?,?,'trace_span',?,NOW(6))")
+                .bind(event).bind(*owner).bind(session).bind(metadata.to_string())
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
 
-        // Public entrypoint, using existing data only: no fixtures, writes,
-        // schema bootstrap, or cleanup. Empty capture is legitimate because
-        // unrelated traces, eviction and retention can hide semantic facts.
-        let capture = load_semantic_judgment_observations(&pool, &user, &session, 32, 8)
+        // Retain Results until after cleanup, including unexpected loader
+        // errors: a failed assertion must not leave committed fixtures behind.
+        let mut captures = Vec::new();
+        for (owner, session, _, _, _) in &fixtures {
+            captures.push(load_semantic_judgment_observations(&pool, owner, session, 32, 8).await);
+        }
+        let wrong_owner =
+            load_semantic_judgment_observations(&pool, &other_user, &fixtures[0].1, 32, 8).await;
+
+        let mut cleanup = pool.get().begin().await.unwrap();
+        for (owner, session, event, _, _) in &fixtures {
+            sqlx::query(
+                "DELETE FROM agent_events WHERE user_id = ? AND session_id = ? AND event_id = ?",
+            )
+            .bind(*owner)
+            .bind(session)
+            .bind(event)
+            .execute(&mut *cleanup)
             .await
-            .expect("owner-scoped public loader must succeed");
-        assert!(capture.available);
-        assert!(capture.capture_incomplete);
-        assert!(capture.candidates_scanned <= 32);
-        assert!(capture.observations.len() <= 8);
-        assert!(
-            capture
-                .gaps
-                .contains(&SemanticJudgmentCaptureGap::TraceMayBeDropped)
-        );
+            .unwrap();
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(*owner)
+                .bind(session)
+                .execute(&mut *cleanup)
+                .await
+                .unwrap();
+        }
+        cleanup.commit().await.unwrap();
 
-        let wrong_owner = uuid::Uuid::new_v4().to_string();
-        assert!(wrong_owner != user, "random test owner must differ");
-        match load_semantic_judgment_observations(&pool, &wrong_owner, &session, 32, 8).await {
+        for (result, (_, _, event, fact, _)) in captures.into_iter().zip(&fixtures) {
+            let capture = result.expect("owner-scoped public loader must succeed");
+            assert!(capture.available && capture.capture_incomplete);
+            assert!(!capture.truncated);
+            assert_eq!(capture.candidates_scanned, 1);
+            assert_eq!(capture.observations.len(), 1);
+            assert_eq!(capture.observations[0].observation_span_id, *event);
+            assert_eq!(capture.observations[0].observation, *fact);
+            assert!(
+                capture
+                    .gaps
+                    .contains(&SemanticJudgmentCaptureGap::TraceMayBeDropped)
+            );
+        }
+        match wrong_owner {
             Err(error) => assert_eq!(error.kind, crate::ServiceErrorKind::NotFound),
-            // An error carries no observation payload; do not print a capture
-            // or real session/user identifiers if the ownership boundary fails.
             Ok(_) => panic!("wrong owner must receive not found, never observations"),
         }
     }
