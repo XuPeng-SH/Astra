@@ -99,6 +99,15 @@ complete clarification must satisfy the same confidence and dependency rules
 and preserve already determined necessary facts; partial evidence is never
 merged into execution authority. No implicit main-model fallback is permitted.
 
+Mutation completion scope describes the resources the current request actually
+requires changing, not its subject, referenced paths, executor location, or
+previously completed work. Workspace and external scopes put all required
+changes on the corresponding side of the bound-workspace effect boundary;
+mixed requires changes on both sides, and an unclear target/boundary remains
+unknown. Effect-owner domain is independent of this scope. Read-only references
+create no mutation obligation. All judgment carriers share this semantic
+contract; the existing typed receipt checks still own completion evidence.
+
 Unavailable classification blocks dependent parallel creation, not unrelated
 tools that the runtime can independently admit. Its rejection carries the
 typed cause, semantic evidence when available, and clarification state. A

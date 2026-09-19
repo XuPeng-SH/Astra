@@ -130,8 +130,11 @@ pub trait TurnIntentJudge: Send + Sync {
 
 // ─── Prompt construction ────────────────────────────────────────────────────
 
-/// Stable prefix for the semantic turn classifier. It stays in the system
-/// message so provider-side prefix caching can reuse it across user turns.
+/// Shared by typed classification, Work planning and the broader turn judge.
+/// Scope is an effect boundary, never a domain-to-location lookup.
+pub(crate) const MUTATION_TARGET_SCOPE_POLICY: &str = "Scope follows requested mutation targets, not subject, references/input paths, executor location or prior completed work. workspace=all required changes within the bound workspace effect boundary; external=all outside; mixed=both; unknown=target/boundary unclear. Domain is the effect owner, independent of scope. Read-only references/information create no mutation targets. Judge semantics, not keywords.";
+
+/// Stable system prefix for provider-side caching across user turns.
 const TURN_INTENT_JUDGE_SYSTEM_PROMPT: &str = r#"Classify the latest user turn for an agentic assistant. Return exactly one minimal JSON object, with no prose or markdown.
 
 Only include fields that are material and confidently determined. Omitted fields mean their typed default or `unknown`; do not emit nulls, empty arrays, or explanatory text. Allowed fields and values:
@@ -141,7 +144,7 @@ Classify semantics, not keywords. Latest user intent wins; prior assistant text 
 
 `work_lifecycle`: only explicit durable tracking/recovery, task mode/board, continuation, or same-turn graph mutation means `required`; a fixed chain alone is `not_required`. Acceptance units never establish durable Work. Count acceptance units, not response containers, agents, tools, or phases. Explicit A and B stay separate in one response when each owes a payload/source and survives peer failure; inputs used only for one combined conclusion are one. A change plus tests is one. An explicit same-turn multi-agent request without tracked lifecycle is `not_required` with `agent_fanout`. Use `unknown` when unclear.
 
-`workspace_mutation` is end state: info=`read_only`; requested workspace or version-control change, or external state change=`must_mutate`, despite prior inspection. For `must_mutate`, include `mutation_completion_scope`: `workspace`=bound project, `external`=managed state outside it, `mixed`=both, unclear=`unknown`. A requested daemon, service, deployment, database, or host path outside the bound project is `external`. Browser=true only when requested. Do not summarize."#;
+`workspace_mutation` is end state: info=`read_only`; requested workspace or version-control change, or external state change=`must_mutate`, despite prior inspection. For `must_mutate`, include `mutation_completion_scope`. Browser=true only when requested. Do not summarize."#;
 
 /// Minimal semantic contract used at the interactive side-effect boundary.
 ///
@@ -172,7 +175,7 @@ Benchmark text, complexity, files/tests, chains or parallelism alone never imply
 
 Count outcomes surviving peer failure, not containers/agents/phases. Separate independent payload/source/verification. One conclusion or change+tests/report is one; independent reports may be tasks.
 
-Mutation is requested end state, not preparatory inspection: info=read_only, state=must_mutate, either=may_mutate. `mutation_completion_scope` is mandatory for must_mutate: workspace|external|mixed|unknown. Omit it for read_only/may_mutate. Managed state outside the project is external. External/mixed must_mutate needs domain (github|git|code|memory|web|system|database); else null.
+Mutation is requested end state, not preparatory inspection: info=read_only, state=must_mutate, either=may_mutate. `mutation_completion_scope` is mandatory for must_mutate: workspace|external|mixed|unknown. Omit it for read_only/may_mutate. External/mixed must_mutate needs domain (github|git|code|memory|web|system|database); else null.
 
 Not required: {"work_lifecycle":"not_required","execution_topology":"primary"|"parallel_subruns","domain":<domain|null>,"workspace_mutation":"read_only"|"may_mutate"|"must_mutate","mutation_completion_scope":<scope>}
 
@@ -567,7 +570,7 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
     vec![
         json!({
             "role": "system",
-            "content": TURN_INTENT_JUDGE_SYSTEM_PROMPT
+            "content": format!("{TURN_INTENT_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}")
         }),
         json!({
             "role": "user",
@@ -587,7 +590,7 @@ pub fn work_admission_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value>
     vec![
         json!({
             "role": "system",
-            "content": WORK_ADMISSION_JUDGE_SYSTEM_PROMPT,
+            "content": format!("{WORK_ADMISSION_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}"),
         }),
         json!({
             "role": "user",
@@ -1360,13 +1363,15 @@ mod tests {
         assert!(system.contains("fixed chain"));
         assert!(system.contains("is end state"));
         assert!(system.contains("version-control change"));
-        assert!(system.contains("daemon, service, deployment"));
+        assert!(system.contains(MUTATION_TARGET_SCOPE_POLICY));
         assert!(system.contains("Plan drafts and memory storage alone are not Work"));
         assert!(system.contains("requested durable tracking/admission/lifecycle is Work"));
         assert!(system.contains("even with JSON output or tool bans"));
         assert!(system.contains("policy governs execution"));
         assert!(
-            system.len() < 2_800,
+            // Previous 2,800-byte budget plus 256 bytes for target-boundary
+            // semantics replacing the old scope definition; no planning cuts.
+            system.len() < 2_800 + 256,
             "the stable semantic prefix must stay small enough to cache cheaply: {} bytes",
             system.len()
         );
@@ -1451,11 +1456,13 @@ mod tests {
         assert!(system.contains("Omit it for read_only/may_mutate"));
         assert!(system.contains("Initial tasks are genesis"));
         assert!(system.contains("Bound graphs use typed planning tools"));
-        assert!(system.contains("Managed state outside the project"));
+        assert!(system.contains(MUTATION_TARGET_SCOPE_POLICY));
         assert!(!system.contains("initial_outcome_count"));
         assert!(!system.contains("final_outcome_count"));
         assert!(
-            system.len() < 3_000,
+            // Previous 3,000-byte budget plus 384 bytes for the shared policy
+            // replacing the old scope sentence. Keep graph semantics intact.
+            system.len() < 3_000 + 384,
             "Work admission must remain a small interactive request: {} bytes",
             system.len()
         );
