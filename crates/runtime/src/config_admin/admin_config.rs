@@ -323,11 +323,11 @@ mod tests {
             &self,
             id: String,
         ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
-            assert_eq!(id, "offer-jet");
+            assert_eq!(id, "offer-jev");
             Ok(ResolvedModelOffering {
                 offering_id: id,
                 model: ResolvedActiveLlmModel {
-                    model_name: "jet".into(),
+                    model_name: "jev".into(),
                     wire_model_name: None,
                     api_key: self.key.clone(),
                     base_url: "http://unused.invalid".into(),
@@ -376,14 +376,14 @@ mod tests {
         }
     }
 
-    fn jet_item(active: bool) -> ModelListItem {
+    fn jev_item(active: bool) -> ModelListItem {
         ModelListItem {
-            offering_id: "offer-jet".into(),
+            offering_id: "offer-jev".into(),
             access_id: "deployment".into(),
             access_kind: ModelAccessKind::SelfHosted,
             access_label: "Server".into(),
             execution_placement: ModelExecutionPlacement::Server,
-            name: "jet".into(),
+            name: "jev".into(),
             provider: "typesafe".into(),
             description: None,
             is_active: active,
@@ -426,7 +426,7 @@ mod tests {
             .uri("/admin/config/judgment_model")
             .header("content-type", "application/json")
             .body(if method == "PUT" {
-                Body::from(r#"{"value":"jet"}"#)
+                Body::from(r#"{"value":"jev"}"#)
             } else {
                 Body::empty()
             })
@@ -436,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn judgment_name_set_get_unset_uses_only_canonical_binding() {
         let config = StubAdminConfigService::empty();
-        let app = judgment_app(config.clone(), vec![jet_item(true)], "fake-key");
+        let app = judgment_app(config.clone(), vec![jev_item(true)], "fake-key");
         assert_eq!(
             app.clone()
                 .oneshot(config_request("PUT"))
@@ -449,7 +449,7 @@ mod tests {
             config.list().await.unwrap(),
             vec![(
                 astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING.into(),
-                "offer-jet".into()
+                "offer-jev".into()
             )]
         );
         let response = app.clone().oneshot(config_request("GET")).await.unwrap();
@@ -459,7 +459,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["value"],
-            "jet"
+            "jev"
         );
         assert_eq!(
             app.oneshot(config_request("DELETE"))
@@ -473,17 +473,17 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_judgment_selection_preserves_previous_binding() {
-        let mut duplicate = jet_item(false);
+        let mut duplicate = jev_item(false);
         duplicate.provider = "other".into();
         duplicate.offering_id = "other-offering".into();
-        let mut personal = jet_item(true);
+        let mut personal = jev_item(true);
         personal.access_kind = ModelAccessKind::ThisDevice;
         for (items, key) in [
             (vec![], "fake-key"),
-            (vec![jet_item(false)], "fake-key"),
-            (vec![jet_item(true), duplicate], "fake-key"),
+            (vec![jev_item(false)], "fake-key"),
+            (vec![jev_item(true), duplicate], "fake-key"),
             (vec![personal], "fake-key"),
-            (vec![jet_item(true)], "  "),
+            (vec![jev_item(true)], "  "),
         ] {
             let config = StubAdminConfigService::with_entry(
                 astra_services::ADMIN_CONFIG_KEY_JUDGMENT_OFFERING,

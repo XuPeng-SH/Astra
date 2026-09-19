@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_jet_usage_is_separate_and_missing_lanes_remain_unknown() {
+    fn auxiliary_jev_usage_is_separate_and_missing_lanes_remain_unknown() {
         use astra_turn_types::{
             ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
             ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
@@ -572,7 +572,7 @@ mod tests {
             attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
                 attempt_id: "aux-1".into(),
                 provider: "typesafe".into(),
-                offering_id: "jet-1".into(),
+                offering_id: "jev-1".into(),
                 model_name: "jev1".into(),
                 purpose: "memory_retrieval_rerank".into(),
                 operation_id: "relevance".into(),
@@ -590,7 +590,7 @@ mod tests {
         graph.apply(start);
         graph.apply(end);
         let output = auxiliary_usage_lines(&graph).join("\n");
-        assert!(output.contains("Jet"), "{output}");
+        assert!(output.contains("Jev"), "{output}");
         assert!(output.contains("in 42"), "{output}");
         assert!(output.contains("out unknown"), "{output}");
         assert!(output.contains("partial"), "{output}");
@@ -671,16 +671,16 @@ mod tests {
     }
 
     #[test]
-    fn mixed_jet_and_llm_usage_remains_isolated_across_repeated_capture_segments() {
+    fn mixed_jev_and_llm_usage_remains_isolated_across_repeated_capture_segments() {
         use astra_turn_types::{
             ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
             ExplainAnalyzeAuxiliaryUsageV1,
         };
         let attempts = [
             (
-                "jet-decision",
+                "jev-decision",
                 "typesafe",
-                "jet-model",
+                "jev-model",
                 "request_judgment",
                 100,
                 3,
@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(lines.len(), 3, "{output}");
         for (identity, label, counts) in [
             (
-                "Jet (jet-model)",
+                "Jev (jev-model)",
                 "Request classification",
                 "in 100 · cache read unknown · cache write unknown · out 3",
             ),
@@ -1038,7 +1038,7 @@ pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String
     let mut lines = Vec::new();
     for ((provider, _, model, purpose, operation), attempts) in groups {
         let provider = if provider == "typesafe" {
-            "Jet"
+            "Jev"
         } else {
             provider
         };

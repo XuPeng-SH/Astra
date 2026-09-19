@@ -143,7 +143,7 @@ pub enum ModelCmd {
 pub struct ModelCompareArgs {
     /// Baseline Offering ID from `astra admin model list`.
     pub baseline: String,
-    /// Candidate Offering ID (e.g. your registered Jet Offering).
+    /// Candidate Offering ID (e.g. your registered Jev Offering).
     pub candidate: String,
     /// JSON case file. Omit to compare the built-in memory judgment cases.
     #[arg(long)]

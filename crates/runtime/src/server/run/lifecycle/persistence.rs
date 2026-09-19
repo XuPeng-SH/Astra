@@ -4456,7 +4456,7 @@ mod tests {
     #[test]
     fn mixed_provider_run_totals_do_not_claim_a_primary_cache_ratio() {
         let mut state = observer_test_state();
-        // Primary: 100 fresh + 900 cached. Jet: 1000 input + 3 output.
+        // Primary: 100 fresh + 900 cached. Jev: 1000 input + 3 output.
         state.total_prompt = 1_100;
         state.total_cache_read = 900;
         state.total_completion = 3;

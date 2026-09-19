@@ -41,7 +41,7 @@ Live `astra-test` quality judging invokes `astra session judge --model MODEL
 --message JUDGMENT_REQUEST_JSON`. This is one tool-free `VerificationJudge`
 completion through the existing authenticated Offering and durable inference
 owners. The input is the shared `JudgmentRequest` schema; ordinary LLMs return
-fixed true/uncertain IDs and Jet returns native probabilities. The CLI returns
+fixed true/uncertain IDs and Jev returns native probabilities. The CLI returns
 normalized answers and their provenance. The harness requires one confident
 rubric category (fully yes, substantially yes, partial, or no), then maps it to
 1.0, 0.7, 0.4, or 0.0. Probabilities are never scores; uncertain, conflicting,

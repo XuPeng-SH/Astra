@@ -426,7 +426,7 @@ mod tests {
         let server = MockServer::start().await;
         let item = |id: &str, provider: &str| json!({"offering_id":id,"access_id":format!("access-{id}"),"access_kind":"self_hosted","access_label":"test","execution_placement":"server","name":id,"provider":provider,"description":null,"is_active":true,"context_window":64000,"max_completion_tokens":512,"architecture":null,"thinking_capability":null});
         Mock::given(method("GET")).and(path("/models")).and(header("authorization", "Bearer sentinel-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[item("offer-baseline","openai"),item("offer-jet","typesafe")],"total":2,"limit":200,"next_cursor":null,"catalog_revision":"test-revision"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[item("offer-baseline","openai"),item("offer-jev","typesafe")],"total":2,"limit":200,"next_cursor":null,"catalog_revision":"test-revision"})))
             .expect(2).mount(&server).await;
         Mock::given(method("POST"))
             .and(path("/sessions"))
@@ -470,7 +470,7 @@ mod tests {
             .and(body_partial_json(json!({"logical_attempt":2})))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(truncated_completion(
-                    "offer-jet",
+                    "offer-jev",
                     r#"{"true":["0"],"uncertain":[]}"#,
                 )),
             )
@@ -483,7 +483,7 @@ mod tests {
         let output = directory.path().join("report");
         let args = ModelCompareArgs {
             baseline: "offer-baseline".into(),
-            candidate: "offer-jet".into(),
+            candidate: "offer-jev".into(),
             cases: Some(cases),
             repeat: 2,
             output: Some(output.clone()),
@@ -550,7 +550,7 @@ mod tests {
                 .iter()
                 .map(|request| request["model_selection"]["offering_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["offer-baseline", "offer-jet", "offer-jet", "offer-baseline"]
+            vec!["offer-baseline", "offer-jev", "offer-jev", "offer-baseline"]
         );
         assert!(
             run(&api, "sentinel-token", &args)

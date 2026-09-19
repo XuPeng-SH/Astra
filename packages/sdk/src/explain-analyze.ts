@@ -228,7 +228,7 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
   const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"]]);
   const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
     const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
-    const provider = first.provider === "typesafe" ? "Jet" : first.provider;
+    const provider = first.provider === "typesafe" ? "Jev" : first.provider;
     const lanes = [["in","fresh_input_tokens"],["cache read","cache_read_tokens"],["cache write","cache_creation_tokens"],["out","output_tokens"]] as const;
     const values = reported.length === 0 ? "usage unavailable" : lanes.map(([name,key]) => {
       const counters = reported.flatMap(u => u[key] === undefined ? [] : [BigInt(u[key])]);

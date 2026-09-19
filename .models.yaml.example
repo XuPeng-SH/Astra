@@ -37,7 +37,7 @@
 #   max_completion_tokens — Max output tokens (integer). Sent to provider. A
 #                           typed judgment model needs enough room for every
 #                           batched answer identity; 512 is a safe starting
-#                           point for the built-in Jet judgment contract.
+#                           point for the built-in Jev judgment contract.
 #   pricing_prompt        — Cost per token (input), in USD. Used by /stats.
 #   pricing_completion    — Cost per token (output), in USD. Used by /stats.
 #   fallback_chain        — Ordered list of model names for rate-limit recovery.
@@ -220,7 +220,7 @@
 # fallback; bind an ordinary model explicitly when that is desired.
 # Omitting judgment_default leaves the existing binding unchanged.
 # Credentials are stored encrypted through the existing model registry.
-# An empty api_key is unusable; no JET_KEY environment variable is required.
+# An empty api_key is unusable; no JEV_KEY environment variable is required.
 # - name: jev-1.13.0
 #   judgment_default: true
 #   provider: typesafe

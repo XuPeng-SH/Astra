@@ -23208,7 +23208,7 @@ mod tests {
         };
         for raw in [
             json!({"true":["0"],"uncertain":[]}),
-            json!({"schema_version":1,"model":"jet","answers":{"0":{"type":"noul","noul":0.95}}}),
+            json!({"schema_version":1,"model":"jev","answers":{"0":{"type":"noul","noul":0.95}}}),
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientSkillAutoRouteJudge {

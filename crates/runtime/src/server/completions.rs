@@ -1254,12 +1254,12 @@ mod tests {
             .await
             .unwrap();
         let shared_pool = astra_core::SharedPool::new(&settings).await.unwrap();
-        let session_id = format!("jet-ledger-{}", uuid::Uuid::new_v4().simple());
+        let session_id = format!("jev-ledger-{}", uuid::Uuid::new_v4().simple());
         sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?, 'test-user', 'active', 0, 'session', NOW(6), NOW(6), NOW(6))").bind(&session_id).execute(shared_pool.get()).await.unwrap();
         let provider = axum::Router::new().route("/v1/systemone", axum::routing::post(|Json(body): Json<serde_json::Value>| async move {
             assert_eq!(body["model"], "provider-wire-model");
             assert!(body["questions"].get("evidence").is_some());
-            let mut response = json!({"model":"mock-jet-returned-model","answers":{"evidence":{"type":"noul","noul":0.9}}});
+            let mut response = json!({"model":"mock-jev-returned-model","answers":{"evidence":{"type":"noul","noul":0.9}}});
             match body["state"]["usage"].as_str().unwrap() {
                 "exact" => response["usage"] = json!({"input_tokens":100,"output_tokens":4}),
                 "partial" => response["usage"] = json!({"input_tokens":70}),
@@ -1307,7 +1307,7 @@ mod tests {
                     .0;
             let answer: JudgmentResponse =
                 serde_json::from_str(&response.choices[0].message.content).unwrap();
-            assert_eq!(answer.model, "mock-jet-returned-model");
+            assert_eq!(answer.model, "mock-jev-returned-model");
             assert_eq!(answer.answers["evidence"].probability(), 0.9);
             if mode == "exact" {
                 let usage = response.usage.unwrap();

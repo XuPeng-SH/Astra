@@ -640,16 +640,16 @@ it("keeps external delivery gaps inside the HTML report's copyable text", () => 
 describe("auxiliary provider usage", () => {
   const auxiliary = {
     available: true,
-    attempts: [{attempt_id: "aux-1", provider: "typesafe", offering_id: "jet-1", model_name: "jev1", purpose: "memory_retrieval_rerank", operation_id: "relevance", usage_status: "provider_partial" as const, usage: {basis: "provider_partial" as const, fresh_input_tokens: 42}}],
+    attempts: [{attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "memory_retrieval_rerank", operation_id: "relevance", usage_status: "provider_partial" as const, usage: {basis: "provider_partial" as const, fresh_input_tokens: 42}}],
   };
-  it("exports Jet separately, deduplicates physical attempts across segments, and preserves unknown lanes", () => {
+  it("exports Jev separately, deduplicates physical attempts across segments, and preserves unknown lanes", () => {
     const first = finished("turn", "turn", 0, 100, {auxiliary_usage: auxiliary});
     const second = finished("segment", "turn", 100, 200, {auxiliary_usage: auxiliary});
     expect(isExplainAnalyzeEventV1(first)).toBe(true);
     const graph = reduceExplainAnalyzeEvents([first, second]);
     const lines = explainAnalyzeAuxiliaryUsageLines(graph);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("Jet");
+    expect(lines[0]).toContain("Jev");
     expect(lines[0]).toContain("in 42");
     expect(lines[0]).toContain("out unknown");
     expect(lines[0]).toContain("1/1 requests reported · partial");
@@ -681,11 +681,11 @@ describe("auxiliary provider usage", () => {
       expect(html).toContain(label);
     }
   });
-  it("isolates Jet and LLM counters and deduplicates repeated capture segments in text and HTML", () => {
+  it("isolates Jev and LLM counters and deduplicates repeated capture segments in text and HTML", () => {
     const usage = {
       available: true,
       attempts: [
-        {attempt_id:"jet-decision", provider:"typesafe", offering_id:"jet-offering", model_name:"jet-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:100, output_tokens:3}},
+        {attempt_id:"jev-decision", provider:"typesafe", offering_id:"jev-offering", model_name:"jev-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:100, output_tokens:3}},
         {attempt_id:"llm-decision", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:40, cache_read_tokens:60, cache_creation_tokens:0, output_tokens:5}},
         {attempt_id:"llm-plan", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"work_plan", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:200, cache_read_tokens:10, cache_creation_tokens:7, output_tokens:20}},
       ],
@@ -699,7 +699,7 @@ describe("auxiliary provider usage", () => {
     expect(lines).toHaveLength(3);
     const html = renderExplainAnalyzeHtml(events);
     for (const [identity, label, counts] of [
-      ["Jet (jet-model)", "Request classification", "in 100 · cache read unknown · cache write unknown · out 3"],
+      ["Jev (jev-model)", "Request classification", "in 100 · cache read unknown · cache write unknown · out 3"],
       ["openai (llm-model)", "Request classification", "in 40 · cache read 60 · cache write 0 · out 5"],
       ["openai (llm-model)", "Work planning", "in 200 · cache read 10 · cache write 7 · out 20"],
     ]) {
@@ -738,7 +738,7 @@ describe("auxiliary provider usage", () => {
 });
 
 it("upgrades auxiliary usage from unavailable through partial to exact across segments", () => {
-  const attempt = {attempt_id: "aux-1", provider: "typesafe", offering_id: "jet-1", model_name: "jev1", purpose: "verification_judge", operation_id: "verification_judge"};
+  const attempt = {attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "verification_judge", operation_id: "verification_judge"};
   const missing = finished("one", "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "unavailable"}]}});
   const partial = finished("two", "turn", 10, 20, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_partial"}]}});
   expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial]))[0]).toContain("partial");

@@ -72,7 +72,7 @@ replacement.
 Ordinary requests require no task graph generation. When durable Work is
 required, the main generation model builds its task graph under the locked
 classification. Graph repair cannot downgrade the lifecycle or change mutation
-scope. Jet is never asked to generate free-form tasks. Both calls retain their
+scope. Jev is never asked to generate free-form tasks. Both calls retain their
 own Offering, durable inference identity and reported usage. Work planning
 remains a separate content-generation call on the main model and is not a
 judgment fallback.
@@ -94,14 +94,14 @@ is no format-repair call or highest-score shortcut.
 
 Judgment output allowances scale with the question IDs in the batch, rather than
 the main model's content-generation allowance or evidence length. Introspection
-uses the same existing execution deadline for Jet and ordinary LLMs. Free-form
+uses the same existing execution deadline for Jev and ordinary LLMs. Free-form
 Work planning and memory extraction remain content-generation operations.
 
 Explain groups auxiliary input, output and cache tokens by actual provider,
 Offering, model and operation: request classification, skill selection and Work
-planning appear separately even when they use the same model. Jet appears as
-`Jet`; ordinary LLM calls retain their provider name. Trace model-request events
-carry the same actual identities and operation. Explain keeps unreported Jet
+planning appear separately even when they use the same model. Jev appears as
+`Jev`; ordinary LLM calls retain their provider name. Trace model-request events
+carry the same actual identities and operation. Explain keeps unreported Jev
 cache counts unknown. Trace does not derive a cache hit rate from the normalized
 accounting buckets' cache zeros, which are not provider-reported cache evidence.
 Request classification and Work planning contribute once to the runtime run
@@ -139,8 +139,8 @@ as calibrated confidence. Uncertain memory decisions do not select or dismiss
 candidates. Business owners retain their thresholds and fallback behavior.
 Choice and Score can be added when a concrete caller needs them.
 
-One Jet Offering contains the connection and encrypted key. Future operations
-reuse that Offering, rather than creating scenario-specific Jet credentials.
+One Jev Offering contains the connection and encrypted key. Future operations
+reuse that Offering, rather than creating scenario-specific Jev credentials.
 Typed nonstream judgments can retain the canonical memory-retrieval,
 introspection or verification-judge purpose. This enables new business callers
 without modifying the provider adapter or mislabeling their purpose.
@@ -160,7 +160,7 @@ Use your existing Astra login and registered Offerings. Obtain the IDs with
 `astra admin model list`, then run:
 
 ```sh
-astra admin model compare <baseline-offering-id> <jet-offering-id>
+astra admin model compare <baseline-offering-id> <jev-offering-id>
 ```
 
 This repeats the twelve built-in memory cases three times through the existing
@@ -173,7 +173,7 @@ Unavailable calls and malformed answers remain distinct from label errors.
 For another replacement, provide a JSON case file:
 
 ```sh
-astra admin model compare <baseline-offering-id> <jet-offering-id> \
+astra admin model compare <baseline-offering-id> <jev-offering-id> \
   --cases examples/judgment-compare.json --repeat 3
 ```
 
@@ -194,18 +194,18 @@ in the local report; users choose any custom evidence sent to their configured
 Offerings. Costs are not guessed: the public catalog has no price fields, so the
 runner reports actual token usage for comparison against Offering prices.
 
-Thresholds can be compared against saved Jet probabilities without making new
+Thresholds can be compared against saved Jev probabilities without making new
 paid calls. Repeated synthetic cases are not independent production coverage;
 the concise-preference relevance labels are subjective. Compare task quality
 and unhappy paths on a representative corpus before enabling a new replacement.
 
-## See Jet usage in Explain
+## See Jev usage in Explain
 
 Enable `/explain on` before sending a request. The finished report separates
 main-model tokens from auxiliary judgments, for example:
 
 ```text
-Auxiliary tokens · Jet (jev1.13.0) · Memory judgment · in 420 · cache read 0 · cache write 0 · out 24 · 1/1 requests reported
+Auxiliary tokens · Jev (jev1.13.0) · Memory judgment · in 420 · cache read 0 · cache write 0 · out 24 · 1/1 requests reported
 ```
 
 This is an illustrative layout, not measured usage. TUI, text/HTML artifacts and
@@ -213,13 +213,13 @@ Web use the same physical-attempt facts. Missing provider counters show
 `unknown`; partial reports remain labeled partial. Retries are separate physical
 attempts, while replayed snapshots do not count them twice. A capture failure
 shows `capture unavailable` and preserves the normal answer. This section does
-not invent auxiliary timings or claim that Jet reduces main-agent rounds.
+not invent auxiliary timings or claim that Jev reduces main-agent rounds.
 
 ## Failure behavior
 
 | Condition | Expected behavior |
 | --- | --- |
-| Empty Jet key | Cannot bind/use the Jet Offering; no provider dispatch |
+| Empty Jev key | Cannot bind/use the Jev Offering; no provider dispatch |
 | Unauthorized, rate limited, unavailable or timed out | Relevance uses the existing lexical fallback; no dismissal is inferred |
 | Invalid answers, probabilities or question identities | Reject the judgment and use the same conservative business fallback |
 | Valid answers with missing/invalid token metadata | Keep the judgment; missing counters remain unknown |
@@ -234,7 +234,7 @@ inference failure does not become a primary task `ExecutionIncomplete` condition
 ## Validate
 
 Normal offline and online tests use local mock providers and fake keys. They do
-not load `JET_KEY`, connect to Jet/DeepSeek, or run `admin model compare` against
+not load `JEV_KEY`, connect to Jev/DeepSeek, or run `admin model compare` against
 real Offerings. Real-provider evaluation is an explicit harness action, separate
 from these tests; the commands above perform that action and may incur charges.
 
@@ -246,5 +246,5 @@ cargo test -p astra-cli --lib admin_cli::judgment_compare::tests
 ```
 
 Only claim lower rounds if an existing call is eliminated: replacing one selector
-LLM call with one Jet request reduces general-purpose LLM calls, not total model
+LLM call with one Jev request reduces general-purpose LLM calls, not total model
 requests or main-agent rounds. Existing selectors already batch all candidates.

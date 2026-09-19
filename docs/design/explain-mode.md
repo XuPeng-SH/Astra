@@ -489,6 +489,6 @@ instead of reporting a silently truncated total. The requested model comes from
 the immutable route and is not an assertion about the provider-returned model.
 
 These facts are separate from timed main-model nodes: no interval is invented
-from database timestamps. TUI, text, HTML and Web show Jet auxiliary tokens
+from database timestamps. TUI, text, HTML and Web show Jev auxiliary tokens
 separately from the main model's tokens. The snapshot is complete only as a
 query at terminal time; auxiliary calls performed after capture are not included.

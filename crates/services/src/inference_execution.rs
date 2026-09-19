@@ -8136,13 +8136,13 @@ mod tests {
 
     #[test]
     fn projected_usage_does_not_invent_system_one_cache_counters() {
-        let jet = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [100, 4, 0, 0])
+        let jev = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [100, 4, 0, 0])
             .unwrap()
             .unwrap();
-        assert_eq!(jet.fresh_input_tokens, Some(100));
-        assert_eq!(jet.output_tokens, Some(4));
-        assert_eq!(jet.cache_read_tokens, None);
-        assert_eq!(jet.cache_creation_tokens, None);
+        assert_eq!(jev.fresh_input_tokens, Some(100));
+        assert_eq!(jev.output_tokens, Some(4));
+        assert_eq!(jev.cache_read_tokens, None);
+        assert_eq!(jev.cache_creation_tokens, None);
         let zero = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [0, 0, 0, 0])
             .unwrap()
             .unwrap();

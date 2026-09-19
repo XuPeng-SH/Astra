@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn judgment_default_rejects_invalid_or_multiple_selections() {
         for source in [
-            "[{name: jet, judgment_default: 'true'}]",
+            "[{name: jev, judgment_default: 'true'}]",
             "[{judgment_default: true}]",
             "[{name: a, judgment_default: true}, {name: b, judgment_default: true}]",
         ] {
@@ -933,7 +933,7 @@ mod tests {
         ] {
             let server = MockServer::start().await;
             Mock::given(method("PUT"))
-                .and(path("/models/jet"))
+                .and(path("/models/jev"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_json(serde_json::json!({"is_active":true,"context_window":1000})),
@@ -942,7 +942,7 @@ mod tests {
                 .mount(&server)
                 .await;
             Mock::given(method("POST"))
-                .and(path("/models/jet/check"))
+                .and(path("/models/jev/check"))
                 .respond_with(
                     ResponseTemplate::new(check_status)
                         .set_body_json(serde_json::json!({"is_active":active})),
@@ -952,10 +952,10 @@ mod tests {
                 .await;
             Mock::given(method("PUT"))
                 .and(path("/admin/config/judgment_model"))
-                .and(body_json(serde_json::json!({"value":"jet"})))
+                .and(body_json(serde_json::json!({"value":"jev"})))
                 .respond_with(
                     ResponseTemplate::new(binding_status)
-                        .set_body_json(serde_json::json!({"value":"jet"})),
+                        .set_body_json(serde_json::json!({"value":"jev"})),
                 )
                 .expect(if default && check_status == 200 && active == Some(true) {
                     1
@@ -966,7 +966,7 @@ mod tests {
                 .await;
             // No credentials or profiles: metadata-only load uses the stored server key.
             let doc = yaml(&format!(
-                "[{{name: jet, provider: typesafe, context_window: 1000, judgment_default: {default}}}]"
+                "[{{name: jev, provider: typesafe, context_window: 1000, judgment_default: {default}}}]"
             ));
             let args = ModelLoadArgs {
                 path: "unused.yaml".into(),

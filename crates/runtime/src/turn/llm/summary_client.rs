@@ -730,17 +730,17 @@ mod tests {
     #[tokio::test]
     async fn typesafe_request_judgment_uses_durable_nonstream_and_reports_usage() {
         let app = Router::new().route("/v1/systemone", post(|axum::Json(body): axum::Json<Value>| async move {
-            assert_eq!(body["model"], "configured-jet");
+            assert_eq!(body["model"], "configured-jev");
             assert!(body.get("messages").is_none());
             let answers: serde_json::Map<String, Value> = body["questions"].as_object().unwrap().keys().map(|key| {
                 let yes = matches!(key.as_str(), "mutation.read_only" | "scope.unknown" | "domain.none");
                 (key.clone(), serde_json::json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}))
             }).collect();
-            axum::Json(serde_json::json!({"model":"configured-jet", "answers":answers,"usage":{"input_tokens":123,"output_tokens":19}}))
+            axum::Json(serde_json::json!({"model":"configured-jev", "answers":answers,"usage":{"input_tokens":123,"output_tokens":19}}))
         }));
         let mut execution = summary_execution(spawn_summary_test_server(app).await);
         execution.provider = "typesafe".into();
-        execution.model_name = "configured-jet".into();
+        execution.model_name = "configured-jev".into();
         execution.offering_id = "configured-judgment-offering".into();
         let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
         let ledger = DurableInferenceLedger::required_with_persistence(

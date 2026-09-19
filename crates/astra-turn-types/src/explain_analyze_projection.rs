@@ -1000,7 +1000,7 @@ mod tests {
                 attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
                     attempt_id: "aux-1".into(),
                     provider: "typesafe".into(),
-                    offering_id: "jet-1".into(),
+                    offering_id: "jev-1".into(),
                     model_name: "jev1".into(),
                     purpose: "verification_judge".into(),
                     operation_id: "verification_judge".into(),
