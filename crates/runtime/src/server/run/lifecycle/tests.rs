@@ -10609,6 +10609,144 @@ fn db_backed_test_service(
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[derive(Clone, Default)]
+struct EvaluationMemorySpy {
+    bindings: Arc<AtomicUsize>,
+    operations: Arc<AtomicUsize>,
+    observations: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::turn::cloud::memoria_compact::MemoriaPort for EvaluationMemorySpy {
+    fn bind_owner(
+        &self,
+        _: &str,
+    ) -> Result<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>, String> {
+        self.bindings.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(self.clone()))
+    }
+
+    async fn retrieve_ext(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+        _: bool,
+    ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn store(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<String, String> {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok("unexpected-production-memory".into())
+    }
+
+    async fn purge_working(&self, _: &str) -> Result<u64, String> {
+        self.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnObserverWorker for EvaluationMemorySpy {
+    async fn run(&self, _: astra_turn_core::contracts::TurnObserverRequest) -> Result<(), String> {
+        self.observations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl EvaluationMemorySpy {
+    fn extraction_service(&self) -> Arc<crate::session_memory::MemoryExtractionService> {
+        let (ingestion, _receiver) =
+            astra_services::event_ingestion::IngestionSender::for_tests(16);
+        Arc::new(
+            crate::session_memory::MemoryExtractionService::new_owner_scoped_template(
+                Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
+                Arc::new(self.clone()),
+                ingestion,
+                Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+            ),
+        )
+    }
+}
+
+#[tokio::test]
+async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
+    let memory = EvaluationMemorySpy::default();
+    let service = test_service().with_memory_extraction_service(memory.extraction_service());
+    let ordinary = test_request("ordinary request");
+    let ordinary_state =
+        service.build_initial_state("owner", &ordinary, "session", "run", None, None, None);
+    assert!(ordinary_state.memory_extraction_service.is_some());
+    let bindings_before_host = memory.bindings.load(Ordering::SeqCst);
+    let _host = service.build_host(
+        "owner",
+        "session",
+        "run",
+        &ordinary,
+        Vec::new(),
+        Map::new(),
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+    );
+    assert!(
+        memory.bindings.load(Ordering::SeqCst) > bindings_before_host,
+        "ordinary hosts must retain owner-scoped recall"
+    );
+
+    let mut evaluation = ordinary;
+    evaluation.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: "experiment".into(),
+        trial_id: "trial".into(),
+        input_content_hash: content_fingerprint("input"),
+        revision_content_hash: content_fingerprint("revision"),
+        skill_revision: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let bindings_before_eval = memory.bindings.load(Ordering::SeqCst);
+    let state = service.build_initial_state(
+        "owner",
+        &evaluation,
+        "eval-session",
+        "eval-run",
+        None,
+        None,
+        None,
+    );
+    let _host = service.build_host(
+        "owner",
+        "eval-session",
+        "eval-run",
+        &evaluation,
+        Vec::new(),
+        Map::new(),
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+    );
+    assert!(state.memory_extraction_service.is_none());
+    assert_eq!(
+        memory.bindings.load(Ordering::SeqCst),
+        bindings_before_eval,
+        "Eval must not bind production memory through either state or host construction"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_scoped() {
@@ -10636,8 +10774,13 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .execute(pool.get())
         .await
         .expect("seed runtime evaluation model fixture");
+    let memory = Arc::new(EvaluationMemorySpy::default());
+    let metrics = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
     let service = db_backed_test_service(&pool, &format!("eval-runtime-pod-{}", Uuid::new_v4()))
         .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_memory_extraction_service(memory.extraction_service())
+        .with_observer_worker(memory.clone())
+        .with_metrics_registry(metrics.clone())
         .with_run_concurrency_limit(1);
 
     let mut request = test_request("evaluate this fixed input");
@@ -10805,6 +10948,26 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             .evidence
             .iter()
             .all(|evidence| evidence.availability == EvidenceAvailability::Available)
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.background_task_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("post-loop dependency consumers should finish before checking isolation");
+    assert_eq!(
+        memory.operations.load(Ordering::SeqCst),
+        0,
+        "Eval must not read, store, or purge production memory"
+    );
+    assert_eq!(memory.observations.load(Ordering::SeqCst), 0);
+    assert!(
+        !metrics
+            .render_prometheus()
+            .contains("astra_turn_observer_dispatches_total"),
+        "Eval must not dispatch a production observer, even asynchronously"
     );
 
     // A queued Eval cancelled before semaphore admission must still settle a
@@ -16889,6 +17052,42 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
     assert!(
         default_state.skills.registry_for_activation.is_some(),
         "unfiltered server catalog should be available for conditional activation"
+    );
+
+    let catalog_reads = skill_service.list_calls.load(Ordering::SeqCst);
+    assert!(
+        catalog_reads > 0,
+        "ordinary requests must load the production catalog"
+    );
+    let mut evaluation = prepared_test_request("evaluate a prompt without Skills");
+    evaluation.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: "experiment".into(),
+        trial_id: "trial".into(),
+        input_content_hash: content_fingerprint(&evaluation.message),
+        revision_content_hash: content_fingerprint("revision"),
+        skill_revision: None,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    svc.validate_request_constraints("test-user", &evaluation)
+        .await
+        .expect("Eval constraints must not discover the production catalog");
+    let eval_state = svc.build_initial_state(
+        "test-user",
+        &evaluation,
+        "eval-session",
+        "eval-run",
+        None,
+        None,
+        None,
+    );
+    assert!(eval_state.skills.resolver.is_none());
+    assert!(eval_state.skills.registry_for_activation.is_none());
+    assert!(eval_state.skills.listing_message.is_none());
+    assert_eq!(
+        skill_service.list_calls.load(Ordering::SeqCst),
+        catalog_reads,
+        "Prompt Eval must not even load the populated production catalog"
     );
 
     let mut request = test_request("hello");

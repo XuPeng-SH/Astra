@@ -236,14 +236,22 @@ identity is stored in its own immutable database field, separate from mutable
 user metadata. The Run start claim is the existing owner lease/CAS boundary,
 and ProviderTask/WorkTurn identities keep their existing lifecycle paths.
 
+The current disabled-memory profile selects no production Memoria client,
+extraction service, or post-turn observer at runtime composition. Prompt
+trials have an empty Skill catalog; Skill trials receive only the admitted
+owner-scoped pinned revision. Neither trial kind falls back to the mutable
+production catalog. Canonical trace, transcript, accounting, and output
+receipts remain part of the normal Run settlement.
+
 The clean-session check is scoped to the derived Run identity: the first
 request must see no prior session state, while a concurrent retry may observe
 that same Run's in-flight rows. A different Run or pre-existing session state
-still makes the trial unavailable. If a process dies after the Run claim but
-before evaluation admission, recovery reads the trusted admission intent from
-the canonical `run_started` event, binds the same Run generation to the
-planned trial, and records a failed/cancelled observation after the crash
-terminal transition. It never creates a replacement Run.
+still makes the trial unavailable. Recovery can read trusted admission intent
+from the canonical `run_started` event, but generation takeover and a crash
+between terminal commit and the settlement marker are not yet fully reconciled
+with Evaluation observations. These windows can leave a trial unavailable or
+awaiting observation; recovery must be completed against canonical Run lineage
+without authorizing stale-generation writes or creating a replacement Run.
 
 The API accepts client intent only. It never accepts client-supplied
 observations and never starts a provider from a read request. Every read uses
