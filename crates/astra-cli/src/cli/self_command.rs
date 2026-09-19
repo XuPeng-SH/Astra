@@ -351,21 +351,20 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
             },
         );
         if report.judgment_usage.is_none() {
-            report.judgment_usage = Some(astra_services::reflect::JudgmentUsageSummary {
-                coverage: if local_allowed {
-                    "unavailable"
-                } else {
-                    "source_excluded"
-                }
-                .into(),
-                groups: Vec::new(),
-                omitted_groups: 0,
-            });
-            report.summary.push_str(if local_allowed {
-                " Local judgment physical usage is unavailable; journal LLM-round totals are not judgment usage."
+            let usage = if local_allowed {
+                crate::explain_analyze_artifact::local_judgment_usage(session_id).summary()
             } else {
-                " Local judgment physical usage source excluded; no token total inferred."
-            });
+                astra_services::reflect::JudgmentUsageSummary {
+                    scope: astra_services::reflect::JudgmentUsageScope::LocalCaptureUnavailable,
+                    capture_incomplete: true,
+                    coverage: "source_excluded".into(),
+                    groups: vec![],
+                    omitted_groups: 0,
+                }
+            };
+            report.summary.push(' ');
+            report.summary.push_str(&usage.render());
+            report.judgment_usage = Some(usage);
         }
     }
     if report.source_policy == "local_only" {
@@ -2547,6 +2546,16 @@ mod tests {
                 .contains("counts unavailable, not zero")
         );
         assert_eq!(
+            report["judgment_usage"]["scope"],
+            "local_capture_unavailable"
+        );
+        assert!(
+            report["judgment_usage"]["groups"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
             report["view"]["data_coverage"]["providers"]["semantic_judgment_trace"]["status"],
             "missing"
         );
@@ -2609,6 +2618,56 @@ mod tests {
                 "no_offering"
             );
             assert_eq!(populated["judgment_usage"]["coverage"], "unavailable");
+        }
+        crate::explain_analyze_artifact::persist_test_judgment_usage(populated_session);
+        for depth in ["hint", "summary"] {
+            let mut request = ReflectRequest::from_observation_params(
+                None,
+                Some("overview"),
+                Some(depth),
+                None,
+                20,
+                "",
+            );
+            request.source_policy = SourcePolicy::LocalOnly;
+            let body = render_reflect_surface_for_session_with_profile(
+                populated_session,
+                20,
+                request,
+                None,
+            )
+            .await
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["known_input_tokens"],
+                123
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["input_incomplete"],
+                true
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["known_output_tokens"],
+                7
+            );
+            assert_eq!(
+                report["judgment_usage"]["groups"][0]["output_incomplete"],
+                true
+            );
+            assert_eq!(report["judgment_usage"]["capture_incomplete"], true);
+            assert_eq!(
+                report["judgment_usage"]["scope"]["local_captured_run_turn"]["turn_id"],
+                "turn-2"
+            );
+            assert!(
+                report["summary"].as_str().unwrap().chars().count()
+                    <= if depth == "hint" { 181 } else { 361 }
+            );
+            assert_eq!(
+                report["judgment_usage"]["scope"]["local_captured_run_turn"]["run_id"],
+                "run-1"
+            );
         }
         let mut unrelated =
             ReflectRequest::from_observation_params(None, Some("cache"), None, None, 20, "");

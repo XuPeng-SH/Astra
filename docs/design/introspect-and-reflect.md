@@ -213,10 +213,23 @@ and session/turn mismatches remain coverage gaps. Missing or unreadable journals
 have unavailable counts, not known zero judgments. Even an empty existing
 journal cannot establish that no judgments occurred upstream.
 
-`local_only` CLI reflection bypasses cloud restoration entirely. Local physical
-judgment usage remains explicitly unavailable: generic LLM-round totals are not
-a substitute for attributed physical attempts. This does not yet add local
-introspect wiring or an adapter for typed Explain usage artifacts.
+`local_only` CLI reflection bypasses cloud restoration entirely. CLI reflection
+and introspection can read physical judgment usage from the latest owner-local
+typed Explain artifact, bounded to 4 MiB with a 16 KiB index. The reader checks
+handle, checksum, size, schema and session/run/turn identity, then uses the
+canonical graph's auxiliary-attempt projection and shared operation filter.
+The scope is `local_captured_run_turn`, not session-ledger totals or necessarily
+the current turn. Historical capture remains incomplete; known token sums are
+lower bounds and unknown cache buckets stay unknown. Missing, invalid or
+unavailable captures never fall back to an older artifact or generic LLM-round
+counters. Local semantic journal coverage and captured-run usage are independent
+sources. Source-excluded and unrelated facets do not read these local artifacts.
+Repeated physical attempts are counted once. Conflicting attribution or known
+token buckets, or conflicting turn/usage facts, make captured usage unavailable;
+a higher usage-status rank cannot override contradictory evidence. Explain's
+text, TUI and HTML views share this rule. Conflicts are neither zero usage nor
+producer truncation. Lightweight reflection retains scoped usage in typed
+fields without replacing execution diagnoses in the summary.
 
 Reflection may produce:
 

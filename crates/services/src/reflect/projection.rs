@@ -183,6 +183,8 @@ mod tests {
     fn lightweight_judgment_groups_are_bounded_with_omission_count() {
         let mut report = large_report("hint");
         report.judgment_usage = Some(JudgmentUsageSummary {
+            scope: super::super::JudgmentUsageScope::default(),
+            capture_incomplete: false,
             coverage: "available".into(),
             groups: (0..10)
                 .map(|index| JudgmentUsageGroup {
@@ -240,6 +242,27 @@ mod tests {
                 .any(|hint| hint.observation_refs.contains(&"obs-59".into()))
         );
         assert!(unsupported.budget_result.truncated);
+    }
+
+    #[test]
+    fn optional_local_usage_does_not_replace_critical_summary_or_diagnosis() {
+        for depth in ["hint", "summary"] {
+            let mut report = large_report(depth);
+            report.summary = "Execution failed: permission denied; do not retry mutation.".into();
+            let expected = report.clone().project_lightweight();
+            report.judgment_usage = Some(JudgmentUsageSummary {
+                scope: super::super::JudgmentUsageScope::LocalCaptureUnavailable,
+                capture_incomplete: true,
+                coverage: "unavailable".into(),
+                groups: vec![],
+                omitted_groups: 0,
+            });
+            let projected = report.project_lightweight();
+            assert_eq!(projected.summary, expected.summary);
+            assert_eq!(projected.observations, expected.observations);
+            assert_eq!(projected.action_hints, expected.action_hints);
+            assert_eq!(projected.clone().project_lightweight(), projected);
+        }
     }
 
     #[test]

@@ -748,6 +748,83 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_auxiliary_evidence_is_visible_without_token_totals() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let mut events = Vec::new();
+        for (i, count) in [731, 947].into_iter().enumerate() {
+            let start = fact(
+                &format!("start-{i}"),
+                &format!("turn-{i}"),
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                ExplainAnalyzeTransitionV1::Started,
+                0,
+                None,
+                None,
+            );
+            let mut end = finished(start.clone(), 100);
+            end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-physical-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            for event in [start, end] {
+                graph.apply(event.clone());
+                events.push(event);
+            }
+        }
+        // TUI consumes the same section; its full renderer has a local test.
+        for output in [
+            auxiliary_usage_lines(&graph).join("\n"),
+            render(&events, false, false),
+            crate::explain_analyze_html::render(&events, false, false),
+        ] {
+            assert!(
+                output.contains("conflicting physical attempt evidence (1 identities)"),
+                "{output}"
+            );
+            assert!(output.contains("no token total inferred"));
+            assert!(!output.contains("731") && !output.contains("947"));
+            assert!(!output.contains("capture truncated"));
+        }
+        let mut no_usage = events[1].clone();
+        no_usage.auxiliary_usage = None;
+        for records in [
+            vec![no_usage.clone(), events[1].clone(), events[3].clone()],
+            vec![events[3].clone(), events[1].clone(), no_usage],
+        ] {
+            for output in [
+                render(&records, false, false),
+                crate::explain_analyze_html::render(&records, false, false),
+            ] {
+                assert!(output.contains("conflicting turn/usage facts"), "{output}");
+                assert!(output.contains("no token total inferred"));
+                assert!(!output.contains("731") && !output.contains("947"));
+                assert!(!output.contains("capture truncated"));
+            }
+        }
+    }
+
+    #[test]
     fn auxiliary_usage_keeps_request_classification_skill_selection_and_work_planning_separate() {
         use astra_turn_types::{
             ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
@@ -1177,6 +1254,15 @@ mod tests {
 /// Same separately attributed auxiliary usage section for text, TUI and HTML.
 pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
     use std::collections::BTreeMap;
+    if graph.auxiliary_capture_conflicted() {
+        return vec!["Auxiliary tokens · capture unavailable · conflicting turn/usage facts; no token total inferred; not a truncation claim".into()];
+    }
+    let conflicts = graph.auxiliary_usage_conflict_count();
+    if conflicts > 0 {
+        return vec![format!(
+            "Auxiliary tokens · capture unavailable · conflicting physical attempt evidence ({conflicts} identities); no token total inferred; not a truncation claim"
+        )];
+    }
     type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
     type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
     let mut groups: BTreeMap<GroupKey<'_>, Attempts<'_>> = BTreeMap::new();

@@ -1159,6 +1159,58 @@ mod tests {
         ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
     };
 
+    #[test]
+    fn conflicting_auxiliary_usage_is_visible_in_settled_cell() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for (index, count) in [731, 947].into_iter().enumerate() {
+            let mut event = finished(
+                &format!("finish-{index}"),
+                &format!("turn-{index}"),
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                "clock",
+                0,
+                10,
+                ExplainAnalyzeOutcomeV1::Succeeded,
+                None,
+                None,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            graph.apply(event);
+        }
+        graph.finish_ingest();
+        let output = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(400));
+        assert!(
+            output.contains("conflicting physical attempt evidence"),
+            "{output}"
+        );
+        assert!(output.contains("no token total inferred"));
+        assert!(!output.contains("731") && !output.contains("947"));
+    }
+
     fn started(
         event_id: &str,
         node_id: &str,

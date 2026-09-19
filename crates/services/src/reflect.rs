@@ -98,10 +98,44 @@ pub struct ReflectReport {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JudgmentUsageSummary {
+    pub scope: JudgmentUsageScope,
+    pub capture_incomplete: bool,
     pub coverage: String,
     pub groups: Vec<JudgmentUsageGroup>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub omitted_groups: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentUsageScope {
+    #[default]
+    SessionSupportedJudgmentOperationsAtLedgerRead,
+    LocalCapturedRunTurn {
+        run_id: String,
+        turn_id: String,
+    },
+    LocalCaptureUnavailable,
+}
+
+impl JudgmentUsageScope {
+    pub fn is_local(&self) -> bool {
+        !matches!(self, Self::SessionSupportedJudgmentOperationsAtLedgerRead)
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            Self::SessionSupportedJudgmentOperationsAtLedgerRead => {
+                "scope=session_supported_judgment_operations cutoff=ledger_read".into()
+            }
+            Self::LocalCapturedRunTurn { run_id, turn_id } => format!(
+                "scope=local_captured_run_turn run={run_id} turn={turn_id}; not session totals or necessarily the current turn"
+            ),
+            Self::LocalCaptureUnavailable => {
+                "scope=local_capture_unavailable; run/turn unknown".into()
+            }
+        }
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -123,9 +157,36 @@ pub struct JudgmentUsageGroup {
 }
 
 impl JudgmentUsageSummary {
-    fn from_physical_attempts(facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1) -> Self {
+    /// The same supported-operation boundary for local introspection and reflection.
+    pub fn supported_attempts(
+        facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    ) -> astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+        let mut supported = facts.clone();
+        supported.attempts.retain(Self::supports_attempt);
+        supported
+    }
+
+    fn supports_attempt(attempt: &astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1) -> bool {
+        matches!(
+            attempt.operation_id.as_str(),
+            "request_judgment"
+                | "skill_auto_route"
+                | "work_direction"
+                | "memory_relevance"
+                | "memory_feedback"
+                | "verification_judge"
+                | "completion_proxy:turn_intent"
+        ) || attempt.purpose == "memory_retrieval_rerank"
+            || attempt.purpose == "verification_judge"
+    }
+
+    pub fn from_physical_attempts(
+        facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    ) -> Self {
         if !facts.available {
             return Self {
+                scope: JudgmentUsageScope::default(),
+                capture_incomplete: false,
                 coverage: "unavailable".into(),
                 groups: Vec::new(),
                 omitted_groups: 0,
@@ -134,18 +195,7 @@ impl JudgmentUsageSummary {
         let mut groups: BTreeMap<(String, String, String, String), JudgmentUsageGroup> =
             BTreeMap::new();
         for attempt in &facts.attempts {
-            if !matches!(
-                attempt.operation_id.as_str(),
-                "request_judgment"
-                    | "skill_auto_route"
-                    | "work_direction"
-                    | "memory_relevance"
-                    | "memory_feedback"
-                    | "verification_judge"
-                    | "completion_proxy:turn_intent"
-            ) && attempt.purpose != "memory_retrieval_rerank"
-                && attempt.purpose != "verification_judge"
-            {
+            if !Self::supports_attempt(attempt) {
                 continue;
             }
             let key = (
@@ -198,6 +248,8 @@ impl JudgmentUsageSummary {
             }
         }
         Self {
+            scope: JudgmentUsageScope::default(),
+            capture_incomplete: false,
             coverage: if facts.truncated {
                 "capture_truncated"
             } else {
@@ -209,25 +261,32 @@ impl JudgmentUsageSummary {
         }
     }
 
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
+        format!("{}; {}", self.scope.render(), self.render_usage())
+    }
+
+    fn render_usage(&self) -> String {
         let truncated = self.coverage == "capture_truncated";
         if self.coverage != "available" && !truncated {
             return "Judgment physical-attempt usage unavailable; no token total inferred.".into();
         }
         if self.groups.is_empty() && self.omitted_groups == 0 {
-            if truncated {
+            if truncated || self.capture_incomplete {
+                if !truncated {
+                    return "Judgment physical-attempt capture incomplete; no supported rows captured; total usage unknown, not zero.".into();
+                }
                 return "Judgment physical-attempt capture truncated; no supported judgment rows captured; total usage unknown, not zero.".into();
             }
-            return "Judgment physical-attempt ledger: no supported judgment operations observed in the bounded session view.".into();
+            return "Judgment physical-attempt capture: no supported judgment operations observed in this bounded source view.".into();
         }
         let mut lines = Vec::with_capacity(self.groups.len());
         for group in &self.groups {
-            let input = if truncated || group.input_incomplete {
+            let input = if truncated || self.capture_incomplete || group.input_incomplete {
                 format!("at least {}", group.known_input_tokens)
             } else {
                 group.known_input_tokens.to_string()
             };
-            let output = if truncated || group.output_incomplete {
+            let output = if truncated || self.capture_incomplete || group.output_incomplete {
                 format!("at least {}", group.known_output_tokens)
             } else {
                 group.known_output_tokens.to_string()
@@ -237,13 +296,16 @@ impl JudgmentUsageSummary {
         if truncated {
             lines.push("capture truncated; counts cover captured calls only; all token sums are lower bounds".into());
         }
+        if self.capture_incomplete {
+            lines.push("historical capture incomplete; missing attempts unknown; totals are lower bounds (not a truncation claim)".into());
+        }
         if self.omitted_groups > 0 {
             lines.push(format!(
                 "{} captured group(s) omitted from display",
                 self.omitted_groups
             ));
         }
-        format!("Judgment physical-attempt ledger: {}.", lines.join("; "))
+        format!("Judgment physical-attempt capture: {}.", lines.join("; "))
     }
 }
 
@@ -1473,6 +1535,8 @@ impl ReflectService for DatabaseReflectService {
                                 "judgment physical-attempt facts unavailable during reflection"
                             );
                             JudgmentUsageSummary {
+                                scope: JudgmentUsageScope::default(),
+                                capture_incomplete: false,
                                 coverage: "unavailable".into(),
                                 groups: Vec::new(),
                                 omitted_groups: 0,
@@ -1481,6 +1545,8 @@ impl ReflectService for DatabaseReflectService {
                     }
                 } else {
                     JudgmentUsageSummary {
+                        scope: JudgmentUsageScope::default(),
+                        capture_incomplete: false,
                         coverage: "unavailable".into(),
                         groups: Vec::new(),
                         omitted_groups: 0,

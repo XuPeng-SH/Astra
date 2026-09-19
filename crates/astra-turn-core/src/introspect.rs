@@ -126,21 +126,18 @@ pub enum JudgmentUsageCoverage {
     Timeout,
     QueryFailed,
     LedgerUnavailable,
+    LocalCaptureUnavailable,
     SourceExcluded,
 }
 
 /// Bounded projection of the service ledger, never a judgment or execution
 /// authority. Nullable usage remains nullable, including cache input buckets.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum JudgmentUsageScope {
-    #[default]
-    SessionSupportedJudgmentOperationsAtLedgerRead,
-}
+pub use astra_services::reflect::JudgmentUsageScope;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JudgmentUsageSnapshot {
     pub scope: JudgmentUsageScope,
+    pub capture_incomplete: bool,
     pub coverage: JudgmentUsageCoverage,
     pub observed_attempts: Option<usize>,
     pub attempts_without_complete_usage: Option<usize>,
@@ -318,7 +315,8 @@ impl JudgmentUsageSnapshot {
 
     pub fn render(&self) -> String {
         let mut out = format!(
-            "Judgment physical usage: scope=session_supported_judgment_operations cutoff=ledger_read coverage={:?} observed_attempts={:?} incomplete_usage_attempts={:?} omitted_attempts={} truncated_identity_fields={}",
+            "Judgment physical usage: {} coverage={:?} observed_attempts={:?} incomplete_usage_attempts={:?} omitted_attempts={} truncated_identity_fields={}",
+            self.scope.render(),
             self.coverage,
             self.observed_attempts,
             self.attempts_without_complete_usage,
@@ -327,6 +325,9 @@ impl JudgmentUsageSnapshot {
         );
         if self.coverage == JudgmentUsageCoverage::CaptureTruncated {
             out.push_str(" capture_truncated=true; attempt counts cover captured rows only; additional physical attempts were omitted (count unknown)");
+        }
+        if self.capture_incomplete {
+            out.push_str(" capture_incomplete=true; missing historical attempts unknown; totals are lower bounds, independent of truncation");
         }
         let total = |known: Option<u128>, complete: bool| match known {
             None => "unknown".into(),
@@ -585,6 +586,15 @@ enum IntrospectTextDepth {
 }
 
 /// Select the same source-scoped semantic trace view for text and JSON.
+fn judgment_source_allowed(source: astra_core::SourcePolicy, local: bool) -> bool {
+    match source {
+        astra_core::SourcePolicy::LiveOnly => false,
+        astra_core::SourcePolicy::LocalOnly => local,
+        astra_core::SourcePolicy::CloudOnly => !local,
+        _ => true,
+    }
+}
+
 fn semantic_judgment_view(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
@@ -596,10 +606,7 @@ fn semantic_judgment_view(
         return None;
     }
     Some(
-        if matches!(
-            request.source_policy,
-            astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
-        ) {
+        if !judgment_source_allowed(request.source_policy, snapshot.semantic_judgments.as_ref().is_some_and(|view| view.scope == astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead)) {
             SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::SourceExcluded)
         } else {
             snapshot
@@ -625,9 +632,12 @@ fn judgment_usage_view(
         return None;
     }
     Some(
-        if matches!(
+        if !judgment_source_allowed(
             request.source_policy,
-            astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+            snapshot
+                .judgment_usage
+                .as_ref()
+                .is_some_and(|view| view.scope.is_local()),
         ) {
             JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
         } else {
@@ -685,7 +695,7 @@ pub fn render_introspect_request(
         body
     };
     let boundary = "## Observation Boundary\n\
-snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage and semantic traces have separate session scopes at their respective read times. Treat counts and states as snapshot-time observations, not final session totals.";
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage and semantic traces carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals.";
     let body = if let Some(semantics) = semantic_judgment_view(snapshot, request) {
         format!("{body}\n\n{}", semantics.render())
     } else {

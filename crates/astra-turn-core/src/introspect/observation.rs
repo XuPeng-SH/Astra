@@ -187,28 +187,31 @@ pub fn build_introspect_report(
             },
             evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
         });
-        evidence[0].summary.push_str(
-            "\nsource=agent_events.trace_span; owner/session-scoped captured semantic facts at read time; trace capture incomplete; model adoption unknown.",
-        );
+        evidence[0].summary.push_str(match semantics.scope {
+            astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead => "\nsource=owner_local_journal.trace_span; bounded historical capture; model adoption unknown.",
+            _ => "\nsource=agent_events.trace_span; owner/session-scoped captured semantic facts at read time; trace capture incomplete; model adoption unknown.",
+        });
     }
     if let Some(usage) = &judgment_usage {
         if usage.coverage != super::JudgmentUsageCoverage::NotObserved {
             observations.push(ObservationRecord {
-            ref_id: "urn:astra:observation:local:introspect:judgment_usage".into(),
-            topic: request.topic.as_str().into(),
-            facet: request.facet.as_str().into(),
-            kind: "judgment_physical_usage".into(),
-            severity: "info".into(),
-            summary: format!("Session physical judgment attempts at ledger read: coverage={:?}, observed={:?}, incomplete={:?}, omitted={}", usage.coverage, usage.observed_attempts, usage.attempts_without_complete_usage, usage.omitted_attempts),
-            confidence: ObservationConfidence::evidence(1.0),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
-        });
+                ref_id: "urn:astra:observation:local:introspect:judgment_usage".into(),
+                topic: request.topic.as_str().into(),
+                facet: request.facet.as_str().into(),
+                kind: "judgment_physical_usage".into(),
+                severity: "info".into(),
+                summary: usage.render(),
+                confidence: ObservationConfidence::evidence(1.0),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
+            });
         }
         // Hint retains only one evidence unit. Keep the ledger provenance and
         // bounded detail in the snapshot unit so its references remain valid.
-        evidence[0]
-            .summary
-            .push_str("\nsource=inference_provider_attempts; ");
+        evidence[0].summary.push_str(if usage.scope.is_local() {
+            "\nsource=owner_local_explain_capture; "
+        } else {
+            "\nsource=inference_provider_attempts; "
+        });
         evidence[0].summary.push_str(&usage.render());
     }
     if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
