@@ -3695,9 +3695,6 @@ fn build_provider_request_body_with_cache_capability(
                 body["system"] = Value::Array(system);
             }
             let mut inference = Map::new();
-            if let Some(max_out) = max_output_tokens {
-                inference.insert("maxTokens".to_string(), json!(max_out));
-            }
             if let Some(temp) = temperature {
                 inference.insert("temperature".to_string(), json!(temp));
             }
@@ -3729,6 +3726,14 @@ fn build_provider_request_body_with_cache_capability(
                     .as_ref()
                     .map(|overrides| overrides.as_ref()),
             );
+            if let Some(max_out) = max_output_tokens {
+                let mut inference = body["inferenceConfig"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                inference.insert("maxTokens".into(), json!(max_out));
+                body["inferenceConfig"] = Value::Object(inference);
+            }
             reconcile_authoritative_temperature(
                 &mut body,
                 TemperatureField::BedrockInferenceConfig,
@@ -3753,11 +3758,6 @@ fn build_provider_request_body_with_cache_capability(
                 if !system.is_empty() {
                     body["system"] = Value::Array(system);
                 }
-                if let Some(max_out) = max_output_tokens {
-                    astra_core::model_wire::apply_chat_output_token_limit(
-                        &mut body, provider, max_out,
-                    );
-                }
                 if let Some(temp) = temperature {
                     body["temperature"] = json!(temp);
                 }
@@ -3773,6 +3773,11 @@ fn build_provider_request_body_with_cache_capability(
                         .as_ref()
                         .map(|overrides| overrides.as_ref()),
                 );
+                if let Some(max_out) = max_output_tokens {
+                    astra_core::model_wire::apply_chat_output_token_limit(
+                        &mut body, provider, max_out,
+                    );
+                }
                 reconcile_authoritative_temperature(
                     &mut body,
                     TemperatureField::TopLevel,
@@ -3797,41 +3802,6 @@ fn build_provider_request_body_with_cache_capability(
             });
             if streaming {
                 body["stream_options"] = json!({"include_usage": true});
-            }
-            if let Some(max_out) = max_output_tokens {
-                // When thinking is active, providers like DeepSeek allocate a
-                // thinking_budget that must be LESS than the output token limit.
-                // If max_out is too small, the request will 400. Bump to at
-                // least thinking_budget + a headroom for the visible answer.
-                //
-                // We honor the user's configured ceiling when it already exceeds
-                // the required floor (respects deliberate budget caps) and only
-                // bump when the configured value is demonstrably too low.
-                let effective_max = if !thinking.is_off() {
-                    let required_floor: usize = match thinking {
-                        ThinkingConfig::Enabled { budget_tokens } => {
-                            (*budget_tokens as usize).saturating_add(8192)
-                        }
-                        _ => 65536,
-                    };
-                    if max_out < required_floor {
-                        tracing::debug!(
-                            user_max = max_out,
-                            bumped_to = required_floor,
-                            "output token limit bumped to fit thinking budget"
-                        );
-                        required_floor
-                    } else {
-                        max_out
-                    }
-                } else {
-                    max_out
-                };
-                astra_core::model_wire::apply_chat_output_token_limit(
-                    &mut body,
-                    provider,
-                    effective_max,
-                );
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -3875,6 +3845,11 @@ fn build_provider_request_body_with_cache_capability(
                 thinking.apply_openai(&mut body);
             }
             apply_request_body_overrides(&mut body, sanitized_overrides.as_deref());
+            if let Some(max_out) = max_output_tokens {
+                // The caller owns the resolved completion ceiling. Transport
+                // must not enlarge it based on generic thinking heuristics.
+                astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, max_out);
+            }
             reconcile_authoritative_temperature(
                 &mut body,
                 TemperatureField::TopLevel,
@@ -4001,7 +3976,7 @@ fn apply_admitted_openai_protocol(
     {
         body["temperature"] = value;
     }
-    thinking.apply_openai_protocol(body, protocol);
+    astra_turn_core::thinking_config::apply_openai_protocol(thinking, body, protocol);
 }
 
 fn validate_request_body_overrides(
@@ -19244,76 +19219,47 @@ mod tests {
         }
     }
 
-    // --- Regression: output-limit bump respects user's ceiling ---
     #[test]
-    fn deepseek_max_tokens_honors_user_when_above_floor() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
-        let thinking = ThinkingConfig::Enabled {
-            budget_tokens: 32_000,
-        };
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(128_000),
-            None,
-            false,
-            &thinking,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(128_000),
-            "user ceiling above floor must not be bumped"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn deepseek_max_tokens_bumps_when_user_below_floor() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
-        let thinking = ThinkingConfig::Enabled {
-            budget_tokens: 32_000,
-        };
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(8_000),
-            None,
-            false,
-            &thinking,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(40_192),
-            "configured max below thinking_budget+headroom must be bumped to floor"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn deepseek_max_tokens_unchanged_when_thinking_off() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(4_096),
-            None,
-            false,
-            &ThinkingConfig::Off,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(4_096),
-            "thinking=off must never bump user's max"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
+    fn resolved_output_ceiling_is_preserved_for_every_thinking_mode() {
+        for thinking in [
+            ThinkingConfig::Off,
+            ThinkingConfig::Enabled {
+                budget_tokens: 32_000,
+            },
+            ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+            },
+        ] {
+            for (provider, model, field) in [
+                ("deepseek", "deepseek-chat", "/max_tokens"),
+                ("openai", "gpt-4o", "/max_completion_tokens"),
+                ("anthropic", "claude-sonnet-4-5", "/max_tokens"),
+                ("bedrock", "claude-sonnet-4-5", "/inferenceConfig/maxTokens"),
+            ] {
+                for ceiling in [37, 8_000, 128_000] {
+                    let overrides = serde_json::from_value::<Map<String, Value>>(json!({
+                        "max_tokens": 999_999, "max_completion_tokens": 999_999,
+                        "inferenceConfig": {"maxTokens": 999_999, "topP": 0.8}
+                    }))
+                    .unwrap();
+                    let body = build_provider_request_body_with_overrides(
+                        &[json!({"role": "user", "content": "hi"})],
+                        &[],
+                        model,
+                        provider,
+                        Some(ceiling),
+                        None,
+                        false,
+                        &thinking,
+                        Some(&overrides),
+                    );
+                    assert_eq!(
+                        body.pointer(field).and_then(Value::as_u64),
+                        Some(ceiling as u64)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

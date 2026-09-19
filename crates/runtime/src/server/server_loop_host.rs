@@ -2126,6 +2126,7 @@ async fn try_resolve_same_owner_fallback(
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
     credential_owner: &ResolvedTurnLlmConfig,
+    runtime_config: &astra_config::runtime_config::RuntimeConfig,
 ) -> FallbackOutcome<ResolvedTurnLlmConfig> {
     try_resolve_fallback(cooldown, chain, reason, |fallback_name| async move {
         let candidate = resolve_llm_model_for_turn(
@@ -2134,6 +2135,7 @@ async fn try_resolve_same_owner_fallback(
             Some(fallback_name.as_str()),
             pool,
             None,
+            runtime_config,
         )
         .await?;
         if !credential_owner.shares_credential_owner_with(&candidate) {
@@ -2996,6 +2998,7 @@ async fn resolve_llm_model_for_turn(
     preferred_model: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
     admitted_execution: Option<&astra_services::AdmittedModelExecution>,
+    runtime_config: &astra_config::runtime_config::RuntimeConfig,
 ) -> Result<ResolvedTurnLlmConfig, String> {
     if let Some(execution) = admitted_execution {
         if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
@@ -3005,7 +3008,7 @@ async fn resolve_llm_model_for_turn(
         }
         return Ok(ResolvedTurnLlmConfig {
             context_budget: crate::turn::execution_config::resolve_context_budget(
-                &astra_config::runtime_config::RuntimeConfig::load(),
+                runtime_config,
                 execution.context_window,
                 execution.max_completion_tokens,
                 crate::prompts::CompactConfig::default(),
@@ -3036,7 +3039,7 @@ async fn resolve_llm_model_for_turn(
             .await?;
     Ok(ResolvedTurnLlmConfig {
         context_budget: crate::turn::execution_config::resolve_context_budget(
-            &astra_config::runtime_config::RuntimeConfig::load(),
+            runtime_config,
             resolved.context_window,
             resolved.max_completion_tokens,
             crate::prompts::CompactConfig::default(),
@@ -3845,6 +3848,7 @@ pub struct ServerAgenticLoopHost {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
+    runtime_config: astra_config::runtime_config::RuntimeConfig,
     inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
@@ -6296,6 +6300,7 @@ pub struct ServerAgenticLoopHostBuilder {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     llm_transport: Result<Arc<crate::turn::llm::client::LlmTransport>, String>,
+    runtime_config: Option<astra_config::runtime_config::RuntimeConfig>,
     inference_owner_pod_id: Option<String>,
     execution_time_budget: Option<RunExecutionTimeBudget>,
     edge_tools: Vec<Value>,
@@ -6384,6 +6389,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: None,
             admitted_model_execution: None,
             llm_transport: crate::turn::llm::client::shared_llm_transport(),
+            runtime_config: None,
             inference_owner_pod_id: None,
             execution_time_budget: None,
             edge_tools: Vec::new(),
@@ -6723,7 +6729,18 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub(crate) fn with_runtime_config(
+        mut self,
+        runtime_config: astra_config::runtime_config::RuntimeConfig,
+    ) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
+        let runtime_config = self
+            .runtime_config
+            .unwrap_or_else(astra_config::runtime_config::RuntimeConfig::load);
         // Compose the prompt-visible tool surface from provider declarations:
         // server-owned tools are always eligible when the server catalog is
         // enabled, while workspace/process tools require an explicit runtime
@@ -6898,7 +6915,7 @@ impl ServerAgenticLoopHostBuilder {
         // scope, so `tool_search` cannot ever select it.
         let server_tool_surface = crate::tool_registry::surface::ToolSurface::build(
             server_catalog_tools.clone(),
-            &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+            &runtime_config.tool_surface,
             &[],
         );
         let mut server_visible_tools = server_tool_surface.always_load_schemas();
@@ -7035,6 +7052,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: self.model_override,
             admitted_model_execution: self.admitted_model_execution,
             llm_transport: self.llm_transport,
+            runtime_config,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
@@ -11546,6 +11564,7 @@ impl ServerAgenticLoopHost {
             effective_model_override.as_deref(),
             pool_ref,
             self.admitted_model_execution.as_ref(),
+            &self.runtime_config,
         )
         .await?;
         self.remember_resolved_llm_config(&llm_cfg);
@@ -11837,7 +11856,13 @@ impl ServerAgenticLoopHost {
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
             return self
-                .durable_summary_client(config, max_output_tokens, state, operation_id)
+                .durable_summary_client(
+                    config,
+                    max_output_tokens,
+                    state,
+                    operation_id,
+                    astra_turn_types::InferencePurpose::Introspection,
+                )
                 .map(|client| Box::new(client) as Box<_>);
         }
 
@@ -11853,8 +11878,14 @@ impl ServerAgenticLoopHost {
             }
         };
         self.remember_resolved_llm_config(&llm_cfg);
-        self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
-            .map(|client| Box::new(client) as Box<_>)
+        self.durable_summary_client(
+            &llm_cfg,
+            max_output_tokens,
+            state,
+            operation_id,
+            astra_turn_types::InferencePurpose::Introspection,
+        )
+        .map(|client| Box::new(client) as Box<_>)
     }
 
     fn durable_summary_client(
@@ -11863,12 +11894,14 @@ impl ServerAgenticLoopHost {
         max_output_tokens: usize,
         state: &AgenticLoopState,
         operation_id: &str,
+        purpose: astra_turn_types::InferencePurpose,
     ) -> Option<RuntimeSummaryClient> {
         self.durable_summary_client_for_execution(
             config,
             max_output_tokens,
             state,
             operation_id,
+            purpose,
             self.admitted_model_execution.as_ref(),
         )
     }
@@ -11879,6 +11912,7 @@ impl ServerAgenticLoopHost {
         max_output_tokens: usize,
         state: &AgenticLoopState,
         operation_id: &str,
+        purpose: astra_turn_types::InferencePurpose,
         execution: Option<&astra_services::AdmittedModelExecution>,
     ) -> Option<RuntimeSummaryClient> {
         let authority = match self.inference_run_authority(state) {
@@ -11941,10 +11975,17 @@ impl ServerAgenticLoopHost {
                 return None;
             }
         };
-        Some(RuntimeSummaryClient::new_with_attempt_allocator(
-            transport,
-            config.execution_route(),
+        let route = config.execution_route();
+        let policy = crate::turn::llm::summary_client::resolve_auxiliary_generation_policy(
+            operation_id,
             max_output_tokens,
+            purpose,
+            &route,
+        );
+        Some(RuntimeSummaryClient::new_with_resolved_policy(
+            transport,
+            route,
+            policy,
             ledger,
             scope,
             self.summary_attempt_allocator.clone(),
@@ -18097,6 +18138,7 @@ impl ServerAgenticLoopHost {
             llm_cfg.context_budget.compact_config.summary_token_budget,
             state,
             "required_compaction",
+            astra_turn_types::InferencePurpose::RequiredCompaction,
         );
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
@@ -19897,6 +19939,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     enc,
                     pool_ref,
                     &credential_owner,
+                    &self.runtime_config,
                 )
                 .await
                 {
@@ -22774,7 +22817,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.sticky_tool_schemas.clone()
         };
         let client = self
-            .durable_summary_client(&config, 4096, state, "pre_turn_compaction")?
+            .durable_summary_client(
+                &config,
+                4096,
+                state,
+                "pre_turn_compaction",
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+            )?
             .with_prompt_cache_context(summary_tools, cache_capability);
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
@@ -46387,6 +46436,7 @@ mod tests {
             Some("gpt-5-mini"),
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve admitted execution");
@@ -46424,6 +46474,7 @@ mod tests {
             None,
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve admitted execution");
@@ -46461,16 +46512,22 @@ mod tests {
     async fn admitted_offering_material_drives_turn_without_model_name_resolution() {
         let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
             .expect("valid Offering material");
+        let mut runtime_config = astra_config::runtime_config::RuntimeConfig::default();
+        runtime_config.compression.compression_threshold = 0.6;
+        runtime_config.compression.preserve_recent_turns = 9;
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             Some("catalog-model"),
             None,
             Some(&execution),
+            &runtime_config,
         )
         .await
         .expect("admitted material should not require a database lookup");
 
+        assert_eq!(resolved.context_budget.compact_threshold, 0.6);
+        assert_eq!(resolved.context_budget.keep_recent_turns, 9);
         assert_eq!(resolved.model_name, "catalog-model");
         assert_eq!(resolved.wire_model_name.as_deref(), Some("upstream-model"));
         assert_eq!(resolved.api_key, "provider-secret");
@@ -46498,6 +46555,7 @@ mod tests {
             None,
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await
         .expect("resolve credential owner");
@@ -46653,6 +46711,7 @@ mod tests {
             Some("other-model"),
             None,
             Some(&execution),
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .await;
 
@@ -48201,6 +48260,7 @@ mod tests {
                 request_timeout: Some(Duration::from_secs(2)),
             },
             128,
+            astra_turn_types::InferencePurpose::RequiredCompaction,
         );
 
         let response = client
@@ -51034,6 +51094,50 @@ mod tests {
             assert!(!host.work_admission_requires_settlement());
             host.work_admission_conflict = Some("trusted workflow conflict".into());
             assert!(host.work_admission_requires_settlement());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn builtin_work_admission_preserves_invalid_generation_policy_error() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+            let inference_ledger =
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+            let (gateway_url, requests, server) =
+                spawn_gateway(axum::http::StatusCode::OK, json!({})).await;
+            let mut execution = test_gateway_execution(gateway_url, Some(3_000));
+            execution.request_body_overrides =
+                Some(Map::from_iter([("temperature".to_string(), json!("cold"))]));
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-policy-error".to_string(),
+                "s-policy-error".to_string(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_test_inference_ledger(inference_ledger.clone())
+            .with_admitted_model_execution(Some(execution))
+            .build();
+            let mut state = create_durable_execution_test_state("s-policy-error");
+            state.session_turn = 2;
+            state.message = "Inspect source and report a finding.".to_string();
+            state.user_intent = state.message.clone();
+            host.judge_turn_intent(&state).await;
+            assert!(host.pending_work_admission_judge.is_some());
+            host.resolve_pending_work_admission(true).await;
+            assert_eq!(
+                host.work_admission_unavailable_reason,
+                Some(WorkAdmissionUnavailableReason::ContractViolation)
+            );
+            assert!(matches!(
+                host.completed_work_admission_phase,
+                Some((_, _, TurnPhaseOutcome::Unavailable))
+            ));
+            assert!(host.take_admitted_work_establishment_call(&state).is_none());
+            assert!(requests.lock().await.is_empty());
+            inference_ledger.assert_quiescent();
+            server.abort();
         }
 
         #[tokio::test]

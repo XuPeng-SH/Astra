@@ -7,6 +7,7 @@ mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
+pub mod auxiliary_execution;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod judgment;
 pub use judgment::{
@@ -52,6 +53,8 @@ mod session_fork;
 mod session_handoff;
 mod stop_hooks;
 pub mod task_resolution;
+mod thinking_config;
+pub use thinking_config::{ThinkingConfig, ThinkingEffort, TurnComplexitySignals};
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;

@@ -10808,7 +10808,10 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         mut request: ChatRequestData,
-    ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<
+        (ChatRequestData, astra_config::runtime_config::RuntimeConfig),
+        (StatusCode, Json<ErrorResponse>),
+    > {
         if self.execution_handoff_requested.load(Ordering::Acquire) {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -10844,7 +10847,8 @@ impl AgenticRunLifecycleService {
                 .transpose()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
-        astra_config::RuntimeConfig::cached()
+        let runtime_config = astra_config::RuntimeConfig::load();
+        runtime_config
             .runtime_limits
             .resolve_turn_ceiling(
                 astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_chat_context(
@@ -10895,7 +10899,7 @@ impl AgenticRunLifecycleService {
             request.model = Some(resolved.model_name.clone());
             request.resolved_model_selection = Some(resolved);
             request.admitted_model_execution = Some(admitted);
-            return Ok(request);
+            return Ok((request, runtime_config));
         }
         let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
         if request.admitted_model_execution.is_some() {
@@ -10945,7 +10949,7 @@ impl AgenticRunLifecycleService {
                 .await?,
             );
             request.model = Some(resolved.model_name.clone());
-            return Ok(request);
+            return Ok((request, runtime_config));
         }
         if request.resolved_model_selection.is_some() {
             return Err(error_response_coded(
@@ -10971,7 +10975,7 @@ impl AgenticRunLifecycleService {
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
         request.admitted_model_execution = Some(admitted);
-        Ok(request)
+        Ok((request, runtime_config))
     }
 
     async fn plan_resume_snapshot_for_request(
@@ -12596,6 +12600,7 @@ impl AgenticRunLifecycleService {
         plan_resume_hint: Option<String>,
         plan_authoring_active: bool,
         work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
+        runtime_config: &astra_config::runtime_config::RuntimeConfig,
     ) -> server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
@@ -12603,6 +12608,7 @@ impl AgenticRunLifecycleService {
             user_id.to_string(),
             session_id.to_string(),
         )
+        .with_runtime_config(runtime_config.clone())
         .with_model(request.model.clone())
         .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
@@ -13167,6 +13173,7 @@ impl AgenticRunLifecycleService {
             None,
             None,
             None,
+            &astra_config::runtime_config::RuntimeConfig::default(),
         )
         .expect("valid test execution budget")
     }
@@ -13376,6 +13383,7 @@ impl AgenticRunLifecycleService {
         request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         execution_owner_generation: Option<u64>,
+        runtime_config: &astra_config::runtime_config::RuntimeConfig,
     ) -> Result<AgenticLoopState, (StatusCode, Json<ErrorResponse>)> {
         let facts = self.prepare_initial_execution_facts(
             user_id,
@@ -13384,6 +13392,7 @@ impl AgenticRunLifecycleService {
             run_id,
             workspace_override,
             edge_context,
+            runtime_config,
         )?;
         let environment = self.assemble_loop_environment(
             user_id,
@@ -13411,6 +13420,7 @@ impl AgenticRunLifecycleService {
             agent_binding_context,
             environment,
             facts,
+            runtime_config,
         ))
     }
 
@@ -13422,6 +13432,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
         edge_context: &EdgeContext,
+        runtime_config: &astra_config::runtime_config::RuntimeConfig,
     ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
         use astra_turn_core::stop_hooks_yaml::{
@@ -13444,7 +13455,7 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&prompt_user_message);
-        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
+        let runtime_turn_ceiling = runtime_config
             .runtime_limits
             .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
             .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
@@ -13577,6 +13588,7 @@ impl AgenticRunLifecycleService {
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         environment: LoopEnvironment,
         facts: LoopExecutionFacts,
+        runtime_config: &astra_config::runtime_config::RuntimeConfig,
     ) -> AgenticLoopState {
         use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
         use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -13591,7 +13603,7 @@ impl AgenticRunLifecycleService {
         let thinking_config =
             Self::thinking_from_chat_context(&request.context, request.model.as_deref())
                 .expect("thinking configuration was validated during request admission");
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = runtime_config
             .tool_selection
             .resolve_for_model(request.model.as_deref());
         AgenticLoopState {
@@ -16806,7 +16818,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .as_ref()
             .filter(|identity| identity.kind() == RunStartIdempotencyKind::EvaluationTrial)
             .cloned();
-        let request = if let Some(identity) = start_identity.as_ref() {
+        let (request, runtime_config) = if let Some(identity) = start_identity.as_ref() {
             let requested_session_id = request.session_id.clone();
             if let Some(durable) = self
                 .load_durable_run_for_user(identity.run_id(), &user_id)
@@ -17329,6 +17341,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_resume_hint,
             plan_authoring_active,
             work_runtime_binding.as_ref(),
+            &runtime_config,
         );
         let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
             Arc::new(DurableHostInteractionSink {
@@ -17597,6 +17610,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             Some(execution_owner_generation),
+            &runtime_config,
         )?;
         install_active_personal_skills(&mut loop_state, active_personal_skills);
         loop_state.context_manifest_user_id = Some(user_id.clone());
@@ -18038,7 +18052,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
-        let request = if let Some(identity) = start_identity.as_ref() {
+        let (request, runtime_config) = if let Some(identity) = start_identity.as_ref() {
             // Idempotent retries may omit runtime context needed only for a
             // new execution. The durable lookup stays authoritative while
             // independent request preparation overlaps its read latency.
@@ -18771,6 +18785,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
             execution_owner_generation,
+            &runtime_config,
         )?;
         install_active_personal_skills(&mut state, active_personal_skills);
         state.context_manifest_user_id = Some(user_id.clone());
@@ -18899,6 +18914,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_resume_hint,
             plan_authoring_active,
             work_runtime_binding.as_ref(),
+            &runtime_config,
         );
         if let Some(admission) = canonical_turn.as_ref() {
             host.bind_execution_handoff(
