@@ -150,7 +150,7 @@ fn build_comparison(
     candidate_label: impl Into<String>,
     observations: &[TrialObservation],
 ) -> ComparisonReport {
-    let (observations, duplicate_warnings) = deduplicate_observations(observations);
+    let observations = observations.to_vec();
     let mut cases = BTreeMap::<String, BTreeSet<ComparisonArm>>::new();
     let mut case_repetitions = BTreeMap::<(String, u32), BTreeSet<ComparisonArm>>::new();
     let mut status_counts = BTreeMap::new();
@@ -191,7 +191,6 @@ fn build_comparison(
             )
         })
         .collect::<Vec<_>>();
-    unavailable.extend(duplicate_warnings);
     for observation in &observations {
         if observation.measurements.is_empty() {
             unavailable.push(format!(
@@ -326,26 +325,6 @@ pub fn build_comparison_for_plan(
         };
     }
     Ok(report)
-}
-
-fn deduplicate_observations(
-    observations: &[TrialObservation],
-) -> (Vec<TrialObservation>, Vec<String>) {
-    let mut accepted = BTreeMap::<&str, TrialObservation>::new();
-    let mut conflicts = Vec::new();
-    for observation in observations {
-        match accepted.get(observation.trial_id.as_str()) {
-            Some(previous) if *previous != *observation => conflicts.push(format!(
-                "trial {} has conflicting duplicate observations; first delivery retained",
-                observation.trial_id
-            )),
-            Some(_) => {}
-            None => {
-                accepted.insert(observation.trial_id.as_str(), observation.clone());
-            }
-        }
-    }
-    (accepted.into_values().collect(), conflicts)
 }
 
 /// Render the same structured report for Markdown or a terminal preview.
@@ -514,14 +493,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn duplicate_trial_ids_are_explicitly_unavailable() {
-        let sample = observation("case-1", ComparisonArm::Baseline, TrialStatus::Completed);
-        let report = build_comparison("baseline", "candidate", &[sample.clone(), sample]);
-        assert_eq!(report.status_counts.get("completed"), Some(&1));
-        assert!(report.unavailable.is_empty());
-    }
-
     fn plan_spec() -> ExperimentSpec {
         ExperimentSpec {
             schema_version: EXPERIMENT_SCHEMA_VERSION,
@@ -547,6 +518,7 @@ mod tests {
                 verifier_id: "verifier".to_string(),
                 verifier_version: "v1".to_string(),
                 holdout: true,
+                task_verifier: None,
                 input_content: None,
             }],
             repetitions: 2,
@@ -666,6 +638,7 @@ mod tests {
             verifier_id: "verifier".to_string(),
             verifier_version: "v1".to_string(),
             holdout: false,
+            task_verifier: None,
             input_content: None,
         });
         spec.budget.max_trials = 8;

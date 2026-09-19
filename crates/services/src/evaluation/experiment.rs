@@ -63,6 +63,8 @@ pub struct EvaluationCase {
     pub verifier_id: String,
     pub verifier_version: String,
     pub holdout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_verifier: Option<super::task_verifier::TaskVerifierSpec>,
     /// Frozen text for the first prompt/Skill adapter. Generic adapters may
     /// use only the content hash until they provide their own materializer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,6 +413,14 @@ impl ExperimentSpec {
                     "input_content must not be empty for case `{}`",
                     case.case_id
                 ));
+            }
+            if let Some(verifier) = &case.task_verifier {
+                verifier.validate()?;
+                if verifier.implementation_id != case.verifier_id
+                    || verifier.implementation_version != case.verifier_version
+                {
+                    return Err("case verifier identity does not match frozen task verifier".into());
+                }
             }
         }
         for (field, value) in [
@@ -903,6 +913,7 @@ mod tests {
                 verifier_id: "verifier".to_string(),
                 verifier_version: "1".to_string(),
                 holdout: false,
+                task_verifier: None,
                 input_content: None,
             }],
             repetitions: 2,
@@ -978,6 +989,7 @@ mod tests {
             verifier_id: "verifier".to_string(),
             verifier_version: "1".to_string(),
             holdout: true,
+            task_verifier: None,
             input_content: None,
         });
         spec.budget.max_trials = 8;
