@@ -528,21 +528,21 @@ pub async fn get_memory_model_handler(
     headers: HeaderMap,
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    if query.judgment_binding()
-        && let Some(admitted) = astra_services::admin_config::resolve_judgment_offering(
+    if query.judgment_binding() {
+        let offerings = astra_services::admin_config::resolve_judgment_offering(
             state.admin.config_service.as_ref(),
             state.model_service.as_ref(),
             &user.user_id,
         )
         .await?
-    {
-        return Ok(Json(MemoryInferenceOfferingsResponse {
-            offerings: vec![MemoryInferenceOfferingResponse {
-                offering_id: admitted.offering_id,
-                model_name: admitted.model_name,
-                thinking_capability: admitted.thinking_capability,
-            }],
-        }));
+        .into_iter()
+        .map(|admitted| MemoryInferenceOfferingResponse {
+            offering_id: admitted.offering_id,
+            model_name: admitted.model_name,
+            thinking_capability: admitted.thinking_capability,
+        })
+        .collect();
+        return Ok(Json(MemoryInferenceOfferingsResponse { offerings }));
     }
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(

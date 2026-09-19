@@ -321,7 +321,7 @@ mod tests {
             &self,
             _: astra_runtime::memory_hooks::MemoryInferenceRequest<'_>,
         ) -> Result<String, astra_core::ClassifiedError> {
-            Ok("[1]".into())
+            Ok(r#"{"true":["1"],"uncertain":[]}"#.into())
         }
     }
 

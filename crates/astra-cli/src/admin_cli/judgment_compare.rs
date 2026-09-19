@@ -306,22 +306,32 @@ pub(super) async fn run(
                 match api.post_completions(token, &request).await {
                     Ok(response) => {
                         let text = response.first_text().unwrap_or("");
+                        let finish_reason = response
+                            .choices
+                            .first()
+                            .map(|choice| choice.finish_reason.clone());
                         row["raw_output"] = json!(text);
                         row["model"] = json!(response.model);
                         row["usage"] = json!(response.usage);
-                        match selection(text, case) {
-                            Ok(selected) => {
-                                row["status"] = json!("valid");
-                                if let Some(expected) = &case.expected {
-                                    let mut expected = expected.clone();
-                                    expected.sort();
-                                    row["matches_expected"] = json!(selected == expected);
+                        row["finish_reason"] = json!(finish_reason);
+                        if finish_reason.as_deref() != Some("stop") {
+                            row["status"] = json!("incomplete");
+                            row["error"] = json!("completion_did_not_finish_normally");
+                        } else {
+                            match selection(text, case) {
+                                Ok(selected) => {
+                                    row["status"] = json!("valid");
+                                    if let Some(expected) = &case.expected {
+                                        let mut expected = expected.clone();
+                                        expected.sort();
+                                        row["matches_expected"] = json!(selected == expected);
+                                    }
+                                    row["selected"] = json!(selected);
                                 }
-                                row["selected"] = json!(selected);
-                            }
-                            Err(reason) => {
-                                row["status"] = json!("invalid_answer");
-                                row["error"] = json!(reason);
+                                Err(reason) => {
+                                    row["status"] = json!("invalid_answer");
+                                    row["error"] = json!(reason);
+                                }
                             }
                         }
                     }
@@ -384,7 +394,7 @@ pub(super) async fn run(
                 ))
             })
             .collect::<Vec<_>>();
-        summary[backend] = json!({"calls":subset.len(),"valid":valid,"unavailable":subset.iter().filter(|r|r["status"]=="unavailable").count(),"invalid_answer":subset.iter().filter(|r|r["status"]=="invalid_answer").count(),"assessed":subset.iter().filter(|r|r.get("matches_expected").is_some()).count(),"matches_expected":subset.iter().filter(|r|r["matches_expected"]==true).count(),"latency_population":"all_calls","median_ms":median,"p95_ms":if timed==0 {None} else {Some(latencies[(timed*95).div_ceil(100)-1])},"usage_reported_calls": reported.len(), "usage_status": if reported.len()==subset.len() {"complete"} else if reported.is_empty() {"unavailable"} else {"partial"}, "input_tokens": if reported.is_empty() {None} else {Some(reported.iter().map(|(input, _)| input).sum::<u64>())}, "output_tokens": if reported.is_empty() {None} else {Some(reported.iter().map(|(_, output)| output).sum::<u64>())}});
+        summary[backend] = json!({"calls":subset.len(),"valid":valid,"unavailable":subset.iter().filter(|r|r["status"]=="unavailable").count(),"incomplete":subset.iter().filter(|r|r["status"]=="incomplete").count(),"invalid_answer":subset.iter().filter(|r|r["status"]=="invalid_answer").count(),"assessed":subset.iter().filter(|r|r.get("matches_expected").is_some()).count(),"matches_expected":subset.iter().filter(|r|r["matches_expected"]==true).count(),"latency_population":"all_calls","median_ms":median,"p95_ms":if timed==0 {None} else {Some(latencies[(timed*95).div_ceil(100)-1])},"usage_reported_calls": reported.len(), "usage_status": if reported.len()==subset.len() {"complete"} else if reported.is_empty() {"unavailable"} else {"partial"}, "input_tokens": if reported.is_empty() {None} else {Some(reported.iter().map(|(input, _)| input).sum::<u64>())}, "output_tokens": if reported.is_empty() {None} else {Some(reported.iter().map(|(_, output)| output).sum::<u64>())}});
         stdout_println!(
             "{backend}: {valid}/{} valid · {} matching · median {} ms · P95 {} ms",
             subset.len(),
@@ -429,6 +439,7 @@ mod tests {
             .mount(&server)
             .await;
         let completion = |id: &str, text: &str| json!({"id":"response","object":"chat.completion","offering_id":id,"model":id,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+        let truncated_completion = |id: &str, text: &str| json!({"id":"response","object":"chat.completion","offering_id":id,"model":id,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"length"}]});
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer sentinel-token"))
@@ -458,7 +469,10 @@ mod tests {
             .and(header("authorization", "Bearer sentinel-token"))
             .and(body_partial_json(json!({"logical_attempt":2})))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(completion("offer-jet", "malformed")),
+                ResponseTemplate::new(200).set_body_json(truncated_completion(
+                    "offer-jet",
+                    r#"{"true":["0"],"uncertain":[]}"#,
+                )),
             )
             .expect(1)
             .mount(&server)
@@ -484,7 +498,8 @@ mod tests {
         let summary: Value =
             serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
         assert_eq!(summary["candidate"]["unavailable"], 1);
-        assert_eq!(summary["candidate"]["invalid_answer"], 1);
+        assert_eq!(summary["candidate"]["incomplete"], 1);
+        assert_eq!(summary["candidate"]["invalid_answer"], 0);
         assert_eq!(summary["candidate"]["valid"], 0);
         assert_eq!(summary["candidate"]["latency_population"], "all_calls");
         assert!(summary["candidate"]["median_ms"].is_number());

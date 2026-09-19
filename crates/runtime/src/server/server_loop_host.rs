@@ -2410,6 +2410,17 @@ impl SummaryClientWorkAdmissionJudge {
         }
     }
 
+    fn require_completed(
+        response: &astra_turn_core::cloud_summary::SummaryResponse,
+    ) -> Result<(), astra_services::TurnIntentJudgeError> {
+        if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
+            return Err(astra_services::TurnIntentJudgeError::Rejected(
+                "work admission judgment did not finish normally".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn classify_and_plan(
         &self,
         planner: &Self,
@@ -2421,6 +2432,7 @@ impl SummaryClientWorkAdmissionJudge {
                 &request,
             ))
             .await?;
+        Self::require_completed(&response)?;
         let classification =
             astra_services::parse_work_admission_classification(&request, &response.text)?;
         if classification.work_lifecycle == WorkLifecycleIntent::NotRequired {
@@ -2495,7 +2507,7 @@ impl SummaryClientWorkAdmissionJudge {
             usage = ?response.usage,
             "Work admission response received"
         );
-        let response_was_length = response.finish_reason.as_deref() == Some("length");
+        Self::require_completed(&response)?;
         let parsed = astra_services::parse_work_admission_response(response.text.as_str());
         let decision = match parsed {
             Ok(decision) => reconcile_trusted_workflow_topology(ctx, decision),
@@ -2522,8 +2534,6 @@ impl SummaryClientWorkAdmissionJudge {
             );
             let repair_instruction = if semantic_conflict {
                 "The previous object chose an unsupported combination: durable Work plus parallel sub-runs. Re-evaluate the user-facing acceptance boundary. Intermediate agents, reviewers, perspectives, findings, and fanout slots that feed one synthesized final answer are not independently accepted outcomes. Return work_lifecycle=not_required with execution_topology=parallel_subruns, required_capabilities=[agent_spawner] unless the user explicitly requested durable task lifecycle control. Only retain required+parallel when both facts are explicit. Return one complete JSON object matching the original schema, with no prose."
-            } else if response_was_length {
-                "The prior response reached its output limit and is incomplete. Re-evaluate the original request and return one minimal complete JSON object within the declared limits. Do not repeat prose, reasoning, or the truncated object. Every not_required object includes execution_topology and only classification fields; every required object includes at most 8 combined initial tasks and mutations. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. For external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning."
             } else {
                 "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel units remain fanout outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add requires task; cancel requires target_initial_task; replace requires both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; choose an initial target only when the user delegates that choice. Never invent an externally bound target or omit a requested mutation. Mutation after_initial_tasks gates graph changes; nested task.after_initial_tasks gates execution. Preserve the requested payload and source in additions. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
             };
@@ -2574,6 +2584,7 @@ impl SummaryClientWorkAdmissionJudge {
                 response = %repaired.text,
                 "Work admission compact semantic repair completed"
             );
+            Self::require_completed(&repaired)?;
             astra_services::parse_work_admission_response(repaired.text.as_str())
                 .and_then(|decision| reconcile_trusted_workflow_topology(ctx, decision))
         } else {
@@ -3744,6 +3755,13 @@ pub struct ServerAgenticLoopHost {
     /// exercise both the primary model and the auxiliary topology authority.
     #[cfg(feature = "e2e-hooks")]
     test_work_admission: Option<astra_services::WorkAdmissionDecision>,
+    /// Test-only explicit semantic-admission clients. Production admission
+    /// resolves these clients from the configured judgment Offering; tests
+    /// can provide the same boundary without coupling a unit test to a live
+    /// catalog row.
+    #[cfg(test)]
+    test_judgment_clients:
+        std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
     /// Optional provider hint for the mock path, so cache_control annotations
     /// are exercised as if talking to anthropic/openai/etc. Default (None)
     /// leaves `PromptCacheConfig::default()` behavior (annotations off).
@@ -5019,6 +5037,13 @@ pub struct ServerAgenticLoopHostBuilder {
     test_llm_rounds_wired: bool,
     #[cfg(feature = "e2e-hooks")]
     test_work_admission: Option<astra_services::WorkAdmissionDecision>,
+    /// Test-only explicit semantic-admission clients. Production admission
+    /// resolves these clients from the configured judgment Offering; tests
+    /// can provide the same boundary without coupling a unit test to a live
+    /// catalog row.
+    #[cfg(test)]
+    test_judgment_clients:
+        std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
     #[cfg(feature = "e2e-hooks")]
     mock_provider: Option<(String, String)>,
     #[cfg(feature = "e2e-hooks")]
@@ -5099,6 +5124,8 @@ impl ServerAgenticLoopHostBuilder {
             test_llm_rounds_wired: false,
             #[cfg(feature = "e2e-hooks")]
             test_work_admission: None,
+            #[cfg(test)]
+            test_judgment_clients: std::collections::VecDeque::new(),
             #[cfg(feature = "e2e-hooks")]
             mock_provider: None,
             #[cfg(feature = "e2e-hooks")]
@@ -5146,6 +5173,18 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    /// **Test-only.** Provide the explicit judgment clients used by semantic
+    /// admission. This keeps unit tests on the same no-fallback boundary as
+    /// production while avoiding an implicit primary-model route.
+    #[cfg(test)]
+    fn with_test_judgment_clients(
+        mut self,
+        clients: impl IntoIterator<Item = Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
+    ) -> Self {
+        self.test_judgment_clients = clients.into_iter().collect();
         self
     }
 
@@ -5812,6 +5851,8 @@ impl ServerAgenticLoopHostBuilder {
             test_llm_rounds_wired: self.test_llm_rounds_wired,
             #[cfg(feature = "e2e-hooks")]
             test_work_admission: self.test_work_admission,
+            #[cfg(test)]
+            test_judgment_clients: self.test_judgment_clients,
             #[cfg(feature = "e2e-hooks")]
             mock_provider: self.mock_provider,
             #[cfg(feature = "e2e-hooks")]
@@ -9962,6 +10003,10 @@ impl ServerAgenticLoopHost {
             );
             return Err(JudgmentClientUnavailable::InvalidRequest);
         }
+        #[cfg(test)]
+        if let Some(client) = self.test_judgment_clients.pop_front() {
+            return Ok(client);
+        }
         let max_output_tokens = request.output_token_budget();
         if let Some(pool) = &self.shared_pool {
             let config = astra_services::DatabaseAdminConfigService::new(self.matrixone.clone())
@@ -10041,6 +10086,10 @@ impl ServerAgenticLoopHost {
         operation_id: &'static str,
         max_output_tokens: usize,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        #[cfg(test)]
+        if let Some(client) = self.test_judgment_clients.pop_front() {
+            return Some(client);
+        }
         if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
             self.clear_resolved_llm_config();
         }
@@ -23435,6 +23484,31 @@ mod tests {
                 .is_err()
         );
         assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_judgment_repair_rejects_truncated_or_failed_responses() {
+        let valid = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","mutation_completion_scope":"unknown","execution_topology":"primary","required_capabilities":[]}"#;
+        for (is_ptl_error, finish_reason) in
+            [(false, Some("length")), (true, Some("stop")), (false, None)]
+        {
+            let mut repaired = summary_response_with_usage(valid, 5, 0, 2);
+            repaired.is_ptl_error = is_ptl_error;
+            repaired.finish_reason = finish_reason.map(str::to_string);
+            let judge =
+                SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
+                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                        Ok(summary_response_with_usage("{", 7, 0, 2)),
+                        Ok(repaired),
+                    ])),
+                }));
+            assert!(matches!(
+                judge
+                    .judge(&astra_services::TurnIntentJudgeContext::default())
+                    .await,
+                Err(astra_services::TurnIntentJudgeError::Rejected(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -37690,12 +37764,45 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn newly_loaded_workflow_invalidates_stale_primary_topology_decision() {
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-        let (gateway_url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::OK,
-            json!({"choices":[{"message":{"content":
-                "{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"read_only\",\"execution_topology\":\"parallel_subruns\",\"required_capabilities\":[\"agent_spawner\"]}"
-            },"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":24}}),
-        ).await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let classification_client = SequencedSummaryClient {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
+                "schema_version": 1,
+                "model": "test",
+                "answers": {
+                    "required": {"type": "noul", "noul": 0.0},
+                    "defer": {"type": "noul", "noul": 0.0},
+                    "mutation.read_only": {"type": "noul", "noul": 1.0},
+                    "mutation.may_mutate": {"type": "noul", "noul": 0.0},
+                    "mutation.must_mutate": {"type": "noul", "noul": 0.0},
+                    "scope.workspace": {"type": "noul", "noul": 0.0},
+                    "scope.external": {"type": "noul", "noul": 0.0},
+                    "scope.mixed": {"type": "noul", "noul": 0.0},
+                    "scope.unknown": {"type": "noul", "noul": 1.0},
+                    "domain.none": {"type": "noul", "noul": 1.0},
+                    "domain.github": {"type": "noul", "noul": 0.0},
+                    "domain.git": {"type": "noul", "noul": 0.0},
+                    "domain.code": {"type": "noul", "noul": 0.0},
+                    "domain.memory": {"type": "noul", "noul": 0.0},
+                    "domain.web": {"type": "noul", "noul": 0.0},
+                    "domain.system": {"type": "noul", "noul": 0.0},
+                    "domain.database": {"type": "noul", "noul": 0.0},
+                    "parallel_subruns": {"type": "noul", "noul": 1.0},
+                    "capability.web": {"type": "noul", "noul": 0.0}
+                }
+            })
+            .to_string()])),
+            requests: requests.clone(),
+        };
+        // `start_work_admission_preflight` resolves both semantic clients at
+        // the boundary. The planner is intentionally unused for a
+        // `not_required` classification, but supplying it keeps this test's
+        // route explicit instead of reviving the removed primary-model
+        // fallback.
+        let planner_client = SequencedSummaryClient {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            requests: requests.clone(),
+        };
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -37708,7 +37815,11 @@ mod tests {
         .with_test_inference_ledger(
             crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
         )
-        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
+        .with_test_judgment_clients([
+            Box::new(classification_client)
+                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+            Box::new(planner_client),
+        ])
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
             domain: None,
@@ -37760,7 +37871,7 @@ mod tests {
             host.work_admission_execution_topology,
             astra_services::WorkExecutionTopology::ParallelSubruns
         );
-        assert_eq!(requests.lock().await.len(), 1);
+        assert_eq!(requests.lock().expect("judgment requests").len(), 1);
         let admission = host.enforce_canonical_delegation_lifecycle(
             &state,
             crate::turn::agentic_loop::host::ToolCallAdmission {
@@ -37772,7 +37883,6 @@ mod tests {
         );
         assert_eq!(admission.admitted.len(), 1);
         assert!(admission.rejected.is_empty());
-        server.abort();
     }
 
     #[tokio::test]
@@ -47235,19 +47345,15 @@ mod tests {
                     "successor_item_id": "verification"
                 }]
             });
-            let (gateway_url, requests, server) = spawn_gateway(
-                axum::http::StatusCode::OK,
-                json!({
-                    "choices": [{
-                        "message": {
-                            "content": classification_response(false)
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 8, "completion_tokens": 12}
-                }),
-            )
-            .await;
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classification_client = SequencedSummaryClient {
+                responses: std::sync::Mutex::new([classification_response(false)].into()),
+                requests: requests.clone(),
+            };
+            let planner_client = SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                requests: requests.clone(),
+            };
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -47260,7 +47366,11 @@ mod tests {
             .with_test_inference_ledger(
                 crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
             )
-            .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
+            .with_test_judgment_clients([
+                Box::new(classification_client)
+                    as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+                Box::new(planner_client),
+            ])
             .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
             .with_test_llm_rounds(vec![json!({
                 "full_text": proposal.to_string(),
@@ -47304,9 +47414,7 @@ mod tests {
             );
             assert!(host.pending_work_establishment.is_none());
             assert_eq!(state.total_tool_calls, 0);
-            assert_eq!(requests.lock().await.len(), 1);
-
-            server.abort();
+            assert_eq!(requests.lock().expect("judgment requests").len(), 1);
         }
     }
 }
