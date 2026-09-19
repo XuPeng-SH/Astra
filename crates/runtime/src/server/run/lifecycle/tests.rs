@@ -10913,6 +10913,77 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         "Eval must not dispatch a production observer, even asynchronously"
     );
 
+    // Model a restart after atomic terminal COMMIT but before the later
+    // settlement marker and derived observation. Retain the committed batch.
+    sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&trial.trial_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_settlement_finished'")
+        .bind(&owner).bind(&run.run_id).execute(pool.get()).await.unwrap();
+    let last_event_idx: i64 = sqlx::query_scalar(
+        "SELECT MAX(event_idx) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run.run_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?")
+        .bind(last_event_idx)
+        .bind(&owner)
+        .bind(&run.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    service
+        .run_engine
+        .append_events_batch(
+            &owner,
+            &session_id,
+            &run.run_id,
+            &[json!({"event_type": "projection_checked", "data": {}})],
+        )
+        .await
+        .expect("later event must not hide the committed terminal batch");
+    let restarted = db_backed_test_service(&pool, "eval-restarted-pod");
+    let provider_calls_before_repair = llm.requests.load(Ordering::SeqCst);
+    restarted
+        .get_run_status(run.run_id.clone(), owner.clone())
+        .await
+        .expect("status read repairs the missing observation without a finished marker");
+    let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let repaired = observation_store
+        .load_by_trial(&owner, &trial.trial_id)
+        .await
+        .unwrap()
+        .expect("restart must derive the observation from the atomic batch");
+    assert_eq!(
+        repaired.request_fingerprint,
+        observation.request_fingerprint
+    );
+    restarted
+        .get_run_status(run.run_id.clone(), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        observation_store
+            .load_by_trial(&owner, &trial.trial_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .observation_id,
+        repaired.observation_id,
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_repair
+    );
+
     // A queued Eval cancelled before semaphore admission must still settle a
     // terminal observation from the same canonical transaction, without ever
     // reaching the provider.

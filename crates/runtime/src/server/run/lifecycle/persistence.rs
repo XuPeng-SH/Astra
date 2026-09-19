@@ -1021,13 +1021,19 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     state: &AgenticLoopState,
     settlement: CanonicalTerminalSettlement<'_>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    let mut events = Vec::with_capacity(settlement.events.len() + 1);
+    let mut events = Vec::with_capacity(settlement.events.len() + 2);
     if let Some(receipt) =
         terminal_output_receipt_event(&append, state, settlement.expected_owner_generation)
     {
         events.push(receipt);
     }
     events.extend_from_slice(settlement.events);
+    events.push(
+        super::AgenticRunLifecycleService::finalized_accounting_event(
+            state,
+            settlement.expected_owner_generation,
+        ),
+    );
     persist_server_loop_canonical_append_inner(
         pool,
         append,
@@ -5940,6 +5946,10 @@ mod tests {
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
+        state.total_prompt = 37;
+        state.total_completion = 17;
+        state.total_tool_calls = 6;
+        state.has_any_usage = true;
         let terminal_events = vec![
             json!({
                 "event_type": "text_done",
@@ -6032,7 +6042,15 @@ mod tests {
             .await
             .expect_err("reject changed terminal output");
         state.final_text = original_output;
-        assert_eq!(&commit.terminal_events[1..], terminal_events.as_slice());
+        assert_eq!(
+            &commit.terminal_events[1..commit.terminal_events.len() - 1],
+            terminal_events.as_slice()
+        );
+        let accounting = commit.terminal_events.last().unwrap();
+        assert_eq!(accounting["event_type"], "run_accounting_finalized");
+        assert_eq!(accounting["data"]["prompt_tokens"], 37);
+        assert_eq!(accounting["data"]["completion_tokens"], 17);
+        assert_eq!(accounting["data"]["tool_call_count"], 6);
         let output_receipt = &commit.terminal_events[0];
         assert_eq!(output_receipt["event_type"], "run_output_recorded");
         assert_eq!(

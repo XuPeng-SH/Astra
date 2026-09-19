@@ -4507,6 +4507,51 @@ enum AtomicTerminalReturnPrefixResolution {
     Conflict(String),
 }
 
+fn decode_atomic_terminal_event_row(
+    row: sqlx::mysql::MySqlRow,
+    run_id: &str,
+) -> Result<AtomicTerminalEventRow, String> {
+    let event_idx = row.try_get::<i64, _>("event_idx").map_err(|source| {
+        db_error("decode_atomic_terminal_event_idx", run_id, source).to_string()
+    })?;
+    let event_type = row.try_get::<String, _>("event_type").map_err(|source| {
+        db_error("decode_atomic_terminal_event_type", run_id, source).to_string()
+    })?;
+    let event_id = row.try_get::<String, _>("event_id").map_err(|source| {
+        db_error("decode_atomic_terminal_event_id", run_id, source).to_string()
+    })?;
+    let idempotency_key = row
+        .try_get::<Option<String>, _>("idempotency_key")
+        .map_err(|source| {
+            db_error("decode_atomic_terminal_event_idempotency", run_id, source).to_string()
+        })?;
+    let event_hash = row.try_get::<String, _>("event_hash").map_err(|source| {
+        db_error("decode_atomic_terminal_event_hash", run_id, source).to_string()
+    })?;
+    let settlement_batch_id = row
+        .try_get::<Option<String>, _>("request_id")
+        .map_err(|source| {
+            db_error("decode_atomic_terminal_settlement_batch", run_id, source).to_string()
+        })?;
+    let payload_json = row.try_get::<String, _>("payload_json").map_err(|source| {
+        db_error("decode_atomic_terminal_event_payload", run_id, source).to_string()
+    })?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        format!("decode atomic terminal event payload for run {run_id}: {error}")
+    })?;
+    Ok((
+        AtomicRunTerminalEventReceipt {
+            event_idx,
+            event_type,
+            event_id,
+            idempotency_key,
+            event_hash,
+            settlement_batch_id,
+        },
+        payload,
+    ))
+}
+
 fn atomic_terminal_event_hash_is_valid(
     receipt: &AtomicRunTerminalEventReceipt,
     payload: &serde_json::Value,
@@ -4521,10 +4566,10 @@ fn atomic_terminal_settlement_batch_id(
     committed_events: &[serde_json::Value],
 ) -> Result<String, String> {
     let identity = serde_json::json!({
-        "contract": "astra.atomic_run_terminal_settlement.v1",
+        "contract": "astra.atomic_run_terminal_settlement.v2",
         "user_id": request.user_id,
         "run_id": request.run_id,
-        "expected_statuses": request.expected_statuses,
+        "session_id": request.expected_session_id,
         "owner_generation": request.expected_owner_generation,
         "status": request.status,
         "waiting_for": request.waiting_for,
@@ -4533,7 +4578,6 @@ fn atomic_terminal_settlement_batch_id(
         "completion_tokens": request.completion_tokens,
         "tool_calls": request.tool_calls,
         "first_event_idx": first_event_idx,
-        "request_event_count": request.events.len(),
         "committed_events": committed_events,
     });
     serde_json::to_vec(&identity)
@@ -4563,6 +4607,8 @@ fn validate_atomic_terminal_batch_identity(
     if rows.iter().enumerate().all(|(offset, (receipt, payload))| {
         receipt.event_idx == first_event_idx + offset as i64
             && receipt.settlement_batch_id.as_deref() == Some(expected_batch_id.as_str())
+            && receipt.event_type == extract_event_type(payload)
+            && receipt.idempotency_key == extract_optional_string(payload, "idempotency_key")
             && atomic_terminal_event_hash_is_valid(receipt, payload)
     }) {
         Ok(())
@@ -4623,6 +4669,9 @@ fn classify_atomic_run_terminal_facts(
     run: &DurableRunRecord,
     request: AtomicRunTerminalSettlementRequest<'_>,
 ) -> AtomicRunTerminalFactMatch {
+    if run.user_id != request.user_id || run.session_id != request.expected_session_id {
+        return AtomicRunTerminalFactMatch::Conflict("run owner or session mismatch");
+    }
     if run.run_generation != request.expected_owner_generation {
         return AtomicRunTerminalFactMatch::Conflict("run generation mismatch");
     }
@@ -4644,6 +4693,80 @@ fn classify_atomic_run_terminal_facts(
         return AtomicRunTerminalFactMatch::Conflict("terminal error code mismatch");
     }
     AtomicRunTerminalFactMatch::Exact
+}
+
+/// Validate restart-readable facts without inventing the original CAS preconditions.
+fn committed_atomic_terminal_from_rows(
+    run: &DurableRunRecord,
+    rows: &[AtomicTerminalEventRow],
+) -> Result<AtomicRunTerminalSettlementCommit, String> {
+    let Some((last, accounting)) = rows.last() else {
+        return Err("empty atomic terminal batch is not settlement evidence".into());
+    };
+    let accounting_key = format!("run-accounting-finalized:{}", run.run_generation);
+    if last.event_type != "run_accounting_finalized"
+        || last.idempotency_key.as_deref() != Some(accounting_key.as_str())
+        || last.event_idx > run.last_event_idx
+        || rows[0].0.event_idx < 0
+    {
+        return Err("atomic terminal batch must end with exact-generation accounting".into());
+    }
+    if !matches!(
+        run.status.as_str(),
+        STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+    ) {
+        return Err("atomic settlement run is not terminal".into());
+    }
+    let usage = accounting
+        .get("data")
+        .ok_or("accounting payload has no data")?;
+    let count = |name: &str| {
+        usage
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("accounting {name} is missing or invalid"))
+    };
+    // These are recorded totals, not proof of usage coverage across all requests.
+    let cache_creation_tokens = count("cache_creation_tokens")?;
+    let prompt_tokens = count("prompt_tokens")?
+        .checked_add(count("cache_read_tokens")?)
+        .and_then(|total| total.checked_add(cache_creation_tokens))
+        .ok_or("accounting input token total is invalid or overflows")?;
+    if prompt_tokens != run.total_prompt_tokens
+        || count("completion_tokens")? != run.total_completion_tokens
+        || count("tool_call_count")? != u64::from(run.total_tool_calls)
+        || usage.get("usage_scope").and_then(serde_json::Value::as_str) != Some("run_total")
+    {
+        return Err("atomic accounting totals do not match the terminal run".into());
+    }
+    let committed_events = rows
+        .iter()
+        .map(|(_, payload)| payload.clone())
+        .collect::<Vec<_>>();
+    let request = AtomicRunTerminalSettlementRequest {
+        user_id: &run.user_id,
+        expected_session_id: &run.session_id,
+        run_id: &run.run_id,
+        expected_owner_generation: run.run_generation,
+        expected_statuses: &[],
+        status: &run.status,
+        waiting_for: run.waiting_for.as_deref(),
+        error_message: run.error_message.as_deref(),
+        prompt_tokens: run.total_prompt_tokens,
+        completion_tokens: run.total_completion_tokens,
+        tool_calls: run.total_tool_calls,
+        events: &committed_events,
+    };
+    if classify_atomic_run_terminal_facts(run, request) != AtomicRunTerminalFactMatch::Exact {
+        return Err("atomic terminal error identity does not match the run".into());
+    }
+    validate_atomic_terminal_batch_identity(request, rows)?;
+    Ok(AtomicRunTerminalSettlementCommit {
+        last_event_idx: last.event_idx,
+        latest_event_type: Some(last.event_type.clone()),
+        event_receipts: rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
+        committed_events,
+    })
 }
 
 pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
@@ -11257,13 +11380,92 @@ impl DatabaseRunStateStore {
         }))
     }
 
+    /// Read a completed atomic batch in one database snapshot. A plain terminal
+    /// row or non-atomic accounting event is not proof of atomic settlement.
+    pub async fn load_committed_atomic_terminal_settlement(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(run) = row
+            .map(run_record_from_row)
+            .transpose()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if run.run_generation != generation
+            || !matches!(
+                run.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            )
+        {
+            return Ok(None);
+        }
+        let anchor = sqlx::query(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND idempotency_key = ?",
+        )
+        .bind(user_id).bind(session_id).bind(run_id)
+        .bind(format!("run-accounting-finalized:{generation}"))
+        .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
+        let Some(anchor) = anchor
+            .map(|row| decode_atomic_terminal_event_row(row, run_id))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        if anchor.0.event_type != "run_accounting_finalized" {
+            return Err("settlement accounting anchor has the wrong event type".into());
+        }
+        let Some(batch_id) = anchor.0.settlement_batch_id.as_deref() else {
+            return Ok(None);
+        };
+        let rows = sqlx::query(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND request_id = ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id).bind(session_id).bind(run_id).bind(batch_id)
+        .fetch_all(&mut *tx).await.map_err(|error| error.to_string())?
+        .into_iter().map(|row| decode_atomic_terminal_event_row(row, run_id))
+        .collect::<Result<Vec<_>, _>>()?;
+        if rows.last() != Some(&anchor) {
+            return Err("settlement accounting anchor is not the batch tail".into());
+        }
+        let commit = committed_atomic_terminal_from_rows(&run, &rows)?;
+        tx.commit().await.map_err(|error| error.to_string())?;
+        Ok(Some(commit))
+    }
+
     /// Resolve an uncertain atomic terminal settlement from committed facts.
     ///
     /// This method never mutates state and never treats a merely-terminal run
     /// as success. The exact owner generation, terminal state, semantic usage,
     /// and event identities/hashes must agree. `expected_receipts` is supplied
     /// after a lost commit acknowledgement; without it, exact replay is
-    /// recognized from the caller's event payload hashes at the durable tail.
+    /// recognized from the caller's event payload hashes within its committed batch.
     pub async fn resolve_atomic_terminal_settlement(
         &self,
         request: AtomicRunTerminalSettlementRequest<'_>,
@@ -11289,49 +11491,64 @@ impl DatabaseRunStateStore {
             }
             AtomicRunTerminalFactMatch::Exact => {}
         }
-        let (receipts, committed_events) = if let Some(expected) = expected_receipts {
-            if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
-                && !expected.is_empty()
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event watermark mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            let rows = self
-                .load_atomic_terminal_event_rows(
-                    request.user_id,
-                    request.run_id,
-                    expected.first().map(|receipt| receipt.event_idx),
-                    expected.len(),
-                )
-                .await?;
-            if rows.len() != expected.len()
-                || !rows.iter().zip(expected).all(|(row, expected)| {
-                    &row.0 == expected && atomic_terminal_event_hash_is_valid(&row.0, &row.1)
-                })
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event receipt mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            if let Err(reason) = validate_atomic_terminal_batch_identity(request, &rows) {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "{reason} for run {}",
-                    request.run_id
-                )));
-            }
-            (
-                rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
-                rows.into_iter().map(|(_, payload)| payload).collect(),
+        let batch_end_idx = if let Some(receipt) = expected_receipts.and_then(|rows| rows.last()) {
+            receipt.event_idx
+        } else if let Some(last_event) = request.events.last() {
+            let event_hash = sha256_hex(
+                serde_json::to_string(last_event)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            );
+            let Some(index) = sqlx::query_scalar::<_, i64>(
+                "SELECT event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_hash = ? AND event_type = ? AND request_id IS NOT NULL
+                   AND event_idx <= ? ORDER BY event_idx DESC LIMIT 1",
             )
-        } else if request.events.is_empty() {
-            let last_row = if run.last_event_idx >= 0 {
+            .bind(request.user_id)
+            .bind(request.expected_session_id)
+            .bind(request.run_id)
+            .bind(event_hash)
+            .bind(extract_event_type(last_event))
+            .bind(run.last_event_idx)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|error| error.to_string())?
+            else {
+                return Ok(AtomicRunTerminalSettlementResolution::Conflict(
+                    "terminal replay batch not found".into(),
+                ));
+            };
+            index
+        } else {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT MAX(event_idx) FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND request_id IS NOT NULL AND event_idx <= ?",
+            )
+            .bind(request.user_id)
+            .bind(request.expected_session_id)
+            .bind(request.run_id)
+            .bind(run.last_event_idx)
+            .fetch_one(self.pool.get())
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or(run.last_event_idx)
+        };
+        if batch_end_idx > run.last_event_idx {
+            return Ok(AtomicRunTerminalSettlementResolution::Conflict(
+                "terminal batch exceeds the run watermark".into(),
+            ));
+        }
+        let (receipts, committed_events): (
+            Vec<AtomicRunTerminalEventReceipt>,
+            Vec<serde_json::Value>,
+        ) = if request.events.is_empty() {
+            let last_row = if batch_end_idx >= 0 {
                 self.load_atomic_terminal_event_rows(
                     request.user_id,
                     request.run_id,
-                    Some(run.last_event_idx),
+                    Some(batch_end_idx),
                     1,
                 )
                 .await?
@@ -11346,7 +11563,7 @@ impl DatabaseRunStateStore {
                     .load_and_validate_atomic_terminal_return_prefix(
                         request.user_id,
                         request.run_id,
-                        run.last_event_idx + 1,
+                        batch_end_idx + 1,
                         batch_id,
                     )
                     .await?
@@ -11374,7 +11591,7 @@ impl DatabaseRunStateStore {
                     .load_atomic_terminal_intent_history_through(
                         request.user_id,
                         request.run_id,
-                        run.last_event_idx,
+                        batch_end_idx,
                     )
                     .await?;
                 if !terminal_user_intent_return_events(&durable_intent_history, true).is_empty() {
@@ -11405,8 +11622,7 @@ impl DatabaseRunStateStore {
                     ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let start_idx = run
-                .last_event_idx
+            let start_idx = batch_end_idx
                 .checked_sub(i64::try_from(expected_rows.len()).unwrap_or(i64::MAX) - 1)
                 .ok_or_else(|| {
                     format!("terminal event index underflow for run {}", request.run_id)
@@ -11491,12 +11707,19 @@ impl DatabaseRunStateStore {
             )
         };
 
+        if expected_receipts.is_some_and(|expected| receipts.as_slice() != expected) {
+            return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
+                "terminal event receipt mismatch for run {}",
+                request.run_id
+            )));
+        }
+
         Ok(AtomicRunTerminalSettlementResolution::Exact(
             AtomicRunTerminalSettlementCommit {
                 latest_event_type: receipts.last().map(|receipt| receipt.event_type.clone()),
                 committed_events,
                 event_receipts: receipts,
-                last_event_idx: run.last_event_idx,
+                last_event_idx: batch_end_idx,
             },
         ))
     }
@@ -11623,49 +11846,7 @@ impl DatabaseRunStateStore {
             db_error("resolve_atomic_terminal_settlement_events", run_id, source).to_string()
         })?;
         rows.into_iter()
-            .map(|row| {
-                let event_idx = row.try_get::<i64, _>("event_idx").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_idx", run_id, source).to_string()
-                })?;
-                let event_type = row.try_get::<String, _>("event_type").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_type", run_id, source).to_string()
-                })?;
-                let event_id = row.try_get::<String, _>("event_id").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_id", run_id, source).to_string()
-                })?;
-                let idempotency_key = row
-                    .try_get::<Option<String>, _>("idempotency_key")
-                    .map_err(|source| {
-                        db_error("decode_atomic_terminal_event_idempotency", run_id, source)
-                            .to_string()
-                    })?;
-                let event_hash = row.try_get::<String, _>("event_hash").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_hash", run_id, source).to_string()
-                })?;
-                let settlement_batch_id =
-                    row.try_get::<Option<String>, _>("request_id")
-                        .map_err(|source| {
-                            db_error("decode_atomic_terminal_settlement_batch", run_id, source)
-                                .to_string()
-                        })?;
-                let payload_json = row.try_get::<String, _>("payload_json").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_payload", run_id, source).to_string()
-                })?;
-                let payload = serde_json::from_str(&payload_json).map_err(|error| {
-                    format!("decode atomic terminal event payload for run {run_id}: {error}")
-                })?;
-                Ok((
-                    AtomicRunTerminalEventReceipt {
-                        event_idx,
-                        event_type,
-                        event_id,
-                        idempotency_key,
-                        event_hash,
-                        settlement_batch_id,
-                    },
-                    payload,
-                ))
-            })
+            .map(|row| decode_atomic_terminal_event_row(row, run_id))
             .collect()
     }
 
@@ -26556,6 +26737,103 @@ mod tests {
     }
 
     #[test]
+    fn atomic_terminal_restart_proof_binds_durable_facts_and_accounting() {
+        let events = [
+            json!({"event_type": "run_finished", "data": {"status": STATUS_COMPLETED}}),
+            json!({"event_type": "run_accounting_finalized",
+                "idempotency_key": "run-accounting-finalized:3",
+                "data": {"usage_scope": "run_total", "usage_available": false, "prompt_tokens": 7,
+                    "cache_read_tokens": 4, "cache_creation_tokens": 2,
+                    "completion_tokens": 5, "tool_call_count": 2}}),
+        ];
+        let request = AtomicRunTerminalSettlementRequest {
+            user_id: "u1",
+            run_id: "run-1",
+            expected_session_id: "s1",
+            expected_statuses: &[STATUS_RUNNING],
+            expected_owner_generation: 3,
+            status: STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &events,
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            tool_calls: 2,
+        };
+        let batch = atomic_terminal_settlement_batch_id(request, 10, &events).unwrap();
+        assert_eq!(
+            batch,
+            atomic_terminal_settlement_batch_id(
+                AtomicRunTerminalSettlementRequest {
+                    expected_statuses: &[],
+                    events: &events[1..],
+                    ..request
+                },
+                10,
+                &events
+            )
+            .unwrap(),
+            "CAS preconditions and input partition are not committed facts"
+        );
+        assert_ne!(
+            batch,
+            atomic_terminal_settlement_batch_id(
+                AtomicRunTerminalSettlementRequest {
+                    expected_session_id: "other",
+                    ..request
+                },
+                10,
+                &events
+            )
+            .unwrap()
+        );
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(i, event)| atomic_terminal_test_row(10 + i as i64, event.clone(), &batch))
+            .collect::<Vec<_>>();
+        let mut run = durable_run_record("run-1");
+        run.status = STATUS_COMPLETED.into();
+        run.run_generation = 3;
+        run.last_event_idx = 20; // Later observations do not move the settlement cut.
+        run.total_prompt_tokens = 13;
+        run.total_completion_tokens = 5;
+        run.total_tool_calls = 2;
+        let commit = committed_atomic_terminal_from_rows(&run, &rows).unwrap();
+        assert_eq!(commit.last_event_idx, 11);
+        assert_eq!(commit.committed_events, events);
+        assert!(committed_atomic_terminal_from_rows(&run, &[]).is_err());
+        assert!(committed_atomic_terminal_from_rows(&run, &rows[..1]).is_err());
+        for field in ["generation", "session", "usage", "error_code"] {
+            let mut wrong = run.clone();
+            match field {
+                "generation" => wrong.run_generation += 1,
+                "session" => wrong.session_id = "other".into(),
+                "usage" => wrong.total_prompt_tokens = 7,
+                _ => wrong.error_code = Some("unexpected".into()),
+            }
+            assert!(
+                committed_atomic_terminal_from_rows(&wrong, &rows).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["hash", "gap", "type", "batch", "accounting"] {
+            let mut wrong = rows.clone();
+            match field {
+                "hash" => wrong[0].0.event_hash = "bad".into(),
+                "gap" => wrong[0].0.event_idx -= 1,
+                "type" => wrong[1].0.event_type = "other".into(),
+                "batch" => wrong[1].0.settlement_batch_id = None,
+                _ => wrong[1].1["data"]["cache_creation_tokens"] = json!(0),
+            }
+            assert!(
+                committed_atomic_terminal_from_rows(&run, &wrong).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
     fn atomic_terminal_replay_restores_return_prefix_before_terminal_tail() {
         let terminal_events = [json!({
             "event_type": "run_finished",
@@ -31987,34 +32265,48 @@ mod tests {
         let closure_event_idx = pre_terminal.last_event_idx + 1;
         let terminal_event_idx = closure_event_idx + 1;
 
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "idempotency_key": format!("atomic-terminal-finished:{run_id}"),
-            "data": {"status": STATUS_COMPLETED},
-        })];
+        let terminal_events = [
+            json!({
+                "event_type": "run_finished",
+                "idempotency_key": format!("atomic-terminal-finished:{run_id}"),
+                "data": {"status": STATUS_COMPLETED},
+            }),
+            json!({
+                "event_type": "run_accounting_finalized",
+                "idempotency_key": "run-accounting-finalized:0",
+                "data": {"usage_scope": "run_total", "prompt_tokens": 7,
+                    "cache_read_tokens": 4, "cache_creation_tokens": 2,
+                    "completion_tokens": 5, "tool_call_count": 2},
+            }),
+        ];
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let request = AtomicRunTerminalSettlementRequest {
+            user_id: &user_id,
+            run_id: &run_id,
+            expected_session_id: &session_id,
+            expected_statuses: &[STATUS_RUNNING],
+            expected_owner_generation: 0,
+            status: STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &terminal_events,
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            tool_calls: 2,
+        };
         let mut tx = pool
             .get()
             .begin()
             .await
             .expect("begin direct terminal settlement transaction");
         let commit = store
-            .settle_terminal_in_existing_transaction(
-                &mut tx,
-                AtomicRunTerminalSettlementRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_statuses: &[STATUS_RUNNING],
-                    expected_owner_generation: 0,
-                    status: STATUS_COMPLETED,
-                    waiting_for: None,
-                    error_message: None,
-                    events: &terminal_events,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            )
+            .settle_terminal_in_existing_transaction(&mut tx, request)
             .await
             .expect("settle terminal in existing transaction")
             .expect("exact terminal authority");
@@ -32022,9 +32314,9 @@ mod tests {
             .await
             .expect("commit direct terminal settlement transaction");
 
-        assert_eq!(commit.event_receipts.len(), 1);
+        assert_eq!(commit.event_receipts.len(), 2);
         assert_eq!(commit.event_receipts[0].event_idx, terminal_event_idx);
-        assert_eq!(commit.last_event_idx, terminal_event_idx);
+        assert_eq!(commit.last_event_idx, terminal_event_idx + 1);
         let rows = sqlx::query(
             "SELECT event_idx, event_type FROM agent_run_events
              WHERE user_id = ? AND session_id = ? AND run_id = ?
@@ -32056,16 +32348,20 @@ mod tests {
             "the durable event stream must remain contiguous and unique"
         );
         assert_eq!(
-            &facts[facts.len() - 2..],
+            &facts[facts.len() - 3..],
             &[
                 (closure_event_idx, "approval_resolved".to_string()),
                 (terminal_event_idx, "run_finished".to_string()),
+                (
+                    terminal_event_idx + 1,
+                    "run_accounting_finalized".to_string()
+                ),
             ],
             "the same transaction must append closure immediately before terminal truth"
         );
         let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_COMPLETED);
-        assert_eq!(durable.last_event_idx, terminal_event_idx);
+        assert_eq!(durable.last_event_idx, terminal_event_idx + 1);
         let closure = durable
             .events
             .iter()
@@ -32076,6 +32372,154 @@ mod tests {
                 .pointer("/data/_durable_resolution/actual_status")
                 .and_then(serde_json::Value::as_str),
             Some(STATUS_COMPLETED)
+        );
+
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &run_id,
+                &[json!({"event_type": "run_settlement_finished", "data": {}})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap(),
+            Some(commit.clone())
+        );
+        for receipts in [None, Some(commit.event_receipts.as_slice())] {
+            assert_eq!(
+                store
+                    .resolve_atomic_terminal_settlement(request, receipts)
+                    .await
+                    .unwrap(),
+                AtomicRunTerminalSettlementResolution::Exact(commit.clone())
+            );
+        }
+        assert!(
+            matches!(
+                store
+                    .resolve_atomic_terminal_settlement(
+                        AtomicRunTerminalSettlementRequest {
+                            events: &terminal_events[1..],
+                            ..request
+                        },
+                        Some(&commit.event_receipts),
+                    )
+                    .await
+                    .unwrap(),
+                AtomicRunTerminalSettlementResolution::Conflict(_)
+            ),
+            "a receipt cannot turn a terminal event into a permitted return prefix"
+        );
+        for (owner, session, generation) in [
+            ("other", session_id.as_str(), 0),
+            (user_id.as_str(), "other", 0),
+            (user_id.as_str(), session_id.as_str(), 1),
+        ] {
+            assert!(
+                store
+                    .load_committed_atomic_terminal_settlement(owner, session, &run_id, generation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let accounting_receipt = commit.event_receipts.last().unwrap();
+        for (column, original) in [
+            ("event_type", accounting_receipt.event_type.as_str()),
+            ("event_hash", accounting_receipt.event_hash.as_str()),
+        ] {
+            let sql = format!(
+                "UPDATE agent_run_events SET {column} = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?"
+            );
+            sqlx::query(&sql)
+                .bind("corrupted")
+                .bind(&user_id)
+                .bind(&run_id)
+                .bind(accounting_receipt.event_idx)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                    .await
+                    .is_err(),
+                "{column}"
+            );
+            sqlx::query(&sql)
+                .bind(original)
+                .bind(&user_id)
+                .bind(&run_id)
+                .bind(accounting_receipt.event_idx)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE agent_runs SET total_prompt_tokens = 7 WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .is_err(),
+            "raw prompt alone does not match the row total"
+        );
+        sqlx::query(
+            "UPDATE agent_runs SET total_prompt_tokens = 13 WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_run_events SET request_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(accounting_receipt.settlement_batch_id.as_deref()).bind(&user_id).bind(&run_id)
+            .bind(commit.last_event_idx + 1).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .is_err(),
+            "accounting must be the last event in its batch"
+        );
+        sqlx::query("UPDATE agent_run_events SET request_id = NULL WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user_id).bind(&run_id).bind(commit.last_event_idx + 1)
+            .execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_run_events SET idempotency_key = NULL WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user_id).bind(&run_id).bind(accounting_receipt.event_idx)
+            .execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal status without an accounting anchor is not proof"
+        );
+        sqlx::query("UPDATE agent_run_events SET idempotency_key = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind("run-accounting-finalized:0").bind(&user_id).bind(&run_id)
+            .bind(accounting_receipt.event_idx).execute(pool.get()).await.unwrap();
+        // Removing the batch identity models ordinary, non-atomic accounting.
+        sqlx::query("UPDATE agent_run_events SET request_id = NULL WHERE user_id = ? AND run_id = ? AND idempotency_key = ?")
+            .bind(&user_id).bind(&run_id).bind("run-accounting-finalized:0")
+            .execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;

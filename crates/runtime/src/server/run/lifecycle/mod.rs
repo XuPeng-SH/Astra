@@ -14642,8 +14642,8 @@ impl AgenticRunLifecycleService {
     }
 
     /// Rebuild a missing Eval observation from bounded durable admission and
-    /// settlement markers, then hydrate the canonical Run only after the
-    /// exact generation has closed its settlement fence. This is intentionally
+    /// settlement facts, verifying an atomic terminal batch when the later
+    /// drain marker is absent. This is intentionally
     /// a projection retry, not a second executor: owner/session/generation/
     /// terminal checks remain in `DatabaseEvaluationObservationStore`.
     pub(crate) async fn reconcile_evaluation_observation_for_run(
@@ -14703,15 +14703,34 @@ impl AgenticRunLifecycleService {
         if evaluation_trial_status(status).is_none() {
             return;
         }
-        // Terminal status is not enough: a status poll may race the executor
-        // between its terminal CAS and the accounting/settlement fence. Do
-        // not create an immutable `Missing` observation in that window. A
-        // crash-recovery terminal event is the explicit owner transition for
-        // the pre-spawn window; it has no normal settlement marker, but the
-        // trial still needs a bound failed/cancelled observation instead of
-        // remaining permanently planned.
+        // A terminal status alone is not evidence readiness. Normal atomic
+        // settlement commits accounting with the output and terminal facts,
+        // so a restart can verify that batch even if the later drain marker
+        // was never written. Control cancellation retains its drain fence.
         if !marker.settlement_finished && !crash_recovered {
-            return;
+            match astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                .load_committed_atomic_terminal_settlement(
+                    user_id,
+                    session_id,
+                    run_id,
+                    run_generation,
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        owner_user_id = user_id,
+                        run_id,
+                        run_generation,
+                        error = %error,
+                        "evaluation recovery could not verify atomic terminal evidence"
+                    );
+                    return;
+                }
+            }
         }
         let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
         if let Err(error) = plan_store
@@ -16739,6 +16758,8 @@ impl AgenticRunLifecycleService {
                 let terminal_accounting_committed =
                     if control_terminal_settlement_committed.is_some() {
                         control_terminal_settlement_committed
+                    } else if atomic_terminal_committed {
+                        Some(true)
                     } else if durable_status_committed {
                         Some(
                             Self::persist_finalized_accounting_after_terminal(
@@ -20621,6 +20642,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let terminal_accounting_committed =
                     if control_terminal_settlement_committed.is_some() {
                         control_terminal_settlement_committed
+                    } else if atomic_terminal_committed {
+                        Some(true)
                     } else if durable_status_committed {
                         Some(
                             Self::persist_finalized_accounting_after_terminal(

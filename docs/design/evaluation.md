@@ -243,14 +243,24 @@ owner-scoped pinned revision. Neither trial kind falls back to the mutable
 production catalog. Canonical trace, transcript, accounting, and output
 receipts remain part of the normal Run settlement.
 
+Normal canonical terminal settlement also commits finalized accounting in
+that same transaction. Its v2 batch fingerprint binds owner, Session, Run,
+generation, terminal state, usage totals, and the complete ordered event batch;
+write-time CAS preconditions are not part of the committed fact identity.
+After a restart, the Run store verifies the complete batch anchored by its
+finalized-accounting event. Later appended events do not change that proof.
+Evaluation can then rebuild a missing observation without a
+`run_settlement_finished` marker or another provider invocation. This does not
+claim that all post-loop cleanup finished, nor that usage collection is complete.
+Control cancellation still requires its own drain/settlement fence.
+
 The clean-session check is scoped to the derived Run identity: the first
 request must see no prior session state, while a concurrent retry may observe
 that same Run's in-flight rows. A different Run or pre-existing session state
 still makes the trial unavailable. Recovery can read trusted admission intent
-from the canonical `run_started` event, but generation takeover and a crash
-between terminal commit and the settlement marker are not yet fully reconciled
-with Evaluation observations. These windows can leave a trial unavailable or
-awaiting observation; recovery must be completed against canonical Run lineage
+from the canonical `run_started` event, but generation takeover is not yet fully
+reconciled with Evaluation observations. This window can leave a trial unavailable
+or awaiting observation; recovery must be completed against canonical Run lineage
 without authorizing stale-generation writes or creating a replacement Run.
 
 The API accepts client intent only. It never accepts client-supplied
