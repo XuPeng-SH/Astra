@@ -122,8 +122,10 @@ typed-only protocol is not selectable there. Typed-judgment catalogs retain
 TypeSafe and ordinary LLMs that implement the canonical discrete judgment
 contract. Registry inspection (`all`) preserves existing visibility rules,
 including inactive administrator entries; it does not grant inference authority.
-Administrative CLI lists/setup request `all`; CLI session judgment and judgment
-comparison request `typed_judgment`. Ordinary Web/CLI selection uses `chat`.
+Administrative CLI registry lists request `all`; CLI session judgment and judgment
+comparison request `typed_judgment`. Guided setup bootstraps chat and requests
+`chat`, like ordinary Web/CLI selection: a judgment-only registry must not count
+as an existing chat-ready model configuration.
 Continuation cursors are scoped to the requested purpose: clients must retain
 the same purpose throughout a drain, as well as checking revision and total.
 
