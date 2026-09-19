@@ -272,7 +272,6 @@ async fn unconfigured_evaluation_routes_return_errors() {
     let get_uris = [
         "/evaluation/quality/trend",
         "/evaluation/drift",
-        "/evaluation/gates",
         "/evaluation/calibration",
         "/evaluation/sessions/scores",
         "/evaluation/trust-report?agent_id=agent-1",
@@ -292,20 +291,11 @@ async fn unconfigured_evaluation_routes_return_errors() {
         );
     }
 
-    let post_cases: [(&str, body::Body, bool); 4] = [
-        (
-            "/evaluation/gate/validate",
-            body::Body::from(r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#),
-            true,
-        ),
-        ("/evaluation/drift/run", body::Body::empty(), false),
-        ("/evaluation/loop", body::Body::empty(), false),
-        (
-            "/evaluation/training-data/extract",
-            body::Body::from(r#"{}"#),
-            true,
-        ),
-    ];
+    let post_cases: [(&str, body::Body, bool); 1] = [(
+        "/evaluation/training-data/extract",
+        body::Body::from(r#"{}"#),
+        true,
+    )];
     let generic_create = oneshot_eval(
         app.clone(),
         "POST",
@@ -325,6 +315,20 @@ async fn unconfigured_evaluation_routes_return_errors() {
             StatusCode::INTERNAL_SERVER_ERROR,
             "POST {uri}"
         );
+    }
+}
+
+#[tokio::test]
+async fn obsolete_evaluation_authority_routes_are_absent() {
+    let app = build_unconfigured_app();
+    for (method, uri) in [
+        ("GET", "/evaluation/gates"),
+        ("POST", "/evaluation/gate/validate"),
+        ("POST", "/evaluation/loop"),
+        ("POST", "/evaluation/drift/run"),
+    ] {
+        let response = oneshot_eval(app.clone(), method, uri, body::Body::from("{}"), true).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
 }
 

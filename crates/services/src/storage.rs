@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v89";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v90";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -6555,27 +6555,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ─── Evaluation tables ───────────────────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "eval_gate_results",
-        "CREATE TABLE IF NOT EXISTS eval_gate_results (
-            gate_id         VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NULL,
-            change_type     VARCHAR(64) NOT NULL,
-            change_id       VARCHAR(64) NOT NULL,
-            sessions_tested INT NOT NULL DEFAULT 0,
-            error_rate      DECIMAL(5,4),
-            score_delta     DECIMAL(5,4),
-            passed          SMALLINT NOT NULL DEFAULT 0,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_egr_user_created (user_id, created_at),
-            INDEX idx_egr_change (change_type, change_id),
-            INDEX idx_egr_passed (passed)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(pool, "eval_quality_assessments",
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (

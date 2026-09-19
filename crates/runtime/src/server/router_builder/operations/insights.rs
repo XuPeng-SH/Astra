@@ -31,7 +31,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(evaluation::quality_trend_handler),
         )
         .route("/evaluation/drift", get(evaluation::drift_handler))
-        .route("/evaluation/gates", get(evaluation::gate_history_handler))
         .route(
             "/evaluation/calibration",
             get(evaluation::calibration_handler),
@@ -40,12 +39,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/evaluation/sessions/scores",
             get(evaluation::session_scores_handler),
         )
-        .route(
-            "/evaluation/gate/validate",
-            post(evaluation::gate_validate_handler),
-        )
-        .route("/evaluation/drift/run", post(evaluation::drift_run_handler))
-        .route("/evaluation/loop", post(evaluation::closed_loop_handler))
         .route(
             "/evaluation/trust-report",
             get(evaluation::trust_report_handler),

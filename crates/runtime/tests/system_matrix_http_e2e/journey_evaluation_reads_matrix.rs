@@ -36,7 +36,6 @@ pub async fn run_evaluation_read_http_smoke() {
     let agent_id = ag_j["agent_id"].as_str().expect("agent_id");
 
     let endpoints: &[&str] = &[
-        "/evaluation/gates?limit=10",
         "/evaluation/calibration?days=7",
         "/evaluation/sessions/scores?limit=10&min_score=0",
         "/evaluation/quality/trend?days=7",

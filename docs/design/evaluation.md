@@ -5,6 +5,13 @@
 
 Evaluation defines how Astra measures agent quality, safety, reliability, and regression risk across prompts, tools, providers, memory, and orchestration.
 
+Owner-level quality trends, drift, calibration, and session scores are read-only
+diagnostics. They do not authorize activation or establish a verdict for an
+arbitrary change. Evaluation has no legacy gate-validation, gate-history,
+closed-loop execution, or drift-run API; drift is read through its GET endpoint.
+The obsolete gate-results table is not part of the schema. Durable experiments,
+observations, and immutable task assessments retain their own evidence contracts.
+
 ## Goals
 
 - Make changes testable before activation.

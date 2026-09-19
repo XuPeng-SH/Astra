@@ -295,19 +295,6 @@ pub async fn drift_handler(
     Ok(Json(resp))
 }
 
-pub async fn gate_history_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<GateHistoryQuery>,
-) -> Result<Json<GateHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
-    let resp = state
-        .evaluation_service
-        .get_gate_history(&user_id, q.limit)
-        .await?;
-    Ok(Json(resp))
-}
-
 pub async fn calibration_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -330,44 +317,6 @@ pub async fn session_scores_handler(
     let resp = state
         .evaluation_service
         .get_session_scores(&user_id, q.limit, q.min_score)
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn gate_validate_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<GateValidateRequest>,
-) -> Result<Json<GateValidateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
-    let resp = state
-        .evaluation_service
-        .validate_gate(&user_id, request)
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn drift_run_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<DriftPipelineResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
-    let resp = state
-        .evaluation_service
-        .run_drift_pipeline(&user_id)
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn closed_loop_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<ClosedLoopQuery>,
-) -> Result<Json<ClosedLoopResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
-    let resp = state
-        .evaluation_service
-        .run_closed_loop(&user_id, q.days, q.dry_run)
         .await?;
     Ok(Json(resp))
 }

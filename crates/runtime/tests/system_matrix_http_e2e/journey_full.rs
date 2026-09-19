@@ -333,8 +333,6 @@ pub async fn run_product_matrix_full_journey(
     assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
     let xuid = &[("x-user-id", user_id.as_str())];
-    let (st_gates, gates_j) = get_json(app, "/evaluation/gates?limit=10", None, xuid).await;
-    assert_eq!(st_gates, StatusCode::OK, "evaluation gates: {gates_j}");
 
     let (st_cal, cal_j) = get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
     assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");

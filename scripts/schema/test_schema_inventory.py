@@ -778,7 +778,6 @@ fn char_literal() { let slash = '/'; }
             "ctx_decision_audits",
             "ctx_snapshots",
             "eval_calibration_assessments",
-            "eval_gate_results",
             "eval_quality_assessments",
             "eval_training_datasets",
             "eval_user_feedback",
@@ -842,10 +841,7 @@ fn char_literal() { let slash = '/'; }
             "capture model/routing decisions",
             self.tables["ctx_decision_audits"]["merge_guidance"],
         )
-        self.assertIn(
-            "change-level release decisions",
-            self.tables["eval_gate_results"]["merge_guidance"],
-        )
+        self.assertNotIn("eval_gate_results", self.tables)
         self.assertIn(
             "target-level assessment state",
             self.tables["eval_quality_assessments"]["merge_guidance"],
