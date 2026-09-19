@@ -1772,6 +1772,7 @@ mod tests {
             schema: crate::model_request_context::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
             stage: ModelRequestEventStage::Terminal,
             identity,
+            route: None,
             lineage: ModelRequestLineage::default(),
             budget: Default::default(),
             usage: Some(ModelRequestUsage {
