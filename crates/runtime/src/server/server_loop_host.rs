@@ -672,7 +672,8 @@ fn explicit_fanout_admission_decision(
 fn provider_batch_needs_work_admission(provider_tool_calls: &[Value]) -> bool {
     // `start_work` is a typed lifecycle payload, not user authorization for a
     // durable state transition. Auto settles semantic admission before its
-    // handler can persist the graph; FixedDefault is the explicit fallback.
+    // handler can persist the graph. With no usable sidecar result, the
+    // primary carrier still crosses the canonical runtime authorization gates.
     // Skill interception is an exclusive semantic-context boundary: every
     // companion call is deferred or surgically removed before execution.
     // Judge the next concrete batch after the trusted workflow ledger is
@@ -801,15 +802,14 @@ fn work_admission_boundary_requires_wait(
     provider_tool_calls: &[Value],
     completed_decision: bool,
     pending_judge: bool,
-    unavailable: bool,
+    runtime_conflict: bool,
 ) -> bool {
     provider_batch_needs_work_admission(provider_tool_calls)
         || !provider_tool_calls.is_empty()
         || completed_decision
-        // A classifier that could not start or did not return a typed result
-        // is itself a completion gate. Include it even for an empty provider
-        // batch so Auto cannot turn Unavailable into a successful text reply.
-        || unavailable
+        // An established runtime conflict also gates a text-only response.
+        // Auxiliary absence or failure is not such a conflict.
+        || runtime_conflict
         // Once the semantic preflight has actually started, a text-only
         // provider response is still an executable completion boundary. Do
         // not cancel the judge and report success before its typed lifecycle
@@ -1334,8 +1334,8 @@ fn auxiliary_llm_policy_label() -> &'static str {
 /// starts one bounded decision beside every eligible unbound primary Auto
 /// turn. `boundary_only` is the explicit lower-latency opt-out that waits for
 /// an effect/topology boundary. A provider `start_work` carrier is a typed
-/// payload, but under Auto it still crosses semantic admission before durable
-/// state is created; FixedDefault is the explicit no-classifier opt-out.
+/// payload; any available decision is settled before canonical admission.
+/// With no configured judge or no usable result, normal typed admission remains.
 fn should_skip_work_admission_judge(
     admission_boundary: bool,
     _topology_boundary: bool,
@@ -2337,21 +2337,6 @@ impl WorkAdmissionUnavailableReason {
             Self::DatabaseError => astra_core::ErrorKind::DatabaseError,
             Self::ContractViolation => astra_core::ErrorKind::ContractViolation,
         }
-    }
-
-    fn retryable(self) -> bool {
-        !matches!(
-            self,
-            Self::Disabled
-                | Self::NoJudgmentOffering
-                | Self::AdmissionMaterialUnavailable
-                | Self::ProviderRejected
-                | Self::UnsupportedCombination
-                | Self::Uncertain
-                | Self::Conflicting
-                | Self::Auth
-                | Self::InferenceFailure(astra_core::ErrorKind::PaymentRequired)
-        )
     }
 
     fn from_inference_error(error: &astra_core::ClassifiedError) -> Self {
@@ -3749,12 +3734,10 @@ pub struct ServerAgenticLoopHost {
     pending_classification_observations: Vec<astra_turn_types::SemanticJudgmentObservationV1>,
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
-    /// Auto fails closed at both action and completion boundaries; callers
-    /// that deliberately omit classification use `FixedDefault`.
+    /// Absence or failure leaves primary typed proposals on normal admission.
     work_admission_attempted: bool,
     /// The sole admission attempt ended without a typed decision. This fact is
-    /// retained after phase telemetry is flushed so an already-returned
-    /// provider action cannot silently execute through the observability path.
+    /// retained for diagnostics, not promoted into a runtime prohibition.
     work_admission_unavailable: bool,
     /// Low-cardinality cause for the unavailable state. Kept separately from
     /// provider text so error details remain bounded and actionable.
@@ -6459,7 +6442,7 @@ fn direct_parallel_agent_rejection(
     } else {
         (
             "parallel_topology_admission_unavailable",
-            "Parallel execution authority is unavailable. Continue in the current agent; switching between direct child calls and fanout cannot authorize parallel work.",
+            "Concurrent direct child calls are not an authorized parallel carrier. Continue in the current agent or propose one fixed agent_fanout.start group when the runtime surface offers it; runtime admission still applies.",
         )
     }
 }
@@ -6741,9 +6724,7 @@ impl ServerAgenticLoopHost {
     fn current_deferred_tool_contract_schemas(&self, state: &AgenticLoopState) -> Vec<Value> {
         let mut restricted = state.restricted_tools.clone();
         restricted.extend(self.runtime_allowlist_restrictions(state));
-        let fanout_start_admitted = self.work_admission_topology_authoritative
-            && self.work_admission_execution_topology
-                == astra_services::WorkExecutionTopology::ParallelSubruns;
+        let fanout_start_admitted = self.fanout_start_proposal_available(state);
         let deferred_candidates = self
             .deferred_tool_schemas
             .iter()
@@ -7755,89 +7736,50 @@ impl ServerAgenticLoopHost {
         })
     }
 
-    /// Whether an unavailable semantic admission must hold back the primary
-    /// response until an authoritative outcome is settled. Missing the
-    /// optional judgment Offering is an explicit no-classifier policy: the
-    /// primary model remains authoritative and ordinary streaming must stay on
-    /// its normal fast path.
+    /// Only an established runtime conflict can hold a response after the
+    /// optional judge has finished. Missing or unreliable auxiliary output
+    /// cannot create a new execution or completion obligation.
     fn work_admission_requires_settlement(&self) -> bool {
-        self.work_admission_unavailable
-            && self.work_admission_unavailable_reason
-                != Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
+        self.work_admission_conflict.is_some()
+    }
+
+    /// Offer a typed fanout proposal without manufacturing a semantic decision.
+    /// This is shared by execution visibility and lifecycle admission; schema,
+    /// permissions, effects, provider readiness and capacity keep their owners.
+    fn fanout_start_proposal_available(&self, state: &AgenticLoopState) -> bool {
+        if self.work_admission_conflict.is_some()
+            || crate::turn::agentic::turn_intent::trusted_loaded_workflow_execution_topology(
+                &state.skills.execution.invoked,
+            ) == Some(astra_services::WorkExecutionTopology::Primary)
+        {
+            return false;
+        }
+        let parallel = self.work_admission_topology_authoritative
+            && self.work_admission_execution_topology
+                == astra_services::WorkExecutionTopology::ParallelSubruns;
+        if self.work_admission_topology_authoritative
+            || matches!(
+                self.work_execution_authority(state),
+                WorkExecutionAuthority::PrimaryAttempt | WorkExecutionAuthority::DelegatedAttempt
+            )
+        {
+            return parallel;
+        }
+        // Unknown auxiliary topology is not a Primary prohibition. The main
+        // model may propose the fixed carrier on the ordinary baseline, but
+        // cannot bypass an existing Work obligation or establishment latch.
+        !self.work_lifecycle_is_required(state) && self.pending_work_establishment.is_none()
     }
 
     fn work_admission_diagnostic(&self) -> Value {
         json!({
             "reason": self.work_admission_unavailable_reason.map(WorkAdmissionUnavailableReason::as_str),
+            "error_kind": self.work_admission_unavailable_reason.map(WorkAdmissionUnavailableReason::error_kind),
             "classification": self.work_admission_semantic_diagnostic,
             "recovery_attempted": self.work_admission_recovery_used.load(std::sync::atomic::Ordering::Acquire),
             "recovery_exhausted": self.work_admission_unavailable
                 && self.work_admission_recovery_used.load(std::sync::atomic::Ordering::Acquire),
         })
-    }
-
-    fn work_admission_unavailable_error(&self) -> Option<astra_core::ClassifiedError> {
-        self.work_admission_unavailable.then(|| {
-            let reason = self
-                .work_admission_unavailable_reason
-                .unwrap_or(WorkAdmissionUnavailableReason::ContractViolation);
-            let disabled = reason == WorkAdmissionUnavailableReason::Disabled;
-            let no_classifier = matches!(
-                reason,
-                WorkAdmissionUnavailableReason::Disabled
-                    | WorkAdmissionUnavailableReason::NoJudgmentOffering
-            );
-            astra_core::ClassifiedError::new(
-                reason.error_kind(),
-                if disabled {
-                    "Work admission is disabled for this Auto turn; no requested action was executed. Use the explicit FixedDefault execution policy to omit semantic classification"
-                } else if reason == WorkAdmissionUnavailableReason::NoJudgmentOffering {
-                    "No judgment Offering is configured; the primary typed Work carrier remains available without an auxiliary classifier"
-                } else if matches!(reason, WorkAdmissionUnavailableReason::Malformed) {
-                    "Work admission returned an invalid typed decision; no requested action was executed"
-                } else if reason == WorkAdmissionUnavailableReason::Uncertain {
-                    "Request classification remains uncertain; dependent actions were not authorized. Inspect admission_diagnostic and clarify the request in a new turn"
-                } else if reason == WorkAdmissionUnavailableReason::Conflicting {
-                    "Request classification contains conflicting decisions; dependent actions were not authorized"
-                } else if matches!(
-                    reason,
-                    WorkAdmissionUnavailableReason::ServerOverload
-                        | WorkAdmissionUnavailableReason::RateLimited
-                ) {
-                    "Work admission provider is temporarily unavailable; no requested action was executed"
-                } else {
-                    "Work admission did not produce a complete typed decision; no requested action was executed"
-                },
-            )
-            .with_details_json(
-                json!({
-                    "source": "work_admission",
-                    "error_kind": "work_admission_unavailable",
-                    "unavailable_reason": reason.as_str(),
-                    "admission_diagnostic": self.work_admission_diagnostic(),
-                    "retryable": reason.retryable(),
-                    "executed": false,
-                    "no_classifier_policy": no_classifier.then_some("fixed_default"),
-                })
-                .to_string(),
-            )
-        })
-    }
-
-    fn executable_work_admission_error(
-        &self,
-        _provider_tool_calls: &[Value],
-    ) -> Option<astra_core::ClassifiedError> {
-        // Work admission is an auxiliary semantic vote.  Once the primary
-        // response has crossed the independent typed tool/schema boundary,
-        // an unavailable vote must not discard that response: the provider
-        // batch is still subject to canonical lifecycle, capability, and
-        // effect admission below.  An administrator-selected disabled policy
-        // is different: it explicitly requires FixedDefault, so Auto keeps
-        // its existing fail-closed contract for that one reason.
-        (self.work_admission_unavailable_reason == Some(WorkAdmissionUnavailableReason::Disabled))
-            .then(|| self.work_admission_unavailable_error())
-            .flatten()
     }
 
     async fn reconcile_work_admission_skill_revision(
@@ -8714,9 +8656,10 @@ impl ServerAgenticLoopHost {
         // when classification is malformed, unavailable, or timed out. Do
         // this structural check before any auxiliary-policy bypass so an
         // unhealthy judge cannot erase runtime-owned topology authority.
-        if crate::turn::agentic::turn_intent::trusted_loaded_workflow_execution_topology(
-            &state.skills.execution.invoked,
-        ) == Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+        if self.work_admission_conflict.is_some()
+            || crate::turn::agentic::turn_intent::trusted_loaded_workflow_execution_topology(
+                &state.skills.execution.invoked,
+            ) == Some(astra_services::WorkExecutionTopology::ParallelSubruns)
         {
             return Some((
                 "work_lifecycle_topology_conflict",
@@ -8725,33 +8668,6 @@ impl ServerAgenticLoopHost {
             ));
         }
         if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
-            return None;
-        }
-
-        // An absent optional judgment Offering is an explicit no-classifier
-        // policy, not a failed semantic decision. The primary model's typed
-        // Work carrier remains the user-visible way to start Work; runtime
-        // lifecycle and effect validation still apply below.
-        if self.work_admission_unavailable_reason
-            == Some(WorkAdmissionUnavailableReason::NoJudgmentOffering)
-        {
-            return None;
-        }
-
-        // The classifier is an optimization layer.  If it produced no
-        // usable decision, an explicit typed `start_work` carrier remains a
-        // valid primary request and must continue through the canonical
-        // lifecycle/effect checks below.  A trusted workflow topology conflict
-        // is different: `work_admission_conflict` is populated only for that
-        // runtime-owned contract failure and is still handled fail-closed by
-        // the terminal guard.
-        let classifier_unavailable =
-            self.work_admission_unavailable || self.work_admission_unavailable_reason.is_some();
-        if classifier_unavailable
-            && self.work_admission_conflict.is_none()
-            && self.work_admission_unavailable_reason
-                != Some(WorkAdmissionUnavailableReason::Disabled)
-        {
             return None;
         }
 
@@ -8785,22 +8701,14 @@ impl ServerAgenticLoopHost {
                     "This turn has no explicit durable Work lifecycle. Continue with ordinary tools or request Work explicitly.",
                     false,
                 )),
-                WorkLifecycleIntent::Unknown => Some((
-                    "work_admission_unavailable",
-                    "Work admission is unavailable for this turn; start_work was not executed. Repeating it in this turn will not rerun admission. A new turn or supported context change can trigger reassessment.",
-                    false,
-                )),
+                WorkLifecycleIntent::Unknown => None,
             };
         }
 
-        // Auto must not persist durable state when its semantic material is
-        // missing or unavailable. FixedDefault is handled above and is the
-        // sole explicit opt-out from this fail-closed carrier gate.
-        Some((
-            "work_admission_unavailable",
-            "Work admission is unavailable for this turn; start_work was not executed. Repeating it in this turn will not rerun admission. A new turn or supported context change can trigger reassessment.",
-            false,
-        ))
+        // No complete auxiliary decision: keep the normal primary carrier.
+        // Durable ownership, authorization and effects are validated by the
+        // existing admission/handler path, not inferred from an error reason.
+        None
     }
 
     fn reject_provider_work_carrier(
@@ -9636,9 +9544,9 @@ impl ServerAgenticLoopHost {
                 );
                 return;
             }
-            tracing::warn!(
+            tracing::debug!(
                 target: "astra::work",
-                "provider fanout has no semantic topology admission; execution will fail closed"
+                "provider fanout remains a primary typed proposal subject to runtime admission"
             );
             return;
         }
@@ -9721,8 +9629,8 @@ impl ServerAgenticLoopHost {
         // fanout-shaped error.  Reject every carrier before any side effect so
         // a provider cannot silently choose one half by switching from
         // `agent_fanout` to `start_work`, a direct child, or an ordinary tool.
-        // The conflict came from the typed semantic judge; no tool name or
-        // user-text heuristic participates in this boundary.
+        // This is a conflict with trusted runtime topology, not an auxiliary
+        // output's internal inconsistency. No user-text heuristic is involved.
         if let Some(conflict) = self.work_admission_conflict.as_deref() {
             for call in admission.admitted.drain(..) {
                 admission
@@ -9768,9 +9676,7 @@ impl ServerAgenticLoopHost {
                             .unwrap_or(false)
                 })
                 .count();
-            let parallel_fanout_admitted = self.work_admission_topology_authoritative
-                && self.work_admission_execution_topology
-                    == astra_services::WorkExecutionTopology::ParallelSubruns;
+            let parallel_fanout_admitted = self.fanout_start_proposal_available(state);
             let direct_parallel_rejection = direct_parallel_agent_rejection(
                 self.work_admission_topology_authoritative,
                 self.work_admission_execution_topology,
@@ -10149,7 +10055,7 @@ impl ServerAgenticLoopHost {
                 }
                 "agent_fanout"
                     if action == Some("start")
-                        && !parallel_topology_admitted
+                        && !self.fanout_start_proposal_available(state)
                         && !single_child_fanout_start(&arguments) =>
                 {
                     if self.pending_work_admission.is_some() {
@@ -10159,8 +10065,8 @@ impl ServerAgenticLoopHost {
                         ))
                     } else {
                         Some((
-                            "parallel_topology_admission_unavailable",
-                            "Parallel execution could not be authorized from the request classification. No parallel children were created by this call. Inspect admission_diagnostic; do not repeat delegation in this turn. Explain the unresolved requirement and request clarification or a new turn.",
+                            "parallel_topology_not_admitted",
+                            "The current trusted workflow or canonical Work lifecycle does not admit this parallel start. No parallel children were created by this call. Continue through the existing authorized execution carrier.",
                         ))
                     }
                 }
@@ -15891,16 +15797,12 @@ impl ServerAgenticLoopHost {
             stable.extend(dynamic);
             tools = stable;
         }
-        // A provider-visible action is an executable promise.  Expose a new
-        // fanout start only after semantic admission has authoritatively
-        // selected parallel subruns; an unresolved/unavailable judge must not
-        // advertise an action that the terminal gate will reject. Historical
+        // Visibility and admission share the same typed proposal boundary.
+        // Missing auxiliary evidence is not a runtime prohibition. Historical
         // or recovered groups still need their read/cancel carrier, so narrow
         // the action union instead of deleting the entire tool. Runtime
         // admission remains the independent forged/stale-call fence.
-        let parallel_fanout_start_admitted = self.work_admission_topology_authoritative
-            && self.work_admission_execution_topology
-                == astra_services::WorkExecutionTopology::ParallelSubruns;
+        let parallel_fanout_start_admitted = self.fanout_start_proposal_available(state);
         if !parallel_fanout_start_admitted {
             tools.retain_mut(|schema| {
                 tool_schema_name(schema) != Some("agent_fanout")
@@ -20607,10 +20509,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
         }
         // A provider-selected `start_work` is a typed payload, not user
-        // authorization. Under Auto, settle semantic admission first and then
-        // either retain the exact carrier (Required) or reject it without
-        // creating an operation/binding (NotRequired/Unavailable). FixedDefault
-        // intentionally keeps the explicit carrier fallback.
+        // authorization. Settle available semantic admission first, retaining
+        // the carrier on Required or no usable result. Reliable NotRequired
+        // and trusted runtime conflicts still reject before durable creation.
         if provider_batch_valid_work_carrier(&logical_provider_tool_calls).is_some() {
             if let Some((error_kind, error, retryable)) =
                 self.provider_work_carrier_rejection(state, &logical_provider_tool_calls)
@@ -20637,23 +20538,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     round_index = state.current_round_index,
                     error = %error,
                     "unsupported Work admission contract stopped the run before tool dispatch"
-                );
-                return Err(error);
-            }
-            if let Some(error) = self.executable_work_admission_error(&logical_provider_tool_calls)
-            {
-                // An explicit administrator-disabled policy is the only
-                // unavailable sidecar state that blocks this Auto turn.
-                self.pending_tool_call_admission = None;
-                tracing::error!(
-                    target: "astra::turn_intent",
-                    operation = "turn_intent.judge",
-                    source = "work_admission_judge",
-                    status = "unavailable",
-                    round_index = state.current_round_index,
-                    tool_call_count = logical_provider_tool_calls.len(),
-                    error = %error,
-                    "Work admission unavailable; executable provider batch rejected before dispatch"
                 );
                 return Err(error);
             }
@@ -28629,7 +28513,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_work_admission_preserves_structural_calls_but_rejects_self_authorized_fanout() {
+    fn unavailable_work_admission_preserves_structural_calls_and_typed_fanout() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -28677,13 +28561,8 @@ mod tests {
                 completion_action_applied: false,
             },
         );
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("parallel_topology_admission_unavailable")
-        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(admission.rejected.is_empty());
 
         let admission = host.enforce_canonical_delegation_lifecycle(
             &state,
@@ -36647,8 +36526,7 @@ mod tests {
         assert!(provider_batch_starts_work_admission(&logical_calls));
         assert!(!host.resolve_pending_work_admission(true).await);
         assert!(
-            host.executable_work_admission_error(&logical_calls)
-                .is_none(),
+            host.work_admission_terminal_error().is_none(),
             "an unavailable auxiliary vote must preserve the independently admitted sibling"
         );
     }
@@ -38017,7 +37895,7 @@ mod tests {
         );
         assert!(
             work_admission_boundary_requires_wait(&[], false, false, true),
-            "an unavailable semantic preflight must reject text-only completion"
+            "an established runtime conflict must gate text-only completion"
         );
     }
 
@@ -38053,7 +37931,6 @@ mod tests {
             WorkAdmissionUnavailableReason::Network,
         ] {
             host.work_admission_unavailable_reason = Some(reason);
-            assert!(reason.retryable(), "a later turn may recover");
             for has_intent in [false, true] {
                 let mut unavailable_state = create_test_state();
                 if has_intent {
@@ -38102,7 +37979,7 @@ mod tests {
         assert_eq!(
             host.provider_work_carrier_rejection(&state, std::slice::from_ref(&carrier))
                 .map(|(kind, _, retryable)| (kind, retryable)),
-            Some(("work_admission_unavailable", false))
+            None
         );
 
         let mut not_required_state = create_test_state();
@@ -38468,65 +38345,144 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_semantic_topology_does_not_let_provider_self_authorize_fanout() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-fanout-unavailable".to_string(),
-            "s-fanout-unavailable".to_string(),
-        )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-            true, false,
-        ))
-        .build();
-        host.work_admission_unavailable = true;
-        host.work_admission_unavailable_reason = Some(WorkAdmissionUnavailableReason::Uncertain);
-        host.work_admission_semantic_diagnostic = Some(json!({"uncertain_fields":["required"]}));
-        host.work_admission_recovery_used
-            .store(true, std::sync::atomic::Ordering::Release);
-        let call = json!({
-            "id": "fanout-without-authority",
-            "function": {
-                "name": "agent_fanout",
-                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
-            }
-        });
-
-        let mut state = create_test_state();
-        host.reconcile_work_activation_from_primary(&mut state, std::slice::from_ref(&call));
-
-        assert!(host.pending_work_admission.is_none());
-        assert_eq!(
-            host.work_admission_execution_topology,
-            astra_services::WorkExecutionTopology::Primary
-        );
-        let admission = host.enforce_canonical_delegation_lifecycle(
-            &create_test_state(),
-            crate::turn::agentic_loop::host::ToolCallAdmission {
+    fn auxiliary_absence_and_failures_preserve_typed_carriers_and_runtime_gates() {
+        for reason in [
+            None,
+            Some(WorkAdmissionUnavailableReason::NoJudgmentOffering),
+            Some(WorkAdmissionUnavailableReason::Disabled),
+            Some(WorkAdmissionUnavailableReason::Timeout),
+            Some(WorkAdmissionUnavailableReason::Malformed),
+            Some(WorkAdmissionUnavailableReason::Uncertain),
+            Some(WorkAdmissionUnavailableReason::Conflicting),
+            Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable),
+        ] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-baseline".into(),
+                "s-baseline".into(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .build();
+            host.work_admission_unavailable = reason.is_some();
+            host.work_admission_unavailable_reason = reason;
+            host.work_admission_semantic_diagnostic =
+                Some(json!({"uncertain_fields":["required"]}));
+            let mut state = create_test_state();
+            state.turn_intent = None;
+            let fanout = json!({"id":"baseline-fanout","type":"function","function":{
+                "name":"agent_fanout",
+                "arguments":r#"{"action":"start","target_count":2,"slots":[{"description":"A","prompt":"A"},{"description":"B","prompt":"B"}]}"#
+            }});
+            let work = json!({"id":"baseline-work","type":"function","function":{
+                "name":"start_work",
+                "arguments":r#"{"activation":"start","goal":"one graph","tasks":[{"objective":"one task","expected_result":"one result"}]}"#
+            }});
+            let partition = |call: Value| crate::turn::agentic_loop::host::ToolCallAdmission {
                 admitted: ordinary_admitted([call]),
-                rejected: Vec::new(),
+                rejected: vec![],
                 completion_action_applied: false,
-            },
-        );
+            };
+            let offers_start = |host: &ServerAgenticLoopHost, state: &AgenticLoopState| {
+                host.current_deferred_tool_contract_schemas(state)
+                    .iter()
+                    .any(|schema| {
+                        tool_schema_name(schema) == Some("agent_fanout")
+                            && schema["function"]["parameters"]["properties"]["action"]["enum"]
+                                .as_array()
+                                .is_some_and(|actions| actions.iter().any(|a| a == "start"))
+                    })
+            };
+            assert!(offers_start(&host, &state), "{reason:?}");
+            assert!(
+                host.provider_work_carrier_rejection(&state, std::slice::from_ref(&work))
+                    .is_none()
+            );
+            host.reconcile_work_activation_from_primary(&mut state, std::slice::from_ref(&fanout));
+            assert!(host.pending_work_admission.is_none());
+            assert!(!host.work_admission_topology_authoritative);
+            assert!(
+                state.turn_intent.is_none(),
+                "baseline must not invent mutation scope"
+            );
+            assert!(!host.work_admission_requires_settlement());
+            let admitted =
+                host.enforce_canonical_delegation_lifecycle(&state, partition(fanout.clone()));
+            assert_eq!(admitted.admitted.len(), 1, "{reason:?}");
+            assert!(admitted.rejected.is_empty(), "{reason:?}");
 
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
-        let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
-        assert_eq!(rejection["admission_diagnostic"]["reason"], "uncertain");
-        assert_eq!(
-            rejection["admission_diagnostic"]["classification"]["uncertain_fields"],
-            json!(["required"])
-        );
-        assert_eq!(
-            rejection["admission_diagnostic"]["recovery_exhausted"],
-            true
-        );
-        assert_eq!(rejection["retryable"], false);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("parallel_topology_admission_unavailable")
-        );
+            // A restricted tool is never exposed just because its classifier is absent.
+            state.restricted_tools.insert("agent_fanout".into());
+            assert!(!offers_start(&host, &state));
+            state.restricted_tools.clear();
+
+            // Existing attempt custody is stronger than a root proposal.
+            host.work_item_attempt_bound = true;
+            assert!(!offers_start(&host, &state));
+            let rejected =
+                host.enforce_canonical_delegation_lifecycle(&state, partition(fanout.clone()));
+            assert!(rejected.admitted.is_empty());
+            assert_eq!(rejected.rejected.len(), 1);
+            host.work_item_attempt_bound = false;
+
+            state.skills.execution.invoked.insert(
+                "serial-workflow".into(),
+                crate::turn::skill_tool::InvokedSkill {
+                    name: "serial-workflow".into(),
+                    content: "trusted workflow".into(),
+                    invoked_at_turn: 1,
+                    reentry_count: 0,
+                    execution_topology: Some(astra_services::WorkExecutionTopology::Primary),
+                },
+            );
+            assert!(!offers_start(&host, &state));
+            assert!(
+                host.enforce_canonical_delegation_lifecycle(&state, partition(fanout.clone()))
+                    .admitted
+                    .is_empty()
+            );
+            state.skills.execution.invoked.clear();
+
+            // A runtime conflict is not an auxiliary model's internal conflict.
+            host.work_admission_conflict = Some("trusted lifecycle/topology conflict".into());
+            assert!(!offers_start(&host, &state));
+            assert!(
+                host.provider_work_carrier_rejection(&state, std::slice::from_ref(&work))
+                    .is_some()
+            );
+            assert!(
+                host.enforce_canonical_delegation_lifecycle(&state, partition(fanout.clone()))
+                    .admitted
+                    .is_empty()
+            );
+            host.work_admission_conflict = None;
+
+            // Completion and execution budgets remain independent gates.
+            state.hooks.completion_settlement.text_only = true;
+            assert!(
+                host.admit_terminal_tool_calls(
+                    &state,
+                    std::slice::from_ref(&fanout),
+                    Some("tool_calls")
+                )
+                .is_empty()
+            );
+            host.pending_tool_call_admission = None;
+            host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
+                remaining_seconds: 0,
+            }));
+            let expired =
+                AgenticLoopHost::admit_tool_calls(&mut host, &[fanout], Some("tool_calls"));
+            assert!(expired.admitted.is_empty());
+            assert_eq!(expired.rejected.len(), 1);
+            assert!(
+                expired.rejected[0]
+                    .result
+                    .contains("execution_time_budget_exhausted")
+            );
+        }
     }
 
     #[test]
@@ -38603,8 +38559,8 @@ mod tests {
                 .as_array()
                 .expect("action enum");
         assert!(
-            !unresolved_actions.iter().any(|action| action == "start"),
-            "an unresolved admission decision must not advertise an unusable fanout start"
+            unresolved_actions.iter().any(|action| action == "start"),
+            "the primary typed carrier remains available without an auxiliary decision"
         );
         let discovery_contracts = host.current_discovery_deferred_tool_contract_schemas(&state);
         let discovery_fanout = discovery_contracts
@@ -47872,7 +47828,7 @@ mod tests {
             );
             assert!(host.work_admission_attempted);
             assert!(
-                host.executable_work_admission_error(&[]).is_none(),
+                host.work_admission_terminal_error().is_none(),
                 "missing auxiliary material must preserve the primary execution path"
             );
             assert!(
@@ -47886,7 +47842,7 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn disabled_work_admission_is_unavailable_for_auto_but_not_fixed_default() {
+        async fn disabled_work_admission_preserves_auto_baseline_without_model_calls() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
             let state = crate::turn::agentic_loop::host::tests::make_state();
             let mut auto = ServerAgenticLoopHostBuilder::new(
@@ -47903,19 +47859,14 @@ mod tests {
                     .await
             );
             assert!(auto.work_admission_attempted);
-            let error = auto
-                .work_admission_unavailable_error()
-                .expect("disabled Auto is unavailable");
             assert!(
-                auto.executable_work_admission_error(&[]).is_some(),
-                "an explicitly disabled Auto admission remains fail-closed"
+                auto.work_admission_terminal_error().is_none(),
+                "disabling auxiliary inference does not disable the primary baseline"
             );
-            let details: Value =
-                serde_json::from_str(error.details_json.as_deref().expect("typed error details"))
-                    .expect("JSON error details");
-            assert_eq!(details["unavailable_reason"], "disabled");
-            assert_eq!(details["retryable"], false);
-            assert_eq!(details["no_classifier_policy"], "fixed_default");
+            assert_eq!(auto.work_admission_diagnostic()["reason"], "disabled");
+            assert!(auto.pending_work_admission_judge.is_none());
+            assert!(auto.pending_work_admission.is_none());
+            assert!(auto.fanout_start_proposal_available(&state));
 
             let mut fixed = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
@@ -47931,61 +47882,49 @@ mod tests {
                     .await
             );
             assert!(!fixed.work_admission_attempted);
-            assert!(fixed.work_admission_unavailable_error().is_none());
+            assert!(!fixed.work_admission_unavailable);
         }
 
         #[tokio::test]
         async fn failed_work_admission_inference_preserves_primary_execution() {
-            let mut host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                "u-failed-admission".to_string(),
-                "s-failed-admission".to_string(),
-            )
-            .build();
-            host.pending_work_admission_judge =
-                Some(pending_work_admission_judge_for_test(tokio::spawn(async {
-                    (
-                        Err(astra_services::TurnIntentJudgeError::Malformed {
-                            raw: "truncated".to_string(),
-                            detail: "json_eof: EOF while parsing object".to_string(),
-                        }),
-                        WorkAdmissionUsage::default(),
-                    )
-                })));
-
-            assert!(!host.resolve_pending_work_admission(true).await);
-            assert!(host.executable_work_admission_error(&[]).is_none());
-            assert!(
-                host.executable_work_admission_error(&[json!({
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "bash", "arguments": "{\"command\":\"true\"}"},
-                })])
-                .is_none()
-            );
-            let error = host
-                .work_admission_unavailable_error()
-                .expect("malformed sidecar remains observable");
-            assert_eq!(
-                error.kind,
-                astra_core::ErrorKind::ContractViolation,
-                "malformed Work admission is a contract failure, not provider overload"
-            );
-            assert_ne!(
-                error.kind,
-                astra_core::ErrorKind::ServerError,
-                "malformed admission must never render as server_overload"
-            );
-            assert!(
-                error
-                    .to_string()
-                    .contains("no requested action was executed")
-            );
-            assert_eq!(
-                serde_json::from_str::<Value>(error.details_json.as_deref().unwrap()).unwrap()["executed"],
-                false
-            );
+            for error in [
+                astra_services::TurnIntentJudgeError::Malformed {
+                    raw: "truncated".into(),
+                    detail: "json_eof".into(),
+                },
+                astra_services::TurnIntentJudgeError::Conflicting {
+                    fields: vec!["required".into()],
+                    detail: "auxiliary answers disagree".into(),
+                },
+            ] {
+                let mut host = ServerAgenticLoopHostBuilder::new(
+                    mock_matrixone(),
+                    mock_encryptor(),
+                    "u-failed-admission".into(),
+                    "s-failed-admission".into(),
+                )
+                .build();
+                host.pending_work_admission_judge = Some(pending_work_admission_judge_for_test(
+                    tokio::spawn(async move { (Err(error), WorkAdmissionUsage::default()) }),
+                ));
+                assert!(!host.resolve_pending_work_admission(true).await);
+                assert!(host.pending_work_admission_judge.is_none());
+                assert!(host.pending_work_admission.is_none());
+                assert!(host.work_admission_terminal_error().is_none());
+                assert!(!host.work_admission_requires_settlement());
+                assert!(host.fanout_start_proposal_available(&create_test_state()));
+                let reason = host.work_admission_unavailable_reason.unwrap();
+                assert_eq!(
+                    reason.error_kind(),
+                    astra_core::ErrorKind::ContractViolation
+                );
+                assert!(matches!(
+                    reason,
+                    WorkAdmissionUnavailableReason::Malformed
+                        | WorkAdmissionUnavailableReason::Conflicting
+                ));
+                assert_eq!(host.work_admission_diagnostic()["reason"], reason.as_str());
+            }
         }
 
         #[test]
@@ -48005,11 +47944,6 @@ mod tests {
                     WorkAdmissionUnavailableReason::from_inference_error(&error).error_kind(),
                     kind
                 );
-                if kind == astra_core::ErrorKind::PaymentRequired {
-                    assert!(
-                        !WorkAdmissionUnavailableReason::from_inference_error(&error).retryable()
-                    );
-                }
             }
         }
 
@@ -48079,6 +48013,8 @@ mod tests {
 
             host.work_admission_unavailable_reason =
                 Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
+            assert!(!host.work_admission_requires_settlement());
+            host.work_admission_conflict = Some("trusted workflow conflict".into());
             assert!(host.work_admission_requires_settlement());
         }
 
