@@ -980,6 +980,27 @@ These settings do not replace Offering authorization or endpoint-specific networ
 restrictions. A transport snapshot alone is not a complete Evaluation execution
 snapshot: context, prompt, model, and runtime policy inputs must also be bound.
 
+Root Run preparation captures its RuntimeConfig once. Admission's round-limit
+validation, initial loop policy, host tool surface, and primary/fallback context
+budget resolution use that captured value. An existing Evaluation Run replay
+returns before new preparation. This process-local capture is not yet a durable
+experiment configuration: evaluation preparation and trial admission must bind
+the complete effective execution inputs, including prompt and auxiliary policy.
+
+Each summary client consumes one resolved generation policy for its operation
+and inference purpose. The policy carries thinking, temperature emission, and
+output budget; a call with a different purpose fails before provider dispatch.
+Turn-intent and Skill routing use Introspection policy. Pre-turn compaction
+keeps its 4096-token output budget, while required context compaction uses the
+resolved context summary budget. Auxiliary calls do not inherit the primary
+call's generation settings indiscriminately.
+
+An explicit resolved completion ceiling remains authoritative in the final
+provider payload, including after route body overrides. Transport does not
+increase it using generic thinking-budget heuristics. Provider-specific
+thinking constraints belong to admission and policy resolution, not a hidden
+increase of the caller's output budget.
+
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing
 provider-attempt deadline/settlement owner, not an outer cancelling timeout.

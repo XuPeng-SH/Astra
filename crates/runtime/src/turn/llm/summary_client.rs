@@ -4,8 +4,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use astra_turn_core::cloud_summary::{SummaryLlmClient, SummaryResponse};
-use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
 use astra_turn_types::InferencePurpose;
+use astra_turn_types::auxiliary_execution::{
+    AUXILIARY_GENERATION_POLICY_VERSION, AuxiliaryGenerationPolicy, AuxiliaryPolicyProvenance,
+    AuxiliaryTemperatureEmission,
+};
+use astra_turn_types::{ThinkingConfig, ThinkingEffort};
 
 use super::client::{LlmCall, LlmTransport, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
@@ -86,65 +90,6 @@ enum SummaryExecution {
     Direct,
 }
 
-/// Final temperature decision for one auxiliary inference call.
-///
-/// This is deliberately distinct from `Option<f64>`: both an inherited route
-/// default and an asserted provider default are represented by `None` at the
-/// lower-level client boundary, but only the former may contain a configured
-/// body override. Resolution below validates that distinction before provider
-/// I/O.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SummaryTemperatureEmission {
-    InheritRouteDefault,
-    ProviderDefault,
-    Forbidden,
-    Explicit(f64),
-}
-
-impl SummaryTemperatureEmission {
-    fn call_temperature(self) -> Option<f64> {
-        match self {
-            Self::Explicit(value) => Some(value),
-            Self::InheritRouteDefault | Self::ProviderDefault | Self::Forbidden => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::InheritRouteDefault => "inherit_route_default",
-            Self::ProviderDefault => "provider_default",
-            Self::Forbidden => "forbidden",
-            Self::Explicit(_) => "explicit",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SummaryGenerationPolicyProvenance {
-    ExistingPurposePolicy,
-    OfferingCapability,
-    CanonicalProviderContract,
-    ConservativeProtocolDefault,
-}
-
-impl SummaryGenerationPolicyProvenance {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ExistingPurposePolicy => "existing_purpose_policy",
-            Self::OfferingCapability => "offering_capability",
-            Self::CanonicalProviderContract => "canonical_provider_contract",
-            Self::ConservativeProtocolDefault => "conservative_protocol_default",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ResolvedSummaryGenerationPolicy {
-    thinking: ThinkingConfig,
-    temperature: SummaryTemperatureEmission,
-    temperature_provenance: SummaryGenerationPolicyProvenance,
-}
-
 /// Runtime-owned adapter from the provider execution contract to summary work.
 /// Provider-specific request construction, authentication, timeouts, and
 /// response parsing remain centralized in the canonical LLM client.
@@ -152,13 +97,47 @@ struct ResolvedSummaryGenerationPolicy {
 pub(crate) struct RuntimeSummaryClient {
     transport: Arc<LlmTransport>,
     route: OwnedLlmExecutionRoute,
-    max_output_tokens: usize,
+    policy: Result<AuxiliaryGenerationPolicy, String>,
     prompt_cache_tools: Vec<Value>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     execution: SummaryExecution,
 }
 
 impl RuntimeSummaryClient {
+    /// Consume the single policy already resolved by execution admission.
+    /// The caller binds it to this exact route in the execution freeze;
+    /// construction never re-resolves generation policy.
+    /// Resolution and scope errors remain deferred to `summarize`, preserving
+    /// the caller's typed inference-failure phase before any provider I/O.
+    pub(crate) fn new_with_resolved_policy(
+        transport: Arc<LlmTransport>,
+        route: OwnedLlmExecutionRoute,
+        policy: Result<AuxiliaryGenerationPolicy, String>,
+        ledger: DurableInferenceLedger,
+        base_scope: astra_turn_types::InferenceInvocationScope,
+        attempt_allocator: DurableSummaryAttemptAllocator,
+    ) -> Self {
+        let policy = policy.and_then(|policy| {
+            if policy.operation_id != base_scope.operation_id() {
+                Err("auxiliary policy operation differs from invocation scope".into())
+            } else {
+                Ok(policy)
+            }
+        });
+        Self {
+            transport,
+            route,
+            policy,
+            prompt_cache_tools: Vec::new(),
+            cache_capability: None,
+            execution: SummaryExecution::Durable(Box::new(DurableSummaryExecution {
+                ledger,
+                base_scope,
+                attempt_allocator,
+            })),
+        }
+    }
+
     fn attempt_allocator_scope_key(
         base_scope: &astra_turn_types::InferenceInvocationScope,
         purpose: InferencePurpose,
@@ -174,27 +153,31 @@ impl RuntimeSummaryClient {
         .map_err(|error| format!("serialize durable summary allocator scope: {error}"))
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new_with_attempt_allocator(
         transport: Arc<LlmTransport>,
         route: OwnedLlmExecutionRoute,
         max_output_tokens: usize,
+        purpose: InferencePurpose,
         ledger: DurableInferenceLedger,
         base_scope: astra_turn_types::InferenceInvocationScope,
         attempt_allocator: DurableSummaryAttemptAllocator,
     ) -> Self {
-        Self {
+        let policy = resolve_auxiliary_generation_policy(
+            base_scope.operation_id(),
+            max_output_tokens,
+            purpose,
+            &route,
+        );
+        Self::new_with_resolved_policy(
             transport,
             route,
-            max_output_tokens,
-            prompt_cache_tools: Vec::new(),
-            cache_capability: None,
-            execution: SummaryExecution::Durable(Box::new(DurableSummaryExecution {
-                ledger,
-                base_scope,
-                attempt_allocator,
-            })),
-        }
+            policy,
+            ledger,
+            base_scope,
+            attempt_allocator,
+        )
     }
 
     /// Reuse the main inference request's stable tool projection and exact
@@ -257,73 +240,8 @@ impl RuntimeSummaryClient {
         )
     }
 
-    /// Resolve the complete bounded-summary generation policy once from the
-    /// admitted route. Generic OpenAI-compatible transport is not proof that
-    /// zero temperature is supported, so an unclassified route uses the
-    /// endpoint default. Exact built-in providers retain their established
-    /// deterministic classifier behavior.
-    fn resolve_generation_policy(
-        purpose: InferencePurpose,
-        route: &OwnedLlmExecutionRoute,
-    ) -> Result<ResolvedSummaryGenerationPolicy, String> {
-        let thinking = Self::thinking_for(purpose, route);
-        let configured_temperature = Self::configured_temperature(route)?;
-        let protocol = route.thinking_protocol.unwrap_or_else(|| {
-            astra_core::model_wire::thinking::canonical_thinking_protocol(
-                &route.provider,
-                &route.base_url,
-                route
-                    .wire_model_name
-                    .as_deref()
-                    .unwrap_or(&route.model_name),
-            )
-        });
-        let (temperature, temperature_provenance) =
-            if !matches!(purpose, InferencePurpose::Introspection) {
-                (
-                    SummaryTemperatureEmission::InheritRouteDefault,
-                    SummaryGenerationPolicyProvenance::ExistingPurposePolicy,
-                )
-            } else if !thinking.is_off() {
-                (
-                    SummaryTemperatureEmission::Forbidden,
-                    SummaryGenerationPolicyProvenance::OfferingCapability,
-                )
-            } else if let Some(value) = configured_temperature {
-                (
-                    SummaryTemperatureEmission::Explicit(value),
-                    SummaryGenerationPolicyProvenance::OfferingCapability,
-                )
-            } else if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot {
-                (
-                    SummaryTemperatureEmission::ProviderDefault,
-                    SummaryGenerationPolicyProvenance::CanonicalProviderContract,
-                )
-            } else if route.completions_url_override.is_none()
-                && astra_core::model_wire::thinking::canonical_zero_temperature(
-                    &route.provider,
-                    &route.base_url,
-                )
-            {
-                (
-                    SummaryTemperatureEmission::Explicit(0.0),
-                    SummaryGenerationPolicyProvenance::CanonicalProviderContract,
-                )
-            } else {
-                (
-                    SummaryTemperatureEmission::ProviderDefault,
-                    SummaryGenerationPolicyProvenance::ConservativeProtocolDefault,
-                )
-            };
-        Ok(ResolvedSummaryGenerationPolicy {
-            thinking,
-            temperature,
-            temperature_provenance,
-        })
-    }
-
     /// Low-level provider-adapter constructor for unit tests. Production
-    /// summary paths must use [`Self::new_with_attempt_allocator`] so auxiliary calls cannot bypass
+    /// summary paths must use [`Self::new_with_resolved_policy`] so auxiliary calls cannot bypass
     /// durable admission and usage settlement.
     #[cfg(test)]
     #[must_use]
@@ -331,16 +249,95 @@ impl RuntimeSummaryClient {
         transport: Arc<LlmTransport>,
         route: OwnedLlmExecutionRoute,
         max_output_tokens: usize,
+        purpose: InferencePurpose,
     ) -> Self {
+        let policy = resolve_auxiliary_generation_policy(
+            "direct-test-summary",
+            max_output_tokens,
+            purpose,
+            &route,
+        );
         Self {
             transport,
             route,
-            max_output_tokens,
+            policy,
             prompt_cache_tools: Vec::new(),
             cache_capability: None,
             execution: SummaryExecution::Direct,
         }
     }
+}
+
+/// Resolve the complete bounded-summary generation policy once from the
+/// admitted route. Generic OpenAI-compatible transport is not proof that
+/// zero temperature is supported, so an unclassified route uses the
+/// endpoint default. Exact built-in providers retain their established
+/// deterministic classifier behavior.
+pub(crate) fn resolve_auxiliary_generation_policy(
+    operation_id: &str,
+    max_output_tokens: usize,
+    purpose: InferencePurpose,
+    route: &OwnedLlmExecutionRoute,
+) -> Result<AuxiliaryGenerationPolicy, String> {
+    let thinking = RuntimeSummaryClient::thinking_for(purpose, route);
+    let configured_temperature = RuntimeSummaryClient::configured_temperature(route)?;
+    let protocol = route.thinking_protocol.unwrap_or_else(|| {
+        astra_core::model_wire::thinking::canonical_thinking_protocol(
+            &route.provider,
+            &route.base_url,
+            route
+                .wire_model_name
+                .as_deref()
+                .unwrap_or(&route.model_name),
+        )
+    });
+    let (temperature, temperature_provenance) =
+        if !matches!(purpose, InferencePurpose::Introspection) {
+            (
+                AuxiliaryTemperatureEmission::InheritRouteDefault,
+                AuxiliaryPolicyProvenance::ExistingPurposePolicy,
+            )
+        } else if !thinking.is_off() {
+            (
+                AuxiliaryTemperatureEmission::Forbidden,
+                AuxiliaryPolicyProvenance::OfferingCapability,
+            )
+        } else if let Some(value) = configured_temperature {
+            (
+                AuxiliaryTemperatureEmission::Explicit(value),
+                AuxiliaryPolicyProvenance::OfferingCapability,
+            )
+        } else if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot {
+            (
+                AuxiliaryTemperatureEmission::ProviderDefault,
+                AuxiliaryPolicyProvenance::CanonicalProviderContract,
+            )
+        } else if route.completions_url_override.is_none()
+            && astra_core::model_wire::thinking::canonical_zero_temperature(
+                &route.provider,
+                &route.base_url,
+            )
+        {
+            (
+                AuxiliaryTemperatureEmission::Explicit(0.0),
+                AuxiliaryPolicyProvenance::CanonicalProviderContract,
+            )
+        } else {
+            (
+                AuxiliaryTemperatureEmission::ProviderDefault,
+                AuxiliaryPolicyProvenance::ConservativeProtocolDefault,
+            )
+        };
+    Ok(AuxiliaryGenerationPolicy {
+        schema_version: AUXILIARY_GENERATION_POLICY_VERSION,
+        operation_id: operation_id.to_string(),
+        purpose,
+        max_output_tokens,
+        configured_temperature,
+        thinking,
+        temperature,
+        temperature_provenance,
+    })
 }
 
 #[async_trait]
@@ -353,8 +350,15 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         let contract_error = |message: String| {
             astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
         };
-        let policy =
-            Self::resolve_generation_policy(purpose, &self.route).map_err(contract_error)?;
+        let policy = self
+            .policy
+            .as_ref()
+            .map_err(|error| contract_error(error.clone()))?;
+        if policy.purpose != purpose {
+            return Err(contract_error(
+                "auxiliary purpose differs from resolved policy".into(),
+            ));
+        }
         let thinking = &policy.thinking;
         let temperature = policy.temperature.call_temperature();
         tracing::debug!(
@@ -404,7 +408,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                                 tools: &self.prompt_cache_tools,
                                 cache_capability: self.cache_capability,
                                 route: self.route.borrowed(),
-                                max_output_tokens: Some(self.max_output_tokens),
+                                max_output_tokens: Some(policy.max_output_tokens),
                                 temperature,
                                 has_fallback: false,
                                 thinking,
@@ -434,7 +438,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         tools: &self.prompt_cache_tools,
                         cache_capability: self.cache_capability,
                         route: self.route.borrowed(),
-                        max_output_tokens: Some(self.max_output_tokens),
+                        max_output_tokens: Some(policy.max_output_tokens),
                         temperature,
                         has_fallback: false,
                         thinking,
@@ -823,6 +827,159 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_policy_freezes_operation_purpose_and_exact_output_limit() {
+        let mut route = route_with_capability(None);
+        route.fixed_temperature = Some(0.6);
+        for (operation, purpose, limit) in [
+            (
+                "pre_turn_compaction",
+                InferencePurpose::RequiredCompaction,
+                4096,
+            ),
+            (
+                "required_compaction",
+                InferencePurpose::RequiredCompaction,
+                20_000,
+            ),
+            ("introspection", InferencePurpose::Introspection, 1024),
+        ] {
+            let policy =
+                resolve_auxiliary_generation_policy(operation, limit, purpose, &route).unwrap();
+            assert_eq!(policy.operation_id, operation);
+            assert_eq!(policy.purpose, purpose);
+            assert_eq!(policy.max_output_tokens, limit);
+            assert_eq!(policy.configured_temperature, Some(0.6));
+            let encoded = serde_json::to_value(&policy).unwrap();
+            assert_eq!(
+                serde_json::from_value::<AuxiliaryGenerationPolicy>(encoded).unwrap(),
+                policy
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_summary_policy_is_consumed_without_resolving_again() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(body["reasoning_effort"], "low");
+                    assert_eq!(body["max_completion_tokens"], 37);
+                    assert!(body.get("temperature").is_none());
+                    let event = serde_json::json!({
+                        "choices": [{"index":0,"delta":{"content":"summary"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":10,"completion_tokens":2}
+                    });
+                    Response::builder().status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
+                        .unwrap()
+                }
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
+        let ledger = DurableInferenceLedger::required_with_persistence(
+            None,
+            Some(&execution),
+            "summary-user",
+            Some(persistence),
+        )
+        .unwrap()
+        .with_run_authority(summary_authority());
+        let mut route = summary_route(&execution);
+        route.thinking_capability = Some(astra_services::models::ThinkingCapability::EffortOnly);
+        route.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort);
+        let scope = summary_scope();
+        let policy = resolve_auxiliary_generation_policy(
+            scope.operation_id(),
+            37,
+            InferencePurpose::Introspection,
+            &route,
+        )
+        .unwrap();
+        let policy: AuxiliaryGenerationPolicy =
+            serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap();
+        // Deliberately change a resolver-only input to detect late recomputation.
+        // Production admission must bind the policy and route together.
+        route.thinking_capability = None;
+        let transport = Arc::new(crate::turn::llm::client::test_llm_transport());
+        let mut wrong_operation = policy.clone();
+        wrong_operation.operation_id = "different_operation".into();
+        let messages = [serde_json::json!({"role":"user","content":"summarize"})];
+        let error = RuntimeSummaryClient::new_with_resolved_policy(
+            transport.clone(),
+            route.clone(),
+            Ok(wrong_operation),
+            ledger.clone(),
+            scope.clone(),
+            DurableSummaryAttemptAllocator::default(),
+        )
+        .summarize(InferencePurpose::Introspection, &messages)
+        .await
+        .expect_err("operation mismatch must remain a typed inference failure");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(
+            error.message,
+            "auxiliary policy operation differs from invocation scope"
+        );
+        let mut invalid_route = route.clone();
+        invalid_route.request_body_overrides = Some(serde_json::Map::from_iter([(
+            "temperature".into(),
+            serde_json::json!("invalid"),
+        )]));
+        let failed_policy = resolve_auxiliary_generation_policy(
+            scope.operation_id(),
+            37,
+            InferencePurpose::Introspection,
+            &invalid_route,
+        );
+        let expected_error = failed_policy.as_ref().unwrap_err().clone();
+        let error = RuntimeSummaryClient::new_with_resolved_policy(
+            transport.clone(),
+            invalid_route,
+            failed_policy,
+            ledger.clone(),
+            scope.clone(),
+            DurableSummaryAttemptAllocator::default(),
+        )
+        .summarize(InferencePurpose::Introspection, &messages)
+        .await
+        .expect_err("resolution failure must remain a typed inference failure");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(error.message, expected_error);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        let client = RuntimeSummaryClient::new_with_resolved_policy(
+            transport,
+            route,
+            Ok(policy),
+            ledger,
+            scope,
+            DurableSummaryAttemptAllocator::default(),
+        );
+        let error = client
+            .summarize(InferencePurpose::RequiredCompaction, &messages)
+            .await
+            .expect_err("a different purpose cannot reuse the frozen policy");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client
+                .summarize(InferencePurpose::Introspection, &messages)
+                .await
+                .unwrap()
+                .text,
+            "summary"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn bounded_introspection_resolves_temperature_from_admitted_capabilities() {
         let canonical = route_with_capability(None);
         for (provider, base_url) in [
@@ -833,49 +990,55 @@ mod tests {
             let mut route = canonical.clone();
             route.provider = provider.to_string();
             route.base_url = base_url.into();
-            let policy = RuntimeSummaryClient::resolve_generation_policy(
+            let policy = resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &route,
             )
             .expect("canonical policy");
             assert_eq!(
                 policy.temperature,
-                SummaryTemperatureEmission::Explicit(0.0),
+                AuxiliaryTemperatureEmission::Explicit(0.0),
                 "provider={provider}"
             );
             assert_eq!(
                 policy.temperature_provenance,
-                SummaryGenerationPolicyProvenance::CanonicalProviderContract,
+                AuxiliaryPolicyProvenance::CanonicalProviderContract,
                 "provider={provider}"
             );
         }
 
         let mut compatible = route_with_capability(None);
         compatible.provider = astra_services::byok_endpoint::COMPATIBLE_PROVIDER.to_string();
-        let compatible_policy = RuntimeSummaryClient::resolve_generation_policy(
+        let compatible_policy = resolve_auxiliary_generation_policy(
+            "policy-test",
+            4096,
             InferencePurpose::Introspection,
             &compatible,
         )
         .expect("compatible policy");
         assert_eq!(
             compatible_policy.temperature,
-            SummaryTemperatureEmission::ProviderDefault,
+            AuxiliaryTemperatureEmission::ProviderDefault,
             "transport compatibility alone must not imply zero-temperature support"
         );
         assert_eq!(
             compatible_policy.temperature_provenance,
-            SummaryGenerationPolicyProvenance::ConservativeProtocolDefault
+            AuxiliaryPolicyProvenance::ConservativeProtocolDefault
         );
 
         compatible.fixed_temperature = Some(0.6);
         assert_eq!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &compatible,
             )
             .expect("fixed-temperature policy")
             .temperature,
-            SummaryTemperatureEmission::Explicit(0.6)
+            AuxiliaryTemperatureEmission::Explicit(0.6)
         );
 
         compatible.fixed_temperature = None;
@@ -884,13 +1047,15 @@ mod tests {
             serde_json::json!(0.7),
         )]));
         assert_eq!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &compatible,
             )
             .expect("configured-temperature policy")
             .temperature,
-            SummaryTemperatureEmission::Explicit(0.7),
+            AuxiliaryTemperatureEmission::Explicit(0.7),
             "the admitted override must not be silently replaced with zero"
         );
 
@@ -899,13 +1064,15 @@ mod tests {
         effort_only.thinking_protocol =
             Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort);
         assert_eq!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &effort_only,
             )
             .expect("effort-only policy")
             .temperature,
-            SummaryTemperatureEmission::Forbidden,
+            AuxiliaryTemperatureEmission::Forbidden,
             "thinking protocols own sampling and must not receive temperature"
         );
 
@@ -915,10 +1082,10 @@ mod tests {
             InferencePurpose::MemoryExtraction,
         ] {
             assert_eq!(
-                RuntimeSummaryClient::resolve_generation_policy(purpose, &canonical)
+                resolve_auxiliary_generation_policy("policy-test", 4096, purpose, &canonical)
                     .expect("non-introspection policy")
                     .temperature,
-                SummaryTemperatureEmission::InheritRouteDefault
+                AuxiliaryTemperatureEmission::InheritRouteDefault
             );
         }
     }
@@ -943,13 +1110,15 @@ mod tests {
                 route.provider = provider.into();
                 route.base_url = url.into();
                 assert_eq!(
-                    RuntimeSummaryClient::resolve_generation_policy(
+                    resolve_auxiliary_generation_policy(
+                        "policy-test",
+                        4096,
                         InferencePurpose::Introspection,
                         &route
                     )
                     .unwrap()
                     .temperature,
-                    SummaryTemperatureEmission::ProviderDefault,
+                    AuxiliaryTemperatureEmission::ProviderDefault,
                     "{provider} {url}"
                 );
             }
@@ -958,13 +1127,15 @@ mod tests {
         route.base_url = "https://api.openai.com/v1".into();
         route.completions_url_override = Some("https://gateway.example/chat/completions".into());
         assert_eq!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &route
             )
             .unwrap()
             .temperature,
-            SummaryTemperatureEmission::ProviderDefault
+            AuxiliaryTemperatureEmission::ProviderDefault
         );
     }
 
@@ -978,7 +1149,9 @@ mod tests {
             serde_json::json!(1.0),
         )]));
         assert!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &route,
             )
@@ -992,7 +1165,9 @@ mod tests {
             serde_json::json!("cold"),
         )]));
         assert!(
-            RuntimeSummaryClient::resolve_generation_policy(
+            resolve_auxiliary_generation_policy(
+                "policy-test",
+                4096,
                 InferencePurpose::Introspection,
                 &route,
             )
@@ -1050,6 +1225,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::RequiredCompaction,
         )
         .with_prompt_cache_context(tools.clone(), cache_capability);
         let messages = vec![
@@ -1134,6 +1310,7 @@ mod tests {
             transport,
             summary_route(&execution),
             1_024,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),
@@ -1266,6 +1443,7 @@ mod tests {
                         Arc::new(crate::turn::llm::client::test_llm_transport()),
                         summary_route(&execution),
                         1_024,
+                        InferencePurpose::Introspection,
                         ledger,
                         summary_scope(),
                         DurableSummaryAttemptAllocator::default(),
@@ -1275,6 +1453,7 @@ mod tests {
                         Arc::new(crate::turn::llm::client::test_llm_transport()),
                         summary_route(&execution),
                         1_024,
+                        InferencePurpose::Introspection,
                     )
                 };
                 let messages = vec![serde_json::json!({
@@ -1330,6 +1509,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             route,
             1024,
+            InferencePurpose::Introspection,
         );
         assert_eq!(
             client
@@ -1382,6 +1562,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             route,
             128,
+            InferencePurpose::Introspection,
         );
 
         client
@@ -1433,6 +1614,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
         );
         let summary = client
             .summarize(
@@ -1560,6 +1742,7 @@ mod tests {
                 request_timeout: None,
             },
             64,
+            InferencePurpose::Introspection,
             ledger,
             astra_turn_types::InferenceInvocationScope::Run {
                 session_id: "summary-session".to_string(),
@@ -1639,6 +1822,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             1_024,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),
@@ -1726,6 +1910,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger.clone(),
             summary_scope(),
             allocator.clone(),
@@ -1734,6 +1919,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             allocator,
@@ -1777,6 +1963,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::with_next_logical_attempt(u64::from(u32::MAX)),
@@ -1824,6 +2011,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger.clone(),
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),
@@ -1835,6 +2023,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),
@@ -1885,6 +2074,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger.clone(),
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),
@@ -1893,6 +2083,7 @@ mod tests {
             Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),

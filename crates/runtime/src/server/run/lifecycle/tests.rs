@@ -473,7 +473,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
         request.model = None;
         request.resolved_model_selection = None;
         request.admitted_model_execution = None;
-        let mut request = service
+        let (mut request, _runtime_config) = service
             .prepare_chat_request("user-1", request)
             .await
             .unwrap();
@@ -658,7 +658,7 @@ async fn run_admission_records_trusted_catalog_source_without_execution_material
     request.model = None;
     request.resolved_model_selection = None;
     request.admitted_model_execution = None;
-    let request = service.prepare_chat_request("u1", request).await.unwrap();
+    let (request, _runtime_config) = service.prepare_chat_request("u1", request).await.unwrap();
     let offering = request
         .admitted_model_execution
         .as_ref()
@@ -802,7 +802,8 @@ async fn run_admission_preserves_mixed_capabilities_and_resolved_executor() {
         request.model = None;
         request.resolved_model_selection = None;
         request.admitted_model_execution = None;
-        let mut request = service.prepare_chat_request("u1", request).await.unwrap();
+        let (mut request, _runtime_config) =
+            service.prepare_chat_request("u1", request).await.unwrap();
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
             executor_id: Some("edge-original".into()),
@@ -10607,6 +10608,7 @@ async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
         None,
         false,
         None,
+        &astra_config::runtime_config::RuntimeConfig::load(),
     );
     assert!(
         memory.bindings.load(Ordering::SeqCst) > bindings_before_host,
@@ -10646,6 +10648,7 @@ async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
         None,
         false,
         None,
+        &astra_config::runtime_config::RuntimeConfig::load(),
     );
     assert!(state.memory_extraction_service.is_none());
     assert_eq!(
@@ -16572,7 +16575,7 @@ async fn server_default_model_mode_uses_existing_model_access_default() {
     request.model_selection = None;
     request.resolved_model_selection = None;
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("Model Access default is admitted once by the runtime");
@@ -16603,7 +16606,7 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
     request.resolved_model_selection = None;
     request.admitted_model_execution = None;
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("non-empty user_intent is valid effective input");
@@ -16963,7 +16966,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             discovery_snapshot: None,
         });
 
-    let prepared = service
+    let (prepared, _runtime_config) = service
         .prepare_chat_request("u1", request)
         .await
         .expect("provider descriptor should become admitted_model_execution");
@@ -24043,6 +24046,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-run",
             None,
             &edge,
+            &astra_config::runtime_config::RuntimeConfig::load(),
         )
         .unwrap();
     let messages = vec![
@@ -24159,6 +24163,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         Some(3),
     );
+    let mut runtime_config = astra_config::runtime_config::RuntimeConfig::default();
+    runtime_config.tool_selection.max_identical_tool_calls = 7;
     let state = svc.assemble_loop_state(
         "test-user",
         &request,
@@ -24169,7 +24175,9 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         environment,
         facts,
+        &runtime_config,
     );
+    assert_eq!(state.max_identical_tool_calls, 7);
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
     assert_eq!(state.user_intent, "original structured intent");
@@ -24275,7 +24283,15 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();
     let mut facts = svc
-        .prepare_initial_execution_facts("user", &request, "session", "run", None, &edge)
+        .prepare_initial_execution_facts(
+            "user",
+            &request,
+            "session",
+            "run",
+            None,
+            &edge,
+            &astra_config::runtime_config::RuntimeConfig::load(),
+        )
         .unwrap();
     facts.hooks.workspace_root_hint = Some("/app".into());
     facts.original.canonical_turn_chain_id = Some("chain".into());
@@ -24308,6 +24324,7 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         None,
         environment,
         facts,
+        &astra_config::runtime_config::RuntimeConfig::load(),
     );
     assert!(state.stall.tool_call_records.is_empty());
     assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
@@ -24487,6 +24504,7 @@ fn build_initial_state_rejects_zero_execution_budget_cap() {
         None,
         None,
         None,
+        &astra_config::runtime_config::RuntimeConfig::load(),
     );
     let (status, error) = result.err().expect("zero cap must be rejected");
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -25052,6 +25070,7 @@ fn late_streaming_start_binds_owner_generation_into_action_state() {
             None,
             None,
             None,
+            &astra_config::runtime_config::RuntimeConfig::load(),
         )
         .expect("valid test execution configuration");
     assert_eq!(state.current_run_owner_generation, None);
@@ -25100,6 +25119,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
             None,
             Some(&binding_context),
             None,
+            &astra_config::runtime_config::RuntimeConfig::load(),
         )
         .expect("valid test execution configuration");
 
@@ -25242,6 +25262,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
             capabilities.request_scoped_skill_resolver.clone(),
             capabilities.agent_binding.as_ref(),
             None,
+            &astra_config::runtime_config::RuntimeConfig::load(),
         )
         .expect("valid test execution configuration");
 
