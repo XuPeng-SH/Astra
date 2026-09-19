@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 1;
-pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v2";
+pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v3";
 const MAX_REPORT_LABEL_BYTES: usize = 256;
 
 pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
@@ -44,6 +44,18 @@ pub struct EvaluationReportCoverage {
     pub missing_trial_ids: Vec<String>,
     pub unavailable_trial_ids: Vec<String>,
     pub evidence_incomplete: bool,
+    pub requirements_frozen: bool,
+    pub metric_gaps: Vec<EvaluationMetricGap>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationMetricGap {
+    pub trial_id: String,
+    pub dimension: String,
+    pub metric: String,
+    pub expected_unit: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +182,53 @@ pub fn build_report_artifact(
         };
     }
     let observation_refs = observation_refs_by_id.into_values().collect::<Vec<_>>();
-    let markdown = render_markdown(&report);
+    let mut markdown = render_markdown(&report);
+    let requirements_frozen = experiment.spec.measurement_profile.is_some();
+    let mut metric_gaps = Vec::new();
+    if let Some(profile) = &experiment.spec.measurement_profile {
+        for trial_id in &planned_trial_ids {
+            let observation = report
+                .observations
+                .iter()
+                .find(|item| &item.trial_id == trial_id);
+            for &(dimension, metric, unit) in profile.requirements() {
+                let measurement = observation
+                    .and_then(|item| item.measurements.iter().find(|item| item.name == metric));
+                let reason = match measurement {
+                    None => "required measurement is missing",
+                    Some(item) if item.unit != unit => {
+                        "measurement unit does not match the frozen requirement"
+                    }
+                    Some(item) if item.status != super::assessment::MeasurementStatus::Observed => {
+                        "required measurement is not observed"
+                    }
+                    // Current observation records contain a textual basis, not
+                    // a scoped proof of collector/verifier completeness. Never
+                    // infer coverage from the existence of a numeric value.
+                    Some(_) if matches!(metric, "prompt_tokens" | "completion_tokens") => {
+                        "reported usage subtotal; request and lane coverage is unknown"
+                    }
+                    Some(_) => "scoped assessment and completeness evidence is unavailable",
+                };
+                metric_gaps.push(EvaluationMetricGap {
+                    trial_id: trial_id.clone(),
+                    dimension: dimension.into(),
+                    metric: metric.into(),
+                    expected_unit: unit.into(),
+                    reason: reason.into(),
+                });
+            }
+        }
+        markdown.push_str("\n## Metric coverage\n\n");
+        for gap in &metric_gaps {
+            markdown.push_str(&format!(
+                "- `{}` / {} / `{}`: {}\n",
+                gap.trial_id, gap.dimension, gap.metric, gap.reason
+            ));
+        }
+    } else {
+        markdown.push_str("\n## Metric coverage\n\nRequirements were not frozen; dimension coverage is unknown.\n");
+    }
     let missing_trial_ids = report.missing_trial_ids.clone();
     let unavailable_trial_ids = normalized_unavailable.into_iter().collect::<Vec<_>>();
     let evidence_incomplete = report.observations.iter().any(|observation| {
@@ -194,7 +252,12 @@ pub fn build_report_artifact(
         observed_trial_count: report.observed_trial_count,
         missing_trial_ids,
         unavailable_trial_ids,
-        evidence_incomplete: !report.unavailable.is_empty() || evidence_incomplete,
+        evidence_incomplete: !requirements_frozen
+            || !metric_gaps.is_empty()
+            || !report.unavailable.is_empty()
+            || evidence_incomplete,
+        requirements_frozen,
+        metric_gaps,
     };
     let report_payload = json!({
         "schema_version": EVALUATION_REPORT_SCHEMA_VERSION,
@@ -306,6 +369,7 @@ mod tests {
                 max_wall_time_secs: 60,
             },
             adapter_profile_version: None,
+            measurement_profile: None,
         };
         let fingerprint = spec.spec_fingerprint().expect("spec fingerprint");
         let experiment = EvaluationExperimentRecord {
@@ -361,6 +425,116 @@ mod tests {
             })
             .collect();
         (experiment, observations)
+    }
+
+    #[test]
+    fn frozen_requirements_cover_every_planned_trial_and_dimension() {
+        let (mut experiment, mut observations) = fixture();
+        experiment.spec.measurement_profile =
+            Some(super::super::measurement_profile::MeasurementProfile::InstructionOnlyV1);
+        experiment.spec_fingerprint = experiment.spec.spec_fingerprint().unwrap();
+        // Profile changes intentionally produce new trial identities.
+        observations.clear();
+        let artifact =
+            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
+                .unwrap();
+        assert!(artifact.manifest.coverage.requirements_frozen);
+        assert!(artifact.manifest.coverage.evidence_incomplete);
+        assert_eq!(artifact.manifest.coverage.metric_gaps.len(), 24);
+        let dimensions = artifact
+            .manifest
+            .coverage
+            .metric_gaps
+            .iter()
+            .map(|gap| gap.dimension.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            dimensions,
+            BTreeSet::from([
+                "task",
+                "tool",
+                "context",
+                "provider",
+                "safety",
+                "reliability",
+                "cost"
+            ])
+        );
+        assert!(
+            artifact
+                .manifest
+                .coverage
+                .metric_gaps
+                .iter()
+                .all(|gap| gap.reason == "required measurement is missing")
+        );
+    }
+
+    #[test]
+    fn reported_usage_does_not_prove_complete_cost() {
+        let (mut experiment, mut observations) = fixture();
+        experiment.spec.measurement_profile =
+            Some(super::super::measurement_profile::MeasurementProfile::InstructionOnlyV1);
+        experiment.spec_fingerprint = experiment.spec.spec_fingerprint().unwrap();
+        for (record, trial) in observations
+            .iter_mut()
+            .zip(experiment.spec.plan_trials().unwrap())
+        {
+            record.trial_id = trial.trial_id.clone();
+            record.observation.trial_id = trial.trial_id;
+            record.observation.experiment_fingerprint = experiment.spec_fingerprint.clone();
+            record.observation.measurements[0].name = "prompt_tokens".into();
+            record.observation.measurements[0].value = Some(0.0);
+        }
+        let artifact =
+            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
+                .unwrap();
+        let gaps = artifact
+            .manifest
+            .coverage
+            .metric_gaps
+            .iter()
+            .filter(|gap| gap.metric == "prompt_tokens")
+            .collect::<Vec<_>>();
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().all(|gap| gap.reason.contains("subtotal")));
+        assert!(artifact.manifest.coverage.evidence_incomplete);
+        assert!(
+            artifact
+                .report
+                .observations
+                .iter()
+                .all(|item| item.measurements[0].value == Some(0.0))
+        );
+    }
+
+    #[test]
+    fn legacy_requirements_are_unknown_and_profile_changes_identity() {
+        let (experiment, observations) = fixture();
+        let legacy = serde_json::to_value(&experiment.spec).unwrap();
+        assert!(legacy.get("measurement_profile").is_none());
+        let restored: ExperimentSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.spec_fingerprint().unwrap(),
+            experiment.spec_fingerprint
+        );
+        assert_eq!(
+            restored.plan_trials().unwrap(),
+            experiment.spec.plan_trials().unwrap()
+        );
+        let artifact =
+            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
+                .unwrap();
+        assert!(!artifact.manifest.coverage.requirements_frozen);
+        assert!(artifact.manifest.coverage.evidence_incomplete);
+        assert!(artifact.markdown.contains("Requirements were not frozen"));
+        let mut profiled = restored;
+        profiled.measurement_profile =
+            Some(super::super::measurement_profile::MeasurementProfile::InstructionOnlyV1);
+        assert_ne!(
+            profiled.spec_fingerprint().unwrap(),
+            experiment.spec_fingerprint
+        );
     }
 
     #[test]

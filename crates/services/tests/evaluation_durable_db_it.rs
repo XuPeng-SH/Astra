@@ -65,6 +65,7 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             max_wall_time_secs: 300,
         },
         adapter_profile_version: None,
+        measurement_profile: None,
     }
 }
 

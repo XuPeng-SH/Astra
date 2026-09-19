@@ -271,6 +271,9 @@ pub fn build_prepared_experiment_spec(
             max_wall_time_secs: request.max_wall_time_secs,
         },
         adapter_profile_version: Some(EVALUATION_ADAPTER_PROFILE_VERSION.to_string()),
+        measurement_profile: Some(
+            super::measurement_profile::MeasurementProfile::InstructionOnlyV1,
+        ),
     };
     spec.validate()
         .map_err(EvaluationBootstrapError::InvalidInput)?;
@@ -677,6 +680,7 @@ mod tests {
                 max_wall_time_secs: 30,
             },
             adapter_profile_version: None,
+            measurement_profile: None,
         };
         let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
         let planned = spec.plan_trials().expect("trials");
@@ -1121,6 +1125,12 @@ mod tests {
         )
         .expect("spec");
         assert!(prepared_request_matches_spec(&request, &spec));
+        assert!(spec.measurement_profile.is_some());
+        let mut legacy = spec.clone();
+        legacy.measurement_profile = None;
+        let fingerprint = legacy.spec_fingerprint().unwrap();
+        assert!(prepared_request_matches_spec(&request, &legacy));
+        assert_eq!(legacy.spec_fingerprint().unwrap(), fingerprint);
         let mut changed = request;
         changed.case.message = "different input".to_string();
         assert!(!prepared_request_matches_spec(&changed, &spec));

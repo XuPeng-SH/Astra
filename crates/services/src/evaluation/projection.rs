@@ -366,6 +366,7 @@ mod tests {
                 max_wall_time_secs: 60,
             },
             adapter_profile_version: None,
+            measurement_profile: None,
         };
         let fingerprint = spec.spec_fingerprint().expect("spec fingerprint");
         let experiment = EvaluationExperimentRecord {
