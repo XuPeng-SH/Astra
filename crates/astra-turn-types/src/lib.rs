@@ -19,6 +19,7 @@ mod canonical_tool_pairing;
 mod completion_settlement;
 #[doc(hidden)]
 pub use completion_settlement::deserialize_required_option;
+pub mod context_execution;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
@@ -29,6 +30,8 @@ mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
+mod llm_transport;
+pub use llm_transport::{LLM_TRANSPORT_POLICY_VERSION, LlmTransportConfig};
 mod memory_ranking;
 mod memory_structure;
 mod permission_mode;

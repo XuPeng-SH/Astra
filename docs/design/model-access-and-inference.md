@@ -994,6 +994,16 @@ User model responses optionally include `thinking_probe`; a missing or stale
 observation is absent, while an inconclusive check has an error. A thinking
 probe failure does not disable a model whose connectivity check succeeded.
 
+Runtime provider calls carry an explicit immutable transport instance containing
+both the HTTP client and its captured timeout, stream-progress, retry, and proxy
+settings. Main calls and auxiliary summaries share that instance. Nonstream
+completions, Skillify, and memory inference use the same transport owner;
+completions no longer construct a separate fixed-timeout, proxy-disabled client.
+Client construction failures do not fall back to a client with different settings.
+These settings do not replace Offering authorization or endpoint-specific network
+restrictions. A transport snapshot alone is not a complete Evaluation execution
+snapshot: context, prompt, model, and runtime policy inputs must also be bound.
+
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing
 provider-attempt deadline/settlement owner, not an outer cancelling timeout.

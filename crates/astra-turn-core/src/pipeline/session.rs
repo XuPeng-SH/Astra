@@ -627,7 +627,7 @@ impl PipelineSession {
     pub fn current_pressure_tier(&self) -> CompactionTier {
         // Delegate to the single source of truth for recovery escalation
         // (CompactionTier::escalate_for_recovery) to avoid threshold desync.
-        CompactionTier::Normal.escalate_for_recovery(&self.recovery)
+        CompactionTier::Normal.escalate_for_recovery(self.recovery.consecutive_ptl_errors)
     }
 
     /// Whether the session should abort (unrecoverable error streak).
@@ -972,6 +972,7 @@ mod tests {
 
     fn test_session_context() -> SessionContext {
         SessionContext {
+            compaction_thresholds: Default::default(),
             session_id: "sess-1".into(),
             run_id: "run-1".into(),
             model_id: "claude-sonnet-4-6".into(),
@@ -1407,6 +1408,65 @@ mod tests {
         assert_eq!(sess.turns_completed(), 5);
         assert_eq!(sess.stats.turns_executed, 5);
         assert!(sess.stats.avg_cache_hit_ratio > 0.0);
+    }
+
+    #[test]
+    fn adaptive_pipeline_uses_admitted_thresholds_and_preserves_recovery_escalation() {
+        use astra_turn_types::context_execution::{CompactConfig, ContextBudget};
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let external = test_external();
+        for (threshold, ptl_errors, expected) in [
+            (0.75, 0, CompactionTier::TrimSchemas),
+            (0.60, 0, CompactionTier::CompactHistory),
+            (0.75, 2, CompactionTier::CompactHistory),
+        ] {
+            let budget = ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                threshold,
+                6,
+                8_000,
+                CompactConfig::default(),
+            );
+            let mut session = test_session_context();
+            session.model_limit = budget.effective_input_limit() as u32;
+            session.pre_reserved_output_tokens = budget.capped_output_tokens() as u32;
+            session.compaction_thresholds = budget.compaction_thresholds();
+            let mut turn = test_turn_state(1);
+            // Same occupancy, catalog limits, and prompt in each comparison.
+            turn.tokens = TokenAccounting::from_fields(
+                (budget.effective_input_limit() as u64 * 65) / 100,
+                0,
+                0,
+                0,
+            );
+            let mut pipeline = PipelineSession::new(PipelineConfig::default());
+            for _ in 0..ptl_errors {
+                pipeline.recovery.record_ptl_error();
+            }
+            let output = pipeline
+                .run_turn_adaptive_with_history_owner(
+                    AdaptiveTurnInput {
+                        statics: &statics,
+                        agent: &agent,
+                        session: &session,
+                        turn: &turn,
+                        external: &external,
+                        model_id: "threshold-test",
+                        query_source: "test",
+                    },
+                    HistoryOptimizationOwner::DownstreamSemanticCompactor,
+                )
+                .expect("admitted pipeline should execute");
+            assert_eq!(
+                output.plan.compact_tier, expected,
+                "threshold={threshold}, ptl={ptl_errors}"
+            );
+            assert!(output.plan.pressure.raw > 0.64 && output.plan.pressure.raw < 0.66);
+            assert_eq!(output.plan.reserves.output_tokens, 0);
+        }
     }
 
     #[test]

@@ -7,10 +7,10 @@ use astra_turn_core::cloud_summary::{SummaryLlmClient, SummaryResponse};
 use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
 use astra_turn_types::InferencePurpose;
 
-use super::client::{LlmCall, OwnedLlmExecutionRoute};
+use super::client::{LlmCall, LlmTransport, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
 
-use super::client::{auxiliary_execution_budget, global_llm_client, llm_nonstream_timeout};
+use super::client::bounded_auxiliary_budget;
 
 #[derive(Clone)]
 struct DurableSummaryExecution {
@@ -152,6 +152,7 @@ struct ResolvedSummaryGenerationPolicy {
 /// response parsing remain centralized in the canonical LLM client.
 #[derive(Clone)]
 pub(crate) struct RuntimeSummaryClient {
+    transport: Arc<LlmTransport>,
     route: OwnedLlmExecutionRoute,
     max_output_tokens: usize,
     prompt_cache_tools: Vec<Value>,
@@ -186,6 +187,7 @@ impl RuntimeSummaryClient {
 
     #[must_use]
     pub(crate) fn new_with_attempt_allocator(
+        transport: Arc<LlmTransport>,
         route: OwnedLlmExecutionRoute,
         max_output_tokens: usize,
         ledger: DurableInferenceLedger,
@@ -193,6 +195,7 @@ impl RuntimeSummaryClient {
         attempt_allocator: DurableSummaryAttemptAllocator,
     ) -> Self {
         Self {
+            transport,
             route,
             max_output_tokens,
             prompt_cache_tools: Vec::new(),
@@ -353,12 +356,17 @@ impl RuntimeSummaryClient {
     }
 
     /// Low-level provider-adapter constructor for unit tests. Production
-    /// summary paths must use [`Self::new`] so auxiliary calls cannot bypass
+    /// summary paths must use [`Self::new_with_attempt_allocator`] so auxiliary calls cannot bypass
     /// durable admission and usage settlement.
     #[cfg(test)]
     #[must_use]
-    pub fn new_direct_for_test(route: OwnedLlmExecutionRoute, max_output_tokens: usize) -> Self {
+    pub fn new_direct_for_test(
+        transport: Arc<LlmTransport>,
+        route: OwnedLlmExecutionRoute,
+        max_output_tokens: usize,
+    ) -> Self {
         Self {
+            transport,
             route,
             max_output_tokens,
             prompt_cache_tools: Vec::new(),
@@ -434,6 +442,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         durable_pair_base
                     };
                     let call = LlmCall {
+                        transport: &self.transport,
                         purpose,
                         messages,
                         tools: &self.prompt_cache_tools,
@@ -449,10 +458,18 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         if self.route.provider == "typesafe" {
                             ledger
                                 .execute_nonstream_with_execution_round(
-                                    global_llm_client(),
+                                    &self.transport.client,
                                     scope,
                                     call,
-                                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                                    bounded_auxiliary_budget(
+                                        purpose,
+                                        std::time::Duration::from_millis(
+                                            self.transport.config().nonstream_timeout_ms,
+                                        ),
+                                        std::time::Duration::from_millis(
+                                            self.transport.config().introspection_budget_ms,
+                                        ),
+                                    ),
                                     execution_round,
                                 )
                                 .await
@@ -469,10 +486,17 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         if self.route.provider == "typesafe" {
                             ledger
                                 .execute_nonstream(
-                                    global_llm_client(),
                                     scope,
                                     call,
-                                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                                    bounded_auxiliary_budget(
+                                        purpose,
+                                        std::time::Duration::from_millis(
+                                            self.transport.config().nonstream_timeout_ms,
+                                        ),
+                                        std::time::Duration::from_millis(
+                                            self.transport.config().introspection_budget_ms,
+                                        ),
+                                    ),
                                 )
                                 .await
                         } else {
@@ -503,8 +527,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             #[cfg(test)]
             SummaryExecution::Direct => (
                 crate::turn::llm::client::call_llm_nonstream_no_tool_choice(
-                    global_llm_client(),
                     LlmCall {
+                        transport: &self.transport,
                         purpose,
                         messages,
                         tools: &self.prompt_cache_tools,
@@ -515,7 +539,11 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         has_fallback: false,
                         thinking,
                     },
-                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                    bounded_auxiliary_budget(
+                                    purpose,
+                                    std::time::Duration::from_millis(self.transport.config().nonstream_timeout_ms),
+                                    std::time::Duration::from_millis(self.transport.config().introspection_budget_ms),
+                                ),
                 )
                 .await,
                 None,
@@ -1261,8 +1289,12 @@ mod tests {
                 astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         };
-        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64)
-            .with_prompt_cache_context(tools.clone(), cache_capability);
+        let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
+            summary_route(&execution),
+            64,
+        )
+        .with_prompt_cache_context(tools.clone(), cache_capability);
         let messages = vec![
             serde_json::json!({"role": "system", "content": "stable prefix"}),
             serde_json::json!({"role": "user", "content": "summarize"}),
@@ -1295,6 +1327,7 @@ mod tests {
 
     async fn summary_with_commit_ack_delay(
         delay: std::time::Duration,
+        introspection_budget_ms: u64,
     ) -> (
         Result<SummaryResponse, astra_core::ClassifiedError>,
         u32,
@@ -1336,7 +1369,13 @@ mod tests {
         )
         .unwrap()
         .with_run_authority(summary_authority());
+        let mut config = crate::turn::llm::client::capture_transport_config();
+        config.introspection_budget_ms = introspection_budget_ms;
+        let transport = Arc::new(
+            LlmTransport::build(config, astra_core::net::ResolvedProxyConfig::capture()).unwrap(),
+        );
         let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            transport,
             summary_route(&execution),
             1_024,
             ledger,
@@ -1360,7 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn durable_summary_receives_success_and_usage_after_slow_commit_ack() {
         let (summary, requests, attempts) =
-            summary_with_commit_ack_delay(std::time::Duration::from_secs(1)).await;
+            summary_with_commit_ack_delay(std::time::Duration::from_millis(100), 1_000).await;
         let summary =
             summary.expect("unused provider time remains available for commit acknowledgement");
         astra_services::parse_work_admission_response(&summary.text).unwrap();
@@ -1375,7 +1414,7 @@ mod tests {
     #[tokio::test]
     async fn durable_summary_timeout_preserves_error_kind_and_provider_usage() {
         let (summary, requests, attempts) =
-            summary_with_commit_ack_delay(std::time::Duration::from_secs(9)).await;
+            summary_with_commit_ack_delay(std::time::Duration::from_secs(1), 200).await;
         let error =
             summary.expect_err("a late durable success cannot authorize foreground delivery");
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
@@ -1468,6 +1507,7 @@ mod tests {
                     .unwrap()
                     .with_run_authority(summary_authority());
                     RuntimeSummaryClient::new_with_attempt_allocator(
+                        Arc::new(crate::turn::llm::client::test_llm_transport()),
                         summary_route(&execution),
                         1_024,
                         ledger,
@@ -1475,7 +1515,11 @@ mod tests {
                         DurableSummaryAttemptAllocator::default(),
                     )
                 } else {
-                    RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 1_024)
+                    RuntimeSummaryClient::new_direct_for_test(
+                        Arc::new(crate::turn::llm::client::test_llm_transport()),
+                        summary_route(&execution),
+                        1_024,
+                    )
                 };
                 let messages = vec![serde_json::json!({
                     "role": "user",
@@ -1526,7 +1570,11 @@ mod tests {
         route.model_name = "arbitrary-local-alias".into();
         route.thinking_protocol =
             Some(astra_core::model_wire::thinking::ThinkingProtocol::Moonshot);
-        let client = RuntimeSummaryClient::new_direct_for_test(route, 1024);
+        let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
+            route,
+            1024,
+        );
         assert_eq!(
             client
                 .summarize(
@@ -1574,7 +1622,11 @@ mod tests {
             "temperature".to_string(),
             serde_json::json!(0.7),
         )]));
-        let client = RuntimeSummaryClient::new_direct_for_test(route, 128);
+        let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
+            route,
+            128,
+        );
 
         client
             .summarize(
@@ -1621,7 +1673,11 @@ mod tests {
             }),
         );
         let execution = summary_execution(spawn_summary_test_server(app).await);
-        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64);
+        let client = RuntimeSummaryClient::new_direct_for_test(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
+            summary_route(&execution),
+            64,
+        );
         let summary = client
             .summarize(
                 InferencePurpose::Introspection,
@@ -1732,6 +1788,7 @@ mod tests {
             None,
         ));
         let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             OwnedLlmExecutionRoute {
                 model_name: execution.model_name.clone(),
                 wire_model_name: None,
@@ -1837,6 +1894,7 @@ mod tests {
         .expect("test ledger")
         .with_run_authority(summary_authority());
         let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             1_024,
             ledger,
@@ -1923,6 +1981,7 @@ mod tests {
         .with_run_authority(summary_authority());
         let allocator = DurableSummaryAttemptAllocator::default();
         let first = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger.clone(),
@@ -1930,6 +1989,7 @@ mod tests {
             allocator.clone(),
         );
         let second = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger,
@@ -1972,6 +2032,7 @@ mod tests {
         .expect("durable summary ledger")
         .with_run_authority(summary_authority());
         let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger,
@@ -2018,6 +2079,7 @@ mod tests {
         let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
 
         RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger.clone(),
@@ -2028,6 +2090,7 @@ mod tests {
         .await
         .expect("prior host summary");
         RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger,
@@ -2077,6 +2140,7 @@ mod tests {
         .expect("durable summary ledger")
         .with_run_authority(summary_authority());
         let first = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger.clone(),
@@ -2084,6 +2148,7 @@ mod tests {
             DurableSummaryAttemptAllocator::default(),
         );
         let second = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(crate::turn::llm::client::test_llm_transport()),
             summary_route(&execution),
             64,
             ledger,
