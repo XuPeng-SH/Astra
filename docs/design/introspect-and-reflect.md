@@ -227,8 +227,11 @@ sources. Source-excluded and unrelated facets do not read these local artifacts.
 Repeated physical attempts are counted once. Conflicting attribution or known
 token buckets, or conflicting turn/usage facts, make captured usage unavailable;
 a higher usage-status rank cannot override contradictory evidence. Explain's
-text, TUI and HTML views share this rule. Conflicts are neither zero usage nor
-producer truncation. Lightweight reflection retains scoped usage in typed
+text, TUI, SDK/Web and HTML views share this rule. A conflicting incoming turn
+fact remains a coverage conflict even when it is discarded and the retained
+node has no usage; consumers must show unavailable totals rather than hide the
+usage section. Conflicts are neither zero usage nor producer truncation.
+Lightweight reflection retains scoped usage in typed
 fields without replacing execution diagnoses in the summary.
 
 Reflection may produce:

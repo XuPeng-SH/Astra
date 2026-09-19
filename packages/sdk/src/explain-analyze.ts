@@ -54,6 +54,8 @@ export type ExplainAnalyzeGraphV1 = {
   duplicateEventCount: number;
   conflictedNodeIds: string[];
   coverageGaps: ExplainAnalyzeCoverageGapV1[];
+  /** Sticky evidence loss when a conflicting incoming turn fact is discarded. */
+  auxiliaryCaptureConflicted?: boolean;
 };
 
 const nodeKinds = new Set([
@@ -210,6 +212,17 @@ function isAuxiliaryUsage(value: unknown): boolean {
 export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1): string[] {
   type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
   const attempts = new Map<string, Attempt>();
+  const known = new Map<string, (number | undefined)[]>();
+  const buckets = (a: Attempt) => [a.usage?.fresh_input_tokens, a.usage?.output_tokens, a.usage?.cache_read_tokens, a.usage?.cache_creation_tokens];
+  const identity = (a: Attempt) => JSON.stringify([a.provider, a.offering_id, a.model_name, a.purpose, a.operation_id]);
+  const rank = { unavailable: 0, provider_partial: 1, provider_exact: 2 };
+  const preferred = (a: Attempt, b: Attempt) => {
+    const left = [rank[a.usage_status], Number(!!a.usage), ...buckets(a).map(v => v ?? -1)];
+    const right = [rank[b.usage_status], Number(!!b.usage), ...buckets(b).map(v => v ?? -1)];
+    for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i] > right[i];
+    return false;
+  };
+  let conflicted = graph.auxiliaryCaptureConflicted === true || graph.nodes.some(n => n.conflicted && (n.kind === "turn" || !!n.auxiliaryUsage));
   let unavailable = false;
   let truncated = false;
   for (const node of graph.nodes) {
@@ -218,11 +231,20 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
     truncated ||= node.auxiliaryUsage.truncated === true;
     for (const attempt of node.auxiliaryUsage.attempts) {
       const existing = attempts.get(attempt.attempt_id);
-      const rank = { unavailable: 0, provider_partial: 1, provider_exact: 2 };
-      if (!existing || rank[attempt.usage_status] > rank[existing.usage_status] ||
-        (attempt.usage_status === existing.usage_status && !existing.usage && attempt.usage)) attempts.set(attempt.attempt_id, attempt);
+      const previous = known.get(attempt.attempt_id) ?? buckets(attempt);
+      if (existing) conflicted ||= identity(existing) !== identity(attempt);
+      buckets(attempt).forEach((value, index) => {
+        if (value !== undefined) {
+          if (previous[index] !== undefined && previous[index] !== value) conflicted = true;
+          previous[index] ??= value;
+        }
+      });
+      known.set(attempt.attempt_id, previous);
+      // Consensus is only conflict evidence; never synthesize a richer record.
+      if (!existing || preferred(attempt, existing)) attempts.set(attempt.attempt_id, attempt);
     }
   }
+  if (conflicted) return ["Auxiliary tokens · capture unavailable: conflicting attribution or usage facts; totals unavailable"];
   const groups = new Map<string, Attempt[]>();
   for (const attempt of attempts.values()) {
     const key = JSON.stringify([attempt.provider,attempt.offering_id,attempt.model_name,attempt.purpose,attempt.operation_id]);
@@ -407,6 +429,7 @@ export function reduceExplainAnalyzeEvents(
   const nodes = new Map<string, ExplainAnalyzeNodeV1>();
   const conflictedNodeIds = new Set<string>();
   let duplicateEventCount = 0;
+  let auxiliaryCaptureConflicted = false;
   const diagnostics: ExplainAnalyzeDiagnosticV1[] = [];
 
   for (const value of events) {
@@ -421,6 +444,7 @@ export function reduceExplainAnalyzeEvents(
     if (seen !== undefined) {
       duplicateEventCount += 1;
       if (seen !== fingerprint) {
+        auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage;
         conflictedNodeIds.add(value.node_id);
         // A reused event identity can also point at a different node.
         const original = JSON.parse(seen) as { node_id: string };
@@ -518,7 +542,10 @@ export function reduceExplainAnalyzeEvents(
       node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
-    if (node.conflicted) conflictedNodeIds.add(node.nodeId);
+    if (node.conflicted) {
+      conflictedNodeIds.add(node.nodeId);
+      auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage;
+    }
   }
 
   const orderedNodes = [...nodes.values()];
@@ -562,6 +589,7 @@ export function reduceExplainAnalyzeEvents(
     duplicateEventCount,
     conflictedNodeIds: [...conflictedNodeIds].sort(),
     coverageGaps: [...new Set(orderedNodes.flatMap((node) => node.coverageGaps))].sort(),
+    auxiliaryCaptureConflicted,
   };
 }
 

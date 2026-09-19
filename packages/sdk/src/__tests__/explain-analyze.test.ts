@@ -766,14 +766,69 @@ describe("auxiliary provider usage", () => {
   });
 });
 
+describe("auxiliary conflict parity", () => {
+  const attempt = {attempt_id: "same", provider: "typesafe", offering_id: "jev", model_name: "jev", purpose: "introspection", operation_id: "request_judgment", usage_status: "provider_exact" as const, usage: {basis: "provider_exact" as const, fresh_input_tokens: 100}};
+  type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
+  const event = (id: string, a: Attempt = attempt) => finished(id, "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [a]}});
+  for (const field of ["provider", "offering_id", "model_name", "purpose", "operation_id", "fresh_input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"]) {
+    it(`rejects conflicting ${field} in either segment order`, () => {
+      const bucket = field.endsWith("tokens");
+      const first = bucket ? {...attempt, usage: {...attempt.usage, [field]: 100}} : attempt;
+      const second = bucket ? {...attempt, usage: {...attempt.usage, [field]: 200}} : {...attempt, [field]: "different"};
+      const events = [event("one", first), event("two", second)];
+      for (const order of [events, [...events].reverse()]) {
+        const graph = reduceExplainAnalyzeEvents(order);
+        const lines = explainAnalyzeAuxiliaryUsageLines(graph);
+        expect(lines).toEqual([expect.stringContaining("capture unavailable")]);
+        expect(lines.join()).not.toContain("requests reported");
+        const html = renderExplainAnalyzeHtml(order);
+        expect(html).toContain("totals unavailable");
+        expect(html).not.toContain("1/1 requests reported");
+      }
+    });
+  }
+  it("retains same-node and reused-event conflicts even when incoming usage is discarded", () => {
+    for (const sameEventId of [false, true]) {
+      const without = finished("one", "preparation", 0, 10);
+      const withUsage = {...event("one"), event_id: sameEventId ? without.event_id : "other-event"};
+      const replay = event("independent");
+      for (const order of [[without, withUsage, replay], [withUsage, without, replay], [replay, without, withUsage]]) {
+        expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))).toEqual([expect.stringContaining("capture unavailable")]);
+        expect(renderExplainAnalyzeHtml(order)).toContain("totals unavailable");
+      }
+      for (const order of [[without, withUsage], [withUsage, without]]) {
+        const html = renderExplainAnalyzeHtml(order);
+        expect(html).toContain("capture unavailable");
+        expect(html).not.toContain("requests reported");
+      }
+      const sameTurn = finished("one", "turn", 0, 10);
+      for (const order of [[sameTurn, withUsage, replay], [withUsage, sameTurn, replay]]) {
+        expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))).toEqual([expect.stringContaining("capture unavailable")]);
+      }
+    }
+  });
+  it("keeps weaker known buckets as conflict evidence without merging them into exact usage", () => {
+    const partial = event("partial", {...attempt, usage_status: "provider_partial", usage: {basis: "provider_partial", fresh_input_tokens: 100, output_tokens: 3}});
+    const exact = event("exact");
+    const conflicting = event("conflicting", {...attempt, usage: {...attempt.usage, output_tokens: 4}});
+    for (const order of [[partial, exact], [exact, partial]]) {
+      expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))[0]).toContain("out unknown");
+      expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([...order, conflicting]))[0]).toContain("capture unavailable");
+    }
+  });
+});
+
 it("upgrades auxiliary usage from unavailable through partial to exact across segments", () => {
   const attempt = {attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "verification_judge", operation_id: "verification_judge"};
   const missing = finished("one", "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "unavailable"}]}});
   const partial = finished("two", "turn", 10, 20, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_partial"}]}});
   expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial]))[0]).toContain("partial");
   const exact = finished("three", "turn", 20, 30, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_exact", usage: {basis: "provider_exact", fresh_input_tokens: 100, output_tokens: 0}}]}});
-  const output = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial, exact]))[0];
-  expect(output).toContain("in 100");
-  expect(output).toContain("out 0");
-  expect(output).not.toContain("partial");
+  for (const order of [[missing, partial, exact], [exact, partial, missing]]) {
+    const output = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))[0];
+    expect(output).toContain("in 100");
+    expect(output).toContain("out 0");
+    expect(output).toContain("cache read unknown");
+    expect(output).not.toContain("partial");
+  }
 });

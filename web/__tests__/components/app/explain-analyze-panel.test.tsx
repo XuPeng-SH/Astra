@@ -24,6 +24,43 @@ const identity = {
 };
 
 describe("ExplainAnalyzePanel", () => {
+  it.each([false, true])("shows unavailable auxiliary totals for conflicting captures (reverse=%s)", (reverse) => {
+    const events = [100, 200].map((input, index) => ({
+      ...identity, event_id: `turn-${index}:finish`, node_id: `turn-${index}`,
+      kind: "turn" as const, label: "User turn", transition: "finished" as const,
+      elapsed_ms: 10, start_elapsed_ms: 0, duration_ms: 10, outcome: "completed" as const,
+      auxiliary_usage: {available: true, attempts: [{
+        attempt_id: "same-attempt", provider: "typesafe", offering_id: "jev", model_name: "jev",
+        purpose: "introspection", operation_id: "request_judgment", usage_status: "provider_exact" as const,
+        usage: {basis: "provider_exact" as const, fresh_input_tokens: input},
+      }]},
+    }));
+    render(<ExplainAnalyzePanel events={reverse ? events.reverse() : events} />);
+    const usage = screen.getByLabelText("Auxiliary model token usage");
+    expect(usage.textContent).toContain("capture unavailable");
+    expect(usage.textContent).toContain("totals unavailable");
+    expect(usage.textContent).not.toContain("requests reported");
+    expect(usage.textContent).not.toContain("in 100");
+  });
+
+  it.each([false, true])("shows discarded incoming auxiliary conflict without any retained usage (reverse=%s)", (reverse) => {
+    const base = {...identity, event_id: "same-event", node_id: "same-node", label: "Stage",
+      transition: "finished" as const, elapsed_ms: 10, start_elapsed_ms: 0, duration_ms: 10,
+      outcome: "completed" as const};
+    const events = [
+      {...base, kind: "preparation" as const},
+      {...base, kind: "turn" as const, auxiliary_usage: {available: true, attempts: [{
+        attempt_id: "same-attempt", provider: "typesafe", offering_id: "jev", model_name: "jev",
+        purpose: "introspection", operation_id: "request_judgment", usage_status: "provider_exact" as const,
+        usage: {basis: "provider_exact" as const, fresh_input_tokens: 100},
+      }]}},
+    ];
+    render(<ExplainAnalyzePanel events={reverse ? events.reverse() : events} />);
+    const usage = screen.getByLabelText("Auxiliary model token usage");
+    expect(usage.textContent).toContain("capture unavailable");
+    expect(usage.textContent).not.toContain("requests reported");
+  });
+
   it("shows memory candidate decisions and distinguishes selection from injection", () => {
     const consoleError = vi.spyOn(console, "error");
     render(<ExplainAnalyzePanel events={[{
