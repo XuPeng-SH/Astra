@@ -7899,6 +7899,29 @@ impl AgenticRunLifecycleService {
             }
         };
         result.map_err(|error| {
+            if request.evaluation_admission.is_some()
+                && let Some((code, detail)) = error.split_once(": ")
+            {
+                let rejection = match code {
+                    "evaluation_trial_order_blocked" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_order_blocked"))
+                    }
+                    "evaluation_trial_capacity_exhausted" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_capacity_exhausted"))
+                    }
+                    "evaluation_trial_binding_conflict" => {
+                        Some((StatusCode::CONFLICT, "evaluation_trial_binding_conflict"))
+                    }
+                    "evaluation_trial_admission_invalid" => Some((
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_trial_admission_invalid",
+                    )),
+                    _ => None,
+                };
+                if let Some((status, code)) = rejection {
+                    return evaluation_preflight_error(status, code, detail);
+                }
+            }
             let status = if error == "session already has an active run" {
                 StatusCode::CONFLICT
             } else {
@@ -8425,10 +8448,9 @@ impl AgenticRunLifecycleService {
                 "snapshot envelope does not prove the admitted Context and policy",
             ));
         }
-        // Claim the trial only after every caller-controlled identity and
-        // policy value has matched the frozen experiment.  The CAS is the
-        // cross-process/multi-session fence; an exact retry for this run is
-        // idempotent, while a competing run receives a conflict.
+        // Run creation already bound this trial atomically under the frozen
+        // execution protocol. Confirm that identity before materialization;
+        // this path cannot claim a planned trial or allocate another slot.
         let binding = plan_store
             .bind_trial_run(user_id, &admission.trial_id, session_id, run_id)
             .await
