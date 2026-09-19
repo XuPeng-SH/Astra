@@ -10774,6 +10774,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     let revision_hash = content_fingerprint("Frozen revision text");
     let admitted_model = crate::server::model_execution_admission::admit_model_execution(
         &service.model_service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         &owner,
         &astra_turn_types::ModelSelection {
             offering_id: "model-test-model".into(),
@@ -11961,6 +11962,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     };
     let admitted_model = crate::server::model_execution_admission::admit_model_execution(
         &service.model_service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         &owner,
         &astra_turn_types::ModelSelection {
             offering_id: "model-test-model".into(),

@@ -72,6 +72,26 @@ comparison input; none of them owns trial identity, assessment, or report
 semantics. Historical quality-tracker data is observational context and cannot
 stand in for a paired evaluation.
 
+Judgment comparisons must establish a capable baseline without Jev and measure
+the additional decision quality and efficiency when Jev is available. Core
+functionality must not require Jev; an explicitly selected Jev-only strategy
+retains its declared failure behavior.
+
+Judgment policies are also comparison inputs. The judgment contract is
+provider-neutral: an ordinary LLM can substitute for Jev, and Jev can be an
+enhancement or the sole judgment backend. Any permitted backend fallback is
+explicit and frozen; Jev-only never implies a fallback LLM call. Low-latency,
+low-cost judgment providers can support frequent classification, relevance,
+routing and direction decisions. Enhancement policies may enable decision
+points or frequencies that are too expensive for the baseline, rather than
+only substituting a cheaper backend for identical calls. Evaluation must
+measure whether those decisions improve downstream
+task outcomes, together with their added latency and all physical-attempt costs.
+A judgment comparison must freeze the Offering, question contract, thresholds
+and invocation policy; confidence or a successful judgment call alone is not
+evidence of improved agent behavior. This is a target beyond the current
+instruction-only profile.
+
 The initial planned isolation profile is `prompt_only_private`: the task input
 and declared read-only resources are frozen, external side effects are
 rejected, and production ranking, reflection, and learning writes are
@@ -151,6 +171,11 @@ started on different days. An exact prepare or Run retry returns its durable
 identity before resolving new configuration. The same backbone consumers use
 the frozen values; live provider admission and actual provider outcomes remain
 external execution evidence rather than guarantees of identical model output.
+
+The current profile admits a chat-capable primary Offering and does not freeze
+an independent judgment Offering. Isolated trials therefore cannot resolve the
+live admin judgment route; adding judgment comparisons requires an explicit
+frozen route and policy contract first.
 
 Every experiment requires `measurement_profile: "instruction-only.v1"`.
 This immutable version defines the required task, tool, context, provider,

@@ -114,6 +114,7 @@ pub async fn prepare_experiment(
 
     let admitted = crate::server::model_execution_admission::admit_model_execution(
         &state.model_service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         owner_user_id,
         &ModelSelection {
             offering_id: request.model_offering_id.clone(),

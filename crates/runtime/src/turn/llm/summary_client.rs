@@ -544,10 +544,14 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         thinking,
                     },
                     bounded_auxiliary_budget(
-                                    purpose,
-                                    std::time::Duration::from_millis(self.transport.config().nonstream_timeout_ms),
-                                    std::time::Duration::from_millis(self.transport.config().introspection_budget_ms),
-                                ),
+                        purpose,
+                        std::time::Duration::from_millis(
+                            self.transport.config().nonstream_timeout_ms,
+                        ),
+                        std::time::Duration::from_millis(
+                            self.transport.config().introspection_budget_ms,
+                        ),
+                    ),
                 )
                 .await,
                 None,
@@ -878,8 +882,10 @@ mod tests {
         .unwrap()
         .with_run_authority(summary_authority());
         let client = RuntimeSummaryClient::new_with_attempt_allocator(
+            Arc::new(LlmTransport::capture().unwrap()),
             summary_route(&execution),
             1024,
+            InferencePurpose::Introspection,
             ledger,
             summary_scope(),
             DurableSummaryAttemptAllocator::default(),

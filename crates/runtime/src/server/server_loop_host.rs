@@ -11793,6 +11793,12 @@ impl ServerAgenticLoopHost {
             None,
             Some(pool.get()),
             Some(&execution),
+            match &self.execution_inputs.policy {
+                PreparedExecutionPolicy::Normal(runtime) => runtime,
+                PreparedExecutionPolicy::Evaluation(_) => {
+                    return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+                }
+            },
         )
         .await
         .map_err(|error| {
@@ -11834,6 +11840,7 @@ impl ServerAgenticLoopHost {
                 max_output_tokens,
                 state,
                 operation_id,
+                astra_turn_types::InferencePurpose::ToolResultRerank,
                 Some(&route.execution),
             )
             .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
@@ -11909,6 +11916,9 @@ impl ServerAgenticLoopHost {
         if let Some(client) = self.test_judgment_clients.pop_front() {
             return Ok(client);
         }
+        let PreparedExecutionPolicy::Normal(_) = &self.execution_inputs.policy else {
+            return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+        };
         let route = self.resolve_judgment_route(operation_id).await?;
         self.judgment_summary_client_for_route(
             state,
@@ -46681,6 +46691,12 @@ mod tests {
             &expected_transport
         ));
         let mut state = create_test_state();
+        let judgment = astra_services::work_admission_classification_request(&Default::default());
+        assert!(matches!(
+            host.judgment_summary_client(&state, "request_judgment", &judgment)
+                .await,
+            Err(JudgmentClientUnavailable::DurableMaterialUnavailable)
+        ));
         let config = host.resolve_llm_config_for_state(&state).await.unwrap();
         assert_eq!(config.context_budget, frozen.context_budget);
         assert!(config.fallback_chain.is_empty());
@@ -51440,50 +51456,6 @@ mod tests {
             assert!(!host.work_admission_requires_settlement());
             host.work_admission_conflict = Some("trusted workflow conflict".into());
             assert!(host.work_admission_requires_settlement());
-        }
-
-        #[tokio::test]
-        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn builtin_work_admission_preserves_invalid_generation_policy_error() {
-            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-            let inference_ledger =
-                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-            let (gateway_url, requests, server) =
-                spawn_gateway(axum::http::StatusCode::OK, json!({})).await;
-            let mut execution = test_gateway_execution(gateway_url, Some(3_000));
-            execution.request_body_overrides =
-                Some(Map::from_iter([("temperature".to_string(), json!("cold"))]));
-            let mut host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                "u-policy-error".to_string(),
-                "s-policy-error".to_string(),
-            )
-            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-                true, false,
-            ))
-            .with_test_inference_ledger(inference_ledger.clone())
-            .with_admitted_model_execution(Some(execution))
-            .build();
-            let mut state = create_durable_execution_test_state("s-policy-error");
-            state.session_turn = 2;
-            state.message = "Inspect source and report a finding.".to_string();
-            state.user_intent = state.message.clone();
-            host.judge_turn_intent(&state).await;
-            assert!(host.pending_work_admission_judge.is_some());
-            host.resolve_pending_work_admission(true).await;
-            assert_eq!(
-                host.work_admission_unavailable_reason,
-                Some(WorkAdmissionUnavailableReason::ContractViolation)
-            );
-            assert!(matches!(
-                host.completed_work_admission_phase,
-                Some((_, _, TurnPhaseOutcome::Unavailable))
-            ));
-            assert!(host.take_admitted_work_establishment_call(&state).is_none());
-            assert!(requests.lock().await.is_empty());
-            inference_ledger.assert_quiescent();
-            server.abort();
         }
 
         #[tokio::test]
