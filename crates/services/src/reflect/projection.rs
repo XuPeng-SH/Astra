@@ -10,6 +10,15 @@ impl ReflectReport {
         if !matches!(depth, ObservationDepth::Hint | ObservationDepth::Summary) {
             return self;
         }
+        if let Some(usage) = self.judgment_usage.as_mut() {
+            let group_limit = if depth == ObservationDepth::Hint {
+                2
+            } else {
+                8
+            };
+            usage.omitted_groups += usage.groups.len().saturating_sub(group_limit);
+            usage.groups.truncate(group_limit);
+        }
         let (max_observations, max_evidence, max_hints) = depth.report_limits();
         let before = (
             self.observations.len(),
@@ -134,6 +143,7 @@ impl ReflectReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reflect::{JudgmentUsageGroup, JudgmentUsageSummary};
     use serde_json::json;
 
     fn large_report(depth: &str) -> ReflectReport {
@@ -167,6 +177,33 @@ mod tests {
             "action_hints":[{"target_type":"tool","summary":text,"confidence":{},"observation_refs":["obs-59"]}],
             "graph_slice":{"nodes":nodes,"edges":[]}
         })).unwrap()
+    }
+
+    #[test]
+    fn lightweight_judgment_groups_are_bounded_with_omission_count() {
+        let mut report = large_report("hint");
+        report.judgment_usage = Some(JudgmentUsageSummary {
+            coverage: "available".into(),
+            groups: (0..10)
+                .map(|index| JudgmentUsageGroup {
+                    provider: "typesafe".into(),
+                    offering_id: format!("offering-{index}"),
+                    model: "jev".into(),
+                    operation: "request_judgment".into(),
+                    attempts: 1,
+                    exact_usage_attempts: 1,
+                    known_input_tokens: 10,
+                    known_output_tokens: 2,
+                    input_incomplete: false,
+                    output_incomplete: false,
+                })
+                .collect(),
+            omitted_groups: 0,
+        });
+        let projected = report.project_lightweight();
+        let usage = projected.judgment_usage.unwrap();
+        assert_eq!(usage.groups.len(), 2);
+        assert_eq!(usage.omitted_groups, 8);
     }
 
     #[test]

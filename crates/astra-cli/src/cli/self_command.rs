@@ -484,6 +484,7 @@ async fn build_reflect_response(
         source_policy: request.source_policy.as_str().to_string(),
         include_context: request.include_context,
         data_coverage,
+        judgment_usage: None,
         view: Some(view),
         summary,
         observations,

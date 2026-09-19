@@ -260,6 +260,26 @@ shape, such as a missing mandatory index. `CREATE TABLE IF NOT EXISTS` and the
 manifest's index declaration are not an in-place upgrade mechanism for an
 existing Work table.
 
+Before the next model call, an owner/session/run-validated active primary Work
+binding receives a bounded `work_evidence_context.v1` snapshot through the
+existing required runtime-context lane. It carries the delivered-settlement
+requirement and at most eight recent journal call identities, dispositions and
+success flags, stopping at a Work lifecycle carrier. It does not copy arguments
+or result bodies, invoke a judge, read storage, or change tool authority. The
+snapshot is rebuilt each boundary and removed when the active binding cannot be
+validated; hosts without an executor or an optional semantic judge still run.
+
+This first stage deliberately reports settlement readiness as unknown. Journal
+execution identity does not bind each result to an exact Work attempt; a missing
+lifecycle boundary after recovery or window truncation cannot prove absence of
+evidence. Even a successful result cannot prove semantic coverage of
+`expected_result`. Recent calls are therefore explicitly a journal suffix, not
+attempt-attributed proof. The existing Work start/continuation context owns the
+expected result, and settlement admission remains the only owner of its gate.
+The projection makes the requirement and reusable observations available before
+a rejected settlement or another inspection; it neither auto-settles nor promises
+that the model will avoid all redundant calls.
+
 Tasks are durable work items projected into UI boards.
 
 ```text

@@ -4194,6 +4194,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    super::guards::refresh_work_evidence_context(state);
+
     // Project the immutable policy revision selected at the preceding
     // authoritative tool boundary. Request retries and preparation reruns
     // render the same bytes; they never evaluate or advance policy state.

@@ -30,6 +30,18 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+Internal judgment usage is a physical-attempt fact. Session reflection reports
+provider, offering, model, operation, attempt count, and known input/output tokens from
+the authenticated inference ledger. An attempt without complete usage remains
+visible with incomplete token coverage; it is never a zero-token call. Explain
+uses the same ledger at turn scope. Classification confidence and reflection's
+inferred confidence are distinct; neither proves that a direction was applied
+or that Work was delivered.
+The session view covers the supported judgment operations (request admission,
+skill routing, memory relevance/feedback, verification, and completion-proxy
+turn intent), not every auxiliary model call. Routine hint/summary projections
+bound group detail and report how many groups were omitted.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.

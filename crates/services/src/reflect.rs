@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astra_core::{
     ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetOmitted,
@@ -72,6 +72,10 @@ pub struct ReflectReport {
     pub source_policy: String,
     pub include_context: bool,
     pub data_coverage: ObservationDataCoverage,
+    /// Physical inference attempts for internal decisions, scoped to this
+    /// authenticated session. Missing coverage is explicit, never zero usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_usage: Option<JudgmentUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -88,6 +92,138 @@ pub struct ReflectReport {
     pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
     pub budget_result: ObservationBudgetResult,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageSummary {
+    pub coverage: String,
+    pub groups: Vec<JudgmentUsageGroup>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub omitted_groups: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgmentUsageGroup {
+    pub provider: String,
+    pub offering_id: String,
+    pub model: String,
+    pub operation: String,
+    pub attempts: usize,
+    pub exact_usage_attempts: usize,
+    pub known_input_tokens: u128,
+    pub known_output_tokens: u128,
+    pub input_incomplete: bool,
+    pub output_incomplete: bool,
+}
+
+impl JudgmentUsageSummary {
+    fn from_physical_attempts(facts: &astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1) -> Self {
+        if !facts.available {
+            return Self {
+                coverage: "unavailable".into(),
+                groups: Vec::new(),
+                omitted_groups: 0,
+            };
+        }
+        let mut groups: BTreeMap<(String, String, String, String), JudgmentUsageGroup> =
+            BTreeMap::new();
+        for attempt in &facts.attempts {
+            if !matches!(
+                attempt.operation_id.as_str(),
+                "request_judgment"
+                    | "skill_auto_route"
+                    | "memory_relevance"
+                    | "memory_feedback"
+                    | "verification_judge"
+                    | "completion_proxy:turn_intent"
+            ) && attempt.purpose != "memory_retrieval_rerank"
+                && attempt.purpose != "verification_judge"
+            {
+                continue;
+            }
+            let key = (
+                attempt.provider.clone(),
+                attempt.offering_id.clone(),
+                attempt.model_name.clone(),
+                attempt.operation_id.clone(),
+            );
+            let group = groups.entry(key).or_insert_with(|| JudgmentUsageGroup {
+                provider: attempt.provider.clone(),
+                offering_id: attempt.offering_id.clone(),
+                model: attempt.model_name.clone(),
+                operation: attempt.operation_id.clone(),
+                attempts: 0,
+                exact_usage_attempts: 0,
+                known_input_tokens: 0,
+                known_output_tokens: 0,
+                input_incomplete: false,
+                output_incomplete: false,
+            });
+            group.attempts += 1;
+            if attempt.usage_status
+                == astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+            {
+                group.exact_usage_attempts += 1;
+            }
+            let usage = attempt.usage.as_ref();
+            let input_parts = usage.map(|u| {
+                [
+                    u.fresh_input_tokens,
+                    u.cache_read_tokens,
+                    u.cache_creation_tokens,
+                ]
+            });
+            if let Some(parts) = input_parts {
+                for part in parts {
+                    if let Some(value) = part {
+                        group.known_input_tokens += u128::from(value);
+                    } else {
+                        group.input_incomplete = true;
+                    }
+                }
+            } else {
+                group.input_incomplete = true;
+            }
+            if let Some(output) = usage.and_then(|u| u.output_tokens) {
+                group.known_output_tokens += u128::from(output);
+            } else {
+                group.output_incomplete = true;
+            }
+        }
+        Self {
+            coverage: "available".into(),
+            groups: groups.into_values().collect(),
+            omitted_groups: 0,
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.coverage != "available" {
+            return "Judgment physical-attempt usage unavailable; no token total inferred.".into();
+        }
+        if self.groups.is_empty() {
+            return "Judgment physical-attempt ledger: no supported judgment operations observed in the bounded session view.".into();
+        }
+        let mut lines = Vec::with_capacity(self.groups.len());
+        for group in &self.groups {
+            let input = if group.input_incomplete {
+                format!("at least {}", group.known_input_tokens)
+            } else {
+                group.known_input_tokens.to_string()
+            };
+            let output = if group.output_incomplete {
+                format!("at least {}", group.known_output_tokens)
+            } else {
+                group.known_output_tokens.to_string()
+            };
+            lines.push(format!("{} ({}, offering {}) {}: {} physical call(s), {}/{} exact usage; input {input}, output {output} tokens", group.provider, group.model, group.offering_id, group.operation, group.attempts, group.exact_usage_attempts, group.attempts));
+        }
+        format!("Judgment physical-attempt ledger: {}.", lines.join("; "))
+    }
 }
 
 /// Session-wide child-delivery accounting shared by local journal reflection
@@ -1292,6 +1428,42 @@ impl ReflectService for DatabaseReflectService {
             None
         };
 
+        let judgment_usage = if let Some(shared_pool) = self.pool.as_ref() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::inference_execution::load_session_auxiliary_usage(
+                    shared_pool,
+                    user_id,
+                    session_id,
+                    512,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(facts)) => JudgmentUsageSummary::from_physical_attempts(&facts),
+                outcome => {
+                    tracing::warn!(
+                        target: "astra_services::reflect",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        ?outcome,
+                        "judgment physical-attempt facts unavailable during reflection"
+                    );
+                    JudgmentUsageSummary {
+                        coverage: "unavailable".into(),
+                        groups: Vec::new(),
+                        omitted_groups: 0,
+                    }
+                }
+            }
+        } else {
+            JudgmentUsageSummary {
+                coverage: "unavailable".into(),
+                groups: Vec::new(),
+                omitted_groups: 0,
+            }
+        };
+
         // `agent_events.meta_duration_ms` is the durable timing projection
         // for model rounds. Keep this optional like cache-context telemetry so
         // older deployments can still produce the causal report when the
@@ -1475,6 +1647,8 @@ impl ReflectService for DatabaseReflectService {
             summary.push(' ');
             summary.push_str(&model_request_summary.render());
         }
+        summary.push(' ');
+        summary.push_str(&judgment_usage.render());
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
             summary.push_str(&llm_latency_summary.render());
@@ -1501,6 +1675,7 @@ impl ReflectService for DatabaseReflectService {
             source_policy: request.source_policy.as_str().to_string(),
             include_context: request.include_context,
             data_coverage,
+            judgment_usage: Some(judgment_usage),
             view: Some(view),
             summary,
             observations,
@@ -1712,6 +1887,69 @@ use astra_core::ObservationGraphEdge;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::{
+        ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+        ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+    };
+
+    #[test]
+    fn judgment_rollup_uses_physical_attempts_and_preserves_missing_usage() {
+        let exact = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-1".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            provider: "typesafe".into(),
+            offering_id: "offering-1".into(),
+            model_name: "jev-1.13.0".into(),
+            purpose: "introspection".into(),
+            operation_id: "request_judgment".into(),
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(120),
+                output_tokens: Some(14),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        };
+        let missing = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-2".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            usage: None,
+            ..exact.clone()
+        };
+        let extraction = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-3".into(),
+            operation_id: "memory_extraction".into(),
+            purpose: "memory_extraction".into(),
+            ..exact.clone()
+        };
+        let different_offering = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt-4".into(),
+            offering_id: "offering-2".into(),
+            ..exact.clone()
+        };
+        let facts = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            attempts: vec![exact, missing, extraction, different_offering],
+        };
+        let summary = JudgmentUsageSummary::from_physical_attempts(&facts);
+        assert_eq!(summary.groups.len(), 2);
+        let group = &summary.groups[0];
+        assert_eq!(group.offering_id, "offering-1");
+        assert_eq!((group.attempts, group.exact_usage_attempts), (2, 1));
+        assert_eq!(
+            (group.known_input_tokens, group.known_output_tokens),
+            (120, 14)
+        );
+        assert!(group.input_incomplete && group.output_incomplete);
+        assert!(summary.render().contains("at least 120"));
+        let unavailable =
+            JudgmentUsageSummary::from_physical_attempts(&ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                attempts: vec![],
+            });
+        assert_eq!(unavailable.coverage, "unavailable");
+        assert!(unavailable.render().contains("unavailable"));
+    }
     use crate::model_request_context::{
         ModelRequestCache, ModelRequestCompaction, ModelRequestContextEvent,
         ModelRequestContextRecord, ModelRequestIdentity, ModelRequestLineage, ModelRequestTopology,
@@ -3167,6 +3405,7 @@ mod tests {
             source_policy: "auto".into(),
             include_context: false,
             data_coverage: data_coverage.clone(),
+            judgment_usage: None,
             view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),

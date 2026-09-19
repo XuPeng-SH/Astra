@@ -7516,13 +7516,41 @@ pub async fn load_explain_auxiliary_usage(
     turn: u32,
     max_attempts: usize,
 ) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
-    use astra_turn_types::{ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1};
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
     let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
         .bind(user_id).bind(session_id).bind(i64::from(turn))
         .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid Explain capture budget"))?).fetch_all(pool.get()).await
         .map_err(|e| ServiceError::internal(format!("load auxiliary Explain usage: {e}")))?;
+    project_auxiliary_usage_rows(rows, max_attempts)
+}
+
+/// Session-scoped view over the same physical attempt facts used by Explain.
+/// Reflection reads this only on demand and never combines invocation totals
+/// with provider-attempt totals.
+pub async fn load_session_auxiliary_usage(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent') OR i.purpose IN ('memory_retrieval_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?")
+        .bind(user_id)
+        .bind(session_id)
+        .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid reflection capture budget"))?)
+        .fetch_all(pool.get())
+        .await
+        .map_err(|e| ServiceError::internal(format!("load session auxiliary usage: {e}")))?;
+    project_auxiliary_usage_rows(rows, max_attempts)
+}
+
+fn project_auxiliary_usage_rows(
+    rows: Vec<sqlx::mysql::MySqlRow>,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    use astra_turn_types::{ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1};
     if rows.len() > max_attempts {
         return Ok(ExplainAnalyzeAuxiliaryUsageV1 {
             available: false,

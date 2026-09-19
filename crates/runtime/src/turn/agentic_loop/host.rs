@@ -2665,6 +2665,9 @@ pub enum VolatileKind {
     /// a newer repository read supersedes the prior value within the same
     /// human turn instead of creating a second independent authority.
     CanonicalWorkState,
+    /// Bounded execution observations and requirements for the next Work
+    /// decision. Observational only; settlement admission retains authority.
+    WorkEvidenceContext,
     /// A provider response completed after newer durable user guidance was
     /// accepted. The stale response is not executable; this singleton tells
     /// the next request to re-evaluate from the applied control epoch.
@@ -2731,7 +2734,8 @@ impl VolatileKind {
                 | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
                 | Self::ActiveWorkSnapshot
-                | Self::CanonicalWorkState,
+                | Self::CanonicalWorkState
+                | Self::WorkEvidenceContext,
         )
     }
 
@@ -2749,6 +2753,7 @@ impl VolatileKind {
             | Self::BackgroundTaskNotification
             | Self::ActiveWorkSnapshot
             | Self::CanonicalWorkState
+            | Self::WorkEvidenceContext
             | Self::UserIntentBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry
@@ -14074,6 +14079,36 @@ mod parallel_execution_tests {
         assert_eq!(value[0]["payload"]["signal"], "policy_advisory");
         assert_eq!(value[0]["payload"]["evidence"], "second advisory");
         assert_eq!(value[0]["payload"]["authority"], "advisory_evidence_only");
+    }
+
+    #[test]
+    fn work_evidence_context_replaces_snapshot_and_uses_required_typed_lane() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::WorkEvidenceContext,
+            json!({"attempt_id": "old"}),
+        );
+        state.push_volatile_payload(
+            VolatileKind::WorkEvidenceContext,
+            json!({"attempt_id": "current", "settlement_readiness": "unknown"}),
+        );
+        assert_eq!(state.volatile_pending.len(), 1);
+        let wire = runtime_volatile_injections_edge_profile_value(&state.volatile_pending).unwrap();
+        assert_eq!(wire[0]["kind"], "work_evidence_context");
+        assert_eq!(wire[0]["delivery_class"], "required_context");
+        assert_eq!(wire[0]["payload"]["attempt_id"], "current");
+        let injection = serde_json::from_value::<
+            astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
+        >(wire[0].clone())
+        .unwrap();
+        let preamble = crate::turn::wire_assembly::runtime_volatile_preamble_message(&injection)
+            .expect("Work evidence must reach the provider preamble");
+        assert!(preamble["content"].as_str().unwrap().contains("current"));
+        assert!(!preamble["content"].as_str().unwrap().contains("old"));
+        assert!(VolatileKind::wire_kind_is_singleton(
+            "work_evidence_context"
+        ));
+        assert!(state.restricted_tools.is_empty());
     }
 
     #[test]

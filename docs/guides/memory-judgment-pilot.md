@@ -127,6 +127,11 @@ planning appear separately even when they use the same model. Jev appears as
 carry the same actual identities and operation. Explain keeps unreported Jev
 cache counts unknown. Trace does not derive a cache hit rate from the normalized
 accounting buckets' cache zeros, which are not provider-reported cache evidence.
+Session `reflect` also includes a bounded, owner-scoped summary of physical
+judgment attempts by provider, offering, model and operation. It reports attempt count
+and exact-usage coverage; incomplete counters are lower bounds, not zero
+consumption. This view spans the session, while Explain's auxiliary section
+is scoped to a selected turn.
 Request classification and Work planning contribute once to the runtime run
 total, but never to a primary request's context-size estimate or per-request
 cache hit rate. This total is marked `runtime_accounted_usage`, without a
