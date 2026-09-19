@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+mod execution_projection;
 mod genesis;
+pub use execution_projection::ModelExecutionProjection;
 mod thinking_probe;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
@@ -6126,6 +6128,278 @@ mod tests {
         .expect("admitted execution");
 
         assert_eq!(execution.fixed_temperature, Some(0.6));
+    }
+
+    fn projection_fixture() -> AdmittedModelExecution {
+        let mut model = sample_resolved_active_model("projection-model");
+        model.request_body_overrides = Some(
+            serde_json::json!({"nested": {"top_p": 0.8, "seed": 42}, "max_tokens": 123})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let mut execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "projection-offering".into(),
+            model,
+        })
+        .unwrap();
+        execution.header_overrides = HashMap::from([
+            ("x-workspace".into(), "private-workspace".into()),
+            ("x-mode".into(), "coding".into()),
+        ]);
+        execution
+    }
+
+    #[test]
+    fn execution_projection_is_canonical_and_secret_free() {
+        let key = FernetTokenEncryptor::new("projection-test-key").unwrap();
+        let original = projection_fixture();
+        let projection = original.freeze_projection(&key).unwrap();
+        let mut reordered = original.clone();
+        reordered.header_overrides = HashMap::from([
+            ("X-MODE".into(), "coding".into()),
+            ("X-WORKSPACE".into(), "private-workspace".into()),
+        ]);
+        reordered.request_body_overrides = Some(
+            serde_json::from_str(r#"{"max_tokens":123,"nested":{"seed":42,"top_p":0.8}}"#).unwrap(),
+        );
+        assert_eq!(projection, reordered.freeze_projection(&key).unwrap());
+        let serialized = serde_json::to_string(&projection).unwrap();
+        let debug = format!("{projection:?}");
+        for private in [
+            "sk-test",
+            "127.0.0.1",
+            "private-workspace",
+            "x-workspace",
+            "top_p",
+        ] {
+            assert!(!serialized.contains(private));
+            assert!(!debug.contains(private));
+        }
+        assert_eq!(
+            projection,
+            serde_json::from_str::<ModelExecutionProjection>(&serialized).unwrap()
+        );
+        assert_ne!(
+            projection,
+            original
+                .freeze_projection(&FernetTokenEncryptor::new("rotated-projection-key").unwrap(),)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn execution_projection_excludes_recognized_authentication_rotation() {
+        let key = FernetTokenEncryptor::new("projection-test-key").unwrap();
+        let original = projection_fixture();
+        let mut rotated = original.clone();
+        rotated.api_key = "rotated-secret".into();
+        rotated.base_url = "http://username:password@127.0.0.1:18080/?api_key=secret".into();
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "X-API-Key",
+            "Cookie",
+            "X-Auth-Token",
+        ] {
+            rotated
+                .header_overrides
+                .insert(name.into(), "rotated-secret".into());
+        }
+        let body = rotated.request_body_overrides.as_mut().unwrap();
+        body.insert("api_key".into(), Value::String("rotated-secret".into()));
+        body.insert(
+            "access_token".into(),
+            Value::String("rotated-secret".into()),
+        );
+        assert_eq!(
+            original.freeze_projection(&key).unwrap(),
+            rotated.freeze_projection(&key).unwrap()
+        );
+
+        let mut endpoint = AdmittedModelExecution::from_endpoint(
+            "endpoint-offering".into(),
+            "endpoint-model".into(),
+            "openai".into(),
+            "https://private.example/chat?api-version=1&access_token=old".into(),
+            "Bearer old".into(),
+            Some(5000),
+            128_000,
+        );
+        let frozen = endpoint.freeze_projection(&key).unwrap();
+        endpoint.completions_url_override =
+            Some("https://private.example/chat?access_token=new&api-version=1".into());
+        endpoint
+            .header_overrides
+            .insert("authorization".into(), "Bearer new".into());
+        assert_eq!(frozen, endpoint.freeze_projection(&key).unwrap());
+        // No body and a body containing only credentials have identical model
+        // behavior, including after credentials are added, rotated, or removed.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"api_key": "old", "access_token": "old"}),
+            serde_json::json!({"api_key": "new", "access_token": "new"}),
+        ] {
+            endpoint.request_body_overrides = Some(body.as_object().unwrap().clone());
+            assert_eq!(frozen, endpoint.freeze_projection(&key).unwrap());
+        }
+        endpoint.request_body_overrides = None;
+        assert_eq!(frozen, endpoint.freeze_projection(&key).unwrap());
+    }
+
+    #[test]
+    fn execution_projection_detects_each_model_behavior_field() {
+        let key = FernetTokenEncryptor::new("projection-test-key").unwrap();
+        let original = projection_fixture();
+        let frozen = original.freeze_projection(&key).unwrap();
+        let mutations: &[fn(&mut AdmittedModelExecution)] = &[
+            |e| e.offering_id.push_str("-other"),
+            |e| e.access_kind = ModelAccessKind::Workspace,
+            |e| e.execution_placement = ModelExecutionPlacement::Edge,
+            |e| e.model_name.push_str("-other"),
+            |e| e.wire_model_name = Some("wire-model".into()),
+            |e| e.provider = "anthropic".into(),
+            |e| e.thinking_capability = Some(ThinkingCapability::Both),
+            |e| e.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort),
+            |e| e.fixed_temperature = Some(0.6),
+            |e| e.context_window = Some(64_000),
+            |e| e.max_completion_tokens = Some(4096),
+            |e| e.request_timeout_ms = Some(5000),
+            |e| e.base_url = "https://different.example/v1".into(),
+            |e| e.completions_url_override = Some("https://private.example/chat".into()),
+            |e| {
+                e.header_overrides
+                    .insert("x-workspace".into(), "other".into());
+            },
+            |e| {
+                e.request_body_overrides
+                    .as_mut()
+                    .unwrap()
+                    .get_mut("nested")
+                    .unwrap()["seed"] = Value::from(43);
+            },
+            |e| {
+                e.request_body_overrides
+                    .as_mut()
+                    .unwrap()
+                    .insert("max_tokens".into(), Value::from(124));
+            },
+            |e| {
+                e.cache_capability = Some(PromptCacheCapabilityData {
+                    protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+                    volatile_placement: PromptCacheVolatilePlacementData::AppendOnlyUserTail,
+                    volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
+                    reuse_scope: None,
+                })
+            },
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                frozen,
+                changed.freeze_projection(&key).unwrap(),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_projection_rejects_ambiguous_or_unrepresentable_material() {
+        let key = FernetTokenEncryptor::new("projection-test-key").unwrap();
+        let mut execution = projection_fixture();
+        execution
+            .header_overrides
+            .insert("X-MODE".into(), "other".into());
+        assert!(execution.freeze_projection(&key).is_err());
+        for url in ["relative/secret", "file:///private/secret", "https://"] {
+            let mut execution = projection_fixture();
+            execution.base_url = url.into();
+            let error = execution.freeze_projection(&key).unwrap_err();
+            assert!(!error.contains(url));
+        }
+        for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut execution = projection_fixture();
+            execution.fixed_temperature = Some(temperature);
+            assert!(execution.freeze_projection(&key).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_projection_preserves_private_query_and_override_semantics() {
+        let key = FernetTokenEncryptor::new("projection-test-key").unwrap();
+        let mut execution = projection_fixture();
+        execution.base_url =
+            "https://private.example/v1?route=first&route=second&api-version=1".into();
+        let frozen = execution.freeze_projection(&key).unwrap();
+        for field in ["API_KEY", "Api_Key", "ACCESS_TOKEN", "token", "key"] {
+            let mut changed = execution.clone();
+            changed.base_url.push_str(&format!("&{field}=first"));
+            let first = changed.freeze_projection(&key).unwrap();
+            assert_ne!(frozen, first, "query {field} must participate");
+            changed.base_url = format!("{}&{field}=changed", execution.base_url);
+            assert_ne!(
+                first,
+                changed.freeze_projection(&key).unwrap(),
+                "query {field} drift"
+            );
+        }
+        for url in [
+            "https://private.example/v1?route=second&route=first&api-version=1",
+            "https://private.example/v1?route=first&route=second&api-version=2",
+            "https://private.example/v1?Route=first&route=second&api-version=1",
+        ] {
+            let mut changed = execution.clone();
+            changed.base_url = url.into();
+            assert_ne!(frozen, changed.freeze_projection(&key).unwrap());
+        }
+        let mut changed = execution.clone();
+        changed
+            .request_body_overrides
+            .as_mut()
+            .unwrap()
+            .insert("stops".into(), serde_json::json!(["first", "second"]));
+        let ordered = changed.freeze_projection(&key).unwrap();
+        changed
+            .request_body_overrides
+            .as_mut()
+            .unwrap()
+            .insert("stops".into(), serde_json::json!(["second", "first"]));
+        assert_ne!(ordered, changed.freeze_projection(&key).unwrap());
+        for field in [
+            "token",
+            "key",
+            "secret",
+            "signature",
+            "api_key",
+            "access_token",
+        ] {
+            let mut changed = execution.clone();
+            changed
+                .request_body_overrides
+                .as_mut()
+                .unwrap()
+                .get_mut("nested")
+                .unwrap()[field] = Value::from("semantic-value");
+            assert_ne!(
+                frozen,
+                changed.freeze_projection(&key).unwrap(),
+                "nested {field}"
+            );
+        }
+        for field in ["token", "key", "secret", "signature", "API_KEY"] {
+            let mut changed = execution.clone();
+            changed
+                .request_body_overrides
+                .as_mut()
+                .unwrap()
+                .insert(field.into(), Value::from("semantic-value"));
+            assert_ne!(
+                frozen,
+                changed.freeze_projection(&key).unwrap(),
+                "top-level {field}"
+            );
+        }
     }
 
     #[test]
