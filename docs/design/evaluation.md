@@ -236,6 +236,17 @@ identity is stored in its own immutable database field, separate from mutable
 user metadata. The Run start claim is the existing owner lease/CAS boundary,
 and ProviderTask/WorkTurn identities keep their existing lifecycle paths.
 
+New trial admission locks the owner-scoped experiment before the canonical
+Session and Run boundaries. The same transaction checks the frozen trial order,
+checks capacity, creates the Run, and binds the trial. All earlier trials in the
+canonical sequence must already be bound. Within each `(case_id, repetition)`
+pair, the second arm waits for the first arm's immutable terminal observation;
+a failed or cancelled observation also releases that dependency. BaselineFirst,
+CandidateFirst, and Balanced use the same sequence-derived rule. Bound trials
+without an observation occupy the frozen `max_concurrency` budget. Exact Run
+retries reuse their binding and do not consume another slot. A premature start
+is retryable; admission does not schedule or automatically start other trials.
+
 The current disabled-memory profile selects no production Memoria client,
 extraction service, or post-turn observer at runtime composition. Prompt
 trials have an empty Skill catalog; Skill trials receive only the admitted
@@ -267,10 +278,11 @@ it does not claim accounting or executor drain has finished.
 Trial binding, admission, and materialization receipts retain the original
 generation. Observations separately persist `admission_run_generation` and the
 terminal `execution_run_generation`. The observation write transaction verifies
-both identities, the admission, and the custody/terminal evidence. It can repair
-an unbound trial after a crash using the original `run_started` intent, without
-inventing materialization receipts or rewriting an existing binding. Ordinary
-binding and materializer writes retain their current-generation fence.
+both identities, the admission, and the custody/terminal evidence. Run creation
+and trial binding commit together, so recovery never creates or repairs a trial
+binding. A crash before materialization can produce a failed observation without
+inventing materialization receipts. Binding confirmation and materializer writes
+retain their current-generation fence.
 
 Recovery evidence stops at the verified terminal event, so later status events
 do not change the observation fingerprint. Without finalized accounting for

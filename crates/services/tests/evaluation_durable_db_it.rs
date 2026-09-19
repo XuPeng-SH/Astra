@@ -8,6 +8,10 @@ mod common;
 
 use astra_core::SharedPool;
 use astra_core::composite_snapshot::CompositeSnapshot;
+use astra_services::evaluation::TrialUnit;
+use astra_services::runs::{
+    DatabaseRunStateStore, DurableRunRecord, DurableRunStartClaim, RunStateStore,
+};
 use astra_services::{
     ComparisonArm, DataIsolation, DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
     DatabaseMaterializationReceiptStore, EvaluationBudget, EvaluationCase,
@@ -104,6 +108,90 @@ async fn insert_run(pool: &SharedPool, owner: &str, session_id: &str) -> String 
     run_id
 }
 
+fn evaluation_run_record(
+    owner: &str,
+    session_id: &str,
+    spec: &ExperimentSpec,
+    trial: &TrialUnit,
+) -> DurableRunRecord {
+    let revision = match trial.arm {
+        ComparisonArm::Baseline => &spec.target.baseline,
+        ComparisonArm::Candidate => &spec.target.candidate,
+    };
+    let admission = EvaluationRunAdmission {
+        experiment_id: spec.experiment_id.clone(),
+        trial_id: trial.trial_id.clone(),
+        input_content_hash: trial.input_content_hash.clone(),
+        revision_content_hash: revision.content_hash.clone(),
+        skill_revision: spec.target.skill_name.as_ref().map(|name| {
+            astra_services::EvaluationSkillRevision {
+                skill_name: name.clone(),
+                revision_id: revision.revision_id.clone(),
+                content_hash: revision.content_hash.clone(),
+            }
+        }),
+        receipt_ids: vec![],
+        snapshot_envelope: None,
+    };
+    let run_id = Uuid::new_v4().to_string();
+    DurableRunRecord {
+        run_id: run_id.clone(),
+        user_id: owner.into(),
+        session_id: session_id.into(),
+        parent_run_id: None,
+        root_run_id: Some(run_id.clone()),
+        ancestor_path: Some(run_id.clone()),
+        depth: 0,
+        delegation_id: None,
+        agent_id: None,
+        retry_of: None,
+        retry_scope: None,
+        status: "queued".into(),
+        waiting_for: None,
+        owner_pod_id: None,
+        owner_lease_expires_at: None,
+        run_generation: 0,
+        last_event_idx: 0,
+        checkpoint_version: None,
+        checkpoint_json: None,
+        error_code: None,
+        error_message: None,
+        retry_count: 0,
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        total_tool_calls: 0,
+        agent_binding_id: None,
+        agent_binding_name: None,
+        agent_binding_schema_version: None,
+        model_offering_id: None,
+        resolved_model_name: None,
+        runtime_profile: None,
+        start_request_fingerprint: Some(format!("evaluation-test:{run_id}")),
+        work_binding: None,
+        events: vec![serde_json::json!({"event_type": "run_started", "data": {
+            "owner_generation": 0, "evaluation_admission": admission,
+        }})],
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+async fn insert_evaluation_run(
+    pool: &SharedPool,
+    owner: &str,
+    session_id: &str,
+    spec: &ExperimentSpec,
+    trial: &TrialUnit,
+) -> String {
+    let record = evaluation_run_record(owner, session_id, spec, trial);
+    let run_id = record.run_id.clone();
+    DatabaseRunStateStore::new(pool.clone())
+        .insert_run(record)
+        .await
+        .expect("atomically create evaluation Run and binding");
+    run_id
+}
+
 async fn insert_evaluation_admitted_event(
     pool: &SharedPool,
     owner: &str,
@@ -118,7 +206,7 @@ async fn insert_evaluation_admitted_event(
         "idempotency_key": format!("evaluation-admitted:{run_id}:{generation}"),
         "data": {"admission": admission},
     });
-    insert_run_event(pool, owner, session_id, run_id, 0, &payload).await;
+    insert_run_event(pool, owner, session_id, run_id, 1, &payload).await;
 }
 
 async fn insert_run_settlement_finished_event(
@@ -176,6 +264,8 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
         ("evaluation_materialization_receipts", "owner_user_id"),
         ("evaluation_trial_bindings", "owner_user_id"),
         ("evaluation_experiments", "owner_user_id"),
+        ("run_display_projections", "user_id"),
+        ("agent_session_execution_slots", "user_id"),
         ("agent_run_events", "user_id"),
         ("agent_runs", "user_id"),
         ("agent_sessions", "user_id"),
@@ -206,7 +296,8 @@ async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() 
         .await
         .expect("list receipt trials");
     let session = insert_session(&pool, &owner).await;
-    let run = insert_run(&pool, &owner, &session).await;
+    let run =
+        insert_evaluation_run(&pool, &owner, &session, &experiment.spec, &trials[0].trial).await;
     let binding = plan_store
         .bind_trial_run(&owner, &trials[0].trial_id, &session, &run)
         .await
@@ -459,7 +550,14 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         .await
         .expect("list observation trials");
     let session_a = insert_session(&pool, &owner).await;
-    let run_a = insert_run(&pool, &owner, &session_a).await;
+    let run_a = insert_evaluation_run(
+        &pool,
+        &owner,
+        &session_a,
+        &experiment.spec,
+        &trials[0].trial,
+    )
+    .await;
     let binding_a = plan_store
         .bind_trial_run(&owner, &trials[0].trial_id, &session_a, &run_a)
         .await
@@ -567,7 +665,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         .expect("evaluation marker exists");
     assert_eq!(marker.admission_run_generation, 0);
     assert!(!marker.settlement_finished);
-    insert_run_settlement_finished_event(&pool, &owner, &session_a, &run_a, 0, 1).await;
+    insert_run_settlement_finished_event(&pool, &owner, &session_a, &run_a, 0, 2).await;
     assert!(
         observation_store
             .load_admission_marker_for_run(&owner, &run_a, 0)
@@ -647,7 +745,14 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
     // A second session/run can settle a different planned trial without
     // sharing process-local state or an idempotency namespace with session A.
     let session_b = insert_session(&pool, &owner).await;
-    let run_b = insert_run(&pool, &owner, &session_b).await;
+    let run_b = insert_evaluation_run(
+        &pool,
+        &owner,
+        &session_b,
+        &experiment.spec,
+        &trials[1].trial,
+    )
+    .await;
     let binding_b = plan_store
         .bind_trial_run(&owner, &trials[1].trial_id, &session_b, &run_b)
         .await
@@ -760,17 +865,14 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
     .execute(pool.get())
     .await
     .unwrap();
-    // Model the pre-bind crash window using this same planned trial fixture.
-    sqlx::query(
-        "UPDATE evaluation_trial_bindings SET binding_status = 'planned',
-        session_id = NULL, run_id = NULL, run_generation = NULL
-        WHERE owner_user_id = ? AND trial_id = ?",
-    )
-    .bind(&owner)
-    .bind(&binding_b.trial_id)
-    .execute(pool.get())
-    .await
-    .unwrap();
+    assert_eq!(
+        plan_store
+            .load_trial(&owner, &binding_b.trial_id)
+            .await
+            .unwrap()
+            .binding_status,
+        "bound"
+    );
     let mut recovered = request_b.clone();
     recovered.execution_run_generation = 2;
     let terminal = astra_services::runs::RunRecoveryTerminal {
@@ -781,7 +883,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         outcome: astra_services::runs::RunRecoveryTerminalOutcome::Failed,
     }
     .event();
-    insert_run_event(&pool, &owner, &session_b, &run_b, 3, &terminal).await;
+    insert_run_event(&pool, &owner, &session_b, &run_b, 4, &terminal).await;
     let custody = |from: u64, to: u64| {
         serde_json::json!({
             "event_type": "run_recovery_claimed",
@@ -790,7 +892,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
                 "from_generation": from, "to_generation": to},
         })
     };
-    insert_run_event(&pool, &owner, &session_b, &run_b, 2, &custody(1, 2)).await;
+    insert_run_event(&pool, &owner, &session_b, &run_b, 3, &custody(1, 2)).await;
     assert!(
         observation_store
             .record_observation(&owner, &recovered)
@@ -804,10 +906,10 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             .await
             .unwrap()
             .binding_status,
-        "planned",
-        "a failed proof must not leave a repaired binding"
+        "bound",
+        "a failed proof must preserve the atomic admission binding"
     );
-    insert_run_event(&pool, &owner, &session_b, &run_b, 1, &custody(0, 1)).await;
+    insert_run_event(&pool, &owner, &session_b, &run_b, 2, &custody(0, 1)).await;
     let mut wrong_generation = recovered.clone();
     wrong_generation.admission_run_generation = 1;
     assert!(
@@ -831,18 +933,18 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             .await
             .is_err()
     );
-    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 2")
         .bind(&session_a).bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
     assert!(
         observation_store
             .record_observation(&owner, &recovered)
             .await
             .is_err(),
-        "custody with the wrong session cannot authorize repair"
+        "custody with the wrong session cannot authorize settlement"
     );
-    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+    sqlx::query("UPDATE agent_run_events SET session_id = ? WHERE user_id = ? AND run_id = ? AND event_idx = 2")
         .bind(&session_b).bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
-    for index in 4..=134 {
+    for index in 5..=135 {
         insert_run_settlement_finished_event(
             &pool,
             &owner,
@@ -859,20 +961,20 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         .unwrap()
         .unwrap();
     assert_eq!(old_admission.admission_run_generation, 0);
-    assert_eq!(old_admission.admission_event_idx, 0);
+    assert_eq!(old_admission.admission_event_idx, 1);
     assert!(!old_admission.settlement_finished);
-    sqlx::query("UPDATE agent_run_events SET event_hash = 'tampered' WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+    sqlx::query("UPDATE agent_run_events SET event_hash = 'tampered' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
         .bind(&owner).bind(&run_b).execute(pool.get()).await.unwrap();
     assert!(
         observation_store
             .record_observation(&owner, &recovered)
             .await
             .is_err(),
-        "admission hash must be revalidated before pre-bind repair"
+        "admission hash must be revalidated before observation settlement"
     );
     // A discovery marker is not write authorization: changing the durable
     // admission after discovery must still be rejected in the write transaction.
-    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 1")
         .bind(&owner)
         .bind(&run_b)
         .execute(pool.get())
@@ -900,7 +1002,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             .is_err(),
         "durable admission must match the frozen revision"
     );
-    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = 1")
         .bind(&owner)
         .bind(&run_b)
         .execute(pool.get())
@@ -918,9 +1020,9 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             .record_observation(&owner, &recovered)
             .await
             .is_err(),
-        "admission beyond canonical Run watermark cannot authorize repair"
+        "admission beyond canonical Run watermark cannot authorize settlement"
     );
-    sqlx::query("UPDATE agent_runs SET last_event_idx = 134 WHERE user_id = ? AND run_id = ?")
+    sqlx::query("UPDATE agent_runs SET last_event_idx = 135 WHERE user_id = ? AND run_id = ?")
         .bind(&owner)
         .bind(&run_b)
         .execute(pool.get())
@@ -977,11 +1079,11 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
         context_receipt_b,
         "an exact original receipt retry remains immutable"
     );
-    let repaired = plan_store
+    let retained = plan_store
         .load_trial(&owner, &binding_b.trial_id)
         .await
         .unwrap();
-    assert_eq!(repaired.run_generation, Some(0));
+    assert_eq!(retained.run_generation, Some(0));
     assert!(
         plan_store
             .bind_trial_run(&owner, &binding_b.trial_id, &session_b, &run_b)
@@ -1236,177 +1338,401 @@ async fn evaluation_trial_binding_is_atomic_across_sessions_and_owner_scoped() {
     let store = DatabaseEvaluationPlanStore::new(pool.clone());
     let owner = format!("eval-bind-owner-{}", Uuid::new_v4());
     let other_owner = format!("eval-bind-other-{}", Uuid::new_v4());
-    let experiment_id = format!("eval-bind-{}", Uuid::new_v4().simple());
-    let record = store
-        .register_experiment(&owner, &spec(&experiment_id), "submit-bind")
-        .await
-        .expect("register binding plan");
-    let trials = store
-        .list_trials(&owner, &record.experiment_id)
-        .await
-        .expect("list planned trials");
-    assert!(matches!(trials[0].trial.arm, ComparisonArm::Baseline));
-
-    // The persisted JSON is not trusted merely because its row count is
-    // correct: changing the arm must fail the canonical-plan comparison.
-    let mut tampered_trial = trials[0].trial.clone();
-    tampered_trial.arm = ComparisonArm::Candidate;
-    sqlx::query(
-        "UPDATE evaluation_trial_bindings SET trial_json = ?
-         WHERE owner_user_id = ? AND trial_id = ?",
-    )
-    .bind(serde_json::to_string(&tampered_trial).unwrap())
-    .bind(&owner)
-    .bind(&trials[0].trial_id)
-    .execute(pool.get())
-    .await
-    .expect("tamper evaluation trial fixture");
-    assert!(matches!(
-        store.list_trials(&owner, &record.experiment_id).await,
-        Err(EvaluationPersistenceError::Conflict(_))
-    ));
-    sqlx::query(
-        "UPDATE evaluation_trial_bindings SET trial_json = ?
-         WHERE owner_user_id = ? AND trial_id = ?",
-    )
-    .bind(serde_json::to_string(&trials[0].trial).unwrap())
-    .bind(&owner)
-    .bind(&trials[0].trial_id)
-    .execute(pool.get())
-    .await
-    .expect("restore evaluation trial fixture");
-
-    // The hot-path loader must also reject a coordinated sequence tamper;
-    // updating both the JSON and relational column must not bypass the
-    // deterministic ordering contract.
-    let mut tampered_sequence = trials[0].trial.clone();
-    tampered_sequence.sequence = 99;
-    sqlx::query(
-        "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
-         WHERE owner_user_id = ? AND trial_id = ?",
-    )
-    .bind(99_i64)
-    .bind(serde_json::to_string(&tampered_sequence).unwrap())
-    .bind(&owner)
-    .bind(&trials[0].trial_id)
-    .execute(pool.get())
-    .await
-    .expect("tamper evaluation sequence fixture");
-    assert!(matches!(
-        store.load_trial(&owner, &trials[0].trial_id).await,
-        Err(EvaluationPersistenceError::Conflict(_))
-    ));
-    sqlx::query(
-        "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
-         WHERE owner_user_id = ? AND trial_id = ?",
-    )
-    .bind(i64::from(trials[0].trial.sequence))
-    .bind(serde_json::to_string(&trials[0].trial).unwrap())
-    .bind(&owner)
-    .bind(&trials[0].trial_id)
-    .execute(pool.get())
-    .await
-    .expect("restore evaluation sequence fixture");
-
-    let session_a = insert_session(&pool, &owner).await;
-    let session_b = insert_session(&pool, &owner).await;
-    let run_a = insert_run(&pool, &owner, &session_a).await;
-    let run_b = insert_run(&pool, &owner, &session_b).await;
-    let other_session = insert_session(&pool, &other_owner).await;
-    let other_run = insert_run(&pool, &other_owner, &other_session).await;
-
-    let first_store = store.clone();
-    let second_store = store.clone();
-    let (first, second) = tokio::join!(
-        first_store.bind_trial_run(&owner, &trials[0].trial_id, &session_a, &run_a),
-        second_store.bind_trial_run(&owner, &trials[1].trial_id, &session_b, &run_b),
-    );
-    let first = first.expect("first session binding succeeds");
-    let second = second.expect("second session binding succeeds concurrently");
-    assert_eq!(first.binding_status, "bound");
-    assert_eq!(second.binding_status, "bound");
-    assert_eq!(first.session_id.as_deref(), Some(session_a.as_str()));
-    assert_eq!(second.session_id.as_deref(), Some(session_b.as_str()));
-
-    assert_eq!(
-        store
-            .bind_trial_run(&owner, &trials[0].trial_id, &session_a, &run_a)
-            .await
-            .expect("same binding is idempotent"),
-        first
-    );
-    assert!(matches!(
-        store
-            .bind_trial_run(&owner, &trials[0].trial_id, &session_b, &run_b)
-            .await,
-        Err(EvaluationPersistenceError::Conflict(_))
-    ));
-    assert!(matches!(
-        store
-            .bind_trial_run(
-                &other_owner,
-                &trials[0].trial_id,
-                &other_session,
-                &other_run,
+    for (order_index, order) in [
+        TrialOrder::BaselineFirst,
+        TrialOrder::CandidateFirst,
+        TrialOrder::Balanced { seed: 42 },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let experiment_id = format!("eval-bind-{}", Uuid::new_v4().simple());
+        let mut protocol_spec = spec(&experiment_id);
+        protocol_spec.order = order;
+        protocol_spec.repetitions = 2;
+        protocol_spec.budget.max_trials = 4;
+        protocol_spec.budget.max_concurrency = 1;
+        let record = store
+            .register_experiment(
+                &owner,
+                &protocol_spec,
+                &format!("submit-bind-{order_index}"),
             )
-            .await,
-        Err(EvaluationPersistenceError::NotFound(_))
-    ));
+            .await
+            .expect("register binding plan");
+        let trials = store
+            .list_trials(&owner, &record.experiment_id)
+            .await
+            .expect("list planned trials");
+        assert!(
+            record
+                .spec
+                .paired_predecessor(&trials[0].trial)
+                .unwrap()
+                .is_none()
+        );
 
-    // A canonical Run is a single execution identity. It cannot be reused by
-    // another trial, even across experiments, and concurrent contenders are
-    // resolved by the database unique key rather than by process-local state.
-    let reuse_experiment_id = format!("eval-bind-reuse-{}", Uuid::new_v4().simple());
-    let mut reuse_spec = spec(&reuse_experiment_id);
-    reuse_spec.repetitions = 2;
-    reuse_spec.budget.max_trials = 4;
-    let reuse_record = store
-        .register_experiment(&owner, &reuse_spec, "submit-bind-reuse")
+        // The persisted JSON is not trusted merely because its row count is
+        // correct: changing the arm must fail the canonical-plan comparison.
+        let mut tampered_trial = trials[0].trial.clone();
+        tampered_trial.arm = match tampered_trial.arm {
+            ComparisonArm::Baseline => ComparisonArm::Candidate,
+            ComparisonArm::Candidate => ComparisonArm::Baseline,
+        };
+        sqlx::query(
+            "UPDATE evaluation_trial_bindings SET trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+        )
+        .bind(serde_json::to_string(&tampered_trial).unwrap())
+        .bind(&owner)
+        .bind(&trials[0].trial_id)
+        .execute(pool.get())
         .await
-        .expect("register run-reuse plan");
-    let reuse_trials = store
-        .list_trials(&owner, &reuse_record.experiment_id)
+        .expect("tamper evaluation trial fixture");
+        assert!(matches!(
+            store.list_trials(&owner, &record.experiment_id).await,
+            Err(EvaluationPersistenceError::Conflict(_))
+        ));
+        sqlx::query(
+            "UPDATE evaluation_trial_bindings SET trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+        )
+        .bind(serde_json::to_string(&trials[0].trial).unwrap())
+        .bind(&owner)
+        .bind(&trials[0].trial_id)
+        .execute(pool.get())
         .await
-        .expect("list run-reuse trials");
-    assert!(matches!(
-        store
-            .bind_trial_run(&owner, &reuse_trials[0].trial_id, &session_a, &run_a,)
-            .await,
-        Err(EvaluationPersistenceError::Conflict(_))
-    ));
+        .expect("restore evaluation trial fixture");
 
-    let reuse_session = insert_session(&pool, &owner).await;
-    let reuse_run = insert_run(&pool, &owner, &reuse_session).await;
-    let reuse_left_store = store.clone();
-    let reuse_right_store = store.clone();
-    let (reuse_left, reuse_right) = tokio::join!(
-        reuse_left_store.bind_trial_run(
-            &owner,
-            &reuse_trials[0].trial_id,
-            &reuse_session,
-            &reuse_run,
-        ),
-        reuse_right_store.bind_trial_run(
-            &owner,
-            &reuse_trials[1].trial_id,
-            &reuse_session,
-            &reuse_run,
-        ),
-    );
-    assert_eq!(
-        [reuse_left.is_ok(), reuse_right.is_ok()]
-            .into_iter()
-            .filter(|bound| *bound)
-            .count(),
-        1,
-        "exactly one trial may own a run"
-    );
-    assert!(
-        matches!(reuse_left, Err(EvaluationPersistenceError::Conflict(_)))
-            || matches!(reuse_right, Err(EvaluationPersistenceError::Conflict(_))),
-        "the losing contender must receive a binding conflict"
-    );
+        // The hot-path loader must also reject a coordinated sequence tamper;
+        // updating both the JSON and relational column must not bypass the
+        // deterministic ordering contract.
+        let mut tampered_sequence = trials[0].trial.clone();
+        tampered_sequence.sequence = 99;
+        sqlx::query(
+            "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+        )
+        .bind(99_i64)
+        .bind(serde_json::to_string(&tampered_sequence).unwrap())
+        .bind(&owner)
+        .bind(&trials[0].trial_id)
+        .execute(pool.get())
+        .await
+        .expect("tamper evaluation sequence fixture");
+        assert!(matches!(
+            store.load_trial(&owner, &trials[0].trial_id).await,
+            Err(EvaluationPersistenceError::Conflict(_))
+        ));
+        sqlx::query(
+            "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+        )
+        .bind(i64::from(trials[0].trial.sequence))
+        .bind(serde_json::to_string(&trials[0].trial).unwrap())
+        .bind(&owner)
+        .bind(&trials[0].trial_id)
+        .execute(pool.get())
+        .await
+        .expect("restore evaluation sequence fixture");
 
+        let run_store = DatabaseRunStateStore::new(pool.clone());
+        let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+        let mut runs = Vec::new();
+        for trial in &trials {
+            let session = insert_session(&pool, &owner).await;
+            runs.push(evaluation_run_record(
+                &owner,
+                &session,
+                &record.spec,
+                &trial.trial,
+            ));
+        }
+        // Public bind cannot manufacture admission for an unrelated existing Run.
+        let unbound_session = insert_session(&pool, &owner).await;
+        let unbound_run = insert_run(&pool, &owner, &unbound_session).await;
+        assert!(
+            store
+                .bind_trial_run(&owner, &trials[0].trial_id, &unbound_session, &unbound_run)
+                .await
+                .is_err()
+        );
+        assert!(
+            run_store
+                .claim_run_start(runs[2].clone(), Some(&runs[2].session_id))
+                .await
+                .unwrap_err()
+                .starts_with("evaluation_trial_order_blocked:"),
+            "all preceding sequences must be bound"
+        );
+        let (first, second) = tokio::join!(
+            run_store.claim_run_start(runs[0].clone(), Some(&runs[0].session_id)),
+            run_store.claim_run_start(runs[1].clone(), Some(&runs[1].session_id)),
+        );
+        assert!(matches!(
+            first.unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        assert!(
+            second
+                .unwrap_err()
+                .starts_with("evaluation_trial_order_blocked:")
+        );
+        assert!(
+            run_store
+                .load_run(&owner, &runs[1].run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "blocked admission must not leave a Run"
+        );
+        let first_binding = store
+            .bind_trial_run(
+                &owner,
+                &trials[0].trial_id,
+                &runs[0].session_id,
+                &runs[0].run_id,
+            )
+            .await
+            .expect("ordinary binding confirms atomic creation");
+        assert_eq!(first_binding.binding_status, "bound");
+        assert!(
+            matches!(
+                run_store
+                    .claim_run_start(runs[0].clone(), Some(&runs[0].session_id))
+                    .await
+                    .unwrap(),
+                DurableRunStartClaim::Existing { .. }
+            ),
+            "exact retry is exempt even at max concurrency"
+        );
+
+        let observation_request =
+            |index: usize, status: TrialStatus| EvaluationObservationRequest {
+                session_id: runs[index].session_id.clone(),
+                execution_run_id: runs[index].run_id.clone(),
+                admission_run_generation: 0,
+                execution_run_generation: 0,
+                observation: TrialObservation {
+                    experiment_fingerprint: record.spec_fingerprint.clone(),
+                    trial_id: trials[index].trial_id.clone(),
+                    case_id: trials[index].trial.case_id.clone(),
+                    arm: trials[index].trial.arm.clone(),
+                    repetition: trials[index].trial.repetition,
+                    status,
+                    measurements: vec![],
+                    evidence: vec![],
+                },
+                materialization_receipt_ids: vec![],
+                idempotency_key: format!("protocol-observation-{order_index}-{index}"),
+            };
+        sqlx::query("UPDATE agent_runs SET status = 'failed' WHERE user_id = ? AND run_id = ?")
+            .bind(&owner)
+            .bind(&runs[0].run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            run_store
+                .claim_run_start(runs[1].clone(), Some(&runs[1].session_id))
+                .await
+                .unwrap_err()
+                .starts_with("evaluation_trial_order_blocked:"),
+            "terminal Run state alone is not an immutable paired observation"
+        );
+        observation_store
+            .record_observation(&owner, &observation_request(0, TrialStatus::Failed))
+            .await
+            .unwrap();
+        // Exactly one admission slot is now free. These different pairs race
+        // through the same experiment mutex; neither scheduling order may
+        // commit two Runs or leave an orphan for the losing contender.
+        let (paired_start, next_pair_start) = tokio::join!(
+            run_store.claim_run_start(runs[1].clone(), Some(&runs[1].session_id)),
+            run_store.claim_run_start(runs[2].clone(), Some(&runs[2].session_id)),
+        );
+        assert_eq!(
+            [paired_start.is_ok(), next_pair_start.is_ok()]
+                .into_iter()
+                .filter(|started| *started)
+                .count(),
+            1,
+            "last-slot race must commit exactly one new Run"
+        );
+        assert!(
+            matches!(paired_start.unwrap(), DurableRunStartClaim::Started { .. }),
+            "failed first-arm observation releases its paired second arm"
+        );
+        let loser = next_pair_start.unwrap_err();
+        assert!(
+            loser.starts_with("evaluation_trial_capacity_exhausted:")
+                || loser.starts_with("evaluation_trial_order_blocked:")
+        );
+        let orphan_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&owner)
+        .bind(&runs[2].run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(orphan_events, 0, "loser must not leave initial Run events");
+        assert!(
+            matches!(
+                run_store
+                    .claim_run_start(runs[1].clone(), Some(&runs[1].session_id))
+                    .await
+                    .unwrap(),
+                DurableRunStartClaim::Existing { .. }
+            ),
+            "the winning Run's retry is exempt at full capacity"
+        );
+        assert!(
+            run_store
+                .claim_run_start(runs[2].clone(), Some(&runs[2].session_id))
+                .await
+                .unwrap_err()
+                .starts_with("evaluation_trial_capacity_exhausted:"),
+            "a different pair cannot exceed bound minus observed capacity"
+        );
+        assert!(
+            store
+                .load_trial(&owner, &trials[2].trial_id)
+                .await
+                .unwrap()
+                .run_id
+                .is_none()
+        );
+        assert!(
+            run_store
+                .load_run(&owner, &runs[2].run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE agent_runs SET status = 'cancelled' WHERE user_id = ? AND run_id = ?")
+            .bind(&owner)
+            .bind(&runs[1].run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            run_store
+                .claim_run_start(runs[2].clone(), Some(&runs[2].session_id))
+                .await
+                .unwrap_err()
+                .starts_with("evaluation_trial_capacity_exhausted:"),
+            "cancelled without observation still consumes capacity"
+        );
+
+        // Hold the experiment mutex while the next start waits. Committing an
+        // observation before releasing it must be visible to the admission current read.
+        let mut mutex = pool.get().begin().await.unwrap();
+        sqlx::query("SELECT experiment_id FROM evaluation_experiments WHERE owner_user_id = ? AND experiment_id = ? FOR UPDATE")
+        .bind(&owner).bind(&record.experiment_id).fetch_one(&mut *mutex).await.unwrap();
+        // An isolated one-connection pool lets the process-list barrier identify
+        // the exact request that has reached the locked experiment row.
+        let mut waiter_settings = pool.settings().clone();
+        waiter_settings.db_pool_max_connections = 1;
+        waiter_settings.db_pool_min_connections = 0;
+        let waiter_pool = SharedPool::new(&waiter_settings).await.unwrap();
+        let waiter_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(waiter_pool.get())
+            .await
+            .unwrap();
+        let waiting_store = DatabaseRunStateStore::new(waiter_pool.clone());
+        let waiting_run = runs[2].clone();
+        let waiter = tokio::spawn(async move {
+            waiting_store
+                .claim_run_start(waiting_run.clone(), Some(&waiting_run.session_id))
+                .await
+        });
+        // Match the established MatrixOne process-list barrier used by the
+        // weighted-admission DB tests: no sleep can substitute for arrival.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.processlist
+                     WHERE db = ? AND conn_id = ?
+                       AND info LIKE '%evaluation_experiments%'
+                       AND info LIKE '%FOR UPDATE%'
+                       AND info NOT LIKE '%information_schema.processlist%'",
+                ).bind(&waiter_settings.database).bind(waiter_connection_id)
+                    .fetch_one(pool.get()).await.unwrap();
+                if waiting > 0 { break; }
+                assert!(!waiter.is_finished(), "start completed before reaching the held experiment mutex");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("observe exact Run start blocked on experiment FOR UPDATE before committing observation");
+        observation_store
+            .record_observation(&owner, &observation_request(1, TrialStatus::Cancelled))
+            .await
+            .unwrap();
+        mutex.commit().await.unwrap();
+        assert!(
+            matches!(
+                waiter.await.unwrap().unwrap(),
+                DurableRunStartClaim::Started { .. }
+            ),
+            "admission reads observation committed while the experiment mutex was held"
+        );
+        waiter_pool.close().await;
+        assert!(matches!(
+            run_store
+                .claim_run_start(runs[2].clone(), Some(&runs[2].session_id))
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Existing { .. }
+        ));
+        assert!(
+            run_store
+                .claim_run_start(runs[3].clone(), Some(&runs[3].session_id))
+                .await
+                .unwrap_err()
+                .starts_with("evaluation_trial_order_blocked:")
+        );
+
+        let competing =
+            evaluation_run_record(&owner, &runs[2].session_id, &record.spec, &trials[2].trial);
+        assert!(
+            run_store
+                .claim_run_start(competing, Some(&runs[2].session_id))
+                .await
+                .is_err(),
+            "a bound trial cannot be rebound to a different Run"
+        );
+        let other_session = insert_session(&pool, &other_owner).await;
+        let foreign =
+            evaluation_run_record(&other_owner, &other_session, &record.spec, &trials[0].trial);
+        assert!(
+            run_store
+                .claim_run_start(foreign, Some(&other_session))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .bind_trial_run(
+                    &owner,
+                    &trials[0].trial_id,
+                    &runs[1].session_id,
+                    &runs[1].run_id
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store
+                .bind_trial_run(
+                    &other_owner,
+                    &trials[0].trial_id,
+                    &other_session,
+                    &runs[0].run_id
+                )
+                .await,
+            Err(EvaluationPersistenceError::NotFound(_))
+        ));
+    }
     cleanup(&pool, &owner).await;
     cleanup(&pool, &other_owner).await;
 }

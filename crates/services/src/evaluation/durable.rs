@@ -23,8 +23,22 @@ const MAX_PERSISTED_SPEC_BYTES: usize = 1_024 * 1_024;
 const MAX_PERSISTED_TRIAL_BYTES: usize = 64 * 1_024;
 const MAX_PERSISTED_PLAN_BYTES: usize = 16 * 1_024 * 1_024;
 
+/// Retryable protocol dependencies, distinct from invalid frozen identities.
+/// The stable prefix survives the canonical RunStore's String error boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum EvaluationProtocolBlock {
+    #[error("evaluation_protocol_blocked:preceding_trials_unbound")]
+    PrecedingTrialsUnbound,
+    #[error("evaluation_protocol_blocked:paired_predecessor_unobserved:{trial_id}")]
+    PairedPredecessorUnobserved { trial_id: String },
+    #[error("evaluation_protocol_blocked:concurrency_limit:{max_concurrency}")]
+    ConcurrencyLimit { max_concurrency: u16 },
+}
+
 #[derive(Debug, Error)]
 pub enum EvaluationPersistenceError {
+    #[error(transparent)]
+    ProtocolBlocked(#[from] EvaluationProtocolBlock),
     #[error("invalid evaluation input: {0}")]
     InvalidInput(String),
     #[error("evaluation database operation failed: {operation}: {source}")]
@@ -43,6 +57,26 @@ pub enum EvaluationPersistenceError {
     Conflict(String),
     #[error("evaluation record not found: {0}")]
     NotFound(String),
+}
+
+fn execution_persistence_error(
+    error: super::execution::EvaluationExecutionError,
+) -> EvaluationPersistenceError {
+    use super::execution::EvaluationExecutionError;
+    match error {
+        EvaluationExecutionError::InvalidInput(detail) => {
+            EvaluationPersistenceError::InvalidInput(detail)
+        }
+        EvaluationExecutionError::Conflict(detail) => EvaluationPersistenceError::Conflict(detail),
+        EvaluationExecutionError::NotFound(detail) => EvaluationPersistenceError::NotFound(detail),
+        EvaluationExecutionError::Database { operation, source } => {
+            EvaluationPersistenceError::Database { operation, source }
+        }
+        EvaluationExecutionError::Json { operation, source } => {
+            EvaluationPersistenceError::Json { operation, source }
+        }
+        EvaluationExecutionError::Persistence(error) => error,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +123,132 @@ impl DatabaseEvaluationPlanStore {
 
     pub(crate) fn shared_pool(&self) -> SharedPool {
         self.pool.clone()
+    }
+
+    /// The Run creation transaction acquires this mutex BEFORE Session locks.
+    /// Keep it until both the Run and its trial binding are committed.
+    pub(crate) async fn lock_experiment_for_run_start(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        admission: &super::execution::EvaluationRunAdmission,
+    ) -> Result<EvaluationExperimentRecord, EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        admission
+            .validate_shape()
+            .map_err(EvaluationPersistenceError::InvalidInput)?;
+        load_experiment_tx(tx, owner_user_id, &admission.experiment_id)
+            .await?
+            .ok_or_else(|| EvaluationPersistenceError::NotFound(admission.experiment_id.clone()))
+    }
+
+    /// Called only while holding the experiment mutex, then Session/Run locks.
+    /// Current reads here must not use a snapshot established before waiting
+    /// for the mutex. Exact bound identity retries skip new-admission gates.
+    pub(crate) async fn admit_trial_run_start(
+        tx: &mut Transaction<'_, MySql>,
+        experiment: &EvaluationExperimentRecord,
+        admission: &super::execution::EvaluationRunAdmission,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<EvaluationTrialBindingRecord, EvaluationPersistenceError> {
+        validate_bounded("session_id", session_id, MAX_SESSION_ID_BYTES)?;
+        validate_bounded("run_id", run_id, MAX_RUN_ID_BYTES)?;
+        if admission.experiment_id != experiment.experiment_id {
+            return Err(EvaluationPersistenceError::Conflict(
+                "admission experiment differs from locked experiment".into(),
+            ));
+        }
+        let bindings = load_trial_bindings_with_lock_tx(
+            tx,
+            &experiment.owner_user_id,
+            &experiment.experiment_id,
+            true,
+        )
+        .await?;
+        let canonical = canonical_trial_index(experiment)?;
+        validate_trial_set(&bindings, experiment, &canonical)?;
+        let target = bindings
+            .iter()
+            .find(|binding| binding.trial_id == admission.trial_id)
+            .ok_or_else(|| EvaluationPersistenceError::NotFound(admission.trial_id.clone()))?;
+        super::execution::validate_admission_for_trial(
+            &experiment.spec,
+            target,
+            &experiment.owner_user_id,
+            session_id,
+            admission,
+        )
+        .map_err(execution_persistence_error)?;
+        if target.binding_status == "bound" {
+            if target.session_id.as_deref() != Some(session_id)
+                || target.run_id.as_deref() != Some(run_id)
+            {
+                return Err(EvaluationPersistenceError::Conflict(
+                    "trial is already bound to another canonical Run".into(),
+                ));
+            }
+            return Ok(target.clone());
+        }
+        if bindings.iter().any(|binding| {
+            binding.trial.sequence < target.trial.sequence && binding.binding_status != "bound"
+        }) {
+            return Err(EvaluationProtocolBlock::PrecedingTrialsUnbound.into());
+        }
+        let observations = super::execution::list_observations_with_lock_tx(
+            tx,
+            &experiment.owner_user_id,
+            &experiment.experiment_id,
+            true,
+        )
+        .await
+        .map_err(execution_persistence_error)?;
+        // Reuse the read model's exact owner/spec/binding checks rather than
+        // introducing a second interpretation of persisted observation identity.
+        let projection = super::projection::EvaluationExperimentProjection::from_records(
+            experiment.clone(),
+            bindings.clone(),
+            BTreeMap::new(),
+            observations,
+        )
+        .map_err(|error| match error {
+            super::projection::EvaluationProjectionError::Persistence(error) => error,
+            super::projection::EvaluationProjectionError::Execution(error) => {
+                execution_persistence_error(error)
+            }
+            super::projection::EvaluationProjectionError::Conflict(detail) => {
+                EvaluationPersistenceError::Conflict(detail)
+            }
+        })?;
+        let observed = projection
+            .trials
+            .iter()
+            .filter(|trial| trial.observation.is_some())
+            .map(|trial| trial.binding.trial_id.as_str())
+            .collect::<HashSet<_>>();
+        if let Some(predecessor) = experiment
+            .spec
+            .paired_predecessor(&target.trial)
+            .map_err(EvaluationPersistenceError::Conflict)?
+            && !observed.contains(predecessor.trial_id.as_str())
+        {
+            return Err(EvaluationProtocolBlock::PairedPredecessorUnobserved {
+                trial_id: predecessor.trial_id,
+            }
+            .into());
+        }
+        let outstanding = bindings
+            .iter()
+            .filter(|binding| {
+                binding.binding_status == "bound" && !observed.contains(binding.trial_id.as_str())
+            })
+            .count();
+        if outstanding >= usize::from(experiment.spec.budget.max_concurrency) {
+            return Err(EvaluationProtocolBlock::ConcurrencyLimit {
+                max_concurrency: experiment.spec.budget.max_concurrency,
+            }
+            .into());
+        }
+        Ok(target.clone())
     }
 
     /// Register an immutable experiment and all planned trial identities in
@@ -507,9 +667,8 @@ impl DatabaseEvaluationPlanStore {
         Ok(binding)
     }
 
-    /// Bind an existing canonical Run to one planned trial with a CAS on the
-    /// unbound row. The session and run are checked under the same transaction
-    /// and must belong to the requesting owner.
+    /// Confirm the binding created atomically with the canonical Run. This
+    /// entrypoint never binds a planned trial and still fences the current generation.
     pub async fn bind_trial_run(
         &self,
         owner_user_id: &str,
@@ -550,27 +709,9 @@ impl DatabaseEvaluationPlanStore {
                 "trial {trial_id} is already bound to another run"
             )));
         }
-        if existing.session_id.is_some() || existing.run_id.is_some() {
-            return Err(EvaluationPersistenceError::Conflict(format!(
-                "trial {trial_id} has a partial binding"
-            )));
-        }
-        let bound = Self::bind_locked_trial(
-            &mut tx,
-            owner_user_id,
-            trial_id,
-            session_id,
-            run_id,
-            run_generation,
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|source| EvaluationPersistenceError::Database {
-                operation: "commit_evaluation_trial_binding",
-                source,
-            })?;
-        Ok(bound)
+        Err(EvaluationPersistenceError::Conflict(
+            "evaluation binding must be created atomically with its canonical Run".into(),
+        ))
     }
 
     /// Called only after the shared locks and caller-specific admission validation.
@@ -871,7 +1012,17 @@ pub(crate) async fn load_trial_bindings_tx(
     owner_user_id: &str,
     experiment_id: &str,
 ) -> Result<Vec<EvaluationTrialBindingRecord>, EvaluationPersistenceError> {
-    let rows = sqlx::query(
+    load_trial_bindings_with_lock_tx(tx, owner_user_id, experiment_id, false).await
+}
+
+async fn load_trial_bindings_with_lock_tx(
+    tx: &mut Transaction<'_, MySql>,
+    owner_user_id: &str,
+    experiment_id: &str,
+    lock: bool,
+) -> Result<Vec<EvaluationTrialBindingRecord>, EvaluationPersistenceError> {
+    let lock = if lock { " FOR UPDATE" } else { "" };
+    let sql = format!(
         "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
                     sequence_num, trial_json, binding_status, session_id, run_id,
                     run_generation,
@@ -879,16 +1030,17 @@ pub(crate) async fn load_trial_bindings_tx(
                 CAST(updated_at AS CHAR) AS updated_at
          FROM evaluation_trial_bindings
          WHERE owner_user_id = ? AND experiment_id = ?
-         ORDER BY sequence_num ASC, trial_id ASC",
-    )
-    .bind(owner_user_id)
-    .bind(experiment_id)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|source| EvaluationPersistenceError::Database {
-        operation: "list_evaluation_trials",
-        source,
-    })?;
+         ORDER BY sequence_num ASC, trial_id ASC{lock}",
+    );
+    let rows = sqlx::query(&sql)
+        .bind(owner_user_id)
+        .bind(experiment_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "list_evaluation_trials",
+            source,
+        })?;
     rows.into_iter()
         .map(decode_trial_binding)
         .collect::<Result<Vec<_>, _>>()

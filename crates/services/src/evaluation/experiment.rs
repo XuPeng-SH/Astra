@@ -679,6 +679,29 @@ impl ExperimentSpec {
         u32::try_from(rank + 1).map_err(|_| "trial sequence exceeds u32".to_string())
     }
 
+    /// The earlier arm of this exact frozen case/repetition pair. Sequence
+    /// ordering is derived through the same canonical algorithm as planning;
+    /// an adjacent trial from another pair is never a predecessor.
+    pub fn paired_predecessor(&self, trial: &TrialUnit) -> Result<Option<TrialUnit>, String> {
+        if self.canonical_trial_sequence(trial)? != trial.sequence {
+            return Err("trial sequence does not match the frozen plan".into());
+        }
+        let mut paired = trial.clone();
+        paired.arm = match trial.arm {
+            ComparisonArm::Baseline => ComparisonArm::Candidate,
+            ComparisonArm::Candidate => ComparisonArm::Baseline,
+        };
+        paired.trial_id = trial_id(
+            &trial.spec_fingerprint,
+            &self.experiment_id,
+            &trial.case_id,
+            trial.repetition,
+            &paired.arm,
+        );
+        paired.sequence = self.canonical_trial_sequence(&paired)?;
+        Ok((paired.sequence < trial.sequence).then_some(paired))
+    }
+
     fn plan_trials_internal(
         &self,
         limits: Option<(usize, usize)>,
@@ -986,6 +1009,35 @@ mod tests {
                 .iter()
                 .all(|trial| { spec.canonical_trial_sequence(trial).unwrap() == trial.sequence })
         );
+    }
+
+    #[test]
+    fn paired_predecessor_uses_frozen_case_repetition_and_order() {
+        for order in [
+            TrialOrder::BaselineFirst,
+            TrialOrder::CandidateFirst,
+            TrialOrder::Balanced { seed: 42 },
+            TrialOrder::Balanced { seed: 7 },
+        ] {
+            let mut spec = spec(order);
+            let mut other_case = spec.cases[0].clone();
+            other_case.case_id = "case-b".into();
+            spec.cases.push(other_case);
+            spec.budget.max_trials = 8;
+            let trials = spec.plan_trials().unwrap();
+            for trial in &trials {
+                let expected = trials.iter().find(|other| {
+                    other.case_id == trial.case_id
+                        && other.repetition == trial.repetition
+                        && other.arm != trial.arm
+                        && other.sequence < trial.sequence
+                });
+                assert_eq!(spec.paired_predecessor(trial).unwrap().as_ref(), expected);
+                let mut tampered = trial.clone();
+                tampered.sequence = if trial.sequence == 1 { 2 } else { 1 };
+                assert!(spec.paired_predecessor(&tampered).is_err());
+            }
+        }
     }
 
     #[test]

@@ -4801,6 +4801,48 @@ fn classify_atomic_run_terminal_facts(
     AtomicRunTerminalFactMatch::Exact
 }
 
+fn initial_evaluation_admission(
+    events: &[serde_json::Value],
+) -> Result<Option<crate::evaluation::EvaluationRunAdmission>, String> {
+    let mut admission = None;
+    for event in events {
+        let Some(value) = event.pointer("/data/evaluation_admission") else {
+            continue;
+        };
+        if extract_event_type(event) != "run_started" || admission.is_some() {
+            return Err(
+                "evaluation_trial_admission_invalid: expected one run_started admission".into(),
+            );
+        }
+        let parsed: crate::evaluation::EvaluationRunAdmission =
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("evaluation_trial_admission_invalid: {error}"))?;
+        parsed
+            .validate_shape()
+            .map_err(|error| format!("evaluation_trial_admission_invalid: {error}"))?;
+        admission = Some(parsed);
+    }
+    Ok(admission)
+}
+
+fn evaluation_run_admission_error(error: crate::evaluation::EvaluationPersistenceError) -> String {
+    use crate::evaluation::durable::{EvaluationPersistenceError, EvaluationProtocolBlock};
+    match error {
+        EvaluationPersistenceError::ProtocolBlocked(block) => match block {
+            EvaluationProtocolBlock::PrecedingTrialsUnbound =>
+                "evaluation_trial_order_blocked: preceding trials must be admitted first".into(),
+            EvaluationProtocolBlock::PairedPredecessorUnobserved { trial_id } =>
+                format!("evaluation_trial_order_blocked: paired first arm {trial_id} awaits terminal observation"),
+            EvaluationProtocolBlock::ConcurrencyLimit { .. } =>
+                "evaluation_trial_capacity_exhausted: experiment has no available admission capacity".into(),
+        },
+        EvaluationPersistenceError::Conflict(detail) => format!("evaluation_trial_binding_conflict: {detail}"),
+        EvaluationPersistenceError::InvalidInput(detail) | EvaluationPersistenceError::NotFound(detail) =>
+            format!("evaluation_trial_admission_invalid: {detail}"),
+        other => other.to_string(),
+    }
+}
+
 /// Validate recovery lineage and its failure/cancellation terminal cut while
 /// the caller owns the canonical observation transaction. The caller obtains
 /// the admission generation/index from its verified admission marker. No
@@ -6260,6 +6302,9 @@ impl InMemoryRunStateStore {
                 existing.start_request_fingerprint.as_deref(),
                 requested_session_id,
             ));
+        }
+        if initial_evaluation_admission(&record.events)?.is_some() {
+            return Err("evaluation trial admission requires the canonical database store".into());
         }
         reconcile_in_memory_execution_slot_for_session(
             &mut slots,
@@ -13824,6 +13869,7 @@ impl DatabaseRunStateStore {
                 &record.session_id,
             ));
         }
+        let evaluation_admission = initial_evaluation_admission(&events)?;
         let initial_event_rows = events
             .iter()
             .enumerate()
@@ -13851,6 +13897,20 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
+        let evaluation_experiment = if let Some(admission) = evaluation_admission.as_ref() {
+            // First database lock: experiment -> Session -> Run -> Trial.
+            Some(
+                crate::evaluation::DatabaseEvaluationPlanStore::lock_experiment_for_run_start(
+                    &mut tx,
+                    &record.user_id,
+                    admission,
+                )
+                .await
+                .map_err(evaluation_run_admission_error)?,
+            )
+        } else {
+            None
+        };
         let execution_admission_facts = crate::storage::admit_session_execution_write_with_facts(
             &mut tx,
             &record.session_id,
@@ -13898,6 +13958,25 @@ impl DatabaseRunStateStore {
                 "run identity {} is already bound to session {existing_session}",
                 record.run_id
             ));
+        }
+
+        if let (Some(admission), Some(experiment)) = (&evaluation_admission, &evaluation_experiment)
+        {
+            let binding = crate::evaluation::DatabaseEvaluationPlanStore::admit_trial_run_start(
+                &mut tx,
+                experiment,
+                admission,
+                &record.session_id,
+                &record.run_id,
+            )
+            .await
+            .map_err(evaluation_run_admission_error)?;
+            if binding.binding_status != "planned" {
+                return Err(
+                    "evaluation_trial_binding_conflict: binding exists without its canonical Run"
+                        .into(),
+                );
+            }
         }
 
         if !run_requires_session_execution_slot(&record) {
@@ -14003,6 +14082,18 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        if let Some(admission) = &evaluation_admission {
+            crate::evaluation::DatabaseEvaluationPlanStore::bind_locked_trial(
+                &mut tx,
+                &record.user_id,
+                &admission.trial_id,
+                &record.session_id,
+                &record.run_id,
+                record.run_generation,
+            )
+            .await
+            .map_err(evaluation_run_admission_error)?;
+        }
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -28342,70 +28433,209 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_start_claim_is_atomic_for_concurrent_exact_retries() {
-        let (store, pool) = setup_database_run_state_store_it().await;
-        let user_id = format!("runs-it-claim-user-{}", Uuid::new_v4());
-        let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
-        let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("clean run-start claim slot");
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-
-        let claim = |store: DatabaseRunStateStore| {
-            let user_id = user_id.clone();
-            let session_id = session_id.clone();
-            let run_id = run_id.clone();
-            async move {
-                let mut record = durable_run_record(&run_id);
-                record.user_id = user_id;
-                record.session_id = session_id.clone();
-                store.claim_run_start(record, Some(&session_id)).await
-            }
-        };
-        let (first, second) = tokio::join!(claim(store.clone()), claim(store.clone()));
-        let outcomes = [first.expect("first claim"), second.expect("second claim")];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, DurableRunStartClaim::Started { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| {
-                    **outcome
-                        == DurableRunStartClaim::Existing {
-                            session_id: session_id.clone(),
-                            start_request_fingerprint: None,
-                        }
-                })
-                .count(),
-            1
-        );
-
-        sqlx::query(
-            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove run-start claim slot");
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        for evaluation in [false, true] {
+            let (store, pool) = setup_database_run_state_store_it().await;
+            let user_id = format!("runs-it-claim-user-{}", Uuid::new_v4());
+            let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
+            let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
             .await
-            .expect("remove run-start claim session");
+            .expect("clean run-start claim slot");
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+
+            let evaluation = if evaluation {
+                use crate::evaluation::{
+                    DatabaseEvaluationPlanStore, PreparedModelIdentity,
+                    build_prepared_experiment_spec,
+                };
+                let request = serde_json::from_value(json!({
+                    "submission_idempotency_key": "atomic-start",
+                    "target": {"kind": "prompt", "baseline": {"revision_id": "base", "content": "base prompt"},
+                        "candidate": {"revision_id": "candidate", "content": "candidate prompt"}},
+                    "case": {"case_id": "case", "message": "fixed input", "verifier_id": "verifier", "verifier_version": "1", "holdout": false},
+                    "model_offering_id": "model", "max_concurrency": 1, "max_wall_time_secs": 30,
+                })).unwrap();
+                let spec = build_prepared_experiment_spec(
+                    &user_id,
+                    &format!("experiment-{}", Uuid::new_v4()),
+                    &request,
+                    &PreparedModelIdentity {
+                        offering_id: "model".into(),
+                        model_name: "model".into(),
+                        provider: "openai".into(),
+                        cache_policy: "provider_default_recorded".into(),
+                        cache_capability: None,
+                    },
+                    None,
+                )
+                .unwrap();
+                let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+                let experiment = plan_store
+                    .register_experiment(&user_id, &spec, "atomic-start")
+                    .await
+                    .unwrap();
+                let trials = plan_store
+                    .list_trials(&user_id, &experiment.experiment_id)
+                    .await
+                    .unwrap();
+                Some((experiment, trials))
+            } else {
+                None
+            };
+            let admission = evaluation.as_ref().map(|(experiment, trials)| {
+                crate::evaluation::EvaluationRunAdmission {
+                    experiment_id: experiment.experiment_id.clone(),
+                    trial_id: trials[0].trial_id.clone(),
+                    input_content_hash: experiment.spec.cases[0].input_content_hash.clone(),
+                    revision_content_hash: experiment.spec.target.baseline.content_hash.clone(),
+                    skill_revision: None,
+                    receipt_ids: vec![],
+                    snapshot_envelope: None,
+                }
+            });
+            let claim = |store: DatabaseRunStateStore| {
+                let user_id = user_id.clone();
+                let session_id = session_id.clone();
+                let run_id = run_id.clone();
+                let admission = admission.clone();
+                async move {
+                    let mut record = durable_run_record(&run_id);
+                    record.user_id = user_id;
+                    record.session_id = session_id.clone();
+                    if let Some(admission) = admission {
+                        record.events = vec![
+                            json!({"event_type": "run_started", "data": {"owner_generation": 0, "evaluation_admission": admission}}),
+                        ];
+                    }
+                    store.claim_run_start(record, Some(&session_id)).await
+                }
+            };
+            let (first, second) = tokio::join!(claim(store.clone()), claim(store.clone()));
+            let outcomes = [first.expect("first claim"), second.expect("second claim")];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, DurableRunStartClaim::Started { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        **outcome
+                            == DurableRunStartClaim::Existing {
+                                session_id: session_id.clone(),
+                                start_request_fingerprint: None,
+                            }
+                    })
+                    .count(),
+                1
+            );
+
+            if let Some((experiment, trials)) = evaluation.as_ref() {
+                let plan_store = crate::evaluation::DatabaseEvaluationPlanStore::new(pool.clone());
+                let bound = plan_store
+                    .load_trial(&user_id, &trials[0].trial_id)
+                    .await
+                    .unwrap();
+                assert_eq!(bound.run_id.as_deref(), Some(run_id.as_str()));
+                assert_eq!(bound.run_generation, Some(0));
+                assert_eq!(bound.binding_status, "bound");
+                // The experiment is full, but exact replay is still the same Run.
+                assert!(matches!(
+                    claim(store.clone()).await.unwrap(),
+                    DurableRunStartClaim::Existing { .. }
+                ));
+                let next_session = format!("next-s-{}", Uuid::new_v4());
+                let next_run = format!("next-r-{}", Uuid::new_v4());
+                insert_active_database_session_fixture(&pool, &user_id, &next_session).await;
+                let mut next = durable_run_record(&next_run);
+                next.user_id = user_id.clone();
+                next.session_id = next_session.clone();
+                let mut next_admission = admission.clone().unwrap();
+                next_admission.trial_id = trials[1].trial_id.clone();
+                next_admission.revision_content_hash =
+                    experiment.spec.target.candidate.content_hash.clone();
+                next.events = vec![
+                    json!({"event_type": "run_started", "data": {"owner_generation": 0, "evaluation_admission": next_admission}}),
+                ];
+                assert!(
+                    store
+                        .claim_run_start(next, Some(&next_session))
+                        .await
+                        .unwrap_err()
+                        .starts_with("evaluation_trial_order_blocked:")
+                );
+                assert!(store.load_run(&user_id, &next_run).await.unwrap().is_none());
+                assert_eq!(
+                    plan_store
+                        .load_trial(&user_id, &trials[1].trial_id)
+                        .await
+                        .unwrap()
+                        .binding_status,
+                    "planned"
+                );
+                sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                    .bind(&user_id)
+                    .bind(&next_session)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                sqlx::query("DELETE FROM evaluation_trial_bindings WHERE owner_user_id = ? AND experiment_id = ?")
+                    .bind(&user_id).bind(&experiment.experiment_id).execute(pool.get()).await.unwrap();
+                sqlx::query("DELETE FROM evaluation_experiments WHERE owner_user_id = ? AND experiment_id = ?")
+                    .bind(&user_id).bind(&experiment.experiment_id).execute(pool.get()).await.unwrap();
+            }
+
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("remove run-start claim slot");
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user_id)
+                .bind(&session_id)
+                .execute(pool.get())
+                .await
+                .expect("remove run-start claim session");
+        }
+    }
+
+    #[test]
+    fn evaluation_run_admission_preserves_retryable_protocol_error_codes() {
+        use crate::evaluation::durable::{EvaluationPersistenceError, EvaluationProtocolBlock};
+        for (error, prefix) in [
+            (
+                EvaluationProtocolBlock::PrecedingTrialsUnbound,
+                "evaluation_trial_order_blocked:",
+            ),
+            (
+                EvaluationProtocolBlock::PairedPredecessorUnobserved {
+                    trial_id: "first".into(),
+                },
+                "evaluation_trial_order_blocked:",
+            ),
+            (
+                EvaluationProtocolBlock::ConcurrencyLimit { max_concurrency: 1 },
+                "evaluation_trial_capacity_exhausted:",
+            ),
+        ] {
+            assert!(
+                evaluation_run_admission_error(EvaluationPersistenceError::ProtocolBlocked(error))
+                    .starts_with(prefix)
+            );
+        }
     }
 
     #[test]

@@ -11126,8 +11126,8 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .await
         .expect("repeated status repair remains idempotent");
 
-    // Crash after canonical Run creation but before trial binding. A claim
-    // itself can also crash: two real claims must preserve the original
+    // Crash after atomic Run creation and trial binding, before materialization.
+    // A claim itself can also crash: two real claims must preserve the original
     // admission identity and settle one observation without invoking a model.
     let mut recovery_spec = spec.clone();
     recovery_spec.experiment_id = format!("eval-recovery-exp-{}", Uuid::new_v4());
@@ -11199,7 +11199,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             .await
             .unwrap()
             .binding_status,
-        "planned"
+        "bound"
     );
     let provider_calls_before_recovery = llm.requests.load(Ordering::SeqCst);
     restarted
@@ -11210,7 +11210,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .load_by_trial(&owner, &recovery_trial.trial_id)
         .await
         .unwrap()
-        .expect("pre-bind crash must settle through verified recovery custody");
+        .expect("pre-materialization crash must settle through verified recovery custody");
     assert_eq!(
         recovered_observation.admission_run_generation,
         authority.owner_generation
@@ -11493,6 +11493,35 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         request_json(&app, &foreign_owner, "POST", &start_uri, json!({})).await;
     assert_eq!(foreign_start_status, StatusCode::NOT_FOUND);
 
+    let second_trial_id = prepared["trials"][1]["trial_id"]
+        .as_str()
+        .expect("paired second trial id");
+    let second_start_uri =
+        format!("/evaluation/experiments/{experiment_id}/trials/{second_trial_id}/start");
+    let calls_before_premature_start = llm.requests.load(Ordering::SeqCst);
+    let (premature_status, premature) =
+        request_json(&app, &owner, "POST", &second_start_uri, json!({})).await;
+    assert_eq!(
+        premature_status,
+        StatusCode::CONFLICT,
+        "paired second arm must wait for its predecessor: {premature}"
+    );
+    assert_eq!(premature["error_code"], "evaluation_trial_order_blocked");
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        calls_before_premature_start
+    );
+    let (status, after_rejection) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("/evaluation/experiments/{experiment_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after_rejection["trials"][1]["binding"]["run_id"].is_null());
+
     let (start_status, started) = request_json(&app, &owner, "POST", &start_uri, json!({})).await;
     assert_eq!(
         start_status,
@@ -11590,6 +11619,31 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         "replaying the same trial must not invoke the provider again"
     );
 
+    let (second_status, second_started) =
+        request_json(&app, &owner, "POST", &second_start_uri, json!({})).await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "the rejected second arm can retry after its predecessor settles: {second_started}"
+    );
+    let second_run_id = second_started["run_id"].as_str().expect("second run id");
+    let second_session_id = second_started["session_id"]
+        .as_str()
+        .expect("second session id");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, value) =
+                request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "paired projection: {value}");
+            if value["observed_trial_count"].as_u64() == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retried second arm must settle through the canonical lifecycle");
+
     sqlx::query("DELETE FROM evaluation_trial_observations WHERE owner_user_id = ?")
         .bind(&owner)
         .execute(pool.get())
@@ -11610,6 +11664,8 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         .execute(pool.get())
         .await
         .expect("clean HTTP evaluation experiments");
+    cleanup_lifecycle_run_fixture(&pool, &owner, second_run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, second_session_id).await;
     cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
@@ -11972,7 +12028,26 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     let rejected_session_id = format!("eval-skill-rej-{}", Uuid::new_v4());
     crate::server::run::insert_active_run_session_fixture(&pool, &owner, &rejected_session_id)
         .await;
+    // Use an unbound trial so the prompt boundary, rather than an attempted
+    // rebind of the completed baseline, owns this rejection.
+    let mut rejected_spec = spec.clone();
+    rejected_spec.experiment_id = format!("eval-skill-rejected-{}", Uuid::new_v4());
+    let rejected_experiment = plan_store
+        .register_experiment(&owner, &rejected_spec, "runtime-skill-eval-rejected")
+        .await
+        .unwrap();
+    let rejected_trial = plan_store
+        .list_trials(&owner, &rejected_experiment.experiment_id)
+        .await
+        .unwrap()
+        .remove(0);
     let mut unstable_prompt_request = baseline_request.clone();
+    let rejected_admission = unstable_prompt_request
+        .evaluation_admission
+        .as_mut()
+        .unwrap();
+    rejected_admission.experiment_id = rejected_experiment.experiment_id;
+    rejected_admission.trial_id = rejected_trial.trial_id.clone();
     unstable_prompt_request.session_id = Some(rejected_session_id.clone());
     unstable_prompt_request.stable_runtime_system_prompt = Some("unfrozen prompt".to_string());
     let rejected = service
@@ -11984,6 +12059,21 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         Some("evaluation_skill_system_prompt_unsupported")
     );
     assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
+    let rejected_binding = plan_store
+        .load_trial(&owner, &rejected_trial.trial_id)
+        .await
+        .unwrap();
+    let rejected_run_id = rejected_binding
+        .run_id
+        .as_deref()
+        .expect("atomic trial binding");
+    let rejected_run = service
+        .run_engine
+        .load_run(&owner, rejected_run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected_run.status, STATUS_FAILED);
 
     for table in [
         "evaluation_trial_observations",
@@ -12001,6 +12091,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     }
     cleanup_lifecycle_run_fixture(&pool, &owner, &run.run_id).await;
     cleanup_lifecycle_run_fixture(&pool, &owner, &candidate_run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, rejected_run_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &candidate_session_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &rejected_session_id).await;
