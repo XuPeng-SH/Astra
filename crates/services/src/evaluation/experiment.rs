@@ -329,6 +329,9 @@ pub struct ExperimentSpec {
     /// this spec. Raw registration intentionally has no preparation marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_profile_version: Option<String>,
+    /// Absent on legacy plans; omission preserves their exact content identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_profile: Option<super::measurement_profile::MeasurementProfile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -920,6 +923,7 @@ mod tests {
                 max_wall_time_secs: 300,
             },
             adapter_profile_version: None,
+            measurement_profile: None,
         }
     }
 

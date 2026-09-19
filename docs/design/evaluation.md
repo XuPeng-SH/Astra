@@ -136,6 +136,20 @@ with no measurements or no evidence references remain explicitly incomplete
 in both structured coverage and Markdown. These basic checks do not prove
 that every evaluation dimension has been measured or that a task verifier ran.
 
+New prepared experiments freeze `measurement_profile: "instruction-only.v1"`.
+This immutable version defines the required task, tool, context, provider,
+safety, reliability, and cost metrics and their units. Legacy specifications
+omit the field, retaining their original fingerprints and trial identities;
+submission retries preserve that original specification rather than adopting
+the current preparation defaults. Reports identify legacy dimension coverage
+as unknown. Profiled reports enumerate gaps for every planned trial and metric,
+including trials without observations. Numeric measurements and textual basis
+labels alone do not prove scoped assessment or complete collection. Existing
+token measurements are reported subtotals with unknown request/lane coverage,
+not complete cost. Until trusted assessment and collector receipts are wired
+in, these gaps remain open; no verifier execution or monetary estimate is
+implied by freezing a profile.
+
 ## Durable registration boundary
 
 The first durable Eval boundary is intentionally small. An owner-scoped

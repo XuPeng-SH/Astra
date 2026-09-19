@@ -6,6 +6,7 @@ pub mod durable;
 pub mod execution;
 pub mod experiment;
 pub mod materialization;
+pub mod measurement_profile;
 pub mod noop;
 pub mod projection;
 pub mod report;
