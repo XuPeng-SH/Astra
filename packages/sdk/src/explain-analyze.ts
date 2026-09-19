@@ -229,7 +229,7 @@ export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1):
     const group = groups.get(key) ?? []; group.push(attempt); groups.set(key,group);
   }
   const purposeLabels = new Map<string,string>([["memory_retrieval_rerank","Memory judgment"], ["memory_extraction","Memory extraction"], ["introspection","Request analysis"], ["verification_judge","Verification"], ["reflection","Reflection"], ["required_compaction","Context summary"]]);
-  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"], ["work_direction","Work next direction"]]);
+  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"]]);
   const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
     const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
     const provider = first.provider === "typesafe" ? "Jev" : first.provider;

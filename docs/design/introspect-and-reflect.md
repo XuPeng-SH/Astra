@@ -74,6 +74,30 @@ retain at most 2/8/16/32 attempts with explicit omitted counts. Identity display
 fields are capped at 128 characters and truncation is reported; these display
 identities are never execution references. Other facets do not load this data.
 
+Semantic judgment results are separate from physical usage. The shared
+owner/session-scoped C3 projection exposes captured request classifications,
+closed abstention/conflict/invalid-response reasons and explicit preparation or
+execution unavailability. Initial classification and clarification remain
+separate stages; subsequent planning failure does not overwrite their results.
+Normalized answer values retain their provenance; discrete values are category
+encodings, not calibrated confidence. Invocation correlation is unknown unless
+an authoritative invocation reference is available. Consumers must not infer a
+provider, token count, or physical call count from semantic observations.
+
+The projection bounds candidate trace rows as well as displayed observations.
+Exact duplicates collapse; conflicting observation identities are excluded and
+reported as a coverage gap. Even an empty successful query describes captured
+observations only: trace buffering, ingestion and retention can lose events.
+Unavailable sources, source-policy exclusion, capture truncation and display
+omission remain distinct. A valid classification does not prove model adoption
+or improved task outcomes. Missing observations do not prove inactivity. The
+bounded recent trace window is not a complete session-wide judgment count.
+
+Explain presents these semantic facts as fixed-label preparation milestones.
+Their zero-length intervals mark observation instants, not inference latency;
+measured provider duration and usage retain their existing owners. Labels are
+derived from the typed facts and are never parsed back into semantic state.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.

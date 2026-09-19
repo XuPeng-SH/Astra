@@ -937,29 +937,37 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         // Refresh only this request's projection; never retain stale ledger
         // facts in the shared round snapshot or add them to primary usage.
         snapshot.judgment_usage = None;
-        if matches!(
+        snapshot.semantic_judgments = None;
+        if astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
             request.facet,
-            astra_core::ObservationFacet::Session
-                | astra_core::ObservationFacet::Overview
-                | astra_core::ObservationFacet::Recent
-                | astra_core::ObservationFacet::Trace
         ) {
             use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
-            snapshot.judgment_usage = Some(
-                if matches!(
-                    request.source_policy,
-                    astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
-                ) {
-                    JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
-                } else {
-                    load_introspect_judgment_usage(
-                        context.context_manifest_pool.as_ref(),
-                        &context.user_id,
-                        &context.session_id,
-                    )
-                    .await
+            let (usage, semantics) = tokio::join!(
+                async {
+                    if matches!(
+                        request.source_policy,
+                        astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+                    ) {
+                        JudgmentUsageSnapshot::unavailable(JudgmentUsageCoverage::SourceExcluded)
+                    } else {
+                        load_introspect_judgment_usage(
+                            context.context_manifest_pool.as_ref(),
+                            &context.user_id,
+                            &context.session_id,
+                        )
+                        .await
+                    }
                 },
+                astra_services::semantic_judgment_observation::load_semantic_judgment_view(
+                    context.context_manifest_pool.as_ref(),
+                    &context.user_id,
+                    &context.session_id,
+                    request.source_policy,
+                    request.depth,
+                )
             );
+            snapshot.judgment_usage = Some(usage);
+            snapshot.semantic_judgments = Some(semantics);
         }
         let run_id = args
             .get("_run_id")
@@ -1643,7 +1651,11 @@ mod tests {
             None,
             None,
         );
-        for (policy, expected) in [("auto", "no_pool"), ("live_only", "source_excluded")] {
+        for (policy, expected) in [
+            ("auto", "no_pool"),
+            ("live_only", "source_excluded"),
+            ("local_only", "source_excluded"),
+        ] {
             let result = IntrospectToolHandler
                 .execute(
                     &executor,
@@ -1657,6 +1669,9 @@ mod tests {
             let report: Value = serde_json::from_str(&result.output).unwrap();
             assert_eq!(report["judgment_usage"]["coverage"], expected);
             assert!(report["judgment_usage"]["observed_attempts"].is_null());
+            assert_eq!(report["semantic_judgments"]["coverage"], expected);
+            assert!(report["semantic_judgments"]["counts"].is_null());
+            assert_eq!(report["semantic_judgments"]["model_adoption"], "unknown");
         }
     }
 

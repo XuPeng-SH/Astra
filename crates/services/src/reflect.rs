@@ -77,6 +77,8 @@ pub struct ReflectReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgment_usage: Option<JudgmentUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_judgments: Option<crate::semantic_judgment_observation::SemanticJudgmentView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
@@ -1447,41 +1449,63 @@ impl ReflectService for DatabaseReflectService {
             None
         };
 
-        let judgment_usage = if let Some(shared_pool) = self.pool.as_ref() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                crate::inference_execution::load_session_auxiliary_usage(
-                    shared_pool,
-                    user_id,
-                    session_id,
-                    512,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(facts)) => JudgmentUsageSummary::from_physical_attempts(&facts),
-                outcome => {
-                    tracing::warn!(
-                        target: "astra_services::reflect",
-                        user_id = %user_id,
-                        session_id = %session_id,
-                        ?outcome,
-                        "judgment physical-attempt facts unavailable during reflection"
-                    );
+        let (judgment_usage, semantic_judgments) = tokio::join!(
+            async {
+                if let Some(shared_pool) = self.pool.as_ref() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        crate::inference_execution::load_session_auxiliary_usage(
+                            shared_pool,
+                            user_id,
+                            session_id,
+                            512,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(facts)) => JudgmentUsageSummary::from_physical_attempts(&facts),
+                        outcome => {
+                            tracing::warn!(
+                                target: "astra_services::reflect",
+                                user_id = %user_id,
+                                session_id = %session_id,
+                                ?outcome,
+                                "judgment physical-attempt facts unavailable during reflection"
+                            );
+                            JudgmentUsageSummary {
+                                coverage: "unavailable".into(),
+                                groups: Vec::new(),
+                                omitted_groups: 0,
+                            }
+                        }
+                    }
+                } else {
                     JudgmentUsageSummary {
                         coverage: "unavailable".into(),
                         groups: Vec::new(),
                         omitted_groups: 0,
                     }
                 }
+            },
+            async {
+                if crate::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                    request.facet,
+                ) {
+                    Some(
+                        crate::semantic_judgment_observation::load_semantic_judgment_view(
+                            self.pool.as_ref(),
+                            user_id,
+                            session_id,
+                            request.source_policy,
+                            request.depth,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
             }
-        } else {
-            JudgmentUsageSummary {
-                coverage: "unavailable".into(),
-                groups: Vec::new(),
-                omitted_groups: 0,
-            }
-        };
+        );
 
         // `agent_events.meta_duration_ms` is the durable timing projection
         // for model rounds. Keep this optional like cache-context telemetry so
@@ -1668,6 +1692,10 @@ impl ReflectService for DatabaseReflectService {
         }
         summary.push(' ');
         summary.push_str(&judgment_usage.render());
+        if let Some(semantics) = &semantic_judgments {
+            summary.push(' ');
+            summary.push_str(&semantics.render());
+        }
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
             summary.push_str(&llm_latency_summary.render());
@@ -1679,7 +1707,29 @@ impl ReflectService for DatabaseReflectService {
             &failure_clusters,
             &budget_result,
         );
-        let view = request.view(overview.total_events, overview.total_decisions);
+        let mut view = request.view(overview.total_events, overview.total_decisions);
+        if let Some(semantics) = &semantic_judgments {
+            view.data_coverage.providers.insert(
+                "semantic_judgment_trace".into(),
+                astra_core::ObservationProviderCoverage {
+                    status: if semantics.counts.is_some() {
+                        "partial"
+                    } else {
+                        "missing"
+                    }
+                    .into(),
+                    freshness_ms: None,
+                    reason: Some(format!(
+                        "session_trace_at_read:{:?};classification_not_execution_authority",
+                        semantics.coverage
+                    )),
+                },
+            );
+            view.data_coverage.overall = "partial".into();
+            view.data_coverage.warnings.push(
+                "Semantic trace capture is incomplete; model adoption remains unknown.".into(),
+            );
+        }
         let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
@@ -1695,6 +1745,7 @@ impl ReflectService for DatabaseReflectService {
             include_context: request.include_context,
             data_coverage,
             judgment_usage: Some(judgment_usage),
+            semantic_judgments,
             view: Some(view),
             summary,
             observations,
@@ -3509,6 +3560,7 @@ mod tests {
             include_context: false,
             data_coverage: data_coverage.clone(),
             judgment_usage: None,
+            semantic_judgments: None,
             view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),
@@ -3600,8 +3652,25 @@ mod tests {
             json_value.get("prompt_preview").is_none(),
             "legacy prompt_preview must not be part of the public reflect report"
         );
-        let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
+        let mut parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+        // Old reports omit the new optional field; new unavailable captures
+        // carry unknown counts rather than inventing zero semantic calls.
+        assert!(parsed.semantic_judgments.is_none());
+        let view = crate::semantic_judgment_observation::SemanticJudgmentView::unavailable(
+            crate::semantic_judgment_observation::SemanticJudgmentCoverage::SourceExcluded,
+        );
+        parsed.summary.push_str(&view.render());
+        parsed.semantic_judgments = Some(view);
+        let projected = parsed.project_lightweight();
+        let value = serde_json::to_value(&projected).unwrap();
+        assert_eq!(value["semantic_judgments"]["coverage"], "source_excluded");
+        assert!(value["semantic_judgments"].get("model_adoption").is_none());
+        assert!(value["semantic_judgments"]["counts"].is_null());
+        assert_eq!(
+            serde_json::from_value::<ReflectReport>(value).unwrap(),
+            projected
+        );
     }
 
     #[test]

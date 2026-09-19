@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "trace_ingestion_tests.rs"]
+mod trace_ingestion_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[path = "cancellation_db_tests.rs"]

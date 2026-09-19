@@ -2033,55 +2033,6 @@ impl RuntimeToolExecutor {
         snapshot
     }
 
-    /// Capture identity and task content under one attempt lock. This is
-    /// evidence for an optional adviser, not an execution or settlement grant.
-    pub(crate) fn work_direction_assignment(
-        &self,
-        user: &str,
-        session: &str,
-        run: &str,
-    ) -> Option<(
-        astra_services::runs::WorkRuntimeBindingRequest,
-        String,
-        String,
-    )> {
-        if self.user_id != user || self.session_id != session {
-            return None;
-        }
-        let active = self.active_primary_work_attempt.read().ok()?;
-        let attempt = active.as_ref()?;
-        let binding = self.work_binding.get()?;
-        if binding.owner_id.as_str() != user
-            || binding.session_id.as_str() != session
-            || attempt.executor_run_id != run
-            || attempt.objective.is_empty()
-            || attempt.expected_result.is_empty()
-            || attempt.objective.len() > 2048
-            || attempt.expected_result.len() > 4096
-        {
-            return None;
-        }
-        let binding = astra_services::runs::WorkRuntimeBindingRequest {
-            work_id: binding.work_id.as_str().into(),
-            branch_id: binding.branch_id.as_str().into(),
-            item: Some(astra_services::runs::WorkItemRuntimeBindingRequest {
-                item_id: attempt.item_id.clone(),
-                item_revision: attempt.item_revision,
-                attempt_id: attempt.attempt_id.clone(),
-            }),
-        };
-        PrimaryWorkHandoff::Active {
-            binding: binding.clone(),
-        }
-        .validate()
-        .ok()?;
-        Some((
-            binding,
-            attempt.objective.clone(),
-            attempt.expected_result.clone(),
-        ))
-    }
-
     pub(super) fn bind_work_establishment_operation(
         &self,
         tool_call_id: &str,
@@ -5638,6 +5589,7 @@ mod tests {
                 include_context: request.include_context,
                 data_coverage,
                 judgment_usage: None,
+                semantic_judgments: None,
                 view: None,
                 summary: "reflect ready".to_string(),
                 observations: Vec::new(),

@@ -3571,6 +3571,18 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         );
     }
 
+    if let (Some(buffer), Some(sender), Some(owner), Some(session), Some(generation)) = (
+        state.turn_event_buffer.as_mut(),
+        state.telemetry.trace_ingestion.clone(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_owner_generation,
+    ) {
+        if let Err(error) = buffer.bind_trace_ingestion(owner, session, generation, sender) {
+            tracing::warn!(error, "turn trace sink binding rejected");
+        }
+    }
+
     if let (Some(hub), Some(session)) = (
         &state.telemetry.observability_hub,
         &state.telemetry.observability_session,

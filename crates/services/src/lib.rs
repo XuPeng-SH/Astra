@@ -46,6 +46,7 @@ pub mod runs;
 pub mod runtime_maintenance;
 pub mod sandbox;
 pub mod self_surface;
+pub mod semantic_judgment_observation;
 pub mod semantic_read_observation_store;
 pub mod service_error;
 pub mod session_analytics;
@@ -78,7 +79,6 @@ pub mod verification;
 pub mod weighted_admission;
 pub mod work;
 pub mod work_admission_judgment;
-pub mod work_direction_judgment;
 pub mod workflows;
 pub mod workspace_records;
 

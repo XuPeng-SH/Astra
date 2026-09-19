@@ -622,7 +622,7 @@ mod tests {
             offering_id: "jev-1".into(),
             model_name: "jev1".into(),
             purpose: "introspection".into(),
-            operation_id: "work_direction".into(),
+            operation_id: "request_judgment".into(),
             usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
             usage: Some(ExplainAnalyzeTokenUsageV1 {
                 basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
@@ -649,7 +649,7 @@ mod tests {
         graph.apply(start);
         graph.apply(end);
         let output = auxiliary_usage_lines(&graph).join("\n");
-        assert!(output.contains("Work next direction"), "{output}");
+        assert!(output.contains("Request classification"), "{output}");
         assert!(output.contains("in at least 40"), "{output}");
         assert!(output.contains("out at least 5"), "{output}");
         assert!(output.contains("1/2 requests reported"), "{output}");
@@ -667,7 +667,7 @@ mod tests {
             offering_id: "offering".into(),
             model_name: "model".into(),
             purpose: "introspection".into(),
-            operation_id: "work_direction".into(),
+            operation_id: "request_judgment".into(),
             usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
             usage: Some(ExplainAnalyzeTokenUsageV1 {
                 basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
@@ -821,8 +821,8 @@ mod tests {
             "Auxiliary inference"
         );
         assert_eq!(
-            auxiliary_usage_label("work_direction", "introspection"),
-            "Work next direction"
+            auxiliary_usage_label("request_judgment", "introspection"),
+            "Request classification"
         );
     }
 
@@ -1275,7 +1275,6 @@ fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
     match operation {
         "request_judgment" => "Request classification",
         "skill_auto_route" => "Skill selection",
-        "work_direction" => "Work next direction",
         "work_plan" => "Work planning",
         _ => match purpose {
             "memory_retrieval_rerank" => "Memory judgment",

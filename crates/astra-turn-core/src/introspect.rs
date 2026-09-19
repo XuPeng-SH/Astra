@@ -68,6 +68,10 @@ pub struct IntrospectSnapshot {
     /// inference ledger, independent of the live round snapshot's cutoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgment_usage: Option<JudgmentUsageSnapshot>,
+    /// Separate C3 semantic facts; never physical attempt counts or adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_judgments:
+        Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
 
     // ── Task #46: enhanced self-awareness ──
     /// Summary of the most recent LLM rounds (in-memory ring). Available
@@ -580,7 +584,33 @@ enum IntrospectTextDepth {
     Hint,
 }
 
-/// Select the same source-scoped ledger view for text and JSON.
+/// Select the same source-scoped semantic trace view for text and JSON.
+fn semantic_judgment_view(
+    snapshot: &IntrospectSnapshot,
+    request: &IntrospectRequest,
+) -> Option<astra_services::semantic_judgment_observation::SemanticJudgmentView> {
+    use astra_services::semantic_judgment_observation::{
+        SemanticJudgmentCoverage, SemanticJudgmentView, semantic_judgment_facet_enabled,
+    };
+    if !semantic_judgment_facet_enabled(request.facet) {
+        return None;
+    }
+    Some(
+        if matches!(
+            request.source_policy,
+            astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+        ) {
+            SemanticJudgmentView::unavailable(SemanticJudgmentCoverage::SourceExcluded)
+        } else {
+            snapshot
+                .semantic_judgments
+                .clone()
+                .unwrap_or_default()
+                .bounded(request.depth)
+        },
+    )
+}
+
 fn judgment_usage_view(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
@@ -655,7 +685,12 @@ pub fn render_introspect_request(
         body
     };
     let boundary = "## Observation Boundary\n\
-snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage has a separate session scope at ledger-read time. Treat counts and states as snapshot-time observations, not final session totals.";
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage and semantic traces have separate session scopes at their respective read times. Treat counts and states as snapshot-time observations, not final session totals.";
+    let body = if let Some(semantics) = semantic_judgment_view(snapshot, request) {
+        format!("{body}\n\n{}", semantics.render())
+    } else {
+        body
+    };
     if historical_horizon {
         format!(
             "## Introspect Live Projection\nrequested_horizon={} coverage=recent-only; use reflect for persisted causal evidence.\n\n{}\n\n{}",
@@ -1569,6 +1604,121 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn semantic_judgment_detail_has_one_bounded_report_owner() {
+        use astra_services::semantic_judgment_observation::*;
+        use astra_turn_types::*;
+        let observation = SemanticJudgmentObservationV1 {
+            schema_version: 1,
+            correlation: SemanticJudgmentCorrelationV1 {
+                run_id: "run-1".into(),
+                turn: 1,
+                round: 2,
+                owner_generation: None,
+                evaluation_span_id: "eval-1".into(),
+                invocation: SemanticJudgmentInvocationV1::Unavailable,
+            },
+            fact: SemanticJudgmentFactV1 {
+                stage: RequestJudgmentStageV1::Initial,
+                result: RequestJudgmentResultV1::NotDispatched {
+                    reason: SemanticJudgmentPreDispatchReasonV1::NoOffering,
+                },
+            },
+        };
+        let capture = SemanticJudgmentCapture {
+            available: true,
+            capture_incomplete: true,
+            truncated: true,
+            candidates_scanned: 12,
+            duplicate_observations: 0,
+            omitted_observations: 2,
+            observations: (0..10)
+                .map(|i| SemanticJudgmentTraceObservation {
+                    observation_span_id: format!("span-{i}"),
+                    observation: observation.clone(),
+                })
+                .collect(),
+            gaps: vec![
+                SemanticJudgmentCaptureGap::TraceMayBeDropped,
+                SemanticJudgmentCaptureGap::ObservationLimit,
+            ],
+        };
+        let snapshot = IntrospectSnapshot {
+            semantic_judgments: Some(SemanticJudgmentView::from_capture(capture)),
+            ..Default::default()
+        };
+        let request = IntrospectRequest::from_args(&serde_json::json!({"depth":"hint"}));
+        let report = build_introspect_report(&snapshot, &request);
+        let semantics = report.semantic_judgments.as_ref().unwrap();
+        assert_eq!(semantics.observations.len(), 2);
+        assert_eq!(semantics.omitted_details, 8);
+        assert_eq!(semantics.capture_omitted_observations, 2);
+        assert_eq!(semantics.counts.as_ref().unwrap().not_dispatched, 10);
+        assert!(!report.summary.contains("no_offering"));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|e| !e.summary.contains("no_offering"))
+        );
+        assert!(
+            report
+                .observations
+                .iter()
+                .all(|o| !o.summary.contains("no_offering"))
+        );
+        // One reason per retained fact, never replicated through prose/graph.
+        assert_eq!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .matches("no_offering")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn semantic_judgment_consumer_preserves_coverage_and_source_boundaries() {
+        use astra_services::semantic_judgment_observation::{
+            SemanticJudgmentCoverage as Coverage, SemanticJudgmentView,
+        };
+        let snapshot = IntrospectSnapshot {
+            semantic_judgments: Some(SemanticJudgmentView::unavailable(Coverage::QueryFailed)),
+            ..Default::default()
+        };
+        for (policy, expected) in [
+            ("auto", Coverage::QueryFailed),
+            ("live_only", Coverage::SourceExcluded),
+            ("local_only", Coverage::SourceExcluded),
+        ] {
+            let request =
+                IntrospectRequest::from_args(&serde_json::json!({"source_policy":policy}));
+            let report = build_introspect_report(&snapshot, &request);
+            let view = report.semantic_judgments.as_ref().unwrap();
+            assert_eq!(view.coverage, expected);
+            assert!(view.counts.is_none());
+            assert!(view.capture_incomplete);
+            assert!(render_introspect_request(&snapshot, &request).contains(&view.render()));
+            assert!(
+                report
+                    .observations
+                    .iter()
+                    .all(|o| o.kind != "semantic_judgment_trace")
+            );
+            assert_eq!(
+                report.data_coverage.providers["semantic_judgment_trace"].status,
+                "missing"
+            );
+        }
+        let request = IntrospectRequest::from_args(&serde_json::json!({"facet":"errors"}));
+        assert!(
+            build_introspect_report(&snapshot, &request)
+                .semantic_judgments
+                .is_none()
+        );
+        assert!(!render_introspect_request(&snapshot, &request).contains("Semantic judgments:"));
+    }
+
     fn judgment_facts(count: usize) -> astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
         use astra_turn_types::*;
         ExplainAnalyzeAuxiliaryUsageV1 {
@@ -1916,6 +2066,7 @@ mod tests {
             semantic_cache_decisions: Vec::new(),
             invocation_lifecycle: None,
             judgment_usage: None,
+            semantic_judgments: None,
             recent_rounds: Vec::new(),
             step_latency: Vec::new(),
             volatile_pending: Vec::new(),

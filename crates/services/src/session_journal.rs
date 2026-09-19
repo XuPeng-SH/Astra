@@ -3012,6 +3012,7 @@ const TURN_EVENT_BUFFER_CAP: usize = 1000;
 const TURN_EVENT_DROPPED_META_KEY: &str = "dropped_events_before";
 
 pub struct TurnEventBuffer {
+    trace_ingestion: Option<(String, String, u64, crate::event_ingestion::IngestionSender)>,
     events: std::collections::VecDeque<JournalEvent>,
     dropped_events: u64,
     turn_start: std::time::Instant,
@@ -3045,6 +3046,7 @@ impl TurnEventBuffer {
     /// Start collecting events for a new turn at a specific round offset.
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3066,6 +3068,7 @@ impl TurnEventBuffer {
     /// is retained in metadata while `JournalEvent::turn` remains unset.
     pub fn begin_producer_turn(session_id: Option<&str>, producer_turn: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3298,12 +3301,8 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        let events = self.events.make_contiguous();
-        annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        self.enqueue_traces(false);
+        self.append_prepared(writer, false)
     }
 
     /// Best-effort flush on interruption: no fsync, marks events as partial.
@@ -3311,7 +3310,99 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        for event in &mut self.events {
+        self.enqueue_traces(true);
+        self.append_prepared(writer, true)
+    }
+
+    /// Bind a trusted runtime execution once; never reattribute a retained batch.
+    pub fn bind_trace_ingestion(
+        &mut self,
+        user: &str,
+        session: &str,
+        generation: u64,
+        sender: crate::event_ingestion::IngestionSender,
+    ) -> Result<(), &'static str> {
+        if user.is_empty() || self.session_id.as_deref() != Some(session) {
+            return Err("trace ingestion owner/session mismatch");
+        }
+        if let Some((owner, bound_session, bound_generation, _)) = &self.trace_ingestion {
+            return if owner == user && bound_session == session && *bound_generation == generation {
+                Ok(())
+            } else {
+                Err("trace ingestion execution already bound")
+            };
+        }
+        self.trace_ingestion = Some((user.into(), session.into(), generation, sender));
+        Ok(())
+    }
+
+    fn enqueue_traces(&mut self, interrupted: bool) {
+        let sink = self.trace_ingestion.clone();
+        let batch = self.prepare_flush(interrupted);
+        if let Some((user, session, _, sender)) = sink {
+            for event in batch {
+                if event.event_type == JournalEventType::TraceSpan
+                    && event.session_id.as_deref() == Some(session.as_str())
+                    && let Ok(event) =
+                        crate::event_ingestion::IngestionEvent::from_journal_event_with_redact(
+                            event, &user, true,
+                        )
+                {
+                    sender.enqueue(event);
+                }
+            }
+        }
+    }
+
+    /// Flush at the canonical owner boundary; enqueue survives local writer initialization failure.
+    pub fn flush_for_owner(
+        &mut self,
+        user: Option<&str>,
+        session: &str,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if self.session_id.as_deref() != Some(session)
+            || self
+                .trace_ingestion
+                .as_ref()
+                .is_some_and(|(owner, sid, _, _)| user != Some(owner.as_str()) || sid != session)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trace flush scope mismatch",
+            ));
+        }
+        self.enqueue_traces(interrupted);
+        let writer = match user {
+            Some(user) => JournalWriter::for_user(user, session)?,
+            None => JournalWriter::new(session)?,
+        };
+        self.append_prepared(&writer, interrupted)
+    }
+
+    fn append_prepared(
+        &mut self,
+        writer: &JournalWriter,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        let batch = self.events.make_contiguous();
+        if interrupted {
+            writer.append_bulk_no_sync(batch)?;
+        } else {
+            writer.append_bulk(batch)?;
+        }
+        self.events.clear();
+        self.dropped_events = 0;
+        Ok(())
+    }
+
+    /// Prepare one canonical batch for local and remote sinks without consuming it.
+    /// Repeated preparation is idempotent; a failed local write retains the batch.
+    pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
+        for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
@@ -3319,10 +3410,7 @@ impl TurnEventBuffer {
         }
         let events = self.events.make_contiguous();
         annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk_no_sync(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        events
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).

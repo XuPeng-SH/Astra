@@ -485,6 +485,7 @@ async fn build_reflect_response(
         include_context: request.include_context,
         data_coverage,
         judgment_usage: None,
+        semantic_judgments: None,
         view: Some(view),
         summary,
         observations,

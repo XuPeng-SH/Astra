@@ -687,7 +687,7 @@ describe("auxiliary provider usage", () => {
       ["request_judgment", "Request classification", 10],
       ["skill_auto_route", "Skill selection", 20],
       ["work_plan", "Work planning", 30],
-      ["work_direction", "Work next direction", 40],
+      ["custom_judgment", "Request analysis", 40],
     ] as const;
     const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
       available: true,

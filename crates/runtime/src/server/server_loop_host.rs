@@ -2146,7 +2146,100 @@ struct SummaryClientWorkAdmissionJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
     usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
     recovery_used: Arc<std::sync::atomic::AtomicBool>,
-    classification_observations: Arc<std::sync::Mutex<Vec<Value>>>,
+    classification_observations: Arc<std::sync::Mutex<Vec<ClassificationObservation>>>,
+}
+
+fn classification_response_failure(
+    response: &astra_turn_core::cloud_summary::SummaryResponse,
+) -> Option<astra_turn_types::SemanticJudgmentUnavailableReasonV1> {
+    if response.is_ptl_error {
+        Some(astra_turn_types::SemanticJudgmentUnavailableReasonV1::ProviderPtlError)
+    } else if response.finish_reason.as_deref() != Some("stop") {
+        Some(astra_turn_types::SemanticJudgmentUnavailableReasonV1::UnexpectedFinish)
+    } else {
+        None
+    }
+}
+
+struct ClassificationObservation {
+    fact: astra_turn_types::SemanticJudgmentFactV1,
+    diagnostic: Option<Value>,
+    interrupted: bool,
+}
+
+/// A dropped classification future still has an unresolved delivery outcome.
+/// Planning begins only after this guard has completed, so a planner timeout
+/// cannot overwrite a successful classification.
+struct ClassificationObservationGuard {
+    observations: Arc<std::sync::Mutex<Vec<ClassificationObservation>>>,
+    stage: astra_turn_types::RequestJudgmentStageV1,
+    completed: bool,
+}
+
+impl ClassificationObservationGuard {
+    fn complete(
+        mut self,
+        result: &Result<
+            astra_services::WorkAdmissionClassification,
+            astra_services::TurnIntentJudgeError,
+        >,
+        received_failure: Option<astra_turn_types::SemanticJudgmentUnavailableReasonV1>,
+    ) {
+        self.completed = true;
+        let diagnostic = match result {
+            Err(astra_services::TurnIntentJudgeError::Uncertain { diagnostics }) => {
+                serde_json::to_value(diagnostics).ok()
+            }
+            _ => None,
+        };
+        let fact = astra_turn_types::SemanticJudgmentFactV1 {
+            stage: self.stage,
+            result: received_failure.map_or_else(
+                || astra_services::semantic_judgment_observation::request_judgment_result(result),
+                |reason| astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                    reason,
+                    delivery: astra_turn_types::SemanticJudgmentDeliveryV1::ResponseReceived,
+                },
+            ),
+        };
+        let mut observations = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observations.len() < 2 {
+            observations.push(ClassificationObservation {
+                fact,
+                diagnostic,
+                interrupted: false,
+            });
+        }
+    }
+}
+
+impl Drop for ClassificationObservationGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut observations = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observations.len() < 2 {
+            observations.push(ClassificationObservation {
+                fact: astra_turn_types::SemanticJudgmentFactV1 {
+                    stage: self.stage,
+                    result: astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                        reason:
+                            astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                        delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
+                    },
+                },
+                diagnostic: None,
+                interrupted: true,
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2438,14 +2531,24 @@ impl SummaryClientWorkAdmissionJudge {
         ctx: &astra_services::TurnIntentJudgeContext,
     ) -> WorkAdmissionDecisionResult {
         let request = astra_services::work_admission_classification_request(ctx);
-        let response = self
-            .summarize(&astra_services::work_admission_classification_messages(
-                &request,
-            ))
-            .await?;
-        Self::require_completed(&response)?;
-        let initial = astra_services::parse_work_admission_classification(&request, &response.text);
-        self.record_classification("initial", &initial);
+        let initial_observation = ClassificationObservationGuard {
+            observations: Arc::clone(&self.classification_observations),
+            stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+            completed: false,
+        };
+        let mut received_failure = None;
+        let initial = async {
+            let response = self
+                .summarize(&astra_services::work_admission_classification_messages(
+                    &request,
+                ))
+                .await?;
+            received_failure = classification_response_failure(&response);
+            Self::require_completed(&response)?;
+            astra_services::parse_work_admission_classification(&request, &response.text)
+        }
+        .await;
+        initial_observation.complete(&initial, received_failure);
         let classification = match initial {
             Err(error @ astra_services::TurnIntentJudgeError::Uncertain { .. }) => {
                 let Some(clarification) =
@@ -2464,18 +2567,28 @@ impl SummaryClientWorkAdmissionJudge {
                 };
                 // The same admitted Offering, outer deadline and usage owner apply.
                 // A complete answer must preserve every locked necessary fact.
-                let clarified = self
-                    .summarize(&astra_services::work_admission_classification_messages(
+                let clarification_observation = ClassificationObservationGuard {
+                    observations: Arc::clone(&self.classification_observations),
+                    stage: astra_turn_types::RequestJudgmentStageV1::Clarification,
+                    completed: false,
+                };
+                let mut received_failure = None;
+                let result = async {
+                    let clarified = self
+                        .summarize(&astra_services::work_admission_classification_messages(
+                            &clarification,
+                        ))
+                        .await?;
+                    received_failure = classification_response_failure(&clarified);
+                    Self::require_completed(&clarified)?;
+                    astra_services::parse_work_admission_clarification(
                         &clarification,
-                    ))
-                    .await?;
-                Self::require_completed(&clarified)?;
-                let result = astra_services::parse_work_admission_clarification(
-                    &clarification,
-                    &clarified.text,
-                    &diagnostics,
-                );
-                self.record_classification("clarification", &result);
+                        &clarified.text,
+                        &diagnostics,
+                    )
+                }
+                .await;
+                clarification_observation.complete(&result, received_failure);
                 result?
             }
             result => result?,
@@ -2489,34 +2602,6 @@ impl SummaryClientWorkAdmissionJudge {
             .await?;
         classification.validate_plan(&decision)?;
         Ok(decision)
-    }
-
-    fn record_classification(
-        &self,
-        stage: &str,
-        result: &Result<
-            astra_services::WorkAdmissionClassification,
-            astra_services::TurnIntentJudgeError,
-        >,
-    ) {
-        let observation = match result {
-            Ok(_) => json!({"stage": stage, "status": "decided"}),
-            Err(astra_services::TurnIntentJudgeError::Uncertain { diagnostics }) => {
-                json!({"stage": stage, "status": "uncertain", "diagnostics": diagnostics})
-            }
-            Err(astra_services::TurnIntentJudgeError::Conflicting { fields, .. }) => {
-                json!({"stage": stage, "status": "conflicting", "fields": fields})
-            }
-            Err(_) => json!({"stage": stage, "status": "invalid_or_unavailable"}),
-        };
-        let mut observations = self
-            .classification_observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // At most two classifications per preflight; resolution drains this list.
-        if observations.len() < 2 {
-            observations.push(observation);
-        }
     }
 
     fn begin_usage_attempt(&self) {
@@ -3657,7 +3742,11 @@ pub struct ServerAgenticLoopHost {
     work_admission_usage: WorkAdmissionUsage,
     /// One semantic clarification per host turn; skill revisions cannot refill it.
     work_admission_recovery_used: Arc<std::sync::atomic::AtomicBool>,
-    work_admission_classification_observations: Arc<std::sync::Mutex<Vec<Value>>>,
+    work_admission_classification_observations:
+        Arc<std::sync::Mutex<Vec<ClassificationObservation>>>,
+    work_admission_classification_correlation:
+        Option<astra_turn_types::SemanticJudgmentCorrelationV1>,
+    pending_classification_observations: Vec<astra_turn_types::SemanticJudgmentObservationV1>,
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
     /// Auto fails closed at both action and completion boundaries; callers
@@ -5852,6 +5941,8 @@ impl ServerAgenticLoopHostBuilder {
             work_admission_usage: WorkAdmissionUsage::default(),
             work_admission_recovery_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_admission_classification_observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+            work_admission_classification_correlation: None,
+            pending_classification_observations: Vec::new(),
             work_admission_attempted: false,
             work_admission_unavailable: false,
             work_admission_unavailable_reason: None,
@@ -7847,6 +7938,17 @@ impl ServerAgenticLoopHost {
         self.work_admission_unavailable_reason = None;
         self.work_admission_semantic_diagnostic = None;
         self.work_admission_skill_revision = skill_revision;
+        self.work_admission_classification_correlation =
+            state.current_run_id.as_ref().map(|run_id| {
+                astra_turn_types::SemanticJudgmentCorrelationV1 {
+                    run_id: run_id.clone(),
+                    turn: state.current_session_turn_number(),
+                    round: state.current_round_index,
+                    owner_generation: state.current_run_owner_generation,
+                    evaluation_span_id: uuid::Uuid::new_v4().to_string(),
+                    invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+                }
+            });
         // `llm_rounds_completed` is an inner provider-round counter.  The
         // admission judge classifies a user turn and must receive the stable
         // outer session-turn identity, otherwise a second user turn is
@@ -7868,6 +7970,13 @@ impl ServerAgenticLoopHost {
         {
             Ok(client) => client,
             Err(unavailable) => {
+                self.record_classification_not_dispatched(match unavailable {
+                    JudgmentClientUnavailable::NoOffering => astra_turn_types::SemanticJudgmentPreDispatchReasonV1::NoOffering,
+                    JudgmentClientUnavailable::InvalidRequest => astra_turn_types::SemanticJudgmentPreDispatchReasonV1::InvalidRequest,
+                    JudgmentClientUnavailable::OutputBudget => astra_turn_types::SemanticJudgmentPreDispatchReasonV1::OutputBudget,
+                    JudgmentClientUnavailable::RouteUnavailable => astra_turn_types::SemanticJudgmentPreDispatchReasonV1::RouteUnavailable,
+                    JudgmentClientUnavailable::DurableMaterialUnavailable => astra_turn_types::SemanticJudgmentPreDispatchReasonV1::DurableMaterialUnavailable,
+                });
                 self.work_admission_unavailable = true;
                 self.work_admission_unavailable_reason = Some(match unavailable {
                     JudgmentClientUnavailable::NoOffering => {
@@ -7901,6 +8010,9 @@ impl ServerAgenticLoopHost {
             .turn_intent_summary_client(state, "work_plan", TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS)
             .await
         else {
+            self.record_classification_not_dispatched(
+                astra_turn_types::SemanticJudgmentPreDispatchReasonV1::DurableMaterialUnavailable,
+            );
             self.work_admission_unavailable = true;
             self.work_admission_unavailable_reason =
                 Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
@@ -8062,17 +8174,20 @@ impl ServerAgenticLoopHost {
         self.work_admission_semantic_diagnostic = observations
             .iter()
             .rev()
-            .find_map(|observation| observation.get("diagnostics").cloned());
-        for observation in observations {
-            tracing::info!(
-                target: "astra::turn_intent",
-                session_id = %self.session_id,
-                round_index,
-                operation = "request_judgment",
-                classification = %observation,
-                "Request classification semantic outcome"
-            );
-        }
+            .find_map(|observation| observation.diagnostic.clone());
+        let interruption_reason = match &result {
+            Err(astra_services::TurnIntentJudgeError::Inference(error)) => match error.kind {
+                astra_core::ErrorKind::ProviderDeadline => {
+                    astra_turn_types::SemanticJudgmentUnavailableReasonV1::Deadline
+                }
+                astra_core::ErrorKind::Cancelled => {
+                    astra_turn_types::SemanticJudgmentUnavailableReasonV1::Cancelled
+                }
+                _ => astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+            },
+            _ => astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+        };
+        self.retain_classification_observations(observations, interruption_reason);
         let duration_ms = finished_at
             .saturating_duration_since(started_at)
             .as_millis() as u64;
@@ -8190,7 +8305,125 @@ impl ServerAgenticLoopHost {
     /// trace/Explain/SSE fan-out as the shared lifecycle. This is
     /// observational only; admission state remains owned by the typed
     /// decision above.
+    fn record_classification_not_dispatched(
+        &mut self,
+        reason: astra_turn_types::SemanticJudgmentPreDispatchReasonV1,
+    ) {
+        if let Some(correlation) = self.work_admission_classification_correlation.clone() {
+            self.queue_classification_observation(
+                astra_turn_types::SemanticJudgmentObservationV1 {
+                    schema_version: astra_turn_types::SEMANTIC_JUDGMENT_SCHEMA_VERSION,
+                    correlation,
+                    fact: astra_turn_types::SemanticJudgmentFactV1 {
+                        stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+                        result: astra_turn_types::RequestJudgmentResultV1::NotDispatched { reason },
+                    },
+                },
+            );
+        }
+    }
+
+    fn retain_classification_observations(
+        &mut self,
+        observations: Vec<ClassificationObservation>,
+        interruption_reason: astra_turn_types::SemanticJudgmentUnavailableReasonV1,
+    ) {
+        let Some(correlation) = self.work_admission_classification_correlation.clone() else {
+            return;
+        };
+        for mut observation in observations {
+            if observation.interrupted {
+                observation.fact.result = astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                    reason: interruption_reason,
+                    delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
+                };
+            }
+            self.queue_classification_observation(
+                astra_turn_types::SemanticJudgmentObservationV1 {
+                    schema_version: astra_turn_types::SEMANTIC_JUDGMENT_SCHEMA_VERSION,
+                    correlation: correlation.clone(),
+                    fact: observation.fact,
+                },
+            );
+        }
+    }
+
+    fn queue_classification_observation(
+        &mut self,
+        observation: astra_turn_types::SemanticJudgmentObservationV1,
+    ) {
+        // C3 is bounded, best-effort telemetry. Never retain provider text or
+        // let observation pressure alter admission/control state.
+        if self.pending_classification_observations.len() < 32 && observation.validate().is_ok() {
+            self.pending_classification_observations.push(observation);
+        }
+    }
+
+    fn flush_classification_observations(&mut self, state: &mut AgenticLoopState) {
+        for observation in std::mem::take(&mut self.pending_classification_observations) {
+            if state.current_session_id.as_deref() != Some(self.session_id.as_str())
+                || state.current_run_id.as_deref() != Some(observation.correlation.run_id.as_str())
+                || state.current_session_turn_number() != observation.correlation.turn
+                || state
+                    .context_manifest_user_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != self.user_id)
+            {
+                continue;
+            }
+            let span_id = format!(
+                "{}-{:?}",
+                observation.correlation.evaluation_span_id, observation.fact.stage
+            );
+            let Ok(trace) = astra_services::semantic_judgment_observation::semantic_judgment_trace(
+                &span_id,
+                &observation,
+                chrono::Utc::now().timestamp_micros().max(0) as u64,
+            ) else {
+                continue;
+            };
+            if let Some(buffer) = state.turn_event_buffer.as_mut() {
+                buffer.record_trace_span_v2(trace);
+            }
+            let Some(context) = self.explain_analyze_context.clone().filter(|context| {
+                context.run_id == observation.correlation.run_id
+                    && context.turn_id == format!("turn-{}", observation.correlation.turn)
+            }) else {
+                continue;
+            };
+            let now = Instant::now();
+            let node = ExplainAnalyzeNode::new(
+                &context,
+                format!("{}/judgment/{span_id}", context.root_node_id),
+                Some(context.root_node_id.clone()),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
+                observation.fact.preparation_label(),
+                now,
+                Some(observation.correlation.round),
+                None,
+            );
+            for (transition, duration, outcome) in [
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+                    None,
+                    None,
+                ),
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    Some(0),
+                    Some(observation.fact.preparation_outcome()),
+                ),
+            ] {
+                if let Some(event) = context.event(&node, transition, now, duration, outcome, None)
+                {
+                    self.emit_progress_event(event);
+                }
+            }
+        }
+    }
+
     fn flush_completed_work_admission_phase(&mut self, state: &mut AgenticLoopState) {
+        self.flush_classification_observations(state);
         let Some((started_at, finished_at, round_index, outcome)) =
             self.completed_work_admission_phase.take()
         else {
@@ -8286,7 +8519,37 @@ impl ServerAgenticLoopHost {
         };
         pending.handle.abort();
         // Retain ownership if cancellation interrupts this synchronization barrier.
-        let _ = (&mut pending.handle).await;
+        let joined = (&mut pending.handle).await;
+        let (interruption_reason, terminal_outcome) = match &joined {
+            Ok((Err(astra_services::TurnIntentJudgeError::Inference(error)), _)) => (
+                match error.kind {
+                    astra_core::ErrorKind::ProviderDeadline => {
+                        astra_turn_types::SemanticJudgmentUnavailableReasonV1::Deadline
+                    }
+                    astra_core::ErrorKind::Cancelled => {
+                        astra_turn_types::SemanticJudgmentUnavailableReasonV1::Cancelled
+                    }
+                    _ => astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                },
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Unavailable,
+            ),
+            Ok((Ok(_), _)) => (
+                astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved,
+            ),
+            Ok((Err(_), _)) => (
+                astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Unavailable,
+            ),
+            Err(error) if error.is_cancelled() => (
+                astra_turn_types::SemanticJudgmentUnavailableReasonV1::Cancelled,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
+            ),
+            Err(_) => (
+                astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+            ),
+        };
         let pending = self
             .pending_work_admission_judge
             .take()
@@ -8312,24 +8575,18 @@ impl ServerAgenticLoopHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        for observation in observations {
-            tracing::info!(
-                target: "astra::turn_intent",
-                session_id = %self.session_id,
-                round_index = pending.round_index,
-                operation = "request_judgment",
-                outcome = "cancelled",
-                classification = %observation,
-                "Cancelled request classification semantic outcome"
+        if observations.is_empty()
+            && usage.attempts == 0
+            && joined.as_ref().is_err_and(|error| error.is_cancelled())
+        {
+            self.record_classification_not_dispatched(
+                astra_turn_types::SemanticJudgmentPreDispatchReasonV1::Cancelled,
             );
         }
+        self.retain_classification_observations(observations, interruption_reason);
         self.work_admission_semantic_diagnostic = None;
         for id in node_id.into_iter().chain(pending.wait_node_id) {
-            self.finish_explain_analyze_timed_node(
-                &id,
-                astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
-                Instant::now(),
-            );
+            self.finish_explain_analyze_timed_node(&id, terminal_outcome, Instant::now());
         }
     }
 
@@ -17293,7 +17550,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let started_at = Instant::now();
         let clock_domain_id = uuid::Uuid::new_v4().to_string();
-        let turn_id = format!("turn-{}", state.session_turn);
+        let turn_id = format!("turn-{}", state.current_session_turn_number());
         let root_node_id = format!("{turn_id}/segment/{clock_domain_id}");
         let context = ExplainAnalyzeContext {
             run_id,
@@ -17335,10 +17592,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     async fn on_turn_terminal(
         &mut self,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
         self.abort_pending_work_admission().await;
+        self.flush_classification_observations(state);
         let Some(context) = self.explain_analyze_context.clone() else {
             if let Some(executor) = state.runtime_tool_executor.as_deref() {
                 executor.set_tool_route_observer(None);
@@ -17715,70 +17973,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending
         } else {
             crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
-        }
-    }
-
-    async fn judge_work_direction(
-        &mut self,
-        state: &AgenticLoopState,
-        evidence: &astra_services::work_direction_judgment::WorkDirectionEvidence,
-    ) -> crate::turn::agentic_loop::host::WorkDirectionOutcome {
-        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
-        use astra_services::work_direction_judgment::{
-            parse_work_direction_judgment, work_direction_judgment_request,
-        };
-        if state
-            .cancellation
-            .flag
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            || state
-                .cancellation
-                .token
-                .as_ref()
-                .is_some_and(|token| token.is_cancelled())
-        {
-            return WorkDirectionOutcome::Unavailable;
-        }
-        if should_skip_auxiliary_llm_for_capacity().is_some() {
-            return WorkDirectionOutcome::Unavailable;
-        }
-        let request = work_direction_judgment_request(evidence);
-        let messages = astra_turn_types::judgment_messages(&request);
-        let cancel = state.cancellation.token.clone();
-        let operation = async {
-            let client = match self
-                .judgment_summary_client(state, "work_direction", &request)
-                .await
-            {
-                Ok(client) => client,
-                Err(JudgmentClientUnavailable::NoOffering) => {
-                    return WorkDirectionOutcome::Disabled;
-                }
-                Err(_) => return WorkDirectionOutcome::Unavailable,
-            };
-            let Ok(response) = client
-                .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
-                .await
-            else {
-                return WorkDirectionOutcome::Unavailable;
-            };
-            if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
-                return WorkDirectionOutcome::Unavailable;
-            }
-            WorkDirectionOutcome::Evaluated(parse_work_direction_judgment(&request, &response.text))
-        };
-        // Includes catalog resolution; never let optional advice consume the
-        // primary model's normal inference deadline. Durable inference owns
-        // physical-attempt settlement even if this waiting future is dropped.
-        tokio::select! {
-            result = tokio::time::timeout(std::time::Duration::from_secs(3), operation) => {
-                result.unwrap_or(WorkDirectionOutcome::Unavailable)
-            }
-            _ = async {
-                if let Some(token) = cancel { token.cancelled().await; }
-                else { std::future::pending::<()>().await; }
-            } => WorkDirectionOutcome::Unavailable,
         }
     }
 
@@ -23346,6 +23540,20 @@ mod tests {
         >,
     }
 
+    struct PendingClassificationClient;
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for PendingClassificationClient {
+        async fn summarize(
+            &self,
+            _purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            std::future::pending().await
+        }
+    }
+
     #[async_trait::async_trait]
     impl SummaryLlmClient for SequencedSummaryClient {
         async fn summarize(
@@ -23510,246 +23718,6 @@ mod tests {
         }
     }
 
-    fn work_direction_test_evidence()
-    -> astra_services::work_direction_judgment::WorkDirectionEvidence {
-        astra_services::work_direction_judgment::WorkDirectionEvidence {
-            objective: "Check report".into(),
-            expected_result: "Validated report".into(),
-            current_guidance: None,
-            observations: vec![],
-            omitted_observations: true,
-        }
-    }
-
-    struct PendingWorkDirectionClient;
-
-    #[async_trait::async_trait]
-    impl SummaryLlmClient for PendingWorkDirectionClient {
-        async fn summarize(
-            &self,
-            _: astra_turn_types::InferencePurpose,
-            _: &[Value],
-        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
-        {
-            std::future::pending().await
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn work_direction_deadline_and_cancellation_are_optional() {
-        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".into(),
-            "s".into(),
-        )
-        .with_test_judgment_clients([
-            Box::new(PendingWorkDirectionClient) as Box<dyn SummaryLlmClient>
-        ])
-        .build();
-        let mut state = create_test_state();
-        let started = tokio::time::Instant::now();
-        assert!(matches!(
-            host.judge_work_direction(&state, &work_direction_test_evidence())
-                .await,
-            WorkDirectionOutcome::Unavailable
-        ));
-        assert_eq!(started.elapsed(), Duration::from_secs(3));
-        let token = Arc::new(tokio_util::sync::CancellationToken::new());
-        token.cancel();
-        state.cancellation.token = Some(token);
-        let started = tokio::time::Instant::now();
-        assert!(matches!(
-            host.judge_work_direction(&state, &work_direction_test_evidence())
-                .await,
-            WorkDirectionOutcome::Unavailable
-        ));
-        assert_eq!(started.elapsed(), Duration::ZERO);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn work_direction_executor_assignment_respects_fresh_turn_floor() {
-        use crate::server::runtime_tool_executor::{ActivePrimaryWorkAttempt, WorkRuntimeBinding};
-        use crate::turn::agentic_loop::guards::judge_work_direction;
-        use astra_services::work::{InternalSessionId, WorkBranchId, WorkId, WorkOwnerId};
-
-        let dir = tempfile::tempdir().expect("workspace");
-        let mut executor = runtime_tool_executor_with_agent_context(dir.path());
-        // The concrete executor binding requires SharedPool, which has no
-        // offline constructor. The regression itself does not query or mutate it.
-        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
-        let _ = dotenvy::dotenv();
-        let pool = SharedPool::new(&MatrixOneSettings::from_env())
-            .await
-            .expect("connect to MatrixOne");
-        executor.set_work_binding(WorkRuntimeBinding::new(
-            pool,
-            WorkOwnerId::parse("user1").unwrap(),
-            InternalSessionId::parse("sess1").unwrap(),
-            WorkId::parse("work-direction-floor").unwrap(),
-            WorkBranchId::parse("branch-direction-floor").unwrap(),
-        ));
-        executor
-            .install_active_primary_work_attempt(ActivePrimaryWorkAttempt {
-                attempt_id: "attempt-direction-floor".into(),
-                executor_run_id: "run1".into(),
-                item_id: "item-direction-floor".into(),
-                item_revision: 1,
-                objective: "Inspect the result".into(),
-                expected_result: "A verified result".into(),
-            })
-            .expect("active assignment");
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("user1".into());
-        state.current_session_id = Some("sess1".into());
-        state.current_run_id = Some("run1".into());
-        state.runtime_tool_executor = Some(Arc::new(executor));
-        state.llm_rounds_completed = 0;
-        state.remaining_turns = 10;
-        let record = |round, id: &str| astra_services::session_journal::ToolCallRecord {
-            name: "read_file".into(),
-            round: Some(round),
-            tool_call_id: Some(id.into()),
-            ok: true,
-            result_full: Some("Verified result".into()),
-            ..Default::default()
-        };
-        state
-            .stall
-            .tool_call_records
-            .push(record(100, "previous-turn"));
-        state.stall.begin_fresh_user_turn();
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user1".into(),
-            "sess1".into(),
-        )
-        .build();
-
-        // Exercise assignment initialization, not a manually initialized gate.
-        judge_work_direction(&mut host, &mut state).await;
-        let gate = &state.provider_adaptation.work_direction;
-        assert!(gate.binding_key.is_some());
-        assert_eq!(
-            gate.first_round, 0,
-            "older turn round 100 is not comparable"
-        );
-        assert!(gate.attempted.is_empty());
-        assert!(!gate.disabled);
-
-        state
-            .stall
-            .tool_call_records
-            .extend([record(0, "current-read"), record(1, "current-verification")]);
-        judge_work_direction(&mut host, &mut state).await;
-        let gate = &state.provider_adaptation.work_direction;
-        assert_eq!(gate.attempted.len(), 1, "current-turn evidence is eligible");
-        assert!(
-            gate.disabled,
-            "eligible snapshot reaches the real no-offering hook"
-        );
-        assert!(
-            gate.cached.is_none(),
-            "no offering grants no advice or authority"
-        );
-
-        state.provider_adaptation.work_direction = Default::default();
-        state.stall.tool_call_records.extend([
-            record(10, "pre-assignment-read"),
-            record(11, "pre-assignment-verify"),
-        ]);
-        for _ in 0..40 {
-            state
-                .stall
-                .tool_call_records
-                .extend([record(2, "old-read"), record(3, "old-verify")]);
-        }
-        judge_work_direction(&mut host, &mut state).await;
-        assert_eq!(state.provider_adaptation.work_direction.first_round, 12);
-        judge_work_direction(&mut host, &mut state).await;
-        assert!(
-            state
-                .provider_adaptation
-                .work_direction
-                .attempted
-                .is_empty()
-        );
-        state
-            .stall
-            .tool_call_records
-            .extend([record(12, "fresh-read"), record(13, "fresh-verify")]);
-        judge_work_direction(&mut host, &mut state).await;
-        assert_eq!(state.provider_adaptation.work_direction.attempted.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn work_direction_no_offering_does_not_borrow_primary_model() {
-        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".into(),
-            "s".into(),
-        )
-        .build();
-        let state = create_test_state();
-        assert!(matches!(
-            host.judge_work_direction(&state, &work_direction_test_evidence())
-                .await,
-            WorkDirectionOutcome::Disabled
-        ));
-        assert!(host.test_judgment_clients.is_empty());
-        assert!(state.restricted_tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn work_direction_shared_judge_uses_exact_request_and_abstains() {
-        use crate::turn::agentic_loop::host::WorkDirectionOutcome;
-        for (raw, definitive) in [
-            (r#"{"true":["verify"],"uncertain":[]}"#, true),
-            (
-                r#"{"schema_version":1,"model":"jev","answers":{"supported":{"type":"noul","noul":0.1},"verify":{"type":"noul","noul":0.9}}}"#,
-                true,
-            ),
-            (r#"{"true":[],"uncertain":["supported"]}"#, false),
-            ("invalid", false),
-        ] {
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                "u".into(),
-                "s".into(),
-            )
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([raw.into()])),
-                requests: requests.clone(),
-            }) as Box<dyn SummaryLlmClient>])
-            .build();
-            let evidence = work_direction_test_evidence();
-            let result = host
-                .judge_work_direction(&create_test_state(), &evidence)
-                .await;
-            assert_eq!(
-                matches!(result, WorkDirectionOutcome::Evaluated(astra_services::work_direction_judgment::WorkDirectionSemanticResult::Decision { .. })),
-                definitive
-            );
-            let calls = requests.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(
-                calls[0],
-                astra_turn_types::judgment_messages(
-                    &astra_services::work_direction_judgment::work_direction_judgment_request(
-                        &evidence
-                    )
-                )
-            );
-        }
-    }
-
     fn classification_response(required: bool) -> String {
         let request = astra_services::work_admission_classification_request(&Default::default());
         let mut answers = serde_json::Map::new();
@@ -23823,10 +23791,20 @@ mod tests {
         .build();
         host.work_admission_recovery_used
             .store(true, std::sync::atomic::Ordering::Release);
-        host.work_admission_classification_observations.lock().unwrap().extend([
-            json!({"stage":"initial","diagnostics":{"uncertain_fields":["required"]}}),
-            json!({"stage":"clarification","diagnostics":{"uncertain_fields":["mutation.may_mutate"]}}),
-        ]);
+        host.work_admission_classification_observations.lock().unwrap().extend(
+            [astra_turn_types::RequestJudgmentStageV1::Initial, astra_turn_types::RequestJudgmentStageV1::Clarification]
+                .into_iter().map(|stage| ClassificationObservation {
+                    fact: astra_turn_types::SemanticJudgmentFactV1 {
+                        stage,
+                        result: astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                            reason: astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+                            delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
+                        },
+                    },
+                    diagnostic: Some(json!({"uncertain_fields":["required"]})),
+                    interrupted: false,
+                }),
+        );
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
             wait_node_id: None,
             handle: tokio::spawn(std::future::pending()),
@@ -24180,11 +24158,285 @@ mod tests {
                 .await
                 .is_err()
         );
+        let observed = judge.classification_observations.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(matches!(
+            observed[0].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::Decided { .. }
+        ));
+        assert!(
+            !observed[0].interrupted,
+            "planner failure must not rewrite classification"
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         let instruction = requests[1].last().unwrap()["content"].as_str().unwrap();
         assert!(instruction.contains("Never reclassify or downgrade"));
         assert!(!instruction.contains("Re-evaluate the acceptance boundary"));
+    }
+
+    #[tokio::test]
+    async fn request_classification_cancelled_future_preserves_unresolved_stage() {
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+        let planner = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+        let context = astra_services::TurnIntentJudgeContext::default();
+        let mut classification = Box::pin(judge.classify_and_plan(&planner, &context));
+        assert!(futures_util::poll!(&mut classification).is_pending());
+        drop(classification);
+        let observed = judge.classification_observations.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].fact.stage,
+            astra_turn_types::RequestJudgmentStageV1::Initial
+        );
+        assert!(observed[0].interrupted);
+        assert!(matches!(
+            observed[0].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_classification_abort_preserves_completed_deadline() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".into(),
+            "s".into(),
+        )
+        .build();
+        host.work_admission_classification_correlation =
+            Some(astra_turn_types::SemanticJudgmentCorrelationV1 {
+                run_id: "r".into(),
+                turn: 1,
+                round: 0,
+                owner_generation: Some(0),
+                evaluation_span_id: "evaluation".into(),
+                invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+            });
+        let observations = Arc::clone(&host.work_admission_classification_observations);
+        let handle = tokio::spawn(async move {
+            let guard = ClassificationObservationGuard {
+                observations,
+                stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+                completed: false,
+            };
+            drop(guard);
+            (
+                Err(astra_services::TurnIntentJudgeError::Inference(
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        "test deadline",
+                    ),
+                )),
+                Instant::now(),
+            )
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            wait_node_id: None,
+            handle,
+            usage: Default::default(),
+            started_at: Instant::now(),
+            round_index: 0,
+        });
+        host.abort_pending_work_admission().await;
+        assert_eq!(host.pending_classification_observations.len(), 1);
+        assert!(matches!(
+            host.pending_classification_observations[0].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::Unavailable {
+                reason: astra_turn_types::SemanticJudgmentUnavailableReasonV1::Deadline,
+                delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_classification_cancel_before_first_poll_is_not_dispatched() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".into(),
+            "s".into(),
+        )
+        .build();
+        host.work_admission_classification_correlation =
+            Some(astra_turn_types::SemanticJudgmentCorrelationV1 {
+                run_id: "r".into(),
+                turn: 1,
+                round: 0,
+                owner_generation: Some(0),
+                evaluation_span_id: "unpolled".into(),
+                invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+            });
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+        host.work_admission_classification_observations =
+            Arc::clone(&judge.classification_observations);
+        let usage = Arc::clone(&judge.usage);
+        let handle = tokio::spawn(async move {
+            let planner =
+                SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+            (
+                judge.classify_and_plan(&planner, &Default::default()).await,
+                Instant::now(),
+            )
+        });
+        host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            wait_node_id: None,
+            handle,
+            usage,
+            started_at: Instant::now(),
+            round_index: 0,
+        });
+        // The current-thread executor has not yielded since spawn.
+        host.abort_pending_work_admission().await;
+        assert_eq!(host.work_admission_usage.attempts, 0);
+        assert_eq!(host.pending_classification_observations.len(), 1);
+        assert!(matches!(
+            host.pending_classification_observations[0].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::NotDispatched {
+                reason: astra_turn_types::SemanticJudgmentPreDispatchReasonV1::Cancelled,
+            }
+        ));
+    }
+
+    #[test]
+    fn request_classification_rejects_wrong_session_before_journal_projection() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".into(),
+            "owned-session".into(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("r".into());
+        state.current_session_id = Some("different-session".into());
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(
+                Some("different-session"),
+                1,
+            ),
+        );
+        host.work_admission_classification_correlation =
+            Some(astra_turn_types::SemanticJudgmentCorrelationV1 {
+                run_id: "r".into(),
+                turn: state.current_session_turn_number(),
+                round: 0,
+                owner_generation: Some(0),
+                evaluation_span_id: "evaluation".into(),
+                invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+            });
+        host.record_classification_not_dispatched(
+            astra_turn_types::SemanticJudgmentPreDispatchReasonV1::NoOffering,
+        );
+        assert_eq!(host.pending_classification_observations.len(), 1);
+        let before = state.turn_event_buffer.as_ref().unwrap().len();
+        host.flush_classification_observations(&mut state);
+        assert_eq!(state.turn_event_buffer.as_ref().unwrap().len(), before);
+        assert!(host.pending_classification_observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_classification_records_transport_and_received_failures() {
+        for received in [false, true] {
+            let response = if received {
+                Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    text: "private provider payload".into(),
+                    is_ptl_error: true,
+                    finish_reason: Some("stop".into()),
+                    usage: Default::default(),
+                })
+            } else {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Network,
+                    "private provider error",
+                ))
+            };
+            let judge =
+                SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
+                    responses: std::sync::Mutex::new([response].into()),
+                }));
+            let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                responses: Default::default(),
+                requests: Default::default(),
+            }));
+            assert!(
+                judge
+                    .classify_and_plan(&planner, &Default::default())
+                    .await
+                    .is_err()
+            );
+            let observations = judge.classification_observations.lock().unwrap();
+            assert_eq!(observations.len(), 1);
+            let astra_turn_types::RequestJudgmentResultV1::Unavailable { delivery, .. } =
+                observations[0].fact.result
+            else {
+                panic!("provider failure must remain unavailable");
+            };
+            assert_eq!(
+                delivery,
+                if received {
+                    astra_turn_types::SemanticJudgmentDeliveryV1::ResponseReceived
+                } else {
+                    astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved
+                }
+            );
+            assert!(
+                !serde_json::to_string(&observations[0].fact)
+                    .unwrap()
+                    .contains("private")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_classification_clarification_failure_retains_initial_abstention() {
+        let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
+        uncertain["answers"]["mutation.may_mutate"]["noul"] = json!(0.37);
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
+            responses: std::sync::Mutex::new(
+                [
+                    Ok(summary_response_with_usage(&uncertain.to_string(), 1, 0, 1)),
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Network,
+                        "private failure",
+                    )),
+                ]
+                .into(),
+            ),
+        }));
+        let planner = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+        assert!(
+            judge
+                .classify_and_plan(&planner, &Default::default())
+                .await
+                .is_err()
+        );
+        let observations = judge.classification_observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].fact.stage,
+            astra_turn_types::RequestJudgmentStageV1::Initial
+        );
+        assert!(matches!(
+            observations[0].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::Abstained { .. }
+        ));
+        assert!(observations[0].diagnostic.is_some());
+        assert_eq!(
+            observations[1].fact.stage,
+            astra_turn_types::RequestJudgmentStageV1::Clarification
+        );
+        assert!(matches!(
+            observations[1].fact.result,
+            astra_turn_types::RequestJudgmentResultV1::Unavailable { .. }
+        ));
     }
 
     #[tokio::test]
@@ -33184,7 +33436,7 @@ mod tests {
             outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
         });
         host.on_final_output_ready(&state).await;
-        host.on_turn_terminal(&state, &Ok(AgenticLoopOutcome::Completed))
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
             .await;
 
         let explain_facts = host
@@ -33382,7 +33634,7 @@ mod tests {
                 .expect("Explain Analyze context should be active");
 
             let error = astra_core::ClassifiedError::new(error_kind, "test early exit");
-            host.on_turn_terminal(&state, &Err(error)).await;
+            host.on_turn_terminal(&mut state, &Err(error)).await;
 
             let events = host.take_emitted_events();
             let terminal = events
@@ -35285,7 +35537,7 @@ mod tests {
             .unwrap(),
             outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
         });
-        host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed))
+        host.on_turn_terminal(&mut explain_state, &Ok(AgenticLoopOutcome::Completed))
             .await;
 
         let explain_facts = host
@@ -35489,7 +35741,7 @@ mod tests {
             assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
             assert_eq!(outcome.results.len(), 1);
             assert_eq!(outcome.results[0].status, "completed");
-            host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed))
+            host.on_turn_terminal(&mut explain_state, &Ok(AgenticLoopOutcome::Completed))
                 .await;
             let tool_terminal = host
                 .emitted_events
