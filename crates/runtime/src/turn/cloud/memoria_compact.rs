@@ -1450,6 +1450,7 @@ pub async fn compact_with_memoria(
     client: Option<&dyn MemoriaPort>,
     compact_config: &CompactConfig,
     summary_client: Option<&dyn SummaryLlmClient>,
+    templates: &astra_turn_types::summary_prompts::SummaryPromptTemplates,
 ) -> CompactResult {
     // Applicability is local state. Do not resolve credentials when this
     // compaction cannot retrieve memory; actual reads still recheck consent.
@@ -1555,6 +1556,7 @@ pub async fn compact_with_memoria(
             messages,
             s_client,
             compact_config.max_ptl_retries,
+            templates,
         )
         .await
         {
@@ -2100,6 +2102,7 @@ mod tests {
                 ..CompactConfig::default()
             }, // Explicitly disabled
             None, // No summary client
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2131,7 +2134,7 @@ mod tests {
             params.current_tokens = tokens;
             params.tier = tier;
             let result =
-                compact_with_memoria(&msgs, session, &config, &params, Some(&mock), &CompactConfig { enable_summary: false, ..CompactConfig::default() }, None)
+                compact_with_memoria(&msgs, session, &config, &params, Some(&mock), &CompactConfig { enable_summary: false, ..CompactConfig::default() }, None, &astra_turn_core::cloud_summary::canonical_summary_prompt_templates())
                     .await;
             assert_eq!(result.messages.len(), 2);
             assert_eq!(
@@ -2183,6 +2186,7 @@ mod tests {
                 ..CompactConfig::default()
             },
             None,
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2240,6 +2244,7 @@ mod tests {
                 ..CompactConfig::default()
             },
             None,
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2404,6 +2409,7 @@ mod tests {
             Some(&mock),
             &compact_config,
             Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2447,6 +2453,7 @@ mod tests {
             Some(&mock),
             &compact_config,
             Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2494,6 +2501,7 @@ mod tests {
             Some(&mock),
             &compact_config,
             Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
@@ -2540,6 +2548,7 @@ mod tests {
             Some(&mock),
             &compact_config,
             Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
         )
         .await;
 
