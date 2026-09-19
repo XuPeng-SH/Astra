@@ -128,6 +128,14 @@ or silently excluded. The report distinguishes paired comparison support from
 mechanism evidence; a trace being available does not by itself prove a causal
 effect.
 
+Measurements must have consistent status and value: `observed` requires a
+finite numeric value (including a genuine zero); missing, unavailable, and
+failed measurements carry no numeric value. The durable write/read boundary
+and plan-bound report assessment enforce the same rule. Completed trials
+with no measurements or no evidence references remain explicitly incomplete
+in both structured coverage and Markdown. These basic checks do not prove
+that every evaluation dimension has been measured or that a task verifier ran.
+
 ## Durable registration boundary
 
 The first durable Eval boundary is intentionally small. An owner-scoped

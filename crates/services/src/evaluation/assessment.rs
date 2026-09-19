@@ -60,6 +60,24 @@ pub struct Measurement {
     pub basis: Option<String>,
 }
 
+impl Measurement {
+    /// An observed zero is a fact; an absent value is never an observation.
+    pub fn validate_value_status(&self) -> Result<(), String> {
+        match (&self.status, self.value) {
+            (MeasurementStatus::Observed, Some(value)) if value.is_finite() => Ok(()),
+            (MeasurementStatus::Observed, _) => Err(format!(
+                "observed measurement {} must have a finite value",
+                self.name
+            )),
+            (_, None) => Ok(()),
+            (_, Some(_)) => Err(format!(
+                "non-observed measurement {} must not have a value",
+                self.name
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComparisonArm {
@@ -174,6 +192,20 @@ fn build_comparison(
         })
         .collect::<Vec<_>>();
     unavailable.extend(duplicate_warnings);
+    for observation in &observations {
+        if observation.measurements.is_empty() {
+            unavailable.push(format!(
+                "trial {} has no measurements",
+                observation.trial_id
+            ));
+        }
+        if observation.evidence.is_empty() {
+            unavailable.push(format!(
+                "trial {} has no evidence references",
+                observation.trial_id
+            ));
+        }
+    }
     // Arm presence is not evidence of a controlled comparison.  The durable
     // trial controller must prove frozen inputs, isolation, ordering, and
     // verifier integrity before a stronger causal classification is allowed.
@@ -224,6 +256,9 @@ pub fn build_comparison_for_plan(
         .collect::<BTreeMap<_, _>>();
     let mut accepted = BTreeMap::<&str, TrialObservation>::new();
     for observation in observations {
+        for measurement in &observation.measurements {
+            measurement.validate_value_status()?;
+        }
         if observation.experiment_fingerprint != fingerprint {
             return Err(format!(
                 "trial {} has fingerprint {}, expected {}",
@@ -454,6 +489,29 @@ mod tests {
                 .flat_map(|observation| &observation.measurements)
                 .all(|measurement| measurement.value.is_none())
         );
+    }
+
+    #[test]
+    fn measurement_status_requires_consistent_values() {
+        for (status, value, valid) in [
+            (MeasurementStatus::Observed, Some(0.0), true),
+            (MeasurementStatus::Observed, None, false),
+            (MeasurementStatus::Observed, Some(f64::NAN), false),
+            (MeasurementStatus::Observed, Some(f64::INFINITY), false),
+            (MeasurementStatus::Missing, None, true),
+            (MeasurementStatus::Missing, Some(0.0), false),
+            (MeasurementStatus::Unavailable, Some(1.0), false),
+            (MeasurementStatus::Failed, Some(1.0), false),
+        ] {
+            let measurement = Measurement {
+                name: "tokens".into(),
+                unit: "tokens".into(),
+                status,
+                value,
+                basis: None,
+            };
+            assert_eq!(measurement.validate_value_status().is_ok(), valid);
+        }
     }
 
     #[test]
