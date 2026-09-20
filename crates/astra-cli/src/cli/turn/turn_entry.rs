@@ -11,6 +11,7 @@ use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_
 use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::streaming_types::UsageAttribution;
 use astra_services::session_journal::{
     JournalWriter, SessionExecutionLease, SessionExecutionLeaseError,
 };
@@ -150,12 +151,16 @@ pub(crate) struct TurnContext<'a> {
 /// canonical StreamResult/partial failure rather than inferred by subtracting
 /// session-lifetime counters, which may be refreshed or advanced by another
 /// executor while the turn is running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnUsage {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
+    pub(crate) usage_attribution: UsageAttribution,
+    /// A provider usage attempt or unavailable capture was observed even if
+    /// no numeric lane survived into the attribution projection.
+    pub(crate) usage_observed: bool,
 }
 
 impl TurnUsage {
@@ -165,8 +170,17 @@ impl TurnUsage {
             completion_tokens: result.completion_tokens,
             cache_read_tokens: result.cache_read_tokens,
             cache_creation_tokens: result.cache_creation_tokens,
+            usage_attribution: result.usage_attribution.clone(),
+            usage_observed: false,
         };
-        (result.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+        let usage_observed = result.token_usage_coverage.attempts > 0
+            || result.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
     }
 
     pub(crate) fn from_partial(partial: &crate::PartialTurnData) -> Option<Self> {
@@ -175,11 +189,20 @@ impl TurnUsage {
             completion_tokens: partial.completion_tokens,
             cache_read_tokens: partial.cache_read_tokens,
             cache_creation_tokens: partial.cache_creation_tokens,
+            usage_attribution: partial.usage_attribution.clone(),
+            usage_observed: false,
         };
-        (partial.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+        let usage_observed = partial.token_usage_coverage.attempts > 0
+            || partial.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
     }
 
-    fn has_values(self) -> bool {
+    pub(crate) fn has_values(&self) -> bool {
         self.prompt_tokens > 0
             || self.completion_tokens > 0
             || self.cache_read_tokens > 0
@@ -602,12 +625,43 @@ async fn ensure_multi_agent_runtime_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ShellPassthroughDecision, TurnContext, acquire_interactive_turn_admission,
+        ShellPassthroughDecision, TurnContext, TurnUsage, acquire_interactive_turn_admission,
         classify_shell_passthrough, ensure_interactive_session_identity,
         ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
         model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
+    use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[test]
+    fn partial_usage_snapshot_survives_without_token_numbers() {
+        let partial = crate::PartialTurnData {
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+
+        let usage = TurnUsage::from_partial(&partial).expect("capture state must be retained");
+
+        assert!(usage.usage_attribution.auxiliary_capture_unavailable);
+        assert!(!usage.has_values());
+    }
+
+    #[test]
+    fn partial_usage_coverage_survives_when_every_token_is_unavailable() {
+        let partial = crate::PartialTurnData {
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 1,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(TurnUsage::from_partial(&partial).is_some());
+    }
 
     #[tokio::test]
     #[serial_test::serial]

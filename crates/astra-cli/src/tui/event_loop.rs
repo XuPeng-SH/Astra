@@ -9975,16 +9975,21 @@ pub(crate) async fn run_tui_session(
                                     let turn_usage = turn_result
                                         .as_ref()
                                         .ok()
-                                        .and_then(|usage| *usage);
-                                    let turn_fresh_input = turn_usage.map(|usage| {
-                                        usage
-                                            .prompt_tokens
-                                            .saturating_add(usage.cache_creation_tokens)
-                                    });
-                                    let turn_completion =
-                                        turn_usage.map(|usage| usage.completion_tokens);
-                                    let turn_cache_read =
-                                        turn_usage.map(|usage| usage.cache_read_tokens);
+                                        .and_then(|usage| usage.clone());
+                                    let primary_usage = turn_usage.as_ref().map_or_else(
+                                        Default::default,
+                                            |usage| {
+                                            crate::cli::turn::turn_reporting::project_primary_usage(
+                                                &usage.usage_attribution,
+                                                usage.usage_observed,
+                                            )
+                                        },
+                                    );
+                                    let turn_fresh_input = primary_usage.fresh_input_tokens;
+                                    let turn_completion = primary_usage.output_tokens;
+                                    let turn_cache_read = primary_usage.cache_read_tokens;
+                                    let turn_cache_creation =
+                                        primary_usage.cache_creation_tokens;
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -10013,17 +10018,28 @@ pub(crate) async fn run_tui_session(
                                             ttft_ms,
                                             tokens_in: turn_fresh_input,
                                             tokens_out: turn_completion,
-                                            // Drive the `💾 N%` segment:
-                                            // hit rate = cache_read / total_input.
-                                            // Only plumbed when the provider
-                                            // reported a cache_read value this
-                                            // turn — `None` keeps the segment
-                                            // off entirely (first turn, non-
-                                            // caching provider, etc.).
-                                            cache_read_tokens: turn_cache_read
-                                                .filter(|tokens| *tokens > 0),
+                                            // Preserve an explicitly reported
+                                            // zero cache lane. `None` means
+                                            // unreported and must not be
+                                            // rewritten to zero.
+                                            cache_read_tokens: turn_cache_read,
+                                            cache_creation_tokens: turn_cache_creation,
+                                            model_name: turn_usage.as_ref().and_then(|usage| {
+                                                usage
+                                                    .usage_attribution
+                                                    .primary_model
+                                                    .clone()
+                                            }),
+                                            auxiliary_summary: turn_usage.as_ref().and_then(
+                                                |usage| usage.usage_attribution.auxiliary_summary(),
+                                            ),
+                                            usage_partial: turn_usage
+                                                .as_ref()
+                                                .is_some_and(|_| {
+                                                    primary_usage.observed && !primary_usage.complete
+                                                }),
                                             tools: turn_tool_count,
-                                            cumulative_tokens: turn_usage.map(|_| {
+                                            cumulative_tokens: turn_usage.as_ref().map(|_| {
                                                 state
                                                     .total_prompt_tokens
                                                     .saturating_add(state.total_completion_tokens)
@@ -10033,6 +10049,7 @@ pub(crate) async fn run_tui_session(
                                                     .saturating_add(state.total_cache_read_tokens)
                                             }),
                                             cumulative_cost_usd: turn_usage
+                                                .as_ref()
                                                 .map(|_| state.total_session_cost),
                                         };
                                         if let Some(ev) = chat_widget::translate(
@@ -11845,7 +11862,7 @@ mod tests {
         result.completion_tokens = 0;
         result.cache_read_tokens = 0;
         result.cache_creation_tokens = 0;
-        assert!(crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result).is_none());
+        assert!(crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result).is_some());
     }
 
     #[test]

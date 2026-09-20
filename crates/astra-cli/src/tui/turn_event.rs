@@ -120,6 +120,19 @@ pub(crate) enum TurnEvent {
         /// stats — `#[serde(default)]` keeps the schema additive.
         #[serde(default)]
         cache_read_tokens: Option<u64>,
+        /// Fresh tokens written to the provider cache. Kept separate from
+        /// `tokens_in` so cache-hit rates do not silently mix lanes.
+        #[serde(default)]
+        cache_creation_tokens: Option<u64>,
+        /// The admitted primary model used for the turn, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_name: Option<String>,
+        /// Human-readable summary of auxiliary judgment/memory calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auxiliary_summary: Option<String>,
+        /// True when primary usage attribution was observed but not complete.
+        #[serde(default)]
+        usage_partial: bool,
         #[serde(default)]
         tools: u32,
         /// Session-cumulative totals at the moment this turn ended.
@@ -331,6 +344,10 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            usage_partial: false,
             tools: 0,
             cumulative_tokens: None,
             cumulative_cost_usd: None,

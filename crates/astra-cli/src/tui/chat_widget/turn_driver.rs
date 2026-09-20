@@ -103,6 +103,10 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
             tokens_in: Some(220),
             tokens_out: Some(50),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(270),
             cumulative_cost_usd: Some(0.0015),
@@ -157,6 +161,10 @@ fn canonical_turn_snapshots_full_scrollback() {
             tokens_in: Some(200),
             tokens_out: Some(40),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(240),
             cumulative_cost_usd: None,
@@ -260,7 +268,7 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     let (stream_tx, control) = stream_bridge::create_controlled_per_turn_bridge(tui_tx);
     let assistant_text = "The requested file was updated successfully.";
-    let user_message = "The requested execution did not complete. Progress is saved. Continue this session to resume.";
+    let user_message = "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work.";
 
     stream_tx
         .send(StreamEvent::Token(assistant_text.into()))

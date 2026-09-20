@@ -89,6 +89,7 @@ pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
     ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
     ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
+    ExplainAnalyzeScopeCoverageV1,
 };
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,

@@ -43,6 +43,7 @@ use crate::{
 use crate::cli::chat_stream::ChatTurnParams;
 use crate::cli::chat_stream::params::StreamEvent;
 use crate::cli::session::session_runtime::{self, ServerDefaultModel};
+use crate::cli::stream::streaming_types::UsageAttribution;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     partial_interruption_notice, resolved_tool_metrics,
@@ -1154,10 +1155,19 @@ pub(crate) async fn stream_chat_sse(
         // prefix. Repair that projection from the accumulated canonical facts
         // before the caller publishes TurnError; otherwise the prefix can be
         // frozen as a complete local report or disappear silently.
-        if p.explain != crate::ExplainMode::Off
-            && (!state.telemetry.explain_analyze_events.is_empty()
-                || state.telemetry.explain_analyze_degraded)
-        {
+        // This failure path has already crossed the normal logical-turn
+        // settlement boundary. Keep the capture verdict independent from the
+        // presentation choice below: Explain Off must not turn the same
+        // incomplete evidence into a complete persisted attribution.
+        let explain_analyze_repair_needed = !state.telemetry.explain_analyze_events.is_empty()
+            || state.telemetry.explain_analyze_degraded;
+        let effective_explain_analyze_degraded = explain_analyze_repair_needed;
+        if p.explain != crate::ExplainMode::Off && explain_analyze_repair_needed {
+            // The snapshot below deliberately carries a degraded delivery
+            // marker because the logical turn failed before its normal
+            // settlement boundary. Use that same effective fact when
+            // building usage attribution; otherwise a raw `false` telemetry
+            // flag can make the persisted partial result look complete.
             let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
                 events: state.telemetry.explain_analyze_events.clone(),
                 // A logical failure leaves coverage/settlement unresolved even
@@ -1200,6 +1210,14 @@ pub(crate) async fn stream_chat_sse(
         let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
             &state.stall.tool_call_records,
         );
+        let usage_attribution = UsageAttribution::from_explain_analyze_events(
+            &state.telemetry.explain_analyze_events,
+            state
+                .current_model_identity()
+                .or(p.model)
+                .map(ToOwned::to_owned),
+            effective_explain_analyze_degraded,
+        );
         return Err(crate::TurnFailure {
             error,
             partial: crate::PartialTurnData {
@@ -1211,6 +1229,7 @@ pub(crate) async fn stream_chat_sse(
                 completion_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
                 cache_creation_tokens: state.total_cache_creation,
+                usage_attribution,
                 tool_calls_count,
                 llm_rounds: Some(state.llm_rounds_completed),
                 token_usage_coverage: state.token_usage_coverage(),
@@ -1270,21 +1289,22 @@ pub(crate) async fn stream_chat_sse(
     }
     finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
 
+    let usage_attribution = UsageAttribution::from_explain_analyze_events(
+        &state.telemetry.explain_analyze_events,
+        state
+            .current_model_identity()
+            .or(p.model)
+            .map(ToOwned::to_owned),
+        state.telemetry.explain_analyze_degraded,
+    );
+
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
         explain_report_format: p.explain_report_format,
         quiet: p.render_policy.is_silent(),
-        verbose_mode: p.verbose_mode,
-        start,
-        model: p.model,
         explain_analyze_events: &state.telemetry.explain_analyze_events,
         explain_analyze_degraded: state.telemetry.explain_analyze_degraded,
         verdict_events: &state.stall.verdict_events,
-        has_any_usage: state.has_any_usage,
-        total_prompt: state.total_prompt,
-        total_cache_read: state.total_cache_read,
-        total_cache_creation: state.total_cache_creation,
-        total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
     });
 
@@ -1332,6 +1352,7 @@ pub(crate) async fn stream_chat_sse(
         completion_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
+        usage_attribution,
         tool_calls_count: state.total_tool_calls,
         tool_ledger_aggregate,
         first_surface_report: state.telemetry.first_selection_report,

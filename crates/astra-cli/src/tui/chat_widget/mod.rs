@@ -188,14 +188,17 @@ pub(crate) enum WireEvent {
 pub(crate) struct TurnStats {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
+    /// Structured primary-provider metrics carried for diagnostics/replay and
+    /// rendered compactly in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Of the `tokens_in` total, how many were served from the
-    /// provider's prompt cache. Drives the `💾 N%` segment in the
-    /// per-turn summary band. `None` when the provider didn't
-    /// report cache stats this turn (e.g. first turn, no cache
-    /// participation, DeepSeek with cache disabled).
+    /// Of the `tokens_in` total, how many were served from the provider's
+    /// prompt cache. `None` when the provider did not report cache stats.
     pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub model_name: Option<String>,
+    pub auxiliary_summary: Option<String>,
+    pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -4261,6 +4264,10 @@ impl ChatWidget {
             tokens_in: stats.tokens_in,
             tokens_out: stats.tokens_out,
             cache_read_tokens: stats.cache_read_tokens,
+            cache_creation_tokens: stats.cache_creation_tokens,
+            model_name: stats.model_name,
+            auxiliary_summary: stats.auxiliary_summary,
+            usage_partial: stats.usage_partial,
             tools: stats.tools,
             cumulative_tokens: stats.cumulative_tokens,
             cumulative_cost_usd: stats.cumulative_cost_usd,
@@ -6704,6 +6711,10 @@ mod tests {
                 tokens_in: Some(10),
                 tokens_out: Some(5),
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
+                model_name: None,
+                auxiliary_summary: None,
+                usage_partial: false,
                 tools: 0,
                 cumulative_tokens: Some(15),
                 cumulative_cost_usd: None,
@@ -7101,6 +7112,10 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
                 cache_read_tokens: None,
+                cache_creation_tokens: None,
+                model_name: None,
+                auxiliary_summary: None,
+                usage_partial: false,
                 tools: 0,
                 cumulative_tokens: None,
                 cumulative_cost_usd: None,
