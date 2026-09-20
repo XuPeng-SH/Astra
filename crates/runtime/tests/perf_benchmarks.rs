@@ -7,7 +7,7 @@ use astra_services::{
     DatabaseRunStateStore, DatabaseStateProjectionStore,
 };
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 use uuid::Uuid;
 
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
@@ -622,5 +622,112 @@ async fn perf_benchmark_6_manifest_batches_across_users_and_sessions() {
     assert!(
         elapsed_ms < 10_000,
         "PERF-6 {WRITERS} multi-user/session manifest writes must complete in <10s, got {elapsed_ms}ms"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
+async fn perf_benchmark_7_latest_manifest_reads_are_owner_scoped() {
+    const MANIFESTS: usize = 512;
+
+    let pool = setup_pool().await;
+    let user_id = id("perf-read-user");
+    let session_id = id("perf-read-session");
+    let run_id = id("perf-read-run");
+    let manifest_prefix = id("perf-manifest");
+    insert_session(&pool, &user_id, &session_id).await;
+
+    let mut insert = QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO context_manifests
+         (manifest_id, user_id, session_id, run_id, turn_id, model_provider, model_name,
+          context_window_tokens, max_output_tokens, total_estimated_tokens, policy_version,
+          tokenizer_id, budget_template_id, turn_intent, reason, dropped_count, manifest_json,
+          created_at) ",
+    );
+    insert.push_values(0..MANIFESTS, |mut row, index| {
+        row.push_bind(format!("{manifest_prefix}-{index:04}"))
+            .push_bind(&user_id)
+            .push_bind(&session_id)
+            .push_bind(&run_id)
+            .push_bind(format!("turn-{index}"))
+            .push_bind("mock")
+            .push_bind("perf-read-llm")
+            .push_bind(8_000_i64)
+            .push_bind(700_i64)
+            .push_bind(1_200_i64)
+            .push_bind("context_manifest_v1")
+            .push_bind("estimated_v1")
+            .push_bind("budget_v1_8k")
+            .push_bind("normal")
+            .push_bind("normal_turn")
+            .push_bind(0_i64)
+            .push_bind("{}")
+            .push("NOW(6)");
+    });
+    insert
+        .build()
+        .execute(pool.get())
+        .await
+        .expect("PERF-7 manifest seed must succeed");
+
+    let started = Instant::now();
+    let preferred = sqlx::query(
+        "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                budget_template_id, policy_version,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+         FROM context_manifests
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+         ORDER BY created_at DESC, manifest_id DESC
+         LIMIT 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("PERF-7 preferred latest-manifest query must succeed");
+    let preferred_ms = millis(started);
+    assert_eq!(
+        preferred.try_get::<String, _>("manifest_id").unwrap(),
+        format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+    );
+
+    let started = Instant::now();
+    let fallback = sqlx::query(
+        "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                budget_template_id, policy_version,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+         FROM context_manifests
+         WHERE user_id = ? AND session_id = ?
+         ORDER BY created_at DESC, manifest_id DESC
+         LIMIT 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("PERF-7 fallback latest-manifest query must succeed");
+    let fallback_ms = millis(started);
+    assert_eq!(
+        fallback.try_get::<String, _>("manifest_id").unwrap(),
+        format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+    );
+
+    let wrong_owner = sqlx::query(
+        "SELECT COUNT(*) AS c
+         FROM context_manifests
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind("perf-read-not-owner")
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("PERF-7 wrong-owner read must succeed")
+    .try_get::<i64, _>("c")
+    .unwrap_or_default();
+    assert_eq!(wrong_owner, 0, "PERF-7 must not read another owner");
+    assert!(
+        preferred_ms < 50 && fallback_ms < 50,
+        "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
     );
 }
