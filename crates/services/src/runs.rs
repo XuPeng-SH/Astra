@@ -18998,46 +18998,30 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String> {
-        let Some(_run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-
-        let row = if let Some(checkpoint_kind) = checkpoint_kind {
-            sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-                        checkpoint_version, idempotency_key, checkpoint_json,
-                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ? AND checkpoint_kind = ?
-                 ORDER BY created_at DESC, checkpoint_id DESC
-                 LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(checkpoint_kind)
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT checkpoint.checkpoint_id, checkpoint.run_id, checkpoint.user_id,
+                    checkpoint.session_id, checkpoint.node_seq, checkpoint.checkpoint_kind,
+                    checkpoint.checkpoint_version, checkpoint.idempotency_key,
+                    checkpoint.checkpoint_json,
+                    DATE_FORMAT(checkpoint.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM run_checkpoints AS checkpoint
+             INNER JOIN agent_runs AS run
+               ON run.user_id = checkpoint.user_id AND run.run_id = checkpoint.run_id
+             WHERE checkpoint.user_id = ",
+        );
+        query.push_bind(user_id);
+        query.push(" AND checkpoint.run_id = ");
+        query.push_bind(run_id);
+        if let Some(checkpoint_kind) = checkpoint_kind {
+            query.push(" AND checkpoint.checkpoint_kind = ");
+            query.push_bind(checkpoint_kind);
+        }
+        query.push(" ORDER BY checkpoint.created_at DESC, checkpoint.checkpoint_id DESC LIMIT 1");
+        let row = query
+            .build()
             .fetch_optional(self.pool.get())
             .await
-            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
-        } else {
-            sqlx::query(
-                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-                        checkpoint_version, idempotency_key, checkpoint_json,
-                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-                 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ?
-                 ORDER BY created_at DESC, checkpoint_id DESC
-                 LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
-        };
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?;
         row.map(|row| decode_run_checkpoint_record_from_row(&row))
             .transpose()
             .map_err(|e| e.to_string())

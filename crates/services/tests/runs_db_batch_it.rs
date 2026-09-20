@@ -681,7 +681,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         "INSERT INTO run_checkpoints
          (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
           checkpoint_version, idempotency_key, checkpoint_json, created_at)
-         VALUES (?, ?, ?, ?, 99, 'resume', 'checkpoint_v1', ?, ?, '2099-01-01 00:00:00.000000')",
+         VALUES (?, ?, ?, ?, 99, 'resume', 'checkpoint_v1', ?, ?, '2099-01-01 00:00:00.999999')",
     )
     .bind(format!("ckpt-foreign-{}", uuid::Uuid::new_v4()))
     .bind(&run_id)
@@ -741,6 +741,48 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         "checkpoint idempotency identity must include owner"
     );
 
+    for (checkpoint_id, checkpoint_kind, idempotency_key, checkpoint_json, created_at) in [
+        (
+            "ckpt-owner-z",
+            "resume",
+            "checkpoint:owner:older",
+            r#"{"version":"checkpoint_v1","graceful":true,"source":"older_resume"}"#,
+            "2099-01-01 00:00:00.000001",
+        ),
+        (
+            "ckpt-owner-a",
+            "resume",
+            "checkpoint:owner:newer",
+            r#"{"version":"checkpoint_v1","graceful":true,"source":"newer_resume"}"#,
+            "2099-01-01 00:00:00.000002",
+        ),
+        (
+            "ckpt-owner-latest",
+            "checkpoint",
+            "checkpoint:owner:latest",
+            r#"{"version":"checkpoint_v1","graceful":false,"source":"newer_checkpoint"}"#,
+            "2099-01-01 00:00:00.000003",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, 100, ?, 'checkpoint_v1', ?, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(&run_id)
+        .bind(&owner_user_id)
+        .bind(&owner_session_id)
+        .bind(checkpoint_kind)
+        .bind(idempotency_key)
+        .bind(checkpoint_json)
+        .bind(created_at)
+        .execute(_pool.get())
+        .await
+        .expect("insert owner checkpoint ordering fixture");
+    }
+
     let latest = store
         .load_latest_checkpoint(&owner_user_id, &run_id, Some("resume"))
         .await
@@ -748,9 +790,30 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .expect("checkpoint exists");
     assert_eq!(latest.user_id, owner_user_id);
     assert!(
-        latest.checkpoint_json.contains(r#""source":"owner_row""#),
-        "owner latest checkpoint should be returned despite a newer foreign row: {:?}",
         latest
+            .checkpoint_json
+            .contains(r#""source":"newer_resume""#),
+        "owner latest resume checkpoint should use microsecond ordering and ignore foreign rows: {:?}",
+        latest
+    );
+
+    let latest_any_kind = store
+        .load_latest_checkpoint(&owner_user_id, &run_id, None)
+        .await
+        .expect("load latest owner checkpoint of any kind")
+        .expect("checkpoint exists");
+    assert!(
+        latest_any_kind
+            .checkpoint_json
+            .contains(r#""source":"newer_checkpoint""#)
+    );
+
+    assert!(
+        store
+            .load_latest_checkpoint(&foreign_user_id, &run_id, Some("resume"))
+            .await
+            .expect("load foreign orphan checkpoint")
+            .is_none()
     );
 
     let _ = sqlx::query("DELETE FROM run_checkpoints WHERE run_id = ?")
