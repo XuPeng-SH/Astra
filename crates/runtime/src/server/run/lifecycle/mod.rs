@@ -163,10 +163,12 @@ impl EvaluationWorkspaceLease {
         pool.finalize_evaluation_workspace(
             &self.user_id,
             self.edge_agent_id.as_deref()?,
-            self.workspace_dir.as_deref()?,
-            &self.source_commit,
-            verifier_command,
-            verifier_timeout_secs,
+            astra_server_types::edge_connection_pool::EdgeWorkspaceFinalizationRequest {
+                workspace_dir: self.workspace_dir.as_deref()?,
+                source_commit: &self.source_commit,
+                verifier_command,
+                verifier_timeout_secs,
+            },
             timeout,
             cancel_token,
         )

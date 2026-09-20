@@ -225,6 +225,15 @@ struct PendingWorkspaceOperation {
     sender: oneshot::Sender<EdgeWorkspaceOperationResult>,
 }
 
+/// Frozen workspace and verifier inputs for one finalization operation.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWorkspaceFinalizationRequest<'a> {
+    pub workspace_dir: &'a str,
+    pub source_commit: &'a str,
+    pub verifier_command: &'a str,
+    pub verifier_timeout_secs: u64,
+}
+
 /// Result returned by a live Edge workspace management operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeWorkspaceOperationResult {
@@ -852,10 +861,7 @@ impl EdgeConnectionPool {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        workspace_dir: &str,
-        source_commit: &str,
-        verifier_command: &str,
-        verifier_timeout_secs: u64,
+        request: EdgeWorkspaceFinalizationRequest<'_>,
         timeout: Duration,
         cancel_token: &CancellationToken,
     ) -> Option<EdgeWorkspaceOperationResult> {
@@ -874,10 +880,10 @@ impl EdgeConnectionPool {
             |request_id, connection_generation| EdgeServerMessage::WorkspaceFinalize {
                 request_id,
                 connection_generation,
-                workspace_dir: workspace_dir.to_string(),
-                source_commit: source_commit.to_string(),
-                verifier_command: verifier_command.to_string(),
-                verifier_timeout_secs,
+                workspace_dir: request.workspace_dir.to_string(),
+                source_commit: request.source_commit.to_string(),
+                verifier_command: request.verifier_command.to_string(),
+                verifier_timeout_secs: request.verifier_timeout_secs,
                 finalization_deadline_unix_ms: deadline_unix_ms,
             },
         )
