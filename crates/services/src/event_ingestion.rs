@@ -1440,8 +1440,6 @@ impl IngestionAdmission {
         );
         add_usage(state.sessions.entry(session_key).or_default(), bytes);
         let current = state.global;
-        drop(state);
-
         let mut stats = astra_core::sync_poison::recover_mutex_lock(&self.stats);
         stats.resident_events_current = current.events as u64;
         stats.resident_events_peak = stats
@@ -1449,6 +1447,8 @@ impl IngestionAdmission {
             .max(stats.resident_events_current);
         stats.resident_bytes_current = current.bytes;
         stats.resident_bytes_peak = stats.resident_bytes_peak.max(current.bytes);
+        drop(stats);
+        drop(state);
 
         Ok(IngestionAdmissionLease {
             inner: Arc::new(IngestionAdmissionLeaseInner {
@@ -1491,12 +1491,11 @@ impl IngestionAdmission {
             bytes,
         );
         let current = state.global;
-        drop(state);
-
         let mut stats = astra_core::sync_poison::recover_mutex_lock(&self.stats);
         stats.resident_events_current = current.events as u64;
         stats.resident_bytes_current = current.bytes;
         drop(stats);
+        drop(state);
         self.released.notify_waiters();
     }
 }
@@ -3357,6 +3356,46 @@ mod tests {
         let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
         assert_eq!(stats.resident_events_current, 0);
         assert_eq!(stats.resident_bytes_current, 0);
+    }
+
+    #[test]
+    fn concurrent_releases_publish_the_authoritative_residency() {
+        let config = IngestionConfig {
+            channel_capacity: 64,
+            max_owner_resident_events: 64,
+            max_session_resident_events: 64,
+            ..Default::default()
+        }
+        .normalized();
+        let stats = Arc::new(Mutex::new(IngestionStats::default()));
+        let admission = IngestionAdmission::new(&config, Arc::clone(&stats));
+        let leases = (0..32)
+            .map(|index| {
+                let mut event = test_event(
+                    &format!("event-{index}"),
+                    &format!("session-{index}"),
+                    "turn",
+                );
+                event.user_id = format!("owner-{index}");
+                admission
+                    .try_acquire(&event, 1, IngestionEventPriority::Critical)
+                    .expect("admit concurrent release fixture")
+            })
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(leases.len()));
+        std::thread::scope(|scope| {
+            for lease in leases {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(lease);
+                });
+            }
+        });
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.resident_bytes_current, 0);
+        assert_eq!(stats.resident_events_peak, 32);
     }
 
     #[test]

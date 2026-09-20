@@ -1390,6 +1390,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             canonical_turn_chain_id: Some(child_turn_chain_id),
             root_user_query_event_id: Some(child_user_query_event_id),
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
             canonical_trace_time_bounds: Default::default(),
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };

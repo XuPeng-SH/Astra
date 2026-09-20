@@ -1096,6 +1096,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             canonical_turn_chain_id: Some(config.run_id.clone()),
             root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
             canonical_trace_time_bounds: Default::default(),
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };

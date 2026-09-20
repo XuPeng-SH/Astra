@@ -1062,6 +1062,7 @@ pub(crate) async fn stream_chat_sse(
                 .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         ),
         turn_event_buffer: None,
+        canonical_turn_started_at: Default::default(),
         canonical_trace_time_bounds: Default::default(),
         harness: {
             #[cfg(feature = "harness")]

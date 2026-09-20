@@ -1193,6 +1193,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             canonical_turn_chain_id: Some(child_turn_chain_id),
             root_user_query_event_id: None,
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
             canonical_trace_time_bounds: Default::default(),
             harness: {
                 #[cfg(feature = "harness")]

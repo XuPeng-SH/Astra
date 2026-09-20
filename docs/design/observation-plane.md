@@ -419,10 +419,12 @@ receipts, and explicit session deletion removes its owner-scoped receipts.
 The v83 core schema requires capture hashes and attempt markers on event and
 manifest writes. Deployments using an earlier table shape require a fresh-schema
 cutover; startup rejects missing capture columns rather than assigning empty
-hashes to old rows. Hashes include producer occurrence timestamps. Post-loop
-canonical capture freezes its time bounds on the execution state; delayed
-retries and lost-acknowledgement resolution reuse those bounds, not the current
-clock. Content and lineage still undergo full hash comparison. Configuration
+hashes to old rows. Hashes include producer occurrence timestamps. Root
+execution freezes the turn-start timestamp before its first durable write, then
+freezes the terminal offset after execution. Delayed retries and
+lost-acknowledgement resolution reuse both bounds, not a later event-buffer
+start or the current clock. Content and lineage still undergo full hash
+comparison. Configuration
 version pushes are the exception: their envelope has a generated delivery time,
 so that field is hashed as JSON null and the first stored delivery time is kept.
 

@@ -280,6 +280,13 @@ impl PostLoopPersistContext {
             &self.run_id,
             state.session_turn,
         );
+        let turn_started_at = *state.canonical_turn_started_at.get_or_init(|| {
+            state
+                .turn_event_buffer
+                .as_ref()
+                .map(astra_services::session_journal::TurnEventBuffer::turn_started_at)
+                .unwrap_or_else(chrono::Utc::now)
+        });
         let Some(event) = server_loop_user_query_event(
             &self.user_id,
             &self.session_id,
@@ -290,11 +297,7 @@ impl PostLoopPersistContext {
             None,
             &trace,
             &self.user_message,
-            state
-                .turn_event_buffer
-                .as_ref()
-                .map(astra_services::session_journal::TurnEventBuffer::turn_started_at)
-                .unwrap_or_else(chrono::Utc::now),
+            turn_started_at,
         ) else {
             return Ok(());
         };
@@ -759,7 +762,12 @@ async fn verify_canonical_append_evidence(
             state.session_turn,
         )
     });
-    let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
+    let (execution_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
+    let root_started_at = state
+        .canonical_turn_started_at
+        .get()
+        .copied()
+        .unwrap_or(execution_started_at);
     let mut expected_trace = build_server_loop_core_events(
         append.user_id,
         append.session_id,
@@ -772,12 +780,13 @@ async fn verify_canonical_append_evidence(
         append.user_message,
         state,
         append.model_name,
-        turn_started_at,
+        root_started_at,
+        execution_started_at,
         terminal_offset_ms,
     );
     expected_trace.extend(build_llm_round_trace_events(
         &trace,
-        turn_started_at,
+        execution_started_at,
         append.run_id,
         append.parent_run_id,
         append.agent_id,
@@ -787,7 +796,7 @@ async fn verify_canonical_append_evidence(
     ));
     expected_trace.extend(build_tool_trace_events(
         &trace,
-        turn_started_at,
+        execution_started_at,
         append.run_id,
         append.parent_run_id,
         append.agent_id,
@@ -1161,7 +1170,12 @@ async fn persist_server_loop_canonical_append_inner(
     // `persist_server_loop_core_events_in_tx` now returns `Result`; on Err the
     // transaction is poisoned (partial writes may be staged) and we MUST
     // rollback instead of continuing to write detail events into the same tx.
-    let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
+    let (execution_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
+    let root_started_at = state
+        .canonical_turn_started_at
+        .get()
+        .copied()
+        .unwrap_or(execution_started_at);
     let mut capture_outcome = match persist_server_loop_core_events_in_tx(
         &mut tx,
         append.user_id,
@@ -1175,7 +1189,8 @@ async fn persist_server_loop_canonical_append_inner(
         append.user_message,
         state,
         append.model_name,
-        turn_started_at,
+        root_started_at,
+        execution_started_at,
         terminal_offset_ms,
     )
     .await
@@ -1200,6 +1215,40 @@ async fn persist_server_loop_canonical_append_inner(
         }
     };
 
+    if settlement.is_some() {
+        // The root user query and terminal assistant response are prerequisites
+        // for a successful terminal. A collision must abort the transaction before
+        // status or any whole-turn projection can make rejected content canonical.
+        let trace = append.trace_context.clone().unwrap_or_else(|| {
+            server_trace_context(
+                append.user_id,
+                append.session_id,
+                append.run_id,
+                state.session_turn,
+            )
+        });
+        let mut rejected_required_event = None;
+        if !append.user_message.is_empty()
+            && !capture_outcome.accepts_projection(&trace.root_event_id)
+        {
+            rejected_required_event = Some(trace.root_event_id.clone());
+        }
+        let response_event_id = trace_event_id("response", &[append.run_id, &trace.turn_id]);
+        if rejected_required_event.is_none()
+            && append.include_terminal_assistant
+            && !state.final_text.is_empty()
+            && !capture_outcome.accepts_projection(&response_event_id)
+        {
+            rejected_required_event = Some(response_event_id);
+        }
+        if let Some(event_id) = rejected_required_event {
+            let _ = tx.rollback().await;
+            return Err(format!(
+                "required canonical event {event_id} was rejected; terminal settlement aborted"
+            ));
+        }
+    }
+
     // Trace detail events (LLM rounds, tool calls).
     match persist_server_loop_trace_events_in_tx(
         &mut tx,
@@ -1212,7 +1261,7 @@ async fn persist_server_loop_canonical_append_inner(
         append.trace_context.clone(),
         state,
         append.model_name,
-        turn_started_at,
+        execution_started_at,
     )
     .await
     {
@@ -1996,7 +2045,8 @@ async fn persist_server_loop_core_events_in_tx(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-    turn_started_at: chrono::DateTime<chrono::Utc>,
+    root_started_at: chrono::DateTime<chrono::Utc>,
+    execution_started_at: chrono::DateTime<chrono::Utc>,
     terminal_offset_ms: u64,
 ) -> Result<TraceEventPersistOutcome, String> {
     let events = build_server_loop_core_events(
@@ -2011,7 +2061,8 @@ async fn persist_server_loop_core_events_in_tx(
         user_message,
         state,
         model_name,
-        turn_started_at,
+        root_started_at,
+        execution_started_at,
         terminal_offset_ms,
     );
     if events.is_empty() {
@@ -2045,7 +2096,8 @@ fn build_server_loop_core_events(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-    turn_started_at: chrono::DateTime<chrono::Utc>,
+    root_started_at: chrono::DateTime<chrono::Utc>,
+    execution_started_at: chrono::DateTime<chrono::Utc>,
     terminal_offset_ms: u64,
 ) -> Vec<TraceEvent> {
     if user_message.is_empty()
@@ -2067,7 +2119,7 @@ fn build_server_loop_core_events(
         parent_agent_id,
         &trace,
         user_message,
-        turn_started_at,
+        root_started_at,
     );
 
     let user_intent_events = state
@@ -2091,7 +2143,7 @@ fn build_server_loop_core_events(
             // Deferred intents currently retain order but not a producer
             // timestamp. Anchor them to the turn root rather than fabricating
             // a post-loop time that would sort after the terminal response.
-            event.created_at = turn_started_at;
+            event.created_at = root_started_at;
             event.metadata = serde_json::json!({
                 "intent_id": intent.intent_id,
                 "delivery": intent.delivery,
@@ -2126,7 +2178,7 @@ fn build_server_loop_core_events(
             .or_else(|| Some(trace.root_event_id.clone()));
         event.llm_model_used = model_name.map(ToString::to_string);
         event.token_usage = usage;
-        event.created_at = turn_started_at
+        event.created_at = execution_started_at
             + chrono::Duration::milliseconds(i64::try_from(terminal_offset_ms).unwrap_or(i64::MAX));
         Some(event)
     } else {
@@ -5598,6 +5650,7 @@ mod tests {
             &state,
             Some("test-model"),
             turn_started_at,
+            turn_started_at,
             terminal_offset_ms,
         );
         let root_event = attempted_core
@@ -5716,6 +5769,53 @@ mod tests {
         .await
         .expect("count durable canonical collision receipts");
         assert_eq!(collision_receipts, 1);
+
+        let baseline_run_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("count baseline run events");
+        let terminal_events = vec![
+            json!({"event_type": "text_done", "data": {"full_text": state.final_text}}),
+            json!({"event_type": "run_finished", "data": {"status": astra_core::STATUS_COMPLETED}}),
+        ];
+        let terminal_error = persist
+            .persist_atomic_terminal_settlement(
+                &state,
+                &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .expect_err("a rejected terminal response must abort settlement");
+        assert!(
+            terminal_error.contains("required canonical event")
+                && terminal_error.contains("terminal settlement aborted"),
+            "unexpected rejection: {terminal_error}"
+        );
+        let durable_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(&user_id)
+                .bind(&run_id)
+                .fetch_one(&db)
+                .await
+                .expect("read run after rejected terminal");
+        assert_eq!(durable_status, astra_core::STATUS_RUNNING);
+        let run_events_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("count run events after rejected terminal");
+        assert_eq!(run_events_after, baseline_run_events);
 
         sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
             .bind(&user_id)
@@ -6103,11 +6203,38 @@ mod tests {
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
-        if with_buffer {
+        let persist = PostLoopPersistContext {
+            matrixone: MatrixOneSettings::from_env(),
+            shared_pool: Some(pool.clone()),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            expected_owner_generation: Some(authority.owner_generation),
+            owner_lease_duration: Some(Duration::from_secs(45)),
+            agent_id: Some("root-agent".to_string()),
+            model_name: Some("test-model".to_string()),
+            user_message: "produce an answer".to_string(),
+            hook_db_writer: None,
+            observer_worker: None,
+            metrics_registry: None,
+            csl_manager: None,
+        };
+        persist
+            .persist_turn_start(&state)
+            .await
+            .expect("persist admission-time root event");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let execution_started_at = if with_buffer {
             state.turn_event_buffer = Some(
                 astra_services::session_journal::TurnEventBuffer::begin_turn(Some(&session_id), 1),
             );
-        }
+            state
+                .turn_event_buffer
+                .as_ref()
+                .map(astra_services::session_journal::TurnEventBuffer::turn_started_at)
+        } else {
+            None
+        };
         let terminal_events = vec![
             json!({
                 "event_type": "text_done",
@@ -6150,6 +6277,37 @@ mod tests {
                 .expect("commit canonical terminal settlement");
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
+        if let Some(execution_started_at) = execution_started_at {
+            let timestamps = sqlx::query(
+                "SELECT event_type, created_at FROM agent_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_type IN ('user_query', 'llm_response')",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(&run_id)
+            .fetch_all(&db)
+            .await
+            .expect("load admission and execution timestamps");
+            let timestamp_for = |event_type: &str| {
+                timestamps
+                    .iter()
+                    .find(|row| row.try_get::<String, _>("event_type").unwrap() == event_type)
+                    .unwrap_or_else(|| panic!("missing {event_type}"))
+                    .try_get::<chrono::NaiveDateTime, _>("created_at")
+                    .expect("decode canonical timestamp")
+            };
+            let user_query_at = timestamp_for("user_query");
+            let response_at = timestamp_for("llm_response");
+            assert!(
+                user_query_at < execution_started_at.naive_utc(),
+                "admission timestamp must precede later buffer creation"
+            );
+            assert!(
+                response_at >= execution_started_at.naive_utc(),
+                "buffer-relative response offset must use the buffer origin"
+            );
+        }
 
         // Exercise the same authoritative resolver used after a lost COMMIT
         // acknowledgement, including its receipt and canonical-evidence checks.
