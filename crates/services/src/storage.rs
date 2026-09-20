@@ -1396,17 +1396,28 @@ pub async fn lock_agent_session_write_fence(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT IGNORE INTO agent_session_lifecycle_fences \
-         (session_id, user_id, created_at, updated_at) \
-         VALUES (?, ?, NOW(6), NOW(6))",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
+    // Session creation/backfill establishes the fence before normal child
+    // writes. Fast-path the common case so every manifest/event write does not
+    // pay an INSERT IGNORE round trip. Keep the insert as a repair path for
+    // lazy-created or externally provisioned sessions, then lock the row again
+    // before inspecting its lifecycle state.
+    let state = match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Missing => {
+            query(
+                "INSERT IGNORE INTO agent_session_lifecycle_fences \
+                 (session_id, user_id, created_at, updated_at) \
+                 VALUES (?, ?, NOW(6), NOW(6))",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+            lock_existing_agent_session_write_fence(tx, session_id, user_id).await?
+        }
+        state => state,
+    };
 
-    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+    match state {
         AgentSessionWriteFenceState::Writable => Ok(()),
         AgentSessionWriteFenceState::PendingDelete
         | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
