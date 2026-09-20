@@ -270,6 +270,12 @@ async fn unconfigured_evaluation_routes_return_errors() {
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "GET {uri}");
     }
 
+    // Reach the unconfigured Evaluation service rather than failing at auth.
+    let app = build_app(
+        AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_auth_service(Arc::new(StubAuthService)),
+    );
+
     let get_uris = [
         "/evaluation/quality/trend",
         "/evaluation/drift",
@@ -298,7 +304,7 @@ async fn unconfigured_evaluation_routes_return_errors() {
         true,
     )];
     let generic_create = oneshot_eval(
-        app.clone(),
+        build_unconfigured_app(),
         "POST",
         "/evaluation/experiments",
         generic_experiment_create_body(),
@@ -421,35 +427,4 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     assert_eq!(json["avg_confidence"], 0.6666666666666666);
     assert_eq!(json["noise_filtered_avg_confidence"], 0.6666666666666666);
     assert_eq!(json["noise_filtered_confidence_samples"], 12);
-}
-
-// Drift/quality/slo routes require a DB and are not backed by Memoria.
-// Verify they return 500 using the unconfigured stub (no TCP attempt).
-#[tokio::test]
-async fn db_dependent_evaluation_routes_return_error_without_db() {
-    let app = build_unconfigured_app();
-
-    let cases = [
-        ("GET", "/evaluation/drift", body::Body::empty(), false),
-        (
-            "GET",
-            "/evaluation/quality/trend?model=gpt-4",
-            body::Body::empty(),
-            false,
-        ),
-        (
-            "GET",
-            "/evaluation/slo/dashboard",
-            body::Body::empty(),
-            false,
-        ),
-    ];
-    for (method, uri, b, json_ct) in cases {
-        let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{method} {uri}"
-        );
-    }
 }
