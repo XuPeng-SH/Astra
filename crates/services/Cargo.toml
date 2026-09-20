@@ -20,6 +20,10 @@ name = "ingestion_capacity_db_it"
 required-features = ["capacity-probes"]
 
 [[test]]
+name = "ingestion_batch_tradeoff_db_it"
+required-features = ["capacity-probes"]
+
+[[test]]
 name = "memoria_live_contract_it"
 required-features = ["external-contract-tests"]
 

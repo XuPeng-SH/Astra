@@ -2330,7 +2330,10 @@ impl EventIngestionWorker {
         let pool_budget = pool_max
             .saturating_sub(MIN_SHARED_POOL_CONNECTION_RESERVE)
             .max(1);
-        let automatic_budget = (pool_max / 4).max(1);
+        // Keep at least half the pool outside ingestion's automatic budget.
+        // Independent session commits need enough parallelism to amortize
+        // sparse-session round trips without coupling their transaction locks.
+        let automatic_budget = (pool_max / 2).max(1);
         config
             .max_concurrent_session_flushes
             .min(pool_budget)
@@ -3509,6 +3512,32 @@ mod tests {
         assert_eq!(ready.pop(), Some(key("owner-b", "session-1")));
         assert_eq!(ready.pop(), Some(key("owner-a", "session-2")));
         assert!(ready.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn ingestion_attempt_budget_preserves_pool_headroom_and_configured_cap() {
+        for (pool_size, expected) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 4), (32, 16), (128, 32)] {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(pool_size)
+                .connect_lazy("mysql://localhost/astra_test")
+                .unwrap();
+            assert_eq!(
+                EventIngestionWorker::session_flush_concurrency_for(
+                    &pool,
+                    &IngestionConfig::default()
+                ),
+                expected,
+                "pool size {pool_size}"
+            );
+            let limited = IngestionConfig {
+                max_concurrent_session_flushes: 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                EventIngestionWorker::session_flush_concurrency_for(&pool, &limited),
+                1
+            );
+        }
     }
 
     #[test]

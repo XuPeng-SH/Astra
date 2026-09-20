@@ -252,6 +252,27 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
+For a short batching tradeoff comparison, run the ignored
+`ingestion_batch_tradeoff_db_it` test against a dedicated disposable database.
+Enable `--features capacity-probes` explicitly; it is not part of the ordinary
+live integration lane.
+It uses the default batch size and flush interval, an eight-connection test
+pool, and 1,000 events with 256-byte content spread across either 1,000 or 10 Sessions,
+with three repeats. It reports first/all database visibility, resolved flushes,
+and concurrent `SELECT 1` latency with sample counts. Use the identical test
+source on both revisions and a fresh database per revision; execute sequentially
+without competing builds or load. Different schema/capture implementations make
+this a full-revision comparison, not a pure COMMIT-cost measurement. Initial
+session fence creation is included; fixture seeding and cleanup are not timed.
+The finite test-profile workload is not a sustained-capacity benchmark, and
+foreground percentiles with few samples must not be treated as an SLO.
+
+```bash
+ASTRA_TEST_DB_IT=1 ASTRA_DATABASE=astra_test_probe_batch \
+cargo test -p astra-services --features capacity-probes \
+  --test ingestion_batch_tradeoff_db_it -- --ignored --nocapture
+```
+
 For a short correctness check, the ignored live test
 `shared_limiter_workers_recover_from_fences_without_blocking_foreground` runs
 two ingestion workers with one shared SQL pool and one two-attempt limiter.

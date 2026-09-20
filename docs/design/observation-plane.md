@@ -281,7 +281,7 @@ The shared ingestion queue is bounded and prioritizes critical audit traffic;
 it does not promise per-owner telemetry fairness or complete trace capture.
 One flush partitions accepted facts by authenticated `(owner, session)` and
 commits each partition in its own transaction. Per worker, active partition
-transactions are capped by the configured ceiling, one quarter of the pool,
+transactions are capped by the configured ceiling, one half of the pool,
 and the pool maximum minus a two-connection reserve. Each term has a minimum
 of one so one-connection test or emergency pools can still make progress; that
 small-pool exception cannot reserve foreground capacity. Event rows, causal
@@ -319,6 +319,11 @@ transaction work, and commit. If an exchange times out, the physical connection
 is detached and closed rather than returned to the idle pool; acknowledged
 commits remain terminal even if later cleanup fails. The limiter and deadline
 do not establish cross-process fairness or database-cluster capacity.
+The client deadline also does not establish a server-side rollback deadline:
+discarding a timed-out connection can restore logical pool capacity before the
+server releases transaction locks. Consequently, unrelated session writes must
+not share a transaction on the assumption that socket cancellation bounds their
+lock coupling. Independent session transactions preserve that isolation boundary.
 
 Enqueue-to-terminal latency uses a fixed-size process-local histogram rather
 than retaining per-event samples. A terminal outcome is commit, durable
