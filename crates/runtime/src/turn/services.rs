@@ -1,9 +1,13 @@
-use crate::data_layer::storage::{insert_trace_events, touch_agent_session_activity};
+use crate::data_layer::storage::{
+    AUXILIARY_EVENT_COLLISION_SOURCE, AgentEventCaptureAttempt, auxiliary_turn_event_payload_hash,
+    classify_agent_event_capture_attempts, insert_trace_events, touch_agent_session_activity,
+};
 use crate::server::run::lifecycle::{
     TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
 };
 use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
+use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 
 #[derive(Clone, Debug, Default)]
@@ -196,6 +200,45 @@ fn record_session_event_delta(
 
 type SessionEventDeltas = std::collections::BTreeMap<(String, String), (i64, Option<String>)>;
 
+#[derive(Debug, Default)]
+pub(crate) struct TraceEventPersistOutcome {
+    pub(crate) session_event_deltas: SessionEventDeltas,
+    pub(crate) event_outcomes: std::collections::BTreeMap<String, DurableCaptureOutcome>,
+}
+
+impl TraceEventPersistOutcome {
+    pub(crate) fn accepts_projection(&self, event_id: &str) -> bool {
+        matches!(
+            self.event_outcomes.get(event_id),
+            Some(DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed)
+        )
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (key, (delta, last_event_id)) in other.session_event_deltas {
+            let entry = self.session_event_deltas.entry(key).or_default();
+            entry.0 += delta;
+            if last_event_id.is_some() {
+                entry.1 = last_event_id;
+            }
+        }
+        for (event_id, incoming) in other.event_outcomes {
+            self.event_outcomes
+                .entry(event_id)
+                .and_modify(|current| {
+                    if !matches!(current, DurableCaptureOutcome::Collision { .. })
+                        && (matches!(&incoming, DurableCaptureOutcome::Collision { .. })
+                            || (*current == DurableCaptureOutcome::Replayed
+                                && incoming == DurableCaptureOutcome::Inserted))
+                    {
+                        *current = incoming.clone();
+                    }
+                })
+                .or_insert(incoming);
+        }
+    }
+}
+
 async fn admit_event_owners_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     owners: impl IntoIterator<Item = (String, String)>,
@@ -357,30 +400,42 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         {
             return Err("core turn events must share one transcript owner/session".to_string());
         }
-        let transcript_items = plan
-            .user_query_event
-            .iter()
-            .chain(plan.llm_response_event.iter())
-            .filter_map(transcript_item)
-            .collect::<Vec<_>>();
         admit_event_owners_in_tx(&mut tx, transcript_owner.clone()).await?;
         let mut deltas =
             std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
+        let mut transcript_items = Vec::new();
+        let mut collision_detected = false;
         if let Some(event) = plan.user_query_event.as_ref() {
-            if insert_core_turn_event(&mut tx, event)
+            let capture = insert_core_turn_event(&mut tx, event)
                 .await
-                .map_err(|error| error.to_string())?
-            {
+                .map_err(|error| error.to_string())?;
+            if capture == DurableCaptureOutcome::Inserted {
                 record_session_event_delta(&mut deltas, event, Some(&event.event_id));
             }
+            if matches!(
+                capture,
+                DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed
+            ) {
+                transcript_items.extend(transcript_item(event));
+            }
+            collision_detected |= matches!(capture, DurableCaptureOutcome::Collision { .. });
         }
+        let mut llm_response_event_id = None;
         if let Some(event) = plan.llm_response_event.as_ref() {
-            if insert_core_turn_event(&mut tx, event)
+            let capture = insert_core_turn_event(&mut tx, event)
                 .await
-                .map_err(|error| error.to_string())?
-            {
+                .map_err(|error| error.to_string())?;
+            if capture == DurableCaptureOutcome::Inserted {
                 record_session_event_delta(&mut deltas, event, Some(&event.event_id));
             }
+            if matches!(
+                capture,
+                DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed
+            ) {
+                transcript_items.extend(transcript_item(event));
+                llm_response_event_id = Some(event.event_id.clone());
+            }
+            collision_detected |= matches!(capture, DurableCaptureOutcome::Collision { .. });
         }
         if let Some((user_id, session_id)) = transcript_owner
             && !transcript_items.is_empty()
@@ -396,13 +451,14 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         }
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
-        if let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
+        if !collision_detected
+            && let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
             && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
         {
             astra_core::agent_error!("turn", "snapshot link update failed: {error}");
         }
         let outcome = TurnCorePersistOutcome {
-            llm_response_event_id: plan.llm_response_event.map(|event| event.event_id),
+            llm_response_event_id,
         };
         Ok(outcome)
     }
@@ -473,8 +529,8 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             .begin()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-        let deltas = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await?;
-        apply_touched_session_deltas_in_tx(&mut tx, &deltas)
+        let outcome = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await?;
+        apply_touched_session_deltas_in_tx(&mut tx, &outcome.session_event_deltas)
             .await
             .map_err(TraceWriteError::Persist)?;
         tx.commit()
@@ -490,9 +546,9 @@ impl DatabaseTraceEventWriter {
     pub(crate) async fn write_many_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         events: Vec<TraceEvent>,
-    ) -> Result<SessionEventDeltas, TraceWriteError> {
+    ) -> Result<TraceEventPersistOutcome, TraceWriteError> {
         if events.is_empty() {
-            return Ok(SessionEventDeltas::new());
+            return Ok(TraceEventPersistOutcome::default());
         }
         admit_event_owners_in_tx(
             tx,
@@ -509,23 +565,35 @@ impl DatabaseTraceEventWriter {
                 .or_default()
                 .push(event);
         }
-        let mut deltas = SessionEventDeltas::new();
+        let mut persist_outcome = TraceEventPersistOutcome::default();
         for ((user_id, session_id), events) in by_session {
-            let (inserted, last_event_id) = insert_trace_events(tx, &events)
+            let outcome = insert_trace_events(tx, &events)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-            if inserted > 0 {
-                deltas.insert(
+            let mut session_outcome = TraceEventPersistOutcome {
+                event_outcomes: outcome.event_outcomes,
+                ..Default::default()
+            };
+            if outcome.inserted > 0 {
+                session_outcome.session_event_deltas.insert(
                     (user_id, session_id),
-                    (i64::try_from(inserted).unwrap_or(i64::MAX), last_event_id),
+                    (
+                        i64::try_from(outcome.inserted).unwrap_or(i64::MAX),
+                        outcome.last_inserted_event_id,
+                    ),
                 );
             }
+            // Event identity is owner-scoped, not session-scoped. A multi-session
+            // write can therefore observe the same ID as an exact replay in its
+            // stored session and as a collision in another session; collision
+            // must dominate before any caller projects derived content.
+            persist_outcome.merge(session_outcome);
         }
         // Session summary updates are deliberately deferred until the owning
         // transaction commits. They use the actual INSERT IGNORE delta, not a
         // COUNT(*) scan that would lock/scan the shared event table under
         // concurrent fanout.
-        Ok(deltas)
+        Ok(persist_outcome)
     }
 }
 
@@ -723,13 +791,19 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                 .and_then(|v| v.get("duration_ms"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
+            let payload_hash = auxiliary_turn_event_payload_hash(
+                &event,
+                meta_tool_name.as_deref(),
+                meta_duration_ms,
+            );
+            let ingestion_write_id = Uuid::new_v4().to_string();
             let metadata_json = event.metadata.as_ref().map(|metadata| metadata.to_string());
             let result = query(
                 "INSERT IGNORE INTO agent_events \
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
                   parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
-                  meta_tool_name, meta_duration_ms, created_at) \
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+                  meta_tool_name, meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             )
             .bind(&event.event_id)
             .bind(&event.session_id)
@@ -740,14 +814,33 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             .bind(&event.content)
             .bind(&event.parent_event_id)
             .bind(&event.causal_chain_id)
-            .bind(metadata_json)
+            .bind(&metadata_json)
             .bind(&event.reasoning_content)
-            .bind(meta_tool_name)
+            .bind(&meta_tool_name)
             .bind(meta_duration_ms)
+            .bind(&payload_hash)
+            .bind(&ingestion_write_id)
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;
-            if result.rows_affected() > 0 {
+            let _reported_rows_affected = result.rows_affected();
+            let outcome = classify_agent_event_capture_attempts(
+                &mut tx,
+                &[AgentEventCaptureAttempt {
+                    user_id: &event.user_id,
+                    session_id: &event.session_id,
+                    event_id: &event.event_id,
+                    payload_hash: &payload_hash,
+                }],
+                &ingestion_write_id,
+                AUXILIARY_EVENT_COLLISION_SOURCE,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing auxiliary event capture outcome".to_string())?;
+            if outcome == DurableCaptureOutcome::Inserted {
                 crate::data_layer::storage::insert_agent_event_edges(
                     &mut *tx,
                     &event.user_id,
@@ -1317,6 +1410,24 @@ mod tests {
         .expect("decode event count");
         assert_eq!(actual_events, 6);
 
+        let collision_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_identity_collisions \
+             WHERE user_id = ? AND identity_kind = 'agent_event'",
+        )
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count hash-fenced writer collisions");
+        assert_eq!(
+            collision_count, 3,
+            "changed core, tool, and auxiliary stable IDs must be classified as collisions"
+        );
+
+        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup event writer collision receipts");
         sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
             .bind(&user_id)
@@ -1329,6 +1440,224 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup event count fixture agent_sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn core_event_collision_does_not_link_snapshot_or_attribute_response_but_replay_repairs()
+    {
+        let shared = setup_live_pool_for_test().await;
+        let pool = shared.get().clone();
+        let settings = MatrixOneSettings::from_env();
+        let suffix = Uuid::new_v4().to_string();
+        let session_id = format!("core-collision-session-{suffix}");
+        let user_id = format!("core-collision-user-{suffix}");
+        let causal_chain_id = format!("core-collision-chain-{suffix}");
+        let response_event_id = format!("core-collision-response-{suffix}");
+        let context_capture_id = Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+             VALUES (?, ?, 'core-collision-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert core collision session");
+        sqlx::query(
+            "INSERT INTO ctx_snapshots \
+             (context_capture_id, user_id, session_id, event_id, context_data) \
+             VALUES (?, ?, ?, ?, CAST('{}' AS JSON))",
+        )
+        .bind(&context_capture_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&response_event_id)
+        .execute(&pool)
+        .await
+        .expect("insert core collision snapshot");
+
+        let original = core_event(
+            &response_event_id,
+            &user_id,
+            &session_id,
+            &causal_chain_id,
+            "llm_response",
+            "original durable response",
+            None,
+        );
+        let writer = DatabaseTurnCoreEventWriter::new(settings).with_pool(shared);
+        writer
+            .persist(TurnCorePersistPlan {
+                user_query_event: None,
+                llm_response_event: Some(original.clone()),
+                snapshot_link_plan: None,
+            })
+            .await
+            .expect("seed original response event");
+        sqlx::query("DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .expect("remove seeded transcript page");
+        sqlx::query(
+            "DELETE FROM session_transcript_items \
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&response_event_id)
+        .execute(&pool)
+        .await
+        .expect("remove seeded response transcript");
+
+        let snapshot_link_plan = SnapshotLinkPlan {
+            context_capture_id: context_capture_id.clone(),
+            user_id: user_id.clone(),
+            llm_request_id: "attempted-request".to_string(),
+            llm_response_id: Some(response_event_id.clone()),
+        };
+        let collision = writer
+            .persist(TurnCorePersistPlan {
+                user_query_event: None,
+                llm_response_event: Some(TurnCoreEventRecord {
+                    content: "conflicting attempted response".to_string(),
+                    ..original.clone()
+                }),
+                snapshot_link_plan: Some(snapshot_link_plan.clone()),
+            })
+            .await
+            .expect("record response collision receipt");
+        assert_eq!(
+            collision.llm_response_event_id, None,
+            "a rejected response payload must not be reported as durably attributed"
+        );
+        let snapshot_after_collision = sqlx::query(
+            "SELECT llm_request_id, llm_response_id FROM ctx_snapshots \
+             WHERE context_capture_id = ? AND user_id = ?",
+        )
+        .bind(&context_capture_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read snapshot after collision");
+        assert_eq!(
+            snapshot_after_collision
+                .try_get::<Option<String>, _>("llm_request_id")
+                .unwrap(),
+            None,
+            "a collision must not apply its snapshot link plan"
+        );
+        assert_eq!(
+            snapshot_after_collision
+                .try_get::<Option<String>, _>("llm_response_id")
+                .unwrap(),
+            None
+        );
+        let transcript_after_collision: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items \
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&response_event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count transcript after collision");
+        assert_eq!(transcript_after_collision, 0);
+
+        let replay = writer
+            .persist(TurnCorePersistPlan {
+                user_query_event: None,
+                llm_response_event: Some(original),
+                snapshot_link_plan: Some(SnapshotLinkPlan {
+                    llm_request_id: "replayed-request".to_string(),
+                    ..snapshot_link_plan
+                }),
+            })
+            .await
+            .expect("repair exact response replay");
+        assert_eq!(
+            replay.llm_response_event_id.as_deref(),
+            Some(response_event_id.as_str())
+        );
+        let repaired_snapshot = sqlx::query(
+            "SELECT llm_request_id, llm_response_id FROM ctx_snapshots \
+             WHERE context_capture_id = ? AND user_id = ?",
+        )
+        .bind(&context_capture_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read replay-repaired snapshot");
+        assert_eq!(
+            repaired_snapshot
+                .try_get::<Option<String>, _>("llm_request_id")
+                .unwrap()
+                .as_deref(),
+            Some("replayed-request")
+        );
+        assert_eq!(
+            repaired_snapshot
+                .try_get::<Option<String>, _>("llm_response_id")
+                .unwrap()
+                .as_deref(),
+            Some(response_event_id.as_str())
+        );
+        let repaired_content: String = sqlx::query_scalar(
+            "SELECT content FROM session_transcript_items \
+             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&response_event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read replay-repaired transcript");
+        assert_eq!(repaired_content, "original durable response");
+        let collision_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_identity_collisions \
+             WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&response_event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count durable core collision receipts");
+        assert_eq!(collision_receipts, 1);
+
+        for statement in [
+            "DELETE FROM transcript_pages WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_events WHERE user_id = ? AND session_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&user_id)
+                .bind(&session_id)
+                .execute(&pool)
+                .await
+                .expect("cleanup core collision fixture");
+        }
+        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup core collision receipt");
+        sqlx::query("DELETE FROM ctx_snapshots WHERE context_capture_id = ? AND user_id = ?")
+            .bind(&context_capture_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup core collision snapshot");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup core collision session");
     }
 
     #[tokio::test]
@@ -1359,34 +1688,27 @@ mod tests {
         }
 
         let writer = DatabaseTraceEventWriter::new(settings).with_pool(shared);
+        let existing_first_event = trace_event(&existing_first, &user_id, &existing_first_session);
         writer
-            .write(trace_event(
-                &existing_first,
-                &user_id,
-                &existing_first_session,
-            ))
+            .write(existing_first_event.clone())
             .await
             .expect("persist existing-first fixture");
         writer
             .write_many(vec![
-                trace_event(&existing_first, &user_id, &existing_first_session),
+                existing_first_event,
                 trace_event(&new_after, &user_id, &existing_first_session),
             ])
             .await
             .expect("persist existing-then-new batch");
-
+        let existing_last_event = trace_event(&existing_last, &user_id, &existing_last_session);
         writer
-            .write(trace_event(
-                &existing_last,
-                &user_id,
-                &existing_last_session,
-            ))
+            .write(existing_last_event.clone())
             .await
             .expect("persist existing-last fixture");
         writer
             .write_many(vec![
                 trace_event(&new_before, &user_id, &existing_last_session),
-                trace_event(&existing_last, &user_id, &existing_last_session),
+                existing_last_event,
             ])
             .await
             .expect("persist new-then-existing batch");

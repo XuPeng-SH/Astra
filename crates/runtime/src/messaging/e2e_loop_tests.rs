@@ -260,6 +260,8 @@ mod tests {
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
+            canonical_trace_time_bounds: Default::default(),
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
         }

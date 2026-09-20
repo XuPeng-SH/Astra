@@ -1262,8 +1262,13 @@ mod tests {
         for (owner, session, event, _, metadata) in &fixtures {
             sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?,?,'active',1,'session',NOW(6),NOW(6),NOW(6))")
                 .bind(session).bind(*owner).execute(&mut *tx).await.unwrap();
-            sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,metadata,created_at) VALUES (?,?,?,'trace_span',?,NOW(6))")
+            sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,metadata,payload_hash,ingestion_write_id,created_at) VALUES (?,?,?,'trace_span',?,?,?,NOW(6))")
                 .bind(event).bind(*owner).bind(session).bind(metadata.to_string())
+                .bind(crate::observation_capture::canonical_observation_payload_hash(
+                    crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                    &json!({"event_id": event, "user_id": owner, "session_id": session, "event_type": "trace_span", "metadata": metadata}),
+                ))
+                .bind(uuid::Uuid::new_v4().to_string())
                 .execute(&mut *tx).await.unwrap();
         }
         tx.commit().await.unwrap();
@@ -1343,8 +1348,13 @@ mod tests {
         let oversized =
             json!({"padding":"x".repeat(MAX_SEMANTIC_JUDGMENT_TRACE_BYTES)}).to_string();
         for (suffix, data) in [("a", None), ("b", Some(normal)), ("c", Some(oversized))] {
-            sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,metadata,created_at) VALUES (?,?,?,'trace_span',?,'2026-01-01 00:00:00.000000')")
+            let hash = crate::observation_capture::canonical_observation_payload_hash(
+                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                &json!({"event_id": format!("{session}-{suffix}"), "user_id": user, "session_id": session, "event_type": "trace_span", "metadata": data.as_deref().map(|value| serde_json::from_str::<serde_json::Value>(value).unwrap()), "created_at": "2026-01-01 00:00:00.000000"}),
+            );
+            sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,metadata,payload_hash,ingestion_write_id,created_at) VALUES (?,?,?,'trace_span',?,?,?,'2026-01-01 00:00:00.000000')")
                 .bind(format!("{session}-{suffix}")).bind(&user).bind(&session).bind(data)
+                .bind(hash).bind(uuid::Uuid::new_v4().to_string())
                 .execute(&mut *tx).await.unwrap();
         }
         let rows = sqlx::query(LOAD_SQL)

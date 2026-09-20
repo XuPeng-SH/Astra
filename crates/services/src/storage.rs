@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-18-v82";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-20-v83";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -536,6 +536,9 @@ fn agent_events_create_sql() -> String {
             meta_tool_name VARCHAR(255) NULL,
             meta_duration_ms INT NULL,
             user_feedback_score BIGINT NULL,
+            payload_hash VARCHAR(80) NOT NULL,
+            ingestion_write_id VARCHAR(64) NOT NULL,
+            server_received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, event_id),
             INDEX idx_agent_events_owner_session_created (user_id, session_id, created_at),
@@ -4236,6 +4239,28 @@ async fn ensure_core_schema_while_leased(
     pool.authority
         .declare("storage", "agent_events", &agent_events_sql);
     query(&agent_events_sql).execute(&pool).await?;
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "agent_events",
+        &["payload_hash", "ingestion_write_id", "server_received_at"],
+    )
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "agent_events",
+        &[
+            "user_id",
+            "event_id",
+            "payload_hash",
+            "ingestion_write_id",
+            "server_received_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
     fail_if_varchar_columns_shorter_than(
         &pool,
         &settings.database,
@@ -4244,6 +4269,8 @@ async fn ensure_core_schema_while_leased(
             ("event_id", AGENT_EVENT_ID_LEN as u64),
             ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
             ("causal_chain_id", AGENT_EVENT_ID_LEN as u64),
+            ("payload_hash", 80),
+            ("ingestion_write_id", 64),
         ],
     )
     .await?;
@@ -6111,7 +6138,7 @@ async fn ensure_core_schema_while_leased(
     // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
     core_schema_create!(pool, "context_manifests",
         "CREATE TABLE IF NOT EXISTS context_manifests (
-            manifest_id VARCHAR(128) PRIMARY KEY,
+            manifest_id VARCHAR(128) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             run_id VARCHAR(128) NULL,
@@ -6133,13 +6160,52 @@ async fn ensure_core_schema_while_leased(
             manifest_json LONGTEXT NOT NULL,
             request_id VARCHAR(128) NULL,
             trace_id VARCHAR(128) NULL,
+            payload_hash VARCHAR(80) NOT NULL,
+            ingestion_write_id VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, manifest_id),
             INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id),
             INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id),
             INDEX idx_ctx_manifest_user_created (user_id, created_at)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "context_manifests",
+        &[
+            "user_id",
+            "manifest_id",
+            "payload_hash",
+            "ingestion_write_id",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "context_manifests",
+        &["payload_hash", "ingestion_write_id"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "context_manifests",
+        &[("payload_hash", 80), ("ingestion_write_id", 64)],
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "context_manifests",
+        &["user_id", "manifest_id"],
+        "ALTER TABLE context_manifests ADD PRIMARY KEY (user_id, manifest_id)",
+    )
     .await?;
     for removed_index in ["idx_ctx_manifest_session_turn", "idx_ctx_manifest_run"] {
         drop_index_if_present(
@@ -6182,6 +6248,7 @@ async fn ensure_core_schema_while_leased(
         pool,
         "context_manifest_items",
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
+            user_id VARCHAR(128) NOT NULL,
             manifest_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             item_order INT NOT NULL,
@@ -6196,10 +6263,10 @@ async fn ensure_core_schema_while_leased(
             render_mode VARCHAR(64) NOT NULL,
             raw_ref VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (manifest_id, item_order),
-            INDEX idx_manifest_items_source (source_table, source_id),
-            INDEX idx_manifest_items_manifest_zone (manifest_id, zone, included),
-            INDEX idx_manifest_items_raw_ref (raw_ref)
+            PRIMARY KEY (user_id, manifest_id, item_order),
+            INDEX idx_manifest_items_source (user_id, source_table, source_id),
+            INDEX idx_manifest_items_manifest_zone (user_id, manifest_id, zone, included),
+            INDEX idx_manifest_items_raw_ref (user_id, raw_ref)
         )",
     )
     .execute(&pool)
@@ -6208,7 +6275,7 @@ async fn ensure_core_schema_while_leased(
         &pool,
         &settings.database,
         "context_manifest_items",
-        &["manifest_id", "item_order"],
+        &["user_id", "manifest_id", "item_order"],
         &["id"],
         &["uq_manifest_item_order"],
     )
@@ -6224,8 +6291,8 @@ async fn ensure_core_schema_while_leased(
         &pool,
         &settings.database,
         "context_manifest_items",
-        &["manifest_id", "item_order"],
-        "ALTER TABLE context_manifest_items ADD PRIMARY KEY (manifest_id, item_order)",
+        &["user_id", "manifest_id", "item_order"],
+        "ALTER TABLE context_manifest_items ADD PRIMARY KEY (user_id, manifest_id, item_order)",
     )
     .await?;
     ensure_index_shape(
@@ -6233,10 +6300,130 @@ async fn ensure_core_schema_while_leased(
         &settings.database,
         "context_manifest_items",
         "idx_manifest_items_manifest_zone",
-        &["manifest_id", "zone", "included"],
-        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_manifest_zone (manifest_id, zone, included)",
+        &["user_id", "manifest_id", "zone", "included"],
+        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_manifest_zone (user_id, manifest_id, zone, included)",
     )
     .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        "idx_manifest_items_source",
+        &["user_id", "source_table", "source_id"],
+        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_source (user_id, source_table, source_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        "idx_manifest_items_raw_ref",
+        &["user_id", "raw_ref"],
+        "ALTER TABLE context_manifest_items ADD INDEX idx_manifest_items_raw_ref (user_id, raw_ref)",
+    )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "observation_identity_collisions",
+        "CREATE TABLE IF NOT EXISTS observation_identity_collisions (
+            user_id VARCHAR(128) NOT NULL,
+            identity_kind VARCHAR(32) NOT NULL,
+            identity_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NULL,
+            stored_payload_hash VARCHAR(80) NOT NULL,
+            attempted_payload_hash VARCHAR(80) NOT NULL,
+            source VARCHAR(64) NOT NULL,
+            collision_count BIGINT UNSIGNED NOT NULL DEFAULT 1,
+            first_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            last_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            expires_at DATETIME(6) NOT NULL,
+            PRIMARY KEY (user_id, identity_kind, identity_id),
+            INDEX idx_observation_collisions_owner_seen (user_id, last_seen_at),
+            INDEX idx_observation_collisions_owner_session_seen (user_id, session_id, last_seen_at),
+            INDEX idx_observation_collisions_expiry (expires_at, user_id, identity_kind, identity_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "observation_identity_collisions",
+        &[
+            "user_id",
+            "identity_kind",
+            "identity_id",
+            "session_id",
+            "stored_payload_hash",
+            "attempted_payload_hash",
+            "source",
+            "collision_count",
+            "first_seen_at",
+            "last_seen_at",
+            "expires_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "observation_identity_collisions",
+        &[
+            "stored_payload_hash",
+            "attempted_payload_hash",
+            "collision_count",
+            "first_seen_at",
+            "last_seen_at",
+            "expires_at",
+            "source",
+        ],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "observation_identity_collisions",
+        &[("stored_payload_hash", 80), ("attempted_payload_hash", 80)],
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "observation_identity_collisions",
+        &["user_id", "identity_kind", "identity_id"],
+        "ALTER TABLE observation_identity_collisions ADD PRIMARY KEY (user_id, identity_kind, identity_id)",
+    )
+    .await?;
+    for (index, expected_columns, ddl) in [
+        (
+            "idx_observation_collisions_owner_seen",
+            &["user_id", "last_seen_at"][..],
+            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_owner_seen (user_id, last_seen_at)",
+        ),
+        (
+            "idx_observation_collisions_owner_session_seen",
+            &["user_id", "session_id", "last_seen_at"][..],
+            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_owner_session_seen (user_id, session_id, last_seen_at)",
+        ),
+        (
+            "idx_observation_collisions_expiry",
+            &["expires_at", "user_id", "identity_kind", "identity_id"][..],
+            "ALTER TABLE observation_identity_collisions ADD INDEX idx_observation_collisions_expiry (expires_at, user_id, identity_kind, identity_id)",
+        ),
+    ] {
+        ensure_index_shape(
+            &pool,
+            &settings.database,
+            "observation_identity_collisions",
+            index,
+            expected_columns,
+            ddl,
+        )
+        .await?;
+    }
 
     core_schema_create!(
         pool,

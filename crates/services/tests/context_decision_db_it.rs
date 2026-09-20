@@ -14,6 +14,13 @@ use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
 
+fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
+    astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &payload,
+    )
+}
+
 async fn seed_session_event(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
@@ -32,12 +39,22 @@ async fn seed_session_event(
 
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-         VALUES (?, ?, ?, 'ctx_decision_it', '{}', '')",
+         (event_id, session_id, user_id, event_type, content, causal_chain_id, \
+          payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'ctx_decision_it', '{}', '', ?, ?)",
     )
     .bind(event_id)
     .bind(session_id)
     .bind(user_id)
+    .bind(agent_event_fixture_payload_hash(json!({
+        "event_id": event_id,
+        "session_id": session_id,
+        "user_id": user_id,
+        "event_type": "ctx_decision_it",
+        "content": "{}",
+        "causal_chain_id": "",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(pool)
     .await
     .expect("insert event");

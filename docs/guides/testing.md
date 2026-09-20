@@ -250,6 +250,108 @@ not claim deployment-scale throughput; use the Work pressure and multi-server
 capacity probes for many readers, multiple server processes, provider quotas,
 and latency measurements.
 
+### Sustained ingestion and shared-pool pressure
+
+For a short batching tradeoff comparison, run the ignored
+`ingestion_batch_tradeoff_db_it` test against a dedicated disposable database.
+Enable `--features capacity-probes` explicitly; it is not part of the ordinary
+live integration lane.
+It uses the default batch size and flush interval, an eight-connection test
+pool, and 1,000 events with 256-byte content spread across either 1,000 or 10 Sessions,
+with three repeats. It reports first/all database visibility, resolved flushes,
+and concurrent `SELECT 1` latency with sample counts. Use the identical test
+source on both revisions and a fresh database per revision; execute sequentially
+without competing builds or load. Different schema/capture implementations make
+this a full-revision comparison, not a pure COMMIT-cost measurement. Initial
+session fence creation is included; fixture seeding and cleanup are not timed.
+The finite test-profile workload is not a sustained-capacity benchmark, and
+foreground percentiles with few samples must not be treated as an SLO.
+
+```bash
+ASTRA_TEST_DB_IT=1 ASTRA_DATABASE=astra_test_probe_batch \
+cargo test -p astra-services --features capacity-probes \
+  --test ingestion_batch_tradeoff_db_it -- --ignored --nocapture
+```
+
+For a short correctness check, the ignored live test
+`shared_limiter_workers_recover_from_fences_without_blocking_foreground` runs
+two ingestion workers with one shared SQL pool and one two-attempt limiter.
+It verifies that held Session fences time out without starving the other
+worker or unrelated foreground reads/writes, that connections are recovered,
+and that releasing the fences drains each delivery exactly once. Run it with
+`ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test event_ingestion_db_it
+shared_limiter_workers_recover_from_fences_without_blocking_foreground -- --ignored --exact`.
+This is same-process fault isolation, not cluster-wide admission or throughput.
+
+The ignored `ingestion_process::cross_process_identity_and_delete_fence` test
+in the same binary starts two real child processes with independent SQL pools.
+It holds a durable Session fence while an unrelated Session progresses, then
+requires an identical event submitted by both processes to produce one insert
+and one replay with one session increment and one parent edge. A subsequent
+write after canonical Session deletion must be rejected without resurrection.
+The parent uses bounded IPC waits and kills/reaps its children on assertion
+failure. This proves durable cross-process correctness, not cluster throughput.
+Select this parent test explicitly; `ingestion_process::child` is only its
+internal subprocess entrypoint. Credentials remain in environment/local `.env`.
+
+The optional ingestion probe exercises the production ingestion queue and a
+shared SQL pool with 100 synthetic owners and 1,000 Sessions. It is deliberately
+separate from ordinary integration CI. Use Python 3.11 or newer, the pinned Rust
+toolchain, and a dedicated disposable `astra_test_probe_*` database. Configure
+database access through the existing environment or local `.env`; never put
+credentials in scripts, command arguments, or published evidence.
+
+```bash
+# Offline harness and report checks; no database required.
+cargo test -p astra-services --features capacity-probes --test ingestion_capacity_db_it
+python3 -m unittest discover -s scripts/load -p test_ingestion_capacity_report.py
+
+# Real database: 60-second warmup, then 600 seconds of measured arrivals.
+python3 scripts/load/ingestion_capacity_probe.py \
+  --database astra_test_probe_capacity --rate 500 --distribution hot
+
+# Use the exact evidence path printed by the preceding command.
+python3 scripts/load/ingestion_capacity_report.py \
+  target/expriment/ingestion-capacity/REPLACE_WITH_RESULT.json
+```
+
+`uniform` spreads arrivals over all Sessions; `hot` sends half to one owner's
+ten Sessions. Events mix 20% critical and 80% telemetry priority, with complete
+serialized envelopes of 1 KiB, 16 KiB, and 128 KiB, targeting a seeded
+80%/15%/5% distribution. Independent
+foreground reads and writes share the pool, with a baseline measured before
+ingestion starts. Default pool size is 32 and foreground rate is 20 operations
+per second. These are declared probe parameters, not product-wide SLOs.
+
+The generator uses absolute arrival deadlines and reports missed arrivals; it
+does not hide overload by slowing the declared arrival rate. Per-delivery
+observations distinguish commit, replay, rejection, and uncertain outcomes,
+including cancellation during pool or transaction waits. Reports reconcile
+durable identities, payload hashes, per-session counts, and parent edges.
+Observer capacity is bounded; unavailable observation invalidates measurement
+completeness without suppressing offered work.
+
+Evidence is written under ignored `target/expriment/ingestion-capacity/`. It
+includes source and binary fingerprints, compiler profile, parameters, bounded
+timing histograms, backlog samples, and structured reconciliation results—not
+raw database logs or credentials. Leave compiled sources unchanged and avoid
+competing builds or probes during a run. The current launcher uses the Cargo
+test profile; inspect the recorded compiler profile before comparing results
+with optimized production builds. Percentiles are quantized upper bounds, not
+exact latency measurements.
+
+The report exits nonzero for malformed or ineligible evidence. It requires at
+least 60 seconds of warmup and 600 measured seconds, arrival misses no greater
+than 0.1%, complete accounting, no rejection or unresolved/late outcome, progress
+for every owner, bounded backlog and age, and preserved foreground latency.
+Sampling must cover the measured window with gaps no greater than 2.5 seconds.
+A short smoke run cannot establish sustained capacity. Repeat the highest
+passing rate and test both distributions before publishing a capacity claim.
+Single-process ingestion evidence does **not** establish concurrent agent-turn
+capacity, multi-server fairness, or fault recovery; those require separate
+scenarios. Completed runs clean up only their uniquely prefixed fixture owners;
+interrupted runs may leave fixture data in the designated disposable database.
+
 ## Recommended Workflow
 
 ### Optional thinking-protocol compatibility checks

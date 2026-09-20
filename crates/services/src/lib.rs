@@ -34,6 +34,7 @@ pub mod mcp_registry;
 pub mod model_request_context;
 pub mod models;
 pub mod multi_agent;
+pub mod observation_capture;
 pub mod pagination;
 pub mod personal_skills;
 pub mod prompt_delta;

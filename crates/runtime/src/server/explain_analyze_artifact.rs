@@ -198,25 +198,6 @@ fn artifact_id_from_handle(handle: &str) -> Option<&str> {
     .then_some(id)
 }
 
-#[cfg(test)]
-pub(crate) async fn snapshot_missing(
-    pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-) -> Result<bool, String> {
-    let Some(pool) = pool else { return Ok(false) };
-    load_snapshot_artifact(
-        pool,
-        user_id,
-        session_id,
-        &artifact_id(run_id),
-        ArtifactFetchPurpose::Discovery,
-    )
-    .await
-    .map(|artifact| artifact.is_none())
-}
-
 struct CapturedExplainEvents {
     events: Vec<Value>,
     facts: Vec<astra_turn_types::ExplainAnalyzeEventV1>,

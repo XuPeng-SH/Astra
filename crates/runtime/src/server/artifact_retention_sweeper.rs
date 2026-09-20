@@ -254,25 +254,38 @@ async fn record_artifact_retention_backlog_warning(
     limit: u32,
 ) -> Result<(), sqlx::Error> {
     let event_id = Uuid::new_v4().to_string();
+    let content =
+        format!("artifact retention sweep reached scan limit: scanned={scanned}, limit={limit}");
+    let metadata = serde_json::json!({
+        "scanned": scanned,
+        "limit": limit,
+        "action": "reschedule_and_alert",
+    });
+    let payload_hash = astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &serde_json::json!({
+            "event_id": event_id,
+            "session_id": "system",
+            "user_id": "system",
+            "event_type": "artifact_retention_backlog_overflow",
+            "content": content,
+            "metadata": metadata,
+        }),
+    );
+    let ingestion_write_id = Uuid::new_v4().to_string();
     let mut tx = pool.get().begin().await?;
     astra_services::storage::admit_session_event_write(&mut tx, "system", "system", true).await?;
     let insert_result = sqlx::query(
         "INSERT INTO agent_events
-         (event_id, session_id, user_id, event_type, content, metadata, created_at)
-         VALUES (?, 'system', 'system', 'artifact_retention_backlog_overflow', ?, ?, NOW(6))",
+         (event_id, session_id, user_id, event_type, content, metadata,
+          payload_hash, ingestion_write_id, created_at)
+         VALUES (?, 'system', 'system', 'artifact_retention_backlog_overflow', ?, ?, ?, ?, NOW(6))",
     )
     .bind(&event_id)
-    .bind(format!(
-        "artifact retention sweep reached scan limit: scanned={scanned}, limit={limit}"
-    ))
-    .bind(
-        serde_json::json!({
-            "scanned": scanned,
-            "limit": limit,
-            "action": "reschedule_and_alert",
-        })
-        .to_string(),
-    )
+    .bind(content)
+    .bind(metadata.to_string())
+    .bind(payload_hash)
+    .bind(ingestion_write_id)
     .execute(&mut *tx)
     .await?;
     let inserted_events = match i64::try_from(insert_result.rows_affected()) {

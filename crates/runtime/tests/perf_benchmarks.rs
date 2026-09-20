@@ -1,13 +1,14 @@
 use std::{sync::Arc, time::Instant};
 
 use astra_core::SharedPool;
+use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::{
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     DatabaseRunStateStore, DatabaseStateProjectionStore,
 };
 use serde_json::json;
-use sqlx::{QueryBuilder, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
@@ -642,38 +643,40 @@ async fn perf_benchmark_7_latest_manifest_reads_are_owner_scoped() {
     let manifest_prefix = id("perf-manifest");
     insert_session(&pool, &user_id, &session_id).await;
 
-    let mut insert = QueryBuilder::<sqlx::MySql>::new(
-        "INSERT INTO context_manifests
-         (manifest_id, user_id, session_id, run_id, turn_id, model_provider, model_name,
-          context_window_tokens, max_output_tokens, total_estimated_tokens, policy_version,
-          tokenizer_id, budget_template_id, turn_intent, reason, dropped_count, manifest_json,
-          created_at) ",
-    );
-    insert.push_values(0..MANIFESTS, |mut row, index| {
-        row.push_bind(format!("{manifest_prefix}-{index:04}"))
-            .push_bind(&user_id)
-            .push_bind(&session_id)
-            .push_bind(&run_id)
-            .push_bind(format!("turn-{index}"))
-            .push_bind("mock")
-            .push_bind("perf-read-llm")
-            .push_bind(8_000_i64)
-            .push_bind(700_i64)
-            .push_bind(1_200_i64)
-            .push_bind("context_manifest_v1")
-            .push_bind("estimated_v1")
-            .push_bind("budget_v1_8k")
-            .push_bind("normal")
-            .push_bind("normal_turn")
-            .push_bind(0_i64)
-            .push_bind("{}")
-            .push("NOW(6)");
-    });
-    insert
-        .build()
-        .execute(pool.get())
-        .await
-        .expect("PERF-7 manifest seed must succeed");
+    // Seed through the capture owner so hashes, write markers, and session
+    // admission stay aligned with production. Setup is outside the read timer.
+    let store = DatabaseContextManifestStore::new(pool.clone());
+    for index in 0..MANIFESTS {
+        let outcome = store
+            .save_manifest(
+                ContextManifestWrite {
+                    manifest_id: format!("{manifest_prefix}-{index:04}"),
+                    user_id: user_id.clone(),
+                    session_id: session_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    turn_id: format!("turn-{index}"),
+                    model_provider: "mock".to_string(),
+                    model_name: "perf-read-llm".to_string(),
+                    context_window_tokens: 8_000,
+                    max_output_tokens: 700,
+                    total_estimated_tokens: 1_200,
+                    policy_version: "context_manifest_v1".to_string(),
+                    tokenizer_id: Some("estimated_v1".to_string()),
+                    budget_template_id: Some("budget_v1_8k".to_string()),
+                    turn_intent: Some("normal".to_string()),
+                    reason: "normal_turn".to_string(),
+                    manifest_json: json!({}),
+                },
+                vec![],
+            )
+            .await
+            .expect("PERF-7 manifest seed must succeed");
+        assert_eq!(
+            outcome,
+            DurableCaptureOutcome::Inserted,
+            "PERF-7 seed must be a fresh capture"
+        );
+    }
 
     let started = Instant::now();
     let preferred = sqlx::query(

@@ -5,6 +5,13 @@ use axum::http::StatusCode;
 use serial_test::serial;
 use uuid::Uuid;
 
+fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
+    astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &payload,
+    )
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -32,12 +39,22 @@ async fn database_data_versioning_rejects_corrupt_required_fields() {
 
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, created_at) \
-         VALUES (?, ?, ?, 'assistant_message', 'hello', '2026-01-01 00:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, payload_hash, \
+          ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'assistant_message', 'hello', ?, ?, '2026-01-01 00:00:00.000000')",
     )
     .bind(&event_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "assistant_message",
+        "content": "hello",
+        "created_at": "2026-01-01 00:00:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert agent event");

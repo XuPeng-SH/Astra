@@ -1056,6 +1056,9 @@ async fn phase1_run_durability_schema_contract() {
         "tool_call_id",
         "parent_agent_id",
         "trace_kind",
+        "payload_hash",
+        "ingestion_write_id",
+        "server_received_at",
     ] {
         assert!(
             agent_events.iter().any(|column| column == expected),
@@ -1067,6 +1070,13 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "event_id"],
         "agent_events identity must be owner-bound so cross-tenant event ids do not collide"
     );
+    for column in ["payload_hash", "ingestion_write_id", "server_received_at"] {
+        assert_eq!(
+            column_nullable(&pool, &schema, "agent_events", column).await,
+            Some(false),
+            "agent_events.{column} must be required for identity classification"
+        );
+    }
     for column in ["event_id", "parent_event_id", "causal_chain_id"] {
         assert_eq!(
             column_character_maximum_length(&pool, &schema, "agent_events", column).await,
@@ -2415,12 +2425,19 @@ async fn phase3_context_manifest_schema_contract() {
         "budget_template_id",
         "reason",
         "dropped_count",
+        "payload_hash",
+        "ingestion_write_id",
     ] {
         assert!(
             manifests.iter().any(|column| column == expected),
             "context_manifests missing {expected}"
         );
     }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "context_manifests").await,
+        ["user_id", "manifest_id"],
+        "manifest identity must be tenant-scoped"
+    );
     assert_eq!(
         index_columns(
             &pool,
@@ -2459,15 +2476,22 @@ async fn phase3_context_manifest_schema_contract() {
     }
 
     let items = column_names(&pool, &schema, "context_manifest_items").await;
-    for expected in ["render_mode", "included", "raw_ref", "budget_tokens"] {
+    for expected in [
+        "user_id",
+        "render_mode",
+        "included",
+        "raw_ref",
+        "budget_tokens",
+    ] {
         assert!(
             items.iter().any(|column| column == expected),
             "context_manifest_items missing {expected}"
         );
     }
-    assert!(
-        !items.iter().any(|column| column == "user_id"),
-        "context_manifest_items must inherit owner scope through context_manifests, not store a second owner column"
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "context_manifest_items").await,
+        ["user_id", "manifest_id", "item_order"],
+        "manifest item identity must be tenant-scoped"
     );
     assert_eq!(
         index_columns(
@@ -2477,8 +2501,59 @@ async fn phase3_context_manifest_schema_contract() {
             "idx_manifest_items_manifest_zone"
         )
         .await,
-        ["manifest_id", "zone", "included"],
-        "manifest items must be indexed by their parent manifest boundary, not bare session"
+        ["user_id", "manifest_id", "zone", "included"],
+        "manifest items must be indexed by their tenant-scoped parent boundary"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifest_items",
+            "idx_manifest_items_source"
+        )
+        .await,
+        ["user_id", "source_table", "source_id"]
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifest_items",
+            "idx_manifest_items_raw_ref"
+        )
+        .await,
+        ["user_id", "raw_ref"]
+    );
+
+    let collisions = column_names(&pool, &schema, "observation_identity_collisions").await;
+    for expected in [
+        "user_id",
+        "identity_kind",
+        "identity_id",
+        "stored_payload_hash",
+        "attempted_payload_hash",
+        "collision_count",
+        "expires_at",
+    ] {
+        assert!(
+            collisions.iter().any(|column| column == expected),
+            "observation_identity_collisions missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "observation_identity_collisions").await,
+        ["user_id", "identity_kind", "identity_id"],
+        "collision receipts must have one bounded row per tenant-scoped identity"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "observation_identity_collisions",
+            "idx_observation_collisions_expiry"
+        )
+        .await,
+        ["expires_at", "user_id", "identity_kind", "identity_id"]
     );
     assert!(
         index_columns(

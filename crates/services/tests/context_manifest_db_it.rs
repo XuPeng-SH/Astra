@@ -15,8 +15,176 @@ use uuid::Uuid;
 
 mod common;
 
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn manifest_replay_and_collision_preserve_original_and_tenant_identity() {
+    use astra_services::observation_capture::DurableCaptureOutcome;
+    let pool = common::setup_pool().await;
+    let user = id("capture-user");
+    let other_user = id("capture-other-user");
+    let session = id("capture-session");
+    let other_session = id("capture-other-session");
+    let manifest_id = id("shared-manifest");
+    insert_session(&pool, &user, &session).await;
+    insert_session(&pool, &other_user, &other_session).await;
+    let store = DatabaseContextManifestStore::new(pool.clone());
+    let mut original = manifest(&manifest_id, &user, &session, None);
+    original.reason = "unknown-reason-for-test".into();
+    let items = vec![item(&session, 1), item(&session, 0)];
+    assert_eq!(
+        store
+            .save_manifest(original.clone(), items.clone())
+            .await
+            .unwrap(),
+        DurableCaptureOutcome::Inserted
+    );
+    let mut reordered = items.clone();
+    reordered.reverse();
+    assert_eq!(
+        store
+            .save_manifest(original.clone(), reordered)
+            .await
+            .unwrap(),
+        DurableCaptureOutcome::Replayed
+    );
+    let mut changed = items.clone();
+    changed[0].source_id = "different-source".into();
+    assert!(matches!(
+        store.save_manifest(original, changed).await.unwrap(),
+        DurableCaptureOutcome::Collision { .. }
+    ));
+    assert_eq!(
+        store
+            .save_manifest(
+                manifest(&manifest_id, &other_user, &other_session, None),
+                vec![item(&other_session, 0)]
+            )
+            .await
+            .unwrap(),
+        DurableCaptureOutcome::Inserted
+    );
+
+    let original_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ?",
+    )
+    .bind(&user)
+    .bind(&manifest_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(original_items, 2);
+    let changed_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ? AND source_id = 'different-source'")
+        .bind(&user).bind(&manifest_id).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(changed_items, 0);
+    let other_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ?",
+    )
+    .bind(&other_user)
+    .bind(&manifest_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(other_items, 1);
+    let diagnostics: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'manifest.reason_unknown'")
+        .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(
+        diagnostics, 1,
+        "replay and collision must not repeat derived diagnostics"
+    );
+    let collisions: u64 = sqlx::query_scalar("SELECT collision_count FROM observation_identity_collisions WHERE user_id = ? AND identity_kind = 'context_manifest' AND identity_id = ?")
+        .bind(&user).bind(&manifest_id).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(collisions, 1);
+    use astra_services::auth::session::{DatabaseSessionService, SessionService};
+    DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone())
+        .delete_session(session.clone(), user.clone())
+        .await
+        .expect("delete only the first owner's session");
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ?",
+    )
+    .bind(&other_user)
+    .bind(&manifest_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "deleting equal manifest ID must preserve the other tenant"
+    );
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_items WHERE user_id = ? AND manifest_id = ?",
+    )
+    .bind(&user)
+    .bind(&manifest_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(deleted, 0);
+}
+
 fn id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn cross_session_artifact_references_replay_once_with_owner_isolation() {
+    use astra_services::observation_capture::DurableCaptureOutcome;
+    let pool = common::setup_pool().await;
+    let owner = id("ref-owner");
+    let foreign = id("ref-foreign");
+    let target_session = id("ref-target");
+    let source_session = id("ref-source");
+    let artifact_id = id("ref-artifact");
+    insert_session(&pool, &owner, &target_session).await;
+    insert_session(&pool, &owner, &source_session).await;
+    insert_session(&pool, &foreign, &source_session).await;
+    for user in [&owner, &foreign] {
+        sqlx::query(
+            "INSERT INTO session_artifacts
+             (user_id, session_id, artifact_id, artifact_kind, content_json,
+              referenced_by_manifest_count) VALUES (?, ?, ?, 'test', '{}', 0)",
+        )
+        .bind(user)
+        .bind(&source_session)
+        .bind(&artifact_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+    let header = manifest(&id("cross-ref"), &owner, &target_session, None);
+    let mut reference = item(&source_session, 0);
+    reference.source_table = "session_artifacts".into();
+    reference.source_id = artifact_id.clone();
+    let store = DatabaseContextManifestStore::new(pool.clone());
+    assert_eq!(
+        store
+            .save_manifest(header.clone(), vec![reference.clone()])
+            .await
+            .unwrap(),
+        DurableCaptureOutcome::Inserted
+    );
+    assert_eq!(
+        store.save_manifest(header, vec![reference]).await.unwrap(),
+        DurableCaptureOutcome::Replayed
+    );
+    for (user, expected) in [(&owner, 1_i64), (&foreign, 0_i64)] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT referenced_by_manifest_count FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user)
+        .bind(&source_session)
+        .bind(&artifact_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, expected,
+            "only the manifest owner's source artifact is referenced once"
+        );
+    }
 }
 
 async fn insert_session(pool: &SharedPool, user_id: &str, session_id: &str) {
@@ -115,9 +283,9 @@ async fn later_item_batch_failure_rolls_back_manifest_and_all_items() {
     let mut items = (0..129)
         .map(|order| item(&session_id, order))
         .collect::<Vec<_>>();
-    // Item 128 is in the second SQL batch and conflicts with item 0 from the
-    // already-successful first batch.
-    items[128].item_order = 0;
+    // After sorting, the duplicate stays at positions 127/128 across the
+    // SQL batch boundary, so batch two fails after batch one succeeded.
+    items[128].item_order = 127;
 
     let store = DatabaseContextManifestStore::new(pool.clone());
     let control_id = id("manifest-multibatch-control");
@@ -200,13 +368,26 @@ async fn artifact_reference_updates_are_exact_and_roll_back_after_later_update_f
     }
     control_items[2].source_table = "session_artifacts".to_string();
     control_items[2].source_id = unaffected_artifact_id.clone();
+    let control_manifest = manifest(&control_id, &user_id, &session_id, None);
     DatabaseContextManifestStore::new(pool.clone())
-        .save_manifest(
-            manifest(&control_id, &user_id, &session_id, None),
-            control_items,
-        )
+        .save_manifest(control_manifest.clone(), control_items.clone())
         .await
         .expect("successful artifact references must commit");
+    assert_eq!(
+        DatabaseContextManifestStore::new(pool.clone())
+            .save_manifest(control_manifest.clone(), control_items.clone())
+            .await
+            .expect("retry after a lost commit acknowledgement must replay"),
+        astra_services::observation_capture::DurableCaptureOutcome::Replayed,
+    );
+    control_items[0].source_id = unaffected_artifact_id.clone();
+    assert!(matches!(
+        DatabaseContextManifestStore::new(pool.clone())
+            .save_manifest(control_manifest, control_items)
+            .await
+            .expect("identity conflict must be a typed outcome"),
+        astra_services::observation_capture::DurableCaptureOutcome::Collision { .. }
+    ));
     for (artifact_id, expected) in [
         (&first_artifact_id, 9_i64),
         (&unaffected_artifact_id, 12_i64),

@@ -279,6 +279,64 @@ that ID; semantic readers reconcile equivalent observation identities, while
 generic trace readers must not assume annotation-changing retries are unique.
 The shared ingestion queue is bounded and prioritizes critical audit traffic;
 it does not promise per-owner telemetry fairness or complete trace capture.
+One flush partitions accepted facts by authenticated `(owner, session)` and
+commits each partition in its own transaction. Per worker, active partition
+transactions are capped by the configured ceiling, one half of the pool,
+and the pool maximum minus a two-connection reserve. Each term has a minimum
+of one so one-connection test or emergency pools can still make progress; that
+small-pool exception cannot reserve foreground capacity. Event rows, causal
+edges, the exact session counter delta, inserted session-end effects, and
+config-version projections share that partition transaction. A blocked or
+retryable partition therefore cannot retain locks for, roll back, or replay an
+unrelated session. Successful and permanently rejected partitions leave the
+retry set immediately; only unresolved partitions retain their already-
+accounted queue payloads. This per-worker cap limits connection amplification
+but is not a shared-pool reservation or a fairness guarantee across workers or
+server processes.
+
+The worker coordinator keeps database attempts and retry timers outside its
+receive path. Accepted facts enter a per-owner/per-session FIFO; only one
+attempt for that key may be active, and a failed head remains ahead of later
+facts for the same session. Runnable owners rotate first, then their runnable
+sessions, so one owner with many hot sessions cannot consume every dispatch
+turn. `batch_size` bounds one session transaction. A sparse session becomes
+runnable at an absolute deadline established by its oldest buffered fact;
+later arrivals do not reset that deadline. Retry backoff consumes neither a
+database slot nor the receive loop. This is process-local dispatch fairness,
+not equal SQL execution time or cluster-wide fairness.
+
+Every accepted fact owns one admission lease from before channel entry through
+queued, retrying, and in-flight states. Global, per-owner, and per-session
+limits apply to both event count and compact-JSON bytes; one blocked session or
+owner therefore cannot consume all process-local headroom. A maximum event size
+rejects oversized payloads before acceptance. Lease release is tied to terminal
+drop rather than scheduler bookkeeping, so cancellation and closed-channel
+paths return capacity as well.
+
+Database attempts use a process-local limiter that can be shared by all workers
+over one pool. A whole-attempt client deadline includes connection acquisition,
+transaction work, and commit. If an exchange times out, the physical connection
+is detached and closed rather than returned to the idle pool; acknowledged
+commits remain terminal even if later cleanup fails. The limiter and deadline
+do not establish cross-process fairness or database-cluster capacity.
+The client deadline also does not establish a server-side rollback deadline:
+discarding a timed-out connection can restore logical pool capacity before the
+server releases transaction locks. Consequently, unrelated session writes must
+not share a transaction on the assumption that socket cancellation bounds their
+lock coupling. Independent session transactions preserve that isolation boundary.
+
+Enqueue-to-terminal latency uses a fixed-size process-local histogram rather
+than retaining per-event samples. A terminal outcome is commit, durable
+admission rejection, or explicit shutdown abandonment; retryable attempts keep
+their original enqueue timestamp. Shutdown seals the receiver before draining,
+so deferred sends that never entered the channel remain pre-acceptance drops.
+If the runtime deadline expires, it aborts and awaits the worker instead of
+detaching a task that may still own pool resources. Delivery accounting belongs
+to the shared admission lease: channel acceptance precedes dispatch, and a
+known commit or rejection settles the lease before control returns to the
+scheduler. Explicit shutdown failure or final-owner drop counts an accepted,
+unsettled delivery as unresolved exactly once across retry clones. Residency
+snapshots are not terminal evidence and never add to that count.
 
 Request-classification observations use the existing `trace_span` envelope
 with name `semantic_judgment` and a bounded typed JSON string in
@@ -336,6 +394,50 @@ metadata
 ```
 
 `event_id` must be stable and collision-resistant. If the same event id arrives with different payload hash, ingestion must treat it as a collision, not idempotent success.
+
+Durable capture distinguishes `Inserted`, `Replayed`, and `Collision` within the
+owning database transaction. Only `Inserted` may apply event counters, parent
+edges, terminal-session effects, configuration projections, or manifest artifact
+references. An exact retry after a lost commit acknowledgement therefore does
+not repeat those effects. Each database attempt uses a fresh write marker;
+retries must not reuse a marker from an attempt whose commit outcome is unknown.
+
+Capture outcomes remain available to downstream projections. A collision must
+not create a transcript row or snapshot link from the rejected payload, nor be
+reported as a successfully captured response. Exact replay may repair a missing
+projection from the accepted payload under the existing transaction and session
+fences. Valid sibling events in the same batch continue to be captured.
+
+Atomic run-terminal settlement is stricter than ordinary batch capture: every
+canonical event in the settlement (including user intents, rounds, and tool
+events) must be inserted or exactly replayed. Any collision rolls back the
+settlement before terminal status, usage, or transcript changes can commit.
+Initial commit and lost-acknowledgement recovery therefore require the same
+complete evidence; recovery must not relax hash verification to accept a subset.
+
+Manifest identity and item identity are tenant-scoped: `(user_id, manifest_id)`
+and `(user_id, manifest_id, item_order)`. The manifest digest covers its header
+and the complete item set ordered by `item_order`. Every item lookup, join, and
+delete must carry the owner. Unknown-reason diagnostics commit with the first
+manifest capture and are not repeated by replay or collision.
+
+Collision receipts retain identities and hashes, never observation payloads.
+They aggregate into one row per `(user_id, identity_kind, identity_id)`, with a
+count and latest conflicting hash. Their fixed seven-day expiry is not extended
+by repeated conflicts. The bounded runtime-maintenance sweep removes expired
+receipts, and explicit session deletion removes its owner-scoped receipts.
+
+The v83 core schema requires capture hashes and attempt markers on event and
+manifest writes. Deployments using an earlier table shape require a fresh-schema
+cutover; startup rejects missing capture columns rather than assigning empty
+hashes to old rows. Hashes include producer occurrence timestamps. Root
+execution freezes the turn-start timestamp before its first durable write, then
+freezes the terminal offset after execution. Delayed retries and
+lost-acknowledgement resolution reuse both bounds, not a later event-buffer
+start or the current clock. Content and lineage still undergo full hash
+comparison. Configuration
+version pushes are the exception: their envelope has a generated delivery time,
+so that field is hashed as JSON null and the first stored delivery time is kept.
 
 ## Event ingestion unhappy paths
 

@@ -12806,6 +12806,8 @@ impl AgenticRunLifecycleService {
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
+            canonical_trace_time_bounds: Default::default(),
             harness,
         }
     }
@@ -14568,6 +14570,7 @@ impl AgenticRunLifecycleService {
                 let mut core_trace_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
+                let mut terminal_assistant_source_event_id = None;
                 let mut canonical_context_cursor = None;
 
                 // Clean up channels for this run.
@@ -14702,7 +14705,8 @@ impl AgenticRunLifecycleService {
                         .await
                     {
                         Ok(Some(commit)) => {
-                            let _ = commit;
+                            terminal_assistant_source_event_id =
+                                commit.terminal_assistant_source_event_id;
                             core_trace_result = Ok(());
                             durable_status_committed = true;
                             owner_terminal_committed = true;
@@ -14719,9 +14723,13 @@ impl AgenticRunLifecycleService {
                             }
                         }
                         Ok(None) => {
-                            core_trace_result = persist_ctx
+                            let persistence = persist_ctx
                                 .persist_core_and_trace_in_transaction(&loop_state)
                                 .await;
+                            if let Ok(source_event_id) = &persistence {
+                                terminal_assistant_source_event_id = source_event_id.clone();
+                            }
+                            core_trace_result = persistence.map(|_| ());
                             if core_trace_result.is_ok() {
                                 match run_engine
                                     .commit_terminal_status_with_events_if_current_owner(
@@ -14849,6 +14857,7 @@ impl AgenticRunLifecycleService {
                 }
 
                 if let Some(status) = preexisting_terminal_status {
+                    terminal_assistant_source_event_id = None;
                     core_trace_result = persist_ctx
                         .persist_trace_after_authoritative_terminal(&loop_state, status.as_str())
                         .await;
@@ -15109,6 +15118,7 @@ impl AgenticRunLifecycleService {
                     if let Err(e) = persist_ctx
                         .materialize_run_transcript_evidence(
                             &loop_state,
+                            terminal_assistant_source_event_id.as_deref(),
                             canonical_context_cursor.as_ref(),
                         )
                         .await
@@ -17877,6 +17887,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut core_trace_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
+                let mut terminal_assistant_source_event_id = None;
                 let mut canonical_context_cursor = None;
                 let mut user_cancellation = false;
                 if matches!(&final_status, RunStatus::Cancelled) {
@@ -18153,6 +18164,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         .await
                     {
                         Ok(Some(commit)) => {
+                            terminal_assistant_source_event_id =
+                                commit.terminal_assistant_source_event_id;
                             core_trace_result = Ok(());
                             durable_status_committed = true;
                             owner_terminal_committed = true;
@@ -18178,9 +18191,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             }
                         }
                         Ok(None) => {
-                            core_trace_result = persist_ctx
+                            let persistence = persist_ctx
                                 .persist_core_and_trace_in_transaction(&state)
                                 .await;
+                            if let Ok(source_event_id) = &persistence {
+                                terminal_assistant_source_event_id = source_event_id.clone();
+                            }
+                            core_trace_result = persistence.map(|_| ());
                             if core_trace_result.is_ok() {
                                 match run_engine
                                     .commit_terminal_status_with_events_if_current_owner(
@@ -18350,6 +18367,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
 
                 if let Some(status) = preexisting_terminal_status {
+                    terminal_assistant_source_event_id = None;
                     core_trace_result = persist_ctx
                         .persist_trace_after_authoritative_terminal(&state, status.as_str())
                         .await;
@@ -18656,6 +18674,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     if let Err(e) = persist_ctx
                         .materialize_run_transcript_evidence(
                             &state,
+                            terminal_assistant_source_event_id.as_deref(),
                             canonical_context_cursor.as_ref(),
                         )
                         .await
@@ -23575,6 +23594,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
+            canonical_trace_time_bounds: Default::default(),
             harness: {
                 #[cfg(feature = "harness")]
                 {

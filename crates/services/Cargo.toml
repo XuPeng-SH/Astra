@@ -12,6 +12,16 @@ e2e-hooks = []
 external-contract-tests = []
 # Requires explicit feature + --ignored + private provider configuration.
 live-provider-tests = []
+# Long-running opt-in load profiles are excluded from ordinary database lanes.
+capacity-probes = []
+
+[[test]]
+name = "ingestion_capacity_db_it"
+required-features = ["capacity-probes"]
+
+[[test]]
+name = "ingestion_batch_tradeoff_db_it"
+required-features = ["capacity-probes"]
 
 [[test]]
 name = "memoria_live_contract_it"
@@ -79,5 +89,5 @@ sqlx = { workspace = true, features = ["chrono"] }
 tempfile = "3"
 # `test-util` enables virtual-time `start_paused` so timeout/retry tests
 # don't wait real seconds.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "sync", "test-util"] }
 uuid.workspace = true
