@@ -1145,7 +1145,7 @@ fn char_literal() { let slash = '/'; }
 
     def test_context_manifest_items_uses_manifest_order_identity(self) -> None:
         row = self.tables["context_manifest_items"]
-        self.assertEqual(row["primary_key"], ["manifest_id", "item_order"])
+        self.assertEqual(row["primary_key"], ["user_id", "manifest_id", "item_order"])
         self.assertEqual(row["auto_increment_columns"], [])
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("manifest-local item", row["primary_query"])

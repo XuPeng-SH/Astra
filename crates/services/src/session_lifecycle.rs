@@ -184,8 +184,8 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "context_manifest_items",
         sql: "DELETE FROM context_manifest_items
-             WHERE manifest_id IN (
-                 SELECT manifest_id FROM context_manifests
+             WHERE (user_id, manifest_id) IN (
+                 SELECT user_id, manifest_id FROM context_manifests
                  WHERE session_id = ? AND user_id = ?
              )",
     },
@@ -309,6 +309,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "context_manifests",
         sql: "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "observation_identity_collisions",
+        sql: "DELETE FROM observation_identity_collisions WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "workspace_records",
@@ -2045,5 +2049,21 @@ mod tests {
             .join(" ");
         assert!(plan_step_runs_sql.contains("user_id = ?"));
         assert!(plan_step_runs_sql.contains("session_id = ? AND user_id = ?"));
+    }
+
+    #[test]
+    fn context_manifest_item_delete_matches_parent_and_child_owner() {
+        let statement = SESSION_DELETE_DERIVED_PARENT_TABLES
+            .iter()
+            .find(|statement| statement.label == "context_manifest_items")
+            .expect("context manifest item delete statement");
+        let normalized = statement
+            .sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("WHERE (user_id, manifest_id) IN"));
+        assert!(normalized.contains("SELECT user_id, manifest_id FROM context_manifests"));
+        assert!(normalized.contains("session_id = ? AND user_id = ?"));
     }
 }

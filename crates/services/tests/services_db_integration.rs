@@ -61,6 +61,13 @@ use uuid::Uuid;
 
 mod common;
 
+fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
+    astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &payload,
+    )
+}
+
 async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
     common::setup_pool_and_settings().await
 }
@@ -1038,11 +1045,22 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     ] {
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, created_at) VALUES (?, ?, ?, 'it_evt', '{}', '', ?)",
+             causal_chain_id, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, 'it_evt', '{}', '', ?, ?, ?)",
         )
         .bind(eid)
         .bind(&session_id)
         .bind(&user_id)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": eid,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": "it_evt",
+            "content": "{}",
+            "causal_chain_id": "",
+            "created_at": ts,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(ts)
         .execute(&pool)
         .await
@@ -1565,13 +1583,24 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
     .execute(&pool)
     .await
     .expect("insert session root");
+    let causal_chain_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-         VALUES (?, ?, ?, 'raw_event', 'not authoritative for session total', ?)",
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+         causal_chain_id, payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'raw_event', 'not authoritative for session total', ?, ?, ?)",
     )
     .bind(&event_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(&causal_chain_id)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "raw_event",
+        "content": "not authoritative for session total",
+        "causal_chain_id": &causal_chain_id,
+    })))
     .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
@@ -2233,13 +2262,24 @@ async fn replay_routes_fail_closed_without_durable_reconstruction() {
     .execute(&pool)
     .await
     .expect("insert session root");
+    let causal_chain_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-         VALUES (?, ?, ?, 'raw_event', 'original event must remain unchanged', ?)",
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+         causal_chain_id, payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'raw_event', 'original event must remain unchanged', ?, ?, ?)",
     )
     .bind(&original_event_id)
     .bind(&session_id)
     .bind(&owner_user_id)
+    .bind(&causal_chain_id)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &original_event_id,
+        "session_id": &session_id,
+        "user_id": &owner_user_id,
+        "event_type": "raw_event",
+        "content": "original event must remain unchanged",
+        "causal_chain_id": &causal_chain_id,
+    })))
     .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
@@ -3808,10 +3848,18 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
             "2026-06-15 10:05:00.000000",
         ),
     ] {
+        let token_usage = serde_json::json!({
+            "input_tokens": tin,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": tout,
+            "total_tokens": ttot,
+        });
         let insert_sql = astra_core::matrixone_statement_with_null_shape(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?)",
+             causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, \
+             llm_model_used, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?, ?)",
             [tool.is_some(), model.is_some()],
         );
         sqlx::query(&insert_sql)
@@ -3819,45 +3867,67 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
             .bind(&s1)
             .bind(&user_id)
             .bind(typ)
-            .bind(
-                serde_json::json!({
-                    "input_tokens": tin,
-                    "cached_input_tokens": 0,
-                    "cache_creation_tokens": 0,
-                    "output_tokens": tout,
-                    "total_tokens": ttot,
-                })
-                .to_string(),
-            )
+            .bind(token_usage.to_string())
             .bind(tin)
             .bind(tout)
             .bind(ttot)
             .bind(tool)
             .bind(model)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({
+                "event_id": eid,
+                "session_id": &s1,
+                "user_id": &user_id,
+                "event_type": typ,
+                "content": "{}",
+                "causal_chain_id": "",
+                "token_usage": &token_usage,
+                "token_input": tin,
+                "token_output": tout,
+                "token_total": ttot,
+                "meta_tool_name": tool,
+                "llm_model_used": model,
+                "created_at": ts,
+            })))
+            .bind(Uuid::new_v4().to_string())
             .bind(ts)
             .execute(&pool)
             .await
             .expect("insert event s1");
     }
 
+    let turn_b1_usage = serde_json::json!({
+        "input_tokens": 5,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 5,
+        "total_tokens": 10,
+    });
     sqlx::query(
         "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-         causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-         VALUES (?, ?, ?, 'user_query', '{}', '', CAST(? AS JSON), 5, 5, 10, NULL, 'm1', ?)",
+         causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, \
+         llm_model_used, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'user_query', '{}', '', CAST(? AS JSON), 5, 5, 10, NULL, 'm1', ?, ?, ?)",
     )
     .bind(&e_turn_b1)
     .bind(&s2)
     .bind(&user_id)
-    .bind(
-        serde_json::json!({
-            "input_tokens": 5,
-            "cached_input_tokens": 0,
-            "cache_creation_tokens": 0,
-            "output_tokens": 5,
-            "total_tokens": 10,
-        })
-        .to_string(),
-    )
+    .bind(turn_b1_usage.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &e_turn_b1,
+        "session_id": &s2,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "{}",
+        "causal_chain_id": "",
+        "token_usage": &turn_b1_usage,
+        "token_input": 5,
+        "token_output": 5,
+        "token_total": 10,
+        "meta_tool_name": null,
+        "llm_model_used": "m1",
+        "created_at": "2026-06-15 10:10:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .bind("2026-06-15 10:10:00.000000")
     .execute(&pool)
     .await
@@ -3865,12 +3935,28 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
 
     sqlx::query(
         "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-         causal_chain_id, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-         VALUES (?, ?, ?, 'turn_error', '{}', '', 0, 0, 0, NULL, NULL, ?)",
+         causal_chain_id, token_input, token_output, token_total, meta_tool_name, llm_model_used, \
+         payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'turn_error', '{}', '', 0, 0, 0, NULL, NULL, ?, ?, ?)",
     )
     .bind(&e_turn_err)
     .bind(&s2)
     .bind(&user_id)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &e_turn_err,
+        "session_id": &s2,
+        "user_id": &user_id,
+        "event_type": "turn_error",
+        "content": "{}",
+        "causal_chain_id": "",
+        "token_input": 0,
+        "token_output": 0,
+        "token_total": 0,
+        "meta_tool_name": null,
+        "llm_model_used": null,
+        "created_at": "2026-06-15 10:11:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .bind("2026-06-15 10:11:00.000000")
     .execute(&pool)
     .await
@@ -3981,13 +4067,28 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
         sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, event_type, content, causal_chain_id, \
-              token_input, token_output, token_total, turn_seq, created_at) \
-             VALUES (?, ?, ?, 'user_query', '{}', '', 1, 1, 2, ?, ?)",
+              token_input, token_output, token_total, turn_seq, payload_hash, \
+              ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, 'user_query', '{}', '', 1, 1, 2, ?, ?, ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(&user_id)
         .bind(turn_seq)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": "user_query",
+            "content": "{}",
+            "causal_chain_id": "",
+            "token_input": 1,
+            "token_output": 1,
+            "token_total": 2,
+            "turn_seq": turn_seq,
+            "created_at": ts,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(ts)
         .execute(&pool)
         .await
@@ -4193,14 +4294,25 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
     for (eid, meta, ts) in payloads.iter() {
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, metadata, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?)",
+             causal_chain_id, metadata, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?)",
         )
         .bind(eid)
         .bind(&s1)
         .bind(&user_id)
         .bind(RUNTIME_PROMOTION_EVENT_TYPE)
         .bind(meta.to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": eid,
+            "session_id": &s1,
+            "user_id": &user_id,
+            "event_type": RUNTIME_PROMOTION_EVENT_TYPE,
+            "content": "{}",
+            "causal_chain_id": "",
+            "metadata": meta,
+            "created_at": ts,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(ts)
         .execute(&pool)
         .await
@@ -4342,14 +4454,25 @@ async fn session_runtime_promotions_db_read_is_bounded() {
         let created_at = format!("2026-07-02 10:{:02}:{:02}.000000", idx / 60, idx % 60);
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, metadata, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?)",
+             causal_chain_id, metadata, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(&user_id)
         .bind(RUNTIME_PROMOTION_EVENT_TYPE)
         .bind(metadata.to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": RUNTIME_PROMOTION_EVENT_TYPE,
+            "content": "{}",
+            "causal_chain_id": "",
+            "metadata": &metadata,
+            "created_at": &created_at,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(&created_at)
         .execute(&pool)
         .await
@@ -4416,54 +4539,93 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
             {"name": "bash", "ok": true, "ms": 123}
         ]
     });
+    let turn_token_usage = serde_json::json!({
+        "input_tokens": 21,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 8,
+        "total_tokens": 29,
+    });
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, metadata, created_at) \
-         VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, CAST(? AS JSON), '2026-09-05 09:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, metadata, \
+          payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, CAST(? AS JSON), ?, ?, \
+                 '2026-09-05 09:00:00.000000')",
     )
     .bind(&turn_event_id)
     .bind(&session_id)
     .bind(&user_id)
     .bind("show audit turn")
-    .bind(
-        serde_json::json!({
-            "input_tokens": 21,
-            "cached_input_tokens": 0,
-            "cache_creation_tokens": 0,
-            "output_tokens": 8,
-            "total_tokens": 29,
-        })
-        .to_string(),
-    )
+    .bind(turn_token_usage.to_string())
     .bind("gpt-5.4")
     .bind(turn_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &turn_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "show audit turn",
+        "token_usage": &turn_token_usage,
+        "llm_model_used": "gpt-5.4",
+        "metadata": &turn_metadata,
+        "created_at": "2026-09-05 09:00:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert audit turn event");
 
+    let child_metadata = serde_json::json!({"tool_name": "bash", "ok": true});
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, parent_event_id, content, metadata, created_at) \
-         VALUES (?, ?, ?, 'tool_call_completed', ?, 'tool child', CAST(? AS JSON), '2026-09-05 09:00:01.000000')",
+         (event_id, session_id, user_id, event_type, parent_event_id, content, metadata, \
+          payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'tool_call_completed', ?, 'tool child', CAST(? AS JSON), ?, ?, \
+                 '2026-09-05 09:00:01.000000')",
     )
     .bind(&child_event_id)
     .bind(&session_id)
     .bind(&user_id)
     .bind(&turn_event_id)
-    .bind(serde_json::json!({"tool_name": "bash", "ok": true}).to_string())
+    .bind(child_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &child_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "tool_call_completed",
+        "parent_event_id": &turn_event_id,
+        "content": "tool child",
+        "metadata": &child_metadata,
+        "created_at": "2026-09-05 09:00:01.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert audit child event");
 
+    let error_metadata = serde_json::json!({"turn": 1, "error": "boom"});
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, metadata, created_at) \
-         VALUES (?, ?, ?, 'turn_error', 'turn failed', CAST(? AS JSON), '2026-09-05 09:00:02.000000')",
+         (event_id, session_id, user_id, event_type, content, metadata, payload_hash, \
+          ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'turn_error', 'turn failed', CAST(? AS JSON), ?, ?, \
+                 '2026-09-05 09:00:02.000000')",
     )
     .bind(&error_event_id)
     .bind(&session_id)
     .bind(&user_id)
-    .bind(serde_json::json!({"turn": 1, "error": "boom"}).to_string())
+    .bind(error_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &error_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "turn_error",
+        "content": "turn failed",
+        "metadata": &error_metadata,
+        "created_at": "2026-09-05 09:00:02.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert audit error event");
@@ -4594,15 +4756,30 @@ async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
     sqlx::query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, \
-          token_input, token_output, token_total, turn_seq, created_at) \
+          token_input, token_output, token_total, turn_seq, payload_hash, ingestion_write_id, \
+          created_at) \
          VALUES (?, ?, ?, 'user_query', '{}', CAST(? AS JSON), ?, 3000000, 1500000, \
-          4500000, 1, NOW(6))",
+          4500000, 1, ?, ?, NOW(6))",
     )
     .bind(&event_id)
     .bind(&session_id)
     .bind(&user_id)
     .bind(usage.to_string())
     .bind(&model_name)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "{}",
+        "token_usage": &usage,
+        "llm_model_used": &model_name,
+        "token_input": 3_000_000,
+        "token_output": 1_500_000,
+        "token_total": 4_500_000,
+        "turn_seq": 1,
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert priced audit event");
@@ -4775,24 +4952,39 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
             "cache_creation_tokens": 0,
             "output_tokens": token_out,
             "total_tokens": token_total,
-        })
-        .to_string();
+        });
         sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, \
-              token_input, token_output, token_total, turn_seq, created_at) \
-             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?)",
+              token_input, token_output, token_total, turn_seq, payload_hash, ingestion_write_id, \
+              created_at) \
+             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&event_id)
         .bind(&session_id)
         .bind(&user_id)
         .bind(content)
-        .bind(&token_usage)
+        .bind(token_usage.to_string())
         .bind(&model)
         .bind(token_in)
         .bind(token_out)
         .bind(token_total)
         .bind(turn_seq)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": &event_id,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": "user_query",
+            "content": content,
+            "token_usage": &token_usage,
+            "llm_model_used": &model,
+            "token_input": token_in,
+            "token_output": token_out,
+            "token_total": token_total,
+            "turn_seq": turn_seq,
+            "created_at": &ts,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(&ts)
         .execute(&pool)
         .await
@@ -5021,27 +5213,40 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
             "2026-09-06 08:04:00.000000",
         ),
     ] {
+        let token_usage = serde_json::json!({
+            "input_tokens": 1,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        });
         sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, event_type, content, token_usage, \
-              token_input, token_output, token_total, turn_seq, created_at) \
-             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), 1, 1, 2, ?, ?)",
+              token_input, token_output, token_total, turn_seq, payload_hash, \
+              ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), 1, 1, 2, ?, ?, ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(&user_id)
         .bind(content)
-        .bind(
-            serde_json::json!({
-                "input_tokens": 1,
-                "cached_input_tokens": 0,
-                "cache_creation_tokens": 0,
-                "output_tokens": 1,
-                "total_tokens": 2,
-            })
-            .to_string(),
-        )
+        .bind(token_usage.to_string())
         .bind(turn_seq)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": "user_query",
+            "content": content,
+            "token_usage": &token_usage,
+            "token_input": 1,
+            "token_output": 1,
+            "token_total": 2,
+            "turn_seq": turn_seq,
+            "created_at": ts,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(ts)
         .execute(&pool)
         .await
@@ -5544,24 +5749,39 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
     .await
     .expect("push session state");
 
+    let query_event_id = Uuid::new_v4().to_string();
+    let query_token_usage = serde_json::json!({
+        "input_tokens": 20,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 10,
+        "total_tokens": 30,
+    });
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'agent events only recent tools turn', CAST(? AS JSON), 20, 10, 30, 1, '2026-09-05 08:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
+          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'agent events only recent tools turn', CAST(? AS JSON), \
+                 20, 10, 30, 1, ?, ?, '2026-09-05 08:00:00.000000')",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&query_event_id)
     .bind(&session_id)
     .bind(&user_id)
-    .bind(
-        serde_json::json!({
-            "input_tokens": 20,
-            "cached_input_tokens": 0,
-            "cache_creation_tokens": 0,
-            "output_tokens": 10,
-            "total_tokens": 30,
-        })
-        .to_string(),
-    )
+    .bind(query_token_usage.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &query_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "agent events only recent tools turn",
+        "token_usage": &query_token_usage,
+        "token_input": 20,
+        "token_output": 10,
+        "token_total": 30,
+        "turn_seq": 1,
+        "created_at": "2026-09-05 08:00:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert user_query");
@@ -5578,16 +5798,28 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
             serde_json::json!(["view", "rg"]),
         ),
     ] {
-        let metadata_json = serde_json::json!({ "tools_used": tools_used }).to_string();
+        let metadata = serde_json::json!({ "tools_used": tools_used });
         sqlx::query(
             "INSERT INTO agent_events \
-             (event_id, session_id, user_id, event_type, content, metadata, created_at) \
-             VALUES (?, ?, ?, 'turn_complete', 'non-authoritative tool summary', CAST(? AS JSON), ?)",
+             (event_id, session_id, user_id, event_type, content, metadata, payload_hash, \
+              ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, 'turn_complete', 'non-authoritative tool summary', \
+                     CAST(? AS JSON), ?, ?, ?)",
         )
-        .bind(event_id)
+        .bind(&event_id)
         .bind(&session_id)
         .bind(&user_id)
-        .bind(metadata_json)
+        .bind(metadata.to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": &event_id,
+            "session_id": &session_id,
+            "user_id": &user_id,
+            "event_type": "turn_complete",
+            "content": "non-authoritative tool summary",
+            "metadata": &metadata,
+            "created_at": created_at,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(created_at)
         .execute(&pool)
         .await
@@ -5792,24 +6024,39 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .await
     .expect("insert checkpoint session");
 
+    let checkpoint_event_id = Uuid::new_v4().to_string();
+    let checkpoint_token_usage = serde_json::json!({
+        "input_tokens": 10,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    });
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, 1, '2026-09-04 09:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
+          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, 1, \
+                 ?, ?, '2026-09-04 09:00:00.000000')",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&checkpoint_event_id)
     .bind(&session_id)
     .bind(&user_id)
-    .bind(
-        serde_json::json!({
-            "input_tokens": 10,
-            "cached_input_tokens": 0,
-            "cache_creation_tokens": 0,
-            "output_tokens": 5,
-            "total_tokens": 15,
-        })
-        .to_string(),
-    )
+    .bind(checkpoint_token_usage.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &checkpoint_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "checkpoint turn",
+        "token_usage": &checkpoint_token_usage,
+        "token_input": 10,
+        "token_output": 5,
+        "token_total": 15,
+        "turn_seq": 1,
+        "created_at": "2026-09-04 09:00:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert checkpoint user_query");
@@ -5824,24 +6071,39 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .await
     .expect("insert heavy-only session");
 
+    let heavy_event_id = Uuid::new_v4().to_string();
+    let heavy_token_usage = serde_json::json!({
+        "input_tokens": 11,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 4,
+        "total_tokens": 15,
+    });
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, 1, '2026-09-04 09:10:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
+          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, 1, \
+                 ?, ?, '2026-09-04 09:10:00.000000')",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&heavy_event_id)
     .bind(&heavy_only_session)
     .bind(&user_id)
-    .bind(
-        serde_json::json!({
-            "input_tokens": 11,
-            "cached_input_tokens": 0,
-            "cache_creation_tokens": 0,
-            "output_tokens": 4,
-            "total_tokens": 15,
-        })
-        .to_string(),
-    )
+    .bind(heavy_token_usage.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &heavy_event_id,
+        "session_id": &heavy_only_session,
+        "user_id": &user_id,
+        "event_type": "user_query",
+        "content": "heavy-only turn",
+        "token_usage": &heavy_token_usage,
+        "token_input": 11,
+        "token_output": 4,
+        "token_total": 15,
+        "turn_seq": 1,
+        "created_at": "2026-09-04 09:10:00.000000",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert heavy-only user_query");
@@ -6161,12 +6423,22 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     .expect("insert owner session");
 
     sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-         VALUES (?, ?, ?, 'stray_evt', '{}', '')",
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+         causal_chain_id, payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'stray_evt', '{}', '', ?, ?)",
     )
     .bind(&stray_event_id)
     .bind(&session_id)
     .bind(&other_user_id)
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &stray_event_id,
+        "session_id": &session_id,
+        "user_id": &other_user_id,
+        "event_type": "stray_evt",
+        "content": "{}",
+        "causal_chain_id": "",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert stray event");
@@ -6690,13 +6962,23 @@ async fn context_and_decision_writes_require_owner_bound_references_on_live_matr
         (&other_event_id, &other_user_id, "other_event"),
     ] {
         sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-             VALUES (?, ?, ?, ?, '{}', '')",
+            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+             causal_chain_id, payload_hash, ingestion_write_id) \
+             VALUES (?, ?, ?, ?, '{}', '', ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(user_id)
         .bind(event_type)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": user_id,
+            "event_type": event_type,
+            "content": "{}",
+            "causal_chain_id": "",
+        })))
+        .bind(Uuid::new_v4().to_string())
         .execute(&pool)
         .await
         .expect("insert event");
@@ -6942,10 +7224,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             "2026-06-01 10:03:00.000000",
         ),
     ] {
+        let token_usage = token_usage.unwrap_or_else(|| serde_json::json!({}));
         sqlx::query(
             "INSERT INTO agent_events \
-             (event_id, session_id, user_id, event_type, content, skill_name, token_usage, causal_chain_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), '', ?)",
+             (event_id, session_id, user_id, event_type, content, skill_name, token_usage, \
+              causal_chain_id, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), '', ?, ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
@@ -6953,7 +7237,19 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .bind(event_type)
         .bind(content)
         .bind(skill_name)
-        .bind(token_usage.map(|value| value.to_string()).unwrap_or_else(|| "{}".into()))
+        .bind(token_usage.to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": user_id,
+            "event_type": event_type,
+            "content": content,
+            "skill_name": skill_name,
+            "token_usage": &token_usage,
+            "causal_chain_id": "",
+            "created_at": created_at,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(created_at)
         .execute(&pool)
         .await
@@ -7018,14 +7314,24 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     ] {
         sqlx::query(
             "INSERT INTO agent_events \
-             (event_id, session_id, user_id, event_type, metadata, created_at) \
-             VALUES (?, ?, ?, ?, CAST(? AS JSON), ?)",
+             (event_id, session_id, user_id, event_type, metadata, payload_hash, \
+              ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(user_id)
         .bind(event_type)
         .bind(metadata.to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": user_id,
+            "event_type": event_type,
+            "metadata": &metadata,
+            "created_at": created_at,
+        })))
+        .bind(Uuid::new_v4().to_string())
         .bind(created_at)
         .execute(&pool)
         .await
@@ -7349,13 +7655,23 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         (&foreign_event_id, &other_user_id, "foreign_evt"),
     ] {
         sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-             VALUES (?, ?, ?, ?, '{}', '')",
+            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+             causal_chain_id, payload_hash, ingestion_write_id) \
+             VALUES (?, ?, ?, ?, '{}', '', ?, ?)",
         )
         .bind(event_id)
         .bind(&session_id)
         .bind(user_id)
         .bind(event_type)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({
+            "event_id": event_id,
+            "session_id": &session_id,
+            "user_id": user_id,
+            "event_type": event_type,
+            "content": "{}",
+            "causal_chain_id": "",
+        })))
+        .bind(Uuid::new_v4().to_string())
         .execute(&pool)
         .await
         .expect("insert event");

@@ -841,12 +841,22 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "context_manifest_items": TableMetadata(
         semantic_owner="astra_services::context_manifest::ContextManifestStore",
         state_class="durable manifest item fact",
-        primary_query="manifest-local item lookup/order by manifest_id and item_order; zone filtering by manifest_id, zone, included",
+        primary_query="owner-scoped manifest-local item lookup/order by user_id, manifest_id, and item_order; zone filtering by user_id, manifest_id, zone, included",
         retention_policy="delete with parent context_manifests during session deletion or manifest retention cleanup",
         rebuildability="rebuildable only by recomputing the exact manifest assembly inputs",
         merge_guidance="keep separate from context_manifests; item-level ordering, source refs, token budgets, and raw refs are independently queried",
         migration_owner="astra_services::storage / context_manifest",
         product_owner="LLM context assembly traceability",
+    ),
+    "observation_identity_collisions": TableMetadata(
+        semantic_owner="astra_services::observation_capture",
+        state_class="bounded diagnostic aggregate",
+        primary_query="one collision aggregate by user_id, identity_kind, identity_id; owner/session diagnostics by last_seen_at; bounded expiry by expires_at",
+        retention_policy="fixed seven days from first collision; bounded runtime maintenance removes expired receipts and session deletion removes owner/session receipts",
+        rebuildability="not reconstructable from retained successful observations; stores only hashes and identity metadata, never rejected payloads",
+        merge_guidance="keep separate from agent_events and context_manifests; rejected identity claims must not overwrite canonical observations or grow one row per attempted hash",
+        migration_owner="astra_services::storage / observation_capture",
+        product_owner="observation integrity diagnostics and runtime maintenance",
     ),
     "session_state_revisions": TableMetadata(
         semantic_owner="astra_services::state_projection",

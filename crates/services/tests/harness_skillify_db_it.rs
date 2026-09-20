@@ -14,6 +14,13 @@ use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
 
+fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
+    astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &payload,
+    )
+}
+
 #[derive(Default)]
 struct CapturingSkillifyExecutor {
     request: Mutex<Option<SkillifyAgentRequest>>,
@@ -83,12 +90,21 @@ async fn database_skillify_uses_event_level_sources_and_rejects_corrupt_events()
         .await
         .expect("insert agent session");
     sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content) \
-         VALUES (?, ?, ?, 'assistant_message', 'Prefer conclusion-first answers.')",
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+         payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'assistant_message', 'Prefer conclusion-first answers.', ?, ?)",
     )
     .bind(&event_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(agent_event_fixture_payload_hash(json!({
+        "event_id": &event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "assistant_message",
+        "content": "Prefer conclusion-first answers.",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert agent event");
@@ -190,12 +206,21 @@ async fn database_skillify_citations_point_to_review_items() {
         .await
         .expect("insert agent session");
     sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content) \
-         VALUES (?, ?, ?, 'user_message', 'Always cite the event-level source.')",
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
+         payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'user_message', 'Always cite the event-level source.', ?, ?)",
     )
     .bind(&event_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(agent_event_fixture_payload_hash(json!({
+        "event_id": &event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "user_message",
+        "content": "Always cite the event-level source.",
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert agent event");

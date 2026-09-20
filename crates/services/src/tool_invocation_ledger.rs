@@ -507,28 +507,37 @@ impl DatabaseToolInvocationLedger {
             || expired_dispatches_unknown > 0
         {
             let event_id = Uuid::new_v4().to_string();
+            let content = format!(
+                "terminal run invocation reconciliation: prepared_rejected={prepared_rejected}, inconsistent_prepared_unknown={inconsistent_prepared_unknown}, expired_dispatches_unknown={expired_dispatches_unknown}, active_dispatches_remaining={active_dispatches_remaining}"
+            );
+            let metadata = serde_json::json!({
+                "run_status": &run_status,
+                "prepared_rejected": prepared_rejected,
+                "inconsistent_prepared_unknown": inconsistent_prepared_unknown,
+                "expired_dispatches_unknown": expired_dispatches_unknown,
+                "active_dispatches_remaining": active_dispatches_remaining,
+            });
+            let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                &serde_json::json!({
+                    "event_id": event_id, "session_id": session_id, "user_id": user_id,
+                    "run_id": run_id, "event_type": "tool_invocation_run_reconciled",
+                    "content": content, "metadata": metadata,
+                }),
+            );
             let insert = sqlx::query(
                 "INSERT INTO agent_events
-                 (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
-                 VALUES (?, ?, ?, ?, 'tool_invocation_run_reconciled', ?, ?, NOW(6))",
+                 (event_id, session_id, user_id, run_id, event_type, content, metadata, payload_hash, ingestion_write_id, created_at)
+                 VALUES (?, ?, ?, ?, 'tool_invocation_run_reconciled', ?, ?, ?, ?, NOW(6))",
             )
             .bind(&event_id)
             .bind(session_id)
             .bind(user_id)
             .bind(run_id)
-            .bind(format!(
-                "terminal run invocation reconciliation: prepared_rejected={prepared_rejected}, inconsistent_prepared_unknown={inconsistent_prepared_unknown}, expired_dispatches_unknown={expired_dispatches_unknown}, active_dispatches_remaining={active_dispatches_remaining}"
-            ))
-            .bind(
-                serde_json::json!({
-                    "run_status": &run_status,
-                    "prepared_rejected": prepared_rejected,
-                    "inconsistent_prepared_unknown": inconsistent_prepared_unknown,
-                    "expired_dispatches_unknown": expired_dispatches_unknown,
-                    "active_dispatches_remaining": active_dispatches_remaining,
-                })
-                .to_string(),
-            )
+            .bind(content)
+            .bind(metadata.to_string())
+            .bind(payload_hash)
+            .bind(Uuid::new_v4().to_string())
             .execute(&mut *tx)
             .await?;
             let inserted_events = crate::storage::rows_affected_to_i64(
@@ -562,26 +571,35 @@ impl DatabaseToolInvocationLedger {
             .fetch_optional(&mut *tx)
             .await?;
             if already_recorded.is_none() {
+                let content = format!(
+                    "terminal run retains {active_dispatches_remaining} actively leased tool invocation(s)"
+                );
+                let metadata = serde_json::json!({
+                    "run_status": &run_status,
+                    "active_dispatches_remaining": active_dispatches_remaining,
+                    "resolution": "wait_for_completion_or_lease_expiry",
+                });
+                let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+                    crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                    &serde_json::json!({
+                        "event_id": event_id, "session_id": session_id, "user_id": user_id,
+                        "run_id": run_id, "event_type": "tool_invocation_compaction_deferred",
+                        "content": content, "metadata": metadata,
+                    }),
+                );
                 sqlx::query(
                     "INSERT INTO agent_events
-                     (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
-                     VALUES (?, ?, ?, ?, 'tool_invocation_compaction_deferred', ?, ?, NOW(6))",
+                     (event_id, session_id, user_id, run_id, event_type, content, metadata, payload_hash, ingestion_write_id, created_at)
+                     VALUES (?, ?, ?, ?, 'tool_invocation_compaction_deferred', ?, ?, ?, ?, NOW(6))",
                 )
                 .bind(&event_id)
                 .bind(session_id)
                 .bind(user_id)
                 .bind(run_id)
-                .bind(format!(
-                    "terminal run retains {active_dispatches_remaining} actively leased tool invocation(s)"
-                ))
-                .bind(
-                    serde_json::json!({
-                        "run_status": &run_status,
-                        "active_dispatches_remaining": active_dispatches_remaining,
-                        "resolution": "wait_for_completion_or_lease_expiry",
-                    })
-                    .to_string(),
-                )
+                .bind(content)
+                .bind(metadata.to_string())
+                .bind(payload_hash)
+                .bind(Uuid::new_v4().to_string())
                 .execute(&mut *tx)
                 .await?;
                 crate::storage::add_agent_session_event_count_or_create(

@@ -42,7 +42,9 @@ use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 use astra_turn_types::SessionCursorV1;
 
 use crate::MatrixOneSettings;
+use crate::data_layer::storage::trace_event_payload_hash;
 use crate::turn::agentic_loop::host::AgenticLoopState;
+use crate::turn::services::TraceEventPersistOutcome;
 use crate::turn::token_usage::TokenUsage;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
@@ -470,12 +472,12 @@ impl PostLoopPersistContext {
     pub(crate) async fn persist_core_and_trace_in_transaction(
         &self,
         state: &AgenticLoopState,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let Some(pool) = self.shared_pool.as_ref() else {
             // Persistence is an explicit deployment capability. An ephemeral
             // runtime performs no durable writes; this is distinct from a
             // configured database failing, which must fail closed below.
-            return Ok(());
+            return Ok(None);
         };
 
         persist_server_loop_canonical_append(
@@ -498,7 +500,6 @@ impl PostLoopPersistContext {
             state,
         )
         .await
-        .map(|_| ())
     }
 
     /// Persist append-only provider/tool observations after another control
@@ -560,7 +561,7 @@ impl PostLoopPersistContext {
             ));
         }
         let (turn_started_at, _) = turn_trace_time_bounds(state);
-        let deltas = persist_server_loop_trace_events_impl(
+        let outcome = persist_server_loop_trace_events_impl(
             &mut tx,
             &self.user_id,
             &self.session_id,
@@ -575,8 +576,9 @@ impl PostLoopPersistContext {
         )
         .await?;
         tx.commit().await.map_err(|error| error.to_string())?;
-        if let Some((delta, last_event_id)) =
-            deltas.get(&(self.user_id.clone(), self.session_id.clone()))
+        if let Some((delta, last_event_id)) = outcome
+            .session_event_deltas
+            .get(&(self.user_id.clone(), self.session_id.clone()))
             && *delta > 0
         {
             crate::data_layer::storage::bump_agent_session_event_count(
@@ -659,6 +661,7 @@ impl PostLoopPersistContext {
     pub(crate) async fn materialize_run_transcript_evidence(
         &self,
         state: &AgenticLoopState,
+        terminal_assistant_source_event_id: Option<&str>,
         canonical_cursor: Option<&SessionCursorV1>,
     ) -> Result<(), String> {
         let Some(pool) = self.shared_pool.as_ref() else {
@@ -671,7 +674,8 @@ impl PostLoopPersistContext {
             None,
             &self.user_message,
             state,
-        );
+        )
+        .filter(|item| terminal_assistant_source_event_id == Some(item.source_event_id.as_str()));
         materialize_server_run_transcript_evidence(
             pool,
             &self.user_id,
@@ -792,7 +796,7 @@ async fn verify_canonical_append_evidence(
     ));
     for expected in expected_trace {
         let row = sqlx::query(
-            "SELECT event_type, run_id, content, reasoning_content
+            "SELECT event_type, run_id, content, reasoning_content, payload_hash
              FROM agent_events
              WHERE user_id = ? AND session_id = ? AND event_id = ?
              LIMIT 1",
@@ -826,11 +830,17 @@ async fn verify_canonical_append_evidence(
         let reasoning_content = row
             .try_get::<Option<String>, _>("reasoning_content")
             .map_err(|error| format!("decode canonical trace reasoning: {error}"))?;
-        if event_type != expected.event_type
-            || run_id.as_deref() != Some(append.run_id)
-            || content != expected.content
-            || reasoning_content != expected.reasoning_content
-        {
+        let payload_hash = row
+            .try_get::<String, _>("payload_hash")
+            .map_err(|error| format!("decode canonical trace payload hash: {error}"))?;
+        if !stored_canonical_trace_matches(
+            &expected,
+            &event_type,
+            run_id.as_deref(),
+            content.as_ref(),
+            reasoning_content.as_ref(),
+            &payload_hash,
+        )? {
             return Err(format!(
                 "canonical trace evidence {} conflicts with replay",
                 expected.event_id
@@ -931,6 +941,23 @@ async fn verify_canonical_append_evidence(
         }
     }
     Ok(())
+}
+
+fn stored_canonical_trace_matches(
+    expected: &TraceEvent,
+    stored_event_type: &str,
+    stored_run_id: Option<&str>,
+    stored_content: Option<&String>,
+    stored_reasoning_content: Option<&String>,
+    stored_payload_hash: &str,
+) -> Result<bool, String> {
+    let expected_payload_hash =
+        trace_event_payload_hash(expected).map_err(|error| error.to_string())?;
+    Ok(stored_event_type == expected.event_type
+        && stored_run_id == expected.run_id.as_deref()
+        && stored_content == expected.content.as_ref()
+        && stored_reasoning_content == expected.reasoning_content.as_ref()
+        && stored_payload_hash == expected_payload_hash)
 }
 
 async fn resolve_existing_atomic_terminal_settlement(
@@ -1135,7 +1162,7 @@ async fn persist_server_loop_canonical_append_inner(
     // transaction is poisoned (partial writes may be staged) and we MUST
     // rollback instead of continuing to write detail events into the same tx.
     let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
-    let mut session_event_deltas = match persist_server_loop_core_events_in_tx(
+    let mut capture_outcome = match persist_server_loop_core_events_in_tx(
         &mut tx,
         append.user_id,
         append.session_id,
@@ -1153,7 +1180,7 @@ async fn persist_server_loop_canonical_append_inner(
     )
     .await
     {
-        Ok(deltas) => deltas,
+        Ok(outcome) => outcome,
         Err(error) => {
             let msg = format!("core events tx failed: {}", error);
             tracing::warn!(
@@ -1189,15 +1216,7 @@ async fn persist_server_loop_canonical_append_inner(
     )
     .await
     {
-        Ok(deltas) => {
-            for (key, (delta, last_event_id)) in deltas {
-                let entry = session_event_deltas.entry(key).or_default();
-                entry.0 += delta;
-                if last_event_id.is_some() {
-                    entry.1 = last_event_id;
-                }
-            }
-        }
+        Ok(outcome) => capture_outcome.merge(outcome),
         Err(error) => {
             let msg = format!("detail events tx failed: {}", error);
             tracing::warn!(
@@ -1228,6 +1247,7 @@ async fn persist_server_loop_canonical_append_inner(
         append.user_message,
         state,
         append.include_terminal_assistant,
+        &capture_outcome,
     )
     .await
     {
@@ -1336,8 +1356,9 @@ async fn persist_server_loop_canonical_append_inner(
     // Event rows and run state are now durable. Update the derived session
     // counter outside the long canonical transaction so sibling fanout runs
     // never wait on `agent_sessions` while holding their own event/run locks.
-    if let Some((delta, last_event_id)) =
-        session_event_deltas.get(&(append.user_id.to_string(), append.session_id.to_string()))
+    if let Some((delta, last_event_id)) = capture_outcome
+        .session_event_deltas
+        .get(&(append.user_id.to_string(), append.session_id.to_string()))
         && *delta > 0
     {
         crate::data_layer::storage::bump_agent_session_event_count(
@@ -1367,20 +1388,16 @@ async fn persist_server_loop_canonical_append_inner(
             "canonical terminal settlement committed but display projection repair failed"
         );
     }
-    let terminal_assistant_source_event_id = append
-        .include_terminal_assistant
-        .then(|| {
-            terminal_assistant_transcript_item(
-                append.user_id,
-                append.session_id,
-                append.run_id,
-                append.trace_context.as_ref(),
-                append.user_message,
-                state,
-            )
-            .map(|item| item.source_event_id)
-        })
-        .flatten();
+    let terminal_assistant_source_event_id = terminal_assistant_transcript_item(
+        append.user_id,
+        append.session_id,
+        append.run_id,
+        append.trace_context.as_ref(),
+        append.user_message,
+        state,
+    )
+    .filter(|item| capture_outcome.accepts_projection(&item.source_event_id))
+    .map(|item| item.source_event_id);
     Ok(CanonicalTerminalSettlementCommit {
         terminal_events: terminal_commit
             .map(|(_, terminal)| terminal.committed_events)
@@ -1973,7 +1990,7 @@ pub(crate) async fn persist_server_loop_core_events_in_tx(
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
     terminal_offset_ms: u64,
-) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
+) -> Result<TraceEventPersistOutcome, String> {
     persist_server_loop_core_events_impl(
         tx,
         user_id,
@@ -2008,7 +2025,7 @@ async fn persist_server_loop_core_events_impl(
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
     terminal_offset_ms: u64,
-) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
+) -> Result<TraceEventPersistOutcome, String> {
     let events = build_server_loop_core_events(
         user_id,
         session_id,
@@ -2025,7 +2042,7 @@ async fn persist_server_loop_core_events_impl(
         terminal_offset_ms,
     );
     if events.is_empty() {
-        return Ok(std::collections::BTreeMap::new());
+        return Ok(TraceEventPersistOutcome::default());
     }
 
     match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
@@ -2347,6 +2364,7 @@ async fn persist_server_loop_transcript_items_in_tx(
     user_message: &str,
     state: &AgenticLoopState,
     include_terminal_assistant: bool,
+    capture_outcome: &TraceEventPersistOutcome,
 ) -> Result<(), String> {
     let items = transcript_items_from_server_loop(
         user_id,
@@ -2356,7 +2374,10 @@ async fn persist_server_loop_transcript_items_in_tx(
         user_message,
         state,
         include_terminal_assistant,
-    );
+    )
+    .into_iter()
+    .filter(|item| capture_outcome.accepts_projection(&item.source_event_id))
+    .collect::<Vec<_>>();
     persist_session_transcript_items_inner_in_tx(tx, user_id, session_id, &items)
         .await
         .map_err(|error| error.to_string())
@@ -3275,7 +3296,7 @@ pub(crate) async fn persist_server_loop_trace_events_in_tx(
     state: &AgenticLoopState,
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
-) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
+) -> Result<TraceEventPersistOutcome, String> {
     persist_server_loop_trace_events_impl(
         tx,
         user_id,
@@ -3304,7 +3325,7 @@ async fn persist_server_loop_trace_events_impl(
     state: &AgenticLoopState,
     model_name: Option<&str>,
     turn_started_at: chrono::DateTime<chrono::Utc>,
-) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
+) -> Result<TraceEventPersistOutcome, String> {
     let trace = trace_context
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
     // Detail events are persisted as one terminal batch, so `Utc::now()` here
@@ -3331,7 +3352,7 @@ async fn persist_server_loop_trace_events_impl(
         &state.stall.tool_call_records,
     ));
     if events.is_empty() {
-        return Ok(std::collections::BTreeMap::new());
+        return Ok(TraceEventPersistOutcome::default());
     }
 
     match DatabaseTraceEventWriter::write_many_in_tx(tx, events).await {
@@ -3873,7 +3894,8 @@ mod tests {
     use tokio::sync::Notify;
     use uuid::Uuid;
 
-    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
+    // Cache schema bootstrap, not sockets owned by a previous test's Tokio runtime.
+    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
 
     fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
@@ -3932,13 +3954,55 @@ mod tests {
         assert_eq!(resolved.last_event_idx, 7);
     }
 
+    #[test]
+    fn authoritative_trace_replay_requires_the_full_capture_hash() {
+        let mut stored = TraceEvent::new(
+            "stable-event",
+            "session-1",
+            "user-1",
+            "llm_response",
+            "turn",
+        );
+        stored.run_id = Some("run-1".to_string());
+        stored.content = Some("same visible content".to_string());
+        stored.metadata = json!({"route": "original"});
+        let stored_payload_hash = trace_event_payload_hash(&stored).unwrap();
+
+        assert!(
+            stored_canonical_trace_matches(
+                &stored,
+                &stored.event_type,
+                stored.run_id.as_deref(),
+                stored.content.as_ref(),
+                stored.reasoning_content.as_ref(),
+                &stored_payload_hash,
+            )
+            .unwrap()
+        );
+
+        let mut conflicting = stored.clone();
+        conflicting.metadata = json!({"route": "conflicting"});
+        assert!(
+            !stored_canonical_trace_matches(
+                &conflicting,
+                &stored.event_type,
+                stored.run_id.as_deref(),
+                stored.content.as_ref(),
+                stored.reasoning_content.as_ref(),
+                &stored_payload_hash,
+            )
+            .unwrap(),
+            "matching legacy projection fields must not hide a full-envelope collision"
+        );
+    }
+
     async fn setup_pool() -> astra_core::SharedPool {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
-        SHARED_BOOTSTRAP
+        let settings = SHARED_BOOTSTRAP
             .get_or_init(|| async {
                 let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
@@ -3946,12 +4010,12 @@ mod tests {
                 astra_services::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure_core_schema");
-                astra_core::SharedPool::new(&settings)
-                    .await
-                    .expect("SharedPool::new")
+                settings
             })
+            .await;
+        astra_core::SharedPool::new(settings)
             .await
-            .clone()
+            .expect("SharedPool::new")
     }
 
     #[derive(Default)]
@@ -5426,12 +5490,16 @@ mod tests {
             metrics_registry: None,
             csl_manager: None,
         };
-        persist
+        let terminal_assistant_source_event_id = persist
             .persist_core_and_trace_in_transaction(&state)
             .await
             .expect("persist atomic core, trace, and transcript prefix");
         persist
-            .materialize_run_transcript_evidence(&state, None)
+            .materialize_run_transcript_evidence(
+                &state,
+                terminal_assistant_source_event_id.as_deref(),
+                None,
+            )
             .await
             .expect("materialize terminal assistant transcript evidence");
 
@@ -5536,6 +5604,213 @@ mod tests {
             "transcript preserves the ordered conversation and exact tool evidence"
         );
 
+        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_append_excludes_colliding_response_from_transcript_and_deferred_projection()
+    {
+        let pool = setup_pool().await;
+        let db = pool.get().clone();
+        let matrixone = MatrixOneSettings::from_env();
+        let session_id = Uuid::new_v4().to_string();
+        let user_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+             VALUES (?, ?, 'canonical-collision-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&db)
+        .await
+        .expect("insert canonical collision session");
+        let store = Arc::new(
+            astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("canonical-collision-owner"),
+        );
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine
+            .start_run(&run_id, &user_id, &session_id)
+            .await
+            .expect("start canonical collision run");
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.session_turn = 9;
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(Some(&session_id), 9),
+        );
+        state.final_text = "conflicting attempted assistant".to_string();
+        state.user_intents.record_applied_user_intents(&[
+            crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "valid-new-sibling".to_string(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "valid new sibling".to_string(),
+            },
+        ]);
+        let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
+        let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(&state);
+        let attempted_core = build_server_loop_core_events(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+            Some("root-agent"),
+            None,
+            Some(trace.clone()),
+            "same user request",
+            &state,
+            Some("test-model"),
+            turn_started_at,
+            terminal_offset_ms,
+        );
+        let root_event = attempted_core
+            .iter()
+            .find(|event| event.event_type == "user_query")
+            .expect("attempted root event")
+            .clone();
+        let attempted_response = attempted_core
+            .iter()
+            .find(|event| event.event_type == "llm_response")
+            .expect("attempted response event")
+            .clone();
+        let response_event_id = attempted_response.event_id.clone();
+        let intent_event_id = attempted_core
+            .iter()
+            .find(|event| event.event_type == "user_message")
+            .expect("attempted intent event")
+            .event_id
+            .clone();
+        let mut original_response = attempted_response;
+        original_response.content = Some("original durable assistant".to_string());
+        DatabaseTraceEventWriter::new(matrixone.clone())
+            .with_pool(pool.clone())
+            .write_many(vec![root_event.clone(), original_response])
+            .await
+            .expect("seed exact root replay and original response collision target");
+
+        let persist = PostLoopPersistContext {
+            matrixone,
+            shared_pool: Some(pool.clone()),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            expected_owner_generation: Some(authority.owner_generation),
+            owner_lease_duration: Some(Duration::from_secs(45)),
+            agent_id: Some("root-agent".to_string()),
+            model_name: Some("test-model".to_string()),
+            user_message: "same user request".to_string(),
+            hook_db_writer: None,
+            observer_worker: None,
+            metrics_registry: None,
+            csl_manager: None,
+        };
+        let terminal_assistant_source_event_id = persist
+            .persist_core_and_trace_in_transaction(&state)
+            .await
+            .expect("persist mixed replay, collision, and valid sibling");
+        assert_eq!(
+            terminal_assistant_source_event_id, None,
+            "a colliding response must not be accepted for deferred projection"
+        );
+        persist
+            .materialize_run_transcript_evidence(
+                &state,
+                terminal_assistant_source_event_id.as_deref(),
+                None,
+            )
+            .await
+            .expect("materialize accepted deferred transcript only");
+
+        let stored_response: String = sqlx::query_scalar(
+            "SELECT content FROM agent_events \
+             WHERE user_id = ? AND session_id = ? AND event_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&response_event_id)
+        .fetch_one(&db)
+        .await
+        .expect("read retained original response");
+        assert_eq!(stored_response, "original durable assistant");
+        let transcript_rows = sqlx::query(
+            "SELECT source_event_id, role, content FROM session_transcript_items \
+             WHERE user_id = ? AND session_id = ? ORDER BY item_seq",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .fetch_all(&db)
+        .await
+        .expect("read mixed-outcome transcript rows");
+        let transcript = transcript_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("source_event_id").unwrap(),
+                    row.try_get::<String, _>("role").unwrap(),
+                    row.try_get::<String, _>("content").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            transcript.iter().any(|(source, role, content)| {
+                source == &root_event.event_id && role == "user" && content == "same user request"
+            }),
+            "an exact replay must repair its missing transcript projection"
+        );
+        assert!(
+            transcript.iter().any(|(source, role, content)| {
+                source == &intent_event_id && role == "user" && content == "valid new sibling"
+            }),
+            "a valid sibling must survive a collision in the same batch"
+        );
+        assert!(
+            transcript
+                .iter()
+                .all(|(source, _, _)| source != &response_event_id),
+            "a colliding response must be excluded from immediate and deferred transcript projection: {transcript:?}"
+        );
+        let collision_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_identity_collisions \
+             WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&response_event_id)
+        .fetch_one(&db)
+        .await
+        .expect("count durable canonical collision receipts");
+        assert_eq!(collision_receipts, 1);
+
+        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&db)
+            .await
+            .expect("cleanup canonical collision receipt");
+        sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(&db)
+            .await
+            .expect("cleanup canonical collision run events");
+        sqlx::query(
+            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .expect("cleanup canonical collision execution slot");
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(&db)
+            .await
+            .expect("cleanup canonical collision run");
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
     }
 

@@ -386,6 +386,38 @@ metadata
 
 `event_id` must be stable and collision-resistant. If the same event id arrives with different payload hash, ingestion must treat it as a collision, not idempotent success.
 
+Durable capture distinguishes `Inserted`, `Replayed`, and `Collision` within the
+owning database transaction. Only `Inserted` may apply event counters, parent
+edges, terminal-session effects, configuration projections, or manifest artifact
+references. An exact retry after a lost commit acknowledgement therefore does
+not repeat those effects. Each database attempt uses a fresh write marker;
+retries must not reuse a marker from an attempt whose commit outcome is unknown.
+
+Capture outcomes remain available to downstream projections. A collision must
+not create a transcript row or snapshot link from the rejected payload, nor be
+reported as a successfully captured response. Exact replay may repair a missing
+projection from the accepted payload under the existing transaction and session
+fences. Valid sibling events in the same batch continue to be captured.
+
+Manifest identity and item identity are tenant-scoped: `(user_id, manifest_id)`
+and `(user_id, manifest_id, item_order)`. The manifest digest covers its header
+and the complete item set ordered by `item_order`. Every item lookup, join, and
+delete must carry the owner. Unknown-reason diagnostics commit with the first
+manifest capture and are not repeated by replay or collision.
+
+Collision receipts retain identities and hashes, never observation payloads.
+They aggregate into one row per `(user_id, identity_kind, identity_id)`, with a
+count and latest conflicting hash. Their fixed seven-day expiry is not extended
+by repeated conflicts. The bounded runtime-maintenance sweep removes expired
+receipts, and explicit session deletion removes its owner-scoped receipts.
+
+The v83 core schema requires capture hashes and attempt markers on event and
+manifest writes. Deployments using an earlier table shape require a fresh-schema
+cutover; startup rejects missing capture columns rather than assigning empty
+hashes to old rows. Hashes include producer occurrence timestamps. Configuration
+version pushes are the exception: their envelope has a generated delivery time,
+so that field is hashed as JSON null and the first stored delivery time is kept.
+
 ## Event ingestion unhappy paths
 
 | Path | Required behavior |

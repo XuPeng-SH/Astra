@@ -4066,7 +4066,20 @@ async fn persist_context_manifest_for_llm_call(
         manifest_json: projection.manifest_json,
     };
     let store = DatabaseContextManifestStore::new(pool);
-    if let Err(error) = store.save_manifest(manifest, projection.items).await {
+    let capture = store.save_manifest(manifest, projection.items).await;
+    if matches!(
+        capture,
+        Ok(astra_services::observation_capture::DurableCaptureOutcome::Collision { .. })
+    ) {
+        tracing::warn!(
+            target: "astra_runtime::context_manifest",
+            run_id,
+            session_id,
+            manifest_id,
+            "context manifest identity collision; original observation retained"
+        );
+    }
+    if let Err(error) = capture {
         tracing::warn!(
             target: "astra_runtime::context_manifest",
             run_id,

@@ -36,6 +36,8 @@ pub struct RuntimeMaintenanceSweepResult {
     pub explicit_delete_intents_reconciled: u64,
     /// Old diagnostic request-context records removed after retention.
     pub model_request_context_events_expired: u64,
+    /// Expired aggregate observation-identity collision diagnostics.
+    pub observation_collision_receipts_expired: u64,
     /// Expired prompt-assembly request diagnostics removed after retention.
     pub prompt_request_records_expired: u64,
     /// Child prompt delta diagnostics removed before their parent requests.
@@ -94,6 +96,11 @@ pub async fn maintain_runtime_storage(
         "expire_model_request_context_events",
         crate::model_request_context::expire_model_request_context_events(pool, policy.batch_limit)
             .await,
+    );
+    result.observation_collision_receipts_expired = record_runtime_storage_maintenance(
+        &mut result.cleanup_errors,
+        "expire_observation_collision_receipts",
+        expire_observation_collision_receipts(pool, policy.batch_limit).await,
     );
     match crate::prompt_delta::expire_prompt_diagnostics(pool, policy.batch_limit).await {
         Ok(expiry) => {
@@ -168,6 +175,7 @@ impl RuntimeMaintenanceSweepResult {
     pub fn total_processed(&self) -> u64 {
         self.explicit_delete_intents_reconciled
             .saturating_add(self.model_request_context_events_expired)
+            .saturating_add(self.observation_collision_receipts_expired)
             .saturating_add(self.prompt_request_records_expired)
             .saturating_add(self.prompt_deltas_expired)
             .saturating_add(self.expired_fork_pins_released)
@@ -183,6 +191,22 @@ impl RuntimeMaintenanceSweepResult {
 
 const WORK_BRANCH_OPERATION_RETENTION_DAYS: u32 = 30;
 const ABANDONED_WORK_BRANCH_OPERATION_RETENTION_DAYS: u32 = 1;
+
+async fn expire_observation_collision_receipts(
+    pool: &astra_core::SharedPool,
+    batch_limit: u32,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM observation_identity_collisions
+         WHERE expires_at <= NOW(6)
+         ORDER BY expires_at, user_id, identity_kind, identity_id
+         LIMIT ?",
+    )
+    .bind(batch_limit)
+    .execute(pool.get())
+    .await
+    .map(|outcome| outcome.rows_affected())
+}
 
 async fn expire_work_branch_control_operations(
     pool: &astra_core::SharedPool,

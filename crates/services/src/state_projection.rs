@@ -124,7 +124,7 @@ pub const COMPACTION_INVARIANT_SQL: &[CompactionInvariant] = &[
         description: "Post-compaction plan_todo context must stay within 800 tokens.",
         sql: "SELECT COUNT(*) AS violations \
 	              FROM context_manifest_items i \
-	              JOIN context_manifests m ON m.manifest_id = i.manifest_id \
+	              JOIN context_manifests m ON m.user_id = i.user_id AND m.manifest_id = i.manifest_id \
 	              WHERE m.user_id = ? AND m.session_id = ? AND m.run_id = ? AND m.reason = 'post_compaction' \
 	                AND i.zone = 'plan_todo' AND i.token_estimate > 800",
         binds_compaction_run_id: true,
@@ -617,7 +617,7 @@ impl DatabaseStateProjectionStore {
                 "conversation_log://{session_id}/compaction@{manifest_id}"
             )),
         }];
-        DatabaseContextManifestStore::new(self.pool.clone())
+        let capture = DatabaseContextManifestStore::new(self.pool.clone())
             .save_manifest(manifest, items)
             .await
             .map_err(|source| StateProjectionError::Database {
@@ -630,6 +630,16 @@ impl DatabaseStateProjectionStore {
                     other => sqlx::Error::Protocol(other.to_string()),
                 },
             })?;
+        if matches!(
+            capture,
+            crate::observation_capture::DurableCaptureOutcome::Collision { .. }
+        ) {
+            return Err(StateProjectionError::Database {
+                operation: "save_post_compaction_manifest",
+                entity: session_id.to_string(),
+                source: sqlx::Error::Protocol("context manifest identity collision".into()),
+            });
+        }
         self.upsert_state_item(StateItemUpsert {
             item_id: Some(bounded_state_item_id(
                 "summary",
@@ -1266,16 +1276,30 @@ impl DatabaseStateProjectionStore {
                 status: version_status,
             });
         }
+        let event_payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+            &serde_json::json!({
+                "event_id": event_id, "session_id": session_id, "user_id": user_id,
+                "event_type": "ui.skill.activate", "content": skill_name,
+                "metadata": serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|source| StateProjectionError::Database {
+                    operation: "hash_skill_activation_event",
+                    entity: session_id.to_string(),
+                    source: sqlx::Error::Protocol(source.to_string()),
+                })?,
+            }),
+        );
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, created_at)
-             VALUES (?, ?, ?, 'ui.skill.activate', ?, ?, NOW(6))",
+             (event_id, session_id, user_id, event_type, content, metadata, payload_hash, ingestion_write_id, created_at)
+             VALUES (?, ?, ?, 'ui.skill.activate', ?, ?, ?, ?, NOW(6))",
         )
         .bind(&event_id)
         .bind(session_id)
         .bind(user_id)
         .bind(skill_name)
         .bind(&payload_json)
+        .bind(event_payload_hash)
+        .bind(uuid::Uuid::new_v4().to_string())
         .execute(&mut *tx)
         .await
         .map_err(|source| StateProjectionError::Database {
@@ -2008,6 +2032,22 @@ mod tests {
                 invariant.id
             );
         }
+    }
+
+    #[test]
+    fn context_manifest_compaction_join_is_owner_bound() {
+        let invariant = COMPACTION_INVARIANT_SQL
+            .iter()
+            .find(|invariant| invariant.id == "plan_todo_zone_cap")
+            .expect("plan_todo_zone_cap invariant");
+        let normalized = invariant
+            .sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains(
+            "JOIN context_manifests m ON m.user_id = i.user_id AND m.manifest_id = i.manifest_id"
+        ));
     }
 
     #[test]

@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::db_row::RowExt as ContextManifestDbRow;
+use crate::observation_capture::{
+    DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
+    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+};
 use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +30,10 @@ pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
 /// many more sections than the current projection. A chunk is still inserted
 /// in the same transaction and under the same session admission lock.
 const CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE: usize = 128;
+const CONTEXT_MANIFEST_ITEM_INSERT_SQL: &str = "INSERT INTO context_manifest_items
+     (user_id, manifest_id, session_id, item_order, zone, source_table, source_id, source_hash,
+      included, token_estimate, budget_tokens, reason, render_mode, raw_ref, created_at)
+     ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionArtifactStatusKind {
@@ -659,18 +667,45 @@ impl DatabaseContextManifestStore {
                 entity: event.entity.to_string(),
                 source,
             })?;
+        Self::insert_session_event_in_transaction(&mut tx, &event_id, &event).await?;
+        tx.commit()
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source,
+            })?;
+        Ok(event_id)
+    }
+
+    async fn insert_session_event_in_transaction(
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        event_id: &str,
+        event: &SessionEventInsert<'_>,
+    ) -> Result<(), ContextManifestError> {
+        let payload_hash = canonical_observation_payload_hash(
+            ObservationPayloadDomain::AgentEvent,
+            &serde_json::json!({
+                "event_id": event_id, "session_id": event.session_id,
+                "user_id": event.user_id, "event_type": event.event_type,
+                "content": event.content, "metadata": event.metadata,
+            }),
+        );
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6))",
+             (event_id, session_id, user_id, event_type, content, metadata,
+              payload_hash, ingestion_write_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
-        .bind(&event_id)
+        .bind(event_id)
         .bind(event.session_id)
         .bind(event.user_id)
         .bind(event.event_type)
         .bind(event.content)
         .bind(event.metadata.to_string())
-        .execute(&mut *tx)
+        .bind(payload_hash)
+        .bind(Uuid::new_v4().to_string())
+        .execute(&mut **tx)
         .await
         .map_err(|source| ContextManifestError::Database {
             operation: event.operation,
@@ -692,11 +727,11 @@ impl DatabaseContextManifestStore {
             });
         }
         crate::storage::add_agent_session_event_count_or_create(
-            &mut tx,
+            tx,
             event.session_id,
             event.user_id,
             inserted_events,
-            Some(&event_id),
+            Some(event_id),
         )
         .await
         .map_err(|source| ContextManifestError::Database {
@@ -704,14 +739,7 @@ impl DatabaseContextManifestStore {
             entity: event.entity.to_string(),
             source,
         })?;
-        tx.commit()
-            .await
-            .map_err(|source| ContextManifestError::Database {
-                operation: event.operation,
-                entity: event.entity.to_string(),
-                source,
-            })?;
-        Ok(event_id)
+        Ok(())
     }
 
     pub async fn normalize_reason(
@@ -751,18 +779,22 @@ impl DatabaseContextManifestStore {
     pub async fn save_manifest(
         &self,
         manifest: ContextManifestWrite,
-        items: Vec<ContextManifestItemWrite>,
-    ) -> Result<(), ContextManifestError> {
-        let reason = self
-            .normalize_reason(
-                &manifest.user_id,
-                &manifest.reason,
-                &manifest.session_id,
-                manifest.run_id.as_deref(),
-                &manifest.turn_id,
-                "context_manifest_store",
-            )
-            .await?;
+        mut items: Vec<ContextManifestItemWrite>,
+    ) -> Result<DurableCaptureOutcome, ContextManifestError> {
+        items.sort_by_key(|item| item.item_order);
+        let known_reason = CONTEXT_MANIFEST_REASONS
+            .iter()
+            .any(|(reason, _, _)| *reason == manifest.reason);
+        let reason = if known_reason {
+            manifest.reason.as_str()
+        } else {
+            "other"
+        };
+        let payload_hash = canonical_observation_payload_hash(
+            ObservationPayloadDomain::ContextManifest,
+            &serde_json::json!({"manifest": &manifest, "items": &items}),
+        );
+        let write_id = Uuid::new_v4().to_string();
         let dropped_count = items.iter().filter(|item| !item.included).count() as i64;
         let manifest_json = serde_json::to_string(&manifest.manifest_json).map_err(|source| {
             ContextManifestError::Json {
@@ -798,11 +830,12 @@ impl DatabaseContextManifestStore {
             )
         })?;
         let manifest_insert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO context_manifests
+            "INSERT IGNORE INTO context_manifests
              (manifest_id, user_id, session_id, run_id, turn_id, model_provider, model_name,
               context_window_tokens, max_output_tokens, total_estimated_tokens, policy_version,
-              tokenizer_id, budget_template_id, turn_intent, reason, dropped_count, manifest_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+              tokenizer_id, budget_template_id, turn_intent, reason, dropped_count, manifest_json,
+              payload_hash, ingestion_write_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
             [
                 manifest.run_id.is_some(),
                 manifest.tokenizer_id.is_some(),
@@ -825,9 +858,11 @@ impl DatabaseContextManifestStore {
             .bind(&manifest.tokenizer_id)
             .bind(&manifest.budget_template_id)
             .bind(&manifest.turn_intent)
-            .bind(&reason)
+            .bind(reason)
             .bind(dropped_count)
             .bind(manifest_json)
+            .bind(&payload_hash)
+            .bind(&write_id)
             .execute(&mut *tx)
             .await
             .map_err(|source| ContextManifestError::Database {
@@ -835,15 +870,80 @@ impl DatabaseContextManifestStore {
                 entity: manifest.manifest_id.clone(),
                 source,
             })?;
+        let stored: (String, String) = sqlx::query_as(
+            "SELECT payload_hash, ingestion_write_id FROM context_manifests
+             WHERE user_id = ? AND manifest_id = ?",
+        )
+        .bind(&manifest.user_id)
+        .bind(&manifest.manifest_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|source| ContextManifestError::Database {
+            operation: "classify_context_manifest",
+            entity: manifest.manifest_id.clone(),
+            source,
+        })?;
+        let outcome = classify_capture(&stored.0, &stored.1, &payload_hash, &write_id);
+        if let DurableCaptureOutcome::Collision {
+            stored_payload_hash,
+            attempted_payload_hash,
+        } = &outcome
+        {
+            record_observation_collision(
+                &mut tx,
+                ObservationCollisionReceipt {
+                    user_id: &manifest.user_id,
+                    domain: ObservationPayloadDomain::ContextManifest,
+                    identity_id: &manifest.manifest_id,
+                    session_id: &manifest.session_id,
+                    stored_payload_hash,
+                    attempted_payload_hash,
+                    source: "context_manifest",
+                },
+            )
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: "record_context_manifest_collision",
+                entity: manifest.manifest_id.clone(),
+                source,
+            })?;
+        }
+        if outcome != DurableCaptureOutcome::Inserted {
+            tx.commit()
+                .await
+                .map_err(|source| ContextManifestError::Database {
+                    operation: "commit_context_manifest_replay",
+                    entity: manifest.manifest_id.clone(),
+                    source,
+                })?;
+            return Ok(outcome);
+        }
+        if !known_reason {
+            Self::insert_session_event_in_transaction(
+                &mut tx,
+                &Uuid::new_v4().to_string(),
+                &SessionEventInsert {
+                    user_id: &manifest.user_id,
+                    session_id: &manifest.session_id,
+                    event_type: "manifest.reason_unknown",
+                    content: &manifest.reason,
+                    metadata: serde_json::json!({
+                        "proposed_reason": manifest.reason,
+                        "turn_id": manifest.turn_id,
+                        "run_id": manifest.run_id,
+                        "component": "context_manifest_store",
+                    }),
+                    operation: "manifest_reason_unknown_event",
+                    entity: &manifest.manifest_id,
+                },
+            )
+            .await?;
+        }
         for item_batch in items.chunks(CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE) {
-            let mut query = QueryBuilder::<MySql>::new(
-                "INSERT INTO context_manifest_items
-                 (manifest_id, session_id, item_order, zone, source_table, source_id, source_hash,
-                  included, token_estimate, budget_tokens, reason, render_mode, raw_ref, created_at)
-                 ",
-            );
+            let mut query = QueryBuilder::<MySql>::new(CONTEXT_MANIFEST_ITEM_INSERT_SQL);
             query.push_values(item_batch, |mut values, item| {
                 values
+                    .push_bind(&manifest.user_id)
                     .push_bind(&manifest.manifest_id)
                     .push_bind(&item.session_id)
                     .push_bind(item.item_order)
@@ -897,7 +997,8 @@ impl DatabaseContextManifestStore {
                 operation: "commit_context_manifest",
                 entity: manifest.manifest_id,
                 source,
-            })
+            })?;
+        Ok(DurableCaptureOutcome::Inserted)
     }
 
     pub async fn validate_raw_ref(&self, raw_ref: &str) -> Result<(), ContextManifestError> {
@@ -1414,5 +1515,14 @@ mod tests {
     #[test]
     fn context_manifest_item_batch_size_is_bounded() {
         assert_eq!(CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE, 128);
+    }
+
+    #[test]
+    fn context_manifest_item_insert_carries_parent_owner() {
+        let normalized = CONTEXT_MANIFEST_ITEM_INSERT_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("(user_id, manifest_id, session_id"));
     }
 }

@@ -12144,23 +12144,37 @@ impl DatabaseRunStateStore {
             })?;
         let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, meta_tool_name, created_at) ",
+             (event_id, session_id, user_id, event_type, content, metadata, meta_tool_name,
+              payload_hash, ingestion_write_id, created_at) ",
         );
+        let ingestion_write_id = Uuid::new_v4().to_string();
         builder.push_values(missing_events.iter(), |mut row, (tool_name, event_id)| {
+            let metadata = serde_json::json!({
+                "run_id": run_id,
+                "tool_name": tool_name,
+                "fallback_max_preview_bytes": FALLBACK_PREVIEW_BYTES,
+            });
+            let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                &serde_json::json!({
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "event_type": "preview_template_missing",
+                    "content": tool_name,
+                    "metadata": metadata,
+                    "meta_tool_name": tool_name,
+                }),
+            );
             row.push_bind(event_id)
                 .push_bind(session_id)
                 .push_bind(user_id)
                 .push_bind("preview_template_missing")
                 .push_bind(tool_name)
-                .push_bind(
-                    serde_json::json!({
-                        "run_id": run_id,
-                        "tool_name": tool_name,
-                        "fallback_max_preview_bytes": FALLBACK_PREVIEW_BYTES,
-                    })
-                    .to_string(),
-                )
+                .push_bind(metadata.to_string())
                 .push_bind(tool_name)
+                .push_bind(payload_hash)
+                .push_bind(&ingestion_write_id)
                 .push("NOW(6)");
         });
         let insert_result = builder.build().execute(&mut *tx).await.map_err(|source| {

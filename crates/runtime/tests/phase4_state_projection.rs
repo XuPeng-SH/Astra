@@ -12,6 +12,13 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
+fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
+    astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &payload,
+    )
+}
+
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
     assert_eq!(
         std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -1212,15 +1219,28 @@ async fn l3_15_s11_cross_session_decision_retrieval_has_provenance() {
         .await
         .unwrap();
     }
+    let retrieval_event_id = format!("retrieval-{}", Uuid::new_v4());
+    let retrieval_metadata =
+        json!({"source_session_id": source_sessions[0], "chunk_type": "decision"});
     sqlx::query(
         "INSERT INTO agent_events
-         (event_id, session_id, user_id, event_type, content, metadata, created_at)
-         VALUES (?, ?, ?, 'retrieval.fts_hit', 'decision recall', ?, NOW(6))",
+         (event_id, session_id, user_id, event_type, content, metadata, payload_hash,
+          ingestion_write_id, created_at)
+         VALUES (?, ?, ?, 'retrieval.fts_hit', 'decision recall', ?, ?, ?, NOW(6))",
     )
-    .bind(format!("retrieval-{}", Uuid::new_v4()))
+    .bind(&retrieval_event_id)
     .bind(&session_id)
     .bind(&user_id)
-    .bind(json!({"source_session_id": source_sessions[0], "chunk_type": "decision"}).to_string())
+    .bind(retrieval_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(json!({
+        "event_id": &retrieval_event_id,
+        "session_id": &session_id,
+        "user_id": &user_id,
+        "event_type": "retrieval.fts_hit",
+        "content": "decision recall",
+        "metadata": &retrieval_metadata,
+    })))
+    .bind(Uuid::new_v4().to_string())
     .execute(pool.get())
     .await
     .unwrap();

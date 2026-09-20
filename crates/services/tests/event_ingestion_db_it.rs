@@ -100,6 +100,14 @@ async fn assert_session_event_count(
 }
 
 async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str) {
+    let _ = sqlx::query(
+        "DELETE FROM observation_identity_collisions \
+         WHERE user_id = ? AND session_id = ? AND identity_kind = 'agent_event'",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?")
         .bind(user_id)
         .bind(session_id)
@@ -1063,7 +1071,10 @@ async fn event_ingest_config_version_dual_writes_config_versions_once() {
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue_async(event.clone()).await;
-    sender.enqueue_async(event.clone()).await;
+    let mut reconstructed_retry =
+        IngestionEvent::for_config_version(&row).expect("reconstruct retry");
+    reconstructed_retry.created_at = "2026-01-02T00:00:00Z".into();
+    sender.enqueue_async(reconstructed_retry).await;
     shutdown.signal();
     sender.shutdown();
     handle.await.expect("config version ingestion worker join");
@@ -1657,8 +1668,8 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
     cleanup_session(&pool, TEST_USER_ID, &valid_session_id).await;
 }
 
-/// Verifies that a duplicate event in a mixed batch cannot mutate causal
-/// edges just because another event in the same session was inserted.
+/// Verifies that a colliding event in a mixed batch cannot mutate causal
+/// edges or prevent a valid sibling from being inserted.
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
@@ -1674,7 +1685,8 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     let first = test_event(&duplicate_event_id, &session_id, "test_edge");
 
     let config = IngestionConfig::default();
-    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sender, shutdown, _initial_stats, handle) =
+        EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue_async(first.clone()).await;
     shutdown.signal();
     handle.await.unwrap();
@@ -1692,7 +1704,7 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
         channel_capacity: 8,
         ..Default::default()
     };
-    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue_async(duplicate_with_parent).await;
     sender.enqueue_async(unique_with_parent).await;
     shutdown.signal();
@@ -1708,7 +1720,7 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     .expect("count duplicate edges");
     assert_eq!(
         duplicate_edges, 0,
-        "duplicate event rows must not gain parent edges from a later ignored retry"
+        "colliding event rows must not gain parent edges from a later attempt"
     );
 
     let unique_parent: Option<String> = sqlx::query_scalar(
@@ -1721,6 +1733,23 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     .expect("load unique edge");
     assert_eq!(unique_parent.as_deref(), Some(unique_parent_id.as_str()));
     assert_session_event_count(&pool, TEST_USER_ID, &session_id, 2).await;
+
+    let receipt = sqlx::query(
+        "SELECT collision_count, source FROM observation_identity_collisions \
+         WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&duplicate_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load collision receipt");
+    assert_eq!(receipt.get::<u64, _>("collision_count"), 1);
+    assert_eq!(receipt.get::<String, _>("source"), "event_ingestion");
+
+    let stats = stats.lock().expect("stats lock").clone();
+    assert_eq!(stats.events_flushed, 2);
+    assert_eq!(stats.events_dropped_permanent, 1);
+    assert_eq!(stats.errors, 1);
 
     cleanup_session(&pool, TEST_USER_ID, &session_id).await;
 }

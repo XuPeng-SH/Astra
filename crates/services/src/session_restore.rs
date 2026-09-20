@@ -2610,12 +2610,35 @@ impl crate::state_sync::MatrixOneSyncService {
             return Err(err);
         }
 
+        let meta_tool_name = signal
+            .tool_surface
+            .as_ref()
+            .and_then(|selection| selection.visible_tools.first().cloned());
+        let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+            &serde_json::json!({
+                "event_id": event_id,
+                "session_id": session_id,
+                "user_id": user_id,
+                "agent_id": "astra-cli",
+                "agent_version": env!("CARGO_PKG_VERSION"),
+                "event_type": "context_trace_signal",
+                "content": content,
+                "parent_event_id": null,
+                "causal_chain_id": signal.turn_id,
+                "metadata": serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .map_err(|error| format!("context trace metadata: {error}"))?,
+                "reasoning_content": null,
+                "meta_tool_name": meta_tool_name,
+                "meta_duration_ms": duration_ms,
+            }),
+        );
         let insert_result = match sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
-              meta_duration_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+              meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&event_id)
         .bind(session_id)
@@ -2628,13 +2651,10 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(&signal.turn_id)
         .bind(metadata_json)
         .bind(None::<String>)
-        .bind(
-            signal
-                .tool_surface
-                .as_ref()
-                .and_then(|selection| selection.visible_tools.first().cloned()),
-        )
+        .bind(meta_tool_name)
         .bind(duration_ms)
+        .bind(payload_hash)
+        .bind(uuid::Uuid::new_v4().to_string())
         .execute(&mut *tx)
         .await
         {
@@ -4669,12 +4689,17 @@ mod tests {
         .expect("insert restore session");
         sqlx::query(
             "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, turn_seq, created_at)
-             VALUES (?, ?, ?, 'user_query', 'turn four', 4, NOW(6))",
+             (event_id, session_id, user_id, event_type, content, turn_seq, payload_hash, ingestion_write_id, created_at)
+             VALUES (?, ?, ?, 'user_query', 'turn four', 4, ?, ?, NOW(6))",
         )
         .bind(&event_id)
         .bind(&session_id)
         .bind(&user_id)
+        .bind(crate::observation_capture::canonical_observation_payload_hash(
+            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+            &serde_json::json!({"event_id": event_id, "session_id": session_id, "user_id": user_id, "event_type": "user_query", "content": "turn four", "turn_seq": 4}),
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
         .execute(pool.get())
         .await
         .expect("insert authoritative turn event");

@@ -11,14 +11,14 @@
 //!   │ accumulates events in buffer
 //!   │ flushes when: buffer >= BATCH_SIZE or FLUSH_INTERVAL elapsed
 //!   ▼
-//! MatrixOne `agent_events` table     ← batch INSERT IGNORE (idempotent)
+//! MatrixOne `agent_events` table     ← hash-fenced batch insertion
 //! ```
 //!
 //! # Guarantees
 //!
 //! - **Retry after acceptance**: flushed batches are retained across transient
-//!   MatrixOne failures and retried; duplicate inserts are deduped by
-//!   `(user_id, event_id)` PK
+//!   MatrixOne failures and retried; owner-scoped identity readback
+//!   distinguishes exact replays from conflicting payloads
 //! - **Backpressure**: bounded channel; async callers await capacity, sync
 //!   callers defer when running inside Tokio. Diagnostic telemetry is shed
 //!   before it consumes channel capacity reserved for critical audit facts.
@@ -37,6 +37,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
+use crate::observation_capture::{
+    DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
+    canonical_observation_payload_hash, classify_capture, record_observation_collision,
+};
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
 };
@@ -74,6 +78,7 @@ pub const DEFAULT_INGESTION_DB_ATTEMPT_TIMEOUT_SECS: u64 = 30;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
 const TELEMETRY_CHANNEL_RESERVE_DIVISOR: usize = 10;
 const MIN_SHARED_POOL_CONNECTION_RESERVE: usize = 2;
+const AGENT_EVENT_COLLISION_SOURCE: &str = "event_ingestion";
 const INGESTION_LATENCY_BUCKET_UPPER_US: [u64; 16] = [
     1_000,
     2_000,
@@ -434,9 +439,9 @@ impl IngestionEvent {
     /// (see `config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE`)
     /// to dual-write: agent_events row AND config_versions row.
     ///
-    /// Event id == version id so INSERT IGNORE on the PK also
-    /// handles agent_events dedup — pushing the same config twice
-    /// records "the fact of pushing it" exactly once on both tables.
+    /// Event id == version id so hash-fenced agent-event insertion also
+    /// handles exact replay — pushing the same config twice records "the fact
+    /// of pushing it" exactly once on both tables.
     pub fn for_config_version(
         row: &crate::config_version_cloud::ConfigVersionPayload,
     ) -> Result<Self, String> {
@@ -1676,6 +1681,7 @@ fn canonical_token_usage_json_from_journal_event(
 #[derive(Debug)]
 struct IngestionEventInsertValues<'a> {
     event: &'a IngestionEvent,
+    payload_hash: String,
     token_usage_json: Option<String>,
     metadata_json: Option<String>,
     skill_name: Option<String>,
@@ -1698,6 +1704,18 @@ struct TokenUsageDbFields {
 
 impl<'a> IngestionEventInsertValues<'a> {
     fn from_event(event: &'a IngestionEvent) -> Result<Self, String> {
+        let mut complete_payload = serde_json::to_value(event)
+            .map_err(|error| format!("serialize complete ingestion event payload: {error}"))?;
+        if event.event_type == crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE {
+            // ConfigVersionPayload has no occurrence timestamp. Its queued
+            // created_at is delivery time, regenerated on every reconstruction,
+            // whereas version_id and content are the durable identity.
+            complete_payload["created_at"] = Value::Null;
+        }
+        let payload_hash = canonical_observation_payload_hash(
+            ObservationPayloadDomain::AgentEvent,
+            &complete_payload,
+        );
         let usage = match event.token_usage.as_ref() {
             Some(value) => match CanonicalTokenUsage::from_json(value) {
                 Ok(usage) => usage,
@@ -1743,6 +1761,7 @@ impl<'a> IngestionEventInsertValues<'a> {
         let meta_duration_ms = metadata_duration_ms(metadata);
         Ok(Self {
             event,
+            payload_hash,
             token_usage_json: token_fields.token_usage_json,
             metadata_json: metadata.map(Value::to_string),
             skill_name: normalize_optional_name(event.skill_name.clone()),
@@ -1801,9 +1820,113 @@ fn add_inserted_rows(total: &mut i64, rows_affected: u64, context: &str) -> Resu
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IngestionCaptureAttempt {
+    event_id: String,
+    payload_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IngestionCaptureReadback {
+    payload_hash: String,
+    ingestion_write_id: String,
+}
+
+fn all_capture_rows_were_inserted(
+    reported_rows_inserted: i64,
+    attempts: &[IngestionCaptureAttempt],
+) -> bool {
+    if attempts.is_empty() || usize::try_from(reported_rows_inserted).ok() != Some(attempts.len()) {
+        return false;
+    }
+    let mut identities = HashSet::with_capacity(attempts.len());
+    attempts.iter().all(|attempt| {
+        !attempt.event_id.is_empty()
+            && attempt.event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
+            && identities.insert(attempt.event_id.as_str())
+    })
+}
+
+fn classify_ingestion_capture_attempts(
+    attempts: &[IngestionCaptureAttempt],
+    readbacks: &HashMap<String, IngestionCaptureReadback>,
+    attempted_write_id: &str,
+) -> Result<Vec<DurableCaptureOutcome>, String> {
+    let mut inserted_effects = HashSet::new();
+    attempts
+        .iter()
+        .map(|attempt| {
+            let stored = readbacks.get(&attempt.event_id).ok_or_else(|| {
+                format!(
+                    "event_ingestion.capture_readback: missing owner-scoped row for event_id={}",
+                    attempt.event_id
+                )
+            })?;
+            let outcome = classify_capture(
+                &stored.payload_hash,
+                &stored.ingestion_write_id,
+                &attempt.payload_hash,
+                attempted_write_id,
+            );
+            if outcome == DurableCaptureOutcome::Inserted
+                && !inserted_effects.insert(attempt.event_id.clone())
+            {
+                return Ok(DurableCaptureOutcome::Replayed);
+            }
+            Ok(outcome)
+        })
+        .collect()
+}
+
+async fn read_back_ingestion_captures(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    attempts: &[IngestionCaptureAttempt],
+) -> Result<HashMap<String, IngestionCaptureReadback>, String> {
+    let event_ids = attempts
+        .iter()
+        .map(|attempt| attempt.event_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT event_id, payload_hash, ingestion_write_id FROM agent_events WHERE user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(" AND event_id IN (");
+    let mut separated = builder.separated(", ");
+    for event_id in event_ids {
+        separated.push_bind(event_id);
+    }
+    separated.push_unseparated(")");
+
+    let rows = builder
+        .build_query_as::<(String, String, String)>()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("event capture readback for {user_id}: {error}"))?;
+    let mut readbacks = HashMap::with_capacity(rows.len());
+    for (event_id, payload_hash, ingestion_write_id) in rows {
+        if readbacks
+            .insert(
+                event_id.clone(),
+                IngestionCaptureReadback {
+                    payload_hash,
+                    ingestion_write_id,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "event_ingestion.capture_readback: duplicate owner-scoped row for event_id={event_id}"
+            ));
+        }
+    }
+    Ok(readbacks)
+}
+
 fn bind_ingestion_event<'q>(
     mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
     values: &'q IngestionEventInsertValues<'q>,
+    ingestion_write_id: &'q str,
 ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
     let event = values.event;
     query = query
@@ -1824,7 +1947,9 @@ fn bind_ingestion_event<'q>(
         .bind(values.meta_duration_ms)
         .bind(values.token_input)
         .bind(values.token_output)
-        .bind(values.token_total);
+        .bind(values.token_total)
+        .bind(&values.payload_hash)
+        .bind(ingestion_write_id);
     query
 }
 
@@ -2510,37 +2635,37 @@ impl EventIngestionWorker {
             });
         }
 
-        let mut rows_inserted = 0_i64;
-        let mut inserted_session_end_sessions =
-            std::collections::BTreeSet::<(String, String)>::new();
+        let ingestion_write_id = uuid::Uuid::new_v4().to_string();
+        let event_rows = events
+            .iter()
+            .map(IngestionEventInsertValues::from_event)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut plain_events = Vec::new();
         let mut plain_session_end_events = Vec::new();
         let mut parented_events = Vec::new();
-        for event in events {
+        for values in &event_rows {
+            let event = values.event;
             if ingestion_event_has_parent_edges(event) {
-                parented_events.push(event);
+                parented_events.push(values);
             } else if event.event_type == SESSION_END_EVENT_TYPE {
-                plain_session_end_events.push(event);
+                plain_session_end_events.push(values);
             } else {
-                plain_events.push(event);
+                plain_events.push(values);
             }
         }
 
-        let mut session_rows_inserted = 0_i64;
+        let mut reported_rows_inserted = 0_i64;
         if !plain_events.is_empty() {
-            let plain_event_rows = plain_events
-                .iter()
-                .map(|event| IngestionEventInsertValues::from_event(event))
-                .collect::<Result<Vec<_>, _>>()?;
             let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "INSERT IGNORE INTO agent_events \
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
                       created_at, parent_event_id, causal_chain_id, \
                       tool_call_id, meta_tool_name, meta_duration_ms, \
-                      token_input, token_output, token_total) ",
+                      token_input, token_output, token_total, payload_hash, \
+                      ingestion_write_id) ",
             );
-            builder.push_values(plain_event_rows.iter(), |mut row, values| {
+            builder.push_values(plain_events.iter(), |mut row, values| {
                 let event = values.event;
                 row.push_bind(&event.event_id)
                     .push_bind(&event.session_id)
@@ -2559,12 +2684,14 @@ impl EventIngestionWorker {
                     .push_bind(values.meta_duration_ms)
                     .push_bind(values.token_input)
                     .push_bind(values.token_output)
-                    .push_bind(values.token_total);
+                    .push_bind(values.token_total)
+                    .push_bind(&values.payload_hash)
+                    .push_bind(&ingestion_write_id);
             });
             builder.push(matrixone_null_shape_comment(
-                plain_event_rows
+                plain_events
                     .iter()
-                    .flat_map(IngestionEventInsertValues::nullable_shape),
+                    .flat_map(|values| values.nullable_shape()),
             ));
 
             let insert_result = builder
@@ -2573,36 +2700,147 @@ impl EventIngestionWorker {
                 .await
                 .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
             add_inserted_rows(
-                &mut session_rows_inserted,
+                &mut reported_rows_inserted,
                 insert_result.rows_affected(),
                 "event_ingestion.batch_insert",
             )?;
         }
 
-        for event in plain_session_end_events.into_iter().chain(parented_events) {
-            let values = IngestionEventInsertValues::from_event(event)?;
+        for values in plain_session_end_events.into_iter().chain(parented_events) {
             let insert_sql = matrixone_statement_with_null_shape(
                 "INSERT IGNORE INTO agent_events \
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
                       created_at, parent_event_id, causal_chain_id, \
                       tool_call_id, meta_tool_name, meta_duration_ms, \
-                      token_input, token_output, token_total) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      token_input, token_output, token_total, payload_hash, \
+                      ingestion_write_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 values.nullable_shape(),
             );
-            let insert_result = bind_ingestion_event(sqlx::query(&insert_sql), &values)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
-            if insert_result.rows_affected() == 0 {
-                continue;
-            }
+            let insert_result =
+                bind_ingestion_event(sqlx::query(&insert_sql), values, &ingestion_write_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
             add_inserted_rows(
-                &mut session_rows_inserted,
+                &mut reported_rows_inserted,
                 insert_result.rows_affected(),
                 "event_ingestion.single_insert",
             )?;
+        }
+
+        let capture_attempts = event_rows
+            .iter()
+            .map(|values| IngestionCaptureAttempt {
+                event_id: values.event.event_id.clone(),
+                payload_hash: values.payload_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        let capture_outcomes =
+            if all_capture_rows_were_inserted(reported_rows_inserted, &capture_attempts) {
+                // INSERT IGNORE reports one affected row per newly inserted row.
+                // When every distinct, untruncated identity was inserted, there is
+                // no existing row to classify. Partial insertion and retries after
+                // an actually committed attempt take the owner-scoped readback path.
+                vec![DurableCaptureOutcome::Inserted; capture_attempts.len()]
+            } else {
+                let capture_readbacks =
+                    read_back_ingestion_captures(&mut tx, user_id, &capture_attempts).await?;
+                classify_ingestion_capture_attempts(
+                    &capture_attempts,
+                    &capture_readbacks,
+                    &ingestion_write_id,
+                )?
+            };
+
+        let mut inserted_events = Vec::new();
+        let mut replayed_events = 0_usize;
+        let mut collision_events = 0_usize;
+        for (values, outcome) in event_rows.iter().zip(capture_outcomes) {
+            match outcome {
+                DurableCaptureOutcome::Inserted => inserted_events.push(values.event),
+                DurableCaptureOutcome::Replayed => {
+                    replayed_events = replayed_events.saturating_add(1);
+                }
+                DurableCaptureOutcome::Collision {
+                    stored_payload_hash,
+                    attempted_payload_hash,
+                } => {
+                    collision_events = collision_events.saturating_add(1);
+                    record_observation_collision(
+                        &mut tx,
+                        ObservationCollisionReceipt {
+                            user_id,
+                            domain: ObservationPayloadDomain::AgentEvent,
+                            identity_id: &values.event.event_id,
+                            session_id,
+                            stored_payload_hash: &stored_payload_hash,
+                            attempted_payload_hash: &attempted_payload_hash,
+                            source: AGENT_EVENT_COLLISION_SOURCE,
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "record event identity collision for {user_id}/{}: {error}",
+                            values.event.event_id
+                        )
+                    })?;
+                    tracing::warn!(
+                        target: "astra_services::event_ingestion",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        event_id = %values.event.event_id,
+                        stored_payload_hash = %stored_payload_hash,
+                        attempted_payload_hash = %attempted_payload_hash,
+                        "event identity collision recorded without applying derived effects"
+                    );
+                }
+            }
+        }
+
+        let inserted_event_count = u64::try_from(inserted_events.len())
+            .map_err(|_| "event_ingestion.inserted_events: len exceeds u64::MAX".to_string())?;
+        let inserted_event_count = crate::storage::rows_affected_to_i64(
+            inserted_event_count,
+            "event_ingestion.inserted_events",
+        )
+        .map_err(|error| error.to_string())?;
+        if inserted_event_count > 0 {
+            crate::storage::add_agent_session_event_count_after_admission(
+                &mut tx,
+                session_id,
+                user_id,
+                inserted_event_count,
+                None,
+            )
+            .await
+            .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
+        }
+
+        if reported_rows_inserted != inserted_event_count {
+            tracing::debug!(
+                target: "astra_services::event_ingestion",
+                user_id = %user_id,
+                session_id = %session_id,
+                reported_rows_inserted,
+                classified_rows_inserted = inserted_event_count,
+                "database row count differed from hash-fenced insertion readback"
+            );
+        }
+        if replayed_events > 0 || collision_events > 0 {
+            astra_core::agent_info!(
+                "event_ingestion",
+                "hash-fenced insertion classified {replayed_events} replays and \
+                 {collision_events} collisions out of {} events",
+                events.len()
+            );
+        }
+
+        let mut inserted_session_end_sessions =
+            std::collections::BTreeSet::<(String, String)>::new();
+        for event in &inserted_events {
             if event.event_type == SESSION_END_EVENT_TYPE {
                 inserted_session_end_sessions
                     .insert((event.user_id.clone(), event.session_id.clone()));
@@ -2621,40 +2859,6 @@ impl EventIngestionWorker {
             }
         }
 
-        if session_rows_inserted > 0 {
-            crate::storage::add_agent_session_event_count_after_admission(
-                &mut tx,
-                session_id,
-                user_id,
-                session_rows_inserted,
-                None,
-            )
-            .await
-            .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
-            rows_inserted = rows_inserted
-                .checked_add(session_rows_inserted)
-                .ok_or_else(|| {
-                    "event_ingestion.rows_inserted: inserted row total overflow".to_string()
-                })?;
-        }
-
-        // Log if duplicates were detected (useful for debugging)
-        let requested_event_count = u64::try_from(events.len())
-            .map_err(|_| "event_ingestion.requested_events: len exceeds u64::MAX".to_string())?;
-        let requested_events = crate::storage::rows_affected_to_i64(
-            requested_event_count,
-            "event_ingestion.requested_events",
-        )
-        .map_err(|e| e.to_string())?;
-        if rows_inserted < requested_events {
-            let skipped = requested_events - rows_inserted;
-            astra_core::agent_info!(
-                "event_ingestion",
-                "INSERT IGNORE skipped {skipped} duplicates out of {} events",
-                events.len()
-            );
-        }
-
         for (user_id, session_id) in inserted_session_end_sessions {
             sqlx::query(
                 "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
@@ -2669,13 +2873,11 @@ impl EventIngestionWorker {
         }
 
         // Step 4b: dual-write config-version events into the
-        // `config_versions` table. Any event the classifier
-        // recognises gets an INSERT IGNORE with the content-
-        // addressed PK so a duplicate push from another machine
-        // is a zero-row no-op. We reuse the same transaction so
-        // the agent_events row and the config_versions row land
-        // together.
-        for event in events {
+        // `config_versions` table. Only events classified as newly inserted
+        // reach this projection. The content-addressed PK remains a secondary
+        // safeguard, and the shared transaction keeps the agent_events row
+        // and config_versions row atomic.
+        for event in inserted_events {
             let Some(payload) = crate::config_version_cloud::extract_config_version_payload(event)?
             else {
                 continue;
@@ -2694,7 +2896,7 @@ impl EventIngestionWorker {
 
         Ok(IngestionBatchOutcome {
             events_resolved: session_event_count,
-            ..Default::default()
+            events_dropped_permanent: collision_events,
         })
     }
 }
@@ -4207,7 +4409,7 @@ mod tests {
             .event_id;
         assert_eq!(
             id1, id2,
-            "event_id must be deterministic for INSERT IGNORE dedup"
+            "event_id must be deterministic for hash-fenced replay"
         );
     }
 
@@ -4481,6 +4683,204 @@ mod tests {
         event.skill_name = Some(" ".to_string());
         let values = IngestionEventInsertValues::from_event(&event).expect("valid event");
         assert_eq!(values.skill_name, None);
+    }
+
+    #[test]
+    fn reconstructed_config_version_delivery_time_is_not_new_content() {
+        let row = crate::config_version_cloud::ConfigVersionPayload {
+            version_id: "config-version".into(),
+            user_id: "owner".into(),
+            toml_body: "model = 'example'".into(),
+            first_seen_session: Some("session".into()),
+        };
+        let mut first = IngestionEvent::for_config_version(&row).unwrap();
+        let mut retry = IngestionEvent::for_config_version(&row).unwrap();
+        first.created_at = "2026-01-01T00:00:00Z".into();
+        retry.created_at = "2026-01-02T00:00:00Z".into();
+        let first_hash = IngestionEventInsertValues::from_event(&first)
+            .unwrap()
+            .payload_hash;
+        assert_eq!(
+            first_hash,
+            IngestionEventInsertValues::from_event(&retry)
+                .unwrap()
+                .payload_hash
+        );
+        retry.content = Some("model = 'changed'".into());
+        assert_ne!(
+            first_hash,
+            IngestionEventInsertValues::from_event(&retry)
+                .unwrap()
+                .payload_hash
+        );
+    }
+
+    #[test]
+    fn event_payload_hash_covers_complete_durable_payload_only() {
+        let base = test_event("evt-hash", "sess-hash", "turn_complete");
+        let complete_payload = serde_json::to_value(&base).expect("serializable event");
+        let expected = canonical_observation_payload_hash(
+            ObservationPayloadDomain::AgentEvent,
+            &complete_payload,
+        );
+        assert_eq!(
+            IngestionEventInsertValues::from_event(&base)
+                .expect("valid event")
+                .payload_hash,
+            expected,
+            "the insertion fence must hash the complete serialized event"
+        );
+
+        let mut process_local_change = base.clone();
+        process_local_change.ingestion_enqueued_at = Some(std::time::Instant::now());
+        assert_eq!(
+            expected,
+            IngestionEventInsertValues::from_event(&process_local_change)
+                .expect("valid event")
+                .payload_hash,
+            "process-local queue bookkeeping must not change the durable payload hash"
+        );
+
+        let mut changed_payload = complete_payload;
+        changed_payload["parent_event_ids"] = serde_json::json!(["parent-a", "parent-b"]);
+        assert_ne!(
+            expected,
+            canonical_observation_payload_hash(
+                ObservationPayloadDomain::AgentEvent,
+                &changed_payload,
+            ),
+            "derived edge inputs are part of the complete payload fence"
+        );
+    }
+
+    #[test]
+    fn full_insert_fast_path_requires_exact_count_and_distinct_bounded_identities() {
+        let attempt = |event_id: &str| IngestionCaptureAttempt {
+            event_id: event_id.into(),
+            payload_hash: "hash".into(),
+        };
+        assert!(all_capture_rows_were_inserted(
+            2,
+            &[attempt("a"), attempt("b")]
+        ));
+        assert!(!all_capture_rows_were_inserted(
+            1,
+            &[attempt("a"), attempt("b")]
+        ));
+        assert!(!all_capture_rows_were_inserted(0, &[attempt("a")]));
+        assert!(!all_capture_rows_were_inserted(
+            2,
+            &[attempt("a"), attempt("a")]
+        ));
+        assert!(!all_capture_rows_were_inserted(1, &[attempt("")]));
+        assert!(!all_capture_rows_were_inserted(
+            1,
+            &[attempt(&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN + 1))]
+        ));
+    }
+
+    #[test]
+    fn capture_classification_isolates_collisions_and_deduplicates_inserted_effects() {
+        let attempts = vec![
+            IngestionCaptureAttempt {
+                event_id: "inserted".to_string(),
+                payload_hash: "hash-inserted".to_string(),
+            },
+            IngestionCaptureAttempt {
+                event_id: "inserted".to_string(),
+                payload_hash: "hash-inserted".to_string(),
+            },
+            IngestionCaptureAttempt {
+                event_id: "replayed".to_string(),
+                payload_hash: "hash-replayed".to_string(),
+            },
+            IngestionCaptureAttempt {
+                event_id: "collision".to_string(),
+                payload_hash: "hash-attempted".to_string(),
+            },
+            IngestionCaptureAttempt {
+                event_id: "same-attempt-conflict".to_string(),
+                payload_hash: "hash-winner".to_string(),
+            },
+            IngestionCaptureAttempt {
+                event_id: "same-attempt-conflict".to_string(),
+                payload_hash: "hash-loser".to_string(),
+            },
+        ];
+        let readbacks = HashMap::from([
+            (
+                "inserted".to_string(),
+                IngestionCaptureReadback {
+                    payload_hash: "hash-inserted".to_string(),
+                    ingestion_write_id: "attempt".to_string(),
+                },
+            ),
+            (
+                "replayed".to_string(),
+                IngestionCaptureReadback {
+                    payload_hash: "hash-replayed".to_string(),
+                    ingestion_write_id: "earlier-attempt".to_string(),
+                },
+            ),
+            (
+                "collision".to_string(),
+                IngestionCaptureReadback {
+                    payload_hash: "hash-stored".to_string(),
+                    ingestion_write_id: "earlier-attempt".to_string(),
+                },
+            ),
+            (
+                "same-attempt-conflict".to_string(),
+                IngestionCaptureReadback {
+                    payload_hash: "hash-winner".to_string(),
+                    ingestion_write_id: "attempt".to_string(),
+                },
+            ),
+        ]);
+
+        let outcomes = classify_ingestion_capture_attempts(&attempts, &readbacks, "attempt")
+            .expect("every identity has an owner-scoped readback");
+
+        assert_eq!(
+            outcomes,
+            vec![
+                DurableCaptureOutcome::Inserted,
+                DurableCaptureOutcome::Replayed,
+                DurableCaptureOutcome::Replayed,
+                DurableCaptureOutcome::Collision {
+                    stored_payload_hash: "hash-stored".to_string(),
+                    attempted_payload_hash: "hash-attempted".to_string(),
+                },
+                DurableCaptureOutcome::Inserted,
+                DurableCaptureOutcome::Collision {
+                    stored_payload_hash: "hash-winner".to_string(),
+                    attempted_payload_hash: "hash-loser".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DurableCaptureOutcome::Inserted)
+                .count(),
+            2,
+            "only one derived-effect trigger is allowed per newly inserted identity"
+        );
+    }
+
+    #[test]
+    fn capture_classification_retries_when_owner_scoped_readback_is_missing() {
+        let error = classify_ingestion_capture_attempts(
+            &[IngestionCaptureAttempt {
+                event_id: "missing".to_string(),
+                payload_hash: "hash".to_string(),
+            }],
+            &HashMap::new(),
+            "attempt",
+        )
+        .expect_err("an ignored insert without a durable row is unresolved");
+
+        assert!(error.contains("missing owner-scoped row"));
     }
 
     #[test]
