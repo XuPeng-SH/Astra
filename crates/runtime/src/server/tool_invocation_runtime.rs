@@ -838,14 +838,20 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
         };
-        match record.state {
-            ToolInvocationState::Prepared => {
-                validate_decision(&record.decision)
-                    .map_err(RuntimeInvocationLedgerError::InvalidDecision)?;
-                Ok(InvocationPrepareDisposition::Prepared {
-                    decision: record.decision,
-                })
+        // Replay must validate immutable execution identity too. A terminal
+        // result cannot bypass allocation/decision binding merely because it
+        // no longer needs a dispatch lease.
+        validate_decision(&record.decision).map_err(|reason| {
+            RuntimeInvocationLedgerError::InvalidDecision {
+                reason,
+                state: record.state,
+                dispatch_certainty: record.dispatch_certainty,
             }
+        })?;
+        match record.state {
+            ToolInvocationState::Prepared => Ok(InvocationPrepareDisposition::Prepared {
+                decision: record.decision,
+            }),
             ToolInvocationState::Dispatched => {
                 let authoritative = self.reconcile_expired_dispatch(identity).await?;
                 let superseding_event_index = guidance_completion_event_index(&authoritative);
@@ -1519,6 +1525,27 @@ fn durability_error_result(
     )
 }
 
+pub(crate) fn ledger_error_result(
+    identity: &ToolInvocationIdentity,
+    error: &RuntimeInvocationLedgerError,
+) -> astra_tools::ToolResult {
+    if let RuntimeInvocationLedgerError::InvalidDecision {
+        state,
+        dispatch_certainty,
+        ..
+    } = error
+    {
+        return invocation_state_result(
+            identity,
+            *state,
+            "tool_invocation_decision",
+            *dispatch_certainty != DispatchCertainty::NotDispatched,
+            &error.to_string(),
+        );
+    }
+    ledger_unavailable_result(identity, error)
+}
+
 pub(crate) fn ledger_unavailable_result(
     identity: &ToolInvocationIdentity,
     detail: impl std::fmt::Display,
@@ -1586,8 +1613,12 @@ pub(crate) enum RuntimeInvocationLedgerError {
     InMemory(Box<InvocationLedgerError>),
     #[error("invalid durable invocation record: {0}")]
     InvalidRecord(String),
-    #[error("invalid frozen tool invocation decision: {0}")]
-    InvalidDecision(String),
+    #[error("invalid frozen tool invocation decision: {reason}")]
+    InvalidDecision {
+        reason: String,
+        state: ToolInvocationState,
+        dispatch_certainty: DispatchCertainty,
+    },
     #[error("tool invocation dispatch clock error: {0}")]
     Clock(String),
     #[error("durable tool dispatch is missing its applied control boundary")]
@@ -2876,10 +2907,35 @@ mod tests {
             .await;
         assert_eq!(retried.result.output, "original evidence");
         assert_eq!(retried.record, original.record);
-        let prepared = ledger
+        let rejected = ledger
             .prepare_for_execution(&identity, &fingerprint, &decision("decision-v1"), |_| {
-                panic!("terminal replay must not reauthorize")
+                Err("allocation mismatch".to_string())
             })
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(RuntimeInvocationLedgerError::InvalidDecision { ref reason, .. })
+                if reason == "allocation mismatch"
+        ));
+        let result = ledger_error_result(&identity, &rejected.err().unwrap());
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["side_effects_maybe"], true);
+        assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["durable_invocation_state"], "succeeded");
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().as_ref(),
+            original.record.as_deref()
+        );
+        let prepared = ledger
+            .prepare_for_execution(
+                &identity,
+                &fingerprint,
+                &decision("decision-v1"),
+                |stored| {
+                    assert_eq!(stored, &decision("decision-v1"));
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         let InvocationPrepareDisposition::Return(replay) = prepared else {

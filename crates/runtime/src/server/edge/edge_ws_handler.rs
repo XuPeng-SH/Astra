@@ -2033,6 +2033,7 @@ mod tests {
 
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "dispatch-request".to_string(),
             identity: Box::new(
                 astra_turn_types::ToolInvocationIdentity::new(

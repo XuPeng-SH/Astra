@@ -448,6 +448,7 @@ async fn try_edge_websocket(
                 edge_agent_id: &edge.edge_agent_id,
                 tool: &request.tool_name,
                 args: plan.args(),
+                evaluation_allocation: plan.evaluation_allocation(),
                 runtime_process_authorization: plan.runtime_process_authorization(),
                 timeout_secs: plan.execution_timeout_secs(),
                 cancel_token,

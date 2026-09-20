@@ -798,6 +798,8 @@ pub struct RuntimeToolExecutor {
     /// Explicit workspace, executor, runtime, and provisioned workspace record
     /// used for routing, tool visibility, and runtime preparation.
     execution_binding: ExecutionBindingState,
+    evaluation_workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
     capabilities: astra_turn_core::capability::CapabilitySet,
 
     // ── Locking (journals and dedup) ──────────────────────────────────────────
@@ -1060,6 +1062,7 @@ impl RuntimeToolExecutor {
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
             execution_binding: ExecutionBindingState::none(),
+            evaluation_workspace: None,
             capabilities,
             enforce_server_tool_capabilities: false,
             server_service_tools_enabled: true,
@@ -2774,6 +2777,16 @@ impl RuntimeToolExecutor {
         self
     }
 
+    pub(crate) fn with_evaluation_workspace(
+        mut self,
+        workspace: Option<
+            astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization,
+        >,
+    ) -> Self {
+        self.evaluation_workspace = workspace;
+        self
+    }
+
     pub fn with_admitted_execution_deadline(
         mut self,
         deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
@@ -3050,6 +3063,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.evaluation_workspace = self.evaluation_workspace.clone();
         request.runtime_process_authorization =
             astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
                 name,
@@ -3081,6 +3095,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.evaluation_workspace = self.evaluation_workspace.clone();
         request.runtime_process_authorization =
             astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
                 name,
@@ -3524,7 +3539,7 @@ impl RuntimeToolExecutor {
             let frozen_decision = match ledger
                 .prepare_for_execution(&identity, &fingerprint, &durable_decision, |decision| {
                     crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
-                        .map(|_| ())
+                        .and_then(|snapshot| snapshot.validate_evaluation_binding(&request))
                         .map_err(|error| error.to_string())
                 })
                 .await
@@ -3552,8 +3567,8 @@ impl RuntimeToolExecutor {
                 Err(error) => {
                     let dispatch_control = dispatch_control_for_invocation_error(&error);
                     return GovernableRuntimeToolResult::completed_with_dispatch_control(
-                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                            &identity, error,
+                        crate::server::tool_invocation_runtime::ledger_error_result(
+                            &identity, &error,
                         ),
                         dispatch_control,
                     );
@@ -3710,8 +3725,8 @@ impl RuntimeToolExecutor {
                     }
                     let dispatch_control = dispatch_control_for_invocation_error(&error);
                     return GovernableRuntimeToolResult::completed_with_dispatch_control(
-                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                            &identity, error,
+                        crate::server::tool_invocation_runtime::ledger_error_result(
+                            &identity, &error,
                         ),
                         dispatch_control,
                     );

@@ -1649,6 +1649,7 @@ mod tests {
                 ExecutorStatus::Online,
             ),
             workspace_record: None,
+            evaluation_workspace: None,
             runtime: None,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,

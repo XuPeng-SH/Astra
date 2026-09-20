@@ -5253,6 +5253,7 @@ async fn attest_edge_workspace(
                     tool: "bash",
                     args: &args,
                     runtime_process_authorization: None,
+                    evaluation_allocation: None,
                     timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
                     cancel_token: None,
                 },
@@ -5291,6 +5292,7 @@ async fn attest_edge_workspace(
             request_id.clone(),
         );
         let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: request_id.clone(),
             identity: Box::new(identity.clone()),
             delivery_generation: 1,

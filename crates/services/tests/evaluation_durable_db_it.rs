@@ -468,7 +468,8 @@ async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() 
         )
         .await
         .expect("current generation admits the exact receipt set");
-    assert_eq!(admitted.len(), 2);
+    assert_eq!(admitted.receipts.len(), 2);
+    assert!(admitted.workspace.is_none());
     assert!(matches!(
         validate_receipt_set(
             &binding,
@@ -2309,7 +2310,7 @@ async fn workspace_admission_resolves_allocation_artifacts_and_rejects_missing_o
                 .receipt_id,
         );
     }
-    receipts
+    let validated = receipts
         .validate_receipts_for_execution(
             &owner,
             &binding.trial_id,
@@ -2321,6 +2322,7 @@ async fn workspace_admission_resolves_allocation_artifacts_and_rejects_missing_o
         )
         .await
         .unwrap();
+    assert_eq!(validated.workspace.as_ref(), Some(&evidence));
     // Expiry after receipt issuance must prevent execution with that same receipt set.
     sqlx::query("UPDATE session_artifacts SET status = 'expired' WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
         .bind(&owner).bind(&session).bind(evidence.artifact_id()).execute(pool.get()).await.unwrap();

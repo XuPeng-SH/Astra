@@ -4796,6 +4796,8 @@ fn terminal_proof_for_repair<T>(
 }
 
 struct AdmittedEvaluationTrial {
+    workspace:
+        Option<astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization>,
     admission: EvaluationRunAdmission,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 }
@@ -8852,7 +8854,7 @@ impl AgenticRunLifecycleService {
         } else {
             admission.receipt_ids.clone()
         };
-        materializer
+        let materialization = materializer
             .validate_receipts_for_execution(
                 user_id,
                 &trial.trial_id,
@@ -8871,6 +8873,7 @@ impl AgenticRunLifecycleService {
                 )
             })?;
         Ok(AdmittedEvaluationTrial {
+            workspace: materialization.workspace,
             admission: EvaluationRunAdmission {
                 experiment_id: admission.experiment_id.clone(),
                 trial_id: admission.trial_id.clone(),
@@ -19008,6 +19011,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "evaluation requires an empty canonical session",
             ));
         }
+        let mut evaluation_workspace = None;
         // Admit the frozen trial only after the canonical coordinator has
         // reserved the session boundary. The reservation is the atomic
         // empty-session check; doing trial admission before it could leave a
@@ -19032,6 +19036,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
             {
                 Ok(admitted) => {
+                    evaluation_workspace = admitted.workspace;
                     if let Some(skill_resolver) = admitted.skill_resolver {
                         runtime_capabilities.request_scoped_skill_resolver = Some(skill_resolver);
                     }
@@ -19314,6 +19319,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             )
+            .with_evaluation_workspace(evaluation_workspace)
             .with_admitted_execution_deadline(request.admitted_execution_deadline);
             if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.memory_extraction_service.as_ref())

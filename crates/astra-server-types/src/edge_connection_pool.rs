@@ -55,6 +55,7 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub identity: &'a ToolInvocationIdentity,
     pub edge_agent_id: &'a str,
     pub tool: &'a str,
+    pub evaluation_allocation: Option<&'a astra_runtime_env::EvaluationAllocationReceipt>,
     pub args: &'a serde_json::Value,
     pub runtime_process_authorization:
         Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
@@ -1079,6 +1080,7 @@ impl EdgeConnectionPool {
         self.execute_durably_admitted_invocation_on_connection_with_cancel(
             DurablyAdmittedEdgeInvocation {
                 connection_user_id: &identity.user_id,
+                evaluation_allocation: None,
                 identity,
                 edge_agent_id,
                 tool,
@@ -1119,6 +1121,7 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_process_authorization,
+            evaluation_allocation,
             timeout_secs,
             cancel_token,
         } = invocation;
@@ -1168,6 +1171,7 @@ impl EdgeConnectionPool {
         );
 
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: evaluation_allocation.cloned().map(Box::new),
             request_id: request_id.clone(),
             identity: Box::new(identity.clone()),
             delivery_generation,
@@ -1853,6 +1857,7 @@ mod tests {
             caller_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        evaluation_allocation: None,
                         connection_user_id: "user-1",
                         identity: &identity,
                         edge_agent_id: "edge-a",

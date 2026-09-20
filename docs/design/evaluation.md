@@ -554,6 +554,16 @@ content hash. Both receipt issuance and execution admission resolve the artifact
 and reject absent, expired, changed, or incorrectly bound evidence. A path or Git
 tree alone is no longer accepted as workspace materialization evidence.
 
+Execution admission carries that resolved artifact into the canonical tool
+executor. Each durable dispatch decision freezes the allocation evidence, and
+both dispatch and terminal-result replay check it against the admitted Run.
+Edge requests carry the expected receipt; the dedicated provider validates it
+against its retained allocation before new execution. Its durable invocation
+journal binds the receipt alongside the invocation identity and arguments, so
+active redelivery and completed replay cannot substitute another allocation.
+Completed replay retains the original evidence even after workspace release;
+it does not claim a new execution or require recreating the old workspace.
+
 The adapter's execution machinery routes Edge file/shell calls through canonical
 tool dispatch and records the source checkout as a receipt. New workspace trials
 remain unavailable until a qualified provider advertises the required capability.

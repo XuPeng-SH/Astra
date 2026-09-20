@@ -223,6 +223,7 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
+        evaluation_allocation: Option<Box<astra_runtime_env::EvaluationAllocationReceipt>>,
         /// Opaque provider authorization injected only for this bash call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
@@ -459,6 +460,7 @@ mod tests {
     #[test]
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "req-456".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -477,6 +479,7 @@ mod tests {
     #[test]
     fn edge_tool_request_round_trips_hidden_process_authorization() {
         let msg = EdgeServerMessage::ToolRequest {
+            evaluation_allocation: None,
             request_id: "req-process-auth".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,

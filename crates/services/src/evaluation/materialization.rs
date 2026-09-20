@@ -20,6 +20,13 @@ use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Resolved execution evidence; workspace authority is loaded from the exact
+/// immutable artifact while the canonical trial binding is locked.
+pub struct ValidatedMaterializationReceipts {
+    pub receipts: Vec<MaterializationReceiptRecord>,
+    pub workspace: Option<super::workspace_evidence::EvaluationWorkspaceMaterialization>,
+}
+
 pub const MATERIALIZATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_OWNER_ID_BYTES: usize = 128;
 const MAX_RECEIPT_ID_BYTES: usize = 64;
@@ -497,7 +504,7 @@ impl DatabaseMaterializationReceiptStore {
         envelope: &SnapshotEnvelope,
         receipt_ids: &[String],
         now: DateTime<Utc>,
-    ) -> Result<Vec<MaterializationReceiptRecord>, MaterializationReceiptError> {
+    ) -> Result<ValidatedMaterializationReceipts, MaterializationReceiptError> {
         validate_identifier("owner_user_id", owner_user_id, MAX_OWNER_ID_BYTES)?;
         validate_identifier("trial_id", trial_id, MAX_TRIAL_ID_BYTES)?;
         validate_identifier("session_id", session_id, MAX_SESSION_ID_BYTES)?;
@@ -555,18 +562,21 @@ impl DatabaseMaterializationReceiptStore {
         }
         validate_receipt_set(&binding, &experiment.spec, envelope, &receipts, now)
             .map_err(|error| MaterializationReceiptError::Conflict(error.to_string()))?;
+        let mut workspace = None;
         for receipt in &receipts {
             if receipt.component_kind == MaterializationComponentKind::Workspace
                 && receipt.outcome == MaterializationOutcome::Available
             {
-                validate_workspace_artifact_tx(
-                    &mut tx,
-                    &binding,
-                    &experiment.spec,
-                    receipt.component_snapshot_ref.as_deref(),
-                    receipt.component_content_fingerprint.as_deref(),
-                )
-                .await?;
+                workspace = Some(
+                    validate_workspace_artifact_tx(
+                        &mut tx,
+                        &binding,
+                        &experiment.spec,
+                        receipt.component_snapshot_ref.as_deref(),
+                        receipt.component_content_fingerprint.as_deref(),
+                    )
+                    .await?,
+                );
             }
         }
         tx.commit()
@@ -575,7 +585,10 @@ impl DatabaseMaterializationReceiptStore {
                 operation: "commit_validate_materialization_receipts",
                 source,
             })?;
-        Ok(receipts)
+        Ok(ValidatedMaterializationReceipts {
+            receipts,
+            workspace,
+        })
     }
 
     async fn load_by_idempotency(
@@ -871,7 +884,10 @@ async fn validate_workspace_artifact_tx(
     spec: &ExperimentSpec,
     artifact_ref: Option<&str>,
     fingerprint: Option<&str>,
-) -> Result<(), MaterializationReceiptError> {
+) -> Result<
+    super::workspace_evidence::EvaluationWorkspaceMaterialization,
+    MaterializationReceiptError,
+> {
     use super::workspace_evidence::{
         EvaluationWorkspaceMaterialization, WORKSPACE_ALLOCATION_ARTIFACT_KIND,
         WORKSPACE_ALLOCATION_ARTIFACT_SOURCE,
@@ -927,7 +943,8 @@ async fn validate_workspace_artifact_tx(
     }
     evidence
         .validate_binding(binding, spec)
-        .map_err(MaterializationReceiptError::Conflict)
+        .map_err(MaterializationReceiptError::Conflict)?;
+    Ok(evidence)
 }
 
 fn validate_new_expiry(

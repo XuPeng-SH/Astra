@@ -24,6 +24,7 @@ pub(crate) struct EdgeBoundExecutionPlan {
     identity: astra_turn_types::ToolInvocationIdentity,
     tool_name: String,
     args: Value,
+    evaluation_allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
     timeout_secs: u64,
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
@@ -79,6 +80,10 @@ impl EdgeBoundExecutionPlan {
             identity,
             tool_name: request.tool_name.clone(),
             args,
+            evaluation_allocation: request
+                .evaluation_workspace
+                .as_ref()
+                .map(|workspace| workspace.allocation.clone()),
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
@@ -106,6 +111,12 @@ impl EdgeBoundExecutionPlan {
 
     pub(crate) fn identity(&self) -> &astra_turn_types::ToolInvocationIdentity {
         &self.identity
+    }
+
+    pub(crate) fn evaluation_allocation(
+        &self,
+    ) -> Option<&astra_runtime_env::EvaluationAllocationReceipt> {
+        self.evaluation_allocation.as_ref()
     }
 
     pub(crate) fn runtime_process_authorization(
@@ -140,6 +151,7 @@ impl EdgeBoundExecutionPlan {
 
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            evaluation_allocation: self.evaluation_allocation.clone().map(Box::new),
             request_id: self.dispatch_request_id.clone(),
             identity: Box::new(self.identity.clone()),
             delivery_generation: 1,

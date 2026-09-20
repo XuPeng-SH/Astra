@@ -1428,6 +1428,26 @@ struct EvaluationToolCall<'a> {
     tool: &'a str,
     args: &'a Value,
     process_authorization: bool,
+    allocation: &'a astra_runtime_env::EvaluationAllocationReceipt,
+}
+
+fn valid_evaluation_allocation_request(
+    dedicated: bool,
+    allocation: Option<&astra_runtime_env::EvaluationAllocationReceipt>,
+    identity: &astra_turn_types::ToolInvocationIdentity,
+    workspace: Option<&Path>,
+) -> bool {
+    match (dedicated, allocation) {
+        (false, None) => true,
+        (true, Some(allocation)) => {
+            allocation.validate().is_ok()
+                && allocation.owner_user_id == identity.user_id
+                && allocation.session_id == identity.session_id
+                && allocation.run_id == identity.run_id
+                && workspace == Some(Path::new(&allocation.workspace_dir))
+        }
+        _ => false,
+    }
 }
 
 async fn execute_evaluation_tool(
@@ -1442,6 +1462,7 @@ async fn execute_evaluation_tool(
         tool,
         args,
         process_authorization,
+        allocation,
     } = call;
     let mut allocations = tokio::select! {
         guard = allocations.lock() => guard,
@@ -1449,6 +1470,7 @@ async fn execute_evaluation_tool(
     };
     let admission = (|| {
         let path = path.ok_or("dedicated tools require an allocated workspace")?;
+        allocations.validate(allocation)?;
         let executor = allocations.executor(path, identity)?;
         if process_authorization || !EVALUATION_TOOLS.contains(&tool) {
             return Err(
@@ -2557,6 +2579,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 tool,
                                 args: mut tool_args,
                                 runtime_process_authorization,
+                                evaluation_allocation,
                                 runtime_process_authorization_required,
                                 timeout_secs,
                                 }) => {
@@ -2597,14 +2620,20 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         .await?;
                                     continue;
                                 }
+                                if !valid_evaluation_allocation_request(config.evaluation.is_some(), evaluation_allocation.as_deref(), &identity, workspace_override.as_deref()) {
+                                    let message = rejected_tool_message(request_id, *identity, delivery_generation, "Evaluation allocation binding is missing or inconsistent");
+                                    write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
+                                    continue;
+                                }
                                 let execution_permit = execution_budget.try_acquire();
                                 match journal
                                     .prepare(
                                         &request_id,
                                         &identity,
                                         delivery_generation,
-                                        &tool,
-                                        &journal_args,
+                                        invocation_journal::InvocationPayload {
+                                            tool: &tool, args: &journal_args, allocation: evaluation_allocation.as_deref(),
+                                        },
                                         execution_permit.is_some(),
                                     )
                                     .await
@@ -2694,6 +2723,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         let result = execute_evaluation_tool(
                                             evaluation, workspace_override.as_deref(), EvaluationToolCall {
                                                 identity: &identity, tool: &tool, args: &tool_args,
+                                                allocation: evaluation_allocation.as_deref().expect("validated dedicated allocation"),
                                                 process_authorization: runtime_process_authorization.is_some() || runtime_process_authorization_required,
                                             }, timeout_secs, &cancel,
                                         ).await;
@@ -3115,7 +3145,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         }
     }
 
-    invocations.cancel_all();
     Ok(())
     }.await;
 
