@@ -1231,6 +1231,9 @@ test-ignored-integration:
 	fi
 	@if [ "$${ASTRA_TEST_DB_IT:-}" = "1" ]; then \
 		FAILED=""; \
+		EVALUATION_EDGE_BIN="$${CARGO_TARGET_DIR:-target}/debug/astra-edge"; \
+		case "$$EVALUATION_EDGE_BIN" in /*) ;; *) EVALUATION_EDGE_BIN="$$(pwd)/$$EVALUATION_EDGE_BIN" ;; esac; \
+		CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-edge --bin astra-edge || exit 1; \
 		JOBS_FLAG=""; \
 		if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then \
 			JOBS_FLAG="-j 1"; \
@@ -1241,7 +1244,7 @@ test-ignored-integration:
 		PERF_FAILED=""; \
 		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
 			echo "Running runtime/plan integration and performance tests in one serial build..."; \
-			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_EVALUATION_EDGE_BIN="$$EVALUATION_EDGE_BIN" ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
@@ -1249,7 +1252,7 @@ test-ignored-integration:
 				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
-			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_EVALUATION_EDGE_BIN="$$EVALUATION_EDGE_BIN" ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \

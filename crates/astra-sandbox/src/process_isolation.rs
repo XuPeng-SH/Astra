@@ -257,6 +257,34 @@ pub struct BashInvocationOwner {
 }
 
 impl BashInvocationOwner {
+    fn prepare_supervised(
+        target_program: &str,
+        target_args: &[String],
+    ) -> std::io::Result<(std::process::Command, Self)> {
+        #[cfg(target_os = "linux")]
+        {
+            let (command, supervisor) = InvocationSupervisor::prepare(target_program, target_args)?;
+            Ok((
+                command,
+                Self {
+                    process_scope: CgroupGuard {
+                        cg_path: None,
+                        procs_path: None,
+                    },
+                    supervisor: Some(supervisor),
+                },
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (target_program, target_args);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "invocation supervisor requires Linux",
+            ))
+        }
+    }
+
     /// Prepare the actual child command and its ownership boundary. Call
     /// [`Self::install`] after the caller has completed environment/sandbox
     /// filtering and immediately before spawn.
@@ -1150,6 +1178,7 @@ fn network_namespace_available() -> bool {
     })
 }
 
+#[cfg(test)]
 fn requested_namespaces_available(config: &IsolationConfig) -> bool {
     unshare_available()
         && (!config.mount_namespace || mount_namespace_available())
@@ -2156,7 +2185,19 @@ pub async fn execute_isolated_with_cancel(
     config: &IsolationConfig,
     cancel_token: Option<&CancellationToken>,
 ) -> IsolatedOutput {
-    execute_isolated_with_cancel_impl(command, env, config, cancel_token, None).await
+    execute_isolated_with_cancel_impl(command, env, config, cancel_token, false, None).await
+}
+
+/// Execute with the invocation-private supervisor as the required process
+/// owner. Callers use this when a durable receipt must not depend on delegated
+/// cgroup settlement behavior.
+pub async fn execute_isolated_with_cancel_supervised(
+    command: &str,
+    env: &std::collections::HashMap<String, String>,
+    config: &IsolationConfig,
+    cancel_token: Option<&CancellationToken>,
+) -> IsolatedOutput {
+    execute_isolated_with_cancel_impl(command, env, config, cancel_token, true, None).await
 }
 
 async fn execute_isolated_with_cancel_impl(
@@ -2164,6 +2205,7 @@ async fn execute_isolated_with_cancel_impl(
     env: &std::collections::HashMap<String, String>,
     config: &IsolationConfig,
     cancel_token: Option<&CancellationToken>,
+    force_supervisor: bool,
     supervisor_helper: Option<(PathBuf, Vec<String>)>,
 ) -> IsolatedOutput {
     let preflight_error = |stderr: String| IsolatedOutput {
@@ -2215,7 +2257,13 @@ async fn execute_isolated_with_cancel_impl(
         }
     }
     let wants_ns = config.pid_namespace || config.mount_namespace || config.net_namespace;
-    let ns_available = wants_ns && requested_namespaces_available(config);
+    let user_pid_namespace_available = unshare_available();
+    let mount_namespace_available = !config.mount_namespace || mount_namespace_available();
+    let network_namespace_available = !config.net_namespace || network_namespace_available();
+    let ns_available = wants_ns
+        && user_pid_namespace_available
+        && mount_namespace_available
+        && network_namespace_available;
 
     // Warn operators when namespace isolation was requested but is unavailable.
     // In Strict mode, this is a hard failure — security guarantees are NOT met.
@@ -2228,9 +2276,9 @@ async fn execute_isolated_with_cancel_impl(
         );
         return IsolatedOutput {
             stdout: String::new(),
-            stderr: "Error: namespace isolation unavailable — strict-mode requires \
-                     PID/mount/network namespace isolation (unshare not found or not permitted)"
-                .to_string(),
+            stderr: format!(
+                "Error: namespace isolation unavailable — strict-mode requires PID/mount/network namespace isolation (user_pid={user_pid_namespace_available}, mount={mount_namespace_available}, network={network_namespace_available})"
+            ),
             exit_code: None,
             timed_out: false,
             cancelled: false,
@@ -2375,7 +2423,7 @@ async fn execute_isolated_with_cancel_impl(
     // Resource-limit cgroups remain preferred. If the host cannot create
     // one, use the same invocation owner as Edge/shared Bash so a setsid or
     // double-fork cannot escape the server-local execution boundary.
-    let (mut std_cmd, mut invocation_owner) = if cg_path.is_some() {
+    let (mut std_cmd, mut invocation_owner) = if cg_path.is_some() && !force_supervisor {
         let mut command = std::process::Command::new(&program);
         command.args(&args);
         (command, None)
@@ -2388,6 +2436,8 @@ async fn execute_isolated_with_cancel_impl(
                 &program,
                 &args,
             )
+        } else if force_supervisor {
+            BashInvocationOwner::prepare_supervised(&program, &args)
         } else {
             BashInvocationOwner::prepare(&program, &args)
         };
@@ -2479,9 +2529,8 @@ async fn execute_isolated_with_cancel_impl(
                 descendants_terminated: false,
             };
         }
-    } else {
-        attach_std_child_to_cgroup(&mut std_cmd, cgroup_procs_path.as_deref());
     }
+    attach_std_child_to_cgroup(&mut std_cmd, cgroup_procs_path.as_deref());
     let supervised_invocation = invocation_owner
         .as_ref()
         .is_some_and(BashInvocationOwner::is_supervised);
@@ -3186,7 +3235,8 @@ mod tests {
             ],
         );
         let out =
-            execute_isolated_with_cancel_impl(&command, &env, &config, None, Some(helper)).await;
+            execute_isolated_with_cancel_impl(&command, &env, &config, None, false, Some(helper))
+                .await;
 
         assert_eq!(out.exit_code, Some(0), "{out:?}");
         assert!(out.scope_settled, "{out:?}");
@@ -3205,6 +3255,7 @@ mod tests {
     async fn execute_isolated_cancel_stops_supervised_setsid_descendant_before_helper() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("cancel-late-marker");
+        let ready = temp.path().join("cancel-ready");
         let mut config = IsolationConfig::disabled(temp.path().to_path_buf());
         config.memory_limit_bytes = 0;
         config.cpu_quota = 0.0;
@@ -3212,8 +3263,9 @@ mod tests {
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let command = format!(
             "setsid sh -c 'sleep 0.35; echo escaped > \"{}\"' >/dev/null 2>&1 & \
-             echo ready; sleep 60",
-            marker.display()
+             echo ready > \"{}\"; sleep 60",
+            marker.display(),
+            ready.display()
         );
         let helper = (
             std::env::current_exe().expect("test executable"),
@@ -3224,13 +3276,30 @@ mod tests {
             ],
         );
         let cancel = CancellationToken::new();
-        let run =
-            execute_isolated_with_cancel_impl(&command, &env, &config, Some(&cancel), Some(helper));
+        let run = execute_isolated_with_cancel_impl(
+            &command,
+            &env,
+            &config,
+            Some(&cancel),
+            false,
+            Some(helper),
+        );
         tokio::pin!(run);
-        tokio::select! {
-            output = &mut run => panic!("command exited before cancellation: {output:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(80)) => cancel.cancel(),
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    output = &mut run => panic!("command exited before cancellation: {output:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if ready.exists() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("supervised command ready");
+        cancel.cancel();
         let out = run.await;
 
         assert!(out.cancelled, "{out:?}");
@@ -3271,7 +3340,8 @@ mod tests {
             ],
         );
         let run = tokio::spawn(async move {
-            execute_isolated_with_cancel_impl(&command, &env, &config, None, Some(helper)).await
+            execute_isolated_with_cancel_impl(&command, &env, &config, None, false, Some(helper))
+                .await
         });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

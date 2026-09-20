@@ -13,6 +13,10 @@ use astra_services::evaluation::{
 };
 use astra_services::{AdmittedModelExecution, auth::FernetTokenEncryptor};
 use astra_turn_types::InferencePurpose;
+
+const REQUEST_JUDGMENT_MAX_OUTPUT_TOKENS: usize = astra_turn_types::REQUEST_JUDGMENT_MAX_FIELDS
+    * (astra_turn_types::SEMANTIC_JUDGMENT_ID_MAX_BYTES + 4)
+    + 64;
 use astra_turn_types::auxiliary_execution::{AuxiliaryCallGate, WorkAdmissionGate};
 
 /// Normal resolution and frozen Evaluation consumption are mutually exclusive.
@@ -96,8 +100,9 @@ fn validate_auxiliary_coverage(config: &EvaluationExecutionConfig) -> Result<(),
     let expected = [
         ("pre_turn_compaction", InferencePurpose::RequiredCompaction),
         ("required_compaction", InferencePurpose::RequiredCompaction),
+        ("request_judgment", InferencePurpose::Introspection),
         ("skill_auto_route", InferencePurpose::Introspection),
-        ("turn_intent", InferencePurpose::Introspection),
+        ("work_plan", InferencePurpose::Introspection),
     ];
     if config.auxiliary_policies.len() != expected.len()
         || expected.iter().any(|(operation, purpose)| {
@@ -108,7 +113,7 @@ fn validate_auxiliary_coverage(config: &EvaluationExecutionConfig) -> Result<(),
         })
     {
         return Err(
-            "evaluation requires exactly the four admitted auxiliary operation policies".into(),
+            "evaluation requires exactly the five admitted auxiliary operation policies".into(),
         );
     }
     Ok(())
@@ -206,17 +211,27 @@ impl PreparedExecutionInputs {
         let primary_thinking =
             astra_turn_core::thinking_config::resolve_model_thinking(&admitted.model_name).1;
         let route = admitted_execution_route(admitted);
+        let request_judgment_output_tokens = admitted
+            .max_completion_tokens
+            .map_or(REQUEST_JUDGMENT_MAX_OUTPUT_TOKENS, |limit| {
+                REQUEST_JUDGMENT_MAX_OUTPUT_TOKENS.min(limit as usize)
+            });
         let mut auxiliary_policies = Vec::new();
         for (operation, purpose, output) in [
             (
-                "turn_intent",
+                "request_judgment",
                 InferencePurpose::Introspection,
-                astra_services::WORK_ADMISSION_MAX_OUTPUT_TOKENS,
+                request_judgment_output_tokens,
             ),
             (
                 "skill_auto_route",
                 InferencePurpose::Introspection,
                 SKILL_AUTO_ROUTE_MAX_OUTPUT_TOKENS,
+            ),
+            (
+                "work_plan",
+                InferencePurpose::Introspection,
+                astra_services::WORK_ADMISSION_MAX_OUTPUT_TOKENS,
             ),
             (
                 "required_compaction",
@@ -476,13 +491,20 @@ mod tests {
             vec![
                 ("pre_turn_compaction", 4_096),
                 (
+                    "request_judgment",
+                    super::REQUEST_JUDGMENT_MAX_OUTPUT_TOKENS
+                ),
+                (
                     "required_compaction",
                     astra_turn_types::context_execution::CompactConfig::default()
                         .summary_token_budget
                 ),
-                ("skill_auto_route", 64),
                 (
-                    "turn_intent",
+                    "skill_auto_route",
+                    super::SKILL_AUTO_ROUTE_MAX_OUTPUT_TOKENS,
+                ),
+                (
+                    "work_plan",
                     astra_services::WORK_ADMISSION_MAX_OUTPUT_TOKENS
                 )
             ]

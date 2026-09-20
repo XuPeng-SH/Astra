@@ -819,10 +819,9 @@ fn validate_component_against_envelope(
                         .to_string(),
                 ));
             };
-            let expected_base = format!("git://{}", workspace.source_commit);
-            if component_base_snapshot_ref != Some(expected_base.as_str()) {
+            if component_base_snapshot_ref.is_some() {
                 return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt must carry the frozen source commit".to_string(),
+                    "workspace receipt must use one canonical materialization address".to_string(),
                 ));
             }
             let Some(tree) = component_content_fingerprint else {
@@ -835,11 +834,14 @@ fn validate_component_against_envelope(
                     "workspace receipt source tree must be a full Git object id".to_string(),
                 ));
             }
-            if !component_snapshot_ref
-                .is_some_and(|snapshot| snapshot.starts_with("edge-workspace://"))
-            {
+            let expected_suffix = format!("/{}", workspace.source_commit);
+            if !component_snapshot_ref.is_some_and(|snapshot| {
+                snapshot.starts_with("edge-workspace://")
+                    && snapshot.ends_with(expected_suffix.as_str())
+            }) {
                 return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt must carry an Edge materialization address".to_string(),
+                    "workspace receipt must carry the frozen source commit in its Edge materialization address"
+                        .to_string(),
                 ));
             }
         }

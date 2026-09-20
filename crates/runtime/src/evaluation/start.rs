@@ -142,7 +142,9 @@ pub async fn start_trial(
         "evaluation_start_fingerprint".to_string(),
         Value::String(plan.request_fingerprint.clone()),
     );
-    let session =
+    let session_id = if trial.binding_status == "bound" {
+        plan.session_id.clone()
+    } else {
         crate::server::session::session_quota::create_idempotent_session_with_resource_quota(
             state,
             owner_user_id.to_string(),
@@ -154,8 +156,10 @@ pub async fn start_trial(
             },
             plan.request_fingerprint.clone(),
         )
-        .await?;
-    let chat_request = build_chat_request(plan, session.session_id.clone())?;
+        .await?
+        .session_id
+    };
+    let chat_request = build_chat_request(plan, session_id)?;
     let run = state
         .execution
         .run_lifecycle_service

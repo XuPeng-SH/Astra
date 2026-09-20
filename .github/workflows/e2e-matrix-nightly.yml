@@ -66,6 +66,10 @@ jobs:
           TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
         run: |
           set -euo pipefail
+          cargo build --manifest-path Cargo.toml -p astra-edge --bin astra-edge
+          EDGE_BIN="${CARGO_TARGET_DIR:-target}/debug/astra-edge"
+          if [[ "$EDGE_BIN" != /* ]]; then EDGE_BIN="$PWD/$EDGE_BIN"; fi
+          export ASTRA_EVALUATION_EDGE_BIN="$EDGE_BIN"
           FILTER="${TEST_NAME_FILTER:-}"
           if [ -n "$FILTER" ]; then
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \

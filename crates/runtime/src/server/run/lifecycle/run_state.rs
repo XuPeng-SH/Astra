@@ -414,6 +414,7 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                         | "run_interrupted"
                         | "run_waiting"
                         | "run_finished"
+                        | "evaluation_coding_evidence"
                         | "evaluation_skill_invoked"
                         | "evaluation_judgment"
                         // Keep reasoning/thinking completion markers, not raw

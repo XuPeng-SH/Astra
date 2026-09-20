@@ -36,7 +36,8 @@ pub use policy::{
 pub use process_isolation::{
     BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
     ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope, execute_isolated,
-    execute_isolated_with_cancel, invocation_supervisor_is_requested, process_scope_available,
+    execute_isolated_with_cancel, execute_isolated_with_cancel_supervised,
+    invocation_supervisor_is_requested, process_scope_available,
     run_invocation_supervisor_if_requested,
 };
 pub use shell_hardening::{

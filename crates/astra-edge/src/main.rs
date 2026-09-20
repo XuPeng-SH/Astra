@@ -1567,7 +1567,7 @@ async fn finalize_evaluation_workspace(
             ),
             ("TZ".to_string(), "UTC".to_string()),
         ]);
-        let output = astra_sandbox::execute_isolated_with_cancel(
+        let output = astra_sandbox::execute_isolated_with_cancel_supervised(
             verifier_command,
             &environment,
             &config,
@@ -1576,7 +1576,16 @@ async fn finalize_evaluation_workspace(
         .await;
         if !output.scope_settled {
             preserve_unsettled_workspace = output.execution_started;
-            return Err("workspace verifier process scope did not settle".into());
+            return Err(format!(
+                "workspace verifier process scope did not settle: ownership={:?}, namespace_active={}, cgroup_active={}, exit_code={:?}, timed_out={}, cancelled={}, stderr={}",
+                output.scope_ownership,
+                output.namespace_active,
+                output.cgroup_active,
+                output.exit_code,
+                output.timed_out,
+                output.cancelled,
+                output.stderr.trim(),
+            ));
         }
         let verification = prepared.verification.clone();
         let result_tree = prepared.result_tree.clone();
@@ -3035,8 +3044,16 @@ async fn settle_invocations(
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    if let Some(exit_code) = astra_sandbox::run_invocation_supervisor_if_requested() {
+        std::process::exit(exit_code);
+    }
+    astra_core::process_runtime::build_process_runtime()
+        .expect("build Edge runtime")
+        .block_on(run());
+}
+
+async fn run() {
     // The release builds CLI and Edge together, unifying ring and aws-lc
     // features. Select the Edge provider before constructing any TLS client.
     rustls::crypto::ring::default_provider()

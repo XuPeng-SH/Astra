@@ -19709,6 +19709,11 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         json!({"event_type": "run_error", "data": {"error": "boom"}}),
         json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         json!({
+            "event_type": "evaluation_coding_evidence",
+            "idempotency_key": "evaluation-coding-evidence:run-1:1",
+            "data": {"status": "unavailable", "detail": {"reason": "fixture"}}
+        }),
+        json!({
             "event_type": "evaluation_judgment",
             "idempotency_key": "evaluation-judgment:run-1:1",
             "data": {"operation_id": "skill_auto_route", "status": "negative"}
@@ -19716,7 +19721,7 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     ];
 
     let persisted = terminal_events_for_persistence(&events);
-    assert_eq!(persisted.len(), 8);
+    assert_eq!(persisted.len(), 9);
     assert_eq!(persisted[0]["type"], "reasoning_done");
     assert_eq!(persisted[1]["type"], "thinking_done");
     assert_eq!(persisted[2]["type"], "runtime.control.handoff.requested");
@@ -19724,7 +19729,8 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     assert_eq!(persisted[4]["event_type"], "text_done");
     assert_eq!(persisted[5]["event_type"], "run_error");
     assert_eq!(persisted[6]["event_type"], "run_finished");
-    assert_eq!(persisted[7]["event_type"], "evaluation_judgment");
+    assert_eq!(persisted[7]["event_type"], "evaluation_coding_evidence");
+    assert_eq!(persisted[8]["event_type"], "evaluation_judgment");
 }
 
 #[tokio::test]

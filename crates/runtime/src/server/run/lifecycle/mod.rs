@@ -40,7 +40,10 @@ use uuid::Uuid;
 use crate::turn::canonical_commit::{
     CanonicalRewriteProof, canonical_commit_delta, pack_canonical_turn_segments,
 };
-use crate::turn::run_control::{RunControlProvider, RunControlStatus, UserIntentProvider};
+use crate::turn::run_control::{
+    ProviderBoundaryAuthorization, RunControlProvider, RunControlStatus,
+    UserIntentAdmissionAuthority, UserIntentProvider,
+};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
     error_response_coded_with_metadata,
@@ -8779,10 +8782,7 @@ impl AgenticRunLifecycleService {
                                 "edge-workspace://{materialization_id}/{}",
                                 workspace_policy.source_commit
                             )),
-                            component_base_snapshot_ref: Some(format!(
-                                "git://{}",
-                                workspace_policy.source_commit
-                            )),
+                            component_base_snapshot_ref: None,
                             component_content_fingerprint: Some(source_tree.clone()),
                             outcome: MaterializationOutcome::Available,
                             failure_code: None,
@@ -11245,6 +11245,9 @@ impl AgenticRunLifecycleService {
             || prepared.workspace_dir == base_root
             || prepared.workspace_dir != expected_workspace;
         if prepared_is_invalid {
+            let detail = prepared.error.clone().unwrap_or_else(|| {
+                "the selected Edge did not prove the frozen isolated workspace clone".to_string()
+            });
             if !prepared.workspace_dir.trim().is_empty() {
                 let _ = pool
                     .release_evaluation_workspace(
@@ -11259,7 +11262,7 @@ impl AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_workspace_materialization_mismatch",
-                "the selected Edge did not prove the frozen isolated workspace clone",
+                detail,
             ));
         }
         if !is_managed_evaluation_workspace_path(&base_root, &prepared.workspace_dir) {
@@ -16307,18 +16310,21 @@ async fn revalidate_evaluation_before_provider(
     if now_unix_ms >= deadline.deadline_unix_ms || Instant::now() >= deadline.monotonic_deadline() {
         return Err("evaluation execution deadline expired before provider admission".to_string());
     }
-    if !run_engine
-        .confirm_execution_authority(
+    let authority = run_engine
+        .authorize_provider_boundary(
             owner_user_id,
             session_id,
             run_id,
-            run_generation,
-            &CancellationToken::new(),
+            UserIntentAdmissionAuthority::DurableOwnerGeneration(run_generation),
         )
         .await
-        .map_err(|error| format!("evaluation execution authority could not be renewed: {error}"))?
-    {
-        return Err("evaluation execution authority changed before provider admission".to_string());
+        .map_err(|error| {
+            format!("evaluation execution authority could not be authorized: {error}")
+        })?;
+    if !matches!(authority, ProviderBoundaryAuthorization::Authorized) {
+        return Err(format!(
+            "evaluation execution authority changed before provider admission: {authority:?}"
+        ));
     }
     let pool = pool
         .ok_or_else(|| "evaluation execution requires the shared durable database".to_string())?;
@@ -17619,8 +17625,7 @@ impl AgenticRunLifecycleService {
                 ) {
                     events.push(event);
                 }
-                if loop_success
-                    && final_status == RunStatus::Completed
+                if final_status == RunStatus::Completed
                     && let Some(event) = finalize_evaluation_coding_evidence(
                         bg_shared_pool.as_ref(),
                         &bg_user_id,

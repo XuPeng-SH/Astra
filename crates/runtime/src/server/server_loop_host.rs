@@ -11983,6 +11983,36 @@ impl ServerAgenticLoopHost {
             return Ok(client);
         }
         if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            if operation_id == "request_judgment" {
+                let execution = frozen.admitted.clone();
+                if !request.output_budget_fits_completion_cap(execution.max_completion_tokens) {
+                    return Err(JudgmentClientUnavailable::OutputBudget);
+                }
+                let auxiliary_policy = frozen
+                    .config
+                    .auxiliary_policies
+                    .iter()
+                    .find(|policy| {
+                        policy.operation_id == operation_id
+                            && policy.purpose == astra_turn_types::InferencePurpose::Introspection
+                    })
+                    .cloned()
+                    .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
+                let route =
+                    resolved_admitted_llm_config(&execution, frozen.config.context_budget.clone());
+                return self
+                    .durable_summary_client_for_execution(
+                        &route,
+                        max_output_tokens,
+                        state,
+                        operation_id,
+                        Some(&execution),
+                        astra_turn_types::InferencePurpose::Introspection,
+                        Some(auxiliary_policy),
+                    )
+                    .map(|client| Box::new(client) as Box<_>)
+                    .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
+            }
             if operation_id != "skill_auto_route" {
                 return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
             }
