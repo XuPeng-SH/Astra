@@ -186,6 +186,15 @@ pub struct SummaryExecutionProvenance {
     pub provider: String,
 }
 
+/// Durable identity of the logical inference used by a summary client.
+/// Production durable adapters supply this so auxiliary decisions can be
+/// traced to the exact ledger invocation that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryInvocationIdentity {
+    pub invocation_id: String,
+    pub logical_attempt: u32,
+}
+
 /// Abstraction over the LLM API for summary generation.
 /// Provider execution belongs to the runtime; this crate only owns summary
 /// behavior and the test seam.
@@ -197,6 +206,12 @@ pub trait SummaryLlmClient: Send + Sync {
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<SummaryResponse, astra_core::ClassifiedError>;
+
+    /// Return the most recent durable invocation used by this client, when the
+    /// adapter owns such an identity.
+    fn last_invocation_identity(&self) -> Option<SummaryInvocationIdentity> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

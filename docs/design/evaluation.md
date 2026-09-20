@@ -109,6 +109,13 @@ selected Offering is re-admitted at prepare time, so selecting Jev is
 Jev-only and selecting an ordinary typed-judgment Offering is the explicit LLM
 substitute.
 
+Each dispatched routing judgment records the frozen contract fingerprint, the
+exact Offering/provider, request fingerprint, durable invocation ID, and
+logical attempt. Observation settlement matches that identity against the
+inference ledger before exposing judgment evidence. `uncertain` remains a
+separate outcome from `negative`; it is usable evidence of an abstention but
+keeps judgment coverage incomplete for a causal claim.
+
 The initial planned isolation profile is `prompt_only_private`: the task input
 and declared read-only resources are frozen, external side effects are
 rejected, and production ranking, reflection, and learning writes are
@@ -395,6 +402,11 @@ unknown Run status is exposed as unavailable; it is not treated as running or
 successful. The report is recomputable and deterministic at this stage; a
 future artifact persistence layer may attach a durable download reference
 without changing its fact or identity contract.
+
+An evaluation Session with a bound trial retains its Run and inference
+evidence. Session close skips ordinary post-session governance for that
+boundary, and hard deletion returns a conflict until the bound experiment has
+been reviewed and released.
 
 ## Local workspace evaluation delivery boundary
 

@@ -6325,27 +6325,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "user_skill_evaluations",
-        "CREATE TABLE IF NOT EXISTS user_skill_evaluations (
-            evaluation_id VARCHAR(128) PRIMARY KEY,
-            owner_user_id VARCHAR(128) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            version_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(128) NULL,
-            hits BIGINT NOT NULL DEFAULT 0,
-            suspects BIGINT NOT NULL DEFAULT 0,
-            false_positives BIGINT NOT NULL DEFAULT 0,
-            payload_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_user_skill_eval_owner_source_created (owner_user_id, source_id, created_at),
-            INDEX idx_user_skill_eval_owner_version_created (owner_user_id, version_id, created_at),
-            INDEX idx_user_skill_eval_owner_run (owner_user_id, run_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (

@@ -103,6 +103,7 @@ pub enum JudgmentExecutionStatus {
     Unavailable,
     NotDispatched,
     Negative,
+    Uncertain,
     Selected,
     Failed,
 }

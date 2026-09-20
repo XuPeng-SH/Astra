@@ -43,15 +43,6 @@ fn map_task_assessment_error(error: TaskAssessmentError) -> (StatusCode, Json<Er
     }
 }
 
-fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Missing X-User-Id header"))
-}
-
 fn map_evaluation_persistence_error(
     error: EvaluationPersistenceError,
 ) -> (StatusCode, Json<ErrorResponse>) {
@@ -293,7 +284,8 @@ pub async fn quality_trend_handler(
     headers: HeaderMap,
     Query(q): Query<QualityTrendQuery>,
 ) -> Result<Json<QualityTrendResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .get_quality_trend(&user_id, q.days, q.model.as_deref())
@@ -305,7 +297,8 @@ pub async fn drift_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<DriftDetectResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state.evaluation_service.detect_drift(&user_id).await?;
     Ok(Json(resp))
 }
@@ -315,7 +308,8 @@ pub async fn calibration_handler(
     headers: HeaderMap,
     Query(q): Query<CalibrationQuery>,
 ) -> Result<Json<CalibrationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .get_calibration(&user_id, q.agent_id.as_deref(), q.days)
@@ -328,7 +322,8 @@ pub async fn session_scores_handler(
     headers: HeaderMap,
     Query(q): Query<SessionScoresQuery>,
 ) -> Result<Json<SessionScoresListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .get_session_scores(&user_id, q.limit, q.min_score)
@@ -341,7 +336,8 @@ pub async fn trust_report_handler(
     headers: HeaderMap,
     Query(q): Query<TrustReportQuery>,
 ) -> Result<Json<TrustReportResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .trust_report(&user_id, &q.agent_id, q.days)
@@ -354,7 +350,8 @@ pub async fn slo_dashboard_handler(
     headers: HeaderMap,
     Query(q): Query<SloDashboardQuery>,
 ) -> Result<Json<SloDashboardResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .slo_dashboard(&user_id, q.period_days)
@@ -368,7 +365,8 @@ pub async fn slo_history_handler(
     Path(agent_id): Path<String>,
     Query(q): Query<SloHistoryQuery>,
 ) -> Result<Json<SloHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .slo_history(&user_id, &agent_id, q.days)
@@ -381,7 +379,8 @@ pub async fn observability_metrics_handler(
     headers: HeaderMap,
     Query(q): Query<ObservabilityQuery>,
 ) -> Result<Json<ObservabilityMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .observability_metrics(&user_id, &q.agent_id, q.days)
@@ -393,7 +392,8 @@ pub async fn memory_health_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryHealthResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state.evaluation_service.memory_health(&user_id).await?;
     Ok(Json(resp))
 }
@@ -402,7 +402,8 @@ pub async fn memory_metrics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state.evaluation_service.memory_metrics(&user_id).await?;
     Ok(Json(resp))
 }
@@ -412,7 +413,8 @@ pub async fn training_data_extract_handler(
     headers: HeaderMap,
     Json(request): Json<TrainingDataExtractRequest>,
 ) -> Result<Json<TrainingDataExtractResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .extract_training_data(&user_id, request)
@@ -426,7 +428,8 @@ pub async fn training_data_export_handler(
     Path(dataset_id): Path<String>,
     Query(q): Query<ExportQuery>,
 ) -> Result<Json<TrainingDataExportResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user_id = extract_user_id(&headers)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     let resp = state
         .evaluation_service
         .export_training_data(&user_id, &dataset_id, &q.format)

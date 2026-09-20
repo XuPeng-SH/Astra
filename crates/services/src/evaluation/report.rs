@@ -84,6 +84,7 @@ fn build_judgment_summary(
                 trial.status,
                 None | Some(JudgmentExecutionStatus::Unavailable)
                     | Some(JudgmentExecutionStatus::NotDispatched)
+                    | Some(JudgmentExecutionStatus::Uncertain)
                     | Some(JudgmentExecutionStatus::Failed)
             ) || !trial.evidence_available
         });

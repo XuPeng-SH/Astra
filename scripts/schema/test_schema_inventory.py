@@ -613,7 +613,6 @@ fn char_literal() { let slash = '/'; }
             "skill_user_credentials",
             "user_skill_sources",
             "user_skill_versions",
-            "user_skill_evaluations",
             "agent_agents",
             "agent_bindings",
         }
@@ -672,10 +671,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "authoring/version content",
             self.tables["user_skill_versions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "run-linked review facts",
-            self.tables["user_skill_evaluations"]["merge_guidance"],
         )
         self.assertIn(
             "user-owned agent definitions",

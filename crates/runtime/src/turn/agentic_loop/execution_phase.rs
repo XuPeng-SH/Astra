@@ -4357,13 +4357,49 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // Load runtime config once per round for all mid-loop guards below.
-    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_policy;
-    let resolved_tool_policy =
-        tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
-    let parallel_batching_force_threshold =
-        resolved_tool_policy.parallel_batching_force_streak as usize;
-    let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
+    // If a mutating task has accumulated only read-only observations, surface
+    // that fact before the next LLM call. It remains advisory because further
+    // investigation may still be justified by a concrete unknown.
+    if should_emit_execution_escalation_advisory(state) {
+        let read_only_calls = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| r.was_executed() && r.ok)
+            .count();
+        state.stall.execution_escalation_advisory_emitted = true;
+        let msg = execution_escalation_message(&state.message, read_only_calls);
+        state.push_volatile(super::host::VolatileKind::ExecutionEscalation, msg);
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "execution_escalation",
+            read_only_calls,
+            round = state.llm_rounds_completed,
+            "execution-pattern advisory observed"
+        );
+        if show_policy_feedback_status && !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; adding execution advisory…"
+                ),
+            );
+        }
+    }
+
+    // Evaluation hosts carry the exact thresholds frozen at admission. The
+    // ordinary path keeps its existing per-round live policy resolution.
+    let (parallel_batching_force_threshold, cache_waste_threshold) = host
+        .evaluation_midloop_guard_thresholds()
+        .unwrap_or_else(|| {
+            let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_policy;
+            let resolved_tool_policy =
+                tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
+            (
+                resolved_tool_policy.parallel_batching_force_streak as usize,
+                tool_cfg.effective_cache_waste_midloop_threshold() as usize,
+            )
+        });
 
     // ── Composable guard pipeline ────────────────────────────────────────
     // Each guard is defined in the `guards` module. The pipeline evaluates

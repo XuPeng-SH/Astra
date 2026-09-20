@@ -600,15 +600,18 @@ pub fn prepare_trial_start(
         }
     };
 
-    let execution_time_budget_secs = request
+    if request
         .execution_time_budget_secs
-        .unwrap_or(experiment.spec.budget.max_wall_time_secs);
-    if execution_time_budget_secs == 0
-        || execution_time_budget_secs > experiment.spec.budget.max_wall_time_secs
+        .is_some_and(|value| value != experiment.spec.budget.max_wall_time_secs)
     {
         return Err(EvaluationBootstrapError::Conflict(
-            "execution_time_budget_secs must be between 1 and the frozen wall-time budget"
-                .to_string(),
+            "execution_time_budget_secs differs from the frozen wall-time budget".to_string(),
+        ));
+    }
+    let execution_time_budget_secs = experiment.spec.budget.max_wall_time_secs;
+    if execution_time_budget_secs == 0 {
+        return Err(EvaluationBootstrapError::Conflict(
+            "the frozen wall-time budget must be positive".to_string(),
         ));
     }
 

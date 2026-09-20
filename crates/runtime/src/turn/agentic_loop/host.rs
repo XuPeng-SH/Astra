@@ -201,8 +201,19 @@ pub enum SkillAutoRouteJudgmentOutcome {
     Disabled,
     NotDispatched { reason: String },
     Negative,
+    Uncertain,
     Selected { skill_name: String },
     Failed { reason: String },
+}
+
+/// Exact durable evidence for the optional routing judgment. The lifecycle
+/// only marks a judgment available when this identity can be matched to the
+/// persisted inference ledger and the frozen request contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillAutoRouteJudgmentEvidence {
+    pub invocation_id: String,
+    pub logical_attempt: u32,
+    pub request_fingerprint: String,
 }
 
 pub struct SkillAutoRouteJudgeContext<'a> {
@@ -842,6 +853,14 @@ pub trait AgenticLoopHost: Send {
         None
     }
 
+    /// Drain the durable identity of the routing judgment inference, when a
+    /// host dispatched one through the canonical auxiliary path.
+    fn take_skill_auto_route_judgment_evidence(
+        &mut self,
+    ) -> Option<SkillAutoRouteJudgmentEvidence> {
+        None
+    }
+
     /// Drain a terminal runtime-control decision produced while consuming the
     /// just-finished LLM response. The loop checks this before normal ingest or
     /// tool execution so terminal controls cannot become ordinary tool calls.
@@ -867,6 +886,12 @@ pub trait AgenticLoopHost: Send {
     /// own user-message guidance injection to avoid double injection.
     fn injects_round_guidance(&self) -> bool {
         false
+    }
+
+    /// Return the exact mid-loop guard thresholds frozen at Evaluation
+    /// admission. Ordinary hosts resolve their live runtime policy per round.
+    fn evaluation_midloop_guard_thresholds(&self) -> Option<(usize, usize)> {
+        None
     }
 
     /// Apply typed intent context needed by the next local model boundary.

@@ -5,7 +5,7 @@
 use super::experiment::{ExperimentSpec, TrialUnit};
 use astra_core::SharedPool;
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::{MySql, Row, Transaction, query_scalar};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
@@ -123,6 +123,31 @@ impl DatabaseEvaluationPlanStore {
 
     pub(crate) fn shared_pool(&self) -> SharedPool {
         self.pool.clone()
+    }
+
+    /// Evaluation sessions retain their Run and inference evidence until the
+    /// experiment has been reviewed. Session lifecycle code uses this single
+    /// owner-scoped query to suppress destructive close governance.
+    pub async fn session_has_bound_trial(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        validate_bounded("session_id", session_id, MAX_SESSION_ID_BYTES)?;
+        let count: i64 = query_scalar(
+            "SELECT COUNT(*) FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'",
+        )
+        .bind(owner_user_id)
+        .bind(session_id)
+        .fetch_one(self.pool.get())
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "check evaluation session binding",
+            source,
+        })?;
+        Ok(count > 0)
     }
 
     /// The Run creation transaction acquires this mutex BEFORE Session locks.

@@ -54,16 +54,6 @@ const COMPLETE_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_
      WHERE session_id = ? AND user_id = ?
        AND delete_requested_at IS NOT NULL";
 
-const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
-    &[SessionDeleteStatement {
-        label: "user_skill_evaluations",
-        sql: "DELETE FROM user_skill_evaluations
-             WHERE (owner_user_id, run_id) IN (
-                 SELECT user_id, run_id FROM agent_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    }];
-
 const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str = "DELETE FROM agent_event_edges
          WHERE session_id = ? AND user_id = ?
          ORDER BY child_event_id ASC, parent_event_id ASC, relation_kind ASC
@@ -1010,18 +1000,6 @@ pub(crate) async fn hard_delete_session_rows(
         .await
         .map_err(|source| format!("delete_session.lock_agent_runs: {source}"))?;
 
-    for statement in SESSION_DELETE_DERIVED_FROM_AGENT_RUNS {
-        let rows_deleted = delete_session_rows_session_user(
-            tx,
-            statement.label,
-            statement.sql,
-            session_id,
-            user_id,
-        )
-        .await?;
-        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
-    }
-
     let rows_deleted = delete_session_rows_session_user_batched(
         tx,
         "agent_event_edges",
@@ -1446,6 +1424,28 @@ async fn ensure_no_live_work_recovery_points(
     }
 }
 
+async fn ensure_evaluation_evidence_retained(
+    pool: &Pool<MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let bound_trials: i64 = query_scalar(
+        "SELECT COUNT(*) FROM evaluation_trial_bindings
+         WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|source| format!("delete_session.check_evaluation_evidence: {source}"))?;
+    if bound_trials > 0 {
+        return Err(format!(
+            "delete_session.evaluation_evidence_retained: session has {bound_trials} bound evaluation trial(s); review the experiment before deleting the Session"
+        ));
+    }
+    Ok(())
+}
+
 async fn lock_session_artifact_content_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -1487,6 +1487,8 @@ pub(crate) async fn hard_delete_session(
     user_id: &str,
 ) -> Result<SessionHardDeleteOutcome, String> {
     let total_start = Instant::now();
+
+    ensure_evaluation_evidence_retained(pool, session_id, user_id).await?;
 
     // Phase 0: Persist delete intent before destructive cleanup. The session
     // row remains until the database transaction commits, so a crash before
@@ -1975,7 +1977,6 @@ mod tests {
     #[test]
     fn session_delete_statements_are_owner_scoped() {
         for group in [
-            SESSION_DELETE_DERIVED_FROM_AGENT_RUNS,
             SESSION_DELETE_SESSION_ORIGIN_TABLES,
             SESSION_DELETE_DERIVED_PARENT_TABLES,
             SESSION_DELETE_DIRECT_TABLES,

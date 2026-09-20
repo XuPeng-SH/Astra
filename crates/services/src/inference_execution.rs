@@ -8635,6 +8635,7 @@ struct EvaluationInferenceInvocationFact {
     invocation_id: String,
     route_id: String,
     operation_id: String,
+    logical_attempt: u32,
     purpose: String,
     status: String,
     usage_status: String,
@@ -8729,6 +8730,7 @@ pub async fn load_evaluation_inference_evidence(
     run_id: &str,
     expected_primary_offering_id: &str,
     expected_primary_provider: &str,
+    expected_judgment: Option<(&str, &str, &str, u32)>,
 ) -> ServiceResult<EvaluationInferenceEvidence> {
     for (label, value, max_bytes) in [
         ("user_id", owner_user_id, 128),
@@ -8743,6 +8745,11 @@ pub async fn load_evaluation_inference_evidence(
     ] {
         validate_identity(value, label, max_bytes)?;
     }
+    if let Some((invocation_id, offering_id, provider, _logical_attempt)) = expected_judgment {
+        validate_identity(invocation_id, "expected_judgment_invocation_id", 128)?;
+        validate_identity(offering_id, "expected_judgment_offering_id", 64)?;
+        validate_identity(provider, "expected_judgment_provider", 64)?;
+    }
 
     let mut tx = pool.get().begin().await.map_err(|error| {
         ServiceError::with_source(
@@ -8753,7 +8760,7 @@ pub async fn load_evaluation_inference_evidence(
     })?;
 
     let invocations = sqlx::query(
-        "SELECT i.invocation_id, i.route_id, i.operation_id, i.purpose,
+        "SELECT i.invocation_id, i.route_id, i.operation_id, i.logical_attempt, i.purpose,
                 i.status, i.usage_status, i.terminal_fingerprint,
                 i.terminal_attempt_id,
                 i.provider_delivery_state,
@@ -8986,6 +8993,20 @@ pub async fn load_evaluation_inference_evidence(
                         error,
                     )
                 })?,
+                logical_attempt: {
+                    let value: i64 = row.try_get("logical_attempt").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode evaluation inference logical attempt",
+                            error,
+                        )
+                    })?;
+                    u32::try_from(value).map_err(|_| {
+                        ServiceError::conflict(
+                            "evaluation inference logical attempt is outside the supported range",
+                        )
+                    })?
+                },
                 purpose: row.try_get("purpose").map_err(|error| {
                     ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -9061,6 +9082,28 @@ pub async fn load_evaluation_inference_evidence(
             })
         })
         .collect::<ServiceResult<Vec<_>>>()?;
+
+    if let Some((
+        expected_invocation_id,
+        expected_offering_id,
+        expected_provider,
+        expected_logical_attempt,
+    )) = expected_judgment
+    {
+        let matched = invocation_facts.iter().any(|invocation| {
+            invocation.invocation_id == expected_invocation_id
+                && invocation.operation_id == "skill_auto_route"
+                && invocation.logical_attempt == expected_logical_attempt
+                && invocation.purpose == astra_turn_types::InferencePurpose::Introspection.as_str()
+                && invocation.offering_id.as_deref() == Some(expected_offering_id)
+                && invocation.provider.as_deref() == Some(expected_provider)
+        });
+        if !matched {
+            return Err(ServiceError::conflict(
+                "evaluation judgment evidence is not bound to the expected inference invocation",
+            ));
+        }
+    }
 
     let attempt_facts = attempts
         .into_iter()
@@ -9222,12 +9265,6 @@ pub async fn load_evaluation_inference_evidence(
             "inference_settlement_pending".to_string(),
         );
     }
-    add_reason(
-        &mut reasons,
-        &mut seen_reasons,
-        "provider_fallback_evidence_unavailable".to_string(),
-    );
-
     let route_ids = routes
         .iter()
         .take(MAX_EVALUATION_INFERENCE_FACTS)
@@ -9381,6 +9418,18 @@ pub async fn load_evaluation_inference_evidence(
         let mut invocation_terminal_at = None;
         let mut invocation_latency_valid = true;
         for attempt in attempts {
+            let pricing = attempt
+                .pricing_json
+                .as_deref()
+                .map(parse_pricing_snapshot)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::conflict(format!(
+                        "invalid pricing snapshot for inference attempt {}: {error}",
+                        attempt.attempt_id
+                    ))
+                })?
+                .flatten();
             if attempt.status == "started" {
                 settlement_pending = true;
                 topology_complete = false;
@@ -9403,7 +9452,10 @@ pub async fn load_evaluation_inference_evidence(
             }
             if attempt.usage_status == "provider_exact" {
                 exact_usage_attempt_count = exact_usage_attempt_count.saturating_add(1);
-                let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone";
+                let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
+                    || pricing.as_ref().is_some_and(|pricing| {
+                        pricing.cache_read.is_none() && pricing.cache_write.is_none()
+                    });
                 if !cache_lanes_known {
                     pricing_complete = false;
                     add_reason(
@@ -9457,19 +9509,10 @@ pub async fn load_evaluation_inference_evidence(
                     format!("usage_{}:{}", attempt.usage_status, attempt.attempt_id),
                 );
             }
-            let pricing = attempt
-                .pricing_json
-                .as_deref()
-                .map(parse_pricing_snapshot)
-                .transpose()
-                .map_err(|error| {
-                    ServiceError::conflict(format!(
-                        "invalid pricing snapshot for inference attempt {}: {error}",
-                        attempt.attempt_id
-                    ))
-                })?
-                .flatten();
-            let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone";
+            let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
+                || pricing.as_ref().is_some_and(|pricing| {
+                    pricing.cache_read.is_none() && pricing.cache_write.is_none()
+                });
             if pricing.is_some() && cache_lanes_known {
                 priced_attempt_count = priced_attempt_count.saturating_add(1);
             } else {
@@ -9577,14 +9620,24 @@ pub async fn load_evaluation_inference_evidence(
         pricing_complete = false;
     }
     let evidence_truncated = invocations_truncated || attempts_truncated || routes_truncated;
-    let complete = topology_complete && usage_complete && pricing_complete && !evidence_truncated;
+    let primary_invocation_ids = invocation_facts
+        .iter()
+        .filter(|invocation| {
+            invocation.purpose == InferencePurpose::PrimaryAgent.as_str()
+                || invocation.purpose == InferencePurpose::SubAgent.as_str()
+        })
+        .map(|invocation| invocation.invocation_id.as_str())
+        .collect::<HashSet<_>>();
     let provider_binding_match = (!primary_routes.is_empty()
         && primary_route_coverage_complete
         && !evidence_truncated)
         .then(|| {
             primary_routes.iter().all(|(offering, provider)| {
                 *offering == expected_primary_offering_id && *provider == expected_primary_provider
-            })
+            }) && attempt_facts
+                .iter()
+                .filter(|attempt| primary_invocation_ids.contains(attempt.invocation_id.as_str()))
+                .all(|attempt| attempt.provider == expected_primary_provider)
         });
     if provider_binding_match == Some(false) {
         add_reason(
@@ -9593,6 +9646,18 @@ pub async fn load_evaluation_inference_evidence(
             "primary_provider_binding_mismatch".to_string(),
         );
     }
+    if provider_binding_match.is_none() {
+        add_reason(
+            &mut reasons,
+            &mut seen_reasons,
+            "primary_provider_binding_unproven".to_string(),
+        );
+    }
+    let complete = topology_complete
+        && usage_complete
+        && pricing_complete
+        && provider_binding_match == Some(true)
+        && !evidence_truncated;
     let fingerprint = evaluation_evidence_fingerprint(
         owner_user_id,
         session_id,
@@ -9619,10 +9684,10 @@ pub async fn load_evaluation_inference_evidence(
         completion_tokens: (complete
             || (!evidence_truncated && topology_complete && usage_complete))
             .then_some(completion_tokens),
-        // The current ledger records physical provider attempts but no
-        // authoritative fallback transition. Preserve the gap instead of
-        // presenting a derived provider comparison as a fallback count.
-        provider_fallback_count: None,
+        // Complete evidence proves every primary attempt stayed on the
+        // frozen provider route. That is the only case where zero fallback
+        // calls is an honest count.
+        provider_fallback_count: (complete && provider_binding_match == Some(true)).then_some(0),
         latency_ms: (topology_complete && latency_complete && !evidence_truncated)
             .then_some(total_latency_ms),
         estimated_cost_usd: (complete && pricing_complete).then_some(estimated_cost_usd),

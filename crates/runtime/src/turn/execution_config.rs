@@ -249,6 +249,9 @@ impl PreparedExecutionInputs {
         let tools = runtime
             .tool_selection
             .resolve_for_model(Some(&admitted.model_name));
+        let midloop_policy = runtime
+            .tool_policy
+            .resolve_for_model(Some(&admitted.model_name));
         let config = EvaluationExecutionConfig {
             schema_version: EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION,
             runtime_contract_version: EVALUATION_RUNTIME_CONTRACT_VERSION,
@@ -274,6 +277,10 @@ impl PreparedExecutionInputs {
                 max_tools_per_turn: tools.max_tools_per_turn,
                 repeated_cache_hit_suppression: tools.repeated_cache_hit_suppression,
                 max_consecutive_empty_name: tools.max_consecutive_empty_name,
+                parallel_batching_force_streak: midloop_policy.parallel_batching_force_streak,
+                cache_waste_midloop_threshold: runtime
+                    .tool_policy
+                    .effective_cache_waste_midloop_threshold(),
                 round_budget_by_case: BTreeMap::from([(
                     case_id.to_string(),
                     FrozenRoundBudget {

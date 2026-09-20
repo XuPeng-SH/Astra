@@ -6,7 +6,8 @@
 //! or `None`. There is no keyword/alias fallback.
 
 use astra_turn_types::{
-    JudgmentQuestion, JudgmentRequest, judgment_messages, normalize_judgment_response,
+    JudgmentQuestion, JudgmentRequest, TYPED_JUDGMENT_SYSTEM_PROMPT, judgment_messages,
+    normalize_judgment_response,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -39,6 +40,19 @@ pub enum SkillAutoRouteJudgeError {
     Rejected(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillAutoRouteParseStatus {
+    Negative,
+    Uncertain,
+    Selected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillAutoRouteParseResult {
+    pub status: SkillAutoRouteParseStatus,
+    pub skill_name: Option<String>,
+}
+
 #[async_trait]
 pub trait SkillAutoRouteJudge: Send + Sync {
     async fn judge(
@@ -69,6 +83,7 @@ pub fn skill_auto_route_judgment_contract_fingerprint() -> String {
         "schema_version": 1,
         "policy": ROUTING_POLICY,
         "question_instructions": ROUTING_QUESTION_INSTRUCTIONS,
+        "typed_judgment_system_prompt": TYPED_JUDGMENT_SYSTEM_PROMPT,
         "skip_threshold": ROUTING_SKIP_THRESHOLD,
         "select_threshold": ROUTING_SELECT_THRESHOLD,
         "output_budget": SKILL_AUTO_ROUTE_SINGLE_SKILL_OUTPUT_TOKENS,
@@ -126,6 +141,21 @@ pub fn skill_auto_route_judgment_request(
     })
 }
 
+/// Stable identity of the exact typed request sent to the routing judge.
+///
+/// The contract fingerprint identifies the evaluator instructions; this
+/// fingerprint identifies the query and owner-scoped catalog snapshot that
+/// those instructions evaluated.
+pub fn skill_auto_route_judgment_request_fingerprint(
+    ctx: &SkillAutoRouteJudgeContext,
+) -> Result<String, SkillAutoRouteJudgeError> {
+    let request = skill_auto_route_judgment_request(ctx)?;
+    let value = serde_json::to_value(&request)
+        .map_err(|error| SkillAutoRouteJudgeError::PromptEncoding(error.to_string()))?;
+    let canonical = astra_core::canonical_json_string(&value);
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
 pub fn build_skill_auto_route_prompt(
     ctx: &SkillAutoRouteJudgeContext,
 ) -> Result<String, SkillAutoRouteJudgeError> {
@@ -145,6 +175,13 @@ pub fn parse_skill_auto_route_response(
     model: &str,
     provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
 ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+    Ok(parse_skill_auto_route_response_with_status(raw, ctx)?.skill_name)
+}
+
+pub fn parse_skill_auto_route_response_with_status(
+    raw: &str,
+    ctx: &SkillAutoRouteJudgeContext,
+) -> Result<SkillAutoRouteParseResult, SkillAutoRouteJudgeError> {
     let request = skill_auto_route_judgment_request(ctx)?;
     let normalized =
         normalize_judgment_response(&request, raw, model, provenance).map_err(|error| {
@@ -160,11 +197,21 @@ pub fn parse_skill_auto_route_response(
         }
         // Every competitor must be confidently false; never choose an argmax.
         if value < ROUTING_SELECT_THRESHOLD || selected.is_some() {
-            return Ok(None);
+            return Ok(SkillAutoRouteParseResult {
+                status: SkillAutoRouteParseStatus::Uncertain,
+                skill_name: None,
+            });
         }
         selected = Some(skill.name.clone());
     }
-    Ok(selected)
+    Ok(SkillAutoRouteParseResult {
+        status: if selected.is_some() {
+            SkillAutoRouteParseStatus::Selected
+        } else {
+            SkillAutoRouteParseStatus::Negative
+        },
+        skill_name: selected,
+    })
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -285,6 +332,13 @@ mod tests {
                 expected
             );
         }
+        let uncertain = parse_skill_auto_route_response_with_status(
+            r#"{"true":["0"],"uncertain":["1"]}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(uncertain.status, SkillAutoRouteParseStatus::Uncertain);
+        assert_eq!(uncertain.skill_name, None);
     }
 
     #[test]

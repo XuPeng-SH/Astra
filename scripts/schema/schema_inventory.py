@@ -841,16 +841,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / personal_skills",
         product_owner="personal skill authoring, review, publish, rollback",
     ),
-    "user_skill_evaluations": TableMetadata(
-        semantic_owner="astra_services::personal_skills",
-        state_class="durable personal skill evaluation fact",
-        primary_query="evaluation lookup by owner_user_id, evaluation_id, source_id, version_id, and run_id",
-        retention_policy="retain while skill quality review, publish decisions, and run-linked audit need evaluation payloads; session hard delete removes rows linked to agent_runs for the deleted session",
-        rebuildability="not fully rebuildable after payload_json, hit/suspect counts, false positives, and run linkage are dropped",
-        merge_guidance="keep separate from user_skill_versions; evaluations are run-linked review facts with different retention and query paths",
-        migration_owner="astra_services::storage / personal_skills",
-        product_owner="personal skill quality review and publishing decisions",
-    ),
     "edge_pending_dispatch": TableMetadata(
         semantic_owner="astra_services::multi_agent::edge_dispatch",
         state_class="coordination dispatch fact",

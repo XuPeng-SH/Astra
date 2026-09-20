@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use astra_turn_core::cloud_summary::{SummaryLlmClient, SummaryResponse};
+use astra_turn_core::cloud_summary::{
+    SummaryInvocationIdentity, SummaryLlmClient, SummaryResponse,
+};
 use astra_turn_types::InferencePurpose;
 use astra_turn_types::auxiliary_execution::{
     AUXILIARY_GENERATION_POLICY_VERSION, AuxiliaryGenerationPolicy, AuxiliaryPolicyProvenance,
@@ -112,6 +114,7 @@ pub(crate) struct RuntimeSummaryClient {
     /// Physical turn round for diagnostic attribution. It is deliberately
     /// carried separately from the canonical durable scope round.
     execution_round: Option<u32>,
+    last_invocation: Arc<std::sync::Mutex<Option<SummaryInvocationIdentity>>>,
 }
 
 impl RuntimeSummaryClient {
@@ -148,6 +151,7 @@ impl RuntimeSummaryClient {
             })),
             advance_on_admission_conflict: true,
             execution_round: None,
+            last_invocation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -299,6 +303,7 @@ impl RuntimeSummaryClient {
             execution: SummaryExecution::Direct,
             advance_on_admission_conflict: true,
             execution_round: None,
+            last_invocation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -382,6 +387,10 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         purpose: InferencePurpose,
         messages: &[Value],
     ) -> Result<SummaryResponse, astra_core::ClassifiedError> {
+        *self
+            .last_invocation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let contract_error = |message: String| {
             astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
         };
@@ -525,6 +534,19 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                             provider: self.route.provider.clone(),
                         }
                     });
+                    let invocation =
+                        outcome
+                            .invocation_id()
+                            .map(|invocation_id| SummaryInvocationIdentity {
+                                invocation_id: invocation_id.to_string(),
+                                logical_attempt: outcome.logical_attempt(),
+                            });
+                    if let Some(invocation) = invocation {
+                        *self
+                            .last_invocation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(invocation);
+                    }
                     break (outcome.into_result(), execution_provenance);
                 }
             }
@@ -600,6 +622,13 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn last_invocation_identity(&self) -> Option<SummaryInvocationIdentity> {
+        self.last_invocation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   getEvaluationExperiment,
   getEvaluationExperimentBySubmission,
+  getEvaluationReport,
   listEvaluationModels,
   listPersonalSkillSources,
   listPersonalSkillVersions,
@@ -24,6 +25,7 @@ import {
   type PersonalSkillVersion,
 } from '@/lib/api/evaluations';
 import { listModels } from '@/lib/api/models';
+import { WebApiError } from '@/lib/api/errors';
 
 type PrimaryModel = Awaited<ReturnType<typeof listModels>>['items'][number];
 const defaultExpected = '{\n  "ok": true\n}';
@@ -232,6 +234,27 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
     setStatus('Choose a published Skill revision to begin.');
   }, []);
 
+  const recoverReview = useCallback(async (id: string) => {
+    const [projectionResult, reportResult] = await Promise.allSettled([
+      getEvaluationExperiment(id),
+      getEvaluationReport(id),
+    ]);
+    let recovered = false;
+    if (projectionResult.status === 'fulfilled') {
+      setProjection(projectionResult.value);
+      recovered = true;
+    }
+    if (reportResult.status === 'fulfilled') {
+      setReport(reportResult.value);
+      recovered = true;
+    }
+    if (recovered) {
+      setExperimentId(id);
+      setStatus(`Experiment ${id} is available; the report shows any remaining evidence gaps.`);
+    }
+    return recovered;
+  }, []);
+
   const retryPendingSubmission = useCallback(async () => {
     if (!pendingSubmission) return;
     setError(null);
@@ -275,22 +298,15 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
     try {
       const submissionIdempotencyKey = payload.submission_idempotency_key;
       if (typeof submissionIdempotencyKey === 'string') {
+        const pending = {
+          version: 1,
+          ownerId,
+          runtimeKey,
+          submissionIdempotencyKey,
+        } satisfies PendingEvaluationSubmission;
+        setPendingSubmission(pending);
         try {
-          window.localStorage.setItem(
-            pendingSubmissionKey,
-            JSON.stringify({
-              version: 1,
-              ownerId,
-              runtimeKey,
-              submissionIdempotencyKey,
-            } satisfies PendingEvaluationSubmission),
-          );
-          setPendingSubmission({
-            version: 1,
-            ownerId,
-            runtimeKey,
-            submissionIdempotencyKey,
-          });
+          window.localStorage.setItem(pendingSubmissionKey, JSON.stringify(pending));
         } catch {
           // The server-side idempotency key remains authoritative.
         }
@@ -327,12 +343,21 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       setProjection(await getEvaluationExperiment(currentExperimentId));
       setStatus('Evaluation report is ready.');
     } catch (reason) {
+      const recovered = currentExperimentId ? await recoverReview(currentExperimentId) : false;
+      if (reason instanceof WebApiError && [400, 409, 422, 501].includes(reason.status)) {
+        setPendingSubmission(null);
+        try {
+          window.localStorage.removeItem(pendingSubmissionKey);
+        } catch {
+          // The rejected request cannot be retried safely with this key.
+        }
+      }
       setError(reason instanceof Error ? reason.message : 'Evaluation failed.');
-      if (currentExperimentId) setStatus(`Experiment ${currentExperimentId} remains available for review.`);
+      if (currentExperimentId && !recovered) setStatus(`Experiment ${currentExperimentId} remains available for review.`);
     } finally {
       setBusy(false);
     }
-  }, [ownerId, pendingSubmissionKey, resetResult, runtimeKey, savedIntentKey]);
+  }, [ownerId, pendingSubmissionKey, recoverReview, resetResult, runtimeKey, savedIntentKey]);
 
   const runComparison = useCallback(async () => {
     setError(null);
@@ -341,7 +366,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       return;
     }
     if (!skillName || !versionId || !primaryOfferingId) {
-      setError('Select a Skill revision and a primary Offering first.');
+      setError('Select a pinned published Skill revision and a primary Offering first.');
       return;
     }
     let expected: unknown;
@@ -399,12 +424,13 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       setProjection(await getEvaluationExperiment(savedIntent.experimentId));
       setStatus('Evaluation report is ready.');
     } catch (reason) {
+      const recovered = await recoverReview(savedIntent.experimentId);
       setError(reason instanceof Error ? reason.message : 'Saved Evaluation resume failed.');
-      setStatus(`Experiment ${savedIntent.experimentId} remains available for review.`);
+      if (!recovered) setStatus(`Experiment ${savedIntent.experimentId} remains available for review.`);
     } finally {
       setBusy(false);
     }
-  }, [savedIntent]);
+  }, [recoverReview, savedIntent]);
 
   if (!savedIntentLoaded || (loading && !savedIntent && !pendingSubmission)) {
     return <div className="flex h-full items-center justify-center text-sm text-text-secondary">Loading Evaluation catalog…</div>;
@@ -442,7 +468,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       <div className="mx-auto max-w-6xl">
         <PageHeader
           title="Evaluation"
-          description="A controlled A/A comparison: both arms use the same published Skill revision; the candidate adds the frozen Skill routing judgment."
+          description="Compare a pinned published Skill with and without the frozen Skill routing judgment."
           action={<Button variant="ghost" leadingIcon={RefreshCw} onClick={loadCatalog} disabled={busy}>Refresh catalog</Button>}
         />
 

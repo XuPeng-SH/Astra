@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::ModelExecutionProjection;
 
-pub const EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION: u32 = 2;
 /// Pins fixed prompt assembly, turn-budget derivation and output-cap retry rules.
-pub const EVALUATION_RUNTIME_CONTRACT_VERSION: u32 = 1;
+pub const EVALUATION_RUNTIME_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +54,8 @@ pub struct InstructionOnlyRuntimeConfig {
     pub max_tools_per_turn: u32,
     pub repeated_cache_hit_suppression: u32,
     pub max_consecutive_empty_name: u32,
+    pub parallel_batching_force_streak: u32,
+    pub cache_waste_midloop_threshold: u32,
     pub round_budget_by_case: BTreeMap<String, FrozenRoundBudget>,
 }
 
@@ -134,6 +136,11 @@ impl EvaluationExecutionConfig {
             {
                 return Err("evaluation case round budget is invalid".into());
             }
+        }
+        if self.runtime.parallel_batching_force_streak == 0
+            || self.runtime.cache_waste_midloop_threshold == 0
+        {
+            return Err("evaluation mid-loop guard thresholds must be positive".into());
         }
         Ok(())
     }

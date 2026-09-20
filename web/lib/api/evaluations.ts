@@ -1,4 +1,6 @@
-import { requestJson } from '@/lib/api/request';
+import { requestJson, type RequestJsonInit } from '@/lib/api/request';
+
+type EvaluationRequestOptions = Pick<RequestJsonInit, 'timeoutMs' | 'signal'>;
 
 export type EvaluationModel = {
   offering_id: string;
@@ -129,16 +131,18 @@ export function listPersonalSkillVersions(skillName: string) {
   );
 }
 
-export function prepareEvaluation(payload: Record<string, unknown>) {
+export function prepareEvaluation(payload: Record<string, unknown>, options?: EvaluationRequestOptions) {
   return requestJson<EvaluationPrepareResponse>('/api/evaluations/experiments/prepare', {
     method: 'POST',
     body: JSON.stringify(payload),
+    ...options,
   });
 }
 
-export function getEvaluationExperiment(experimentId: string) {
+export function getEvaluationExperiment(experimentId: string, options?: EvaluationRequestOptions) {
   return requestJson<EvaluationProjection>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}`,
+    options,
   );
 }
 
@@ -148,14 +152,14 @@ export function getEvaluationExperimentBySubmission(submissionIdempotencyKey: st
   );
 }
 
-export function startEvaluationTrial(experimentId: string, trialId: string) {
+export function startEvaluationTrial(experimentId: string, trialId: string, options?: EvaluationRequestOptions) {
   return requestJson<{ run_id: string; session_id: string; status: string }>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}/trials/${encodeURIComponent(trialId)}/start`,
-    { method: 'POST', body: '{}' },
+    { method: 'POST', body: '{}', ...options },
   );
 }
 
-export function assessEvaluationTrial(experimentId: string, trialId: string) {
+export function assessEvaluationTrial(experimentId: string, trialId: string, options?: EvaluationRequestOptions) {
   return requestJson<{
     status: 'pending' | 'recorded';
     assessment?: {
@@ -163,13 +167,14 @@ export function assessEvaluationTrial(experimentId: string, trialId: string) {
     };
   }>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}/trials/${encodeURIComponent(trialId)}/assess`,
-    { method: 'POST' },
+    { method: 'POST', ...options },
   );
 }
 
-export function getEvaluationReport(experimentId: string) {
+export function getEvaluationReport(experimentId: string, options?: EvaluationRequestOptions) {
   return requestJson<EvaluationReport>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}/report`,
+    options,
   );
 }
 
@@ -183,15 +188,21 @@ export async function runPreparedEvaluation(
 ) {
   const experimentId = prepared.experiment.experiment_id;
   const deadline = Date.now() + options.waitSecs * 1000;
+  const remainingMs = () => Math.max(1, deadline - Date.now());
+  const ensureTime = (label: string) => {
+    if (Date.now() >= deadline) throw new Error(`${label} deadline exceeded`);
+  };
   const trials = [...prepared.trials].sort((left, right) => left.trial.sequence - right.trial.sequence);
   for (const trial of trials) {
+    ensureTime(`Evaluation at trial ${trial.trial_id}`);
     if (trial.binding_status === 'planned') {
-      await startEvaluationTrial(experimentId, trial.trial_id);
+      await startEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
     } else if (trial.binding_status !== 'bound') {
       throw new Error(`Trial ${trial.trial_id} has unsupported binding status ${trial.binding_status}.`);
     }
     while (true) {
-      const projection = await getEvaluationExperiment(experimentId);
+      ensureTime(`Evaluation wait at trial ${trial.trial_id}`);
+      const projection = await getEvaluationExperiment(experimentId, { timeoutMs: remainingMs() });
       options.onProjection?.(projection);
       const current = projection.trials.find((entry) => entry.binding.trial_id === trial.trial_id);
       if (!current) {
@@ -201,28 +212,26 @@ export async function runPreparedEvaluation(
         break;
       }
       if (current.lifecycle === 'terminal_awaiting_observation') {
-        await assessEvaluationTrial(experimentId, trial.trial_id);
+        await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
       }
       if (current.lifecycle === 'unavailable' || current.lifecycle === 'planned') {
         throw new Error(`Trial ${trial.trial_id} became ${current.lifecycle}.`);
       }
-      if (Date.now() >= deadline) {
-        throw new Error(`Evaluation wait deadline exceeded at trial ${trial.trial_id}.`);
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, options.pollMs ?? 500));
+      ensureTime(`Evaluation wait at trial ${trial.trial_id}`);
+      await new Promise((resolve) => window.setTimeout(resolve, Math.min(options.pollMs ?? 500, remainingMs())));
     }
-    await assessEvaluationTrial(experimentId, trial.trial_id);
+    await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
   }
 
   for (const trial of trials) {
     while (true) {
-      const assessment = await assessEvaluationTrial(experimentId, trial.trial_id);
+      ensureTime(`Assessment at trial ${trial.trial_id}`);
+      const assessment = await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
       if (assessment.status === 'recorded') break;
-      if (Date.now() >= deadline) {
-        throw new Error(`Assessment wait deadline exceeded at trial ${trial.trial_id}.`);
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, options.pollMs ?? 500));
+      ensureTime(`Assessment wait at trial ${trial.trial_id}`);
+      await new Promise((resolve) => window.setTimeout(resolve, Math.min(options.pollMs ?? 500, remainingMs())));
     }
   }
-  return getEvaluationReport(experimentId);
+  ensureTime('Evaluation report');
+  return getEvaluationReport(experimentId, { timeoutMs: remainingMs() });
 }

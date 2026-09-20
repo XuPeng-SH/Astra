@@ -705,6 +705,13 @@ impl DatabaseSessionService {
                     "session_has_saved_work",
                 ));
             }
+            Err(error) if error.starts_with("delete_session.evaluation_evidence_retained:") => {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    error.trim_start_matches("delete_session.evaluation_evidence_retained: "),
+                    "evaluation_evidence_retained",
+                ));
+            }
             Err(error) => return Err(internal_error(error)),
         };
 

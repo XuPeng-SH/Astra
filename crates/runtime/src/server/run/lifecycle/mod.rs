@@ -15936,6 +15936,7 @@ async fn persist_evaluation_observation_after_settlement(
     if context_event_json.is_some() {
         astra_services::evaluation::apply_context_evidence(&mut observation);
     }
+    let mut expected_judgment_inference: Option<(String, String, String, u32)> = None;
     if let Some(policy) = admission.judgment_policy.as_ref() {
         match policy {
             astra_services::evaluation::FrozenSkillRoutingPolicy::Unavailable {
@@ -15949,7 +15950,11 @@ async fn persist_evaluation_observation_after_settlement(
                     evidence_id: None,
                 });
             }
-            astra_services::evaluation::FrozenSkillRoutingPolicy::Available { .. } => {
+            astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+                model,
+                judgment_contract_fingerprint,
+                ..
+            } => {
                 let judgment_event = evidence_index.and_then(|index| {
                     canonical_events[..=index].iter().find(|event| {
                         event.get("event_type").and_then(Value::as_str)
@@ -15963,10 +15968,67 @@ async fn persist_evaluation_observation_after_settlement(
                 let judgment_evidence_id =
                     format!("judgment-evidence:{run_id}:{admission_run_generation}");
                 let judgment_event_json = judgment_event.map(serde_json::to_string).transpose()?;
+                let (judgment_status, usable_judgment_evidence) = judgment_event
+                    .map(|event| {
+                        let data = event.get("data").unwrap_or(&Value::Null);
+                        let status = match data.get("status").and_then(Value::as_str) {
+                            Some("disabled") => JudgmentExecutionStatus::Disabled,
+                            Some("not_dispatched") => JudgmentExecutionStatus::NotDispatched,
+                            Some("negative") => JudgmentExecutionStatus::Negative,
+                            Some("uncertain") => JudgmentExecutionStatus::Uncertain,
+                            Some("selected") => JudgmentExecutionStatus::Selected,
+                            Some("failed") => JudgmentExecutionStatus::Failed,
+                            _ => JudgmentExecutionStatus::Failed,
+                        };
+                        let contract_matches =
+                            data.get("contract_fingerprint").and_then(Value::as_str)
+                                == Some(judgment_contract_fingerprint.as_str());
+                        let route_matches = data.get("offering_id").and_then(Value::as_str)
+                            == Some(model.offering_id.as_str())
+                            && data.get("provider").and_then(Value::as_str)
+                                == Some(model.provider.as_str());
+                        let needs_invocation = matches!(
+                            &status,
+                            JudgmentExecutionStatus::Negative
+                                | JudgmentExecutionStatus::Uncertain
+                                | JudgmentExecutionStatus::Selected
+                                | JudgmentExecutionStatus::Failed
+                        );
+                        let invocation_id = data
+                            .get("invocation_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty());
+                        let request_fingerprint = data
+                            .get("request_fingerprint")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty());
+                        let logical_attempt = data
+                            .get("logical_attempt")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let identity_present = invocation_id.is_some()
+                            && request_fingerprint.is_some()
+                            && logical_attempt.is_some();
+                        let usable = contract_matches
+                            && route_matches
+                            && (!needs_invocation || identity_present);
+                        if usable && needs_invocation {
+                            expected_judgment_inference = Some((
+                                invocation_id
+                                    .expect("identity_present implies invocation id")
+                                    .to_string(),
+                                model.offering_id.clone(),
+                                model.provider.clone(),
+                                logical_attempt.expect("identity_present implies logical attempt"),
+                            ));
+                        }
+                        (status, usable)
+                    })
+                    .unwrap_or((JudgmentExecutionStatus::NotDispatched, false));
                 observation.evidence.push(EvidenceRef {
                     evidence_id: judgment_evidence_id.clone(),
                     kind: EvidenceKind::Trace,
-                    availability: if judgment_event_json.is_some() {
+                    availability: if judgment_event_json.is_some() && usable_judgment_evidence {
                         EvidenceAvailability::Available
                     } else {
                         EvidenceAvailability::Missing
@@ -15977,25 +16039,24 @@ async fn persist_evaluation_observation_after_settlement(
                 observation.judgment = Some(match judgment_event {
                     Some(event) => {
                         let data = event.get("data").unwrap_or(&Value::Null);
-                        let status = match data.get("status").and_then(Value::as_str) {
-                            Some("disabled") => JudgmentExecutionStatus::Disabled,
-                            Some("not_dispatched") => JudgmentExecutionStatus::NotDispatched,
-                            Some("negative") => JudgmentExecutionStatus::Negative,
-                            Some("selected") => JudgmentExecutionStatus::Selected,
-                            Some("failed") => JudgmentExecutionStatus::Failed,
-                            _ => JudgmentExecutionStatus::Failed,
-                        };
                         JudgmentExecutionObservation {
                             operation_id: "skill_auto_route".to_string(),
-                            status,
+                            status: if usable_judgment_evidence {
+                                judgment_status
+                            } else {
+                                JudgmentExecutionStatus::Failed
+                            },
                             skill_name: data
                                 .get("skill_name")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
-                            reason: data
-                                .get("reason")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
+                            reason: if usable_judgment_evidence {
+                                data.get("reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            } else {
+                                Some("invalid_or_unbound_judgment_evidence".to_string())
+                            },
                             evidence_id: Some(judgment_evidence_id.clone()),
                         }
                     }
@@ -16017,6 +16078,16 @@ async fn persist_evaluation_observation_after_settlement(
         run_id,
         &experiment.spec.conditions.model_binding,
         &experiment.spec.conditions.provider_binding,
+        expected_judgment_inference.as_ref().map(
+            |(invocation_id, offering_id, provider, logical_attempt)| {
+                (
+                    invocation_id.as_str(),
+                    offering_id.as_str(),
+                    provider.as_str(),
+                    *logical_attempt,
+                )
+            },
+        ),
     )
     .await
     {
@@ -16135,11 +16206,12 @@ fn evaluation_skill_invocation_event(
 fn evaluation_judgment_event(
     admission: Option<&EvaluationRunAdmission>,
     outcome: Option<crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome>,
+    evidence: Option<crate::turn::agentic_loop::host::SkillAutoRouteJudgmentEvidence>,
     run_id: &str,
     run_generation: u64,
 ) -> Option<Value> {
     let admission = admission?;
-    admission.judgment_policy.as_ref()?;
+    let policy = admission.judgment_policy.as_ref()?;
     let outcome = outcome?;
     let mut data = serde_json::Map::new();
     data.insert("operation_id".to_string(), json!("skill_auto_route"));
@@ -16156,6 +16228,9 @@ fn evaluation_judgment_event(
         crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Negative => {
             data.insert("status".to_string(), json!("negative"));
         }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Uncertain => {
+            data.insert("status".to_string(), json!("uncertain"));
+        }
         crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Selected { skill_name } => {
             data.insert("status".to_string(), json!("selected"));
             data.insert("skill_name".to_string(), json!(skill_name));
@@ -16164,6 +16239,30 @@ fn evaluation_judgment_event(
             data.insert("status".to_string(), json!("failed"));
             data.insert("reason".to_string(), json!(reason));
         }
+    }
+    if let astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+        model,
+        judgment_contract_fingerprint,
+        ..
+    } = policy
+    {
+        data.insert(
+            "contract_fingerprint".to_string(),
+            json!(judgment_contract_fingerprint),
+        );
+        data.insert("offering_id".to_string(), json!(model.offering_id));
+        data.insert("provider".to_string(), json!(model.provider));
+    }
+    if let Some(evidence) = evidence {
+        data.insert("invocation_id".to_string(), json!(evidence.invocation_id));
+        data.insert(
+            "logical_attempt".to_string(),
+            json!(evidence.logical_attempt),
+        );
+        data.insert(
+            "request_fingerprint".to_string(),
+            json!(evidence.request_fingerprint),
+        );
     }
     Some(json!({
         "event_type": "evaluation_judgment",
@@ -16639,9 +16738,12 @@ impl AgenticRunLifecycleService {
                 ) {
                     events.push(event);
                 }
+                let judgment_outcome = host.take_skill_auto_route_judgment_outcome();
+                let judgment_evidence = host.take_skill_auto_route_judgment_evidence();
                 if let Some(event) = evaluation_judgment_event(
                     bg_eval_admission.as_ref(),
-                    host.take_skill_auto_route_judgment_outcome(),
+                    judgment_outcome,
+                    judgment_evidence,
                     &bg_run_id,
                     execution_owner_generation,
                 ) {

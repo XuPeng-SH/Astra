@@ -3631,6 +3631,10 @@ impl DurableInferenceInvocation {
         self.plan.logical_attempt()
     }
 
+    pub(crate) fn invocation_id(&self) -> &str {
+        self.plan.invocation_id()
+    }
+
     pub(crate) fn attempt_observer(&self) -> &dyn ProviderAttemptObserver {
         self.observer.as_ref()
     }

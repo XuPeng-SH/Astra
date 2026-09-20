@@ -95,6 +95,8 @@ pub fn execution_config(model: &str, provider: &str, case_id: &str) -> Evaluatio
             max_tools_per_turn: 10,
             repeated_cache_hit_suppression: 2,
             max_consecutive_empty_name: 2,
+            parallel_batching_force_streak: 8,
+            cache_waste_midloop_threshold: 3,
             round_budget_by_case: BTreeMap::from([(
                 case_id.into(),
                 FrozenRoundBudget {

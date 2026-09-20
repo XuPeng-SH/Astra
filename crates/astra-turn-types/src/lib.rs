@@ -12,9 +12,9 @@ pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1}
 mod judgment;
 pub use judgment::{
     JudgmentAnswer, JudgmentCodecError, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
-    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
-    judgment_request_from_messages, normalize_judgment_response,
-    output_budget_exceeds_completion_cap,
+    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria,
+    TYPED_JUDGMENT_SYSTEM_PROMPT, judgment_messages, judgment_request_from_messages,
+    normalize_judgment_response, output_budget_exceeds_completion_cap,
 };
 mod canonical_tool_pairing;
 mod completion_settlement;

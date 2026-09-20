@@ -55,9 +55,9 @@ use crate::turn::agentic_loop::execution_phase::{
 use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
-    SkillAutoRouteJudgmentOutcome, TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind,
-    TurnPhaseOutcome, TurnPhaseReceipt, complete_turn_phase, context_manifest_identity_from_result,
-    interaction_scoped_tool_restrictions,
+    SkillAutoRouteJudgmentEvidence, SkillAutoRouteJudgmentOutcome, TurnInteractionMode,
+    TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt, complete_turn_phase,
+    context_manifest_identity_from_result, interaction_scoped_tool_restrictions,
 };
 use crate::turn::execution_config::PreparedExecutionPolicy;
 use crate::turn::llm::client::{
@@ -87,6 +87,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::cloud_summary::SummaryInvocationIdentity;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::rate_limit_cooldown::{
@@ -2628,6 +2629,27 @@ fn pending_work_admission_judge_for_test(
 
 struct SummaryClientSkillAutoRouteJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+    last_status: Arc<std::sync::Mutex<Option<astra_services::SkillAutoRouteParseStatus>>>,
+}
+
+impl SummaryClientSkillAutoRouteJudge {
+    fn new(client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>) -> Self {
+        Self {
+            client,
+            last_status: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn last_invocation_identity(&self) -> Option<SummaryInvocationIdentity> {
+        self.client.last_invocation_identity()
+    }
+
+    fn last_status(&self) -> Option<astra_services::SkillAutoRouteParseStatus> {
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -2951,6 +2973,10 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
         &self,
         ctx: &astra_services::SkillAutoRouteJudgeContext,
     ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
         let response = self
             .client
@@ -2962,12 +2988,17 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
                 "skill judgment did not finish normally".into(),
             ));
         }
-        astra_services::parse_skill_auto_route_response(
+        let parsed = astra_services::parse_skill_auto_route_response_with_status(
             response.text.as_str(),
             ctx,
             &response.model_used,
             response.judgment_provenance,
-        )
+        )?;
+        *self
+            .last_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed.status);
+        Ok(parsed.skill_name)
     }
 }
 
@@ -4245,6 +4276,8 @@ pub struct ServerAgenticLoopHost {
     /// One durable classification for the evaluation Skill adapter. Normal
     /// runs do not project this process-local value into evaluation evidence.
     evaluation_judgment_outcome: Option<SkillAutoRouteJudgmentOutcome>,
+    /// Exact durable inference identity for the evaluation routing judgment.
+    evaluation_judgment_evidence: Option<SkillAutoRouteJudgmentEvidence>,
 }
 
 struct ExecutionHandoffContext {
@@ -7233,6 +7266,7 @@ impl ServerAgenticLoopHostBuilder {
             turn_intent_judge: None,
             skill_auto_route_judge: None,
             evaluation_judgment_outcome: None,
+            evaluation_judgment_evidence: None,
         }
     }
 
@@ -11595,6 +11629,20 @@ impl ServerAgenticLoopHost {
 
     fn take_evaluation_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
         self.evaluation_judgment_outcome.take()
+    }
+
+    fn record_evaluation_judgment_evidence(&mut self, evidence: SkillAutoRouteJudgmentEvidence) {
+        if matches!(
+            self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        ) && self.evaluation_judgment_evidence.is_none()
+        {
+            self.evaluation_judgment_evidence = Some(evidence);
+        }
+    }
+
+    fn take_evaluation_judgment_evidence(&mut self) -> Option<SkillAutoRouteJudgmentEvidence> {
+        self.evaluation_judgment_evidence.take()
     }
 
     async fn resolve_llm_config_for_state(
@@ -19204,6 +19252,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true // Server injects guidance into the system prompt in execute_turn.
     }
 
+    fn evaluation_midloop_guard_thresholds(&self) -> Option<(usize, usize)> {
+        match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Evaluation(frozen) => Some((
+                frozen.config.runtime.parallel_batching_force_streak as usize,
+                frozen.config.runtime.cache_waste_midloop_threshold as usize,
+            )),
+            PreparedExecutionPolicy::Normal(_) => None,
+        }
+    }
+
     fn requires_turn_intent_decision(&self) -> bool {
         // The built-in auxiliary admission judge is an optimization and a
         // typed Work projection, not the only authority capable of starting
@@ -19226,6 +19284,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn take_skill_auto_route_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
         self.take_evaluation_judgment_outcome()
+    }
+
+    fn take_skill_auto_route_judgment_evidence(
+        &mut self,
+    ) -> Option<SkillAutoRouteJudgmentEvidence> {
+        self.take_evaluation_judgment_evidence()
     }
 
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
@@ -19734,6 +19798,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // function without changing its identity.
             PreparedExecutionPolicy::Evaluation(_) => None,
         };
+        let request_fingerprint = if evaluation {
+            match astra_services::skill_auto_route_judgment_request_fingerprint(&service_ctx) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::NotDispatched {
+                            reason: "invalid_request".to_string(),
+                        },
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let mut parsed_status = None;
         let judged = if let Some(judge) = injected_judge {
             judge.judge(&service_ctx).await
         } else {
@@ -19794,8 +19875,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return None;
                 }
             };
-            let judge = SummaryClientSkillAutoRouteJudge { client };
-            judge.judge(&service_ctx).await
+            let judge = SummaryClientSkillAutoRouteJudge::new(client);
+            let judged = judge.judge(&service_ctx).await;
+            if let (true, Some(request_fingerprint), Some(identity)) = (
+                evaluation,
+                request_fingerprint,
+                judge.last_invocation_identity(),
+            ) {
+                self.record_evaluation_judgment_evidence(SkillAutoRouteJudgmentEvidence {
+                    invocation_id: identity.invocation_id,
+                    logical_attempt: identity.logical_attempt,
+                    request_fingerprint,
+                });
+            }
+            parsed_status = judge.last_status();
+            judged
         };
 
         match judged {
@@ -19816,9 +19910,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             Ok(None) => {
                 if evaluation {
-                    self.record_evaluation_judgment_outcome(
-                        SkillAutoRouteJudgmentOutcome::Negative,
-                    );
+                    self.record_evaluation_judgment_outcome(match parsed_status {
+                        Some(astra_services::SkillAutoRouteParseStatus::Uncertain) => {
+                            SkillAutoRouteJudgmentOutcome::Uncertain
+                        }
+                        _ => SkillAutoRouteJudgmentOutcome::Negative,
+                    });
                 }
                 None
             }
@@ -26360,15 +26457,13 @@ mod tests {
             ),
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let judge = SummaryClientSkillAutoRouteJudge {
-                client: Box::new(SequencedSummaryClient {
-                    provenance,
-                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                        raw.to_string()
-                    ])),
-                    requests: requests.clone(),
-                }),
-            };
+            let judge = SummaryClientSkillAutoRouteJudge::new(Box::new(SequencedSummaryClient {
+                provenance,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    raw.to_string()
+                ])),
+                requests: requests.clone(),
+            }));
             assert_eq!(
                 judge.judge(&ctx).await.unwrap().as_deref(),
                 Some("review-changes")
@@ -26398,8 +26493,8 @@ mod tests {
         for (is_ptl_error, finish_reason) in
             [(false, Some("length")), (true, Some("stop")), (false, None)]
         {
-            let judge = SummaryClientSkillAutoRouteJudge {
-                client: Box::new(UsageSequencedSummaryClient {
+            let judge =
+                SummaryClientSkillAutoRouteJudge::new(Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
                         astra_turn_core::cloud_summary::SummaryResponse {
                             judgment_provenance: Some(
@@ -26413,8 +26508,7 @@ mod tests {
                             execution: None,
                         },
                     )])),
-                }),
-            };
+                }));
             assert!(matches!(
                 judge.judge(&ctx).await,
                 Err(SkillAutoRouteJudgeError::Rejected(_))
