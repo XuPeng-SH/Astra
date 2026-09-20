@@ -81,8 +81,9 @@ pub use service::EvaluationService;
 pub use types::*;
 
 pub use task_assessment::{
-    TASK_ASSESSMENT_SCHEMA_VERSION, TaskAssessmentError, TaskAssessmentOutcome,
-    TaskAssessmentRecord, TaskAssessmentResult, TaskAssessmentUnavailableReason,
+    TASK_ASSESSMENT_SCHEMA_VERSION, TOOL_INVOCATION_COVERAGE_SCHEMA_VERSION, TaskAssessmentError,
+    TaskAssessmentOutcome, TaskAssessmentRecord, TaskAssessmentResult,
+    TaskAssessmentUnavailableReason, ToolInvocationCoverageProof,
 };
 
 #[cfg(test)]

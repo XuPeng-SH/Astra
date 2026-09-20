@@ -3623,11 +3623,17 @@ impl RuntimeToolExecutor {
                 semantic_read_cache_key_id = semantic_cache_key.as_ref().map(|key| key.key_id.as_str()),
                 "resolved frozen tool invocation decision"
             );
+            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
+                admission.expected_execution_binding_generation =
+                    request.policy.execution_binding_generation;
+                admission
+            });
             let (cache_fill, mut cache_evidence) = match crate::server::semantic_read_observation_runtime::before_dispatch(
                 self.semantic_read_observation_store.as_ref(),
                 ledger,
                 &identity,
                 semantic_cache_key.as_ref(),
+                durable_dispatch_admission,
                 cancel_token.as_deref(),
             )
             .await
@@ -3655,11 +3661,6 @@ impl RuntimeToolExecutor {
                         provider_confirmed: false,
                     }
                 })
-            });
-            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
-                admission.expected_execution_binding_generation =
-                    request.policy.execution_binding_generation;
-                admission
             });
             let admitted_control_epoch = durable_dispatch_admission
                 .as_ref()
@@ -8960,6 +8961,7 @@ esac
             &first_identity,
             Some(&key),
             None,
+            None,
         )
         .await
         {
@@ -8998,6 +9000,7 @@ esac
             &ledger,
             &second_identity,
             Some(&key),
+            None,
             None,
         )
         .await
@@ -9041,6 +9044,7 @@ esac
             &identity,
             Some(&key),
             None,
+            None,
         )
         .await
         {
@@ -9077,6 +9081,7 @@ esac
             &ledger,
             &next_identity,
             Some(&key),
+            None,
             None,
         )
         .await;
@@ -9115,6 +9120,7 @@ esac
             &ledger,
             &first_identity,
             Some(&key),
+            None,
             None,
         )
         .await
@@ -9164,6 +9170,7 @@ esac
             &ledger,
             &second_identity,
             Some(&key),
+            None,
             None,
         )
         .await;

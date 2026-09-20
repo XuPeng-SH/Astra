@@ -255,6 +255,11 @@ It persists one immutable assessment per owner/trial. Pass and Fail mean only
 that the frozen structured-output criterion passed or failed; Run completion
 alone does not establish either verdict. Non-completed executions and proven
 absence of terminal output have no numeric task-success value.
+Before the criterion runs, assessment independently verifies the complete Run
+action history and hot/archive invocation ledger in the same transaction. The
+persisted assessment includes the exact admitted tool identities and typed
+completion references; missing, unresolved, or contradictory invocation
+coverage leaves the assessment pending or unavailable.
 
 `POST /evaluation/experiments/{experiment_id}/trials/{trial_id}/assess` takes
 only authenticated owner and path identities. It returns an existing assessment

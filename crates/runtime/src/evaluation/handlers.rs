@@ -29,6 +29,21 @@ fn map_task_assessment_error(error: TaskAssessmentError) -> (StatusCode, Json<Er
         }
         TaskAssessmentError::NotFound(detail) => error_response(StatusCode::NOT_FOUND, detail),
         TaskAssessmentError::Integrity(detail) => error_response(StatusCode::CONFLICT, detail),
+        TaskAssessmentError::Invocation(error) => match *error {
+            astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::EvidenceIntegrity(
+                detail,
+            ) => error_response(StatusCode::CONFLICT, detail),
+            astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionHistory(
+                astra_services::runs::RunActionHistoryError::Integrity(detail),
+            ) => error_response(StatusCode::CONFLICT, detail),
+            astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionHistory(
+                astra_services::runs::RunActionHistoryError::Unavailable,
+            ) => error_response(
+                StatusCode::CONFLICT,
+                "Run action history is unavailable for the bound evaluation",
+            ),
+            other => internal_error(TaskAssessmentError::Invocation(Box::new(other))),
+        },
         TaskAssessmentError::Persistence(error) => map_evaluation_persistence_error(error),
         TaskAssessmentError::Execution(
             astra_services::evaluation::EvaluationExecutionError::Conflict(detail),

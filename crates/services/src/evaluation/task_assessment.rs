@@ -26,6 +26,11 @@ pub use crate::runs::{CommittedTerminalProof, RunOutputProof};
 use crate::runs::{
     TerminalOutputIdentity, TerminalOutputReadError, load_verified_terminal_output_in_transaction,
 };
+use crate::tool_invocation_ledger::{
+    DatabaseToolInvocationLedger, ToolInvocationLedgerStoreError, ToolInvocationRunEvidence,
+};
+use astra_turn_types::ToolInvocationCompletionRef;
+use std::collections::BTreeSet;
 
 pub const TASK_ASSESSMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -36,6 +41,113 @@ pub enum TaskAssessmentUnavailableReason {
     NoTerminalOutput,
     OutputTooLarge,
     CodingEvidenceUnavailable,
+}
+
+pub const TOOL_INVOCATION_COVERAGE_SCHEMA_VERSION: u32 = 1;
+
+/// Immutable proof that the Run journal and retained invocation ledger agreed
+/// on every invocation that crossed (or was completed by) an action boundary
+/// when this assessment was created.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInvocationCoverageProof {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub run_generation: u64,
+    pub last_event_index: i64,
+    pub admitted_action_ids: Vec<String>,
+    pub completion_refs: Vec<ToolInvocationCompletionRef>,
+    pub proof_fingerprint: String,
+}
+
+impl ToolInvocationCoverageProof {
+    fn from_evidence(
+        evidence: ToolInvocationRunEvidence,
+        run_id: &str,
+        run_generation: u64,
+    ) -> Result<Self, TaskAssessmentError> {
+        if evidence.history.run_generation != run_generation {
+            return Err(TaskAssessmentError::Integrity(
+                "tool invocation coverage run generation differs from the assessment run".into(),
+            ));
+        }
+        let mut admitted_action_ids = evidence
+            .history
+            .grants
+            .iter()
+            .filter_map(|grant| grant.action_id.strip_prefix("tool_invocation:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        admitted_action_ids.sort();
+        admitted_action_ids.dedup();
+        let mut completion_refs = evidence.completions;
+        completion_refs.sort_by(|left, right| left.identity.cmp(&right.identity));
+        let completion_ids = completion_refs
+            .iter()
+            .map(|reference| reference.identity.storage_key())
+            .collect::<BTreeSet<_>>();
+        if completion_ids != admitted_action_ids.iter().cloned().collect() {
+            return Err(TaskAssessmentError::Integrity(
+                "tool invocation coverage set differs between grants and completions".into(),
+            ));
+        }
+        let mut proof = Self {
+            schema_version: TOOL_INVOCATION_COVERAGE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            run_generation,
+            last_event_index: evidence.history.last_event_index,
+            admitted_action_ids,
+            completion_refs,
+            proof_fingerprint: String::new(),
+        };
+        proof.proof_fingerprint = proof.fingerprint()?;
+        Ok(proof)
+    }
+
+    fn fingerprint(&self) -> Result<String, TaskAssessmentError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+        value
+            .as_object_mut()
+            .expect("coverage proof serializes as an object")
+            .remove("proof_fingerprint");
+        Ok(content_fingerprint(&format!(
+            "tool-invocation-coverage.v1:{}",
+            canonical_json_string(&value)
+        )))
+    }
+
+    fn validate(&self, run_id: &str, run_generation: u64) -> Result<(), TaskAssessmentError> {
+        if self.schema_version != TOOL_INVOCATION_COVERAGE_SCHEMA_VERSION
+            || self.run_id != run_id
+            || self.run_generation != run_generation
+            || self.last_event_index < -1
+            || self.proof_fingerprint != self.fingerprint()?
+            || self
+                .admitted_action_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .completion_refs
+                .windows(2)
+                .any(|pair| pair[0].identity >= pair[1].identity)
+            || self
+                .completion_refs
+                .iter()
+                .any(|reference| reference.identity.run_id != run_id)
+            || self
+                .completion_refs
+                .iter()
+                .map(|reference| reference.identity.storage_key())
+                .collect::<BTreeSet<_>>()
+                != self.admitted_action_ids.iter().cloned().collect()
+        {
+            return Err(TaskAssessmentError::Integrity(
+                "tool invocation coverage proof identity is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +196,7 @@ pub struct TaskAssessmentRecord {
     pub spec_fingerprint: String,
     pub observation_id: String,
     pub verifier_fingerprint: String,
+    pub tool_invocation_coverage: ToolInvocationCoverageProof,
     pub terminal: Option<CommittedTerminalProof>,
     pub output: Option<RunOutputProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +235,8 @@ pub enum TaskAssessmentError {
     Persistence(#[from] EvaluationPersistenceError),
     #[error(transparent)]
     Execution(#[from] EvaluationExecutionError),
+    #[error(transparent)]
+    Invocation(#[from] Box<ToolInvocationLedgerStoreError>),
 }
 
 impl TaskAssessmentError {
@@ -135,7 +250,7 @@ impl TaskAssessmentError {
                 | Self::Execution(EvaluationExecutionError::Persistence(
                     EvaluationPersistenceError::Database { .. }
                 ))
-        )
+        ) || matches!(self, Self::Invocation(error) if error.is_retryable())
     }
 }
 
@@ -378,6 +493,15 @@ impl TaskAssessmentRecord {
                 "assessment is outside its frozen trial/observation binding".into(),
             ));
         }
+        self.tool_invocation_coverage
+            .validate(&self.execution_run_id, self.execution_run_generation)?;
+        if self.terminal.as_ref().is_some_and(|terminal| {
+            self.tool_invocation_coverage.last_event_index < terminal.terminal_event_idx
+        }) {
+            return Err(TaskAssessmentError::Integrity(
+                "tool invocation coverage ends before the terminal Run event".into(),
+            ));
+        }
         match (
             &observation.observation.status,
             &self.outcome,
@@ -614,6 +738,27 @@ impl DatabaseEvaluationObservationStore {
             .iter()
             .find(|case| case.case_id == binding.trial.case_id)
             .ok_or_else(|| TaskAssessmentError::Integrity("bound case is absent".into()))?;
+        let tool_invocation_coverage =
+            match DatabaseToolInvocationLedger::inspect_run_evidence_in_transaction(
+                &mut tx,
+                owner,
+                &observation.session_id,
+                &observation.execution_run_id,
+            )
+            .await
+            {
+                Ok(evidence) => ToolInvocationCoverageProof::from_evidence(
+                    evidence,
+                    &observation.execution_run_id,
+                    observation.execution_run_generation,
+                )?,
+                Err(ToolInvocationLedgerStoreError::EvidenceUnresolved(_)) => {
+                    return Ok(TaskAssessmentResult::Pending);
+                }
+                Err(error) => {
+                    return Err(TaskAssessmentError::Invocation(Box::new(error)));
+                }
+            };
         let mut record = TaskAssessmentRecord {
             schema_version: TASK_ASSESSMENT_SCHEMA_VERSION,
             assessment_id: String::new(),
@@ -628,6 +773,7 @@ impl DatabaseEvaluationObservationStore {
             spec_fingerprint: experiment.spec_fingerprint.clone(),
             observation_id: observation.observation_id.clone(),
             verifier_fingerprint: verifier_fingerprint(&case.task_verifier)?,
+            tool_invocation_coverage,
             terminal: None,
             output: None,
             coding: None,
@@ -766,6 +912,9 @@ fn decode_assessment(
     let record: TaskAssessmentRecord = serde_json::from_str(&get("assessment_json")?)
         .map_err(|e| TaskAssessmentError::Integrity(e.to_string()))?;
     record.validate_hash()?;
+    record
+        .tool_invocation_coverage
+        .validate(&record.execution_run_id, record.execution_run_generation)?;
     if record.owner_user_id != get("owner_user_id")?
         || record.experiment_id != get("experiment_id")?
         || record.trial_id != get("trial_id")?
@@ -845,6 +994,16 @@ pub(crate) fn test_assessment_record(
             2
         },
     });
+    let mut tool_invocation_coverage = ToolInvocationCoverageProof {
+        schema_version: TOOL_INVOCATION_COVERAGE_SCHEMA_VERSION,
+        run_id: observation.execution_run_id.clone(),
+        run_generation: observation.execution_run_generation,
+        last_event_index: 12,
+        admitted_action_ids: Vec::new(),
+        completion_refs: Vec::new(),
+        proof_fingerprint: String::new(),
+    };
+    tool_invocation_coverage.proof_fingerprint = tool_invocation_coverage.fingerprint().unwrap();
     let mut record = TaskAssessmentRecord {
         schema_version: TASK_ASSESSMENT_SCHEMA_VERSION,
         assessment_id: String::new(),
@@ -859,6 +1018,7 @@ pub(crate) fn test_assessment_record(
         spec_fingerprint: experiment.spec_fingerprint.clone(),
         observation_id: observation.observation_id.clone(),
         verifier_fingerprint: verifier_fingerprint(&case.task_verifier).unwrap(),
+        tool_invocation_coverage,
         terminal: completed.then(|| CommittedTerminalProof {
             settlement_batch_id: "test-atomic-batch".into(),
             terminal_event_idx: 12,
@@ -952,6 +1112,21 @@ mod tests {
         let mut changed = pass.clone();
         changed.outcome = TaskAssessmentOutcome::Fail;
         assert!(changed.validate_binding(&experiment, &observation).is_err());
+        let mut stale_coverage = pass.clone();
+        stale_coverage.tool_invocation_coverage.last_event_index = 11;
+        stale_coverage.tool_invocation_coverage.proof_fingerprint = stale_coverage
+            .tool_invocation_coverage
+            .fingerprint()
+            .unwrap();
+        stale_coverage.assessment_fingerprint = stale_coverage.fingerprint().unwrap();
+        stale_coverage.assessment_id = stale_coverage
+            .assessment_fingerprint
+            .replace("sha256:", "eva_");
+        assert!(
+            stale_coverage
+                .validate_binding(&experiment, &observation)
+                .is_err()
+        );
         let mut changed_observation = observation.clone();
         changed_observation.execution_run_generation += 1;
         assert!(

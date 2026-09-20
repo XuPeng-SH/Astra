@@ -18,6 +18,9 @@ use astra_services::evaluation::TrialUnit;
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunRecord, DurableRunStartClaim, RunStateStore,
 };
+use astra_services::tool_invocation_ledger::{
+    DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
+};
 use astra_services::{
     ComparisonArm, DataIsolation, DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
     DatabaseMaterializationReceiptStore, EvaluationBudget, EvaluationCase,
@@ -28,6 +31,12 @@ use astra_services::{
     MaterializationValidationError, MemoryIsolation, RevisionRef, SnapshotEnvelope,
     TrialObservation, TrialOrder, TrialStatus, TrustedMaterializerContext, validate_receipt_set,
 };
+use astra_turn_types::{
+    DurableToolReference, ToolInvocationCompletionSource, ToolInvocationDecision,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationResultPayload,
+};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 fn spec(experiment_id: &str) -> ExperimentSpec {
@@ -1911,8 +1920,17 @@ async fn settle_task_assessment_trial(
     use astra_services::evaluation::content_fingerprint;
     use astra_services::runs::AtomicRunTerminalSettlementRequest;
     let session = insert_session(pool, owner).await;
-    let run = insert_evaluation_run(pool, owner, &session, &experiment.spec, trial).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
+    let mut run_record = evaluation_run_record(owner, &session, &experiment.spec, trial);
+    run_record.status = "running".into();
+    let run = run_record.run_id.clone();
+    let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("assessment-pod");
+    assert!(matches!(
+        store
+            .claim_run_start(run_record, Some(&session))
+            .await
+            .unwrap(),
+        DurableRunStartClaim::Started { .. }
+    ));
     let envelope = SnapshotEnvelope::new(
         owner,
         &experiment.experiment_id,
@@ -1981,13 +1999,69 @@ async fn settle_task_assessment_trial(
         "event_type":"evaluation_admitted", "run_generation":0,
         "idempotency_key":format!("evaluation-admitted:{run}:0"), "data":{"admission":admission}
     })]).await.unwrap();
+    let invocation_ledger = DatabaseToolInvocationLedger::new(pool.clone());
+    let invocation = ToolInvocationIdentity::new(
+        owner,
+        &session,
+        &run,
+        "assessment-cache-turn",
+        "assessment-cache-invocation",
+    )
+    .unwrap();
+    let invocation_decision = ToolInvocationDecision::new(
+        &serde_json::json!({"route":"assessment_fixture","policy":"frozen"}),
+    )
+    .unwrap();
+    let invocation_arguments = serde_json::json!({"resource":"assessment-fixture"});
+    let invocation_fingerprint = ToolInvocationFingerprint::new(
+        DurableToolReference::built_in("bash", "assessment-v1").unwrap(),
+        &invocation_arguments,
+        &invocation_decision.decision_id,
+    )
+    .unwrap();
+    assert!(matches!(
+        invocation_ledger
+            .prepare(&invocation, &invocation_fingerprint, &invocation_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+    let control_epoch = store
+        .load_run(owner, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    invocation_ledger
+        .complete_from_semantic_read_cache(
+            &invocation,
+            &ToolInvocationResultPayload::new(
+                "cached assessment observation",
+                BTreeMap::new(),
+                None,
+            )
+            .unwrap(),
+            &ToolInvocationCompletionSource::semantic_read_cache(
+                format!("sha256:{}", "a".repeat(64)),
+                format!("sha256:{}", "b".repeat(64)),
+            )
+            .unwrap(),
+            ToolInvocationDispatchAdmission {
+                expected_control_epoch: control_epoch,
+                expected_owner_generation: 0,
+                expected_owner_pod_id: store.owner_pod_id().to_string(),
+                expected_execution_binding_generation: None,
+            },
+        )
+        .await
+        .unwrap();
     let events = [
         serde_json::json!({"event_type":"run_output_recorded","idempotency_key":"run-output-recorded:0",
             "data":{"schema_version":1,"owner_user_id":owner,"session_id":session,"run_id":run,"run_generation":0,
                 "source_event_id":"assessment-output","content_hash":content_fingerprint(content),"content_bytes":content.len()}}),
         serde_json::json!({"event_type":"run_finished","data":{"status":status}}),
         serde_json::json!({"event_type":"run_accounting_finalized","idempotency_key":"run-accounting-finalized:0",
-            "data":{"usage_scope":"run_total","prompt_tokens":7,"cache_read_tokens":4,"cache_creation_tokens":2,"completion_tokens":5,"tool_call_count":0}}),
+            "data":{"usage_scope":"run_total","prompt_tokens":7,"cache_read_tokens":4,"cache_creation_tokens":2,"completion_tokens":5,"tool_call_count":1}}),
     ];
     let mut tx = pool.get().begin().await.unwrap();
     sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'assessment-output','transcript-envelope')")
@@ -2000,14 +2074,14 @@ async fn settle_task_assessment_trial(
                 expected_session_id: &session,
                 run_id: &run,
                 expected_owner_generation: 0,
-                expected_statuses: &["queued"],
+                expected_statuses: &["running"],
                 status,
                 waiting_for: None,
                 error_message: None,
                 events: &events,
                 prompt_tokens: 13,
                 completion_tokens: 5,
-                tool_calls: 0,
+                tool_calls: 1,
             },
         )
         .await
@@ -2042,7 +2116,7 @@ async fn settle_task_assessment_trial(
             },
             Some(7),
             Some(5),
-            Some(0),
+            Some(1),
             vec![EvidenceRef {
                 evidence_id: format!("run:{run}"),
                 kind: EvidenceKind::Trace,
@@ -2176,6 +2250,8 @@ async fn task_assessment_is_historical_owner_bound_and_retries_missing_sources()
             panic!("assessment must persist")
         };
         assert_eq!(record.outcome, expected);
+        assert_eq!(record.tool_invocation_coverage.admitted_action_ids.len(), 1);
+        assert_eq!(record.tool_invocation_coverage.completion_refs.len(), 1);
         record.validate_binding(&experiment, &observation).unwrap();
         assert!(
             store

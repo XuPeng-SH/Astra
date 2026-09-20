@@ -11633,16 +11633,6 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
     .await
     .expect("remove first-arm observation before explicit repair");
     assert_eq!(deleted.rows_affected(), 1);
-    let removed_marker = sqlx::query(
-        "DELETE FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_settlement_finished'",
-    )
-    .bind(&owner)
-    .bind(&session_id)
-    .bind(&run_id)
-    .execute(pool.get())
-    .await
-    .expect("remove late settlement marker to require canonical atomic proof");
-    assert_eq!(removed_marker.rows_affected(), 1);
     let (accounting_event_idx, accounting_event_hash): (i64, String) = sqlx::query_as(
         "SELECT event_idx, event_hash FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'",
     )
@@ -11722,7 +11712,8 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
             .load_by_trial(&owner, &trial_id)
             .await
             .unwrap()
-            .is_none()
+            .is_some(),
+        "projection repair may commit independently, but corrupted evidence must not create an assessment"
     );
     let assessment_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM evaluation_task_assessments WHERE owner_user_id = ? AND experiment_id = ? AND trial_id = ?",

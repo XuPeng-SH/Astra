@@ -1,4 +1,9 @@
+mod action_history;
 mod permission_control;
+pub use action_history::{
+    RunActionHistoryError, VerifiedRunActionGrant, VerifiedRunActionHistory,
+    load_verified_run_action_history_in_transaction,
+};
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
