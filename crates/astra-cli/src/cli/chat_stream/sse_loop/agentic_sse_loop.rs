@@ -1,21 +1,15 @@
-//! Post-loop finalization: CLI sidecars (explain, verdict, telemetry stderr)
+//! Post-loop finalization: CLI sidecars (explain and verdict reports)
 //! and [`StreamResult`] assembly from [`AgenticLoopState`].
-
-use std::collections::HashSet;
-use std::time::Instant;
 
 use astra_core::canonical_names::normalize_name_list;
 use astra_pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder};
-use astra_runtime::{
-    turn::agentic_turn_telemetry::{format_token_count_compact, session_id_footer_abbrev},
-    turn::turn_guard::TurnGuard,
-};
+use astra_runtime::turn::turn_guard::TurnGuard;
 use astra_services::session_journal::ToolCallRecord;
 use astra_turn_core::{
     tool_health_persistence::ToolHealthEntry, tool_registry_report::ToolSelectionReport,
 };
-use crossterm::style::Stylize;
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::cli::stream::streaming_types::{AppliedStreamUserIntent, UsageAttribution};
 use crate::{ExplainMode, StreamResult, VerdictEvent};
@@ -27,19 +21,10 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) explain: ExplainMode,
     pub(crate) explain_report_format: ExplainReportFormat,
     pub(crate) quiet: bool,
-    pub(crate) verbose_mode: bool,
-    pub(crate) start: Instant,
-    pub(crate) model: Option<&'a str>,
     pub(crate) explain_analyze_events: &'a [astra_turn_types::ExplainAnalyzeEventV1],
     pub(crate) explain_analyze_degraded: bool,
     pub(crate) verdict_events: &'a [VerdictEvent],
-    pub(crate) has_any_usage: bool,
-    pub(crate) total_prompt: u64,
-    pub(crate) total_cache_read: u64,
-    pub(crate) total_cache_creation: u64,
-    pub(crate) total_completion: u64,
     pub(crate) current_session_id: Option<&'a str>,
-    pub(crate) usage_attribution: &'a UsageAttribution,
 }
 
 pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
@@ -47,19 +32,10 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         explain,
         explain_report_format,
         quiet,
-        verbose_mode,
-        start,
-        model,
         explain_analyze_events,
         explain_analyze_degraded,
         verdict_events,
-        has_any_usage,
-        total_prompt,
-        total_cache_read,
-        total_cache_creation,
-        total_completion,
         current_session_id,
-        usage_attribution,
     } = ctx;
 
     let mut explain_artifact_error = None;
@@ -102,49 +78,6 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     }
     if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
         print_verdict_report(verdict_events, explain == ExplainMode::Verbose);
-    }
-
-    let elapsed = start.elapsed().as_secs_f64();
-    let model_tag = usage_attribution
-        .primary_model
-        .as_deref()
-        .or(model)
-        .unwrap_or("auto");
-    let session_tag = session_id_footer_abbrev(current_session_id);
-    if verbose_mode && !quiet {
-        // `↑` is the full billable input: fresh + cache-read + cache-creation.
-        // All three occupy the context window and are all billed (different
-        // rates). Showing only `total_prompt` (fresh) made cache-heavy turns
-        // look like ↑12 when the actual traffic was 60k+.
-        let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-            total_prompt,
-            total_cache_read,
-            total_cache_creation,
-        )
-        .total_input_tokens();
-        eprintln!(
-            "{}",
-            format!(
-                "  ⏱ {:.1}s  ↓ {}  ↑ {}  overall · main: {}  auxiliary: {}  session: {}",
-                elapsed,
-                if has_any_usage {
-                    format_token_count_compact(total_completion)
-                } else {
-                    "?".to_string()
-                },
-                if has_any_usage {
-                    format_token_count_compact(total_input)
-                } else {
-                    "?".to_string()
-                },
-                model_tag,
-                usage_attribution
-                    .auxiliary_summary()
-                    .unwrap_or_else(|| "none".to_string()),
-                session_tag,
-            )
-            .dim()
-        );
     }
 }
 

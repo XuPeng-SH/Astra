@@ -248,6 +248,20 @@ impl UsageAttribution {
             || self.auxiliary_capture_truncated
     }
 
+    /// Whether Explain captured any usage state, even when no provider token
+    /// lane is known.  A zero-valued or unavailable capture is still a fact
+    /// that must survive turn settlement; it is not equivalent to an absent
+    /// usage snapshot.
+    pub(crate) fn has_observed_state(&self) -> bool {
+        self.primary.is_some()
+            || self.primary_complete
+            || self.primary_attempts > 0
+            || self.primary_model.is_some()
+            || self.has_auxiliary()
+            || self.auxiliary_complete
+            || !self.auxiliary_sources.is_empty()
+    }
+
     pub(crate) fn auxiliary_summary(&self) -> Option<String> {
         if !self.has_auxiliary() {
             return None;
@@ -325,7 +339,6 @@ fn primary_accumulator_complete(
     terminal_turn_observed
         && !explain_analyze_degraded
         && graph.diagnostics().is_empty()
-        && graph.coverage_gaps().is_empty()
         && graph
             .nodes()
             .iter()
@@ -1190,6 +1203,60 @@ mod usage_attribution_tests {
         assert!(summary.contains("request_judgment"));
         assert!(summary.contains("in 7"));
         assert!(summary.contains("out 2"));
+    }
+
+    #[test]
+    fn timing_coverage_gaps_do_not_invalidate_complete_token_usage() {
+        let primary = finished_primary(
+            "primary",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(10),
+            }),
+        );
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.auxiliary_usage = None;
+        terminal.coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ProviderRetryBackoff,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
+        ];
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), primary, terminal],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(
+            attribution.primary_complete,
+            "timing coverage is independent from provider token coverage"
+        );
+    }
+
+    #[test]
+    fn timing_coverage_gaps_do_not_hide_missing_token_lanes() {
+        let missing_usage = finished_primary("primary", None);
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.auxiliary_usage = None;
+        terminal.coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
+        ];
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), missing_usage, terminal],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(!attribution.primary_complete);
     }
 
     #[test]

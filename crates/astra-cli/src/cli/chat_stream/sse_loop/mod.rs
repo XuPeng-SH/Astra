@@ -1293,19 +1293,10 @@ pub(crate) async fn stream_chat_sse(
         explain: p.explain,
         explain_report_format: p.explain_report_format,
         quiet: p.render_policy.is_silent(),
-        verbose_mode: p.verbose_mode,
-        start,
-        model: p.model,
         explain_analyze_events: &state.telemetry.explain_analyze_events,
         explain_analyze_degraded: state.telemetry.explain_analyze_degraded,
         verdict_events: &state.stall.verdict_events,
-        has_any_usage: state.has_any_usage,
-        total_prompt: state.total_prompt,
-        total_cache_read: state.total_cache_read,
-        total_cache_creation: state.total_cache_creation,
-        total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
-        usage_attribution: &usage_attribution,
     });
 
     // `turn_intent` is populated only by the strict LLM judge. Preserve

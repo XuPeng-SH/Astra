@@ -188,13 +188,12 @@ pub(crate) enum WireEvent {
 pub(crate) struct TurnStats {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
+    /// Structured provider metrics carried for diagnostics/replay. The
+    /// default completion marker deliberately does not render these lanes.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Of the `tokens_in` total, how many were served from the
-    /// provider's prompt cache. Drives the `💾 N%` segment in the
-    /// per-turn summary band. `None` when the provider didn't
-    /// report cache stats this turn (e.g. first turn, no cache
-    /// participation, DeepSeek with cache disabled).
+    /// Of the `tokens_in` total, how many were served from the provider's
+    /// prompt cache. `None` when the provider did not report cache stats.
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
     pub model_name: Option<String>,

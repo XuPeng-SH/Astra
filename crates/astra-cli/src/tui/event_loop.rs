@@ -10043,13 +10043,11 @@ pub(crate) async fn run_tui_session(
                                             ttft_ms,
                                             tokens_in: turn_fresh_input,
                                             tokens_out: turn_completion,
-                                            // Drive the `💾 N%` segment:
-                                            // hit rate = cache_read / total_input.
-                                            // Only plumbed when the provider
-                                            // reported a cache_read value this
-                                            // turn — `None` keeps the segment
-                                            // off entirely (first turn, non-
-                                            // caching provider, etc.).
+                                            // Retain cache lanes in the
+                                            // structured turn event for
+                                            // diagnostics/replay. The default
+                                            // completion marker intentionally
+                                            // does not render them.
                                             cache_read_tokens: turn_cache_read
                                                 .filter(|tokens| *tokens > 0),
                                             cache_creation_tokens: turn_cache_creation,
@@ -11894,7 +11892,7 @@ mod tests {
         result.completion_tokens = 0;
         result.cache_read_tokens = 0;
         result.cache_creation_tokens = 0;
-        assert!(crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result).is_none());
+        assert!(crate::cli::turn::turn_entry::TurnUsage::from_stream_result(&result).is_some());
     }
 
     #[test]

@@ -3,14 +3,14 @@
 //! Shape:
 //!
 //! ```text
-//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · main deepseek · Jev ...)
+//!   8.5s · with deepseek-flash · 1 tool
 //! ```
 //!
-//! The summary intentionally stays in product language rather than
-//! exposing raw telemetry grammar. Lower-value details such as
-//! per-direction token arrows are omitted so the band reads like a
-//! calm recap instead of an engineering dashboard. Sections that
-//! don't apply to this turn are elided.
+//! The summary is a user-facing completion marker, not a telemetry report.
+//! It answers how long the turn took, which primary model answered, and
+//! whether material tools ran. Token lanes, cache ratios, auxiliary judgment,
+//! and session totals remain structured evidence for Explain Analyze rather
+//! than being dumped into every chat turn.
 //!
 //! Persists as [`TurnEvent::TurnSummary`]. Never live.
 
@@ -26,10 +26,11 @@ use crate::tui::turn_event::TurnEvent;
 pub(crate) struct TurnSummaryCell {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
+    /// Structured provider metrics retained for diagnostics/replay. They are
+    /// intentionally not rendered in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Cached input alongside the fresh `tokens_in`. Drives both total provider
-    /// traffic and the cache-rate band.
+    /// Cached input alongside the fresh `tokens_in`.
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
     pub model_name: Option<String>,
@@ -120,64 +121,17 @@ impl HistoryCell for TurnSummaryCell {
 impl TurnSummaryCell {
     fn sections(&self, label: Style, value: Style) -> Vec<Section> {
         let mut sections: Vec<Section> = Vec::new();
-        let mut secondary_parts: Vec<Vec<Span<'static>>> = Vec::new();
-
         if let Some(elapsed) = self.elapsed_ms {
-            sections.push(Section::primary(vec![
-                Span::styled(fmt_duration_ms(elapsed), value),
-                Span::styled(" total", label),
-            ]));
+            sections.push(Section::primary(vec![Span::styled(
+                fmt_duration_ms(elapsed),
+                value,
+            )]));
         }
 
-        if let Some(ttft) = self.ttft_ms
-            && ttft > 0
-        {
+        if let Some(model) = self.model_name.as_deref() {
             sections.push(Section::primary(vec![
-                Span::styled("ttft ", label),
-                Span::styled(fmt_ms(ttft), value),
-            ]));
-        }
-
-        let has_known_provider_lane = self.tokens_in.is_some()
-            || self.tokens_out.is_some()
-            || self.cache_read_tokens.is_some()
-            || self.cache_creation_tokens.is_some();
-        if has_known_provider_lane {
-            let provider_tokens = self
-                .tokens_in
-                .unwrap_or(0)
-                .saturating_add(self.cache_read_tokens.unwrap_or(0))
-                .saturating_add(self.cache_creation_tokens.unwrap_or(0))
-                .saturating_add(self.tokens_out.unwrap_or(0));
-            sections.push(Section::primary(vec![
-                Span::styled(fmt_tokens(provider_tokens), value),
-                Span::styled(
-                    if self.usage_partial {
-                        " tokens known"
-                    } else {
-                        " tokens"
-                    },
-                    label,
-                ),
-            ]));
-        }
-
-        if !self.usage_partial
-            && let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
-            && let Some(cache_creation) = self.cache_creation_tokens.or(Some(0))
-            && cache_read > 0
-        {
-            let total_input = cache_read
-                .saturating_add(fresh_input)
-                .saturating_add(cache_creation);
-            let pct = if total_input == 0 {
-                0
-            } else {
-                ((cache_read as f64 / total_input as f64) * 100.0).round() as u32
-            };
-            sections.push(Section::primary(vec![
-                Span::styled(format!("{pct}%"), value),
-                Span::styled(" cached", label),
+                Span::styled("with ", label),
+                Span::styled(model.to_string(), value),
             ]));
         }
 
@@ -186,56 +140,6 @@ impl TurnSummaryCell {
                 Span::styled(self.tools.to_string(), value),
                 Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
             ]));
-        }
-
-        if let Some(model) = self.model_name.as_deref() {
-            secondary_parts.push(vec![
-                Span::styled("main ", label),
-                Span::styled(model.to_string(), value),
-            ]);
-        }
-        if let Some(auxiliary) = self.auxiliary_summary.as_deref() {
-            secondary_parts.push(vec![Span::styled(auxiliary.to_string(), value)]);
-        }
-        if self.usage_partial {
-            secondary_parts.push(vec![Span::styled("usage not fully attributed", label)]);
-        }
-
-        let current_provider_tokens = self
-            .tokens_in
-            .unwrap_or(0)
-            .saturating_add(self.cache_read_tokens.unwrap_or(0))
-            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
-            .saturating_add(self.tokens_out.unwrap_or(0));
-        let cumulative_tokens = self
-            .cumulative_tokens
-            .filter(|c| *c > current_provider_tokens)
-            .map(|c| Span::styled(fmt_tokens(c), value));
-
-        if let Some(cost) = self.cumulative_cost_usd
-            && cost > 0.0
-        {
-            secondary_parts.push(vec![
-                Span::styled(fmt_cost(cost), value),
-                Span::styled(" spent", label),
-            ]);
-        }
-
-        if cumulative_tokens.is_some() || !secondary_parts.is_empty() {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::styled("(", label));
-            if let Some(tokens) = cumulative_tokens {
-                spans.push(tokens);
-                spans.push(Span::styled(" overall", label));
-            } else {
-                spans.push(Span::styled("Overall", label));
-            }
-            for part in secondary_parts {
-                spans.push(Span::styled(" · ", label));
-                spans.extend(part);
-            }
-            spans.push(Span::styled(")", label));
-            sections.push(Section::secondary(spans));
         }
 
         sections
@@ -264,35 +168,6 @@ fn fmt_duration_ms(ms: u64) -> String {
     }
 }
 
-/// Sub-turn ttft: ms below 1s, decimal seconds above.
-fn fmt_ms(ms: u64) -> String {
-    if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn fmt_cost(usd: f64) -> String {
-    if usd >= 1.0 {
-        format!("${usd:.2}")
-    } else if usd >= 0.01 {
-        format!("${usd:.3}")
-    } else {
-        format!("${usd:.4}")
-    }
-}
-
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
@@ -303,22 +178,11 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 #[derive(Debug, Clone)]
 struct Section {
     spans: Vec<Span<'static>>,
-    secondary: bool,
 }
 
 impl Section {
     fn primary(spans: Vec<Span<'static>>) -> Self {
-        Self {
-            spans,
-            secondary: false,
-        }
-    }
-
-    fn secondary(spans: Vec<Span<'static>>) -> Self {
-        Self {
-            spans,
-            secondary: true,
-        }
+        Self { spans }
     }
 }
 
@@ -392,12 +256,17 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn full_summary_contains_all_sections() {
+    fn full_summary_contains_only_user_facing_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["total", "ttft", "tokens", "tools", "overall", "spent"] {
+        for seg in ["16s", "tools"] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
-        assert!(out.contains("145.0k"));
+        for diagnostic in ["ttft", "tokens", "cached", "overall", "spent"] {
+            assert!(
+                !out.contains(diagnostic),
+                "diagnostic section {diagnostic:?} leaked into {out}"
+            );
+        }
     }
 
     #[test]
@@ -414,80 +283,43 @@ mod tests {
         c.ttft_ms = Some(0);
         let out = render(&c, 120);
         assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
-        assert!(out.contains("total"));
+        assert!(out.contains("16s"));
     }
 
     #[test]
-    fn cache_segment_shows_hit_rate_percentage() {
+    fn model_name_is_compact_and_user_facing() {
         let mut c = mk_full();
-        // 23.2k fresh + 18k cached input → ~44% cache hit rate.
-        c.cache_read_tokens = Some(18_000);
+        c.model_name = Some("deepseek-flash".into());
         let out = render(&c, 120);
-        assert!(out.contains("cached"), "cache label missing: {out}");
-        assert!(out.contains("44%"), "expected ~44% hit rate in: {out}");
+        assert!(out.contains("with deepseek-flash"), "model missing: {out}");
     }
 
     #[test]
-    fn headline_tokens_include_provider_cache_traffic() {
-        let c = TurnSummaryCell {
-            tokens_in: Some(1_200),
-            tokens_out: Some(300),
-            cache_read_tokens: Some(98_800),
-            ..Default::default()
-        };
-        let out = render(&c, 120);
-        assert!(
-            out.contains("100.3k tokens"),
-            "provider traffic should headline: {out}"
-        );
-        assert!(
-            out.contains("99% cached"),
-            "cache traffic should stay visible: {out}"
-        );
-        assert!(
-            !out.contains("1.5k tokens"),
-            "fresh-only billing tokens must not masquerade as provider traffic: {out}"
-        );
-    }
-
-    #[test]
-    fn partial_usage_keeps_known_tokens_but_hides_exact_cache_rate() {
-        let c = TurnSummaryCell {
-            tokens_in: Some(1_200),
-            tokens_out: Some(300),
-            cache_read_tokens: Some(98_800),
-            cache_creation_tokens: None,
-            usage_partial: true,
-            ..Default::default()
-        };
-        let out = render(&c, 120);
-        assert!(
-            out.contains("100.3k tokens known"),
-            "known lanes missing: {out}"
-        );
-        assert!(
-            !out.contains("cached"),
-            "cache rate must be unavailable: {out}"
-        );
-        assert!(
-            out.contains("usage not fully attributed"),
-            "coverage missing: {out}"
-        );
-    }
-
-    #[test]
-    fn partial_usage_hides_cache_rate_even_when_all_input_lanes_are_known() {
+    fn usage_details_are_not_dumped_into_default_summary() {
         let c = TurnSummaryCell {
             tokens_in: Some(1_200),
             tokens_out: Some(300),
             cache_read_tokens: Some(98_800),
             cache_creation_tokens: Some(0),
+            auxiliary_summary: Some("Jev (jev-1.13.0) · request_judgment".into()),
             usage_partial: true,
+            cumulative_tokens: Some(145_000),
             ..Default::default()
         };
         let out = render(&c, 120);
-        assert!(!out.contains("cached"), "partial cache rate leaked: {out}");
-        assert!(out.contains("usage not fully attributed"));
+        for diagnostic in [
+            "tokens",
+            "cached",
+            "Jev",
+            "request_judgment",
+            "usage not fully attributed",
+            "overall",
+        ] {
+            assert!(
+                !out.contains(diagnostic),
+                "diagnostic {diagnostic:?} leaked into {out}"
+            );
+        }
     }
 
     #[test]
@@ -500,7 +332,6 @@ mod tests {
             ..Default::default()
         };
         let out = render(&c, 120);
-        assert!(out.contains("100.3k tokens"));
         assert!(
             !out.contains("overall"),
             "duplicate overall is noise: {out}"
@@ -508,42 +339,20 @@ mod tests {
     }
 
     #[test]
-    fn cache_segment_elided_when_unreported() {
-        // Many providers don't surface cache reads on first turn
-        // or when caching is disabled — absence should not render
-        // a misleading "0%" chip.
+    fn usage_summary_is_empty_when_only_diagnostics_are_present() {
         let mut c = mk_full();
         c.cache_read_tokens = None;
+        c.elapsed_ms = None;
+        c.tools = 0;
         let out = render(&c, 120);
-        assert!(!out.contains("cached"), "cache chip must be elided: {out}");
-    }
-
-    #[test]
-    fn cache_segment_elided_when_read_is_zero() {
-        // Provider reported but hit rate genuinely zero — still
-        // elide rather than show "0%", which reads as noise.
-        let mut c = mk_full();
-        c.cache_read_tokens = Some(0);
-        let out = render(&c, 120);
-        assert!(
-            !out.contains("cached"),
-            "zero-hit cache chip must elide: {out}"
-        );
-    }
-
-    #[test]
-    fn sigma_section_elided_when_cumulative_zero() {
-        let mut c = mk_full();
-        c.cumulative_tokens = Some(0);
-        c.cumulative_cost_usd = Some(0.0);
-        let out = render(&c, 120);
-        assert!(!out.contains("overall"));
-        assert!(!out.contains("spent"));
+        assert!(out.trim().is_empty(), "diagnostic-only cell leaked: {out}");
     }
 
     #[test]
     fn narrow_width_wraps_summary_into_multiple_lines() {
-        let out = render(&mk_full(), 46);
+        let mut cell = mk_full();
+        cell.model_name = Some("deepseek-flash".into());
+        let out = render(&cell, 32);
         let non_empty: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
         assert!(
             non_empty.len() >= 2,
@@ -569,36 +378,32 @@ mod tests {
         assert_eq!(fmt_duration_ms(125_000), "2m 5s");
     }
 
-    #[test]
-    fn fmt_tokens_scales() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_234), "1.2k");
-        assert_eq!(fmt_tokens(23_200), "23.2k");
-        assert_eq!(fmt_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn fmt_cost_precision_scales_with_magnitude() {
-        assert_eq!(fmt_cost(0.0042), "$0.0042");
-        assert_eq!(fmt_cost(0.014), "$0.014");
-        assert_eq!(fmt_cost(2.5), "$2.50");
-    }
-
     // ── Persistence ──────────────────────────────────────────────
 
     #[test]
     fn persist_roundtrip_keeps_every_field() {
-        let orig = mk_full();
+        let mut orig = mk_full();
+        orig.cache_read_tokens = Some(18_000);
+        orig.cache_creation_tokens = Some(7);
+        orig.model_name = Some("deepseek-flash".into());
+        orig.auxiliary_summary = Some("Jev (deepseek-judgement) · request_judgment".into());
+        orig.usage_partial = true;
+        orig.ts = Some("2026-09-20T00:00:00Z".into());
         let ev = orig.to_persist().unwrap();
         let back = TurnSummaryCell::from_persist(ev).unwrap();
         assert_eq!(back.elapsed_ms, orig.elapsed_ms);
         assert_eq!(back.ttft_ms, orig.ttft_ms);
         assert_eq!(back.tokens_in, orig.tokens_in);
         assert_eq!(back.tokens_out, orig.tokens_out);
+        assert_eq!(back.cache_read_tokens, orig.cache_read_tokens);
+        assert_eq!(back.cache_creation_tokens, orig.cache_creation_tokens);
+        assert_eq!(back.model_name, orig.model_name);
+        assert_eq!(back.auxiliary_summary, orig.auxiliary_summary);
+        assert_eq!(back.usage_partial, orig.usage_partial);
         assert_eq!(back.tools, orig.tools);
         assert_eq!(back.cumulative_tokens, orig.cumulative_tokens);
         assert_eq!(back.cumulative_cost_usd, orig.cumulative_cost_usd);
+        assert_eq!(back.ts, orig.ts);
     }
 
     #[test]

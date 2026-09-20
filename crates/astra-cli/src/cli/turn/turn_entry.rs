@@ -169,7 +169,11 @@ impl TurnUsage {
             cache_creation_tokens: result.cache_creation_tokens,
             usage_attribution: result.usage_attribution.clone(),
         };
-        (result.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+        (result.token_usage_coverage.attempts > 0
+            || result.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state())
+        .then_some(usage)
     }
 
     pub(crate) fn from_partial(partial: &crate::PartialTurnData) -> Option<Self> {
@@ -180,7 +184,11 @@ impl TurnUsage {
             cache_creation_tokens: partial.cache_creation_tokens,
             usage_attribution: partial.usage_attribution.clone(),
         };
-        (partial.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
+        (partial.token_usage_coverage.attempts > 0
+            || partial.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state())
+        .then_some(usage)
     }
 
     pub(crate) fn has_values(&self) -> bool {
@@ -606,12 +614,43 @@ async fn ensure_multi_agent_runtime_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ShellPassthroughDecision, TurnContext, acquire_interactive_turn_admission,
+        ShellPassthroughDecision, TurnContext, TurnUsage, acquire_interactive_turn_admission,
         classify_shell_passthrough, ensure_interactive_session_identity,
         ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
         model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
+    use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[test]
+    fn partial_usage_snapshot_survives_without_token_numbers() {
+        let partial = crate::PartialTurnData {
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+
+        let usage = TurnUsage::from_partial(&partial).expect("capture state must be retained");
+
+        assert!(usage.usage_attribution.auxiliary_capture_unavailable);
+        assert!(!usage.has_values());
+    }
+
+    #[test]
+    fn partial_usage_coverage_survives_when_every_token_is_unavailable() {
+        let partial = crate::PartialTurnData {
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 1,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(TurnUsage::from_partial(&partial).is_some());
+    }
 
     #[tokio::test]
     #[serial_test::serial]
