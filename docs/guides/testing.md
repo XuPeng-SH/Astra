@@ -250,6 +250,66 @@ not claim deployment-scale throughput; use the Work pressure and multi-server
 capacity probes for many readers, multiple server processes, provider quotas,
 and latency measurements.
 
+### Sustained ingestion and shared-pool pressure
+
+The optional ingestion probe exercises the production ingestion queue and a
+shared SQL pool with 100 synthetic owners and 1,000 Sessions. It is deliberately
+separate from ordinary integration CI. Use Python 3.11 or newer, the pinned Rust
+toolchain, and a dedicated disposable `astra_test_probe_*` database. Configure
+database access through the existing environment or local `.env`; never put
+credentials in scripts, command arguments, or published evidence.
+
+```bash
+# Offline harness and report checks; no database required.
+cargo test -p astra-services --features capacity-probes --test ingestion_capacity_db_it
+python3 -m unittest discover -s scripts/load -p test_ingestion_capacity_report.py
+
+# Real database: 60-second warmup, then 600 seconds of measured arrivals.
+python3 scripts/load/ingestion_capacity_probe.py \
+  --database astra_test_probe_capacity --rate 500 --distribution hot
+
+# Use the exact evidence path printed by the preceding command.
+python3 scripts/load/ingestion_capacity_report.py \
+  target/expriment/ingestion-capacity/REPLACE_WITH_RESULT.json
+```
+
+`uniform` spreads arrivals over all Sessions; `hot` sends half to one owner's
+ten Sessions. Events mix 20% critical and 80% telemetry priority, with complete
+serialized envelopes of 1 KiB, 16 KiB, and 128 KiB, targeting a seeded
+80%/15%/5% distribution. Independent
+foreground reads and writes share the pool, with a baseline measured before
+ingestion starts. Default pool size is 32 and foreground rate is 20 operations
+per second. These are declared probe parameters, not product-wide SLOs.
+
+The generator uses absolute arrival deadlines and reports missed arrivals; it
+does not hide overload by slowing the declared arrival rate. Per-delivery
+observations distinguish commit, replay, rejection, and uncertain outcomes,
+including cancellation during pool or transaction waits. Reports reconcile
+durable identities, payload hashes, per-session counts, and parent edges.
+Observer capacity is bounded; unavailable observation invalidates measurement
+completeness without suppressing offered work.
+
+Evidence is written under ignored `target/expriment/ingestion-capacity/`. It
+includes source and binary fingerprints, compiler profile, parameters, bounded
+timing histograms, backlog samples, and structured reconciliation results—not
+raw database logs or credentials. Leave compiled sources unchanged and avoid
+competing builds or probes during a run. The current launcher uses the Cargo
+test profile; inspect the recorded compiler profile before comparing results
+with optimized production builds. Percentiles are quantized upper bounds, not
+exact latency measurements.
+
+The report exits nonzero for malformed or ineligible evidence. It requires at
+least 60 seconds of warmup and 600 measured seconds, arrival misses no greater
+than 0.1%, complete accounting, no rejection or unresolved/late outcome, progress
+for every owner, bounded backlog and age, and preserved foreground latency.
+Sampling must cover the measured window with gaps no greater than 2.5 seconds.
+A short smoke run cannot establish sustained capacity. Repeat the highest
+passing rate and test both distributions before publishing a capacity claim.
+Single-process ingestion evidence does **not** establish concurrent agent-turn
+capacity, multi-server fairness, or fault recovery; those require separate
+scenarios. Completed runs clean up only their uniquely prefixed fixture owners;
+interrupted runs may leave fixture data in the designated disposable database.
+
 ## Recommended Workflow
 
 ### Optional thinking-protocol compatibility checks

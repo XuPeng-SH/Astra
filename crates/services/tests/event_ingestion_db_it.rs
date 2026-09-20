@@ -23,6 +23,144 @@ mod common;
 
 const TEST_USER_ID: &str = "test-user";
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn observed_pool_wait_cancellation_retains_elapsed_time_and_unknown_outcome() {
+    use astra_services::event_ingestion::measurement::{
+        IngestionDeliveryKey, IngestionDeliveryTerminal, IngestionMeasurementSink,
+        IngestionUnknownReason,
+    };
+    use std::time::Duration;
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.expect("hold every pool connection"));
+    }
+    let (sender, _, _, worker) = EventIngestionWorker::spawn(
+        pool.clone(),
+        IngestionConfig {
+            batch_size: 1,
+            ..Default::default()
+        },
+    );
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+    let (token, probe) = sink.try_start(IngestionDeliveryKey(1)).unwrap();
+    sender.enqueue_observed(
+        test_event("pool-cancel", "no-db-write", "user_query"),
+        token,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.snapshot().first_dispatched_at.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker dispatched");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    let report = reports.recv().await.unwrap();
+    assert_eq!(
+        report.terminal,
+        IngestionDeliveryTerminal::Unknown(IngestionUnknownReason::DeliveryDropped)
+    );
+    assert!(report.progress.pool_wait >= Duration::from_millis(10));
+    assert_eq!(report.progress.transaction_time, Duration::ZERO);
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+        .await
+        .expect("pool remains usable")
+        .expect("acquire after cancellation");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_rejection() {
+    use astra_services::event_ingestion::measurement::{
+        IngestionDeliveryKey, IngestionDeliveryTerminal, IngestionMeasurementSink,
+        IngestionRejectionReason,
+    };
+    use std::time::Duration;
+
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let user_id = format!("observed-{}", Uuid::new_v4());
+    let session_id = Uuid::new_v4().to_string();
+    insert_session_root(&pool, &user_id, &session_id).await;
+    let config = IngestionConfig {
+        batch_size: 4,
+        flush_interval_secs: 1,
+        ..Default::default()
+    };
+    let (sender, shutdown, _, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(5);
+    let first = test_event_for_user(&user_id, "same-event", &session_id, "user_query");
+    let replay = first.clone();
+    let mut collision = first.clone();
+    collision.content = Some("conflicting payload".to_string());
+    let sibling = test_event_for_user(&user_id, "sibling", &session_id, "user_query");
+    for (index, event) in [first, replay, collision, sibling].into_iter().enumerate() {
+        let (token, _) = sink.try_start(IngestionDeliveryKey(index as u64)).unwrap();
+        sender.enqueue_observed(event, token);
+    }
+    let mut outcomes = std::collections::BTreeMap::new();
+    for _ in 0..4 {
+        let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+            .await
+            .expect("observed commit deadline")
+            .expect("terminal report");
+        assert!(report.progress.channel_accepted_at.is_some());
+        assert!(report.progress.worker_received_at.is_some());
+        assert_eq!(report.progress.attempt_count, 1);
+        outcomes.insert(report.key.0, report.terminal);
+    }
+    assert_eq!(outcomes[&0], IngestionDeliveryTerminal::CommittedInserted);
+    assert_eq!(outcomes[&1], IngestionDeliveryTerminal::CommittedReplayed);
+    assert_eq!(
+        outcomes[&2],
+        IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::IdentityCollision)
+    );
+    assert_eq!(outcomes[&3], IngestionDeliveryTerminal::CommittedInserted);
+    assert_session_event_count(&pool, &user_id, &session_id, 2).await;
+    let receipts: u64 = sqlx::query_scalar(
+        "SELECT collision_count FROM observation_identity_collisions WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = 'same-event'",
+    ).bind(&user_id).fetch_one(&pool).await.expect("receipt committed before terminal report");
+    assert_eq!(receipts, 1);
+
+    sqlx::query(
+        "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("fence deleted session");
+    let (token, _) = sink.try_start(IngestionDeliveryKey(4)).unwrap();
+    sender.enqueue_observed(
+        test_event_for_user(&user_id, "rejected", &session_id, "user_query"),
+        token,
+    );
+    let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+        .await
+        .expect("session rejection deadline")
+        .expect("session rejection report");
+    assert_eq!(
+        report.terminal,
+        IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::SessionAdmission)
+    );
+    assert!(report.progress.channel_accepted_at.is_some());
+    assert_session_event_count(&pool, &user_id, &session_id, 2).await;
+
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("worker shutdown")
+        .expect("worker joined");
+    cleanup_session(&pool, &user_id, &session_id).await;
+}
+
 fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
     test_event_for_user(TEST_USER_ID, event_id, session_id, event_type)
 }

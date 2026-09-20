@@ -36,6 +36,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc};
 
+pub mod measurement;
+use measurement::{
+    DeliveryObservation, IngestionDeliveryTerminal, IngestionDeliveryToken,
+    IngestionMeasurementPhase, IngestionRejectionReason, IngestionUnknownReason,
+};
+
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
@@ -244,6 +250,7 @@ fn stable_json_digest<T: Serialize>(value: &T) -> Result<String, String> {
 pub struct IngestionQueueReservation {
     history_work: Option<Arc<astra_core::history_work::QueueBytesReservation>>,
     admission: Option<IngestionAdmissionLease>,
+    observation: Option<DeliveryObservation>,
 }
 
 impl std::fmt::Debug for IngestionQueueReservation {
@@ -305,6 +312,67 @@ fn ingestion_queue_reservation(
     IngestionQueueReservation {
         history_work,
         admission: Some(admission),
+        observation: None,
+    }
+}
+
+fn delivery_observation(event: &IngestionEvent) -> Option<&DeliveryObservation> {
+    event
+        .history_work_queue_reservation
+        .as_ref()?
+        .observation
+        .as_ref()
+}
+
+fn reject_observation(observation: Option<&DeliveryObservation>, reason: IngestionRejectionReason) {
+    if let Some(observation) = observation {
+        observation.finish(IngestionDeliveryTerminal::Rejected(reason));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ObservedAttemptPhase {
+    Limiter,
+    Pool,
+    Transaction,
+}
+
+/// Borrowing the deliveries makes cancellation drop this timer before their
+/// last observation owner can finalize an Unknown report.
+struct ObservedAttemptTimer<'a> {
+    events: &'a [IngestionEvent],
+    phase: ObservedAttemptPhase,
+    started: std::time::Instant,
+}
+
+impl<'a> ObservedAttemptTimer<'a> {
+    fn start(events: &'a [IngestionEvent], phase: ObservedAttemptPhase) -> Option<Self> {
+        events
+            .iter()
+            .any(|event| delivery_observation(event).is_some())
+            .then(|| Self {
+                events,
+                phase,
+                started: std::time::Instant::now(),
+            })
+    }
+}
+
+impl Drop for ObservedAttemptTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        for observation in self.events.iter().filter_map(delivery_observation) {
+            match self.phase {
+                ObservedAttemptPhase::Limiter => observation.add_limiter_wait(elapsed),
+                ObservedAttemptPhase::Pool => observation.add_pool_wait(elapsed),
+                ObservedAttemptPhase::Transaction => {
+                    observation.add_transaction_time(elapsed);
+                    // No-op after acknowledged commit; records uncertainty if
+                    // cancellation interrupted the commit future itself.
+                    observation.commit_failed();
+                }
+            }
+        }
     }
 }
 
@@ -824,12 +892,28 @@ impl IngestionSender {
     /// async send task so the event waits for capacity instead of being dropped.
     /// `overflow_count` tracks these backpressure deferrals and hard
     /// closed-channel drops.
-    pub fn enqueue(&self, mut event: IngestionEvent) {
+    pub fn enqueue(&self, event: IngestionEvent) {
+        self.enqueue_inner(event, None);
+    }
+
+    /// Observe one delivery without changing its admission or retry policy.
+    pub fn enqueue_observed(&self, event: IngestionEvent, token: IngestionDeliveryToken) {
+        self.enqueue_inner(event, Some(token.into_observation()));
+    }
+
+    fn enqueue_inner(&self, mut event: IngestionEvent, observation: Option<DeliveryObservation>) {
+        if let Some(observation) = &observation {
+            observation.mark(IngestionMeasurementPhase::Submitted);
+        }
         let priority = event.priority();
         if priority == IngestionEventPriority::Telemetry {
             let reserve_slots = telemetry_channel_reserve_slots(self.tx.max_capacity());
             let available_slots = self.tx.capacity();
             if reserve_slots > 0 && available_slots <= reserve_slots {
+                reject_observation(
+                    observation.as_ref(),
+                    IngestionRejectionReason::TelemetryHeadroom,
+                );
                 let dropped = self.record_drop_before_acceptance(priority);
                 tracing::warn!(
                     target: "astra_services::event_ingestion",
@@ -845,6 +929,10 @@ impl IngestionSender {
         let bytes = match astra_core::history_work::serialized_bytes(&event) {
             Ok(bytes) => bytes,
             Err(error) => {
+                reject_observation(
+                    observation.as_ref(),
+                    IngestionRejectionReason::Serialization,
+                );
                 let dropped = self.record_drop_before_acceptance(priority);
                 tracing::warn!(
                     target: "astra_services::event_ingestion",
@@ -859,6 +947,10 @@ impl IngestionSender {
         let lease = match self.admission.try_acquire(&event, bytes, priority) {
             Ok(lease) => lease,
             Err(rejection) => {
+                reject_observation(
+                    observation.as_ref(),
+                    IngestionRejectionReason::ResidentLimit,
+                );
                 let dropped = self.record_drop_before_acceptance(priority);
                 self.overflow_count.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -873,11 +965,21 @@ impl IngestionSender {
                 return;
             }
         };
-        event.history_work_queue_reservation = Some(ingestion_queue_reservation(bytes, lease));
+        let mut reservation = ingestion_queue_reservation(bytes, lease);
+        if let Some(observation) = &observation {
+            observation.mark(IngestionMeasurementPhase::ResidentAdmitted);
+            reservation.observation = Some(observation.clone());
+        }
+        event.history_work_queue_reservation = Some(reservation);
         event.ingestion_enqueued_at = Some(std::time::Instant::now());
-        match self.tx.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => {
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                if let Some(observation) = &observation {
+                    observation.mark(IngestionMeasurementPhase::ChannelAccepted);
+                }
+                permit.send(event);
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
                 let priority = event.priority();
                 let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::warn!(
@@ -910,14 +1012,29 @@ impl IngestionSender {
                                 "ingestion deferred-send queue full; event dropped"
                             );
                             self.record_drop_before_acceptance(priority);
+                            reject_observation(
+                                observation.as_ref(),
+                                IngestionRejectionReason::DeferredLimit,
+                            );
                             return;
+                        }
+                        if let Some(observation) = &observation {
+                            observation.mark(IngestionMeasurementPhase::Deferred);
                         }
                         drop(handle.spawn(async move {
                             let _pending = PendingDeferralGuard {
                                 pending_deferrals,
                                 scheduler_notify,
                             };
-                            if tx.send(event).await.is_err() {
+                            match tx.reserve().await {
+                                Ok(permit) => {
+                                    if let Some(observation) = &observation {
+                                        observation.mark(IngestionMeasurementPhase::ChannelAccepted);
+                                    }
+                                    permit.send(event);
+                                }
+                                Err(_) => {
+                                reject_observation(observation.as_ref(), IngestionRejectionReason::ChannelClosed);
                                 let n = overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 dropped_before_acceptance_count
                                     .fetch_add(1, Ordering::Relaxed);
@@ -931,10 +1048,15 @@ impl IngestionSender {
                                     priority = priority.as_label(),
                                     "ingestion channel closed while deferred event was waiting; event dropped"
                                 );
-                            }
+                                }
+                            };
                         }));
                     }
                     Err(_) => {
+                        reject_observation(
+                            observation.as_ref(),
+                            IngestionRejectionReason::NoRuntime,
+                        );
                         tracing::warn!(
                             target: "astra_services::event_ingestion",
                             overflow_count = n,
@@ -945,7 +1067,11 @@ impl IngestionSender {
                     }
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(event)) => {
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                reject_observation(
+                    observation.as_ref(),
+                    IngestionRejectionReason::ChannelClosed,
+                );
                 let priority = event.priority();
                 let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                 self.record_drop_before_acceptance(priority);
@@ -1421,6 +1547,8 @@ fn remove_keyed_usage<K: std::hash::Hash + Eq>(
 struct IngestionBatchOutcome {
     events_resolved: usize,
     events_dropped_permanent: usize,
+    // Input-position aligned: repeated durable IDs still represent distinct deliveries.
+    delivery_outcomes: Option<Vec<IngestionDeliveryTerminal>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2217,6 +2345,9 @@ impl EventIngestionWorker {
         now: tokio::time::Instant,
         draining: bool,
     ) {
+        if let Some(observation) = delivery_observation(&event) {
+            observation.mark(IngestionMeasurementPhase::WorkerReceived);
+        }
         self.record_event_received();
         let key = IngestionSessionKey::from_event(&event);
         let queue = sessions.entry(key.clone()).or_default();
@@ -2299,7 +2430,15 @@ impl EventIngestionWorker {
             let db_attempt_timeout_secs = self.config.db_attempt_timeout_secs;
             let attempt_key = key.clone();
             in_flight.push(Box::pin(async move {
-                let result = match db_limiter.acquire().await {
+                for observation in events.iter().filter_map(delivery_observation) {
+                    observation.mark(IngestionMeasurementPhase::Dispatched);
+                    observation.start_attempt();
+                }
+                let limiter_timer =
+                    ObservedAttemptTimer::start(&events, ObservedAttemptPhase::Limiter);
+                let permit = db_limiter.acquire().await;
+                drop(limiter_timer);
+                let result = match permit {
                     Ok(_permit) => {
                         let _attempt = IngestionDbAttemptGuard::begin(stats);
                         EventIngestionWorker::insert_session_group_on_pool(
@@ -2336,6 +2475,13 @@ impl EventIngestionWorker {
         let mut terminal_events = 0_usize;
         match completion.result {
             Ok(outcome) => {
+                if let Some(delivery_outcomes) = &outcome.delivery_outcomes {
+                    for (event, terminal) in completion.events.iter().zip(delivery_outcomes) {
+                        if let Some(observation) = delivery_observation(event) {
+                            observation.finish(*terminal);
+                        }
+                    }
+                }
                 terminal_events = completion.events.len();
                 self.record_terminal_latencies(&completion.events, enqueued_at, now);
                 queue.retry_attempts = 0;
@@ -2347,6 +2493,11 @@ impl EventIngestionWorker {
             }
             Err(error) => {
                 if draining {
+                    for observation in completion.events.iter().filter_map(delivery_observation) {
+                        observation.finish(IngestionDeliveryTerminal::Unknown(
+                            IngestionUnknownReason::ShutdownUnresolved,
+                        ));
+                    }
                     terminal_events = completion.events.len();
                     self.record_terminal_latencies(&completion.events, enqueued_at, now);
                     if let Ok(mut stats) = self.stats.lock() {
@@ -2575,17 +2726,19 @@ impl EventIngestionWorker {
         db_attempt_timeout_secs: u64,
     ) -> Result<IngestionBatchOutcome, String> {
         let deadline = IngestionDbDeadline::after(db_attempt_timeout_secs);
-        let mut connection = BoundedIngestionDbConnection::acquire(pool, deadline).await?;
-        let outcome = match tokio::time::timeout_at(
+        let pool_timer = ObservedAttemptTimer::start(events, ObservedAttemptPhase::Pool);
+        let connection = BoundedIngestionDbConnection::acquire(pool, deadline).await;
+        drop(pool_timer);
+        let mut connection = connection?;
+        let transaction_timer =
+            ObservedAttemptTimer::start(events, ObservedAttemptPhase::Transaction);
+        let result = tokio::time::timeout_at(
             deadline.at,
             Self::insert_session_group_on_connection(connection.connection_mut(), events),
         )
-        .await
-        {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(deadline.timeout("transaction")),
-        };
+        .await;
+        drop(transaction_timer);
+        let outcome = result.map_err(|_| deadline.timeout("transaction"))??;
         connection.release();
         Ok(outcome)
     }
@@ -2632,6 +2785,17 @@ impl EventIngestionWorker {
             return Ok(IngestionBatchOutcome {
                 events_resolved: session_event_count,
                 events_dropped_permanent: session_event_count,
+                delivery_outcomes: events
+                    .iter()
+                    .any(|event| delivery_observation(event).is_some())
+                    .then(|| {
+                        vec![
+                            IngestionDeliveryTerminal::Rejected(
+                                IngestionRejectionReason::SessionAdmission
+                            );
+                            session_event_count
+                        ]
+                    }),
             });
         }
 
@@ -2754,6 +2918,27 @@ impl EventIngestionWorker {
                 )?
             };
 
+        let delivery_outcomes = events
+            .iter()
+            .any(|event| delivery_observation(event).is_some())
+            .then(|| {
+                capture_outcomes
+                    .iter()
+                    .map(|outcome| match outcome {
+                        DurableCaptureOutcome::Inserted => {
+                            IngestionDeliveryTerminal::CommittedInserted
+                        }
+                        DurableCaptureOutcome::Replayed => {
+                            IngestionDeliveryTerminal::CommittedReplayed
+                        }
+                        DurableCaptureOutcome::Collision { .. } => {
+                            IngestionDeliveryTerminal::Rejected(
+                                IngestionRejectionReason::IdentityCollision,
+                            )
+                        }
+                    })
+                    .collect()
+            });
         let mut inserted_events = Vec::new();
         let mut replayed_events = 0_usize;
         let mut collision_events = 0_usize;
@@ -2892,11 +3077,18 @@ impl EventIngestionWorker {
                 .map_err(|e| format!("config_versions insert for {}: {e}", payload.version_id))?;
         }
 
+        for observation in events.iter().filter_map(delivery_observation) {
+            observation.commit_started();
+        }
         tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+        for observation in events.iter().filter_map(delivery_observation) {
+            observation.commit_acknowledged();
+        }
 
         Ok(IngestionBatchOutcome {
             events_resolved: session_event_count,
             events_dropped_permanent: collision_events,
+            delivery_outcomes,
         })
     }
 }
@@ -2963,6 +3155,64 @@ mod tests {
         assert!(astra_core::is_duplicate_key_error(&dup));
         let unrelated = sqlx::Error::Protocol("connection reset by peer".into());
         assert!(!astra_core::is_duplicate_key_error(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn observed_enqueue_stamps_acceptance_before_publication_without_changing_payload() {
+        use measurement::{IngestionDeliveryKey, IngestionMeasurementSink};
+        let (sender, mut events) = IngestionSender::for_tests(16);
+        let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+        let event = test_event("observed", "session", "user_query");
+        let payload = serde_json::to_value(&event).unwrap();
+        let (token, probe) = sink.try_start(IngestionDeliveryKey(1)).unwrap();
+        sender.enqueue_observed(event, token);
+        let accepted = events.recv().await.unwrap();
+        assert!(probe.snapshot().channel_accepted_at.is_some());
+        assert_eq!(serde_json::to_value(&accepted).unwrap(), payload);
+        assert!(reports.try_recv().is_err(), "acceptance is not a commit");
+        drop(accepted);
+        assert_eq!(
+            reports.recv().await.unwrap().terminal,
+            IngestionDeliveryTerminal::Unknown(IngestionUnknownReason::DeliveryDropped),
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_closed_sender_reports_rejection_without_acceptance() {
+        use measurement::{IngestionDeliveryKey, IngestionMeasurementSink};
+        let sender = IngestionSender::disconnected();
+        let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+        let (token, probe) = sink.try_start(IngestionDeliveryKey(2)).unwrap();
+        sender.enqueue_observed(test_event("closed", "session", "user_query"), token);
+        let report = reports.recv().await.unwrap();
+        assert_eq!(
+            report.terminal,
+            IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::ChannelClosed),
+        );
+        assert!(probe.snapshot().channel_accepted_at.is_none());
+        assert_eq!(sender.dropped_before_acceptance_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_deferred_delivery_is_not_accepted_until_channel_publication() {
+        use measurement::{IngestionDeliveryKey, IngestionMeasurementSink};
+        let (tx, mut events) = mpsc::channel(1);
+        let sender = test_sender(tx, 2);
+        sender.enqueue(test_event("first", "session", "user_query"));
+        let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+        let (token, probe) = sink.try_start(IngestionDeliveryKey(3)).unwrap();
+        sender.enqueue_observed(test_event("deferred", "session", "user_query"), token);
+        assert!(probe.snapshot().deferred_at.is_some());
+        assert!(probe.snapshot().channel_accepted_at.is_none());
+        drop(events.recv().await.unwrap());
+        let accepted = events.recv().await.unwrap();
+        assert!(probe.snapshot().channel_accepted_at.is_some());
+        assert!(reports.try_recv().is_err());
+        drop(accepted);
+        assert_eq!(
+            reports.recv().await.unwrap().terminal,
+            IngestionDeliveryTerminal::Unknown(IngestionUnknownReason::DeliveryDropped),
+        );
     }
 
     #[test]
@@ -5060,6 +5310,42 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_millis(100))
             .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/nonexistent")
             .expect("connect_lazy should not fail")
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_limiter_wait_records_elapsed_before_unknown_finalization() {
+        use measurement::{IngestionDeliveryKey, IngestionMeasurementSink};
+        let limiter = IngestionDbLimiter::new(1);
+        let held = limiter.acquire().await.unwrap();
+        let (sender, _, _, worker) = EventIngestionWorker::spawn_with_db_limiter(
+            dummy_pool(),
+            IngestionConfig {
+                batch_size: 1,
+                ..Default::default()
+            },
+            limiter,
+        );
+        let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+        let (token, probe) = sink.try_start(IngestionDeliveryKey(1)).unwrap();
+        sender.enqueue_observed(test_event("waiting", "session", "user_query"), token);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while probe.snapshot().first_dispatched_at.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker dispatched");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let report = reports.recv().await.unwrap();
+        assert_eq!(
+            report.terminal,
+            IngestionDeliveryTerminal::Unknown(IngestionUnknownReason::DeliveryDropped)
+        );
+        assert!(report.progress.limiter_wait >= std::time::Duration::from_millis(10));
+        assert_eq!(report.progress.pool_wait, std::time::Duration::ZERO);
+        drop(held);
     }
 
     #[tokio::test]
