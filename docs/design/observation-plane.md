@@ -294,6 +294,41 @@ accounted queue payloads. This per-worker cap limits connection amplification
 but is not a shared-pool reservation or a fairness guarantee across workers or
 server processes.
 
+The worker coordinator keeps database attempts and retry timers outside its
+receive path. Accepted facts enter a per-owner/per-session FIFO; only one
+attempt for that key may be active, and a failed head remains ahead of later
+facts for the same session. Runnable owners rotate first, then their runnable
+sessions, so one owner with many hot sessions cannot consume every dispatch
+turn. `batch_size` bounds one session transaction. A sparse session becomes
+runnable at an absolute deadline established by its oldest buffered fact;
+later arrivals do not reset that deadline. Retry backoff consumes neither a
+database slot nor the receive loop. This is process-local dispatch fairness,
+not equal SQL execution time or cluster-wide fairness.
+
+Every accepted fact owns one admission lease from before channel entry through
+queued, retrying, and in-flight states. Global, per-owner, and per-session
+limits apply to both event count and compact-JSON bytes; one blocked session or
+owner therefore cannot consume all process-local headroom. A maximum event size
+rejects oversized payloads before acceptance. Lease release is tied to terminal
+drop rather than scheduler bookkeeping, so cancellation and closed-channel
+paths return capacity as well.
+
+Database attempts use a process-local limiter that can be shared by all workers
+over one pool. A whole-attempt client deadline includes connection acquisition,
+transaction work, and commit. If an exchange times out, the physical connection
+is detached and closed rather than returned to the idle pool; acknowledged
+commits remain terminal even if later cleanup fails. The limiter and deadline
+do not establish cross-process fairness or database-cluster capacity.
+
+Enqueue-to-terminal latency uses a fixed-size process-local histogram rather
+than retaining per-event samples. A terminal outcome is commit, durable
+admission rejection, or explicit shutdown abandonment; retryable attempts keep
+their original enqueue timestamp. Shutdown seals the receiver before draining,
+so deferred sends that never entered the channel remain pre-acceptance drops.
+If the runtime deadline expires, it records the accepted resident facts as
+having an unresolved durable outcome, then aborts and awaits the worker instead
+of detaching a task that may still own pool resources.
+
 Request-classification observations use the existing `trace_span` envelope
 with name `semantic_judgment` and a bounded typed JSON string in
 `attrs["semantic_judgment.v1"]`. They do not create another usage or execution

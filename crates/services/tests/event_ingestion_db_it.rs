@@ -53,6 +53,7 @@ fn test_event_for_user(
         parent_event_ids: vec![],
         causal_chain_id: None,
         history_work_queue_reservation: None,
+        ingestion_enqueued_at: None,
     }
 }
 
@@ -215,7 +216,7 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
         .expect("hold blocked session lifecycle fence");
 
     let config = IngestionConfig {
-        batch_size: 2,
+        batch_size: 1,
         flush_interval_secs: 300,
         channel_capacity: 4,
         max_retries: 1,
@@ -298,6 +299,103 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let user_id = format!("ingestion-late-user-{}", Uuid::new_v4().simple());
+    let blocked_session = format!("a-blocked-{}", Uuid::new_v4().simple());
+    let late_session = format!("z-late-{}", Uuid::new_v4().simple());
+    let blocked_event = format!("blocked-event-{}", Uuid::new_v4().simple());
+    let late_event = format!("late-event-{}", Uuid::new_v4().simple());
+    insert_session_root(&pool, &user_id, &blocked_session).await;
+    insert_session_root(&pool, &user_id, &late_session).await;
+
+    let mut fence_holder = pool.begin().await.expect("begin fence holder");
+    admit_session_event_write(&mut fence_holder, &blocked_session, &user_id, true)
+        .await
+        .expect("hold blocked session lifecycle fence");
+    let config = IngestionConfig {
+        batch_size: 1,
+        flush_interval_secs: 300,
+        channel_capacity: 4,
+        max_concurrent_session_flushes: 2,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender
+        .enqueue_async(test_event_for_user(
+            &user_id,
+            &blocked_event,
+            &blocked_session,
+            "blocked_first",
+        ))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if astra_core::sync_poison::recover_mutex_lock(&stats).events_received == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must receive the first event before the late arrival");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    sender
+        .enqueue_async(test_event_for_user(
+            &user_id,
+            &late_event,
+            &late_session,
+            "late_healthy",
+        ))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let visible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&late_event)
+            .fetch_one(&pool)
+            .await
+            .expect("check late event visibility");
+            if visible == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("late session must commit without waiting for the blocked transaction");
+
+    let blocked_visible: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&user_id)
+            .bind(&blocked_event)
+            .fetch_one(&pool)
+            .await
+            .expect("check blocked event visibility");
+    assert_eq!(blocked_visible, 0);
+
+    fence_holder
+        .rollback()
+        .await
+        .expect("release blocked fence");
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("scheduler shutdown")
+        .expect("scheduler task");
+    assert_session_event_count(&pool, &user_id, &blocked_session, 1).await;
+    assert_session_event_count(&pool, &user_id, &late_session, 1).await;
+    cleanup_session(&pool, &user_id, &blocked_session).await;
+    cleanup_session(&pool, &user_id, &late_session).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_flush_concurrency_is_bounded_to_two_transactions() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
@@ -322,7 +420,7 @@ async fn session_flush_concurrency_is_bounded_to_two_transactions() {
     let event_b = format!("event-b-{}", Uuid::new_v4().simple());
     let event_c = format!("event-c-{}", Uuid::new_v4().simple());
     let config = IngestionConfig {
-        batch_size: 3,
+        batch_size: 1,
         flush_interval_secs: 300,
         channel_capacity: 4,
         max_retries: 1,
@@ -396,6 +494,133 @@ async fn session_flush_concurrency_is_bounded_to_two_transactions() {
         .expect("worker task");
 
     for session_id in [&session_a, &session_b, &session_c] {
+        assert_session_event_count(&pool, &user_id, session_id, 1).await;
+        cleanup_session(&pool, &user_id, session_id).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaking_pool_capacity() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let user_id = format!("ingestion-timeout-user-{}", Uuid::new_v4().simple());
+    let blocked_a = format!("a-blocked-{}", Uuid::new_v4().simple());
+    let blocked_b = format!("b-blocked-{}", Uuid::new_v4().simple());
+    let healthy = format!("z-healthy-{}", Uuid::new_v4().simple());
+    for session_id in [&blocked_a, &blocked_b, &healthy] {
+        insert_session_root(&pool, &user_id, session_id).await;
+    }
+
+    let mut fence_a = pool.begin().await.expect("begin timeout fence A");
+    admit_session_event_write(&mut fence_a, &blocked_a, &user_id, true)
+        .await
+        .expect("hold timeout fence A");
+    let mut fence_b = pool.begin().await.expect("begin timeout fence B");
+    admit_session_event_write(&mut fence_b, &blocked_b, &user_id, true)
+        .await
+        .expect("hold timeout fence B");
+
+    let event_a = format!("timeout-a-{}", Uuid::new_v4().simple());
+    let event_b = format!("timeout-b-{}", Uuid::new_v4().simple());
+    let healthy_event = format!("timeout-healthy-{}", Uuid::new_v4().simple());
+    let config = IngestionConfig {
+        batch_size: 1,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        max_retries: 1,
+        max_concurrent_session_flushes: 2,
+        db_attempt_timeout_secs: 1,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    for (event_id, session_id) in [(&event_a, &blocked_a), (&event_b, &blocked_b)] {
+        sender
+            .enqueue_async(test_event_for_user(
+                &user_id,
+                event_id,
+                session_id,
+                "timeout_blocked",
+            ))
+            .await;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats).clone();
+            if snapshot.db_attempts_current == 2 && snapshot.db_attempts_peak == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both ingestion attempt slots must be occupied by held fences");
+
+    sender
+        .enqueue_async(test_event_for_user(
+            &user_id,
+            &healthy_event,
+            &healthy,
+            "timeout_healthy",
+        ))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let visible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&healthy_event)
+            .fetch_one(&pool)
+            .await
+            .expect("check healthy event after blocked-attempt deadlines");
+            if visible == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("healthy session must progress after both blocked attempts time out");
+    {
+        let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(snapshot.db_attempts_current, 0, "{snapshot:?}");
+        assert_eq!(snapshot.db_attempts_peak, 2, "{snapshot:?}");
+        assert_eq!(snapshot.events_flushed, 1, "{snapshot:?}");
+        assert_eq!(snapshot.resident_events_current, 2, "{snapshot:?}");
+    }
+
+    // The two fence holders consume two of the eight test-pool connections.
+    // Acquiring all six remaining permits simultaneously proves timed-out
+    // ingestion attempts were detached instead of leaking pool capacity.
+    let mut recovered = Vec::new();
+    for _ in 0..6 {
+        recovered.push(
+            tokio::time::timeout(std::time::Duration::from_secs(2), pool.acquire())
+                .await
+                .expect("timed-out attempt must restore pool capacity")
+                .expect("acquire recovered pool connection"),
+        );
+    }
+    drop(recovered);
+
+    fence_a.rollback().await.expect("release timeout fence A");
+    fence_b.rollback().await.expect("release timeout fence B");
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("drain retained retry heads after releasing fences")
+        .expect("timeout worker task");
+    {
+        let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(snapshot.events_flushed, 3, "{snapshot:?}");
+        assert_eq!(snapshot.events_abandoned_shutdown, 0, "{snapshot:?}");
+        assert_eq!(snapshot.resident_events_current, 0, "{snapshot:?}");
+        assert_eq!(snapshot.db_attempts_current, 0, "{snapshot:?}");
+    }
+    for session_id in [&blocked_a, &blocked_b, &healthy] {
         assert_session_event_count(&pool, &user_id, session_id, 1).await;
         cleanup_session(&pool, &user_id, session_id).await;
     }
@@ -1059,7 +1284,7 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
         IngestionEvent::for_config_version(&payload).expect("rejected config event");
     let healthy = test_event_for_user(&user_id, &healthy_event, &healthy_session, "healthy_peer");
     let config = IngestionConfig {
-        batch_size: 2,
+        batch_size: 1,
         flush_interval_secs: 300,
         channel_capacity: 4,
         ..Default::default()
@@ -1135,7 +1360,7 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
         "healthy_peer",
     );
     let config = IngestionConfig {
-        batch_size: 2,
+        batch_size: 1,
         flush_interval_secs: 300,
         channel_capacity: 4,
         max_retries: 1,
@@ -1196,6 +1421,151 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
 
     cleanup_session(&pool, &user_id, &failing_session).await;
     cleanup_session(&pool, &user_id, &healthy_session).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne load profile"]
+async fn event_ingest_100_users_by_10_sessions_finishes_finite_burst() {
+    // This is a finite-burst smoke/load baseline, not evidence of sustained
+    // open-loop capacity or starvation freedom: it offers one event per
+    // session and asserts exact eventual persistence.
+    const USERS: usize = 100;
+    const SESSIONS_PER_USER: usize = 10;
+    const TOTAL: usize = USERS * SESSIONS_PER_USER;
+
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let run = Uuid::new_v4().simple().to_string();
+    let user_prefix = format!("ingestion-load-{run}-");
+    let event_type = format!("load_profile_{run}");
+
+    for user_chunk_start in (0..USERS).step_by(20) {
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) ",
+        );
+        builder.push_values(
+            (user_chunk_start..(user_chunk_start + 20).min(USERS))
+                .flat_map(|user| (0..SESSIONS_PER_USER).map(move |session| (user, session))),
+            |mut row, (user, session)| {
+                row.push_bind(format!("session-{user:03}-{session:02}-{run}"))
+                    .push_bind(format!("{user_prefix}{user:03}"))
+                    .push_bind("event-ingestion-load")
+                    .push_bind("active")
+                    .push_bind(0_i64);
+            },
+        );
+        builder
+            .build()
+            .execute(&pool)
+            .await
+            .expect("insert load-profile session roots");
+    }
+
+    let config = IngestionConfig {
+        batch_size: 1,
+        flush_interval_secs: 300,
+        channel_capacity: 2_000,
+        max_concurrent_session_flushes: 32,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let started = std::time::Instant::now();
+    for user in 0..USERS {
+        for session in 0..SESSIONS_PER_USER {
+            let user_id = format!("{user_prefix}{user:03}");
+            let session_id = format!("session-{user:03}-{session:02}-{run}");
+            let event_id = format!("event-{user:03}-{session:02}-{run}");
+            sender
+                .enqueue_async(test_event_for_user(
+                    &user_id,
+                    &event_id,
+                    &session_id,
+                    &event_type,
+                ))
+                .await;
+        }
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            let visible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type = ? AND user_id LIKE ?",
+            )
+            .bind(&event_type)
+            .bind(format!("{user_prefix}%"))
+            .fetch_one(&pool)
+            .await
+            .expect("count visible load-profile events");
+            if visible == TOTAL as i64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all 1000 session events must become visible");
+    let elapsed = started.elapsed();
+
+    let owner_counts = sqlx::query(
+        "SELECT user_id, COUNT(*) AS event_count
+         FROM agent_events
+         WHERE event_type = ? AND user_id LIKE ?
+         GROUP BY user_id",
+    )
+    .bind(&event_type)
+    .bind(format!("{user_prefix}%"))
+    .fetch_all(&pool)
+    .await
+    .expect("load per-owner progress");
+    assert_eq!(owner_counts.len(), USERS);
+    for row in owner_counts {
+        let count: i64 = row.get("event_count");
+        assert_eq!(count, SESSIONS_PER_USER as i64);
+    }
+    let (p50_ms, p95_ms, p99_ms) = {
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.events_received, TOTAL as u64, "{stats:?}");
+        assert_eq!(stats.events_flushed, TOTAL as u64, "{stats:?}");
+        assert_eq!(stats.events_dropped_permanent, 0, "{stats:?}");
+        assert_eq!(stats.resident_events_current, 0, "{stats:?}");
+        assert!(stats.resident_events_peak <= 2_000, "{stats:?}");
+        (
+            stats
+                .enqueue_to_terminal_percentile_ms(0.50)
+                .expect("p50 latency"),
+            stats
+                .enqueue_to_terminal_percentile_ms(0.95)
+                .expect("p95 latency"),
+            stats
+                .enqueue_to_terminal_percentile_ms(0.99)
+                .expect("p99 latency"),
+        )
+    };
+    println!(
+        "PERF_RESULT benchmark=event_ingestion_100x10 sessions={TOTAL} elapsed_ms={} throughput_events_per_sec={:.2} enqueue_to_terminal_p50_ms={p50_ms} enqueue_to_terminal_p95_ms={p95_ms} enqueue_to_terminal_p99_ms={p99_ms}",
+        elapsed.as_millis(),
+        TOTAL as f64 / elapsed.as_secs_f64()
+    );
+
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("load-profile scheduler shutdown")
+        .expect("load-profile scheduler task");
+    let like = format!("{user_prefix}%");
+    for statement in [
+        "DELETE FROM agent_event_edges WHERE user_id LIKE ?",
+        "DELETE FROM agent_events WHERE user_id LIKE ?",
+        "DELETE FROM agent_session_lifecycle_fences WHERE user_id LIKE ?",
+        "DELETE FROM agent_sessions WHERE user_id LIKE ?",
+    ] {
+        sqlx::query(statement)
+            .bind(&like)
+            .execute(&pool)
+            .await
+            .expect("clean load-profile fixtures");
+    }
 }
 
 #[tokio::test]
@@ -1278,7 +1648,7 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
     let stats = stats.lock().expect("stats lock").clone();
     assert_eq!(stats.events_flushed, 2);
     assert_eq!(stats.events_dropped_permanent, 0);
-    assert_eq!(stats.flush_count, 1);
+    assert_eq!(stats.flush_count, 2);
     assert_eq!(stats.errors, 0);
     assert_eq!(stats.last_error, None);
 

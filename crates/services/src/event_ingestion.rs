@@ -24,14 +24,19 @@
 //!   before it consumes channel capacity reserved for critical audit facts.
 //! - **Graceful shutdown**: flush remaining buffer on drop
 
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use sqlx::Acquire;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Semaphore, mpsc};
 
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
 };
@@ -48,15 +53,45 @@ pub const MIN_INGESTION_RETRIES: u32 = 1;
 pub const MAX_INGESTION_RETRIES: u32 = 8;
 pub const MIN_INGESTION_SESSION_CONCURRENCY: usize = 1;
 pub const MAX_INGESTION_SESSION_CONCURRENCY: usize = 32;
+pub const MIN_INGESTION_RESIDENT_BYTES: u64 = 3 * 1024;
+pub const MAX_INGESTION_RESIDENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MIN_INGESTION_EVENT_BYTES: u64 = 1024;
+pub const MAX_INGESTION_EVENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MIN_INGESTION_DB_ATTEMPT_TIMEOUT_SECS: u64 = 1;
+pub const MAX_INGESTION_DB_ATTEMPT_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_INGESTION_BATCH_SIZE: usize = 100;
 pub const DEFAULT_INGESTION_FLUSH_INTERVAL_SECS: u64 = 1;
 pub const DEFAULT_INGESTION_CHANNEL_CAPACITY: usize = 5_000;
 pub const DEFAULT_INGESTION_RETRIES: u32 = 3;
 pub const DEFAULT_INGESTION_SESSION_CONCURRENCY: usize = MAX_INGESTION_SESSION_CONCURRENCY;
-const MAX_SHUTDOWN_DRAIN_PENDING_YIELDS: usize = 64;
+pub const DEFAULT_INGESTION_MAX_RESIDENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_INGESTION_MAX_EVENT_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_INGESTION_MAX_OWNER_RESIDENT_EVENTS: usize = 4_000;
+pub const DEFAULT_INGESTION_MAX_OWNER_RESIDENT_BYTES: u64 = 48 * 1024 * 1024;
+pub const DEFAULT_INGESTION_MAX_SESSION_RESIDENT_EVENTS: usize = 1_000;
+pub const DEFAULT_INGESTION_MAX_SESSION_RESIDENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_INGESTION_DB_ATTEMPT_TIMEOUT_SECS: u64 = 30;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
 const TELEMETRY_CHANNEL_RESERVE_DIVISOR: usize = 10;
 const MIN_SHARED_POOL_CONNECTION_RESERVE: usize = 2;
+const INGESTION_LATENCY_BUCKET_UPPER_US: [u64; 16] = [
+    1_000,
+    2_000,
+    4_000,
+    8_000,
+    16_000,
+    32_000,
+    64_000,
+    128_000,
+    256_000,
+    512_000,
+    1_024_000,
+    2_048_000,
+    4_096_000,
+    8_192_000,
+    16_384_000,
+    u64::MAX,
+];
 
 /// Configuration for the ingestion worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,12 +101,29 @@ pub struct IngestionConfig {
     /// Max time between flushes (seconds).
     pub flush_interval_secs: u64,
     /// Channel capacity (backpressure threshold).
+    /// This is also the process-local maximum accepted resident event count;
+    /// the physical channel reserves a small part of it for deferred senders.
     pub channel_capacity: usize,
+    /// Maximum compact-JSON bytes retained across sender admission, deferred
+    /// sends, the channel, scheduler queues, retries, and in-flight attempts.
+    pub max_resident_bytes: u64,
+    /// Maximum compact-JSON bytes accepted for one event.
+    pub max_event_bytes: u64,
+    /// Per-owner retained count limit. Normalization preserves global headroom.
+    pub max_owner_resident_events: usize,
+    /// Per-owner retained byte limit. Normalization preserves global headroom.
+    pub max_owner_resident_bytes: u64,
+    /// Per-session retained count limit. Normalization preserves owner headroom.
+    pub max_session_resident_events: usize,
+    /// Per-session retained byte limit. Normalization preserves owner headroom.
+    pub max_session_resident_bytes: u64,
     /// Max retries per batch on transient errors.
     pub max_retries: u32,
     /// Maximum owner/session transactions this worker may execute at once.
     /// The worker also leaves a small reserve in the shared SQL pool.
     pub max_concurrent_session_flushes: usize,
+    /// Whole-attempt deadline, including connection acquisition and cleanup.
+    pub db_attempt_timeout_secs: u64,
     /// When true, replace user-content fields (`content`) on outgoing
     /// IngestionEvents with a privacy marker (`<redacted: len=N sha=...>`)
     /// instead of the raw text. Default: `true` so cloud ingestion is
@@ -85,8 +137,15 @@ impl Default for IngestionConfig {
             batch_size: DEFAULT_INGESTION_BATCH_SIZE,
             flush_interval_secs: DEFAULT_INGESTION_FLUSH_INTERVAL_SECS,
             channel_capacity: DEFAULT_INGESTION_CHANNEL_CAPACITY,
+            max_resident_bytes: DEFAULT_INGESTION_MAX_RESIDENT_BYTES,
+            max_event_bytes: DEFAULT_INGESTION_MAX_EVENT_BYTES,
+            max_owner_resident_events: DEFAULT_INGESTION_MAX_OWNER_RESIDENT_EVENTS,
+            max_owner_resident_bytes: DEFAULT_INGESTION_MAX_OWNER_RESIDENT_BYTES,
+            max_session_resident_events: DEFAULT_INGESTION_MAX_SESSION_RESIDENT_EVENTS,
+            max_session_resident_bytes: DEFAULT_INGESTION_MAX_SESSION_RESIDENT_BYTES,
             max_retries: DEFAULT_INGESTION_RETRIES,
             max_concurrent_session_flushes: DEFAULT_INGESTION_SESSION_CONCURRENCY,
+            db_attempt_timeout_secs: DEFAULT_INGESTION_DB_ATTEMPT_TIMEOUT_SECS,
             redact_content: true,
         }
     }
@@ -105,12 +164,38 @@ impl IngestionConfig {
             MIN_INGESTION_CHANNEL_CAPACITY,
             MAX_INGESTION_CHANNEL_CAPACITY,
         );
+        self.max_resident_bytes = self
+            .max_resident_bytes
+            .clamp(MIN_INGESTION_RESIDENT_BYTES, MAX_INGESTION_RESIDENT_BYTES);
+        self.max_event_bytes = self
+            .max_event_bytes
+            .clamp(MIN_INGESTION_EVENT_BYTES, MAX_INGESTION_EVENT_BYTES)
+            .min(self.max_resident_bytes / 3);
+        self.max_owner_resident_events = self
+            .max_owner_resident_events
+            .clamp(1, self.channel_capacity.saturating_sub(1).max(1));
+        self.max_session_resident_events = self
+            .max_session_resident_events
+            .clamp(1, self.max_owner_resident_events.saturating_sub(1).max(1));
+        self.max_owner_resident_bytes = self.max_owner_resident_bytes.clamp(
+            self.max_event_bytes.saturating_mul(2),
+            self.max_resident_bytes.saturating_sub(self.max_event_bytes),
+        );
+        self.max_session_resident_bytes = self.max_session_resident_bytes.clamp(
+            self.max_event_bytes,
+            self.max_owner_resident_bytes
+                .saturating_sub(self.max_event_bytes),
+        );
         self.max_retries = self
             .max_retries
             .clamp(MIN_INGESTION_RETRIES, MAX_INGESTION_RETRIES);
         self.max_concurrent_session_flushes = self.max_concurrent_session_flushes.clamp(
             MIN_INGESTION_SESSION_CONCURRENCY,
             MAX_INGESTION_SESSION_CONCURRENCY,
+        );
+        self.db_attempt_timeout_secs = self.db_attempt_timeout_secs.clamp(
+            MIN_INGESTION_DB_ATTEMPT_TIMEOUT_SECS,
+            MAX_INGESTION_DB_ATTEMPT_TIMEOUT_SECS,
         );
         self
     }
@@ -151,13 +236,20 @@ fn stable_json_digest<T: Serialize>(value: &T) -> Result<String, String> {
 
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct IngestionQueueReservation(Arc<astra_core::history_work::QueueBytesReservation>);
+pub struct IngestionQueueReservation {
+    history_work: Option<Arc<astra_core::history_work::QueueBytesReservation>>,
+    admission: Option<IngestionAdmissionLease>,
+}
 
 impl std::fmt::Debug for IngestionQueueReservation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("IngestionQueueReservation")
-            .field("owners", &Arc::strong_count(&self.0))
+            .field(
+                "history_work_owners",
+                &self.history_work.as_ref().map(Arc::strong_count),
+            )
+            .field("admission", &self.admission)
             .finish_non_exhaustive()
     }
 }
@@ -189,26 +281,25 @@ pub struct IngestionEvent {
     #[doc(hidden)]
     #[serde(skip)]
     pub history_work_queue_reservation: Option<IngestionQueueReservation>,
+    /// Process-local enqueue timestamp used for bounded latency histograms.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub ingestion_enqueued_at: Option<std::time::Instant>,
 }
 
-fn ingestion_queue_reservation(event: &IngestionEvent) -> Option<IngestionQueueReservation> {
-    if !astra_core::history_work::instrumentation_enabled() {
-        return None;
-    }
-    match astra_core::history_work::serialized_bytes(event) {
-        Ok(bytes) => Some(IngestionQueueReservation(Arc::new(
-            astra_core::history_work::QueueBytesReservation::for_site(
-                astra_core::history_work::HistoryWorkSite::EventIngestionQueue,
-                bytes,
-            ),
-        ))),
-        Err(error) => {
-            astra_core::history_work::record_serialization_failure(
-                astra_core::history_work::HistoryWorkSite::EventIngestionQueue,
-                &error,
-            );
-            None
-        }
+fn ingestion_queue_reservation(
+    bytes: u64,
+    admission: IngestionAdmissionLease,
+) -> IngestionQueueReservation {
+    let history_work = astra_core::history_work::instrumentation_enabled().then(|| {
+        Arc::new(astra_core::history_work::QueueBytesReservation::for_site(
+            astra_core::history_work::HistoryWorkSite::EventIngestionQueue,
+            bytes,
+        ))
+    });
+    IngestionQueueReservation {
+        history_work,
+        admission: Some(admission),
     }
 }
 
@@ -379,6 +470,7 @@ impl IngestionEvent {
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
             history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
         })
     }
 
@@ -476,6 +568,7 @@ impl IngestionEvent {
             parent_event_ids,
             causal_chain_id,
             history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
         })
     }
 
@@ -615,6 +708,7 @@ impl IngestionEvent {
                     parent_event_ids: vec![main_event_id.clone()],
                     causal_chain_id: Some(main_event_id.clone()),
                     history_work_queue_reservation: None,
+                    ingestion_enqueued_at: None,
                 });
             }
         }
@@ -646,24 +740,46 @@ impl IngestionEvent {
 #[derive(Clone)]
 pub struct IngestionSender {
     tx: mpsc::Sender<IngestionEvent>,
+    admission: Arc<IngestionAdmission>,
     overflow_count: Arc<AtomicU64>,
     dropped_before_acceptance_count: Arc<AtomicU64>,
     dropped_telemetry_before_acceptance_count: Arc<AtomicU64>,
     pending_deferrals: Arc<AtomicUsize>,
     max_pending_deferrals: usize,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+}
+
+struct PendingDeferralGuard {
+    pending_deferrals: Arc<AtomicUsize>,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for PendingDeferralGuard {
+    fn drop(&mut self) {
+        self.pending_deferrals.fetch_sub(1, Ordering::AcqRel);
+        self.scheduler_notify.notify_one();
+    }
 }
 
 impl IngestionSender {
     /// Handle with no worker: [`Self::enqueue`] is a no-op (disconnected channel). Tests only.
     pub fn disconnected() -> Self {
         let (tx, _rx) = mpsc::channel(1);
+        let config = IngestionConfig {
+            channel_capacity: 2,
+            ..Default::default()
+        }
+        .normalized();
+        let stats = Arc::new(Mutex::new(IngestionStats::default()));
         Self {
             tx,
+            admission: IngestionAdmission::new(&config, stats),
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: DISCONNECTED_PENDING_DEFERRAL_LIMIT,
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -674,14 +790,22 @@ impl IngestionSender {
     /// [`EventIngestionWorker::spawn`] there.
     pub fn for_tests(capacity: usize) -> (Self, mpsc::Receiver<IngestionEvent>) {
         let (tx, rx) = mpsc::channel(capacity);
+        let config = IngestionConfig {
+            channel_capacity: capacity.saturating_mul(2).max(1),
+            ..Default::default()
+        }
+        .normalized();
+        let stats = Arc::new(Mutex::new(IngestionStats::default()));
         (
             Self {
                 tx,
+                admission: IngestionAdmission::new(&config, stats),
                 overflow_count: Arc::new(AtomicU64::new(0)),
                 dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
                 dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
                 pending_deferrals: Arc::new(AtomicUsize::new(0)),
                 max_pending_deferrals: capacity.max(1),
+                scheduler_notify: Arc::new(tokio::sync::Notify::new()),
             },
             rx,
         )
@@ -696,7 +820,6 @@ impl IngestionSender {
     /// `overflow_count` tracks these backpressure deferrals and hard
     /// closed-channel drops.
     pub fn enqueue(&self, mut event: IngestionEvent) {
-        event.history_work_queue_reservation = ingestion_queue_reservation(&event);
         let priority = event.priority();
         if priority == IngestionEventPriority::Telemetry {
             let reserve_slots = telemetry_channel_reserve_slots(self.tx.max_capacity());
@@ -714,6 +837,39 @@ impl IngestionSender {
                 return;
             }
         }
+        let bytes = match astra_core::history_work::serialized_bytes(&event) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let dropped = self.record_drop_before_acceptance(priority);
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    priority = priority.as_label(),
+                    dropped_before_acceptance_count = dropped,
+                    error = %error,
+                    "ingestion event could not be sized and was rejected before acceptance"
+                );
+                return;
+            }
+        };
+        let lease = match self.admission.try_acquire(&event, bytes, priority) {
+            Ok(lease) => lease,
+            Err(rejection) => {
+                let dropped = self.record_drop_before_acceptance(priority);
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    priority = priority.as_label(),
+                    reason = rejection.as_label(),
+                    event_bytes = bytes,
+                    max_event_bytes = self.admission.limits.max_event_bytes,
+                    dropped_before_acceptance_count = dropped,
+                    "ingestion event rejected before acceptance"
+                );
+                return;
+            }
+        };
+        event.history_work_queue_reservation = Some(ingestion_queue_reservation(bytes, lease));
+        event.ingestion_enqueued_at = Some(std::time::Instant::now());
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
@@ -733,6 +889,7 @@ impl IngestionSender {
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
                         let pending_deferrals = self.pending_deferrals.clone();
+                        let scheduler_notify = Arc::clone(&self.scheduler_notify);
                         let max_pending_deferrals = self.max_pending_deferrals_for(priority);
                         if pending_deferrals
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
@@ -751,6 +908,10 @@ impl IngestionSender {
                             return;
                         }
                         drop(handle.spawn(async move {
+                            let _pending = PendingDeferralGuard {
+                                pending_deferrals,
+                                scheduler_notify,
+                            };
                             if tx.send(event).await.is_err() {
                                 let n = overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 dropped_before_acceptance_count
@@ -766,7 +927,6 @@ impl IngestionSender {
                                     "ingestion channel closed while deferred event was waiting; event dropped"
                                 );
                             }
-                            pending_deferrals.fetch_sub(1, Ordering::Relaxed);
                         }));
                     }
                     Err(_) => {
@@ -842,8 +1002,50 @@ impl IngestionSender {
 
     /// Enqueue with backpressure (waits if channel full).
     pub async fn enqueue_async(&self, mut event: IngestionEvent) {
-        event.history_work_queue_reservation = ingestion_queue_reservation(&event);
         let priority = event.priority();
+        let bytes = match astra_core::history_work::serialized_bytes(&event) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.record_drop_before_acceptance(priority);
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    priority = priority.as_label(),
+                    error = %error,
+                    "ingestion event could not be sized and was rejected before acceptance"
+                );
+                return;
+            }
+        };
+        if bytes > self.admission.limits.max_event_bytes {
+            self.record_drop_before_acceptance(priority);
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                priority = priority.as_label(),
+                event_bytes = bytes,
+                max_event_bytes = self.admission.limits.max_event_bytes,
+                "oversized ingestion event rejected before acceptance"
+            );
+            return;
+        }
+        let lease = tokio::select! {
+            lease = self.admission.acquire(&event, bytes, priority) => lease,
+            _ = self.tx.closed() => {
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                self.record_drop_before_acceptance(priority);
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    priority = priority.as_label(),
+                    "ingestion channel closed while waiting for admission; event dropped"
+                );
+                return;
+            }
+        };
+        let Ok(lease) = lease else {
+            self.record_drop_before_acceptance(priority);
+            return;
+        };
+        event.history_work_queue_reservation = Some(ingestion_queue_reservation(bytes, lease));
+        event.ingestion_enqueued_at = Some(std::time::Instant::now());
         if self.tx.send(event).await.is_err() {
             self.overflow_count.fetch_add(1, Ordering::Relaxed);
             self.record_drop_before_acceptance(priority);
@@ -868,23 +1070,430 @@ pub struct IngestionStats {
     pub events_received: u64,
     pub events_flushed: u64,
     pub events_dropped_permanent: u64,
+    pub events_abandoned_shutdown: u64,
+    /// Accepted events whose durable outcome is unknown after shutdown.
+    pub events_unresolved_shutdown: u64,
+    pub resident_events_current: u64,
+    pub resident_events_peak: u64,
+    pub resident_bytes_current: u64,
+    pub resident_bytes_peak: u64,
+    pub db_attempts_current: u64,
+    pub db_attempts_peak: u64,
     pub flush_count: u64,
     pub errors: u64,
     pub last_error: Option<String>,
+    enqueue_to_terminal_latency_buckets: [u64; INGESTION_LATENCY_BUCKET_UPPER_US.len()],
+    enqueue_to_terminal_latency_samples: u64,
+}
+
+struct IngestionDbAttemptGuard {
+    stats: Arc<Mutex<IngestionStats>>,
+}
+
+impl IngestionDbAttemptGuard {
+    fn begin(stats: Arc<Mutex<IngestionStats>>) -> Self {
+        {
+            let mut snapshot = astra_core::sync_poison::recover_mutex_lock(&stats);
+            snapshot.db_attempts_current = snapshot.db_attempts_current.saturating_add(1);
+            snapshot.db_attempts_peak = snapshot.db_attempts_peak.max(snapshot.db_attempts_current);
+        }
+        Self { stats }
+    }
+}
+
+impl Drop for IngestionDbAttemptGuard {
+    fn drop(&mut self) {
+        let mut snapshot = astra_core::sync_poison::recover_mutex_lock(&self.stats);
+        snapshot.db_attempts_current = snapshot.db_attempts_current.saturating_sub(1);
+    }
+}
+
+impl IngestionStats {
+    /// Upper bound of the fixed histogram bucket containing this percentile.
+    /// Returns `None` before any accepted event reaches a terminal outcome.
+    pub fn enqueue_to_terminal_percentile_ms(&self, percentile: f64) -> Option<u64> {
+        if self.enqueue_to_terminal_latency_samples == 0 {
+            return None;
+        }
+        let percentile = percentile.clamp(0.0, 1.0);
+        let rank =
+            ((self.enqueue_to_terminal_latency_samples as f64 * percentile).ceil() as u64).max(1);
+        let mut cumulative = 0_u64;
+        for (index, count) in self.enqueue_to_terminal_latency_buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            if cumulative >= rank {
+                return Some(INGESTION_LATENCY_BUCKET_UPPER_US[index].saturating_add(999) / 1_000);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IngestionAdmissionLimits {
+    max_events: usize,
+    max_bytes: u64,
+    max_event_bytes: u64,
+    max_owner_events: usize,
+    max_owner_bytes: u64,
+    max_session_events: usize,
+    max_session_bytes: u64,
+    telemetry_reserve_events: usize,
+    telemetry_reserve_bytes: u64,
+}
+
+impl IngestionAdmissionLimits {
+    fn from_config(config: &IngestionConfig) -> Self {
+        Self {
+            max_events: config.channel_capacity,
+            max_bytes: config.max_resident_bytes,
+            max_event_bytes: config.max_event_bytes,
+            max_owner_events: config.max_owner_resident_events,
+            max_owner_bytes: config.max_owner_resident_bytes,
+            max_session_events: config.max_session_resident_events,
+            max_session_bytes: config.max_session_resident_bytes,
+            telemetry_reserve_events: telemetry_channel_reserve_slots(config.channel_capacity),
+            telemetry_reserve_bytes: config.max_event_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IngestionResidentUsage {
+    events: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct IngestionAdmissionState {
+    global: IngestionResidentUsage,
+    owners: HashMap<String, IngestionResidentUsage>,
+    sessions: HashMap<(String, String), IngestionResidentUsage>,
+}
+
+struct IngestionAdmission {
+    limits: IngestionAdmissionLimits,
+    state: Mutex<IngestionAdmissionState>,
+    released: tokio::sync::Notify,
+    stats: Arc<Mutex<IngestionStats>>,
+}
+
+#[derive(Clone)]
+struct IngestionAdmissionLease {
+    inner: Arc<IngestionAdmissionLeaseInner>,
+}
+
+impl std::fmt::Debug for IngestionAdmissionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IngestionAdmissionLease")
+            .field("owners", &Arc::strong_count(&self.inner))
+            .field("bytes", &self.inner.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+struct IngestionAdmissionLeaseInner {
+    admission: Arc<IngestionAdmission>,
+    user_id: String,
+    session_id: String,
+    bytes: u64,
+}
+
+impl Drop for IngestionAdmissionLeaseInner {
+    fn drop(&mut self) {
+        self.admission
+            .release(&self.user_id, &self.session_id, self.bytes);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestionAdmissionRejection {
+    Oversized,
+    GlobalPressure,
+    OwnerPressure,
+    SessionPressure,
+}
+
+impl IngestionAdmissionRejection {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Oversized => "oversized",
+            Self::GlobalPressure => "global_pressure",
+            Self::OwnerPressure => "owner_pressure",
+            Self::SessionPressure => "session_pressure",
+        }
+    }
+}
+
+impl IngestionAdmission {
+    fn new(config: &IngestionConfig, stats: Arc<Mutex<IngestionStats>>) -> Arc<Self> {
+        Arc::new(Self {
+            limits: IngestionAdmissionLimits::from_config(config),
+            state: Mutex::new(IngestionAdmissionState::default()),
+            released: tokio::sync::Notify::new(),
+            stats,
+        })
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        event: &IngestionEvent,
+        bytes: u64,
+        priority: IngestionEventPriority,
+    ) -> Result<IngestionAdmissionLease, IngestionAdmissionRejection> {
+        if bytes > self.limits.max_event_bytes {
+            return Err(IngestionAdmissionRejection::Oversized);
+        }
+
+        let mut state = astra_core::sync_poison::recover_mutex_lock(&self.state);
+        let global_event_limit = if priority == IngestionEventPriority::Telemetry {
+            self.limits
+                .max_events
+                .saturating_sub(self.limits.telemetry_reserve_events)
+        } else {
+            self.limits.max_events
+        };
+        let global_byte_limit = if priority == IngestionEventPriority::Telemetry {
+            self.limits
+                .max_bytes
+                .saturating_sub(self.limits.telemetry_reserve_bytes)
+        } else {
+            self.limits.max_bytes
+        };
+        if !usage_fits(
+            state.global,
+            1,
+            bytes,
+            global_event_limit,
+            global_byte_limit,
+        ) {
+            return Err(IngestionAdmissionRejection::GlobalPressure);
+        }
+
+        let owner = state
+            .owners
+            .get(&event.user_id)
+            .copied()
+            .unwrap_or_default();
+        if !usage_fits(
+            owner,
+            1,
+            bytes,
+            self.limits.max_owner_events,
+            self.limits.max_owner_bytes,
+        ) {
+            return Err(IngestionAdmissionRejection::OwnerPressure);
+        }
+        let session_key = (event.user_id.clone(), event.session_id.clone());
+        let session = state
+            .sessions
+            .get(&session_key)
+            .copied()
+            .unwrap_or_default();
+        if !usage_fits(
+            session,
+            1,
+            bytes,
+            self.limits.max_session_events,
+            self.limits.max_session_bytes,
+        ) {
+            return Err(IngestionAdmissionRejection::SessionPressure);
+        }
+
+        add_usage(&mut state.global, bytes);
+        add_usage(
+            state.owners.entry(event.user_id.clone()).or_default(),
+            bytes,
+        );
+        add_usage(state.sessions.entry(session_key).or_default(), bytes);
+        let current = state.global;
+        drop(state);
+
+        let mut stats = astra_core::sync_poison::recover_mutex_lock(&self.stats);
+        stats.resident_events_current = current.events as u64;
+        stats.resident_events_peak = stats
+            .resident_events_peak
+            .max(stats.resident_events_current);
+        stats.resident_bytes_current = current.bytes;
+        stats.resident_bytes_peak = stats.resident_bytes_peak.max(current.bytes);
+
+        Ok(IngestionAdmissionLease {
+            inner: Arc::new(IngestionAdmissionLeaseInner {
+                admission: Arc::clone(self),
+                user_id: event.user_id.clone(),
+                session_id: event.session_id.clone(),
+                bytes,
+            }),
+        })
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        event: &IngestionEvent,
+        bytes: u64,
+        priority: IngestionEventPriority,
+    ) -> Result<IngestionAdmissionLease, IngestionAdmissionRejection> {
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_acquire(event, bytes, priority) {
+                Ok(lease) => return Ok(lease),
+                Err(IngestionAdmissionRejection::Oversized) => {
+                    return Err(IngestionAdmissionRejection::Oversized);
+                }
+                Err(_) => notified.await,
+            }
+        }
+    }
+
+    fn release(&self, user_id: &str, session_id: &str, bytes: u64) {
+        let mut state = astra_core::sync_poison::recover_mutex_lock(&self.state);
+        remove_usage(&mut state.global, bytes);
+        let owner_key = user_id.to_string();
+        remove_keyed_usage(&mut state.owners, &owner_key, bytes);
+        remove_keyed_usage(
+            &mut state.sessions,
+            &(owner_key, session_id.to_string()),
+            bytes,
+        );
+        let current = state.global;
+        drop(state);
+
+        let mut stats = astra_core::sync_poison::recover_mutex_lock(&self.stats);
+        stats.resident_events_current = current.events as u64;
+        stats.resident_bytes_current = current.bytes;
+        drop(stats);
+        self.released.notify_waiters();
+    }
+}
+
+fn usage_fits(
+    current: IngestionResidentUsage,
+    additional_events: usize,
+    additional_bytes: u64,
+    max_events: usize,
+    max_bytes: u64,
+) -> bool {
+    current
+        .events
+        .checked_add(additional_events)
+        .is_some_and(|events| events <= max_events)
+        && current
+            .bytes
+            .checked_add(additional_bytes)
+            .is_some_and(|bytes| bytes <= max_bytes)
+}
+
+fn add_usage(usage: &mut IngestionResidentUsage, bytes: u64) {
+    usage.events += 1;
+    usage.bytes += bytes;
+}
+
+fn remove_usage(usage: &mut IngestionResidentUsage, bytes: u64) {
+    usage.events = usage.events.saturating_sub(1);
+    usage.bytes = usage.bytes.saturating_sub(bytes);
+}
+
+fn remove_keyed_usage<K: std::hash::Hash + Eq>(
+    usage: &mut HashMap<K, IngestionResidentUsage>,
+    key: &K,
+    bytes: u64,
+) {
+    let remove = if let Some(current) = usage.get_mut(key) {
+        remove_usage(current, bytes);
+        current.events == 0
+    } else {
+        false
+    };
+    if remove {
+        usage.remove(key);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct IngestionBatchOutcome {
     events_resolved: usize,
     events_dropped_permanent: usize,
-    retry_events: Vec<IngestionEvent>,
-    retry_errors: Vec<String>,
 }
 
-struct IngestionSessionAttempt {
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct IngestionSessionKey {
+    user_id: String,
+    session_id: String,
+}
+
+impl IngestionSessionKey {
+    fn from_event(event: &IngestionEvent) -> Self {
+        Self {
+            user_id: event.user_id.clone(),
+            session_id: event.session_id.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct IngestionSessionQueue {
+    pending: VecDeque<IngestionEvent>,
+    retry_head: Option<Vec<IngestionEvent>>,
+    retry_attempts: u32,
+    ready: bool,
+    in_flight: bool,
+    flush_deadline: Option<tokio::time::Instant>,
+    retry_deadline: Option<tokio::time::Instant>,
+}
+
+#[derive(Default)]
+struct FairSessionReadyQueue {
+    owners: VecDeque<String>,
+    owner_present: HashSet<String>,
+    sessions: HashMap<String, VecDeque<IngestionSessionKey>>,
+    session_present: HashSet<IngestionSessionKey>,
+}
+
+impl FairSessionReadyQueue {
+    fn push(&mut self, key: IngestionSessionKey) {
+        if !self.session_present.insert(key.clone()) {
+            return;
+        }
+        let owner = key.user_id.clone();
+        self.sessions
+            .entry(owner.clone())
+            .or_default()
+            .push_back(key);
+        if self.owner_present.insert(owner.clone()) {
+            self.owners.push_back(owner);
+        }
+    }
+
+    fn pop(&mut self) -> Option<IngestionSessionKey> {
+        let owner = self.owners.pop_front()?;
+        self.owner_present.remove(&owner);
+        let queue = self.sessions.get_mut(&owner)?;
+        let key = queue.pop_front()?;
+        self.session_present.remove(&key);
+        if queue.is_empty() {
+            self.sessions.remove(&owner);
+        } else if self.owner_present.insert(owner.clone()) {
+            self.owners.push_back(owner);
+        }
+        Some(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.session_present.is_empty()
+    }
+}
+
+struct IngestionAttemptCompletion {
+    key: IngestionSessionKey,
     events: Vec<IngestionEvent>,
     result: Result<IngestionBatchOutcome, String>,
 }
+
+type IngestionAttemptFuture =
+    Pin<Box<dyn Future<Output = IngestionAttemptCompletion> + Send + 'static>>;
 
 /// Convert ISO 8601 / RFC 3339 timestamp to MySQL DATETIME(6) format.
 ///
@@ -1219,6 +1828,103 @@ fn bind_ingestion_event<'q>(
     query
 }
 
+/// Cloneable process-local aggregate budget for ingestion DB attempts.
+///
+/// Pass the same limiter to [`EventIngestionWorker::spawn_with_db_limiter`]
+/// for every worker sharing a SQL pool. This does not coordinate across
+/// processes; each process must construct and share its own limiter.
+#[derive(Clone, Debug)]
+pub struct IngestionDbLimiter {
+    permits: Arc<Semaphore>,
+    max_concurrent_attempts: usize,
+}
+
+impl IngestionDbLimiter {
+    pub fn new(max_concurrent_attempts: usize) -> Self {
+        let max_concurrent_attempts = max_concurrent_attempts.max(1);
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent_attempts)),
+            max_concurrent_attempts,
+        }
+    }
+
+    pub fn max_concurrent_attempts(&self) -> usize {
+        self.max_concurrent_attempts
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| "ingestion DB limiter closed".to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IngestionDbDeadline {
+    at: tokio::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl IngestionDbDeadline {
+    fn after(seconds: u64) -> Self {
+        let budget = std::time::Duration::from_secs(seconds);
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    fn timeout(self, stage: &'static str) -> String {
+        format!(
+            "event_ingestion.{stage} timed out after {} seconds",
+            self.budget.as_secs()
+        )
+    }
+}
+
+struct BoundedIngestionDbConnection {
+    connection: Option<CancellationSafePoolConnection>,
+}
+
+impl BoundedIngestionDbConnection {
+    async fn acquire(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        deadline: IngestionDbDeadline,
+    ) -> Result<Self, String> {
+        let connection =
+            tokio::time::timeout_at(deadline.at, CancellationSafePoolConnection::acquire(pool))
+                .await
+                .map_err(|_| deadline.timeout("connection_acquire"))?
+                .map_err(|error| format!("event_ingestion.connection_acquire: {error}"))?;
+        Ok(Self {
+            connection: Some(connection),
+        })
+    }
+
+    fn connection_mut(&mut self) -> &mut sqlx::MySqlConnection {
+        self.connection
+            .as_mut()
+            .expect("bounded ingestion connection already released")
+            .connection_mut()
+    }
+
+    fn release(mut self) {
+        self.connection
+            .take()
+            .expect("bounded ingestion connection already released")
+            .release();
+    }
+}
+
+impl Drop for BoundedIngestionDbConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.discard();
+        }
+    }
+}
+
 /// The background worker that batches and flushes events to MatrixOne.
 pub struct EventIngestionWorker {
     rx: mpsc::Receiver<IngestionEvent>,
@@ -1226,6 +1932,8 @@ pub struct EventIngestionWorker {
     config: IngestionConfig,
     stats: Arc<std::sync::Mutex<IngestionStats>>,
     pending_deferrals: Arc<AtomicUsize>,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+    db_limiter: IngestionDbLimiter,
 }
 
 /// Handle to signal the ingestion worker to shut down immediately.
@@ -1243,10 +1951,33 @@ impl IngestionShutdownHandle {
 }
 
 impl EventIngestionWorker {
-    /// Spawn the ingestion pipeline.
+    /// Spawn one ingestion worker with a worker-local DB limiter.
+    ///
+    /// Deployments that create multiple workers over the same pool should use
+    /// [`Self::spawn_with_db_limiter`] and pass one shared limiter instead.
     pub fn spawn(
         pool: sqlx::Pool<sqlx::MySql>,
         config: IngestionConfig,
+    ) -> (
+        IngestionSender,
+        IngestionShutdownHandle,
+        Arc<std::sync::Mutex<IngestionStats>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let normalized = config.clone().normalized();
+        let db_limiter =
+            IngestionDbLimiter::new(Self::session_flush_concurrency_for(&pool, &normalized));
+        Self::spawn_with_db_limiter(pool, config, db_limiter)
+    }
+
+    /// Spawn a worker sharing a process-local aggregate DB transaction budget.
+    ///
+    /// Clone one [`IngestionDbLimiter`] into every worker that uses the same
+    /// SQL pool. The worker's own scheduler cap is still applied independently.
+    pub fn spawn_with_db_limiter(
+        pool: sqlx::Pool<sqlx::MySql>,
+        config: IngestionConfig,
+        db_limiter: IngestionDbLimiter,
     ) -> (
         IngestionSender,
         IngestionShutdownHandle,
@@ -1264,15 +1995,25 @@ impl EventIngestionWorker {
                 flush_interval_secs = config.flush_interval_secs,
                 requested_channel_capacity = raw_config.channel_capacity,
                 channel_capacity = config.channel_capacity,
+                requested_max_resident_bytes = raw_config.max_resident_bytes,
+                max_resident_bytes = config.max_resident_bytes,
+                requested_max_event_bytes = raw_config.max_event_bytes,
+                max_event_bytes = config.max_event_bytes,
                 requested_max_retries = raw_config.max_retries,
                 max_retries = config.max_retries,
                 "event ingestion config was clamped to supported bounds"
             );
         }
-        let (tx, rx) = mpsc::channel(config.channel_capacity);
         let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
         let stats_clone = stats.clone();
+        let admission = IngestionAdmission::new(&config, Arc::clone(&stats));
+        let physical_channel_capacity = config
+            .channel_capacity
+            .saturating_sub(telemetry_channel_reserve_slots(config.channel_capacity))
+            .max(1);
+        let (tx, rx) = mpsc::channel(physical_channel_capacity);
         let notify = Arc::new(tokio::sync::Notify::new());
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
         let pending_deferrals = Arc::new(AtomicUsize::new(0));
         let max_pending_deferrals = config.channel_capacity;
 
@@ -1281,7 +2022,11 @@ impl EventIngestionWorker {
             batch_size = config.batch_size,
             flush_interval_secs = config.flush_interval_secs,
             channel_capacity = config.channel_capacity,
+            physical_channel_capacity,
+            max_resident_bytes = config.max_resident_bytes,
+            max_event_bytes = config.max_event_bytes,
             max_concurrent_session_flushes = config.max_concurrent_session_flushes,
+            aggregate_db_attempt_limit = db_limiter.max_concurrent_attempts(),
             "event ingestion worker spawned"
         );
 
@@ -1291,6 +2036,8 @@ impl EventIngestionWorker {
             config,
             stats,
             pending_deferrals: Arc::clone(&pending_deferrals),
+            scheduler_notify: Arc::clone(&scheduler_notify),
+            db_limiter,
         };
         // Share the same Arc so the handle can signal the worker.
         let shutdown_handle = IngestionShutdownHandle {
@@ -1301,11 +2048,13 @@ impl EventIngestionWorker {
 
         let sender = IngestionSender {
             tx,
+            admission,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals,
             max_pending_deferrals,
+            scheduler_notify,
         };
         (sender, shutdown_handle, stats_clone, handle)
     }
@@ -1317,167 +2066,353 @@ impl EventIngestionWorker {
     }
 
     fn session_flush_concurrency(&self) -> usize {
-        let pool_max = self.pool.options().get_max_connections() as usize;
+        Self::session_flush_concurrency_for(&self.pool, &self.config)
+    }
+
+    fn session_flush_concurrency_for(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        config: &IngestionConfig,
+    ) -> usize {
+        let pool_max = pool.options().get_max_connections() as usize;
         let pool_budget = pool_max
             .saturating_sub(MIN_SHARED_POOL_CONNECTION_RESERVE)
             .max(1);
         let automatic_budget = (pool_max / 4).max(1);
-        self.config
+        config
             .max_concurrent_session_flushes
             .min(pool_budget)
             .min(automatic_budget)
     }
 
-    fn drain_available_channel_events(&mut self, buffer: &mut Vec<IngestionEvent>) -> usize {
-        let mut drained = 0;
-        while let Ok(event) = self.rx.try_recv() {
-            self.record_event_received();
-            buffer.push(event);
-            drained += 1;
+    fn enqueue_scheduled_event(
+        &self,
+        sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+        ready: &mut FairSessionReadyQueue,
+        event: IngestionEvent,
+        now: tokio::time::Instant,
+        draining: bool,
+    ) {
+        self.record_event_received();
+        let key = IngestionSessionKey::from_event(&event);
+        let queue = sessions.entry(key.clone()).or_default();
+        if queue.pending.is_empty() {
+            queue.flush_deadline =
+                Some(now + tokio::time::Duration::from_secs(self.config.flush_interval_secs));
         }
-        drained
+        queue.pending.push_back(event);
+        if !queue.in_flight
+            && queue.retry_deadline.is_none()
+            && (draining || queue.pending.len() >= self.config.batch_size)
+        {
+            queue.ready = true;
+            ready.push(key);
+        }
     }
 
-    async fn drain_channel_for_shutdown(&mut self, buffer: &mut Vec<IngestionEvent>) {
-        let mut pending_yields = 0;
-        let mut observed_empty_after_pending_zero = false;
-        loop {
-            let drained = self.drain_available_channel_events(buffer);
-            if drained > 0 {
-                pending_yields = 0;
-                observed_empty_after_pending_zero = false;
+    fn promote_due_sessions(
+        &self,
+        sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+        ready: &mut FairSessionReadyQueue,
+        now: tokio::time::Instant,
+        draining: bool,
+    ) {
+        let mut promoted = Vec::new();
+        for (key, queue) in sessions.iter_mut() {
+            if queue.in_flight || queue.ready {
                 continue;
             }
+            if draining || queue.retry_deadline.is_some_and(|deadline| deadline <= now) {
+                queue.retry_deadline = None;
+            }
+            let retry_waiting =
+                !draining && queue.retry_head.is_some() && queue.retry_deadline.is_some();
+            let flush_due = queue.flush_deadline.is_some_and(|deadline| deadline <= now);
+            let has_work = queue.retry_head.is_some() || !queue.pending.is_empty();
+            if has_work && !retry_waiting && (draining || queue.retry_head.is_some() || flush_due) {
+                queue.ready = true;
+                promoted.push(key.clone());
+            }
+        }
+        for key in promoted {
+            ready.push(key);
+        }
+    }
 
-            let pending = self.pending_deferrals.load(Ordering::Relaxed);
-            if pending == 0 {
-                if observed_empty_after_pending_zero {
-                    break;
-                }
-                observed_empty_after_pending_zero = true;
-                tokio::task::yield_now().await;
+    fn dispatch_ready_sessions(
+        &self,
+        sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+        ready: &mut FairSessionReadyQueue,
+        in_flight: &mut FuturesUnordered<IngestionAttemptFuture>,
+    ) {
+        let concurrency = self.session_flush_concurrency();
+        while in_flight.len() < concurrency {
+            let Some(key) = ready.pop() else { break };
+            let Some(queue) = sessions.get_mut(&key) else {
+                continue;
+            };
+            queue.ready = false;
+            if queue.in_flight || queue.retry_deadline.is_some() {
                 continue;
             }
-            observed_empty_after_pending_zero = false;
-            if pending_yields >= MAX_SHUTDOWN_DRAIN_PENDING_YIELDS {
-                tracing::warn!(
+            let events = if let Some(retry_head) = queue.retry_head.take() {
+                retry_head
+            } else {
+                let take = queue.pending.len().min(self.config.batch_size);
+                let events = queue.pending.drain(..take).collect::<Vec<_>>();
+                if queue.pending.is_empty() {
+                    queue.flush_deadline = None;
+                }
+                events
+            };
+            if events.is_empty() {
+                continue;
+            }
+            queue.in_flight = true;
+            let pool = self.pool.clone();
+            let db_limiter = self.db_limiter.clone();
+            let stats = Arc::clone(&self.stats);
+            let db_attempt_timeout_secs = self.config.db_attempt_timeout_secs;
+            let attempt_key = key.clone();
+            in_flight.push(Box::pin(async move {
+                let result = match db_limiter.acquire().await {
+                    Ok(_permit) => {
+                        let _attempt = IngestionDbAttemptGuard::begin(stats);
+                        EventIngestionWorker::insert_session_group_on_pool(
+                            &pool,
+                            &events,
+                            db_attempt_timeout_secs,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                IngestionAttemptCompletion {
+                    key: attempt_key,
+                    events,
+                    result,
+                }
+            }));
+        }
+    }
+
+    fn complete_scheduled_attempt(
+        &self,
+        sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+        ready: &mut FairSessionReadyQueue,
+        enqueued_at: &mut HashMap<(String, String), VecDeque<tokio::time::Instant>>,
+        completion: IngestionAttemptCompletion,
+        now: tokio::time::Instant,
+        draining: bool,
+    ) -> usize {
+        let Some(queue) = sessions.get_mut(&completion.key) else {
+            return 0;
+        };
+        queue.in_flight = false;
+        let mut terminal_events = 0_usize;
+        match completion.result {
+            Ok(outcome) => {
+                terminal_events = completion.events.len();
+                self.record_terminal_latencies(&completion.events, enqueued_at, now);
+                queue.retry_attempts = 0;
+                self.record_flush_outcome(
+                    outcome.events_resolved,
+                    outcome.events_dropped_permanent,
+                    None,
+                );
+            }
+            Err(error) => {
+                if draining {
+                    terminal_events = completion.events.len();
+                    self.record_terminal_latencies(&completion.events, enqueued_at, now);
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.events_abandoned_shutdown = stats
+                            .events_abandoned_shutdown
+                            .saturating_add(completion.events.len() as u64);
+                        stats.events_unresolved_shutdown = stats
+                            .events_unresolved_shutdown
+                            .saturating_add(completion.events.len() as u64);
+                        stats.errors = stats.errors.saturating_add(1);
+                        stats.last_error = Some(format!("shutdown flush failed: {error}"));
+                    }
+                } else {
+                    queue.retry_head = Some(completion.events);
+                    queue.retry_attempts = queue.retry_attempts.saturating_add(1);
+                    let exhausted = queue.retry_attempts >= self.config.max_retries;
+                    let delay = if exhausted {
+                        queue.retry_attempts = 0;
+                        self.record_flush_outcome(
+                            0,
+                            0,
+                            Some(format!(
+                                "session-group flush exhausted retry burst: {error}"
+                            )),
+                        );
+                        tokio::time::Duration::from_secs(
+                            self.config.flush_interval_secs.clamp(1, 30),
+                        )
+                    } else {
+                        tokio::time::Duration::from_millis(
+                            500_u64.saturating_mul(1_u64 << (queue.retry_attempts - 1).min(6)),
+                        )
+                    };
+                    queue.retry_deadline = Some(now + delay);
+                }
+            }
+        }
+
+        if !queue.in_flight
+            && queue.retry_deadline.is_none()
+            && (queue.retry_head.is_some()
+                || (draining && !queue.pending.is_empty())
+                || queue.pending.len() >= self.config.batch_size
+                || queue.flush_deadline.is_some_and(|deadline| deadline <= now))
+        {
+            queue.ready = true;
+            ready.push(completion.key.clone());
+        }
+        if !queue.in_flight && queue.retry_head.is_none() && queue.pending.is_empty() {
+            sessions.remove(&completion.key);
+        }
+        terminal_events
+    }
+
+    fn record_terminal_latencies(
+        &self,
+        events: &[IngestionEvent],
+        enqueued_at: &mut HashMap<(String, String), VecDeque<tokio::time::Instant>>,
+        now: tokio::time::Instant,
+    ) {
+        let mut latencies = Vec::with_capacity(events.len());
+        for event in events {
+            let identity = (event.user_id.clone(), event.event_id.clone());
+            let accepted = enqueued_at.get_mut(&identity).and_then(VecDeque::pop_front);
+            if enqueued_at.get(&identity).is_some_and(VecDeque::is_empty) {
+                enqueued_at.remove(&identity);
+            }
+            if let Some(accepted) = accepted {
+                let micros = now
+                    .duration_since(accepted)
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64;
+                latencies.push(micros);
+            }
+        }
+        if latencies.is_empty() {
+            return;
+        }
+        if let Ok(mut stats) = self.stats.lock() {
+            for micros in latencies {
+                let bucket = INGESTION_LATENCY_BUCKET_UPPER_US
+                    .iter()
+                    .position(|upper| micros <= *upper)
+                    .unwrap_or(INGESTION_LATENCY_BUCKET_UPPER_US.len() - 1);
+                stats.enqueue_to_terminal_latency_buckets[bucket] =
+                    stats.enqueue_to_terminal_latency_buckets[bucket].saturating_add(1);
+                stats.enqueue_to_terminal_latency_samples =
+                    stats.enqueue_to_terminal_latency_samples.saturating_add(1);
+            }
+        }
+    }
+
+    fn next_scheduler_deadline(
+        sessions: &BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+    ) -> Option<tokio::time::Instant> {
+        sessions
+            .values()
+            .filter(|queue| !queue.in_flight && !queue.ready)
+            .filter_map(|queue| {
+                if queue.retry_head.is_some() {
+                    queue.retry_deadline
+                } else {
+                    queue.flush_deadline
+                }
+            })
+            .min()
+    }
+
+    async fn run_with_shutdown(mut self, shutdown: Arc<tokio::sync::Notify>) {
+        let mut sessions = BTreeMap::new();
+        let mut ready = FairSessionReadyQueue::default();
+        let mut in_flight = FuturesUnordered::<IngestionAttemptFuture>::new();
+        let mut enqueued_at = HashMap::new();
+        let mut draining = false;
+        let mut channel_drained = false;
+
+        tracing::debug!(
+            target: "astra_services::event_ingestion",
+            concurrency = self.session_flush_concurrency(),
+            "event ingestion scheduler started"
+        );
+
+        loop {
+            let now = tokio::time::Instant::now();
+            self.promote_due_sessions(&mut sessions, &mut ready, now, draining);
+            self.dispatch_ready_sessions(&mut sessions, &mut ready, &mut in_flight);
+
+            if draining
+                && channel_drained
+                && self.pending_deferrals.load(Ordering::Relaxed) == 0
+                && sessions.is_empty()
+                && ready.is_empty()
+                && in_flight.is_empty()
+            {
+                tracing::info!(
                     target: "astra_services::event_ingestion",
-                    pending_deferrals = pending,
-                    "event ingestion shutdown drain stopped with deferred sends still pending"
+                    "event ingestion scheduler drained and stopped"
                 );
                 break;
             }
 
-            pending_yields += 1;
-            tokio::task::yield_now().await;
-        }
-    }
-
-    async fn run_with_shutdown(mut self, shutdown: Arc<tokio::sync::Notify>) {
-        let mut buffer: Vec<IngestionEvent> = Vec::with_capacity(self.config.batch_size);
-        let flush_interval = tokio::time::Duration::from_secs(self.config.flush_interval_secs);
-
-        tracing::debug!(
-            target: "astra_services::event_ingestion",
-            "event ingestion worker run loop started"
-        );
-
-        loop {
-            let deadline = tokio::time::sleep(flush_interval);
+            let wake = Self::next_scheduler_deadline(&sessions)
+                .unwrap_or_else(|| now + tokio::time::Duration::from_secs(3600));
+            let deadline = tokio::time::sleep_until(wake);
             tokio::pin!(deadline);
 
             tokio::select! {
-                // audit-#7: bias toward shutdown so a busy `rx` cannot starve the drain branch.
                 biased;
-                _ = shutdown.notified() => {
-                    // Drain remaining events, including deferred `enqueue` sends
-                    // that become ready only after the first drain frees capacity.
-                    self.drain_channel_for_shutdown(&mut buffer).await;
-                    if !buffer.is_empty() {
-                        self.flush_batch_once(&mut buffer).await;
-                    }
-                    tracing::info!(
-                        target: "astra_services::event_ingestion",
-                        "event ingestion worker stopped after shutdown signal"
+                _ = shutdown.notified(), if !draining => {
+                    draining = true;
+                    self.rx.close();
+                }
+                Some(completion) = in_flight.next(), if !in_flight.is_empty() => {
+                    self.complete_scheduled_attempt(
+                        &mut sessions,
+                        &mut ready,
+                        &mut enqueued_at,
+                        completion,
+                        tokio::time::Instant::now(),
+                        draining,
                     );
-                    break;
                 }
-                Some(event) = self.rx.recv() => {
-                    self.record_event_received();
-                    buffer.push(event);
-                    if buffer.len() >= self.config.batch_size {
-                        self.flush_batch(&mut buffer).await;
+                _ = &mut deadline => {}
+                _ = self.scheduler_notify.notified() => {}
+                event = self.rx.recv(), if !channel_drained => {
+                    match event {
+                        Some(event) => {
+                            self.enqueue_scheduled_event(
+                                &mut sessions,
+                                &mut ready,
+                                {
+                                let event_enqueued_at = event
+                                    .ingestion_enqueued_at
+                                    .map(tokio::time::Instant::from_std)
+                                    .unwrap_or_else(tokio::time::Instant::now);
+                                enqueued_at
+                                    .entry((event.user_id.clone(), event.event_id.clone()))
+                                    .or_insert_with(VecDeque::new)
+                                    .push_back(event_enqueued_at);
+                                    event
+                                },
+                                tokio::time::Instant::now(),
+                                draining,
+                            )
+                        },
+                        None => {
+                            channel_drained = true;
+                            draining = true;
+                        }
                     }
                 }
-                _ = &mut deadline => {
-                    if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
-                    }
-                }
-                else => {
-                    // Channel closed — best-effort flush with no retries.
-                    if !buffer.is_empty() {
-                        self.flush_batch_once(&mut buffer).await;
-                    }
-                    tracing::info!(
-                        target: "astra_services::event_ingestion",
-                        "event ingestion worker stopped (channel closed)"
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    async fn flush_batch(&self, buffer: &mut Vec<IngestionEvent>) {
-        if buffer.is_empty() {
-            return;
-        }
-
-        let mut pending = std::mem::take(buffer);
-        let mut events_resolved = 0_usize;
-        let mut events_dropped_permanent = 0_usize;
-
-        for attempt in 0..self.config.max_retries {
-            let outcome = self.insert_batch(pending).await;
-            events_resolved = events_resolved.saturating_add(outcome.events_resolved);
-            events_dropped_permanent =
-                events_dropped_permanent.saturating_add(outcome.events_dropped_permanent);
-            pending = outcome.retry_events;
-            if pending.is_empty() {
-                self.record_flush_outcome(events_resolved, events_dropped_permanent, None);
-                return;
-            }
-            let error = outcome.retry_errors.join("; ");
-            if attempt + 1 < self.config.max_retries {
-                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
-                tracing::debug!(
-                    target: "astra_services::event_ingestion",
-                    attempt = attempt + 1,
-                    max_retries = self.config.max_retries,
-                    event_count = pending.len(),
-                    error = %error,
-                    "session-group flush retry after transient error"
-                );
-                tokio::time::sleep(delay).await;
-            } else {
-                self.record_flush_outcome(
-                    events_resolved,
-                    events_dropped_permanent,
-                    Some(format!(
-                        "batch flush failed after {} retries for unresolved session groups: {error}",
-                        self.config.max_retries
-                    )),
-                );
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    event_count = pending.len(),
-                    max_retries = self.config.max_retries,
-                    error = %error,
-                    "session-group flush failed after retries; retaining unresolved groups"
-                );
-                buffer.extend(pending);
-                return;
             }
         }
     }
@@ -1509,80 +2444,29 @@ impl EventIngestionWorker {
         }
     }
 
-    /// Single-attempt flush used during shutdown drain. Skips retries so we
-    /// don't block exit for seconds when the DB is unreachable.
-    async fn flush_batch_once(&self, buffer: &mut Vec<IngestionEvent>) {
-        if buffer.is_empty() {
-            return;
-        }
-        let batch = std::mem::take(buffer);
-        let outcome = self.insert_batch(batch).await;
-        let retry_error = (!outcome.retry_events.is_empty()).then(|| {
-            format!(
-                "shutdown flush failed with {} events unresolved: {}",
-                outcome.retry_events.len(),
-                outcome.retry_errors.join("; ")
-            )
-        });
-        self.record_flush_outcome(
-            outcome.events_resolved,
-            outcome.events_dropped_permanent,
-            retry_error,
-        );
-        if !outcome.retry_events.is_empty() {
-            tracing::warn!(
-                target: "astra_services::event_ingestion",
-                event_count = outcome.retry_events.len(),
-                "shutdown flush left session groups unresolved (single attempt)"
-            );
-        }
+    async fn insert_session_group_on_pool(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        events: &[IngestionEvent],
+        db_attempt_timeout_secs: u64,
+    ) -> Result<IngestionBatchOutcome, String> {
+        let deadline = IngestionDbDeadline::after(db_attempt_timeout_secs);
+        let mut connection = BoundedIngestionDbConnection::acquire(pool, deadline).await?;
+        let outcome = match tokio::time::timeout_at(
+            deadline.at,
+            Self::insert_session_group_on_connection(connection.connection_mut(), events),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(deadline.timeout("transaction")),
+        };
+        connection.release();
+        Ok(outcome)
     }
 
-    async fn insert_batch(&self, events: Vec<IngestionEvent>) -> IngestionBatchOutcome {
-        if events.is_empty() {
-            return IngestionBatchOutcome::default();
-        }
-
-        let mut grouped_events =
-            std::collections::BTreeMap::<(String, String), Vec<IngestionEvent>>::new();
-        for event in events {
-            grouped_events
-                .entry((event.user_id.clone(), event.session_id.clone()))
-                .or_default()
-                .push(event);
-        }
-
-        let concurrency = self.session_flush_concurrency();
-        let attempts = stream::iter(grouped_events.into_values().map(|events| async move {
-            let result = self.insert_session_group(&events).await;
-            IngestionSessionAttempt { events, result }
-        }))
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
-
-        let mut outcome = IngestionBatchOutcome::default();
-        for attempt in attempts {
-            match attempt.result {
-                Ok(session_outcome) => {
-                    outcome.events_resolved = outcome
-                        .events_resolved
-                        .saturating_add(session_outcome.events_resolved);
-                    outcome.events_dropped_permanent = outcome
-                        .events_dropped_permanent
-                        .saturating_add(session_outcome.events_dropped_permanent);
-                }
-                Err(error) => {
-                    outcome.retry_events.extend(attempt.events);
-                    outcome.retry_errors.push(error);
-                }
-            }
-        }
-        outcome
-    }
-
-    async fn insert_session_group(
-        &self,
+    async fn insert_session_group_on_connection(
+        connection: &mut sqlx::MySqlConnection,
         events: &[IngestionEvent],
     ) -> Result<IngestionBatchOutcome, String> {
         let first = events
@@ -1597,8 +2481,7 @@ impl EventIngestionWorker {
             return Err("event_ingestion.session_group: mixed owner/session identity".to_string());
         }
 
-        let mut tx = self
-            .pool
+        let mut tx = connection
             .begin()
             .await
             .map_err(|e| format!("begin tx for {user_id}/{session_id}: {e}"))?;
@@ -1618,10 +2501,12 @@ impl EventIngestionWorker {
                 event_count = session_event_count,
                 "dropping ingestion events rejected by durable session admission"
             );
+            tx.rollback()
+                .await
+                .map_err(|error| format!("rollback durable admission rejection: {error}"))?;
             return Ok(IngestionBatchOutcome {
                 events_resolved: session_event_count,
                 events_dropped_permanent: session_event_count,
-                ..Default::default()
             });
         }
 
@@ -1836,6 +2721,34 @@ mod tests {
             parent_event_ids: vec![],
             causal_chain_id: None,
             history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
+        }
+    }
+
+    fn test_sender(
+        tx: mpsc::Sender<IngestionEvent>,
+        max_pending_deferrals: usize,
+    ) -> IngestionSender {
+        let config = IngestionConfig {
+            channel_capacity: tx
+                .max_capacity()
+                .saturating_add(max_pending_deferrals)
+                .saturating_add(2),
+            ..Default::default()
+        }
+        .normalized();
+        IngestionSender {
+            tx,
+            admission: IngestionAdmission::new(
+                &config,
+                Arc::new(Mutex::new(IngestionStats::default())),
+            ),
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals,
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -1859,6 +2772,11 @@ mod tests {
             DEFAULT_INGESTION_FLUSH_INTERVAL_SECS
         );
         assert_eq!(config.channel_capacity, DEFAULT_INGESTION_CHANNEL_CAPACITY);
+        assert_eq!(
+            config.max_resident_bytes,
+            DEFAULT_INGESTION_MAX_RESIDENT_BYTES
+        );
+        assert_eq!(config.max_event_bytes, DEFAULT_INGESTION_MAX_EVENT_BYTES);
         assert_eq!(config.max_retries, DEFAULT_INGESTION_RETRIES);
         assert_eq!(
             config.max_concurrent_session_flushes,
@@ -1884,14 +2802,27 @@ mod tests {
             batch_size: 0,
             flush_interval_secs: 0,
             channel_capacity: 0,
+            max_resident_bytes: 0,
+            max_event_bytes: 0,
+            max_owner_resident_events: 0,
+            max_owner_resident_bytes: 0,
+            max_session_resident_events: 0,
+            max_session_resident_bytes: 0,
             max_retries: 0,
             max_concurrent_session_flushes: 0,
+            db_attempt_timeout_secs: 0,
             ..Default::default()
         }
         .normalized();
         assert_eq!(zero.batch_size, MIN_INGESTION_BATCH_SIZE);
         assert_eq!(zero.flush_interval_secs, MIN_INGESTION_FLUSH_INTERVAL_SECS);
         assert_eq!(zero.channel_capacity, MIN_INGESTION_CHANNEL_CAPACITY);
+        assert_eq!(zero.max_resident_bytes, MIN_INGESTION_RESIDENT_BYTES);
+        assert_eq!(zero.max_event_bytes, MIN_INGESTION_EVENT_BYTES);
+        assert_eq!(zero.max_owner_resident_events, 1);
+        assert_eq!(zero.max_session_resident_events, 1);
+        assert_eq!(zero.max_owner_resident_bytes, 2 * MIN_INGESTION_EVENT_BYTES);
+        assert_eq!(zero.max_session_resident_bytes, MIN_INGESTION_EVENT_BYTES);
         assert_eq!(zero.max_retries, MIN_INGESTION_RETRIES);
         assert_eq!(
             zero.max_concurrent_session_flushes,
@@ -1902,18 +2833,339 @@ mod tests {
             batch_size: usize::MAX,
             flush_interval_secs: u64::MAX,
             channel_capacity: usize::MAX,
+            max_resident_bytes: u64::MAX,
+            max_event_bytes: u64::MAX,
+            max_owner_resident_events: usize::MAX,
+            max_owner_resident_bytes: u64::MAX,
+            max_session_resident_events: usize::MAX,
+            max_session_resident_bytes: u64::MAX,
             max_retries: u32::MAX,
             max_concurrent_session_flushes: usize::MAX,
+            db_attempt_timeout_secs: u64::MAX,
             ..Default::default()
         }
         .normalized();
         assert_eq!(huge.batch_size, MAX_INGESTION_BATCH_SIZE);
         assert_eq!(huge.flush_interval_secs, MAX_INGESTION_FLUSH_INTERVAL_SECS);
         assert_eq!(huge.channel_capacity, MAX_INGESTION_CHANNEL_CAPACITY);
+        assert_eq!(huge.max_resident_bytes, MAX_INGESTION_RESIDENT_BYTES);
+        assert_eq!(huge.max_event_bytes, MAX_INGESTION_EVENT_BYTES);
+        assert_eq!(
+            huge.max_owner_resident_events,
+            MAX_INGESTION_CHANNEL_CAPACITY - 1
+        );
+        assert_eq!(
+            huge.max_session_resident_events,
+            MAX_INGESTION_CHANNEL_CAPACITY - 2
+        );
         assert_eq!(huge.max_retries, MAX_INGESTION_RETRIES);
         assert_eq!(
             huge.max_concurrent_session_flushes,
             MAX_INGESTION_SESSION_CONCURRENCY
+        );
+        assert_eq!(
+            huge.db_attempt_timeout_secs,
+            MAX_INGESTION_DB_ATTEMPT_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn admission_enforces_global_serialized_byte_budget_and_raii_release() {
+        let config = IngestionConfig {
+            channel_capacity: 10,
+            max_resident_bytes: MIN_INGESTION_RESIDENT_BYTES,
+            max_event_bytes: MIN_INGESTION_EVENT_BYTES,
+            max_owner_resident_events: 9,
+            max_owner_resident_bytes: 2 * MIN_INGESTION_EVENT_BYTES,
+            max_session_resident_events: 8,
+            max_session_resident_bytes: MIN_INGESTION_EVENT_BYTES,
+            ..Default::default()
+        }
+        .normalized();
+        let stats = Arc::new(Mutex::new(IngestionStats::default()));
+        let admission = IngestionAdmission::new(&config, Arc::clone(&stats));
+        let mut template = test_event("event", "session", "turn");
+        template.content = Some("x".repeat(400));
+        let bytes = astra_core::history_work::serialized_bytes(&template).expect("event size");
+        assert!(bytes <= config.max_event_bytes);
+        let accepted = (config.max_resident_bytes / bytes) as usize;
+        assert!(accepted < config.channel_capacity);
+
+        let mut leases = Vec::new();
+        for index in 0..accepted {
+            let mut event = template.clone();
+            event.user_id = format!("owner-{index}");
+            event.session_id = format!("session-{index}");
+            leases.push(
+                admission
+                    .try_acquire(&event, bytes, IngestionEventPriority::Critical)
+                    .expect("event within global byte budget"),
+            );
+        }
+        let mut rejected = template;
+        rejected.user_id = "next-owner".to_string();
+        rejected.session_id = "next-session".to_string();
+        assert!(matches!(
+            admission.try_acquire(&rejected, bytes, IngestionEventPriority::Critical),
+            Err(IngestionAdmissionRejection::GlobalPressure)
+        ));
+        {
+            let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+            assert_eq!(stats.resident_events_current, accepted as u64);
+            assert_eq!(stats.resident_bytes_current, bytes * accepted as u64);
+            assert_eq!(stats.resident_bytes_peak, stats.resident_bytes_current);
+        }
+        drop(leases);
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.resident_bytes_current, 0);
+    }
+
+    #[test]
+    fn session_and_owner_admission_leave_global_headroom_for_another_owner() {
+        let config = IngestionConfig {
+            channel_capacity: 4,
+            max_owner_resident_events: 3,
+            max_session_resident_events: 2,
+            ..Default::default()
+        }
+        .normalized();
+        let admission =
+            IngestionAdmission::new(&config, Arc::new(Mutex::new(IngestionStats::default())));
+        let event = test_event("a-1", "blocked", "turn");
+        let bytes = astra_core::history_work::serialized_bytes(&event).expect("event size");
+        let first = admission
+            .try_acquire(&event, bytes, IngestionEventPriority::Critical)
+            .expect("first blocked-session event");
+        let second = admission
+            .try_acquire(&event, bytes, IngestionEventPriority::Critical)
+            .expect("second blocked-session event");
+        assert!(matches!(
+            admission.try_acquire(&event, bytes, IngestionEventPriority::Critical),
+            Err(IngestionAdmissionRejection::SessionPressure)
+        ));
+
+        let mut same_owner = test_event("a-3", "other-session", "turn");
+        same_owner.user_id = event.user_id.clone();
+        let same_owner_bytes =
+            astra_core::history_work::serialized_bytes(&same_owner).expect("event size");
+        let third = admission
+            .try_acquire(
+                &same_owner,
+                same_owner_bytes,
+                IngestionEventPriority::Critical,
+            )
+            .expect("owner headroom for another session");
+        assert!(matches!(
+            admission.try_acquire(
+                &same_owner,
+                same_owner_bytes,
+                IngestionEventPriority::Critical,
+            ),
+            Err(IngestionAdmissionRejection::OwnerPressure)
+        ));
+
+        let mut other_owner = test_event("b-1", "healthy", "turn");
+        other_owner.user_id = "other-owner".to_string();
+        let other_bytes =
+            astra_core::history_work::serialized_bytes(&other_owner).expect("event size");
+        let other = admission
+            .try_acquire(&other_owner, other_bytes, IngestionEventPriority::Critical)
+            .expect("global headroom remains for another owner");
+        drop((first, second, third, other));
+    }
+
+    #[tokio::test]
+    async fn async_admission_waits_for_saturated_session_without_blocking_other_owner() {
+        let config = IngestionConfig {
+            channel_capacity: 3,
+            max_owner_resident_events: 2,
+            max_session_resident_events: 1,
+            ..Default::default()
+        }
+        .normalized();
+        let admission =
+            IngestionAdmission::new(&config, Arc::new(Mutex::new(IngestionStats::default())));
+        let event = test_event("blocked-1", "blocked", "turn");
+        let bytes = astra_core::history_work::serialized_bytes(&event).expect("event size");
+        let held = admission
+            .try_acquire(&event, bytes, IngestionEventPriority::Critical)
+            .expect("initial session lease");
+        let waiting_admission = Arc::clone(&admission);
+        let waiting_event = test_event("blocked-2", "blocked", "turn");
+        let waiter = tokio::spawn(async move {
+            waiting_admission
+                .acquire(&waiting_event, bytes, IngestionEventPriority::Critical)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "saturated session must wait");
+
+        let mut healthy = test_event("healthy-1", "healthy", "turn");
+        healthy.user_id = "other-owner".to_string();
+        let healthy_bytes =
+            astra_core::history_work::serialized_bytes(&healthy).expect("event size");
+        let healthy_lease = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            admission.acquire(&healthy, healthy_bytes, IngestionEventPriority::Critical),
+        )
+        .await
+        .expect("another owner must not be blocked")
+        .expect("healthy owner admission");
+        drop(held);
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiting session should wake after release")
+            .expect("waiter task")
+            .expect("waiter admission");
+        drop((healthy_lease, waited));
+    }
+
+    #[tokio::test]
+    async fn shared_db_limiter_caps_attempts_across_clones() {
+        let limiter = IngestionDbLimiter::new(1);
+        let first = limiter.acquire().await.expect("first permit");
+        let second_limiter = limiter.clone();
+        let second = tokio::spawn(async move { second_limiter.acquire().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "a second worker attempt must wait for the shared permit"
+        );
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second attempt should wake")
+            .expect("second attempt task")
+            .expect("second permit");
+        drop(second);
+    }
+
+    #[test]
+    fn fair_ready_queue_rotates_owners_before_an_owners_next_session() {
+        let key = |user: &str, session: &str| IngestionSessionKey {
+            user_id: user.to_string(),
+            session_id: session.to_string(),
+        };
+        let mut ready = FairSessionReadyQueue::default();
+        ready.push(key("owner-a", "session-1"));
+        ready.push(key("owner-a", "session-2"));
+        ready.push(key("owner-b", "session-1"));
+        ready.push(key("owner-a", "session-1"));
+
+        assert_eq!(ready.pop(), Some(key("owner-a", "session-1")));
+        assert_eq!(ready.pop(), Some(key("owner-b", "session-1")));
+        assert_eq!(ready.pop(), Some(key("owner-a", "session-2")));
+        assert!(ready.pop().is_none());
+    }
+
+    #[test]
+    fn fair_ready_queue_gives_100_owners_a_turn_before_second_sessions() {
+        let mut ready = FairSessionReadyQueue::default();
+        for owner in 0..100 {
+            for session in 0..10 {
+                ready.push(IngestionSessionKey {
+                    user_id: format!("owner-{owner:03}"),
+                    session_id: format!("session-{session:02}"),
+                });
+            }
+        }
+        let first_round = (0..100)
+            .map(|_| ready.pop().expect("one grant per owner").user_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(first_round.len(), 100);
+
+        let mut grants = HashMap::<String, usize>::new();
+        for turn in 0..500 {
+            let key = ready.pop().expect("remaining fair work");
+            *grants.entry(key.user_id.clone()).or_default() += 1;
+            if key.user_id == "owner-000" {
+                ready.push(IngestionSessionKey {
+                    user_id: key.user_id,
+                    session_id: format!("hot-replenished-{turn}"),
+                });
+            }
+        }
+        let min = grants.values().copied().min().expect("minimum grants");
+        let max = grants.values().copied().max().expect("maximum grants");
+        assert!(
+            max - min <= 1,
+            "a replenished hot owner must not outrun peers: min={min}, max={max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_flush_deadline_is_absolute_under_continuous_arrivals() {
+        let (_tx, rx) = mpsc::channel(1);
+        let worker = EventIngestionWorker {
+            rx,
+            pool: dummy_pool(),
+            config: IngestionConfig {
+                batch_size: 100,
+                flush_interval_secs: 10,
+                ..Default::default()
+            }
+            .normalized(),
+            stats: Arc::new(std::sync::Mutex::new(IngestionStats::default())),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
+            db_limiter: IngestionDbLimiter::new(1),
+        };
+        let mut sessions = BTreeMap::new();
+        let mut ready = FairSessionReadyQueue::default();
+        let first_arrival = tokio::time::Instant::now();
+        worker.enqueue_scheduled_event(
+            &mut sessions,
+            &mut ready,
+            test_event("first", "session", "turn"),
+            first_arrival,
+            false,
+        );
+        let key = IngestionSessionKey {
+            user_id: "test-user".to_string(),
+            session_id: "session".to_string(),
+        };
+        let first_deadline = sessions[&key].flush_deadline;
+        worker.enqueue_scheduled_event(
+            &mut sessions,
+            &mut ready,
+            test_event("second", "session", "turn"),
+            first_arrival + tokio::time::Duration::from_secs(9),
+            false,
+        );
+        assert_eq!(sessions[&key].flush_deadline, first_deadline);
+        assert!(ready.is_empty());
+        worker.promote_due_sessions(
+            &mut sessions,
+            &mut ready,
+            first_deadline.expect("first deadline"),
+            false,
+        );
+        assert_eq!(ready.pop(), Some(key));
+    }
+
+    #[test]
+    fn retry_backoff_deadline_masks_expired_tail_flush_deadline() {
+        let now = tokio::time::Instant::now();
+        let retry_deadline = now + tokio::time::Duration::from_secs(30);
+        let key = IngestionSessionKey {
+            user_id: "owner".to_string(),
+            session_id: "session".to_string(),
+        };
+        let sessions = BTreeMap::from([(
+            key,
+            IngestionSessionQueue {
+                pending: VecDeque::from([test_event("tail", "session", "turn")]),
+                retry_head: Some(vec![test_event("retry", "session", "turn")]),
+                flush_deadline: Some(now - tokio::time::Duration::from_secs(1)),
+                retry_deadline: Some(retry_deadline),
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            EventIngestionWorker::next_scheduler_deadline(&sessions),
+            Some(retry_deadline),
+            "an expired tail deadline must not spin the scheduler or starve intake during retry backoff"
         );
     }
 
@@ -2131,28 +3383,67 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_without_worker_does_not_panic() {
         let (tx, _rx) = mpsc::channel(10);
+        let sender = test_sender(tx, 10);
+        sender.enqueue(test_event("e1", "s1", "test"));
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_oversized_before_acceptance_and_tracks_raii_residency() {
+        let config = IngestionConfig {
+            channel_capacity: 4,
+            max_resident_bytes: MIN_INGESTION_RESIDENT_BYTES,
+            max_event_bytes: MIN_INGESTION_EVENT_BYTES,
+            ..Default::default()
+        }
+        .normalized();
+        let stats = Arc::new(Mutex::new(IngestionStats::default()));
+        let admission = IngestionAdmission::new(&config, Arc::clone(&stats));
+        let (tx, mut rx) = mpsc::channel(4);
         let sender = IngestionSender {
             tx,
+            admission,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 10,
+            max_pending_deferrals: 4,
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
         };
-        sender.enqueue(test_event("e1", "s1", "test"));
+
+        let mut oversized = test_event("oversized", "session", "turn");
+        oversized.content = Some("secret payload".repeat(200));
+        sender.enqueue(oversized);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sender.dropped_before_acceptance_count(), 1);
+        assert_eq!(
+            astra_core::sync_poison::recover_mutex_lock(&stats).resident_events_current,
+            0
+        );
+
+        sender.enqueue(test_event("accepted", "session", "turn"));
+        {
+            let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+            assert_eq!(stats.resident_events_current, 1);
+            assert!(stats.resident_bytes_current > 0);
+            assert_eq!(stats.resident_events_peak, 1);
+            assert_eq!(stats.resident_bytes_peak, stats.resident_bytes_current);
+        }
+        let accepted = rx.recv().await.expect("accepted event");
+        assert_eq!(
+            astra_core::sync_poison::recover_mutex_lock(&stats).resident_events_current,
+            1,
+            "moving out of the channel must retain the lease"
+        );
+        drop(accepted);
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.resident_bytes_current, 0);
     }
 
     #[tokio::test]
     async fn sender_enqueue_defers_when_channel_full() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 1,
-        };
+        let sender = test_sender(tx, 1);
         sender.enqueue(test_event("e1", "s1", "test"));
         sender.enqueue(test_event("e2", "s1", "test"));
 
@@ -2487,14 +3778,7 @@ mod tests {
     #[tokio::test]
     async fn sender_shutdown_closes_channel() {
         let (tx, mut rx) = mpsc::channel(10);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 10,
-        };
+        let sender = test_sender(tx, 10);
         sender.enqueue(test_event("e1", "s1", "test"));
         sender.shutdown();
         // After shutdown, recv should drain the one event then return None
@@ -2879,14 +4163,7 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_async_respects_backpressure() {
         let (tx, mut rx) = mpsc::channel(3);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 3,
-        };
+        let sender = test_sender(tx, 3);
 
         for i in 0..3 {
             sender
@@ -2904,14 +4181,7 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_defers_until_capacity_is_available() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 1,
-        };
+        let sender = test_sender(tx, 1);
 
         sender.enqueue(test_event("e1", "s1", "turn"));
         sender.enqueue(test_event("e2", "s1", "turn"));
@@ -3254,14 +4524,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_count_increments_on_full_channel() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 2,
-        };
+        let sender = test_sender(tx, 2);
 
         sender.enqueue(test_event("e1", "s1", "turn"));
         sender.enqueue(test_event("e2", "s1", "turn"));
@@ -3289,14 +4552,7 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_caps_pending_deferrals() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 1,
-        };
+        let sender = test_sender(tx, 1);
 
         sender.enqueue(test_event("e1", "s1", "turn"));
         sender.enqueue(test_event("e2", "s1", "turn"));
@@ -3330,14 +4586,7 @@ mod tests {
     #[tokio::test]
     async fn sender_sheds_telemetry_before_consuming_critical_channel_reserve() {
         let (tx, mut rx) = mpsc::channel(10);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 10,
-        };
+        let sender = test_sender(tx, 10);
 
         for i in 0..9 {
             sender.enqueue(test_event(&format!("critical-{i}"), "s1", "turn"));
@@ -3362,14 +4611,7 @@ mod tests {
     #[tokio::test]
     async fn sender_reserves_deferred_backlog_for_critical_events() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender {
-            tx,
-            overflow_count: Arc::new(AtomicU64::new(0)),
-            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
-            pending_deferrals: Arc::new(AtomicUsize::new(0)),
-            max_pending_deferrals: 2,
-        };
+        let sender = test_sender(tx, 2);
 
         sender.enqueue(test_event("critical-buffered", "s1", "turn"));
         sender.enqueue(test_event("telemetry-deferred", "s1", "llm_round"));
@@ -3421,6 +4663,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_deferred_completion_wakeup_is_race_safe() {
+        let pending_deferrals = Arc::new(AtomicUsize::new(1));
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let guard = PendingDeferralGuard {
+            pending_deferrals: Arc::clone(&pending_deferrals),
+            scheduler_notify: Arc::clone(&scheduler_notify),
+        };
+
+        drop(guard);
+        assert_eq!(pending_deferrals.load(Ordering::Acquire), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            scheduler_notify.notified(),
+        )
+        .await
+        .expect("completion before scheduler wait must leave a stored wakeup");
+    }
+
+    #[tokio::test]
     async fn shutdown_handle_signal_stops_worker() {
         let (sender, shutdown, _stats, jh) =
             EventIngestionWorker::spawn(dummy_pool(), IngestionConfig::default());
@@ -3442,29 +4703,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_deferred_full_channel_sends() {
+    async fn shutdown_seals_admission_and_cancels_unaccepted_deferrals() {
         let (tx, rx) = mpsc::channel(1);
         let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
         let pending_deferrals = Arc::new(AtomicUsize::new(0));
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let config = IngestionConfig {
+            batch_size: 100,
+            channel_capacity: 4,
+            max_retries: 1,
+            ..IngestionConfig::default()
+        }
+        .normalized();
         let worker = EventIngestionWorker {
             rx,
             pool: dummy_pool(),
-            config: IngestionConfig {
-                batch_size: 100,
-                max_retries: 1,
-                ..IngestionConfig::default()
-            }
-            .normalized(),
+            config: config.clone(),
             stats: Arc::clone(&stats),
             pending_deferrals: Arc::clone(&pending_deferrals),
+            scheduler_notify: Arc::clone(&scheduler_notify),
+            db_limiter: IngestionDbLimiter::new(1),
         };
         let sender = IngestionSender {
             tx,
+            admission: IngestionAdmission::new(&config, Arc::clone(&stats)),
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals,
             max_pending_deferrals: 1,
+            scheduler_notify,
         };
 
         sender.enqueue(test_event("e1", "s1", "turn"));
@@ -3481,10 +4749,11 @@ mod tests {
 
         let s = astra_core::sync_poison::recover_mutex_lock(&stats);
         assert_eq!(
-            s.events_received, 2,
-            "shutdown drain must include deferred sends that become ready after capacity is freed"
+            s.events_received, 1,
+            "only the event already accepted by the channel belongs to the drain"
         );
         assert_eq!(sender.pending_deferral_count(), 0);
+        assert_eq!(sender.dropped_before_acceptance_count(), 1);
     }
 
     #[tokio::test]
@@ -3508,7 +4777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_flush_retains_batch_for_next_retry_cycle() {
+    async fn failed_session_attempt_retains_exact_retry_head_ahead_of_tail() {
         let (_tx, rx) = mpsc::channel(1);
         let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
         let worker = EventIngestionWorker {
@@ -3521,26 +4790,53 @@ mod tests {
             .normalized(),
             stats: Arc::clone(&stats),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
+            db_limiter: IngestionDbLimiter::new(1),
         };
-        let mut buffer = vec![
+        let events = vec![
             test_event("failed-e1", "s1", "turn"),
             test_event("failed-e2", "s1", "turn"),
         ];
-
-        worker.flush_batch(&mut buffer).await;
-
-        assert_eq!(
-            buffer.len(),
-            2,
-            "normal flush failures must keep the batch in memory for a later retry"
+        let key = IngestionSessionKey::from_event(&events[0]);
+        let mut sessions = BTreeMap::from([(
+            key.clone(),
+            IngestionSessionQueue {
+                pending: VecDeque::from([test_event("tail-e3", "s1", "turn")]),
+                in_flight: true,
+                ..Default::default()
+            },
+        )]);
+        let mut ready = FairSessionReadyQueue::default();
+        let mut enqueued_at = HashMap::new();
+        worker.complete_scheduled_attempt(
+            &mut sessions,
+            &mut ready,
+            &mut enqueued_at,
+            IngestionAttemptCompletion {
+                key: key.clone(),
+                events,
+                result: Err("transient failure".to_string()),
+            },
+            tokio::time::Instant::now(),
+            false,
         );
+        let queue = sessions.get(&key).expect("failed session queue retained");
+        assert_eq!(
+            queue.retry_head.as_ref().map(Vec::len),
+            Some(2),
+            "the exact failed head must be retained"
+        );
+        assert_eq!(
+            queue.pending.len(),
+            1,
+            "later accepted events must remain behind the retry head"
+        );
+        assert!(queue.retry_deadline.is_some());
+        assert!(ready.is_empty());
         let s = astra_core::sync_poison::recover_mutex_lock(&stats);
-        assert_eq!(s.errors, 1);
-        assert!(
-            s.last_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("batch flush failed after 1 retries")
+        assert_eq!(
+            s.errors, 1,
+            "max_retries=1 exhausts the first retry burst and records one scheduler error"
         );
     }
 
@@ -3568,9 +4864,9 @@ mod tests {
             s.events_received, 5,
             "all 5 events should be counted (recv + drain)"
         );
-        assert_eq!(
-            s.errors, 1,
-            "shutdown uses a single flush attempt after draining"
+        assert!(
+            s.errors >= 1,
+            "shutdown reports every failed session attempt"
         );
         assert_eq!(
             s.flush_count, 0,

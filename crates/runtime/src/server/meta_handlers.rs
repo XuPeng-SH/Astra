@@ -50,6 +50,50 @@ fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics
         "astra_event_ingestion_config_max_retries",
         "Configured event ingestion max retries for this runtime process.",
     );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_resident_bytes",
+        "Configured global serialized-byte admission budget for event ingestion.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_event_bytes",
+        "Configured maximum serialized size of one ingestion event.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_concurrent_session_flushes",
+        "Configured per-worker ceiling for concurrent session flush attempts.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_db_attempt_timeout_secs",
+        "Configured whole-attempt ingestion database deadline in seconds.",
+    );
+    for (name, help) in [
+        (
+            "astra_event_ingestion_resident_events",
+            "Accepted ingestion events currently retained across all process-local states.",
+        ),
+        (
+            "astra_event_ingestion_resident_events_peak",
+            "Process peak of accepted ingestion events retained concurrently.",
+        ),
+        (
+            "astra_event_ingestion_resident_bytes",
+            "Serialized bytes currently retained by accepted ingestion events.",
+        ),
+        (
+            "astra_event_ingestion_resident_bytes_peak",
+            "Process peak serialized bytes retained by accepted ingestion events.",
+        ),
+        (
+            "astra_event_ingestion_db_attempts",
+            "Ingestion database attempts currently active.",
+        ),
+        (
+            "astra_event_ingestion_db_attempts_peak",
+            "Process peak concurrent ingestion database attempts.",
+        ),
+    ] {
+        registry.register_gauge(name, help);
+    }
     registry.register_counter(
         "astra_event_ingestion_events_received_total",
         "Events accepted by the event ingestion worker.",
@@ -61,6 +105,14 @@ fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics
     registry.register_counter(
         "astra_event_ingestion_events_dropped_permanent_total",
         "Events permanently dropped by the ingestion worker after acceptance.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_abandoned_shutdown_total",
+        "Accepted events explicitly abandoned by a failed graceful shutdown flush.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_unresolved_shutdown_total",
+        "Accepted events whose durable outcome is unknown after shutdown.",
     );
     registry.register_counter(
         "astra_event_ingestion_flushes_total",
@@ -112,6 +164,26 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
         &[],
         config.max_retries as f64,
     );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_resident_bytes",
+        &[],
+        config.max_resident_bytes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_event_bytes",
+        &[],
+        config.max_event_bytes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_concurrent_session_flushes",
+        &[],
+        config.max_concurrent_session_flushes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_db_attempt_timeout_secs",
+        &[],
+        config.db_attempt_timeout_secs as f64,
+    );
     registry.set_counter_absolute(
         "astra_event_ingestion_enqueue_overflows_total",
         &[],
@@ -152,11 +224,49 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
         stats.events_dropped_permanent,
     );
     registry.set_counter_absolute(
+        "astra_event_ingestion_events_abandoned_shutdown_total",
+        &[],
+        stats.events_abandoned_shutdown,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_unresolved_shutdown_total",
+        &[],
+        stats.events_unresolved_shutdown,
+    );
+    registry.set_counter_absolute(
         "astra_event_ingestion_flushes_total",
         &[],
         stats.flush_count,
     );
     registry.set_counter_absolute("astra_event_ingestion_errors_total", &[], stats.errors);
+    for (name, value) in [
+        (
+            "astra_event_ingestion_resident_events",
+            stats.resident_events_current,
+        ),
+        (
+            "astra_event_ingestion_resident_events_peak",
+            stats.resident_events_peak,
+        ),
+        (
+            "astra_event_ingestion_resident_bytes",
+            stats.resident_bytes_current,
+        ),
+        (
+            "astra_event_ingestion_resident_bytes_peak",
+            stats.resident_bytes_peak,
+        ),
+        (
+            "astra_event_ingestion_db_attempts",
+            stats.db_attempts_current,
+        ),
+        (
+            "astra_event_ingestion_db_attempts_peak",
+            stats.db_attempts_peak,
+        ),
+    ] {
+        registry.set_gauge(name, &[], value as f64);
+    }
 }
 
 fn scrape_history_work_metrics(state: &AppState) {

@@ -28,6 +28,20 @@ impl CancellationSafePoolConnection {
     pub(crate) fn release(mut self) {
         drop(self.connection.take());
     }
+
+    /// Remove this checkout from pool reuse without waiting for a graceful
+    /// protocol close.
+    ///
+    /// Use this after a cancelled or timed-out MySQL exchange: the client no
+    /// longer knows whether a response is still in flight, so returning the
+    /// physical connection to the idle pool would be unsafe. `detach` restores
+    /// the pool's logical capacity; immediately dropping the detached
+    /// connection closes the socket instead of leaking a pool permit.
+    pub(crate) fn discard(mut self) {
+        if let Some(connection) = self.connection.take() {
+            drop(connection.detach());
+        }
+    }
 }
 
 impl Drop for CancellationSafePoolConnection {

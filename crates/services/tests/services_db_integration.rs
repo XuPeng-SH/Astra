@@ -6312,6 +6312,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
             history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
         })
         .await;
     shutdown.signal();

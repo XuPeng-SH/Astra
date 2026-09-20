@@ -94,6 +94,34 @@ Every capacity change reports, per workload and per pod count:
 - provider request rate, token rate, time to first token, and error rate;
 - durable event/control-plane QPS and end-to-end turn latency.
 
+### Observation-ingestion capacity
+
+Connected or active sessions must not map one-for-one to database connections
+or background tasks. Durable observation ingestion uses logical owner/session
+queues and a bounded number of database attempts. One session has at most one
+attempt in flight so retries cannot be overtaken; runnable owners rotate before
+their runnable sessions. This process-local ordering improves isolation but is
+not evidence of cluster-wide fairness.
+
+Admission covers every accepted payload state: deferred send, channel,
+scheduled tail, retry head, and in-flight transaction. The admission lease is
+bounded by both serialized bytes and event count and includes per-owner and
+per-session shares, so one blocked producer cannot consume all global
+headroom. Database-attempt permits are shared by every ingestion worker using
+the same process pool and remain held until transaction cleanup has either
+completed or discarded the physical connection. A retry timer does not own a
+database permit.
+
+A finite burst that eventually persists 1,000 single-event sessions is only a
+smoke/load baseline. A sustained-capacity claim additionally requires declared
+open-loop offered rate and duration, repeated and mixed-size payloads, hot-owner
+competition, injected transaction failures, all attempt slots blocked, and a
+foreground database workload. Report accepted, committed, rejected, and
+unresolved counts; retained event bytes; effective database concurrency;
+oldest-backlog age; owner progress; pool-acquire latency; and end-to-end
+ingestion p50/p95/p99. Multi-process or cluster claims require the same evidence
+at that deployment scope.
+
 The first implementation stage aligns local and durable admission configuration
 and records the configuration in the shared gate. The second stage keeps exact
 global and per-owner usage in the durable protocol: normal reserve and release

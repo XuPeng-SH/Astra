@@ -393,17 +393,38 @@ impl MatrixCloudRuntime {
         }
         // Await the worker join handle with a timeout.
         let handle = self.ingestion_handle.lock().ok().and_then(|mut g| g.take());
-        if let Some(jh) = handle {
-            match tokio::time::timeout(INGESTION_SHUTDOWN_TIMEOUT, jh).await {
+        if let Some(mut jh) = handle {
+            match tokio::time::timeout(INGESTION_SHUTDOWN_TIMEOUT, &mut jh).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     astra_core::agent_warn!("ingestion", "worker join failed: {e}");
                 }
                 Err(_) => {
+                    let unresolved = self
+                        .ingestion_stats
+                        .lock()
+                        .ok()
+                        .map(|stats| stats.resident_events_current)
+                        .unwrap_or(0);
                     astra_core::agent_warn!(
                         "ingestion",
-                        "worker flush timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}, some events may be lost"
+                        "worker flush timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}; {unresolved} accepted events have an unresolved durable outcome"
                     );
+                    jh.abort();
+                    if let Err(error) = jh.await
+                        && !error.is_cancelled()
+                    {
+                        astra_core::agent_warn!(
+                            "ingestion",
+                            "worker failed while aborting after shutdown timeout: {error}"
+                        );
+                    }
+                    if unresolved > 0
+                        && let Ok(mut stats) = self.ingestion_stats.lock()
+                    {
+                        stats.events_unresolved_shutdown =
+                            stats.events_unresolved_shutdown.saturating_add(unresolved);
+                    }
                 }
             }
         }
