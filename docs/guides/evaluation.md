@@ -9,6 +9,30 @@ Use an authenticated Server API connection. Both Skill revisions must belong
 to your account and support instruction-only, inline execution. Skillify can
 produce a candidate revision; Evaluation owns the comparison and its results.
 
+## Use the CLI or Web flow
+
+The CLI and Web surface are thin clients of the same control plane. They submit
+the prepare intent, start the planned trials through the canonical Run
+backbone, follow the owner-scoped projection, request durable assessment, and
+render the returned report. They do not keep a second experiment lifecycle.
+
+For the CLI, save the prepare JSON as `evaluation-intent.json` and run:
+
+```sh
+astra evaluation run evaluation-intent.json
+astra evaluation show <experiment-id>
+astra evaluation report <experiment-id>
+```
+
+The Web flow is available at `/evaluations`. It lists the authenticated user's
+published instruction-only Skills, primary model Offerings, and typed-judgment
+Offerings. Leaving Judgment Offering at `Use configured default` lets the
+server freeze the value configured for the authenticated user, including a Jev
+Offering from `.models.yaml`; choosing an Offering freezes that exact value.
+The page only displays server projections and report coverage, so an
+interrupted browser run remains durable and can be resumed through the CLI
+with the same intent; the page displays the experiment ID for that review.
+
 ## Prepare the comparison
 
 Send `POST /evaluation/experiments/prepare` with your revision and Offering IDs:
@@ -115,5 +139,6 @@ published Skill revision on both arms:
 
 Omit `judgment_model_offering_id` to use the configured judgment Offering,
 which is frozen during prepare. If no default judgment Offering is available,
-the candidate records an unavailable enhancement and keeps the basic Skill
-path; that candidate must not be interpreted as a successful Jev comparison.
+the candidate keeps the basic Skill path and the report cannot establish a Jev
+benefit; the fallback run must not be interpreted as a successful Jev
+comparison.
