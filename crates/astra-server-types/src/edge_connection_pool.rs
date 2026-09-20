@@ -241,6 +241,8 @@ pub struct EdgeWorkspaceFinalizationRequest<'a> {
     pub verifier_timeout_secs: u64,
 }
 
+pub use crate::edge_ws_protocol::EdgeWorkspacePreparationRequest;
+
 /// Result returned by a live Edge workspace management operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeWorkspaceOperationResult {
@@ -820,16 +822,14 @@ impl EdgeConnectionPool {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        connection_generation: u64,
-        workspace_key: &str,
-        source_commit: &str,
+        request: EdgeWorkspacePreparationRequest<'_>,
         timeout: Duration,
     ) -> Option<EdgeWorkspaceOperationResult> {
         self.request_workspace_operation(
             WorkspaceOperationTarget {
                 user_id,
                 edge_agent_id,
-                generation: connection_generation,
+                generation: request.connection_generation,
             },
             timeout,
             None,
@@ -837,8 +837,10 @@ impl EdgeConnectionPool {
             |request_id, connection_generation| EdgeServerMessage::WorkspacePrepare {
                 request_id,
                 connection_generation,
-                workspace_key: workspace_key.to_string(),
-                source_commit: source_commit.to_string(),
+                workspace_key: request.workspace_key.to_string(),
+                session_id: request.session_id.to_string(),
+                source_commit: request.source_commit.to_string(),
+                confinement: request.confinement.clone(),
             },
         )
         .await
@@ -1539,7 +1541,27 @@ mod tests {
         let timeout = Duration::from_secs(1);
         assert!(
             pool.prepare_evaluation_workspace(
-                "owner", "edge", expected, "trial", "commit", timeout,
+                "owner",
+                "edge",
+                EdgeWorkspacePreparationRequest {
+                    connection_generation: expected,
+                    workspace_key: "trial",
+                    session_id: "session",
+                    source_commit: "commit",
+                    confinement: &astra_runtime_env::WorkspaceConfinementContract {
+                        profile_id: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+                        toolchain_manifest: astra_runtime_env::ToolchainManifest {
+                            schema_version: 1,
+                            inputs: vec![astra_runtime_env::ToolchainInput {
+                                guest_mount_path: "/usr/bin".into(),
+                                content_digest: format!("sha256:{}", "a".repeat(64)),
+                            }],
+                            launcher_digest: format!("sha256:{}", "b".repeat(64)),
+                            supervisor_digest: format!("sha256:{}", "c".repeat(64)),
+                        },
+                    },
+                },
+                timeout,
             )
             .await
             .is_none()

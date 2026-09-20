@@ -185,6 +185,16 @@ pub enum EdgeClientMessage {
     Ping {},
 }
 
+/// Server-frozen inputs for provisioning one Evaluation allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeWorkspacePreparationRequest<'a> {
+    pub connection_generation: u64,
+    pub workspace_key: &'a str,
+    pub session_id: &'a str,
+    pub source_commit: &'a str,
+    pub confinement: &'a astra_runtime_env::WorkspaceConfinementContract,
+}
+
 /// Messages sent from server to edge agent.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -228,7 +238,9 @@ pub enum EdgeServerMessage {
         request_id: String,
         connection_generation: u64,
         workspace_key: String,
+        session_id: String,
         source_commit: String,
+        confinement: astra_runtime_env::WorkspaceConfinementContract,
     },
 
     /// Ask the Edge to prove the current source identity of a prepared clone.
@@ -623,7 +635,17 @@ mod tests {
             request_id: "workspace-request".to_string(),
             connection_generation: 4,
             workspace_key: "trial-1".to_string(),
+            session_id: "session".to_string(),
             source_commit: "a".repeat(40),
+            confinement: serde_json::from_value(serde_json::json!({
+                "profile_id": astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE,
+                "toolchain_manifest": {
+                    "schema_version": 1,
+                    "inputs": [{"guest_mount_path": "/usr/bin", "content_digest": format!("sha256:{}", "a".repeat(64))}],
+                    "launcher_digest": format!("sha256:{}", "b".repeat(64)),
+                    "supervisor_digest": format!("sha256:{}", "c".repeat(64))
+                }
+            })).unwrap(),
         };
         let decoded: EdgeServerMessage =
             serde_json::from_value(serde_json::to_value(&prepare).unwrap()).unwrap();

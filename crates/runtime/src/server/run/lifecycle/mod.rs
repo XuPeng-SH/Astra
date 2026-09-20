@@ -10462,7 +10462,12 @@ impl AgenticRunLifecycleService {
             && request.executor_binding.is_none()
         {
             evaluation_workspace_lease = self
-                .populate_evaluation_edge_binding(user_id, request, evaluation_workspace_key)
+                .populate_evaluation_edge_binding(
+                    user_id,
+                    session_id,
+                    request,
+                    evaluation_workspace_key,
+                )
                 .await?;
         }
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
@@ -11020,6 +11025,7 @@ impl AgenticRunLifecycleService {
     async fn populate_evaluation_edge_binding(
         &self,
         user_id: &str,
+        session_id: &str,
         request: &mut ChatRequestData,
         workspace_key: Option<&str>,
     ) -> Result<Option<EvaluationWorkspaceLease>, (StatusCode, Json<ErrorResponse>)> {
@@ -11209,9 +11215,13 @@ impl AgenticRunLifecycleService {
             .prepare_evaluation_workspace(
                 user_id,
                 executor_id,
-                connected.generation,
-                workspace_key,
-                &workspace_policy.source_commit,
+                astra_server_types::edge_connection_pool::EdgeWorkspacePreparationRequest {
+                    connection_generation: connected.generation,
+                    workspace_key,
+                    session_id,
+                    source_commit: &workspace_policy.source_commit,
+                    confinement: &workspace_policy.confinement,
+                },
                 std::time::Duration::from_secs(60),
             )
             .await

@@ -443,6 +443,43 @@ submission retries return the stored experiment without resolving a new capabili
 Missing confinement capability rejects new workspace preparations. Ordinary Edge
 registration makes no confinement claim; dedicated provider deployment and
 execution-receipt integration remain required before advertising this capability.
+
+The dedicated Edge entrypoint is `astra-edge --evaluation-config
+/etc/astra/evaluation.json --workspace-dir /var/lib/astra-eval/allocations/source`
+with the usual authenticated connection arguments. This mode is currently
+integration-only: it withholds the confinement advertisement until allocation,
+tool, and verifier receipts are admitted and persisted end to end. Ordinary
+Edge execution remains a separate provider mode and cannot be selected as a
+fallback from a dedicated allocation.
+
+Its first supported deployment is Linux x86-64 with an exclusive non-root
+service UID, no supplementary groups or capabilities, and a root-owned,
+read-only SquashFS service root. The private writable allocation root has mode
+0700 beneath root-controlled ancestors; its only child mount is the root-owned,
+read-only SquashFS source checkout. Toolchain trees must be flattened (no
+symlinks or special files), immutable, and match the frozen content manifest.
+The service also needs real procfs, `/dev/null`, private writable `/tmp`, and a
+writable Edge state/journal directory outside trial mounts. Host temporary
+coordination retains its existing root-owned sticky-directory requirements.
+Configuration and manifest live in `/etc/astra` in the service image. Startup
+checks the actual mounted inputs and launcher/supervisor digests, then requires
+a real confined launch with verified setup and authoritative process settlement.
+Host administration, image production, kernel, and exclusive service-UID
+provisioning are trusted deployment responsibilities.
+
+Configuration is strict JSON with `schema_version: 1`, `deployment_id`,
+`expected_uid`, `allocation_root`, `toolchain_manifest_path`,
+`toolchain_manifest_sha256`, and
+`dedicated_service_assumption: "exclusive_uid_trusted_host_v1"`.
+The manifest contains the shared `WorkspaceConfinementContract`; its file digest
+covers the exact JSON bytes. The provider owns the versioned tree-content hash
+encoding. Dedicated allocations retain directory identity and one canonical tool
+executor across reconnects, bound to the authenticated owner and frozen
+Session/Run. Explicit never-started tool refusals allow corrected requests;
+started invocations without authoritative settlement quarantine the allocation.
+Unknown paths after process restart remain quarantined rather than being
+adopted from their name. Deployment-level qualification is still required.
+
 The canonical Session binding still resolves the owner's active registration;
 it rejects owner mismatch, an unavailable registration, a missing
 materialization/root, or root/materialization drift before execution. The Edge
@@ -467,11 +504,12 @@ canonical tool-dispatch channel throughout execution. An independently running
 User Runner retains its own lifecycle; the TUI may disconnect and reconnect
 through the existing observation APIs.
 
-The current Linux workspace adapter has not yet demonstrated this full isolation
-contract. Its mount wrapper retains readable host files, namespace isolation does
-not block pathname Unix sockets exposed through mounted directories. Managed
-native file operations now reject host temporary paths, but shell integration
-and persisted proof of the complete confinement profile remain pending. A
+The ordinary Linux managed-workspace wrapper does not satisfy this full isolation
+contract: it retains readable host files, and namespace isolation alone does
+not block pathname Unix sockets exposed through mounted directories. The dedicated
+mode now selects the restricted-root shell and retained native file authority,
+but persisted proof of the complete confinement profile and deployment acceptance
+remain pending; its Evaluation capability is consequently withheld. A
 successful namespace probe or read-only root mount is therefore insufficient
 evidence of confidentiality or external-side-effect isolation. The coding E2E
 must prove these boundaries before this adapter can be considered complete.
@@ -505,8 +543,10 @@ receipt set; cleanup may remove only the instance whose ownership the
 materializer can prove. Edge disconnect does not authorize Server-local
 fallback.
 
-The adapter admits real Edge file/shell calls through the canonical tool
-dispatch path and records the source checkout as a receipt. Coding assessment
+The adapter's execution machinery routes Edge file/shell calls through canonical
+tool dispatch and records the source checkout as a receipt. New workspace trials
+remain unavailable until a qualified provider advertises the required capability.
+Coding assessment
 now captures a durable final patch and runs the frozen verifier against a clean
 materialization of that patch; it never infers test success from tool names or final
 text. Acceptance still requires an end-to-end Edge client run across the public

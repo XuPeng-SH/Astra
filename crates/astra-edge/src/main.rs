@@ -9,6 +9,8 @@
 //! astra-edge --server-url https://astra.example.com --workspace-dir ~/projects/my-app
 //! ```
 
+mod evaluation_allocation;
+mod evaluation_provider;
 mod invocation_journal;
 mod runtime_process_authorization;
 mod token_manager;
@@ -98,6 +100,10 @@ struct Args {
     #[arg(long, env = "ASTRA_EDGE_ID")]
     edge_id: Option<String>,
 
+    /// Dedicated evaluation provider configuration; startup failure never falls back.
+    #[arg(long)]
+    evaluation_config: Option<PathBuf>,
+
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
@@ -117,6 +123,8 @@ struct EdgeConfig {
     materialization_id: String,
     reconnect: bool,
     invocation_journal_root: Option<PathBuf>,
+    evaluation_config: Option<PathBuf>,
+    evaluation: Option<Arc<Mutex<evaluation_allocation::Allocations>>>,
 }
 
 #[derive(Debug)]
@@ -485,6 +493,8 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         materialization_id,
         reconnect: args.reconnect,
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
+        evaluation_config: args.evaluation_config,
+        evaluation: None,
     })
 }
 
@@ -542,6 +552,29 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
     advertisement
+}
+
+const EVALUATION_TOOLS: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "delete_file",
+    "str_replace",
+    "multi_edit",
+];
+
+fn dedicated_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
+    let mut value = edge_runtime_environment_capabilities(edge_id, workspace);
+    value["protocol_capabilities"] = serde_json::json!({});
+    if let Some(names) = value["binding"]["tool_surface"]["tool_names"].as_array_mut() {
+        names.retain(|name| {
+            name.as_str()
+                .is_some_and(|name| EVALUATION_TOOLS.contains(&name))
+        });
+    }
+    // Do not set workspace_confinement until runtime admission and durable
+    // materialization/tool/finalization receipts consume the complete evidence.
+    value
 }
 
 fn workspace_source_identity(workspace: &Path) -> Option<WorkspaceSourceIdentity> {
@@ -1256,6 +1289,7 @@ struct EvaluationWorkspaceFinalization {
     namespace_active: bool,
     scope_settled: bool,
     timed_out: bool,
+    error: Option<String>,
 }
 
 fn copy_evaluation_snapshot(
@@ -1388,6 +1422,140 @@ fn copy_evaluation_snapshot(
     copy_dir(source, source, destination, &mut 0, &mut 0, cancel, 0)
 }
 
+// Dedicated dispatch cannot reach runtime process authorization or an ordinary shell.
+struct EvaluationToolCall<'a> {
+    identity: &'a astra_turn_types::ToolInvocationIdentity,
+    tool: &'a str,
+    args: &'a Value,
+    process_authorization: bool,
+}
+
+async fn execute_evaluation_tool(
+    allocations: Arc<Mutex<evaluation_allocation::Allocations>>,
+    path: Option<&Path>,
+    call: EvaluationToolCall<'_>,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> astra_tools::ToolResult {
+    let EvaluationToolCall {
+        identity,
+        tool,
+        args,
+        process_authorization,
+    } = call;
+    let mut allocations = tokio::select! {
+        guard = allocations.lock() => guard,
+        _ = cancel.cancelled() => return astra_tools::ToolResult::error("allocation admission cancelled".into()),
+    };
+    let admission = (|| {
+        let path = path.ok_or("dedicated tools require an allocated workspace")?;
+        let executor = allocations.executor(path, identity)?;
+        if process_authorization || !EVALUATION_TOOLS.contains(&tool) {
+            return Err(
+                "tool or runtime process authorization is unsupported by dedicated evaluation"
+                    .into(),
+            );
+        }
+        Ok::<_, String>((path, executor))
+    })();
+    let (path, executor) = match admission {
+        Ok(path) => path,
+        Err(error) => return astra_tools::ToolResult::error(error),
+    };
+    // Pessimistic before awaiting: panic/drop leaves the allocation quarantined.
+    allocations.mark_unsettled(path);
+    let execution =
+        astra_tools::ToolExecutor::execute_with_cancel(executor.as_ref(), tool, args, Some(cancel));
+    tokio::pin!(execution);
+    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut execution).await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            cancel.cancel();
+            execution.await
+        }
+    };
+    let settled = tool != "bash"
+        || result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("shell_confinement"))
+            .and_then(|value| {
+                serde_json::from_value::<astra_runtime_env::ShellExecutionEvidence>(value.clone())
+                    .ok()
+            })
+            .is_some_and(|receipt| allocation_reusable_after_shell(&receipt));
+    if settled {
+        allocations.mark_settled(path);
+    }
+    result
+}
+
+fn allocation_reusable_after_shell(receipt: &astra_runtime_env::ShellExecutionEvidence) -> bool {
+    receipt.schema_version == 1
+        && receipt.profile == astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE
+        && (!receipt.execution_started || authoritative_shell_settlement(receipt))
+}
+
+fn authoritative_shell_settlement(receipt: &astra_runtime_env::ShellExecutionEvidence) -> bool {
+    receipt.settlement.scope_settled
+        && matches!(
+            receipt.settlement.ownership,
+            Some(
+                astra_runtime_env::ShellScopeOwnership::InvocationSupervisor
+                    | astra_runtime_env::ShellScopeOwnership::InvocationCgroup
+            )
+        )
+}
+
+async fn execute_evaluation_verifier(
+    boundary: &astra_sandbox::ShellProcessBoundary,
+    command: &str,
+    limits: &astra_sandbox::IsolationConfig,
+    cancel: &CancellationToken,
+) -> Result<(astra_sandbox::IsolatedOutput, Option<String>), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let plan = boundary
+            .launch_plan_with_protected_paths(
+                &boundary.workspace,
+                "/usr/bin/bash",
+                &[
+                    "--noprofile".into(),
+                    "--norc".into(),
+                    "-c".into(),
+                    command.into(),
+                ],
+                &[boundary.workspace.join(".git")],
+            )
+            .map_err(|error| format!("verifier confinement preparation failed: {error}"))?;
+        let output = astra_sandbox::execute_confined_with_cancel(plan, limits, Some(cancel)).await;
+        let receipt = output.execution_evidence();
+        let error = if !matches!(
+            receipt.setup,
+            astra_runtime_env::ShellSetupEvidence::Verified { .. }
+        ) || !authoritative_shell_settlement(&receipt)
+        {
+            Some(format!(
+                "verifier confinement incomplete: {}",
+                serde_json::to_string(&receipt).map_err(|e| e.to_string())?
+            ))
+        } else {
+            None
+        };
+        let mut process = output.process;
+        if error.is_some() {
+            process.exit_code = None;
+        }
+        Ok((process, error))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (boundary, command, limits, cancel);
+        Err("dedicated verifier requires Linux".into())
+    }
+}
+
 async fn finalize_evaluation_workspace(
     base_workspace: &Path,
     requested_workspace: &Path,
@@ -1395,6 +1563,7 @@ async fn finalize_evaluation_workspace(
     verifier_command: &str,
     verifier_timeout_secs: u64,
     cancel: CancellationToken,
+    boundary: Option<astra_sandbox::ShellProcessBoundary>,
 ) -> Result<EvaluationWorkspaceFinalization, String> {
     if verifier_command.trim().is_empty()
         || verifier_command.len() > 4_096
@@ -1414,10 +1583,15 @@ async fn finalize_evaluation_workspace(
 
     let base_workspace = base_workspace.to_path_buf();
     let requested_workspace = requested_workspace.to_path_buf();
+    let retained_allocation = boundary.is_some();
     let frozen_source_commit = frozen_source_commit.to_string();
     let prepare_cancel = cancel.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        let workspace = validate_workspace_override(&base_workspace, &requested_workspace)?;
+        let workspace = if retained_allocation {
+            requested_workspace
+        } else {
+            validate_workspace_override(&base_workspace, &requested_workspace)?
+        };
         let source = workspace_source_identity(&workspace)
             .ok_or_else(|| "workspace source identity is unavailable".to_string())?;
         if source.commit != frozen_source_commit {
@@ -1549,6 +1723,7 @@ async fn finalize_evaluation_workspace(
     .await
     .map_err(|error| format!("evaluation replay preparation task failed: {error}"))??;
 
+    let dedicated = boundary.is_some();
     let mut preserve_unsettled_workspace = false;
     let result = async {
         let mut config = astra_sandbox::IsolationConfig::strict(prepared.verification.clone());
@@ -1567,13 +1742,37 @@ async fn finalize_evaluation_workspace(
             ),
             ("TZ".to_string(), "UTC".to_string()),
         ]);
-        let output = astra_sandbox::execute_isolated_with_cancel_supervised(
-            verifier_command,
-            &environment,
-            &config,
-            Some(&cancel),
-        )
-        .await;
+        let (output, evidence_error) = if let Some(mut boundary) = boundary {
+            boundary.workspace = prepared.verification.clone();
+            match execute_evaluation_verifier(&boundary, verifier_command, &config, &cancel).await {
+                Ok(output) => output,
+                Err(error) => {
+                    preserve_unsettled_workspace = true;
+                    return Ok(EvaluationWorkspaceFinalization {
+                        workspace_dir: prepared.workspace_dir.clone(), source_commit: prepared.source.commit.clone(),
+                        source_tree: prepared.source.tree.clone(), base_revision: prepared.base_revision.clone(),
+                        result_revision: prepared.result_revision.clone(), patch: prepared.patch.clone(),
+                        verifier_exit_code: None, verifier_output: String::new(),
+                        namespace_active: false, scope_settled: false, timed_out: false, error: Some(error),
+                    });
+                }
+            }
+        } else {
+            (astra_sandbox::execute_isolated_with_cancel_supervised(
+                verifier_command, &environment, &config, Some(&cancel),
+            ).await, None)
+        };
+        if let Some(error) = evidence_error {
+            preserve_unsettled_workspace = output.execution_started;
+            return Ok(EvaluationWorkspaceFinalization {
+                workspace_dir: prepared.workspace_dir.clone(), source_commit: prepared.source.commit.clone(),
+                source_tree: prepared.source.tree.clone(), base_revision: prepared.base_revision.clone(),
+                result_revision: prepared.result_revision.clone(), patch: prepared.patch.clone(),
+                verifier_exit_code: None, verifier_output: output.combined_output(),
+                namespace_active: output.namespace_active, scope_settled: output.scope_settled,
+                timed_out: output.timed_out, error: Some(error),
+            });
+        }
         if !output.scope_settled {
             preserve_unsettled_workspace = output.execution_started;
             return Err(format!(
@@ -1590,7 +1789,7 @@ async fn finalize_evaluation_workspace(
         let verification = prepared.verification.clone();
         let result_tree = prepared.result_tree.clone();
         let verify_cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
+        let verification_result = tokio::task::spawn_blocking(move || {
             let added = git_command_with_cancel(
                 &verification,
                 &["add", "--all", "--force", "--"],
@@ -1612,7 +1811,10 @@ async fn finalize_evaluation_workspace(
             Ok::<_, String>(())
         })
         .await
-        .map_err(|error| format!("post-verifier observation task failed: {error}"))??;
+        .map_err(|error| format!("post-verifier observation task failed: {error}"))
+        .and_then(|result| result);
+        if !dedicated { verification_result.as_ref().map_err(Clone::clone)?; }
+        if verification_result.is_err() { preserve_unsettled_workspace = true; }
         Ok(EvaluationWorkspaceFinalization {
             workspace_dir: prepared.workspace_dir.clone(),
             source_commit: prepared.source.commit.clone(),
@@ -1625,6 +1827,7 @@ async fn finalize_evaluation_workspace(
             namespace_active: output.namespace_active,
             scope_settled: output.scope_settled,
             timed_out: output.timed_out,
+            error: verification_result.err(),
         })
     }
     .await;
@@ -2189,10 +2392,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(edge_runtime_environment_capabilities(
-            &config.edge_id,
-            &workspace,
-        )),
+        capabilities: Some(if config.evaluation.is_some() {
+            dedicated_runtime_environment_capabilities(&config.edge_id, &workspace)
+        } else {
+            edge_runtime_environment_capabilities(&config.edge_id, &workspace)
+        }),
     };
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
@@ -2210,6 +2414,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 interaction_api_major,
             }) => {
                 validate_interaction_api_major(&interaction_api_major)?;
+                if let Some(evaluation) = &config.evaluation {
+                    evaluation
+                        .lock()
+                        .await
+                        .bind_owner(&user_id)
+                        .map_err(PermanentEdgeConnectionError)?;
+                }
                 tracing::info!(user_id = %user_id, "Authenticated successfully");
                 // The token that just proved itself is the SNAPSHOT this
                 // connection authenticated with — not the current shared value
@@ -2254,13 +2465,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     }
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
-        &workspace,
-        config.edge_id.clone(),
-        session_id.clone(),
-        "astra-edge/0.1",
-        Duration::from_secs(30),
-    ));
+    let executor = config.evaluation.is_none().then(|| {
+        Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
+            &workspace,
+            config.edge_id.clone(),
+            session_id.clone(),
+            "astra-edge/0.1",
+            Duration::from_secs(30),
+        ))
+    });
     let workspace_executors: Arc<
         Mutex<HashMap<PathBuf, Arc<astra_tools::executor::DefaultToolExecutor>>>,
     > = Arc::new(Mutex::new(HashMap::new()));
@@ -2461,7 +2674,8 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 };
                                 let workspace_executors = Arc::clone(&workspace_executors);
                                 let base_workspace = workspace.clone();
-                                let base_executor = Arc::clone(&executor);
+                                let base_executor = executor.clone();
+                                let evaluation = config.evaluation.clone();
                                 let edge_id = config.edge_id.clone();
                                 let session_id = session_id.clone();
                                 let completed_tx = completed_tx.clone();
@@ -2469,6 +2683,19 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 tasks.spawn(async move {
                                     let _execution_permit = execution_permit;
                                     let start = Instant::now();
+                                    if let Some(evaluation) = evaluation {
+                                        let result = execute_evaluation_tool(
+                                            evaluation, workspace_override.as_deref(), EvaluationToolCall {
+                                                identity: &identity, tool: &tool, args: &tool_args,
+                                                process_authorization: runtime_process_authorization.is_some() || runtime_process_authorization_required,
+                                            }, timeout_secs, &cancel,
+                                        ).await;
+                                        let _ = completed_tx.send(CompletedEdgeInvocation {
+                                            request_id, generation: delivery_generation, result,
+                                            duration_ms: start.elapsed().as_millis() as u64,
+                                        }).await;
+                                        return;
+                                    }
                                     // Git metadata validation is blocking
                                     // filesystem/process work. Own it inside
                                     // the invocation task so the receive loop
@@ -2542,7 +2769,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             })
                                             .clone()
                                     } else {
-                                        base_executor
+                                        base_executor.expect("ordinary mode has a base executor")
                                     };
                                     let execution = async {
                                         if let Some(process_authorization) =
@@ -2602,15 +2829,26 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 request_id,
                                 connection_generation,
                                 workspace_key,
+                                session_id,
                                 source_commit,
+                                confinement,
                             }) => {
                                 let operation_tx = workspace_operation_tx.clone();
                                 let base_workspace = workspace.clone();
                                 let materialization_id = config.materialization_id.clone();
                                 let response_materialization_id = materialization_id.clone();
                                 let response_workspace_key = workspace_key.clone();
+                                let evaluation = config.evaluation.clone();
                                 tokio::spawn(async move {
+                                    let mut authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let result = tokio::task::spawn_blocking(move || {
+                                        if let Some(authority) = authority.as_mut() {
+                                            return authority.prepare(&base_workspace, &materialization_id, astra_server_types::edge_ws_protocol::EdgeWorkspacePreparationRequest {
+                                                connection_generation, workspace_key: &workspace_key, session_id: &session_id,
+                                                source_commit: &source_commit, confinement: &confinement,
+                                            })
+                                                .map(|source| (base_workspace, source));
+                                        }
                                         prepare_evaluation_workspace(
                                             &base_workspace,
                                             &materialization_id,
@@ -2667,12 +2905,17 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 let operation_tx = workspace_operation_tx.clone();
                                 let base_workspace = workspace.clone();
                                 let requested_workspace = PathBuf::from(&workspace_dir);
+                                let evaluation = config.evaluation.clone();
                                 tokio::spawn(async move {
+                                    let authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let result = tokio::task::spawn_blocking(move || {
-                                        let path = validate_workspace_override(
+                                        let path = if let Some(authority) = authority.as_ref() {
+                                            authority.validate(&requested_workspace, None)?;
+                                            requested_workspace.clone()
+                                        } else { validate_workspace_override(
                                             &base_workspace,
                                             &requested_workspace,
-                                        )?;
+                                        )? };
                                         let source = workspace_source_identity(&path).ok_or_else(|| {
                                             "workspace source identity is unavailable".to_string()
                                         })?;
@@ -2726,6 +2969,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 let requested_workspace = PathBuf::from(&workspace_dir);
                                 let response_request_id = request_id.clone();
                                 let response_workspace_dir = workspace_dir.clone();
+                                let evaluation = config.evaluation.clone();
                                 let cancel = CancellationToken::new();
                                 finalizations
                                     .lock()
@@ -2733,6 +2977,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     .insert(request_id.clone(), cancel.clone());
                                 let finalizations = finalizations.clone();
                                 tokio::spawn(async move {
+                                    let mut authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let now_unix_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .ok()
@@ -2740,7 +2985,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     let remaining_ms = now_unix_ms
                                         .and_then(|now| finalization_deadline_unix_ms.checked_sub(now))
                                         .filter(|remaining| *remaining > 0);
-                                    let result = if let Some(remaining_ms) = remaining_ms {
+                                    let admission = authority.as_ref().map_or(Ok(()), |authority| authority.validate(&requested_workspace, Some(&source_commit)));
+                                    let result = if let Err(error) = admission { Err(error) } else if let Some(remaining_ms) = remaining_ms {
+                                        let boundary = authority.as_ref().map(|authority| authority.provider.boundary(&requested_workspace));
+                                        if let Some(authority) = authority.as_mut() { authority.mark_unsettled(&requested_workspace); }
                                         let execution = finalize_evaluation_workspace(
                                             &base_workspace,
                                             &requested_workspace,
@@ -2748,6 +2996,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             &verifier_command,
                                             verifier_timeout_secs,
                                             cancel.clone(),
+                                            boundary,
                                         );
                                         tokio::pin!(execution);
                                         match tokio::time::timeout(
@@ -2765,6 +3014,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     } else {
                                         Err("evaluation finalization deadline expired before Edge execution".into())
                                     };
+                                    if let Some(authority) = authority.as_mut()
+                                        && result.as_ref().is_ok_and(|result| result.error.is_none()) {
+                                        authority.mark_settled(&requested_workspace);
+                                    }
                                     finalizations
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner())
@@ -2784,7 +3037,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             namespace_active: result.namespace_active,
                                             scope_settled: result.scope_settled,
                                             timed_out: result.timed_out,
-                                            error: None,
+                                            error: result.error,
                                         },
                                         Err(error) => EdgeClientMessage::WorkspaceFinalized {
                                             request_id,
@@ -2847,8 +3100,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 let base_workspace = workspace.clone();
                                 let requested_workspace = PathBuf::from(&workspace_dir);
                                 let frozen_source_commit = source_commit.clone();
+                                let evaluation = config.evaluation.clone();
                                 tokio::spawn(async move {
+                                    let mut authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let result = tokio::task::spawn_blocking(move || {
+                                        if let Some(authority) = authority.as_mut() {
+                                            return authority.release(&base_workspace, &requested_workspace, &frozen_source_commit);
+                                        }
                                         release_evaluation_workspace(
                                             &base_workspace,
                                             &requested_workspace,
@@ -3093,13 +3351,30 @@ async fn run() {
     );
 
     let args = Args::parse();
-    let config = match resolve_config(args) {
+    let mut config = match resolve_config(args) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Error: {error}");
             std::process::exit(2);
         }
     };
+
+    if let Some(path) = &config.evaluation_config {
+        let provider =
+            match evaluation_allocation::Provider::start(path, &config.workspace_dir).await {
+                Ok(provider) => provider,
+                Err(error) => {
+                    eprintln!("Dedicated evaluation startup rejected: {error}");
+                    std::process::exit(2);
+                }
+            };
+        config.evaluation = Some(Arc::new(Mutex::new(
+            evaluation_allocation::Allocations::new(provider),
+        )));
+        tracing::warn!(
+            "Evaluation capability withheld: allocation/tool/finalization runtime receipts are not yet persisted and admitted end to end"
+        );
+    }
 
     eprintln!(
         "astra-edge v{} — remote tool execution agent",
@@ -3827,6 +4102,72 @@ mod tests {
             budget.try_acquire().is_some(),
             "completed executions must release capacity"
         );
+    }
+
+    #[test]
+    fn dedicated_advertisement_withholds_incomplete_capabilities() {
+        let root = tempfile::tempdir().unwrap();
+        let value = dedicated_runtime_environment_capabilities("test", root.path());
+        assert!(value.get("workspace_confinement").is_none());
+        assert_eq!(value["protocol_capabilities"], serde_json::json!({}));
+        for name in value["binding"]["tool_surface"]["tool_names"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(EVALUATION_TOOLS.contains(&name.as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn dedicated_cli_mode_is_explicit() {
+        let args = Args::try_parse_from([
+            "astra-edge",
+            "--evaluation-config",
+            "/etc/astra/evaluation.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.evaluation_config.as_deref(),
+            Some(Path::new("/etc/astra/evaluation.json"))
+        );
+        assert!(
+            Args::try_parse_from(["astra-edge"])
+                .unwrap()
+                .evaluation_config
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn foreground_settlement_cannot_release_dedicated_allocation() {
+        use astra_runtime_env::{
+            ShellExecutionEvidence, ShellScopeOwnership, ShellSettlementEvidence,
+            ShellSetupEvidence,
+        };
+        let mut receipt = ShellExecutionEvidence {
+            schema_version: 1,
+            profile: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+            execution_started: true,
+            setup: ShellSetupEvidence::Unverified {
+                reason_code: "setup_or_exec_unverified".into(),
+            },
+            settlement: ShellSettlementEvidence {
+                scope_settled: true,
+                ownership: Some(ShellScopeOwnership::ForegroundProcessGroup),
+                descendants_terminated: false,
+            },
+            timed_out: false,
+            cancelled: false,
+        };
+        assert!(!authoritative_shell_settlement(&receipt));
+        assert!(!allocation_reusable_after_shell(&receipt));
+        receipt.execution_started = false;
+        assert!(allocation_reusable_after_shell(&receipt));
+        receipt.execution_started = true;
+        receipt.settlement.ownership = Some(ShellScopeOwnership::InvocationSupervisor);
+        assert!(authoritative_shell_settlement(&receipt));
+        receipt.settlement.scope_settled = false;
+        assert!(!authoritative_shell_settlement(&receipt));
     }
 
     #[test]

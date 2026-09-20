@@ -400,9 +400,15 @@ impl DefaultToolExecutor {
     }
 }
 
-#[async_trait]
-impl ToolExecutor for DefaultToolExecutor {
-    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+impl DefaultToolExecutor {
+    // The invocation-local flag records entry into the process owner, not a
+    // guess from a result string or missing metadata. Dropped futures return no proof.
+    async fn execute_with_launch_tracking(
+        &self,
+        name: &str,
+        args: &Value,
+        launch_attempted: &mut bool,
+    ) -> ToolResult {
         if let Err(error) = crate::schemas::validate_tool_arguments(name, args) {
             return error.into_tool_result();
         }
@@ -622,7 +628,13 @@ impl ToolExecutor for DefaultToolExecutor {
         } else {
             None
         };
-        let dispatch = self.dispatch(name, args, bash_workdir.as_ref(), native_access);
+        let dispatch = self.dispatch(
+            name,
+            args,
+            bash_workdir.as_ref(),
+            native_access,
+            launch_attempted,
+        );
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
         // abandon the post-execution workspace receipt after a partial write.
@@ -885,6 +897,54 @@ impl ToolExecutor for DefaultToolExecutor {
         result
     }
 
+    fn unstarted_shell_result(&self, name: &str, mut result: ToolResult) -> ToolResult {
+        if name == "bash" && self.shell_process_boundary.is_some() {
+            let receipt = astra_runtime_env::ShellExecutionEvidence {
+                schema_version: 1,
+                profile: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+                execution_started: false,
+                setup: astra_runtime_env::ShellSetupEvidence::Unverified {
+                    reason_code: "not_dispatched".into(),
+                },
+                settlement: astra_runtime_env::ShellSettlementEvidence {
+                    scope_settled: true,
+                    ownership: None,
+                    descendants_terminated: false,
+                },
+                timed_out: false,
+                cancelled: result
+                    .metadata
+                    .as_ref()
+                    .and_then(|fields| fields.get("cancelled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            result
+                .metadata
+                .get_or_insert_with(serde_json::Map::new)
+                .insert(
+                    "shell_confinement".into(),
+                    serde_json::to_value(receipt).expect("shell evidence serializes"),
+                );
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for DefaultToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+        let mut launch_attempted = false;
+        let result = self
+            .execute_with_launch_tracking(name, args, &mut launch_attempted)
+            .await;
+        if launch_attempted {
+            result
+        } else {
+            self.unstarted_shell_result(name, result)
+        }
+    }
+
     async fn execute_with_cancel(
         &self,
         name: &str,
@@ -895,7 +955,7 @@ impl ToolExecutor for DefaultToolExecutor {
             return self.execute(name, args).await;
         };
         if cancel_token.is_cancelled() {
-            return crate::cancelled_tool_result(name, false);
+            return self.unstarted_shell_result(name, crate::cancelled_tool_result(name, false));
         }
         // Execute against a shallow clone whose context carries the caller's
         // token.  Shared caches and generation remain
@@ -1028,6 +1088,7 @@ impl DefaultToolExecutor {
         args: &Value,
         bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
         access: Option<&crate::fs_ops::FileAccess>,
+        launch_attempted: &mut bool,
     ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
 
@@ -1045,6 +1106,7 @@ impl DefaultToolExecutor {
                     &self.ctx,
                     args,
                     self.shell_process_boundary.as_ref().expect("selected boundary"),
+                    launch_attempted,
                     self.filesystem_write_boundary.as_deref().unwrap_or(&[]),
                     bash_workdir.expect("bash dispatch requires a resolved workdir"),
                 )
@@ -1352,12 +1414,28 @@ mod tests {
         assert!(exec.bash_cache_key(&args, &workdir).is_none());
         for args in [
             serde_json::json!({"command": "touch escaped", "workdir": "nested"}),
+            serde_json::json!({"command": "touch escaped", "workdir": "missing-directory"}),
+            serde_json::json!({}),
             serde_json::json!({"command": "touch escaped", "env": {}}),
             serde_json::json!({"command": "touch escaped", "detach": true}),
             serde_json::json!({"command": "touch escaped", "run_in_background": true}),
         ] {
-            assert!(exec.execute("bash", &args).await.is_error);
+            let result = exec.execute("bash", &args).await;
+            assert!(result.is_error);
+            let receipt: astra_runtime_env::ShellExecutionEvidence =
+                serde_json::from_value(result.metadata.unwrap()["shell_confinement"].clone())
+                    .unwrap();
+            assert!(!receipt.execution_started);
+            assert!(receipt.settlement.scope_settled);
+            assert_eq!(receipt.verified_exit_code(), None);
         }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let refused = exec.execute_with_cancel("bash", &args, Some(&cancel)).await;
+        let receipt: astra_runtime_env::ShellExecutionEvidence =
+            serde_json::from_value(refused.metadata.unwrap()["shell_confinement"].clone()).unwrap();
+        assert!(!receipt.execution_started);
+        assert!(receipt.cancelled);
         for name in ["run_script", "worktree", "grep", "glob"] {
             assert!(exec.execute(name, &serde_json::json!({})).await.is_error);
         }
@@ -1450,6 +1528,7 @@ mod tests {
                             .unwrap()
                             .operation(),
                     ),
+                    &mut false,
                 )
                 .await;
             assert!(result.is_error, "{name}: {}", result.output);
@@ -1469,6 +1548,7 @@ mod tests {
                         .unwrap()
                         .operation(),
                 ),
+                &mut false,
             )
             .await;
         assert!(!result.is_error, "{}", result.output);

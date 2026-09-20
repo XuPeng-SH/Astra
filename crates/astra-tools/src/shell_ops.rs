@@ -1938,10 +1938,16 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     .await
 }
 
+struct RestrictedShellInvocation<'a> {
+    boundary: &'a astra_sandbox::ShellProcessBoundary,
+    launch_attempted: &'a mut bool,
+}
+
 pub(crate) async fn execute_bash_with_process_boundary_at_workdir(
     ctx: &crate::ToolContext,
     args: &Value,
     boundary: &astra_sandbox::ShellProcessBoundary,
+    launch_attempted: &mut bool,
     protected_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
@@ -1951,7 +1957,10 @@ pub(crate) async fn execute_bash_with_process_boundary_at_workdir(
             args,
             protected_paths,
             workdir,
-            Some(boundary),
+            Some(RestrictedShellInvocation {
+                boundary,
+                launch_attempted,
+            }),
         )
         .await
     })
@@ -1963,7 +1972,7 @@ async fn execute_bash_with_filesystem_boundary_inner(
     args: &Value,
     read_only_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
-    boundary: Option<&astra_sandbox::ShellProcessBoundary>,
+    boundary: Option<RestrictedShellInvocation<'_>>,
 ) -> ToolResult {
     if boundary.is_some()
         && (ctx.detach_shell_handle.is_some()
@@ -2208,11 +2217,15 @@ async fn execute_restricted_bash(
     ctx: &crate::ToolContext,
     command: &str,
     timeout_secs: f64,
-    boundary: &astra_sandbox::ShellProcessBoundary,
+    invocation: RestrictedShellInvocation<'_>,
     protected_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
     source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
 ) -> ToolResult {
+    let RestrictedShellInvocation {
+        boundary,
+        launch_attempted,
+    } = invocation;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
@@ -2222,6 +2235,7 @@ async fn execute_restricted_bash(
             boundary,
             protected_paths,
             workdir,
+            launch_attempted,
         );
         attach_source_preimage(
             ToolResult::error("SANDBOX_DENIED: restricted shell requires Linux".into()),
@@ -2273,6 +2287,7 @@ async fn execute_restricted_bash(
         );
         config.timeout = Duration::from_secs_f64(timeout_secs);
         config.max_output_bytes = per_tool_output_limit("bash");
+        *launch_attempted = true;
         let output =
             astra_sandbox::execute_confined_with_cancel(plan, &config, ctx.cancel_token.as_deref())
                 .await;
