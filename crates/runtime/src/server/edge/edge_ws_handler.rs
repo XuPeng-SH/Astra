@@ -1040,6 +1040,14 @@ async fn handle_edge_connection(
                                             source_commit,
                                             source_tree,
                                             clean: error.is_none(),
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
                                             error,
                                         },
                                     );
@@ -1073,6 +1081,14 @@ async fn handle_edge_connection(
                                             source_commit,
                                             source_tree,
                                             clean,
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
                                             error,
                                         },
                                     );
@@ -1083,6 +1099,54 @@ async fn handle_edge_connection(
                                             edge_agent_id = %edge_agent_id,
                                             request_id = %request_id,
                                             "Edge workspace snapshot result had no live waiter"
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::WorkspaceFinalized {
+                                    request_id,
+                                    connection_generation,
+                                    workspace_dir,
+                                    source_commit,
+                                    source_tree,
+                                    base_revision,
+                                    result_revision,
+                                    patch,
+                                    verifier_exit_code,
+                                    verifier_output,
+                                    namespace_active,
+                                    scope_settled,
+                                    timed_out,
+                                    error,
+                                }) => {
+                                    let delivered = state.edge_connection_pool.deliver_workspace_operation(
+                                        &user_id,
+                                        &edge_agent_id,
+                                        &request_id,
+                                        connection_generation,
+                                        astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult {
+                                            connection_generation,
+                                            workspace_dir,
+                                            source_commit,
+                                            source_tree,
+                                            clean: false,
+                                            base_revision,
+                                            result_revision,
+                                            patch,
+                                            verifier_exit_code,
+                                            verifier_output,
+                                            namespace_active,
+                                            scope_settled,
+                                            timed_out,
+                                            error,
+                                        },
+                                    );
+                                    if !delivered {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge workspace finalization result had no live waiter"
                                         );
                                     }
                                 }

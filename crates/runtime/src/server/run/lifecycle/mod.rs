@@ -148,6 +148,27 @@ impl EvaluationWorkspaceLease {
     fn activate_after_run_claim(&self) {
         self.claimed.store(true, Ordering::Release);
     }
+
+    async fn finalize(
+        &self,
+        verifier_command: &str,
+        verifier_timeout_secs: u64,
+        timeout: Duration,
+        cancel_token: &CancellationToken,
+    ) -> Option<astra_server_types::edge_connection_pool::EdgeWorkspaceOperationResult> {
+        let pool = self.pool.as_ref()?;
+        pool.finalize_evaluation_workspace(
+            &self.user_id,
+            self.edge_agent_id.as_deref()?,
+            self.workspace_dir.as_deref()?,
+            &self.source_commit,
+            verifier_command,
+            verifier_timeout_secs,
+            timeout,
+            cancel_token,
+        )
+        .await
+    }
 }
 
 impl Drop for EvaluationWorkspaceLease {
@@ -16950,6 +16971,193 @@ fn evaluation_skill_revision_matches(
         && expected.content_hash == frozen_content_hash
 }
 
+async fn finalize_evaluation_coding_evidence(
+    shared_pool: Option<&astra_core::SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: Option<&EvaluationRunAdmission>,
+    lease: Option<&EvaluationWorkspaceLease>,
+    execution_deadline: Option<ExecutionDeadlineAuthority>,
+    cancel_token: &CancellationToken,
+) -> Option<Value> {
+    let admission = admission?;
+    let event = |status: &str, data: Value| {
+        json!({
+            "event_type": "evaluation_coding_evidence",
+            "run_generation": run_generation,
+            "idempotency_key": format!("evaluation-coding-evidence:{run_id}:{run_generation}"),
+            "data": {"status": status, "detail": data},
+        })
+    };
+    let Some(pool) = shared_pool else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"durable_pool_unavailable"}),
+        ));
+    };
+    let experiment =
+        match astra_services::evaluation::DatabaseEvaluationPlanStore::new(pool.clone())
+            .load_experiment(owner_user_id, &admission.experiment_id)
+            .await
+        {
+            Ok(experiment) => experiment,
+            Err(error) => return Some(event("unavailable", json!({"reason":error.to_string()}))),
+        };
+    let planned = match experiment.spec.plan_trials() {
+        Ok(planned) => planned,
+        Err(error) => return Some(event("unavailable", json!({"reason":error}))),
+    };
+    let Some(trial) = planned
+        .iter()
+        .find(|trial| trial.trial_id == admission.trial_id)
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"frozen_trial_missing"}),
+        ));
+    };
+    let Some(case) = experiment
+        .spec
+        .cases
+        .iter()
+        .find(|case| case.case_id == trial.case_id)
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"frozen_case_missing"}),
+        ));
+    };
+    let astra_services::evaluation::task_verifier::TaskVerifierConfig::WorkspaceCommand {
+        command,
+        expected_exit_code,
+        timeout_secs,
+    } = &case.task_verifier.config
+    else {
+        return None;
+    };
+    let Some(lease) = lease else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"workspace_lease_missing"}),
+        ));
+    };
+    let Some(deadline) = execution_deadline else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"execution_deadline_missing"}),
+        ));
+    };
+    let remaining = deadline
+        .monotonic_deadline()
+        .saturating_duration_since(Instant::now());
+    if remaining.is_zero() || cancel_token.is_cancelled() {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"execution_deadline_expired"}),
+        ));
+    }
+    let finalize_timeout = remaining.min(Duration::from_secs(timeout_secs.saturating_add(10)));
+    let Some(result) = lease
+        .finalize(command, *timeout_secs, finalize_timeout, cancel_token)
+        .await
+    else {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"edge_finalize_unavailable"}),
+        ));
+    };
+    let expected_generation = lease.connection_generation();
+    let expected_workspace = lease.workspace_dir();
+    let complete = result.error.is_none()
+        && Some(result.connection_generation) == expected_generation
+        && Some(result.workspace_dir.as_str()) == expected_workspace
+        && result.source_commit.as_deref() == Some(lease.source_commit.as_str())
+        && result.source_tree.is_some()
+        && result.base_revision.is_some()
+        && result.result_revision.is_some()
+        && result.patch.is_some()
+        && result.verifier_exit_code.is_some()
+        && result.verifier_output.is_some()
+        && result.namespace_active
+        && result.scope_settled
+        && !result.timed_out;
+    if !complete {
+        return Some(event(
+            "unavailable",
+            json!({"reason":result.error.unwrap_or_else(|| "incomplete_edge_finalize_evidence".into())}),
+        ));
+    }
+    let artifact_id = format!("evaluation-coding-{}", admission.trial_id);
+    let verifier_passed = result.verifier_exit_code == Some(*expected_exit_code);
+    let content = json!({
+        "schema_version": 1,
+        "experiment_id": admission.experiment_id,
+        "trial_id": admission.trial_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "run_generation": run_generation,
+        "spec_fingerprint": experiment.spec_fingerprint,
+        "verifier": case.task_verifier,
+        "workspace": {
+            "connection_generation": result.connection_generation,
+            "workspace_dir": result.workspace_dir,
+            "source_commit": result.source_commit,
+            "source_tree": result.source_tree,
+            "base_revision": result.base_revision,
+            "result_revision": result.result_revision,
+        },
+        "patch": result.patch,
+        "verifier_exit_code": result.verifier_exit_code,
+        "verifier_output": result.verifier_output,
+        "isolation": {
+            "namespace_active": result.namespace_active,
+            "network_namespace": true,
+            "scope_settled": result.scope_settled,
+        },
+        "verifier_passed": verifier_passed,
+    });
+    let artifact_hash = astra_services::evaluation::content_fingerprint(
+        &astra_core::canonical_json_string(&content),
+    );
+    let store =
+        astra_services::DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::default())
+            .with_pool(pool.clone());
+    let record = astra_services::SessionArtifactJsonRecord {
+        artifact_id: artifact_id.clone(),
+        session_id: session_id.to_string(),
+        user_id: owner_user_id.to_string(),
+        artifact_kind: "evaluation_coding_evidence".into(),
+        source: Some("evaluation_edge_finalize".into()),
+        turn: None,
+        round: None,
+        content: content.clone(),
+        metadata: Some(json!({"content_hash": artifact_hash})),
+        references: Vec::new(),
+    };
+    use astra_services::SessionArtifactJsonStore as _;
+    let persisted = match store.persist_json_artifact(record).await {
+        Ok(_) => true,
+        Err(_) => store
+            .load_json_artifact(owner_user_id, session_id, &artifact_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|existing| existing.content == content),
+    };
+    if !persisted {
+        return Some(event(
+            "unavailable",
+            json!({"reason":"artifact_persistence_failed"}),
+        ));
+    }
+    Some(event(
+        if verifier_passed { "pass" } else { "fail" },
+        json!({"artifact_id":artifact_id,"content_hash":artifact_hash}),
+    ))
+}
+
 impl AgenticRunLifecycleService {
     async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
         let OwnedBackgroundExecution {
@@ -17409,6 +17617,23 @@ impl AgenticRunLifecycleService {
                     &bg_run_id,
                     execution_owner_generation,
                 ) {
+                    events.push(event);
+                }
+                if loop_success
+                    && final_status == RunStatus::Completed
+                    && let Some(event) = finalize_evaluation_coding_evidence(
+                        bg_shared_pool.as_ref(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                        bg_eval_admission.as_ref(),
+                        _evaluation_workspace_lease.as_ref(),
+                        request.admitted_execution_deadline,
+                        bg_llm_cancel_token.as_ref(),
+                    )
+                    .await
+                {
                     events.push(event);
                 }
                 let mut user_cancellation = false;

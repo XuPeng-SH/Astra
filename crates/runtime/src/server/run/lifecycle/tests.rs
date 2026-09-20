@@ -11486,7 +11486,7 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         "case": {
             "case_id": "http-case",
             "message": "Explain the frozen evaluation input.",
-            "verifier_config": {"expected": {"ok": true}},
+            "verifier_config": {"kind":"json_value_equals", "expected": {"ok": true}},
             "holdout": false
         },
         "model_offering_id": offering_id.clone(),

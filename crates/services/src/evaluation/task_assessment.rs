@@ -35,6 +35,24 @@ pub enum TaskAssessmentUnavailableReason {
     TerminalNotCompleted,
     NoTerminalOutput,
     OutputTooLarge,
+    CodingEvidenceUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAssessmentProof {
+    pub artifact_id: String,
+    pub content_hash: String,
+    pub source_commit: String,
+    pub source_tree: String,
+    pub base_revision: String,
+    pub result_revision: String,
+    pub patch_hash: String,
+    pub verifier_output_hash: String,
+    pub verifier_exit_code: i32,
+    pub namespace_active: bool,
+    pub network_namespace: bool,
+    pub scope_settled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +86,8 @@ pub struct TaskAssessmentRecord {
     pub verifier_fingerprint: String,
     pub terminal: Option<CommittedTerminalProof>,
     pub output: Option<RunOutputProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding: Option<CodingAssessmentProof>,
     pub outcome: TaskAssessmentOutcome,
     pub created_at: String,
 }
@@ -145,6 +165,143 @@ fn verifier_fingerprint(spec: &TaskVerifierSpec) -> Result<String, TaskAssessmen
     Ok(content_fingerprint(&format!(
         "task-verifier.v1:{}",
         canonical_json_string(&value)
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodingArtifactWorkspace {
+    connection_generation: u64,
+    workspace_dir: String,
+    source_commit: Option<String>,
+    source_tree: Option<String>,
+    base_revision: Option<String>,
+    result_revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodingArtifactIsolation {
+    namespace_active: bool,
+    network_namespace: bool,
+    scope_settled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodingArtifactV1 {
+    schema_version: u32,
+    experiment_id: String,
+    trial_id: String,
+    session_id: String,
+    run_id: String,
+    run_generation: u64,
+    spec_fingerprint: String,
+    verifier: TaskVerifierSpec,
+    workspace: CodingArtifactWorkspace,
+    patch: String,
+    verifier_exit_code: Option<i32>,
+    verifier_output: String,
+    isolation: CodingArtifactIsolation,
+    verifier_passed: bool,
+}
+
+async fn load_coding_proof(
+    tx: &mut Transaction<'_, MySql>,
+    owner: &str,
+    experiment: &EvaluationExperimentRecord,
+    observation: &EvaluationObservationRecord,
+    trial_id: &str,
+    verifier: &TaskVerifierSpec,
+) -> Result<Option<(CodingAssessmentProof, bool)>, TaskAssessmentError> {
+    let artifact_id = format!("evaluation-coding-{trial_id}");
+    let row = sqlx::query(
+        "SELECT artifact_kind, source, content_json FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(owner)
+    .bind(&observation.session_id)
+    .bind(&artifact_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| TaskAssessmentError::Database {
+        operation: "load_coding_evidence_artifact",
+        source,
+    })?;
+    let Some(row) = row else { return Ok(None) };
+    let artifact_kind: String = row
+        .try_get("artifact_kind")
+        .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+    let source: Option<String> = row
+        .try_get("source")
+        .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+    if artifact_kind != "evaluation_coding_evidence"
+        || source.as_deref() != Some("evaluation_edge_finalize")
+    {
+        return Err(TaskAssessmentError::Integrity(
+            "coding evidence artifact type mismatch".into(),
+        ));
+    }
+    let content_json: String = row
+        .try_get("content_json")
+        .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&content_json)
+        .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+    let content_hash = content_fingerprint(&canonical_json_string(&value));
+    let artifact: CodingArtifactV1 = serde_json::from_value(value)
+        .map_err(|error| TaskAssessmentError::Integrity(error.to_string()))?;
+    if artifact.schema_version != 1
+        || artifact.experiment_id != experiment.experiment_id
+        || artifact.trial_id != trial_id
+        || artifact.session_id != observation.session_id
+        || artifact.run_id != observation.execution_run_id
+        || artifact.run_generation != observation.execution_run_generation
+        || artifact.spec_fingerprint != experiment.spec_fingerprint
+        || artifact.verifier != *verifier
+        || artifact.workspace.connection_generation == 0
+        || artifact.workspace.workspace_dir.trim().is_empty()
+        || !artifact.isolation.namespace_active
+        || !artifact.isolation.network_namespace
+        || !artifact.isolation.scope_settled
+    {
+        return Err(TaskAssessmentError::Integrity(
+            "coding evidence artifact binding mismatch".into(),
+        ));
+    }
+    let (
+        Some(source_commit),
+        Some(source_tree),
+        Some(base_revision),
+        Some(result_revision),
+        Some(exit_code),
+    ) = (
+        artifact.workspace.source_commit,
+        artifact.workspace.source_tree,
+        artifact.workspace.base_revision,
+        artifact.workspace.result_revision,
+        artifact.verifier_exit_code,
+    )
+    else {
+        return Err(TaskAssessmentError::Integrity(
+            "coding evidence artifact is incomplete".into(),
+        ));
+    };
+    Ok(Some((
+        CodingAssessmentProof {
+            artifact_id,
+            content_hash,
+            source_commit,
+            source_tree,
+            base_revision,
+            result_revision,
+            patch_hash: content_fingerprint(&artifact.patch),
+            verifier_output_hash: content_fingerprint(&artifact.verifier_output),
+            verifier_exit_code: exit_code,
+            namespace_active: artifact.isolation.namespace_active,
+            network_namespace: artifact.isolation.network_namespace,
+            scope_settled: artifact.isolation.scope_settled,
+        },
+        artifact.verifier_passed,
     )))
 }
 
@@ -226,13 +383,22 @@ impl TaskAssessmentRecord {
             &self.outcome,
             &self.terminal,
             &self.output,
+            &self.coding,
         ) {
             (
                 TrialStatus::Completed,
                 TaskAssessmentOutcome::Pass | TaskAssessmentOutcome::Fail,
                 Some(_),
                 Some(_),
+                None,
             ) => {}
+            (
+                TrialStatus::Completed,
+                TaskAssessmentOutcome::Pass | TaskAssessmentOutcome::Fail,
+                Some(_),
+                None,
+                Some(proof),
+            ) if proof.namespace_active && proof.network_namespace && proof.scope_settled => {}
             (
                 TrialStatus::Completed,
                 TaskAssessmentOutcome::Unavailable(
@@ -240,18 +406,30 @@ impl TaskAssessmentRecord {
                 ),
                 Some(_),
                 None,
+                None,
             ) => {}
             (
                 TrialStatus::Completed,
                 TaskAssessmentOutcome::Unavailable(TaskAssessmentUnavailableReason::OutputTooLarge),
                 Some(_),
                 Some(_),
+                None,
+            ) => {}
+            (
+                TrialStatus::Completed,
+                TaskAssessmentOutcome::Unavailable(
+                    TaskAssessmentUnavailableReason::CodingEvidenceUnavailable,
+                ),
+                Some(_),
+                None,
+                None,
             ) => {}
             (
                 status,
                 TaskAssessmentOutcome::Unavailable(
                     TaskAssessmentUnavailableReason::TerminalNotCompleted,
                 ),
+                None,
                 None,
                 None,
             ) if *status != TrialStatus::Completed && *status != TrialStatus::Unknown => {}
@@ -270,6 +448,27 @@ impl TaskAssessmentRecord {
         {
             return Err(TaskAssessmentError::Integrity(
                 "assessment output is outside terminal cut".into(),
+            ));
+        }
+        if let Some(proof) = &self.coding
+            && ([
+                &proof.content_hash,
+                &proof.patch_hash,
+                &proof.verifier_output_hash,
+            ]
+            .iter()
+            .any(|value| {
+                value.len() != 71
+                    || !value.starts_with("sha256:")
+                    || !value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) || proof.artifact_id != format!("evaluation-coding-{}", self.trial_id)
+                || proof.source_commit.is_empty()
+                || proof.source_tree.is_empty()
+                || proof.base_revision.is_empty()
+                || proof.result_revision.is_empty())
+        {
+            return Err(TaskAssessmentError::Integrity(
+                "coding assessment proof is invalid".into(),
             ));
         }
         Ok(())
@@ -298,6 +497,19 @@ impl TaskAssessmentRecord {
             content_hash: Some(self.assessment_fingerprint.clone()),
             locator: Some(format!("evaluation://assessment/{}", self.assessment_id)),
         }
+    }
+
+    pub fn coding_evidence(&self) -> Option<EvidenceRef> {
+        self.coding.as_ref().map(|proof| EvidenceRef {
+            evidence_id: proof.artifact_id.clone(),
+            kind: EvidenceKind::Artifact,
+            availability: EvidenceAvailability::Available,
+            content_hash: Some(proof.content_hash.clone()),
+            locator: Some(format!(
+                "session-artifact://{}/{}",
+                self.session_id, proof.artifact_id
+            )),
+        })
     }
 }
 
@@ -418,54 +630,106 @@ impl DatabaseEvaluationObservationStore {
             verifier_fingerprint: verifier_fingerprint(&case.task_verifier)?,
             terminal: None,
             output: None,
+            coding: None,
             outcome: TaskAssessmentOutcome::Unavailable(
                 TaskAssessmentUnavailableReason::TerminalNotCompleted,
             ),
             created_at: String::new(),
         };
         if observation.observation.status == TrialStatus::Completed {
-            let evidence = load_verified_terminal_output_in_transaction(
-                &mut tx,
-                &TerminalOutputIdentity {
-                    owner_user_id: owner,
-                    session_id: &record.session_id,
-                    run_id: &record.execution_run_id,
-                    generation: record.execution_run_generation,
-                },
-                MAX_OUTPUT_BYTES,
-            )
-            .await;
-            let evidence = match evidence {
-                Ok(evidence) => evidence,
-                Err(TerminalOutputReadError::Pending) => return Ok(TaskAssessmentResult::Pending),
-                Err(error) => return Err(error.into()),
-            };
-            record.outcome = match (&evidence.output, evidence.content.as_deref()) {
-                (None, _) => TaskAssessmentOutcome::Unavailable(
-                    TaskAssessmentUnavailableReason::NoTerminalOutput,
-                ),
-                (Some(proof), _) if proof.content_bytes > MAX_OUTPUT_BYTES as u64 => {
-                    TaskAssessmentOutcome::Unavailable(
-                        TaskAssessmentUnavailableReason::OutputTooLarge,
-                    )
-                }
-                (Some(_), None) => return Ok(TaskAssessmentResult::Pending),
-                (Some(_), Some(content)) => {
-                    match verify_complete_output(&case.task_verifier, Some(content))
-                        .map_err(TaskAssessmentError::Integrity)?
-                    {
-                        TaskVerifierVerdict::Pass => TaskAssessmentOutcome::Pass,
-                        TaskVerifierVerdict::Fail => TaskAssessmentOutcome::Fail,
-                        TaskVerifierVerdict::Unavailable => {
-                            return Err(TaskAssessmentError::Integrity(
-                                "bounded verifier unexpectedly unavailable".into(),
-                            ));
-                        }
+            if matches!(
+                case.task_verifier.config,
+                super::task_verifier::TaskVerifierConfig::WorkspaceCommand { .. }
+            ) {
+                let terminal_evidence = load_verified_terminal_output_in_transaction(
+                    &mut tx,
+                    &TerminalOutputIdentity {
+                        owner_user_id: owner,
+                        session_id: &record.session_id,
+                        run_id: &record.execution_run_id,
+                        generation: record.execution_run_generation,
+                    },
+                    MAX_OUTPUT_BYTES,
+                )
+                .await;
+                let terminal_evidence = match terminal_evidence {
+                    Ok(evidence) => evidence,
+                    Err(TerminalOutputReadError::Pending) => {
+                        return Ok(TaskAssessmentResult::Pending);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                match load_coding_proof(
+                    &mut tx,
+                    owner,
+                    &experiment,
+                    observation,
+                    trial_id,
+                    &case.task_verifier,
+                )
+                .await?
+                {
+                    Some((proof, passed)) => {
+                        record.outcome = if passed {
+                            TaskAssessmentOutcome::Pass
+                        } else {
+                            TaskAssessmentOutcome::Fail
+                        };
+                        record.coding = Some(proof);
+                    }
+                    None => {
+                        record.outcome = TaskAssessmentOutcome::Unavailable(
+                            TaskAssessmentUnavailableReason::CodingEvidenceUnavailable,
+                        );
                     }
                 }
-            };
-            record.terminal = Some(evidence.terminal);
-            record.output = evidence.output;
+                record.terminal = Some(terminal_evidence.terminal);
+            } else {
+                let evidence = load_verified_terminal_output_in_transaction(
+                    &mut tx,
+                    &TerminalOutputIdentity {
+                        owner_user_id: owner,
+                        session_id: &record.session_id,
+                        run_id: &record.execution_run_id,
+                        generation: record.execution_run_generation,
+                    },
+                    MAX_OUTPUT_BYTES,
+                )
+                .await;
+                let evidence = match evidence {
+                    Ok(evidence) => evidence,
+                    Err(TerminalOutputReadError::Pending) => {
+                        return Ok(TaskAssessmentResult::Pending);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                record.outcome = match (&evidence.output, evidence.content.as_deref()) {
+                    (None, _) => TaskAssessmentOutcome::Unavailable(
+                        TaskAssessmentUnavailableReason::NoTerminalOutput,
+                    ),
+                    (Some(proof), _) if proof.content_bytes > MAX_OUTPUT_BYTES as u64 => {
+                        TaskAssessmentOutcome::Unavailable(
+                            TaskAssessmentUnavailableReason::OutputTooLarge,
+                        )
+                    }
+                    (Some(_), None) => return Ok(TaskAssessmentResult::Pending),
+                    (Some(_), Some(content)) => {
+                        match verify_complete_output(&case.task_verifier, Some(content))
+                            .map_err(TaskAssessmentError::Integrity)?
+                        {
+                            TaskVerifierVerdict::Pass => TaskAssessmentOutcome::Pass,
+                            TaskVerifierVerdict::Fail => TaskAssessmentOutcome::Fail,
+                            TaskVerifierVerdict::Unavailable => {
+                                return Err(TaskAssessmentError::Integrity(
+                                    "bounded verifier unexpectedly unavailable".into(),
+                                ));
+                            }
+                        }
+                    }
+                };
+                record.terminal = Some(evidence.terminal);
+                record.output = evidence.output;
+            }
         }
         record.assessment_fingerprint = record.fingerprint()?;
         record.assessment_id = record.assessment_fingerprint.replace("sha256:", "eva_");
@@ -600,6 +864,7 @@ pub(crate) fn test_assessment_record(
             terminal_event_idx: 12,
         }),
         output,
+        coding: None,
         outcome,
         created_at: "2026-09-19 00:00:00".into(),
     };
@@ -620,7 +885,7 @@ mod tests {
         let request = serde_json::from_value(serde_json::json!({
             "submission_idempotency_key": "assessment-test",
             "target": {"kind":"prompt", "baseline":{"revision_id":"base","content":"base"}, "candidate":{"revision_id":"candidate","content":"candidate"}},
-            "case":{"case_id":"case", "message":"return JSON", "holdout":false, "verifier_config":{"expected":{"ok":true}}},
+            "case":{"case_id":"case", "message":"return JSON", "holdout":false, "verifier_config":{"kind":"json_value_equals","expected":{"ok":true}}},
             "model_offering_id":"model", "max_concurrency":1,"max_wall_time_secs":30
         })).unwrap();
         let spec = build_prepared_experiment_spec(

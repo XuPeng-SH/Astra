@@ -2021,14 +2021,29 @@ async fn execute_bash_with_filesystem_boundary_inner(
             }
         }
     }
+    let isolated_home = boundary_root.join(".git").to_string_lossy().into_owned();
     let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
         boundary_root,
         canonical_read_only_paths,
     );
+    config.net_namespace = !ctx.sandbox.network_allowed;
     workdir.install_on_isolation_config(&mut config);
     config.timeout = Duration::from_secs_f64(timeout_secs);
     config.max_output_bytes = per_tool_output_limit("bash");
-    let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
+    let mut environment = if ctx.sandbox.network_allowed {
+        std::env::vars().collect::<std::collections::HashMap<_, _>>()
+    } else {
+        std::collections::HashMap::from([
+            ("HOME".to_string(), isolated_home),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            ),
+            ("TZ".to_string(), "UTC".to_string()),
+        ])
+    };
     astra_sandbox::scrub_secrets_from_env(&mut environment);
     let output = astra_sandbox::execute_isolated_with_cancel(
         command,

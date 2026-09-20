@@ -229,7 +229,7 @@ fn prepared_experiment_body() -> body::Body {
             "case": {
                 "case_id": "case-1",
                 "message": "fixed input",
-                "verifier_config": {"expected": {"ok": true}},
+                "verifier_config": {"kind":"json_value_equals", "expected": {"ok": true}},
                 "holdout": false
             },
             "model_offering_id": "model",

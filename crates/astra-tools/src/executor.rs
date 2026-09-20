@@ -296,6 +296,15 @@ impl DefaultToolExecutor {
         self
     }
 
+    /// Require the process sandbox to create an isolated network namespace.
+    /// Evaluation workspaces use this together with the filesystem boundary;
+    /// namespace unavailability therefore rejects execution rather than
+    /// degrading to host networking.
+    pub fn with_network_isolation(mut self) -> Self {
+        self.ctx.sandbox.network_allowed = false;
+        self
+    }
+
     /// Install the host's detach slot so the bash runner can hand
     /// off live children to the BackgroundTaskRegistry on Ctrl+B.
     /// `None` is the default (no detach plumbing — bash runs through

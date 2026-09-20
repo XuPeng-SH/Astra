@@ -39,6 +39,7 @@ tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools.workspace = true
+astra-sandbox.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true

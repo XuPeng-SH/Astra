@@ -233,6 +233,14 @@ pub struct EdgeWorkspaceOperationResult {
     pub source_commit: Option<String>,
     pub source_tree: Option<String>,
     pub clean: bool,
+    pub base_revision: Option<String>,
+    pub result_revision: Option<String>,
+    pub patch: Option<String>,
+    pub verifier_exit_code: Option<i32>,
+    pub verifier_output: Option<String>,
+    pub namespace_active: bool,
+    pub scope_settled: bool,
+    pub timed_out: bool,
     pub error: Option<String>,
 }
 
@@ -804,6 +812,8 @@ impl EdgeConnectionPool {
             user_id,
             edge_agent_id,
             timeout,
+            None,
+            false,
             |request_id, connection_generation| EdgeServerMessage::WorkspacePrepare {
                 request_id,
                 connection_generation,
@@ -827,10 +837,48 @@ impl EdgeConnectionPool {
             user_id,
             edge_agent_id,
             timeout,
+            None,
+            false,
             |request_id, connection_generation| EdgeServerMessage::WorkspaceSnapshotRequest {
                 request_id,
                 connection_generation,
                 workspace_dir: workspace_dir.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn finalize_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_dir: &str,
+        source_commit: &str,
+        verifier_command: &str,
+        verifier_timeout_secs: u64,
+        timeout: Duration,
+        cancel_token: &CancellationToken,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        let deadline_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .saturating_add(timeout.as_millis());
+        let deadline_unix_ms = u64::try_from(deadline_unix_ms).ok()?;
+        self.request_workspace_operation(
+            user_id,
+            edge_agent_id,
+            timeout,
+            Some(cancel_token),
+            true,
+            |request_id, connection_generation| EdgeServerMessage::WorkspaceFinalize {
+                request_id,
+                connection_generation,
+                workspace_dir: workspace_dir.to_string(),
+                source_commit: source_commit.to_string(),
+                verifier_command: verifier_command.to_string(),
+                verifier_timeout_secs,
+                finalization_deadline_unix_ms: deadline_unix_ms,
             },
         )
         .await
@@ -871,11 +919,14 @@ impl EdgeConnectionPool {
         user_id: &str,
         edge_agent_id: &str,
         timeout: Duration,
+        cancel_token: Option<&CancellationToken>,
+        cancel_finalize: bool,
         build_message: F,
     ) -> Option<EdgeWorkspaceOperationResult>
     where
         F: FnOnce(String, u64) -> EdgeServerMessage,
     {
+        let deadline = tokio::time::Instant::now() + timeout;
         let key = pool_key(user_id, edge_agent_id);
         let (generation, sender) = {
             let entry = self.connections.get(&key)?;
@@ -893,21 +944,44 @@ impl EdgeConnectionPool {
                 sender: tx,
             },
         );
-        if sender
-            .send(build_message(request_id.clone(), generation))
-            .await
-            .is_err()
-        {
+        let message = build_message(request_id.clone(), generation);
+        let sent = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                result = sender.send(message) => result.is_ok(),
+                _ = cancel_token.cancelled() => false,
+                _ = tokio::time::sleep_until(deadline) => false,
+            }
+        } else {
+            tokio::select! {
+                result = sender.send(message) => result.is_ok(),
+                _ = tokio::time::sleep_until(deadline) => false,
+            }
+        };
+        if !sent {
             self.workspace_operations.remove(&request_id);
             return None;
         }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => Some(result),
-            _ => {
-                self.workspace_operations.remove(&request_id);
-                None
+        let result = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline, rx) => result.ok().and_then(Result::ok),
+                _ = cancel_token.cancelled() => None,
+            }
+        } else {
+            tokio::time::timeout_at(deadline, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        if result.is_none() {
+            self.workspace_operations.remove(&request_id);
+            if cancel_finalize {
+                let _ = sender.try_send(EdgeServerMessage::WorkspaceFinalizeCancel {
+                    request_id,
+                    connection_generation: generation,
+                });
             }
         }
+        result
     }
 
     /// Deliver a workspace operation result only to the connection generation

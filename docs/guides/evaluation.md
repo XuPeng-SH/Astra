@@ -53,7 +53,7 @@ Send `POST /evaluation/experiments/prepare` with your revision and Offering IDs:
   "case": {
     "case_id": "structured-result",
     "message": "Apply the Skill and return exactly the JSON result.",
-    "verifier_config": {"expected": {"ok": true}}
+    "verifier_config": {"kind": "json_value_equals", "expected": {"ok": true}}
   },
   "model_offering_id": "OFFERING_ID",
   "max_concurrency": 1,
@@ -73,6 +73,27 @@ full commit to evaluate, and the exact built-in tools the model may see:
   }
 }
 ```
+
+Replace the case verifier with the frozen command that establishes the coding
+claim:
+
+```json
+{
+  "verifier_config": {
+    "kind": "workspace_command",
+    "command": "make check",
+    "expected_exit_code": 0,
+    "timeout_secs": 120
+  }
+}
+```
+
+The command runs after agent execution with network disabled against a clean
+clone reconstructed from the captured patch. Its output, exit code, final
+patch, source identity, and isolation proof are persisted before the workspace
+can be released. Symlinks and nested Git repositories are unsupported in this
+profile. Missing replay, isolation, settlement, or a mutating verifier is
+reported as unavailable.
 
 The server freezes this policy into the experiment. The selected Edge must be
 registered for the owner with the same root and materialization identity, and
@@ -122,8 +143,8 @@ never trigger execution or verification.
 | Result | Meaning |
 | --- | --- |
 | Run completed | Execution ended successfully; the task criterion may still fail. |
-| Assessment pass | The complete recorded output matched the frozen JSON criterion. |
-| Assessment fail | The complete recorded output did not match that criterion. |
+| Assessment pass | The frozen JSON criterion matched, or the frozen workspace command completed with its expected exit code and complete evidence. |
+| Assessment fail | The applicable frozen criterion was evaluated and did not pass. |
 | Assessment unavailable | A proven limitation prevents a criterion verdict; no success value is assigned. |
 | Assessment pending | Evidence is not ready; retry assessment without rerunning the trial. |
 | Metric gap | That dimension lacks sufficient measurement evidence. |
@@ -166,7 +187,7 @@ published Skill revision on both arms:
   "case": {
     "case_id": "routing-case",
     "message": "Review the current branch and report the findings.",
-    "verifier_config": {"expected": {"ok": true}}
+    "verifier_config": {"kind": "json_value_equals", "expected": {"ok": true}}
   },
   "model_offering_id": "PRIMARY_OFFERING_ID",
   "judgment_model_offering_id": "JEV_OFFERING_ID",

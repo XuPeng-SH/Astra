@@ -224,8 +224,10 @@ monetary estimate. The current frozen adapter does not switch providers, so a
 complete zero proves route consistency for that run; it does not claim that a
 Jev-to-LLM fallback chain is enabled.
 
-The prepare API requires `case.verifier_config.expected` for the
-`json_value_equals` verifier version `1`. The server records the implementation
+The prepare API requires one tagged `case.verifier_config`. Prompt-only cases
+use `json_value_equals` version `1`; workspace coding cases use
+`workspace_command` version `1` with a frozen command, expected exit code, and
+timeout. The server records the implementation
 manifest, fixed rubric, and canonical configuration hashes in the case; these
 are part of the experiment identity. The expected value is evaluator input,
 never trial prompt content. A changed configuration conflicts on submission
@@ -233,6 +235,15 @@ retry. Cases carry the complete frozen verifier contract; separate caller-provid
 verifier identity fields are not accepted. The shared pure JSON criterion
 is also used by the test harness: it consumes the complete document and uses
 JSON value equality, without extracting code fences or interpreting prose.
+The workspace verifier runs only after agent execution settles. Edge captures
+the final Git patch, applies it to a second clean clone, executes the command
+against that replay with evaluator-owned Git metadata read-only, filesystem and
+network namespace isolation, and a deterministic environment, then proves the
+replayed Git tree did not change during verification. Symlinks and nested Git
+metadata are outside this first coding profile and fail closed. Server persists the patch, output, exit
+code, source/tree identity, and isolation facts before terminal settlement.
+Missing capture, isolation, settlement, or artifact persistence yields an
+unavailable assessment rather than inferred success.
 Canonical atomic terminal settlement now writes `run_output_recorded` in the
 same transaction, binding the output to its owner, Session, Run, generation,
 and transcript `source_event_id`, with a content-only hash and byte count.
@@ -465,12 +476,12 @@ receipt set; cleanup may remove only the instance whose ownership the
 materializer can prove. Edge disconnect does not authorize Server-local
 fallback.
 
-The adapter now admits real Edge file/shell calls through the canonical tool
-dispatch path and records the source checkout as a receipt. Acceptance still
-requires an end-to-end Edge client run that produces test output and patch
-evidence for a coding claim; the current report exposes the canonical tool
-ledger and Run/output evidence but does not synthesize a patch or infer test
-success from tool names. Wrong owner, stale binding, unavailable runner,
+The adapter admits real Edge file/shell calls through the canonical tool
+dispatch path and records the source checkout as a receipt. Coding assessment
+now captures a durable final patch and runs the frozen verifier against a clean
+materialization of that patch; it never infers test success from tool names or final
+text. Acceptance still requires an end-to-end Edge client run across the public
+control plane. Wrong owner, stale binding, unavailable runner,
 cancellation, and tool-result replay must follow their canonical contracts.
 Reports distinguish Run completion, Skill invocation, verifier success, and
 missing evidence. A workspace receipt therefore enables the execution path;

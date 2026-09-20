@@ -279,7 +279,7 @@ mod tests {
             r#"{{
                 "submission_idempotency_key":"cli-test",
                 "target":{{"kind":"skill_routing_judgment","skill_name":"review","baseline":{{"revision_id":"v1"}},"candidate":{{"revision_id":"v1"}}}},
-                "case":{{"case_id":"case-1","message":"return json","verifier_config":{{"expected":{{"ok":true}}}}}},
+                "case":{{"case_id":"case-1","message":"return json","verifier_config":{{"kind":"json_value_equals","expected":{{"ok":true}}}}}},
                 "model_offering_id":"primary",
                 "judgment_model_offering_id":"jev",
                 "max_concurrency":1,

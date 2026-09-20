@@ -51,6 +51,9 @@ const GIT_STDERR_LIMIT: usize = 64 * 1024;
 const MAX_CLEAN_PROOF_ENTRIES: usize = 65_536;
 const MAX_CLEAN_PROOF_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CLEAN_PROOF_DEPTH: usize = 1_024;
+const MAX_EVALUATION_PATCH_BYTES: usize = 144 * 1024;
+const MAX_EVALUATION_VERIFIER_OUTPUT_BYTES: usize = 48 * 1024;
+const MAX_EDGE_FINALIZATION_MESSAGE_BYTES: usize = 240 * 1024;
 
 #[derive(Clone)]
 struct EdgeExecutionBudget {
@@ -191,6 +194,17 @@ struct InFlightEdgeInvocation {
 #[derive(Default)]
 struct EdgeInvocationTracker {
     in_flight: HashMap<String, InFlightEdgeInvocation>,
+}
+
+struct FinalizationCancellationGuard(Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>);
+
+impl Drop for FinalizationCancellationGuard {
+    fn drop(&mut self) {
+        let finalizations = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        for cancel in finalizations.values() {
+            cancel.cancel();
+        }
+    }
 }
 
 impl EdgeInvocationTracker {
@@ -1229,6 +1243,388 @@ fn release_evaluation_workspace(
         .map_err(|error| format!("failed to remove evaluation workspace: {error}"))
 }
 
+#[derive(Debug)]
+struct EvaluationWorkspaceFinalization {
+    workspace_dir: String,
+    source_commit: String,
+    source_tree: String,
+    base_revision: String,
+    result_revision: String,
+    patch: String,
+    verifier_exit_code: Option<i32>,
+    verifier_output: String,
+    namespace_active: bool,
+    scope_settled: bool,
+    timed_out: bool,
+}
+
+fn copy_evaluation_snapshot(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    fn copy_dir(
+        root: &Path,
+        directory: &Path,
+        destination: &Path,
+        entries: &mut usize,
+        bytes: &mut u64,
+        cancel: &CancellationToken,
+        depth: usize,
+    ) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("evaluation finalization cancelled".into());
+        }
+        if depth > MAX_CLEAN_PROOF_DEPTH {
+            return Err("evaluation workspace nesting is too deep".into());
+        }
+        let mut children = Vec::new();
+        for child in std::fs::read_dir(directory)
+            .map_err(|error| format!("cannot read evaluation workspace: {error}"))?
+        {
+            if cancel.is_cancelled() {
+                return Err("evaluation finalization cancelled".into());
+            }
+            if children.len() >= MAX_CLEAN_PROOF_ENTRIES {
+                return Err("evaluation workspace directory contains too many entries".into());
+            }
+            children.push(
+                child.map_err(|error| format!("cannot enumerate evaluation workspace: {error}"))?,
+            );
+        }
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for child in children {
+            if directory == root && child.file_name() == ".git" {
+                continue;
+            }
+            *entries = entries.saturating_add(1);
+            if *entries > MAX_CLEAN_PROOF_ENTRIES {
+                return Err("evaluation workspace contains too many entries".into());
+            }
+            let source_path = child.path();
+            let relative = source_path
+                .strip_prefix(root)
+                .map_err(|_| "evaluation workspace entry escaped its root")?;
+            if relative
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+            {
+                return Err("nested Git metadata is unsupported in evaluation workspaces".into());
+            }
+            let target = destination.join(relative);
+            let metadata = std::fs::symlink_metadata(&source_path)
+                .map_err(|error| format!("cannot inspect evaluation workspace entry: {error}"))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                std::fs::create_dir_all(&target)
+                    .map_err(|error| format!("cannot create replay directory: {error}"))?;
+                copy_dir(
+                    root,
+                    &source_path,
+                    destination,
+                    entries,
+                    bytes,
+                    cancel,
+                    depth + 1,
+                )?;
+            } else if metadata.file_type().is_symlink() {
+                return Err("symlinks are unsupported in evaluation workspaces".into());
+            } else if metadata.is_file() {
+                *bytes = bytes.saturating_add(metadata.len());
+                if *bytes > MAX_CLEAN_PROOF_BYTES {
+                    return Err("evaluation workspace snapshot is too large".into());
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(nix::libc::O_NOFOLLOW);
+                }
+                let input = options
+                    .open(&source_path)
+                    .map_err(|error| format!("cannot open evaluation workspace file: {error}"))?;
+                let mut output = std::fs::File::create(&target)
+                    .map_err(|error| format!("cannot create replay file: {error}"))?;
+                let remaining =
+                    MAX_CLEAN_PROOF_BYTES.saturating_sub(bytes.saturating_sub(metadata.len()));
+                let copied =
+                    std::io::copy(&mut input.take(remaining.saturating_add(1)), &mut output)
+                        .map_err(|error| {
+                            format!("cannot copy evaluation workspace file: {error}")
+                        })?;
+                if copied != metadata.len() || copied > remaining {
+                    return Err(
+                        "evaluation workspace changed or exceeded its snapshot limit while copying"
+                            .into(),
+                    );
+                }
+                std::fs::set_permissions(&target, metadata.permissions())
+                    .map_err(|error| format!("cannot preserve replay permissions: {error}"))?;
+            } else {
+                return Err("evaluation workspace contains an unsupported entry type".into());
+            }
+        }
+        Ok(())
+    }
+
+    for entry in std::fs::read_dir(destination)
+        .map_err(|error| format!("cannot read replay workspace: {error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("cannot enumerate replay workspace: {error}"))?
+            .path();
+        if path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect replay entry: {error}"))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .map_err(|error| format!("cannot clear replay workspace: {error}"))?;
+    }
+    copy_dir(source, source, destination, &mut 0, &mut 0, cancel, 0)
+}
+
+async fn finalize_evaluation_workspace(
+    base_workspace: &Path,
+    requested_workspace: &Path,
+    frozen_source_commit: &str,
+    verifier_command: &str,
+    verifier_timeout_secs: u64,
+    cancel: CancellationToken,
+) -> Result<EvaluationWorkspaceFinalization, String> {
+    if verifier_command.trim().is_empty()
+        || verifier_command.len() > 4_096
+        || !(1..=1_800).contains(&verifier_timeout_secs)
+    {
+        return Err("invalid frozen workspace verifier".into());
+    }
+    struct PreparedReplay {
+        workspace_dir: String,
+        verification: PathBuf,
+        source: WorkspaceSourceIdentity,
+        base_revision: String,
+        result_revision: String,
+        result_tree: String,
+        patch: String,
+    }
+
+    let base_workspace = base_workspace.to_path_buf();
+    let requested_workspace = requested_workspace.to_path_buf();
+    let frozen_source_commit = frozen_source_commit.to_string();
+    let prepare_cancel = cancel.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let workspace = validate_workspace_override(&base_workspace, &requested_workspace)?;
+        let source = workspace_source_identity(&workspace)
+            .ok_or_else(|| "workspace source identity is unavailable".to_string())?;
+        if source.commit != frozen_source_commit {
+            return Err("workspace source commit differs from the frozen commit".into());
+        }
+        let nonce = uuid::Uuid::new_v4();
+        let capture = workspace.with_file_name(format!(".astra-evaluation-capture-{nonce}"));
+        let verification = workspace.with_file_name(format!(".astra-evaluation-verify-{nonce}"));
+        let verification_cleanup = verification.clone();
+        let operation = (|| {
+            for (path, label) in [(&capture, "capture"), (&verification, "verification")] {
+                let mut clone =
+                    astra_tools::workspace_observation::hardened_git_command(&base_workspace)
+                        .ok_or_else(|| "trusted Git executable is unavailable".to_string())?;
+                clone
+                    .args(["clone", "--no-local", "--no-checkout"])
+                    .arg(&base_workspace)
+                    .arg(path);
+                let cloned = run_git_command_with_cancel(
+                    clone,
+                    &format!("git clone for evaluation {label}"),
+                    Some(&prepare_cancel),
+                )?;
+                if !cloned.status.success() {
+                    return Err(git_failure(
+                        &cloned,
+                        &format!("clone for evaluation {label}"),
+                    ));
+                }
+                sanitize_evaluation_git_config(path)?;
+                let checkout = git_command_with_cancel(
+                    path,
+                    &["checkout", "--detach", "--force", &frozen_source_commit],
+                    Some(&prepare_cancel),
+                )?;
+                if !checkout.status.success() {
+                    return Err(git_failure(
+                        &checkout,
+                        &format!("checkout evaluation {label}"),
+                    ));
+                }
+            }
+            let replay_source = verify_evaluation_workspace(&capture, &frozen_source_commit)?;
+            let verification_source =
+                verify_evaluation_workspace(&verification, &frozen_source_commit)?;
+            if replay_source.tree != source.tree || verification_source != replay_source {
+                return Err("workspace source identity differs from the trusted replay".into());
+            }
+            copy_evaluation_snapshot(&workspace, &capture, &prepare_cancel)?;
+            let added = git_command_with_cancel(
+                &capture,
+                &["add", "--all", "--force", "--"],
+                Some(&prepare_cancel),
+            )?;
+            if !added.status.success() {
+                return Err(git_failure(&added, "stage evaluation capture"));
+            }
+            let diff = git_command_with_cancel(
+                &capture,
+                &[
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-ext-diff",
+                    "HEAD",
+                    "--",
+                ],
+                Some(&prepare_cancel),
+            )?;
+            if !diff.status.success() {
+                return Err(git_failure(&diff, "capture evaluation patch"));
+            }
+            if diff.stdout.len() > MAX_EVALUATION_PATCH_BYTES {
+                return Err("evaluation patch exceeds the Edge evidence limit".into());
+            }
+            let patch = String::from_utf8(diff.stdout)
+                .map_err(|_| "workspace patch is not valid UTF-8".to_string())?;
+            if !patch.is_empty() {
+                let patch_path = verification.join(".git").join("astra-evaluation.patch");
+                std::fs::write(&patch_path, patch.as_bytes()).map_err(|error| {
+                    format!("cannot stage evaluation patch for replay: {error}")
+                })?;
+                let mut apply =
+                    astra_tools::workspace_observation::hardened_git_command(&verification)
+                        .ok_or_else(|| "trusted Git executable is unavailable".to_string())?;
+                apply
+                    .args(["apply", "--index", "--binary", "--whitespace=nowarn", "--"])
+                    .arg(&patch_path);
+                let applied = run_git_command_with_cancel(
+                    apply,
+                    "git apply evaluation patch",
+                    Some(&prepare_cancel),
+                )?;
+                let _ = std::fs::remove_file(&patch_path);
+                if !applied.status.success() {
+                    return Err(git_failure(&applied, "apply evaluation patch"));
+                }
+            }
+            let tree =
+                git_command_with_cancel(&verification, &["write-tree"], Some(&prepare_cancel))?;
+            if !tree.status.success() {
+                return Err(git_failure(&tree, "write evaluation result tree"));
+            }
+            let result_tree = String::from_utf8(tree.stdout)
+                .map_err(|_| "evaluation result tree is not UTF-8".to_string())?
+                .trim()
+                .to_string();
+            let base_revision = format!("git-tree:{}", replay_source.tree);
+            let mut revision = Sha256::new();
+            revision.update(replay_source.tree.as_bytes());
+            revision.update([0]);
+            revision.update(patch.as_bytes());
+            Ok(PreparedReplay {
+                workspace_dir: workspace.to_string_lossy().into_owned(),
+                verification,
+                source: replay_source,
+                base_revision,
+                result_revision: format!("sha256:{:x}", revision.finalize()),
+                result_tree,
+                patch,
+            })
+        })();
+        let _ = std::fs::remove_dir_all(&capture);
+        if operation.is_err() {
+            let _ = std::fs::remove_dir_all(&verification_cleanup);
+        }
+        operation
+    })
+    .await
+    .map_err(|error| format!("evaluation replay preparation task failed: {error}"))??;
+
+    let mut preserve_unsettled_workspace = false;
+    let result = async {
+        let mut config = astra_sandbox::IsolationConfig::strict(prepared.verification.clone());
+        config.timeout = Duration::from_secs(verifier_timeout_secs);
+        config.max_output_bytes = MAX_EVALUATION_VERIFIER_OUTPUT_BYTES;
+        config
+            .read_only_paths
+            .push(prepared.verification.join(".git"));
+        let environment = std::collections::HashMap::from([
+            ("HOME".to_string(), "/tmp/astra-evaluation-home".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            ),
+            ("TZ".to_string(), "UTC".to_string()),
+        ]);
+        let output = astra_sandbox::execute_isolated_with_cancel(
+            verifier_command,
+            &environment,
+            &config,
+            Some(&cancel),
+        )
+        .await;
+        if !output.scope_settled {
+            preserve_unsettled_workspace = output.execution_started;
+            return Err("workspace verifier process scope did not settle".into());
+        }
+        let verification = prepared.verification.clone();
+        let result_tree = prepared.result_tree.clone();
+        let verify_cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let added = git_command_with_cancel(
+                &verification,
+                &["add", "--all", "--force", "--"],
+                Some(&verify_cancel),
+            )?;
+            if !added.status.success() {
+                return Err(git_failure(&added, "stage post-verifier workspace"));
+            }
+            let tree =
+                git_command_with_cancel(&verification, &["write-tree"], Some(&verify_cancel))?;
+            if !tree.status.success() {
+                return Err(git_failure(&tree, "write post-verifier tree"));
+            }
+            let observed = String::from_utf8(tree.stdout)
+                .map_err(|_| "post-verifier tree is not UTF-8".to_string())?;
+            if observed.trim() != result_tree {
+                return Err("workspace verifier modified the replayed result".into());
+            }
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|error| format!("post-verifier observation task failed: {error}"))??;
+        Ok(EvaluationWorkspaceFinalization {
+            workspace_dir: prepared.workspace_dir.clone(),
+            source_commit: prepared.source.commit.clone(),
+            source_tree: prepared.source.tree.clone(),
+            base_revision: prepared.base_revision.clone(),
+            result_revision: prepared.result_revision.clone(),
+            patch: prepared.patch.clone(),
+            verifier_exit_code: output.exit_code,
+            verifier_output: output.combined_output(),
+            namespace_active: output.namespace_active,
+            scope_settled: output.scope_settled,
+            timed_out: output.timed_out,
+        })
+    }
+    .await;
+    if !preserve_unsettled_workspace {
+        let _ = std::fs::remove_dir_all(&prepared.verification);
+    }
+    result
+}
+
 fn independent_git_checkout(workspace: &Path) -> bool {
     independent_git_checkout_with_cancel(workspace, None)
 }
@@ -1865,6 +2261,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();
     let mut tasks = JoinSet::new();
+    let finalizations = Arc::new(std::sync::Mutex::new(
+        HashMap::<String, CancellationToken>::new(),
+    ));
+    let _finalization_cancellation_guard = FinalizationCancellationGuard(finalizations.clone());
     let journal_path = edge_invocation_journal_path_in_root(
         &config.edge_id,
         &workspace,
@@ -2127,7 +2527,8 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                                         "astra-edge/0.1",
                                                         Duration::from_secs(30),
                                                     )
-                                                    .with_filesystem_write_boundary(Vec::new()),
+                                                    .with_filesystem_write_boundary(Vec::new())
+                                                    .with_network_isolation(),
                                                 )
                                             })
                                             .clone()
@@ -2302,6 +2703,132 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         .await;
                                 });
                             }
+                            Ok(EdgeServerMessage::WorkspaceFinalize {
+                                request_id,
+                                connection_generation,
+                                workspace_dir,
+                                source_commit,
+                                verifier_command,
+                                verifier_timeout_secs,
+                                finalization_deadline_unix_ms,
+                            }) => {
+                                let operation_tx = workspace_operation_tx.clone();
+                                let base_workspace = workspace.clone();
+                                let requested_workspace = PathBuf::from(&workspace_dir);
+                                let response_request_id = request_id.clone();
+                                let response_workspace_dir = workspace_dir.clone();
+                                let cancel = CancellationToken::new();
+                                finalizations
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(request_id.clone(), cancel.clone());
+                                let finalizations = finalizations.clone();
+                                tokio::spawn(async move {
+                                    let now_unix_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .ok()
+                                        .and_then(|value| u64::try_from(value.as_millis()).ok());
+                                    let remaining_ms = now_unix_ms
+                                        .and_then(|now| finalization_deadline_unix_ms.checked_sub(now))
+                                        .filter(|remaining| *remaining > 0);
+                                    let result = if let Some(remaining_ms) = remaining_ms {
+                                        let execution = finalize_evaluation_workspace(
+                                            &base_workspace,
+                                            &requested_workspace,
+                                            &source_commit,
+                                            &verifier_command,
+                                            verifier_timeout_secs,
+                                            cancel.clone(),
+                                        );
+                                        tokio::pin!(execution);
+                                        match tokio::time::timeout(
+                                            Duration::from_millis(remaining_ms),
+                                            &mut execution,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                cancel.cancel();
+                                                execution.await
+                                            }
+                                        }
+                                    } else {
+                                        Err("evaluation finalization deadline expired before Edge execution".into())
+                                    };
+                                    finalizations
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .remove(&request_id);
+                                    let mut message = match result {
+                                        Ok(result) => EdgeClientMessage::WorkspaceFinalized {
+                                            request_id,
+                                            connection_generation,
+                                            workspace_dir: result.workspace_dir,
+                                            source_commit: Some(result.source_commit),
+                                            source_tree: Some(result.source_tree),
+                                            base_revision: Some(result.base_revision),
+                                            result_revision: Some(result.result_revision),
+                                            patch: Some(result.patch),
+                                            verifier_exit_code: result.verifier_exit_code,
+                                            verifier_output: Some(result.verifier_output),
+                                            namespace_active: result.namespace_active,
+                                            scope_settled: result.scope_settled,
+                                            timed_out: result.timed_out,
+                                            error: None,
+                                        },
+                                        Err(error) => EdgeClientMessage::WorkspaceFinalized {
+                                            request_id,
+                                            connection_generation,
+                                            workspace_dir,
+                                            source_commit: None,
+                                            source_tree: None,
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
+                                            error: Some(error),
+                                        },
+                                    };
+                                    if serde_json::to_vec(&message)
+                                        .is_ok_and(|bytes| bytes.len() > MAX_EDGE_FINALIZATION_MESSAGE_BYTES)
+                                    {
+                                        message = EdgeClientMessage::WorkspaceFinalized {
+                                            request_id: response_request_id,
+                                            connection_generation,
+                                            workspace_dir: response_workspace_dir,
+                                            source_commit: None,
+                                            source_tree: None,
+                                            base_revision: None,
+                                            result_revision: None,
+                                            patch: None,
+                                            verifier_exit_code: None,
+                                            verifier_output: None,
+                                            namespace_active: false,
+                                            scope_settled: false,
+                                            timed_out: false,
+                                            error: Some("evaluation evidence exceeds the Edge protocol limit".into()),
+                                        };
+                                    }
+                                    let _ = operation_tx.send(message).await;
+                                });
+                            }
+                            Ok(EdgeServerMessage::WorkspaceFinalizeCancel {
+                                request_id,
+                                connection_generation: _,
+                            }) => {
+                                if let Some(cancel) = finalizations
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .get(&request_id)
+                                {
+                                    cancel.cancel();
+                                }
+                            }
                             Ok(EdgeServerMessage::WorkspaceRelease {
                                 connection_generation,
                                 workspace_dir,
@@ -2421,6 +2948,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         }
     }
 
+    invocations.cancel_all();
     Ok(())
     }.await;
 

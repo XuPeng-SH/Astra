@@ -74,7 +74,7 @@ pub struct EvaluationPrepareCase {
     #[serde(default)]
     pub holdout: bool,
     /// Required task criterion. Implementation identity is frozen by the server.
-    pub verifier_config: super::task_verifier::JsonValueEqualsConfig,
+    pub verifier_config: super::task_verifier::TaskVerifierConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -130,7 +130,7 @@ mod tests {
         let valid = json!({
             "case_id": "case-1",
             "message": "Return the expected JSON",
-            "verifier_config": {"expected": {"ok": true}}
+            "verifier_config": {"kind":"json_value_equals", "expected": {"ok": true}}
         });
         assert!(serde_json::from_value::<EvaluationPrepareCase>(valid.clone()).is_ok());
         let mut missing = valid.clone();

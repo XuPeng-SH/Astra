@@ -74,6 +74,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
   const [edgeExecutorId, setEdgeExecutorId] = useState('');
   const [sourceCommit, setSourceCommit] = useState('');
   const [workspaceTools, setWorkspaceTools] = useState('read_file,write_file,bash');
+  const [verifierCommand, setVerifierCommand] = useState('make check');
   const [caseId, setCaseId] = useState('routing-case');
   const [message, setMessage] = useState('Apply the pinned Skill and return exactly the expected JSON.');
   const [expectedJson, setExpectedJson] = useState(defaultExpected);
@@ -379,12 +380,14 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       setError('Select the pinned published Skill revisions and a primary Offering first.');
       return;
     }
-    let expected: unknown;
-    try {
-      expected = JSON.parse(expectedJson);
-    } catch (reason) {
-      setError(`Expected JSON is invalid: ${reason instanceof Error ? reason.message : String(reason)}`);
-      return;
+    let expected: unknown = null;
+    if (!workspaceEnabled) {
+      try {
+        expected = JSON.parse(expectedJson);
+      } catch (reason) {
+        setError(`Expected JSON is invalid: ${reason instanceof Error ? reason.message : String(reason)}`);
+        return;
+      }
     }
     const wall = Number(wallTimeSecs);
     if (!Number.isSafeInteger(wall) || wall < 1) {
@@ -402,6 +405,10 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       setError('Fill in the Edge executor, full source commit, and at least one workspace tool.');
       return;
     }
+    if (workspaceEnabled && !verifierCommand.trim()) {
+      setError('Enter a frozen verifier command for the workspace comparison.');
+      return;
+    }
     const payload: Record<string, unknown> = {
       submission_idempotency_key: `web-skill-routing-${crypto.randomUUID()}`,
       target: {
@@ -413,7 +420,9 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       case: {
         case_id: caseId.trim() || 'routing-case',
         message: message.trim(),
-        verifier_config: { expected },
+        verifier_config: workspaceEnabled
+          ? { kind: 'workspace_command', command: verifierCommand.trim(), expected_exit_code: 0, timeout_secs: wall }
+          : { kind: 'json_value_equals', expected },
       },
       model_offering_id: primaryOfferingId,
       ...(comparisonKind === 'skill_routing_judgment' && judgmentOfferingId
@@ -424,7 +433,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       ...(workspace ? { workspace } : {}),
     };
     await executeIntent(payload);
-  }, [baselineVersionId, candidateVersionId, caseId, comparisonKind, edgeExecutorId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, sourceCommit, wallTimeSecs, workspaceEnabled, workspaceTools]);
+  }, [baselineVersionId, candidateVersionId, caseId, comparisonKind, edgeExecutorId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, sourceCommit, verifierCommand, wallTimeSecs, workspaceEnabled, workspaceTools]);
 
   const resumeSavedComparison = useCallback(async () => {
     if (!savedIntent) return;
@@ -552,6 +561,10 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
                     <Input value={workspaceTools} onChange={(event) => setWorkspaceTools(event.target.value)} disabled={busy} placeholder="read_file,write_file,bash" className="mt-1.5 font-mono text-xs" />
                     <span className="mt-1.5 block text-xs font-normal text-text-muted">Comma-separated built-in tools. Only the frozen list is visible to the model.</span>
                   </label>
+                  <label className="text-sm font-medium sm:col-span-2">Verifier command
+                    <Input value={verifierCommand} onChange={(event) => setVerifierCommand(event.target.value)} disabled={busy} placeholder="make check" className="mt-1.5 font-mono text-xs" />
+                    <span className="mt-1.5 block text-xs font-normal text-text-muted">Runs once after the agent settles, without network access. The patch, command output, exit code, and workspace identity become durable evidence.</span>
+                  </label>
                 </div>
               ) : null}
             </div>
@@ -566,9 +579,9 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
               </label>
             </div>
 
-            <label className="mt-4 block text-sm font-medium">Expected JSON
+            {!workspaceEnabled ? <label className="mt-4 block text-sm font-medium">Expected JSON
               <Textarea value={expectedJson} onChange={(event) => setExpectedJson(event.target.value)} disabled={busy} className="mt-1.5 min-h-32 font-mono text-xs" />
-            </label>
+            </label> : null}
 
             <div className="mt-4 flex flex-wrap items-end justify-between gap-4">
               <label className="text-sm font-medium">Max wall time per trial

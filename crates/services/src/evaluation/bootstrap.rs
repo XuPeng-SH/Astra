@@ -966,7 +966,8 @@ mod tests {
                 holdout: false,
                 verifier_config: crate::evaluation::task_verifier::JsonValueEqualsConfig {
                     expected: serde_json::json!({"ok": true}),
-                },
+                }
+                .into(),
             },
             model_offering_id: "model-1".to_string(),
             workspace: None,
@@ -981,7 +982,8 @@ mod tests {
         let mut request = prepared_request(EvaluationTargetKind::Prompt);
         request.case.verifier_config = super::super::task_verifier::JsonValueEqualsConfig {
             expected: serde_json::json!({"private_expected_answer": 42}),
-        };
+        }
+        .into();
         let spec = build_prepared_experiment_spec(
             "owner-1",
             "evx_prepare",
@@ -1021,8 +1023,10 @@ mod tests {
         );
         assert!(prepared_request_matches_spec(&request, &spec));
         let mut changed_verifier = request.clone();
-        changed_verifier.case.verifier_config.expected =
-            serde_json::json!({"private_expected_answer": 43});
+        changed_verifier.case.verifier_config =
+            super::super::task_verifier::TaskVerifierConfig::JsonValueEquals {
+                expected: serde_json::json!({"private_expected_answer": 43}),
+            };
         assert!(!prepared_request_matches_spec(&changed_verifier, &spec));
         assert_eq!(
             spec.target.baseline.content_hash,

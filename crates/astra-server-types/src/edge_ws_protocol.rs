@@ -159,6 +159,27 @@ pub enum EdgeClientMessage {
         error: Option<String>,
     },
 
+    /// Durable coding evidence captured after agent execution and before the
+    /// per-trial workspace lease may be released.
+    #[serde(rename = "edge_workspace_finalized")]
+    WorkspaceFinalized {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        base_revision: Option<String>,
+        result_revision: Option<String>,
+        patch: Option<String>,
+        verifier_exit_code: Option<i32>,
+        verifier_output: Option<String>,
+        namespace_active: bool,
+        scope_settled: bool,
+        timed_out: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
@@ -218,6 +239,26 @@ pub enum EdgeServerMessage {
         workspace_dir: String,
     },
 
+    /// Capture the final patch and execute the server-frozen verifier in the
+    /// exact trial workspace. This operation is independent from model tools.
+    #[serde(rename = "edge_workspace_finalize")]
+    WorkspaceFinalize {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        source_commit: String,
+        verifier_command: String,
+        verifier_timeout_secs: u64,
+        finalization_deadline_unix_ms: u64,
+    },
+
+    /// Cancel an in-flight workspace finalization owned by this connection.
+    #[serde(rename = "edge_workspace_finalize_cancel")]
+    WorkspaceFinalizeCancel {
+        request_id: String,
+        connection_generation: u64,
+    },
+
     /// Release a clean per-trial clone after the Run has settled.
     #[serde(rename = "edge_workspace_release")]
     WorkspaceRelease {
@@ -262,6 +303,8 @@ impl EdgeServerMessage {
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
             EdgeServerMessage::WorkspacePrepare { .. } => "workspace_prepare",
             EdgeServerMessage::WorkspaceSnapshotRequest { .. } => "workspace_snapshot_request",
+            EdgeServerMessage::WorkspaceFinalize { .. } => "workspace_finalize",
+            EdgeServerMessage::WorkspaceFinalizeCancel { .. } => "workspace_finalize_cancel",
             EdgeServerMessage::WorkspaceRelease { .. } => "workspace_release",
             EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
@@ -603,6 +646,52 @@ mod tests {
         assert!(matches!(
             decoded,
             EdgeClientMessage::WorkspaceSnapshot { clean: true, .. }
+        ));
+
+        let finalize = EdgeServerMessage::WorkspaceFinalize {
+            request_id: "finalize-request".to_string(),
+            connection_generation: 4,
+            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            source_commit: "a".repeat(40),
+            verifier_command: "make check".to_string(),
+            verifier_timeout_secs: 120,
+            finalization_deadline_unix_ms: 1_900_000_000_000,
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(&finalize).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::WorkspaceFinalize {
+                verifier_timeout_secs: 120,
+                ..
+            }
+        ));
+
+        let finalized = EdgeClientMessage::WorkspaceFinalized {
+            request_id: "finalize-request".to_string(),
+            connection_generation: 4,
+            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            source_commit: Some("a".repeat(40)),
+            source_tree: Some("b".repeat(40)),
+            base_revision: Some(format!("sha256:{}", "c".repeat(64))),
+            result_revision: Some(format!("sha256:{}", "d".repeat(64))),
+            patch: Some("diff --git a/a b/a".to_string()),
+            verifier_exit_code: Some(0),
+            verifier_output: Some("ok".to_string()),
+            namespace_active: true,
+            scope_settled: true,
+            timed_out: false,
+            error: None,
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(&finalized).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::WorkspaceFinalized {
+                verifier_exit_code: Some(0),
+                namespace_active: true,
+                ..
+            }
         ));
     }
 

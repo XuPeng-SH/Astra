@@ -304,6 +304,9 @@ pub fn build_report_artifact(
         {
             observation.measurements.push(assessment.measurement());
             observation.evidence.push(assessment.evidence());
+            if let Some(evidence) = assessment.coding_evidence() {
+                observation.evidence.push(evidence);
+            }
         }
     }
     let assessment_refs = assessment_refs_by_trial.into_values().collect::<Vec<_>>();
@@ -349,6 +352,9 @@ pub fn build_report_artifact(
             Some(TaskAssessmentOutcome::Unavailable(
                 TaskAssessmentUnavailableReason::OutputTooLarge,
             )) => "Unavailable: output exceeds the frozen verifier limit",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::CodingEvidenceUnavailable,
+            )) => "Unavailable: coding evidence was not durably captured",
             None => "Not assessed",
         };
         markdown.push_str(&format!("| `{trial_id}` | {result} |\n"));

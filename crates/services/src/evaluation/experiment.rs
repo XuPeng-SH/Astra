@@ -689,6 +689,20 @@ impl ExperimentSpec {
                 return Err("workspace tool_names must be sorted".to_string());
             }
         }
+        let has_workspace_verifier = self.cases.iter().any(|case| {
+            matches!(
+                case.task_verifier.config,
+                super::task_verifier::TaskVerifierConfig::WorkspaceCommand { .. }
+            )
+        });
+        if has_workspace_verifier
+            && (self.conditions.workspace_execution.is_none()
+                || self.conditions.isolation_profile != "edge_workspace_private_v1")
+        {
+            return Err(
+                "workspace command verifiers require the frozen Edge workspace profile".into(),
+            );
+        }
         let expected = self
             .cases
             .len()
@@ -1247,7 +1261,10 @@ mod tests {
             assert!(forged.validate().is_err(), "accepted forged {field}");
         }
         let mut changed = original.clone();
-        changed.cases[0].task_verifier.config.expected = serde_json::json!({"ok": false});
+        changed.cases[0].task_verifier.config =
+            super::super::task_verifier::TaskVerifierConfig::JsonValueEquals {
+                expected: serde_json::json!({"ok": false}),
+            };
         assert!(changed.validate().is_err());
         changed.cases[0].task_verifier = super::super::task_verifier::TaskVerifierSpec::freeze(
             changed.cases[0].task_verifier.config.clone(),

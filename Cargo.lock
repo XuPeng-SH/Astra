@@ -294,6 +294,7 @@ dependencies = [
  "astra-credentials",
  "astra-logging",
  "astra-runtime-env",
+ "astra-sandbox",
  "astra-server-types",
  "astra-tools",
  "astra-turn-types",
