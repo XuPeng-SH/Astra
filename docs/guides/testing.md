@@ -252,6 +252,16 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
+For a short correctness check, the ignored live test
+`shared_limiter_workers_recover_from_fences_without_blocking_foreground` runs
+two ingestion workers with one shared SQL pool and one two-attempt limiter.
+It verifies that held Session fences time out without starving the other
+worker or unrelated foreground reads/writes, that connections are recovered,
+and that releasing the fences drains each delivery exactly once. Run it with
+`ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test event_ingestion_db_it
+shared_limiter_workers_recover_from_fences_without_blocking_foreground -- --ignored --exact`.
+This is same-process fault isolation, not cluster-wide admission or throughput.
+
 The optional ingestion probe exercises the production ingestion queue and a
 shared SQL pool with 100 synthetic owners and 1,000 Sessions. It is deliberately
 separate from ordinary integration CI. Use Python 3.11 or newer, the pinned Rust

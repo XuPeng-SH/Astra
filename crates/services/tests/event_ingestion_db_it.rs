@@ -25,6 +25,196 @@ const TEST_USER_ID: &str = "test-user";
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn shared_limiter_workers_recover_from_fences_without_blocking_foreground() {
+    use astra_services::event_ingestion::IngestionDbLimiter;
+    use astra_services::event_ingestion::measurement::{
+        IngestionDeliveryKey, IngestionDeliveryTerminal, IngestionMeasurementSink,
+    };
+    use std::time::Duration;
+
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let owner = format!("shared-limiter-{}", Uuid::new_v4());
+    let sessions = ["blocked-a", "blocked-b", "healthy", "foreground"];
+    for session in sessions {
+        insert_session_root(&pool, &owner, session).await;
+    }
+    let mut fences = Vec::new();
+    for session in &sessions[..2] {
+        let mut fence = pool.begin().await.unwrap();
+        admit_session_event_write(&mut fence, session, &owner, true)
+            .await
+            .unwrap();
+        fences.push(fence);
+    }
+    let config = IngestionConfig {
+        batch_size: 1,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        max_retries: 1,
+        max_concurrent_session_flushes: 2,
+        db_attempt_timeout_secs: 3,
+        ..Default::default()
+    };
+    let limiter = IngestionDbLimiter::new(2);
+    let (sender_a, shutdown_a, stats_a, worker_a) =
+        EventIngestionWorker::spawn_with_db_limiter(pool.clone(), config.clone(), limiter.clone());
+    let (sender_b, shutdown_b, stats_b, worker_b) =
+        EventIngestionWorker::spawn_with_db_limiter(pool.clone(), config, limiter);
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(3);
+    for (key, session) in sessions[..2].iter().enumerate() {
+        let (token, _) = sink.try_start(IngestionDeliveryKey(key as u64)).unwrap();
+        sender_a.enqueue_observed(
+            test_event_for_user(&owner, session, session, "user_query"),
+            token,
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while astra_core::sync_poison::recover_mutex_lock(&stats_a).db_attempts_current != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker A occupies both aggregate DB slots");
+
+    let (token, healthy_probe) = sink.try_start(IngestionDeliveryKey(2)).unwrap();
+    sender_b.enqueue_observed(
+        test_event_for_user(&owner, "healthy", "healthy", "user_query"),
+        token,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while healthy_probe.snapshot().first_dispatched_at.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker B dispatches while A holds the slots");
+    // Assert the contention precondition instead of inferring it from a sleep.
+    assert_eq!(
+        astra_core::sync_poison::recover_mutex_lock(&stats_a).db_attempts_current,
+        2
+    );
+    assert_eq!(
+        astra_core::sync_poison::recover_mutex_lock(&stats_b).db_attempts_current,
+        0
+    );
+    assert_eq!(healthy_probe.snapshot().pool_wait, Duration::ZERO);
+    assert!(
+        reports.try_recv().is_err(),
+        "blocked deliveries must not report success or rejection"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for index in 0..4 {
+            let mut connection = pool.acquire().await.expect("foreground pool acquisition");
+            let title = format!("foreground-{index}");
+            sqlx::query("UPDATE agent_sessions SET title = ? WHERE user_id = ? AND session_id = ?")
+                .bind(&title)
+                .bind(&owner)
+                .bind("foreground")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            let actual: String = sqlx::query_scalar(
+                "SELECT title FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&owner)
+            .bind("foreground")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+            assert_eq!(actual, title);
+        }
+    })
+    .await
+    .expect("unrelated foreground reads and writes retain shared-pool capacity");
+    assert_eq!(
+        astra_core::sync_poison::recover_mutex_lock(&stats_a).db_attempts_current,
+        2,
+        "foreground work completed before either blocked attempt released its slot"
+    );
+    assert_eq!(
+        astra_core::sync_poison::recover_mutex_lock(&stats_b).db_attempts_current,
+        0,
+        "worker B cannot bypass the aggregate limiter"
+    );
+
+    let healthy = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+        .await
+        .expect("worker B progresses after blocked attempts expire")
+        .unwrap();
+    assert_eq!(healthy.key, IngestionDeliveryKey(2));
+    assert_eq!(
+        healthy.terminal,
+        IngestionDeliveryTerminal::CommittedInserted
+    );
+    assert!(healthy.progress.limiter_wait >= Duration::from_millis(10));
+    assert!(
+        reports.try_recv().is_err(),
+        "held fences retain retryable deliveries"
+    );
+    assert_eq!(
+        astra_core::sync_poison::recover_mutex_lock(&stats_a).resident_events_current,
+        2
+    );
+
+    // Timed-out attempts must return every connection other than the two
+    // intentionally held fence transactions, even across separate workers.
+    let mut recovered = Vec::new();
+    for _ in 0..pool.options().get_max_connections() - 2 {
+        recovered.push(
+            tokio::time::timeout(Duration::from_secs(2), pool.acquire())
+                .await
+                .expect("no leaked connection after timeout")
+                .unwrap(),
+        );
+    }
+    drop(recovered);
+    for fence in fences {
+        fence.rollback().await.unwrap();
+    }
+    shutdown_a.signal();
+    shutdown_b.signal();
+    sender_a.shutdown();
+    sender_b.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        worker_a.await.unwrap();
+        worker_b.await.unwrap();
+    })
+    .await
+    .expect("both workers drain after fence release");
+    let mut remaining = std::collections::BTreeSet::new();
+    while let Ok(report) = reports.try_recv() {
+        assert_eq!(
+            report.terminal,
+            IngestionDeliveryTerminal::CommittedInserted
+        );
+        assert!(
+            remaining.insert(report.key.0),
+            "one terminal report per delivery"
+        );
+    }
+    assert_eq!(remaining, std::collections::BTreeSet::from([0, 1]));
+    for stats in [&stats_a, &stats_b] {
+        let stats = astra_core::sync_poison::recover_mutex_lock(stats);
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.db_attempts_current, 0);
+        assert_eq!(stats.events_abandoned_shutdown, 0);
+    }
+    for session in &sessions[..3] {
+        assert_session_event_count(&pool, &owner, session, 1).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_id = ?")
+            .bind(&owner).bind(session).bind(session).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+    }
+    assert_session_event_count(&pool, &owner, "foreground", 0).await;
+    for session in sessions {
+        cleanup_session(&pool, &owner, session).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn observed_pool_wait_cancellation_retains_elapsed_time_and_unknown_outcome() {
     use astra_services::event_ingestion::measurement::{
         IngestionDeliveryKey, IngestionDeliveryTerminal, IngestionMeasurementSink,
