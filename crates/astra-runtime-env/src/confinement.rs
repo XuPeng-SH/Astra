@@ -9,6 +9,82 @@ use sha2::{Digest, Sha256};
 
 pub const WORKSPACE_CONFINEMENT_PROFILE: &str = "linux_restricted_root_x86_64_v1";
 
+/// Issued by the provider holding the directory authority, never reconstructed
+/// from a path. Connection and Run generations belong to their existing owners.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationAllocationReceipt {
+    pub schema_version: u32,
+    pub allocation_id: String,
+    pub owner_user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub deployment_id: String,
+    pub materialization_id: String,
+    pub workspace_dir: String,
+    pub source_commit: String,
+    pub source_tree: String,
+    pub confinement_fingerprint: String,
+}
+
+impl EvaluationAllocationReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("unsupported allocation receipt schema".into());
+        }
+        for value in [
+            &self.allocation_id,
+            &self.owner_user_id,
+            &self.session_id,
+            &self.run_id,
+            &self.deployment_id,
+            &self.materialization_id,
+        ] {
+            if value.is_empty()
+                || value.trim() != value
+                || value.len() > 512
+                || value.chars().any(char::is_control)
+            {
+                return Err("invalid allocation identity".into());
+            }
+        }
+        if !self.workspace_dir.starts_with('/')
+            || self.workspace_dir.len() > 4096
+            || self
+                .workspace_dir
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("invalid allocation workspace address".into());
+        }
+        for object in [&self.source_commit, &self.source_tree] {
+            if !matches!(object.len(), 40 | 64)
+                || !object
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(
+                    "allocation source must use full canonical Git object identities".into(),
+                );
+            }
+        }
+        if !self
+            .confinement_fingerprint
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return Err("invalid allocation confinement fingerprint".into());
+        }
+        Ok(())
+    }
+}
+
 /// Actual per-launch evidence. A configured profile alone is never a receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +287,43 @@ impl WorkspaceConfinementContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_receipt_requires_canonical_source_and_workspace_identity() {
+        let receipt = EvaluationAllocationReceipt {
+            schema_version: 1,
+            allocation_id: "allocation".into(),
+            owner_user_id: "owner".into(),
+            session_id: "session".into(),
+            run_id: "run".into(),
+            deployment_id: "deployment".into(),
+            materialization_id: "materialization".into(),
+            workspace_dir: "/allocations/trial".into(),
+            source_commit: "a".repeat(40),
+            source_tree: "b".repeat(40),
+            confinement_fingerprint: format!("sha256:{}", "c".repeat(64)),
+        };
+        receipt.validate().unwrap();
+        for path in [
+            "relative",
+            "/allocations/../trial",
+            "/allocations//trial",
+            "/",
+        ] {
+            let mut invalid = receipt.clone();
+            invalid.workspace_dir = path.into();
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = receipt.clone();
+        invalid.run_id.clear();
+        assert!(invalid.validate().is_err());
+        invalid = receipt.clone();
+        invalid.source_tree = "main".into();
+        assert!(invalid.validate().is_err());
+        invalid = receipt;
+        invalid.confinement_fingerprint = "configured".into();
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn verifier_receipt_requires_setup_and_authoritative_settlement() {

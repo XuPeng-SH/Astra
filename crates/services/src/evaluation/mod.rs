@@ -16,6 +16,7 @@ pub mod task_assessment;
 pub mod task_verifier;
 pub mod types;
 pub mod utils;
+pub mod workspace_evidence;
 
 pub use api::{
     EvaluationExperimentCreateRequest, EvaluationExperimentPrepareRequest,

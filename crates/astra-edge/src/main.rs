@@ -1456,9 +1456,9 @@ async fn execute_evaluation_tool(
                     .into(),
             );
         }
-        Ok::<_, String>((path, executor))
+        Ok::<_, String>((path, executor, allocations.receipt(path)?))
     })();
-    let (path, executor) = match admission {
+    let (path, executor, allocation) = match admission {
         Ok(path) => path,
         Err(error) => return astra_tools::ToolResult::error(error),
     };
@@ -1467,14 +1467,21 @@ async fn execute_evaluation_tool(
     let execution =
         astra_tools::ToolExecutor::execute_with_cancel(executor.as_ref(), tool, args, Some(cancel));
     tokio::pin!(execution);
-    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut execution).await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            cancel.cancel();
-            execution.await
-        }
-    };
+    let mut result =
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut execution).await {
+            Ok(result) => result,
+            Err(_) => {
+                cancel.cancel();
+                execution.await
+            }
+        };
+    result
+        .metadata
+        .get_or_insert_with(serde_json::Map::new)
+        .insert(
+            "evaluation_allocation".into(),
+            serde_json::to_value(&allocation).expect("allocation receipt serializes"),
+        );
     let settled = tool != "bash"
         || result
             .metadata
@@ -2826,144 +2833,63 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 });
                             }
                             Ok(EdgeServerMessage::WorkspacePrepare {
-                                request_id,
-                                connection_generation,
-                                workspace_key,
-                                session_id,
-                                source_commit,
-                                confinement,
+                                request_id, connection_generation, workspace_key, session_id, source_commit, confinement,
                             }) => {
                                 let operation_tx = workspace_operation_tx.clone();
                                 let base_workspace = workspace.clone();
                                 let materialization_id = config.materialization_id.clone();
-                                let response_materialization_id = materialization_id.clone();
-                                let response_workspace_key = workspace_key.clone();
-                                let evaluation = config.evaluation.clone();
-                                tokio::spawn(async move {
-                                    let mut authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
-                                    let result = tokio::task::spawn_blocking(move || {
-                                        if let Some(authority) = authority.as_mut() {
-                                            return authority.prepare(&base_workspace, &materialization_id, astra_server_types::edge_ws_protocol::EdgeWorkspacePreparationRequest {
-                                                connection_generation, workspace_key: &workspace_key, session_id: &session_id,
-                                                source_commit: &source_commit, confinement: &confinement,
-                                            })
-                                                .map(|source| (base_workspace, source));
-                                        }
-                                        prepare_evaluation_workspace(
-                                            &base_workspace,
-                                            &materialization_id,
-                                            &workspace_key,
-                                            &source_commit,
-                                        )
-                                        .map(|source| (base_workspace, source))
-                                    })
-                                    .await;
-                                    let (workspace_dir, source_commit, source_tree, error) =
-                                        match result {
-                                            Ok(Ok((base_workspace, source))) => {
-                                                match evaluation_workspace_path(
-                                                    &base_workspace,
-                                                    &response_materialization_id,
-                                                    &response_workspace_key,
-                                                ) {
-                                                    Ok(path) => (
-                                                        path.to_string_lossy().to_string(),
-                                                        Some(source.commit),
-                                                        Some(source.tree),
-                                                        None,
-                                                    ),
-                                                    Err(error) => {
-                                                        (String::new(), None, None, Some(error))
-                                                    }
-                                                }
-                                            }
-                                            Ok(Err(error)) => (String::new(), None, None, Some(error)),
-                                            Err(error) => (
-                                                String::new(),
-                                                None,
-                                                None,
-                                                Some(format!("workspace preparation task failed: {error}")),
-                                            ),
-                                        };
-                                    let _ = operation_tx
-                                        .send(EdgeClientMessage::WorkspacePrepared {
-                                            request_id,
-                                            connection_generation,
-                                            workspace_dir,
-                                            source_commit,
-                                            source_tree,
-                                            error,
-                                        })
-                                        .await;
-                                });
-                            }
-                            Ok(EdgeServerMessage::WorkspaceSnapshotRequest {
-                                request_id,
-                                connection_generation,
-                                workspace_dir,
-                            }) => {
-                                let operation_tx = workspace_operation_tx.clone();
-                                let base_workspace = workspace.clone();
-                                let requested_workspace = PathBuf::from(&workspace_dir);
                                 let evaluation = config.evaluation.clone();
                                 tokio::spawn(async move {
                                     let authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let result = tokio::task::spawn_blocking(move || {
-                                        let path = if let Some(authority) = authority.as_ref() {
-                                            authority.validate(&requested_workspace, None)?;
-                                            requested_workspace.clone()
-                                        } else { validate_workspace_override(
-                                            &base_workspace,
-                                            &requested_workspace,
-                                        )? };
-                                        let source = workspace_source_identity(&path).ok_or_else(|| {
-                                            "workspace source identity is unavailable".to_string()
-                                        })?;
-                                        Ok::<_, String>((path, source))
-                                    })
-                                    .await;
-                                    let (workspace_dir, source_commit, source_tree, clean, error) =
-                                        match result {
-                                            Ok(Ok((path, source))) => (
-                                                path.to_string_lossy().to_string(),
-                                                Some(source.commit),
-                                                Some(source.tree),
-                                                source.clean,
-                                                None,
-                                            ),
-                                            Ok(Err(error)) => {
-                                                (workspace_dir, None, None, false, Some(error))
-                                            }
-                                            Err(error) => (
-                                                workspace_dir,
-                                                None,
-                                                None,
-                                                false,
-                                                Some(format!("workspace snapshot task failed: {error}")),
-                                            ),
-                                        };
-                                    let _ = operation_tx
-                                        .send(EdgeClientMessage::WorkspaceSnapshot {
-                                            request_id,
-                                            connection_generation,
-                                            workspace_dir,
-                                            source_commit,
-                                            source_tree,
-                                            clean,
-                                            error,
+                                        let mut authority = authority.ok_or("dedicated allocation authority is required")?;
+                                        authority.prepare(&base_workspace, &materialization_id, astra_server_types::edge_ws_protocol::EdgeWorkspacePreparationRequest {
+                                            connection_generation, workspace_key: &workspace_key, session_id: &session_id,
+                                            source_commit: &source_commit, confinement: &confinement,
                                         })
-                                        .await;
+                                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                                    let (allocation, error) = match result {
+                                        Ok(receipt) => (Some(receipt), None), Err(error) => (None, Some(error)),
+                                    };
+                                    let _ = operation_tx.send(EdgeClientMessage::WorkspacePrepared {
+                                        request_id, connection_generation,
+                                        workspace_dir: allocation.as_ref().map(|a| a.workspace_dir.clone()).unwrap_or_default(),
+                                        source_commit: allocation.as_ref().map(|a| a.source_commit.clone()),
+                                        source_tree: allocation.as_ref().map(|a| a.source_tree.clone()), allocation, error,
+                                    }).await;
+                                });
+                            }
+                            Ok(EdgeServerMessage::WorkspaceSnapshotRequest { request_id, connection_generation, allocation }) => {
+                                let operation_tx = workspace_operation_tx.clone();
+                                let workspace_dir = allocation.workspace_dir.clone();
+                                let evaluation = config.evaluation.clone();
+                                tokio::spawn(async move {
+                                    let authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let authority = authority.ok_or("dedicated allocation authority is required")?;
+                                        authority.validate(&allocation)?;
+                                        let source = workspace_source_identity(Path::new(&allocation.workspace_dir)).ok_or("workspace source identity is unavailable")?;
+                                        Ok::<_, String>((allocation, source))
+                                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                                    let (allocation, source_commit, source_tree, clean, error) = match result {
+                                        Ok((allocation, source)) => (Some(allocation), Some(source.commit), Some(source.tree), source.clean, None),
+                                        Err(error) => (None, None, None, false, Some(error)),
+                                    };
+                                    let _ = operation_tx.send(EdgeClientMessage::WorkspaceSnapshot {
+                                        request_id, connection_generation, workspace_dir, allocation, source_commit, source_tree, clean, error,
+                                    }).await;
                                 });
                             }
                             Ok(EdgeServerMessage::WorkspaceFinalize {
                                 request_id,
                                 connection_generation,
-                                workspace_dir,
-                                source_commit,
+                                allocation,
                                 verifier_command,
                                 verifier_timeout_secs,
                                 finalization_deadline_unix_ms,
                             }) => {
+                                let workspace_dir = allocation.workspace_dir.clone();
+                                let source_commit = allocation.source_commit.clone();
                                 let operation_tx = workspace_operation_tx.clone();
                                 let base_workspace = workspace.clone();
                                 let requested_workspace = PathBuf::from(&workspace_dir);
@@ -2985,7 +2911,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     let remaining_ms = now_unix_ms
                                         .and_then(|now| finalization_deadline_unix_ms.checked_sub(now))
                                         .filter(|remaining| *remaining > 0);
-                                    let admission = authority.as_ref().map_or(Ok(()), |authority| authority.validate(&requested_workspace, Some(&source_commit)));
+                                    let admission = authority.as_ref().ok_or_else(|| "dedicated allocation authority is required".to_string()).and_then(|authority| authority.validate(&allocation));
                                     let result = if let Err(error) = admission { Err(error) } else if let Some(remaining_ms) = remaining_ms {
                                         let boundary = authority.as_ref().map(|authority| authority.provider.boundary(&requested_workspace));
                                         if let Some(authority) = authority.as_mut() { authority.mark_unsettled(&requested_workspace); }
@@ -3027,6 +2953,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             request_id,
                                             connection_generation,
                                             workspace_dir: result.workspace_dir,
+                                            allocation: Some(allocation.clone()),
                                             source_commit: Some(result.source_commit),
                                             source_tree: Some(result.source_tree),
                                             base_revision: Some(result.base_revision),
@@ -3043,6 +2970,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             request_id,
                                             connection_generation,
                                             workspace_dir,
+                                            allocation: None,
                                             source_commit: None,
                                             source_tree: None,
                                             base_revision: None,
@@ -3063,6 +2991,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             request_id: response_request_id,
                                             connection_generation,
                                             workspace_dir: response_workspace_dir,
+                                            allocation: None,
                                             source_commit: None,
                                             source_tree: None,
                                             base_revision: None,
@@ -3091,45 +3020,16 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     cancel.cancel();
                                 }
                             }
-                            Ok(EdgeServerMessage::WorkspaceRelease {
-                                connection_generation,
-                                workspace_dir,
-                                source_commit,
-                            }) => {
-                                let _ = connection_generation;
+                            Ok(EdgeServerMessage::WorkspaceRelease { connection_generation: _, allocation }) => {
                                 let base_workspace = workspace.clone();
-                                let requested_workspace = PathBuf::from(&workspace_dir);
-                                let frozen_source_commit = source_commit.clone();
                                 let evaluation = config.evaluation.clone();
                                 tokio::spawn(async move {
-                                    let mut authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
+                                    let authority = match evaluation { Some(value) => Some(value.lock_owned().await), None => None };
                                     let result = tokio::task::spawn_blocking(move || {
-                                        if let Some(authority) = authority.as_mut() {
-                                            return authority.release(&base_workspace, &requested_workspace, &frozen_source_commit);
-                                        }
-                                        release_evaluation_workspace(
-                                            &base_workspace,
-                                            &requested_workspace,
-                                            &frozen_source_commit,
-                                        )
-                                    })
-                                    .await;
-                                    match result {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) => {
-                                            tracing::info!(
-                                                workspace_dir = %workspace_dir,
-                                                %error,
-                                                "Evaluation workspace retained after release"
-                                            );
-                                        }
-                                        Err(error) => {
-                                            tracing::info!(
-                                                workspace_dir = %workspace_dir,
-                                                %error,
-                                                "Evaluation workspace release task failed; retaining workspace"
-                                            );
-                                        }
+                                        authority.ok_or("dedicated allocation authority is required")?.release(&base_workspace, &allocation)
+                                    }).await;
+                                    if !matches!(result, Ok(Ok(()))) {
+                                        tracing::info!(?result, "Evaluation workspace retained after release");
                                     }
                                 });
                             }

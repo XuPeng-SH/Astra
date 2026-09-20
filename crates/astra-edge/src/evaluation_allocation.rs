@@ -1,6 +1,6 @@
 //! Process-local allocation authority. A restart deliberately cannot adopt old paths.
 use super::*;
-use astra_runtime_env::WorkspaceConfinementContract;
+use astra_runtime_env::{EvaluationAllocationReceipt, WorkspaceConfinementContract};
 
 #[derive(Debug)]
 pub struct Allocations {
@@ -11,10 +11,8 @@ pub struct Allocations {
 
 struct Allocation {
     directory: std::fs::File,
-    run_id: String,
-    session_id: String,
+    receipt: EvaluationAllocationReceipt,
     executor: Arc<astra_tools::executor::DefaultToolExecutor>,
-    source_commit: String,
     // A failed or interrupted execution cannot authorize later capture or release.
     unsettled: bool,
 }
@@ -22,8 +20,8 @@ struct Allocation {
 impl std::fmt::Debug for Allocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Allocation")
-            .field("run_id", &self.run_id)
-            .field("session_id", &self.session_id)
+            .field("run_id", &self.receipt.run_id)
+            .field("session_id", &self.receipt.session_id)
             .field("unsettled", &self.unsettled)
             .finish_non_exhaustive()
     }
@@ -55,7 +53,7 @@ impl Allocations {
         base: &Path,
         materialization: &str,
         request: astra_server_types::edge_ws_protocol::EdgeWorkspacePreparationRequest<'_>,
-    ) -> Result<WorkspaceSourceIdentity, String> {
+    ) -> Result<EvaluationAllocationReceipt, String> {
         let key = request.workspace_key;
         let commit = request.source_commit;
         let session_id = request.session_id;
@@ -75,11 +73,12 @@ impl Allocations {
             .ok_or("evaluation workspace_key must be trial-{run_id}")?;
         let path = evaluation_workspace_path(base, materialization, key)?;
         if let Some(existing) = self.entries.get(&path) {
-            if existing.session_id != session_id {
+            if existing.receipt.session_id != session_id {
                 return Err("allocation Session identity mismatch".into());
             }
-            self.validate(&path, Some(commit))?;
-            return verify_evaluation_workspace(&path, commit);
+            self.validate(&existing.receipt)?;
+            verify_evaluation_workspace(&path, commit)?;
+            return Ok(existing.receipt.clone());
         }
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -101,21 +100,33 @@ impl Allocations {
             )
             .with_shell_process_boundary(self.provider.boundary(&path), vec![path.join(".git")]),
         );
+        let receipt = EvaluationAllocationReceipt {
+            schema_version: 1,
+            allocation_id: uuid::Uuid::new_v4().to_string(),
+            owner_user_id: self.owner.as_ref().unwrap().clone(),
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            deployment_id: self.provider.0.deployment_id().into(),
+            materialization_id: materialization.into(),
+            workspace_dir: path.to_string_lossy().into_owned(),
+            source_commit: source.commit,
+            source_tree: source.tree,
+            confinement_fingerprint: self.provider.0.contract_fingerprint().into(),
+        };
+        receipt.validate()?;
         self.entries.insert(
             path,
             Allocation {
                 directory,
-                run_id: run_id.into(),
-                session_id: session_id.into(),
+                receipt: receipt.clone(),
                 executor,
-                source_commit: commit.into(),
                 unsettled: false,
             },
         );
-        Ok(source)
+        Ok(receipt)
     }
 
-    pub fn validate(&self, path: &Path, commit: Option<&str>) -> Result<(), String> {
+    fn entry(&self, path: &Path) -> Result<&Allocation, String> {
         self.provider.revalidate()?;
         let allocation = self
             .entries
@@ -124,10 +135,20 @@ impl Allocations {
         if allocation.unsettled {
             return Err("allocation settlement is unproven; preserving evidence".into());
         }
-        if commit.is_some_and(|commit| commit != allocation.source_commit) {
-            return Err("allocation source commit mismatch".into());
+        same_directory(&allocation.directory, path)?;
+        Ok(allocation)
+    }
+
+    pub fn validate(&self, expected: &EvaluationAllocationReceipt) -> Result<(), String> {
+        let entry = self.entry(Path::new(&expected.workspace_dir))?;
+        if entry.receipt != *expected {
+            return Err("allocation receipt does not match retained authority".into());
         }
-        same_directory(&allocation.directory, path)
+        Ok(())
+    }
+
+    pub fn receipt(&self, path: &Path) -> Result<EvaluationAllocationReceipt, String> {
+        Ok(self.entry(path)?.receipt.clone())
     }
 
     pub fn executor(
@@ -135,12 +156,11 @@ impl Allocations {
         path: &Path,
         identity: &astra_turn_types::ToolInvocationIdentity,
     ) -> Result<Arc<astra_tools::executor::DefaultToolExecutor>, String> {
-        self.validate(path, None)?;
-        let entry = &self.entries[path];
+        let entry = self.entry(path)?;
         if !allocation_identity_matches(
             self.owner.as_deref(),
-            &entry.run_id,
-            &entry.session_id,
+            &entry.receipt.run_id,
+            &entry.receipt.session_id,
             identity,
         ) {
             return Err("allocation owner or Run identity mismatch".into());
@@ -160,9 +180,14 @@ impl Allocations {
         }
     }
 
-    pub fn release(&mut self, base: &Path, path: &Path, commit: &str) -> Result<(), String> {
-        self.validate(path, Some(commit))?;
-        release_evaluation_workspace(base, path, commit)?;
+    pub fn release(
+        &mut self,
+        base: &Path,
+        expected: &EvaluationAllocationReceipt,
+    ) -> Result<(), String> {
+        self.validate(expected)?;
+        let path = Path::new(&expected.workspace_dir);
+        release_evaluation_workspace(base, path, &expected.source_commit)?;
         self.entries.remove(path);
         Ok(())
     }

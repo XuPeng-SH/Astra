@@ -117,6 +117,7 @@ struct EvaluationWorkspaceLease {
     connection_generation: Option<u64>,
     workspace_dir: Option<String>,
     source_commit: String,
+    allocation: astra_runtime_env::EvaluationAllocationReceipt,
     claimed: Arc<AtomicBool>,
 }
 
@@ -126,16 +127,16 @@ impl EvaluationWorkspaceLease {
         user_id: String,
         edge_agent_id: Option<String>,
         connection_generation: Option<u64>,
-        workspace_dir: Option<String>,
-        source_commit: String,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
     ) -> Self {
         Self {
             pool,
             user_id,
             edge_agent_id,
             connection_generation,
-            workspace_dir,
-            source_commit,
+            workspace_dir: Some(allocation.workspace_dir.clone()),
+            source_commit: allocation.source_commit.clone(),
+            allocation,
             claimed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -165,8 +166,7 @@ impl EvaluationWorkspaceLease {
             self.edge_agent_id.as_deref()?,
             astra_server_types::edge_connection_pool::EdgeWorkspaceFinalizationRequest {
                 connection_generation: self.connection_generation?,
-                workspace_dir: self.workspace_dir.as_deref()?,
-                source_commit: &self.source_commit,
+                allocation: &self.allocation,
                 verifier_command,
                 verifier_timeout_secs,
             },
@@ -196,16 +196,17 @@ impl Drop for EvaluationWorkspaceLease {
             return;
         };
         let user_id = self.user_id.clone();
-        let source_commit = self.source_commit.clone();
+        let allocation = self.allocation.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if !pool
                     .release_evaluation_workspace(
                         &user_id,
                         &edge_agent_id,
-                        connection_generation,
-                        &workspace_dir,
-                        &source_commit,
+                        astra_server_types::edge_connection_pool::EdgeWorkspaceAllocationTarget {
+                            connection_generation,
+                            allocation: &allocation,
+                        },
                     )
                     .await
                 {
@@ -8154,7 +8155,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         execution_owner_generation: u64,
         expected_edge_connection_generation: Option<u64>,
-        expected_edge_workspace_dir: Option<&str>,
+        expected_allocation: Option<&astra_runtime_env::EvaluationAllocationReceipt>,
         request: &ChatRequestData,
         admission: &EvaluationRunAdmission,
     ) -> Result<AdmittedEvaluationTrial, (StatusCode, Json<ErrorResponse>)> {
@@ -8626,7 +8627,7 @@ impl AgenticRunLifecycleService {
                 request,
                 workspace_policy,
                 expected_edge_connection_generation,
-                expected_edge_workspace_dir,
+                expected_allocation,
             )
             .await?;
         let policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
@@ -8720,6 +8721,46 @@ impl AgenticRunLifecycleService {
                 "trial binding changed before materialization",
             ));
         }
+        let workspace_artifact = if let Some(allocation) = workspace_materialization {
+            use astra_services::evaluation::workspace_evidence::EvaluationWorkspaceMaterialization;
+            let evidence = EvaluationWorkspaceMaterialization {
+                schema_version: 1,
+                experiment_id: experiment.experiment_id.clone(),
+                trial_id: trial.trial_id.clone(),
+                run_generation: execution_owner_generation,
+                spec_fingerprint: binding.spec_fingerprint.clone(),
+                edge_executor_id: workspace_policy
+                    .expect("workspace proof requires frozen policy")
+                    .edge_executor_id
+                    .clone(),
+                connection_generation: expected_edge_connection_generation.ok_or_else(|| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_allocation_missing",
+                        "workspace connection generation is absent",
+                    )
+                })?,
+                allocation,
+            };
+            evidence
+                .validate_binding(&binding, &experiment.spec)
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_allocation_mismatch",
+                        error,
+                    )
+                })?;
+            Some(evidence.persist(&pool).await.map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_materialization_failed",
+                    error,
+                )
+            })?)
+        } else {
+            None
+        };
         let materializer = DatabaseMaterializationReceiptStore::new(pool.clone());
         let receipt_ids = if admission.receipt_ids.is_empty() {
             // The receipt lifetime is the shorter of the frozen experiment
@@ -8774,9 +8815,7 @@ impl AgenticRunLifecycleService {
                     })?;
                 ids.push(record.receipt_id);
             }
-            if let (Some(workspace_policy), Some((materialization_id, source_tree))) =
-                (workspace_policy, workspace_materialization.as_ref())
-            {
+            if let Some((artifact_id, fingerprint)) = workspace_artifact.as_ref() {
                 let record = materializer
                     .record_receipt(
                         &trusted,
@@ -8785,12 +8824,9 @@ impl AgenticRunLifecycleService {
                             session_id: session_id.to_string(),
                             envelope: envelope.clone(),
                             component_kind: MaterializationComponentKind::Workspace,
-                            component_snapshot_ref: Some(format!(
-                                "edge-workspace://{materialization_id}/{}",
-                                workspace_policy.source_commit
-                            )),
+                            component_snapshot_ref: Some(format!("artifact://{artifact_id}")),
                             component_base_snapshot_ref: None,
-                            component_content_fingerprint: Some(source_tree.clone()),
+                            component_content_fingerprint: Some(fingerprint.clone()),
                             outcome: MaterializationOutcome::Available,
                             failure_code: None,
                             expires_at: Some(expires_at),
@@ -10796,8 +10832,11 @@ impl AgenticRunLifecycleService {
         request: &ChatRequestData,
         workspace_policy: Option<&astra_services::evaluation::FrozenWorkspaceExecution>,
         expected_edge_connection_generation: Option<u64>,
-        expected_edge_workspace_dir: Option<&str>,
-    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+        expected_allocation: Option<&astra_runtime_env::EvaluationAllocationReceipt>,
+    ) -> Result<
+        Option<astra_runtime_env::EvaluationAllocationReceipt>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
         let Some(workspace_policy) = workspace_policy else {
             return Ok(None);
         };
@@ -10871,7 +10910,7 @@ impl AgenticRunLifecycleService {
             || record.edge_agent_id != workspace_policy.edge_executor_id
             || registered_root != Some(base_root)
             || materialization_id.is_none()
-            || expected_edge_workspace_dir != Some(request_root)
+            || expected_allocation.map(|a| a.workspace_dir.as_str()) != Some(request_root)
         {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
@@ -10969,8 +11008,16 @@ impl AgenticRunLifecycleService {
             .snapshot_evaluation_workspace(
                 user_id,
                 &workspace_policy.edge_executor_id,
-                connected.generation,
-                request_root,
+                astra_server_types::edge_connection_pool::EdgeWorkspaceAllocationTarget {
+                    connection_generation: connected.generation,
+                    allocation: expected_allocation.ok_or_else(|| {
+                        evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_allocation_missing",
+                            "the Run has no retained allocation receipt",
+                        )
+                    })?,
+                },
                 std::time::Duration::from_secs(15),
             )
             .await
@@ -10982,6 +11029,9 @@ impl AgenticRunLifecycleService {
                 )
             })?;
         if snapshot.error.is_some()
+            || snapshot.allocation.as_ref() != expected_allocation
+            || snapshot.source_tree.as_deref()
+                != expected_allocation.map(|receipt| receipt.source_tree.as_str())
             || snapshot.connection_generation != connected.generation
             || !snapshot.clean
             || snapshot.workspace_dir.trim() != request_root
@@ -11010,16 +11060,7 @@ impl AgenticRunLifecycleService {
                 &detail,
             )
         })?;
-        let trial_materialization = format!(
-            "{materialization_id}-{:x}",
-            Sha256::digest(request_root.as_bytes())
-        );
-        Ok(Some((
-            trial_materialization,
-            snapshot
-                .source_tree
-                .expect("snapshot source tree checked above"),
-        )))
+        Ok(snapshot.allocation)
     }
 
     async fn populate_evaluation_edge_binding(
@@ -11232,52 +11273,39 @@ impl AgenticRunLifecycleService {
                     "the selected Edge did not return an isolated workspace clone",
                 )
             })?;
-        let prepared_is_invalid = prepared.error.is_some()
-            || prepared.source_commit.as_deref() != Some(workspace_policy.source_commit.as_str())
-            || prepared
-                .source_tree
-                .as_deref()
-                .is_none_or(|tree| !is_git_object_id(tree))
-            || prepared.workspace_dir.trim().is_empty()
-            || prepared.workspace_dir == base_root
-            || prepared.workspace_dir != expected_workspace;
-        if prepared_is_invalid {
-            let detail = prepared.error.clone().unwrap_or_else(|| {
-                "the selected Edge did not prove the frozen isolated workspace clone".to_string()
-            });
-            if !prepared.workspace_dir.trim().is_empty() {
-                let _ = pool
-                    .release_evaluation_workspace(
-                        user_id,
-                        executor_id,
-                        prepared.connection_generation,
-                        &prepared.workspace_dir,
-                        &workspace_policy.source_commit,
-                    )
-                    .await;
-            }
-            return Err(evaluation_preflight_error(
-                StatusCode::CONFLICT,
-                "evaluation_workspace_materialization_mismatch",
-                detail,
-            ));
-        }
-        if !is_managed_evaluation_workspace_path(&base_root, &prepared.workspace_dir) {
-            let _ = pool
-                .release_evaluation_workspace(
-                    user_id,
-                    executor_id,
-                    prepared.connection_generation,
-                    &prepared.workspace_dir,
-                    &workspace_policy.source_commit,
+        let expected_fingerprint = workspace_policy
+            .confinement
+            .fingerprint()
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_confinement_invalid",
+                    error,
                 )
-                .await;
+            })?;
+        let prepared_is_invalid = prepared.error.is_some()
+            || prepared.connection_generation != connected.generation
+            || prepared.workspace_dir != expected_workspace
+            || prepared.allocation.as_ref().is_none_or(|allocation| {
+                allocation.validate().is_err()
+                    || allocation.owner_user_id != user_id
+                    || allocation.session_id != session_id
+                    || Some(allocation.run_id.as_str()) != workspace_key.strip_prefix("trial-")
+                    || allocation.materialization_id != materialization_id
+                    || allocation.workspace_dir != prepared.workspace_dir
+                    || allocation.source_commit != workspace_policy.source_commit
+                    || prepared.source_commit.as_deref() != Some(allocation.source_commit.as_str())
+                    || prepared.source_tree.as_deref() != Some(allocation.source_tree.as_str())
+                    || allocation.confinement_fingerprint != expected_fingerprint
+            });
+        if prepared_is_invalid {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_workspace_materialization_mismatch",
-                "the selected Edge returned an unmanaged isolated workspace path",
+                "the selected Edge did not prove the frozen allocation; no unknown workspace was released",
             ));
         }
+        let allocation = prepared.allocation.expect("validated allocation");
         request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
             kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
             display_name: Some(executor_id.to_string()),
@@ -11300,11 +11328,7 @@ impl AgenticRunLifecycleService {
             user_id.to_string(),
             Some(executor_id.to_string()),
             Some(prepared.connection_generation),
-            request
-                .workspace_binding
-                .as_ref()
-                .and_then(|workspace| workspace.root.clone()),
-            workspace_policy.source_commit.clone(),
+            allocation,
         )))
     }
 
@@ -17074,6 +17098,7 @@ async fn finalize_evaluation_coding_evidence(
     let expected_generation = lease.connection_generation();
     let expected_workspace = lease.workspace_dir();
     let complete = result.error.is_none()
+        && result.allocation.as_ref() == Some(&lease.allocation)
         && Some(result.connection_generation) == expected_generation
         && Some(result.workspace_dir.as_str()) == expected_workspace
         && result.source_commit.as_deref() == Some(lease.source_commit.as_str())
@@ -19000,7 +19025,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         .and_then(EvaluationWorkspaceLease::connection_generation),
                     evaluation_workspace_lease
                         .as_ref()
-                        .and_then(EvaluationWorkspaceLease::workspace_dir),
+                        .map(|lease| &lease.allocation),
                     &request,
                     &admission,
                 )

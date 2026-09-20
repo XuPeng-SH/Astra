@@ -154,7 +154,7 @@ pub struct MaterializationReceiptRequest {
     /// which the materializer derived the component.
     pub component_base_snapshot_ref: Option<String>,
     /// Content identity is separate from the component address. It is
-    /// optional for address-only components such as a workspace checkout.
+    /// required for available workspace allocation artifacts.
     pub component_content_fingerprint: Option<String>,
     pub outcome: MaterializationOutcome,
     pub failure_code: Option<String>,
@@ -321,6 +321,19 @@ impl DatabaseMaterializationReceiptStore {
             &request.envelope,
             &experiment.spec,
         )?;
+
+        if request.component_kind == MaterializationComponentKind::Workspace
+            && request.outcome == MaterializationOutcome::Available
+        {
+            validate_workspace_artifact_tx(
+                &mut tx,
+                &binding,
+                &experiment.spec,
+                request.component_snapshot_ref.as_deref(),
+                request.component_content_fingerprint.as_deref(),
+            )
+            .await?;
+        }
 
         if let Some(existing) = load_receipt_by_idempotency_tx(
             &mut tx,
@@ -542,6 +555,20 @@ impl DatabaseMaterializationReceiptStore {
         }
         validate_receipt_set(&binding, &experiment.spec, envelope, &receipts, now)
             .map_err(|error| MaterializationReceiptError::Conflict(error.to_string()))?;
+        for receipt in &receipts {
+            if receipt.component_kind == MaterializationComponentKind::Workspace
+                && receipt.outcome == MaterializationOutcome::Available
+            {
+                validate_workspace_artifact_tx(
+                    &mut tx,
+                    &binding,
+                    &experiment.spec,
+                    receipt.component_snapshot_ref.as_deref(),
+                    receipt.component_content_fingerprint.as_deref(),
+                )
+                .await?;
+            }
+        }
         tx.commit()
             .await
             .map_err(|source| MaterializationReceiptError::Database {
@@ -813,35 +840,24 @@ fn validate_component_against_envelope(
             ));
         }
         MaterializationComponentKind::Workspace => {
-            let Some(workspace) = spec.conditions.workspace_execution.as_ref() else {
+            if spec.conditions.workspace_execution.is_none()
+                || component_base_snapshot_ref.is_some()
+                || !component_snapshot_ref.is_some_and(|value| {
+                    value
+                        .strip_prefix("artifact://")
+                        .is_some_and(|id| !id.is_empty())
+                })
+                || !component_content_fingerprint.is_some_and(|value| {
+                    value.strip_prefix("sha256:").is_some_and(|hash| {
+                        hash.len() == 64
+                            && hash
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                })
+            {
                 return Err(MaterializationReceiptError::Conflict(
-                    "workspace materialization is not declared by this frozen isolation profile"
-                        .to_string(),
-                ));
-            };
-            if component_base_snapshot_ref.is_some() {
-                return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt must use one canonical materialization address".to_string(),
-                ));
-            }
-            let Some(tree) = component_content_fingerprint else {
-                return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt must carry the authenticated source tree".to_string(),
-                ));
-            };
-            if !is_git_object_id(tree) {
-                return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt source tree must be a full Git object id".to_string(),
-                ));
-            }
-            let expected_suffix = format!("/{}", workspace.source_commit);
-            if !component_snapshot_ref.is_some_and(|snapshot| {
-                snapshot.starts_with("edge-workspace://")
-                    && snapshot.ends_with(expected_suffix.as_str())
-            }) {
-                return Err(MaterializationReceiptError::Conflict(
-                    "workspace receipt must carry the frozen source commit in its Edge materialization address"
-                        .to_string(),
+                    "workspace receipt requires a persisted allocation artifact and its canonical content hash".into(),
                 ));
             }
         }
@@ -849,8 +865,69 @@ fn validate_component_against_envelope(
     Ok(())
 }
 
-fn is_git_object_id(value: &str) -> bool {
-    matches!(value.len(), 40 | 64) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+async fn validate_workspace_artifact_tx(
+    tx: &mut Transaction<'_, MySql>,
+    binding: &EvaluationTrialBindingRecord,
+    spec: &ExperimentSpec,
+    artifact_ref: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<(), MaterializationReceiptError> {
+    use super::workspace_evidence::{
+        EvaluationWorkspaceMaterialization, WORKSPACE_ALLOCATION_ARTIFACT_KIND,
+        WORKSPACE_ALLOCATION_ARTIFACT_SOURCE,
+    };
+    let artifact_id = artifact_ref
+        .and_then(|reference| reference.strip_prefix("artifact://"))
+        .ok_or_else(|| {
+            MaterializationReceiptError::Conflict(
+                "workspace allocation artifact reference is absent".into(),
+            )
+        })?;
+    let row = sqlx::query("SELECT artifact_kind, source, status, content_json FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE")
+        .bind(&binding.owner_user_id).bind(&binding.session_id).bind(artifact_id)
+        .fetch_optional(&mut **tx).await.map_err(|source| MaterializationReceiptError::Database { operation: "load_workspace_allocation_artifact", source })?
+        .ok_or_else(|| MaterializationReceiptError::Conflict("workspace allocation artifact is missing".into()))?;
+    let decode = |source| MaterializationReceiptError::Database {
+        operation: "decode_workspace_allocation_artifact",
+        source,
+    };
+    let kind: String = row.try_get("artifact_kind").map_err(decode)?;
+    let source: Option<String> = row.try_get("source").map_err(decode)?;
+    let status: String = row.try_get("status").map_err(decode)?;
+    if kind != WORKSPACE_ALLOCATION_ARTIFACT_KIND
+        || source.as_deref() != Some(WORKSPACE_ALLOCATION_ARTIFACT_SOURCE)
+        || status != "active"
+    {
+        return Err(MaterializationReceiptError::Conflict(
+            "workspace allocation artifact is inactive or has the wrong provenance".into(),
+        ));
+    }
+    let raw: String = row.try_get("content_json").map_err(decode)?;
+    let content: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        MaterializationReceiptError::Conflict(format!(
+            "workspace allocation artifact is malformed: {error}"
+        ))
+    })?;
+    let hash = super::content_fingerprint(&astra_core::canonical_json_string(&content));
+    if fingerprint != Some(hash.as_str()) {
+        return Err(MaterializationReceiptError::Conflict(
+            "workspace allocation artifact content hash differs".into(),
+        ));
+    }
+    let evidence: EvaluationWorkspaceMaterialization =
+        serde_json::from_value(content).map_err(|error| {
+            MaterializationReceiptError::Conflict(format!(
+                "workspace allocation evidence is malformed: {error}"
+            ))
+        })?;
+    if evidence.artifact_id() != artifact_id {
+        return Err(MaterializationReceiptError::Conflict(
+            "workspace allocation artifact identity differs".into(),
+        ));
+    }
+    evidence
+        .validate_binding(binding, spec)
+        .map_err(MaterializationReceiptError::Conflict)
 }
 
 fn validate_new_expiry(

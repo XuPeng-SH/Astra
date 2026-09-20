@@ -543,6 +543,17 @@ receipt set; cleanup may remove only the instance whose ownership the
 materializer can prove. Edge disconnect does not authorize Server-local
 fallback.
 
+The dedicated Edge allocation owner issues an opaque allocation identity bound to
+owner, Session, Run, deployment, materialization, source commit/tree, and frozen
+confinement fingerprint. Snapshot, finalization, and release require that exact
+retained receipt. Admitted tool results carry the same allocation receipt.
+Before Run admission, the receipt is persisted as an immutable Session artifact
+bound to the experiment, trial, Run generation, and authenticated connection.
+Available workspace materialization references this artifact and its canonical
+content hash. Both receipt issuance and execution admission resolve the artifact
+and reject absent, expired, changed, or incorrectly bound evidence. A path or Git
+tree alone is no longer accepted as workspace materialization evidence.
+
 The adapter's execution machinery routes Edge file/shell calls through canonical
 tool dispatch and records the source checkout as a receipt. New workspace trials
 remain unavailable until a qualified provider advertises the required capability.

@@ -2168,3 +2168,212 @@ async fn task_assessment_is_historical_owner_bound_and_retries_missing_sources()
     );
     cleanup(&pool, &owner).await;
 }
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn workspace_admission_resolves_allocation_artifacts_and_rejects_missing_or_changed_evidence()
+{
+    use astra_runtime_env::{
+        EvaluationAllocationReceipt, ToolchainInput, ToolchainManifest,
+        WORKSPACE_CONFINEMENT_PROFILE, WorkspaceConfinementContract,
+    };
+    use astra_services::evaluation::{
+        FrozenWorkspaceExecution, content_fingerprint,
+        workspace_evidence::EvaluationWorkspaceMaterialization,
+    };
+    let pool = common::setup_pool().await;
+    let plans = DatabaseEvaluationPlanStore::new(pool.clone());
+    let receipts = DatabaseMaterializationReceiptStore::new(pool.clone());
+    let owner = format!("allocation-owner-{}", Uuid::new_v4());
+    let mut frozen = spec(&format!("allocation-exp-{}", Uuid::new_v4().simple()));
+    let confinement = WorkspaceConfinementContract {
+        profile_id: WORKSPACE_CONFINEMENT_PROFILE.into(),
+        toolchain_manifest: ToolchainManifest {
+            schema_version: 1,
+            inputs: vec![ToolchainInput {
+                guest_mount_path: "/usr/bin".into(),
+                content_digest: format!("sha256:{}", "a".repeat(64)),
+            }],
+            launcher_digest: format!("sha256:{}", "b".repeat(64)),
+            supervisor_digest: format!("sha256:{}", "c".repeat(64)),
+        },
+    };
+    frozen.conditions.workspace_execution = Some(FrozenWorkspaceExecution {
+        confinement: confinement.clone(),
+        edge_executor_id: "edge-a".into(),
+        source_commit: "a".repeat(40),
+        tool_names: vec!["bash".into()],
+    });
+    frozen.conditions.isolation_profile = "edge_workspace_private_v1".into();
+    let experiment = plans
+        .register_experiment(&owner, &frozen, "allocation-submit")
+        .await
+        .unwrap();
+    let trials = plans
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .unwrap();
+    let session = insert_session(&pool, &owner).await;
+    let run =
+        insert_evaluation_run(&pool, &owner, &session, &experiment.spec, &trials[0].trial).await;
+    let binding = plans
+        .bind_trial_run(&owner, &trials[0].trial_id, &session, &run)
+        .await
+        .unwrap();
+    let envelope = SnapshotEnvelope::new(
+        &owner,
+        &experiment.experiment_id,
+        Some(binding.trial_id.clone()),
+        CompositeSnapshot {
+            snapshot_id: Uuid::new_v4().to_string(),
+            session_id: session.clone(),
+            turn: 1,
+            created_at: "2026-09-20T00:00:00Z".into(),
+            version: 1,
+            label: None,
+            refs: vec![],
+        },
+        "sha256:context",
+        "sha256:tools",
+    )
+    .unwrap();
+    let trusted = TrustedMaterializerContext {
+        owner_user_id: owner.clone(),
+        materializer_kind: "test.edge".into(),
+        provider_binding_id: Some("provider-v1".into()),
+        execution_run_id: Some(run.clone()),
+        execution_run_generation: binding.run_generation,
+    };
+    let evidence = EvaluationWorkspaceMaterialization {
+        schema_version: 1,
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: binding.trial_id.clone(),
+        run_generation: binding.run_generation.unwrap(),
+        spec_fingerprint: binding.spec_fingerprint.clone(),
+        edge_executor_id: "edge-a".into(),
+        connection_generation: 1,
+        allocation: EvaluationAllocationReceipt {
+            schema_version: 1,
+            allocation_id: Uuid::new_v4().to_string(),
+            owner_user_id: owner.clone(),
+            session_id: session.clone(),
+            run_id: run,
+            deployment_id: "deployment-a".into(),
+            materialization_id: "materialization-a".into(),
+            workspace_dir: "/allocation/trial-a".into(),
+            source_commit: "a".repeat(40),
+            source_tree: "b".repeat(40),
+            confinement_fingerprint: confinement.fingerprint().unwrap(),
+        },
+    };
+    evidence
+        .validate_binding(&binding, &experiment.spec)
+        .unwrap();
+    let content = serde_json::to_value(&evidence).unwrap();
+    let hash = content_fingerprint(&astra_core::canonical_json_string(&content));
+    let mut request = MaterializationReceiptRequest {
+        trial_id: binding.trial_id.clone(),
+        session_id: session.clone(),
+        envelope: envelope.clone(),
+        component_kind: MaterializationComponentKind::Workspace,
+        component_snapshot_ref: Some(format!("artifact://{}", evidence.artifact_id())),
+        component_base_snapshot_ref: None,
+        component_content_fingerprint: Some(hash.clone()),
+        outcome: MaterializationOutcome::Available,
+        failure_code: None,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        idempotency_key: "allocation-receipt".into(),
+    };
+    assert!(matches!(
+        receipts.record_receipt(&trusted, &request).await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+    let persisted = evidence.persist(&pool).await.unwrap();
+    assert_eq!(persisted, (evidence.artifact_id(), hash));
+    assert_eq!(evidence.persist(&pool).await.unwrap(), persisted);
+    let workspace = receipts.record_receipt(&trusted, &request).await.unwrap();
+    let mut ids = vec![workspace.receipt_id];
+    for (component, hash) in [
+        (MaterializationComponentKind::Context, "sha256:context"),
+        (MaterializationComponentKind::Policy, "sha256:tools"),
+    ] {
+        request.component_kind = component;
+        request.component_snapshot_ref = Some(format!("evaluation://{}", component.as_str()));
+        request.component_content_fingerprint = Some(hash.into());
+        request.idempotency_key = format!("allocation-{}", component.as_str());
+        ids.push(
+            receipts
+                .record_receipt(&trusted, &request)
+                .await
+                .unwrap()
+                .receipt_id,
+        );
+    }
+    receipts
+        .validate_receipts_for_execution(
+            &owner,
+            &binding.trial_id,
+            &session,
+            &experiment.spec,
+            &envelope,
+            &ids,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    // Expiry after receipt issuance must prevent execution with that same receipt set.
+    sqlx::query("UPDATE session_artifacts SET status = 'expired' WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+        .bind(&owner).bind(&session).bind(evidence.artifact_id()).execute(pool.get()).await.unwrap();
+    assert!(matches!(
+        receipts
+            .validate_receipts_for_execution(
+                &owner,
+                &binding.trial_id,
+                &session,
+                &experiment.spec,
+                &envelope,
+                &ids,
+                chrono::Utc::now()
+            )
+            .await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+    // Even a well-formed replacement artifact cannot reuse the admitted content hash.
+    let mut changed = evidence.clone();
+    changed.allocation.run_id = "different-run".into();
+    assert!(
+        changed
+            .validate_binding(&binding, &experiment.spec)
+            .is_err()
+    );
+    sqlx::query("UPDATE session_artifacts SET status = 'active', content_json = ? WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+        .bind(serde_json::to_string(&changed).unwrap()).bind(&owner).bind(&session).bind(evidence.artifact_id()).execute(pool.get()).await.unwrap();
+    assert!(matches!(
+        receipts
+            .validate_receipts_for_execution(
+                &owner,
+                &binding.trial_id,
+                &session,
+                &experiment.spec,
+                &envelope,
+                &ids,
+                chrono::Utc::now()
+            )
+            .await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+    request.component_kind = MaterializationComponentKind::Workspace;
+    request.component_snapshot_ref = Some(format!("artifact://{}", evidence.artifact_id()));
+    request.component_content_fingerprint = Some(content_fingerprint(
+        &astra_core::canonical_json_string(&serde_json::to_value(&changed).unwrap()),
+    ));
+    request.idempotency_key = "changed-allocation".into();
+    assert!(matches!(
+        receipts.record_receipt(&trusted, &request).await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+    assert!(
+        evidence.persist(&pool).await.is_err(),
+        "retry cannot replace changed evidence"
+    );
+}

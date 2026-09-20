@@ -140,6 +140,7 @@ pub enum EdgeClientMessage {
         request_id: String,
         connection_generation: u64,
         workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
         source_commit: Option<String>,
         source_tree: Option<String>,
         #[serde(default)]
@@ -152,6 +153,7 @@ pub enum EdgeClientMessage {
         request_id: String,
         connection_generation: u64,
         workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
         source_commit: Option<String>,
         source_tree: Option<String>,
         clean: bool,
@@ -166,6 +168,7 @@ pub enum EdgeClientMessage {
         request_id: String,
         connection_generation: u64,
         workspace_dir: String,
+        allocation: Option<astra_runtime_env::EvaluationAllocationReceipt>,
         source_commit: Option<String>,
         source_tree: Option<String>,
         base_revision: Option<String>,
@@ -248,7 +251,7 @@ pub enum EdgeServerMessage {
     WorkspaceSnapshotRequest {
         request_id: String,
         connection_generation: u64,
-        workspace_dir: String,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
     },
 
     /// Capture the final patch and execute the server-frozen verifier in the
@@ -257,8 +260,7 @@ pub enum EdgeServerMessage {
     WorkspaceFinalize {
         request_id: String,
         connection_generation: u64,
-        workspace_dir: String,
-        source_commit: String,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
         verifier_command: String,
         verifier_timeout_secs: u64,
         finalization_deadline_unix_ms: u64,
@@ -275,8 +277,7 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_workspace_release")]
     WorkspaceRelease {
         connection_generation: u64,
-        workspace_dir: String,
-        source_commit: String,
+        allocation: astra_runtime_env::EvaluationAllocationReceipt,
     },
 
     /// Server heartbeat response.
@@ -328,6 +329,23 @@ impl EdgeServerMessage {
 
 fn default_tool_timeout_secs() -> u64 {
     EDGE_TOOL_TIMEOUT_SECS
+}
+
+#[cfg(test)]
+pub(crate) fn test_allocation_receipt() -> astra_runtime_env::EvaluationAllocationReceipt {
+    astra_runtime_env::EvaluationAllocationReceipt {
+        schema_version: 1,
+        allocation_id: "allocation".into(),
+        owner_user_id: "owner".into(),
+        session_id: "session".into(),
+        run_id: "run".into(),
+        deployment_id: "deployment".into(),
+        materialization_id: "materialization".into(),
+        workspace_dir: "/workspace/trial".into(),
+        source_commit: "a".repeat(40),
+        source_tree: "b".repeat(40),
+        confinement_fingerprint: format!("sha256:{}", "c".repeat(64)),
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +676,7 @@ mod tests {
             request_id: "workspace-request".to_string(),
             connection_generation: 4,
             workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            allocation: Some(test_allocation_receipt()),
             source_commit: Some("a".repeat(40)),
             source_tree: Some("b".repeat(40)),
             clean: true,
@@ -673,8 +692,7 @@ mod tests {
         let finalize = EdgeServerMessage::WorkspaceFinalize {
             request_id: "finalize-request".to_string(),
             connection_generation: 4,
-            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
-            source_commit: "a".repeat(40),
+            allocation: test_allocation_receipt(),
             verifier_command: "make check".to_string(),
             verifier_timeout_secs: 120,
             finalization_deadline_unix_ms: 1_900_000_000_000,
@@ -693,6 +711,7 @@ mod tests {
             request_id: "finalize-request".to_string(),
             connection_generation: 4,
             workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            allocation: Some(test_allocation_receipt()),
             source_commit: Some("a".repeat(40)),
             source_tree: Some("b".repeat(40)),
             base_revision: Some(format!("sha256:{}", "c".repeat(64))),
