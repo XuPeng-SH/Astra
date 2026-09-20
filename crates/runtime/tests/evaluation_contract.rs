@@ -167,7 +167,8 @@ fn generic_experiment_create_value() -> serde_json::Value {
             "target": {
                 "kind": "prompt",
                 "baseline": {"revision_id": "base", "content_hash": hash('a')},
-                "candidate": {"revision_id": "candidate", "content_hash": hash('b')}
+                "candidate": {"revision_id": "candidate", "content_hash": hash('b')},
+                "judgment_policy": {"kind": "disabled"}
             },
             "cases": [{
                 "case_id": "case-1",
