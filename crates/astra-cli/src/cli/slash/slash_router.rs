@@ -681,7 +681,7 @@ pub(crate) async fn fetch_model_catalog(
         let response = api
             .get_models_page_response_timeout(
                 tok,
-                std::time::Duration::from_secs(3),
+                astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
                 astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
             )

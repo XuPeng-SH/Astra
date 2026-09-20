@@ -310,6 +310,12 @@ impl NativeStore {
         }
     }
 
+    /// Validate the credential destination before opening a browser. This does
+    /// not relax permissions or modify an existing credential file.
+    pub fn prepare_for_login(&self) -> Result<(), String> {
+        self.prepare_dir()
+    }
+
     fn prepare_dir(&self) -> Result<(), String> {
         #[cfg(unix)]
         {
@@ -754,6 +760,27 @@ pub async fn revoke(environment: &Environment, refresh_token: &str) -> Result<()
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn login_preflight_rejects_unsafe_directory_without_changing_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("auth");
+        let store = super::NativeStore::with_directory(path.clone());
+        store.prepare_for_login().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(store.prepare_for_login().is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!path.join("auth.json").exists());
+    }
+
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 

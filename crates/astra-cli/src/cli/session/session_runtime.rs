@@ -384,7 +384,7 @@ pub(crate) async fn load_server_model_catalog(
         let response = api
             .get_models_page_response_timeout(
                 token,
-                std::time::Duration::from_secs(3),
+                astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
                 purpose,
             )

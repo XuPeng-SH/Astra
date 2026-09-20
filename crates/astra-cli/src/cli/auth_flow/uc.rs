@@ -10,6 +10,7 @@ pub(crate) async fn login_with_observer(
     terminal_workspace_prompt: bool,
 ) -> Result<(), String> {
     let store = NativeStore::new()?;
+    store.prepare_for_login()?;
     native::secure_url(&api.api_origin())?;
     native::secure_url(&discovery.issuer)?;
     native::secure_url(&discovery.moi_api_url)?;
@@ -324,6 +325,7 @@ async fn prepare_products(
     }
     let response = client
         .post(format!("{}/auth/uc/bootstrap", environment.astra_url))
+        .timeout(std::time::Duration::from_secs(40))
         .bearer_auth(token)
         .send()
         .await

@@ -33,6 +33,9 @@ pub use astra_server_types::{
     WorkTurnRequestV1,
 };
 pub use client::ThinClient;
+/// Allow the server's bounded dependency lookup to return its classified error
+/// instead of cancelling model discovery before that lookup finishes.
+pub const MODEL_CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use device_proof::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
     ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, canonical_device_proof_message,

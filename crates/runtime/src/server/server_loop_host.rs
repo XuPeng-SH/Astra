@@ -10263,7 +10263,10 @@ impl ServerAgenticLoopHost {
             service
                 .admit_model_offering(self.user_id.clone(), admitted.offering_id.clone())
                 .await
-                .map_err(|(_, body)| body.0.detail)?
+                .map_err(|(_, body)| match body.0.error_code {
+                    Some(code) => format!("[{code}] {}", body.0.detail),
+                    None => body.0.detail,
+                })?
         } else {
             astra_services::revalidate_admitted_model_execution(
                 &self.matrixone,

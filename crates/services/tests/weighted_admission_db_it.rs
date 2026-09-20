@@ -811,6 +811,9 @@ async fn gate_and_pool_wait_share_bounded_admission_budget() {
     reset_admission_scope(&pool).await;
     let mut controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(2))
         .expect("valid admission limits");
+    // Keep the normal I/O budget for the recovery probe. Cloning shares the
+    // same local semaphore and SQL pool, so a leaked waiter still fails it.
+    let recovery_controller = controller.clone();
     controller.with_admission_wait_timeout(Duration::from_millis(100));
 
     // Occupy the complete pool. The first request must wait for a connection
@@ -870,7 +873,7 @@ async fn gate_and_pool_wait_share_bounded_admission_budget() {
     drop(held_connections);
     let permit = tokio::time::timeout(
         Duration::from_secs(2),
-        controller.try_reserve(
+        recovery_controller.try_reserve(
             &key("bounded-wait-after-cancel"),
             work(),
             Duration::from_secs(30),
@@ -895,6 +898,7 @@ async fn durable_gate_wait_obeys_admission_budget() {
     reset_admission_scope(&pool).await;
     let mut controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(2))
         .expect("valid admission limits");
+    let recovery_controller = controller.clone();
     controller.with_admission_wait_timeout(Duration::from_millis(100));
 
     let mut gate_tx = pool.get().begin().await.expect("begin gate holder");
@@ -930,15 +934,21 @@ async fn durable_gate_wait_obeys_admission_budget() {
     );
     gate_tx.rollback().await.expect("release durable gate");
 
-    let permit = controller
-        .try_reserve(
+    // The 100ms budget induces the blocked-gate failure above; it is not a
+    // latency requirement for a complete healthy SQL transaction. Keep the
+    // shared gate/pool and a bounded recovery probe, without retrying it.
+    let permit = tokio::time::timeout(
+        Duration::from_secs(2),
+        recovery_controller.try_reserve(
             &key("durable-gate-after-timeout"),
             work(),
             Duration::from_secs(30),
             "durable-gate-after-timeout",
-        )
-        .await
-        .expect("gate timeout must not poison the next reservation");
+        ),
+    )
+    .await
+    .expect("gate timeout must not leave recovery blocked")
+    .expect("gate timeout must not poison the next reservation");
     permit
         .release()
         .await
@@ -954,6 +964,7 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
     reset_admission_scope(&pool).await;
     let mut controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(2))
         .expect("valid admission limits");
+    let recovery_controller = controller.clone();
     controller.with_admission_wait_timeout(Duration::from_millis(100));
     let permit = controller
         .try_reserve(
@@ -1004,15 +1015,20 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
     .expect("count retried release reservation");
     assert_eq!(remaining, 0, "retry must remove the durable reservation");
 
-    let replacement = controller
-        .try_reserve(
+    // Verify capacity reuse with the normal I/O budget on the same local
+    // gate/pool, not the fault-injection budget captured by the release permit.
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(2),
+        recovery_controller.try_reserve(
             &key("release-timeout-replacement"),
             work(),
             Duration::from_secs(30),
             "release-timeout-replacement-turn",
-        )
-        .await
-        .expect("capacity must be immediately reusable after retry");
+        ),
+    )
+    .await
+    .expect("capacity reuse must not remain blocked after retry")
+    .expect("capacity must be reusable after retry");
     replacement
         .release()
         .await
