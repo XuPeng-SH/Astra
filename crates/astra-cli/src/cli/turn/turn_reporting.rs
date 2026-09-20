@@ -171,19 +171,58 @@ pub(crate) fn format_primary_usage_summary(
         .saturating_add(tokens_out.unwrap_or(0))
         .saturating_add(cache_read_tokens.unwrap_or(0))
         .saturating_add(cache_creation_tokens.unwrap_or(0));
-    let mut summary = format!("{} tokens", format_token_count(total));
-    if !complete {
-        summary.push_str(" known");
-    } else if let (Some(fresh), Some(cache_read)) = (tokens_in, cache_read_tokens) {
-        let input_total = fresh
-            .saturating_add(cache_read)
-            .saturating_add(cache_creation_tokens.unwrap_or(0));
-        if input_total > 0 {
-            let cached_percent = ((u128::from(cache_read) * 100) / u128::from(input_total)) as u64;
-            summary.push_str(&format!(" · {cached_percent}% cached"));
-        }
+    let mut summary = format!("{} tokens", format_usage_count(total, complete));
+    if let Some(cache) = format_cache_usage_summary(
+        tokens_in,
+        cache_read_tokens,
+        cache_creation_tokens,
+        complete,
+    ) {
+        summary.push_str(&format!(" · {cache}"));
     }
     Some(summary)
+}
+
+/// Shared CLI/TUI cache presentation. Partial usage retains known cache reads,
+/// but cannot establish the whole turn's input denominator or hit rate.
+pub(crate) fn format_cache_usage_summary(
+    fresh: Option<u64>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    complete: bool,
+) -> Option<String> {
+    let cache_read = cache_read?;
+    if complete && let Some(fresh) = fresh {
+        let input =
+            u128::from(fresh) + u128::from(cache_read) + u128::from(cache_creation.unwrap_or(0));
+        if let Some(percent) = (u128::from(cache_read) * 100).checked_div(input) {
+            return Some(format!("{percent}% cached"));
+        }
+    }
+    Some(format!(
+        "{} cached",
+        format_usage_count(cache_read, complete)
+    ))
+}
+
+/// Partial sums are lower bounds. Truncate their compact decimal so rounding
+/// cannot advertise a larger lower bound than the provider actually reported.
+pub(crate) fn format_usage_count(tokens: u64, complete: bool) -> String {
+    if complete {
+        return format_token_count(tokens);
+    }
+    let count = if tokens >= 1_000_000 {
+        format!(
+            "{}.{:01}M",
+            tokens / 1_000_000,
+            tokens % 1_000_000 / 100_000
+        )
+    } else if tokens >= 1_000 {
+        format!("{}.{:01}k", tokens / 1_000, tokens % 1_000 / 100)
+    } else {
+        tokens.to_string()
+    };
+    format!("≥{count}")
 }
 
 /// The only usage facts eligible for the compact primary-model summary. Raw
@@ -548,8 +587,8 @@ mod tests {
         result.usage_attribution.primary_complete = false;
 
         let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
-        assert!(parts.contains(&"1.0k tokens known".to_string()));
-        assert!(!parts.iter().any(|part| part.contains("cached")));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached".to_string()));
+        assert!(!parts.iter().any(|part| part.contains("%")));
     }
 
     #[test]
@@ -581,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_primary_usage_is_labeled_known_and_hides_cache_rate() {
+    fn incomplete_primary_usage_retains_known_cache_without_a_hit_rate() {
         assert_eq!(
             super::format_primary_usage_summary(
                 Some(100),
@@ -592,8 +631,34 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("1.0k tokens known")
+            Some("≥1.0k tokens · ≥900 cached")
         );
+    }
+
+    #[test]
+    fn cache_summary_distinguishes_unknown_zero_partial_and_complete() {
+        assert_eq!(super::format_usage_count(19_999, false), "≥19.9k");
+        assert_eq!(super::format_usage_count(1_999_999, false), "≥1.9M");
+        assert_eq!(super::format_usage_count(19_999, true), "20.0k");
+        for (fresh, read, write, complete, expected) in [
+            (Some(100), None, None, false, None),
+            (Some(100), Some(0), None, false, Some("≥0 cached")),
+            (None, Some(900), None, false, Some("≥900 cached")),
+            (Some(100), Some(900), Some(1000), true, Some("45% cached")),
+            (Some(0), Some(0), Some(0), true, Some("0 cached")),
+            (
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(0),
+                true,
+                Some("50% cached"),
+            ),
+        ] {
+            assert_eq!(
+                super::format_cache_usage_summary(fresh, read, write, complete).as_deref(),
+                expected
+            );
+        }
     }
 
     #[test]

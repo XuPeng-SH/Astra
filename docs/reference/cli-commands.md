@@ -2,6 +2,14 @@
 
 Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 
+## Turn summary
+
+The completion line shows elapsed time, time to first token (`ttft`), primary
+model tokens, and cache usage when reported. Complete input accounting shows
+the cached-input percentage; incomplete accounting shows lower bounds such as
+`≥19.9k tokens · ≥17.9k cached`. Missing cache measurements are omitted, not
+reported as zero. Session totals remain separate in parentheses.
+
 ## Personal BYOK model setup
 
 Run `astra model add` after logging in to configure a personal model interactively.

@@ -20,6 +20,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
+use crate::cli::turn::turn_reporting::{format_cache_usage_summary, format_usage_count};
 use crate::tui::turn_event::TurnEvent;
 
 #[derive(Debug, Clone, Default)]
@@ -143,42 +144,29 @@ impl TurnSummaryCell {
             || self.tokens_out.is_some()
             || self.cache_read_tokens.is_some()
             || self.cache_creation_tokens.is_some();
+        let provider_tokens = self
+            .tokens_in
+            .unwrap_or(0)
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+            .saturating_add(self.tokens_out.unwrap_or(0));
         if usage_observed {
-            let provider_tokens = self
-                .tokens_in
-                .unwrap_or(0)
-                .saturating_add(self.cache_read_tokens.unwrap_or(0))
-                .saturating_add(self.cache_creation_tokens.unwrap_or(0))
-                .saturating_add(self.tokens_out.unwrap_or(0));
             sections.push(Section::primary(vec![
-                Span::styled(fmt_tokens(provider_tokens), value),
                 Span::styled(
-                    if self.usage_partial {
-                        " tokens known"
-                    } else {
-                        " tokens"
-                    },
-                    label,
+                    format_usage_count(provider_tokens, !self.usage_partial),
+                    value,
                 ),
+                Span::styled(" tokens", label),
             ]));
         }
 
-        if !self.usage_partial
-            && let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
-            && cache_read > 0
-        {
-            let total_input = cache_read
-                .saturating_add(fresh_input)
-                .saturating_add(self.cache_creation_tokens.unwrap_or(0));
-            let pct = if total_input == 0 {
-                0
-            } else {
-                ((cache_read as f64 / total_input as f64) * 100.0).round() as u32
-            };
-            sections.push(Section::primary(vec![
-                Span::styled(format!("{pct}%"), value),
-                Span::styled(" cached", label),
-            ]));
+        if let Some(cache) = format_cache_usage_summary(
+            self.tokens_in,
+            self.cache_read_tokens,
+            self.cache_creation_tokens,
+            !self.usage_partial,
+        ) {
+            sections.push(Section::primary(vec![Span::styled(cache, value)]));
         }
 
         if self.tools > 0 {
@@ -188,16 +176,10 @@ impl TurnSummaryCell {
             ]));
         }
 
-        let current_provider_tokens = self
-            .tokens_in
-            .unwrap_or(0)
-            .saturating_add(self.cache_read_tokens.unwrap_or(0))
-            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
-            .saturating_add(self.tokens_out.unwrap_or(0));
         let cumulative_tokens = self
             .cumulative_tokens
-            .filter(|c| *c > current_provider_tokens)
-            .map(|c| Span::styled(fmt_tokens(c), value));
+            .filter(|c| *c > provider_tokens)
+            .map(|c| Span::styled(format_usage_count(c, true), value));
 
         if let Some(cost) = self.cumulative_cost_usd
             && cost > 0.0
@@ -257,16 +239,6 @@ fn fmt_ms(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{ms}ms")
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
     }
 }
 
@@ -446,10 +418,20 @@ mod tests {
             "primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("100.3k tokens known"),
+            out.contains("≥100.3k tokens"),
             "known primary usage should remain visible: {out}"
         );
-        assert!(!out.contains("cached"), "partial cache rate leaked: {out}");
+        assert!(
+            out.contains("≥98.8k cached"),
+            "known cache reads missing: {out}"
+        );
+        assert!(!out.contains("%"), "partial cache rate leaked: {out}");
+        let restored = TurnSummaryCell::from_persist(c.to_persist().unwrap()).unwrap();
+        assert_eq!(
+            render(&restored, 120),
+            out,
+            "cache must survive history replay"
+        );
         for diagnostic in ["Jev", "request_judgment", "usage not fully attributed"] {
             assert!(
                 !out.contains(diagnostic),
@@ -466,10 +448,7 @@ mod tests {
             ..Default::default()
         };
         let out = render(&c, 120);
-        assert!(
-            out.contains("1.2k tokens known"),
-            "known input missing: {out}"
-        );
+        assert!(out.contains("≥1.2k tokens"), "known input missing: {out}");
     }
 
     #[test]
