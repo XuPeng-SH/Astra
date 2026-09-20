@@ -12806,6 +12806,7 @@ impl AgenticRunLifecycleService {
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
             turn_event_buffer: None,
+            canonical_trace_time_bounds: Default::default(),
             harness,
         }
     }
@@ -23592,6 +23593,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
+            canonical_trace_time_bounds: Default::default(),
             harness: {
                 #[cfg(feature = "harness")]
                 {

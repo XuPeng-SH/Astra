@@ -3750,6 +3750,9 @@ pub struct AgenticLoopState {
     pub root_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
+    /// Frozen on first post-loop capture; persistence retries must not generate
+    /// new event timestamps for the same completed execution.
+    pub canonical_trace_time_bounds: std::sync::OnceLock<(chrono::DateTime<chrono::Utc>, u64)>,
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
@@ -5480,6 +5483,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         canonical_turn_chain_id: None,
         root_user_query_event_id: None,
         turn_event_buffer: None,
+        canonical_trace_time_bounds: Default::default(),
         harness: super::super::harness_adapter::HarnessSlot::empty(),
         observation_journal: Default::default(),
     }
@@ -7329,6 +7333,7 @@ pub(crate) mod tests {
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
+            canonical_trace_time_bounds: Default::default(),
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
         }

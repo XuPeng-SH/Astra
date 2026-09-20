@@ -561,7 +561,7 @@ impl PostLoopPersistContext {
             ));
         }
         let (turn_started_at, _) = turn_trace_time_bounds(state);
-        let outcome = persist_server_loop_trace_events_impl(
+        let outcome = persist_server_loop_trace_events_in_tx(
             &mut tx,
             &self.user_id,
             &self.session_id,
@@ -1902,6 +1902,14 @@ pub(crate) fn trace_context_from_subrun_context(
 }
 
 fn turn_trace_time_bounds(state: &AgenticLoopState) -> (chrono::DateTime<chrono::Utc>, u64) {
+    *state
+        .canonical_trace_time_bounds
+        .get_or_init(|| capture_turn_trace_time_bounds(state))
+}
+
+fn capture_turn_trace_time_bounds(
+    state: &AgenticLoopState,
+) -> (chrono::DateTime<chrono::Utc>, u64) {
     let latest_round_end = state
         .recent_rounds
         .iter()
@@ -1975,42 +1983,7 @@ fn server_loop_user_query_event(
 
 /// Transactional variant: uses the provided transaction for all writes instead
 /// of creating its own. The caller owns commit/rollback.
-pub(crate) async fn persist_server_loop_core_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    parent_run_id: Option<&str>,
-    parent_event_id: Option<&str>,
-    agent_id: Option<&str>,
-    parent_agent_id: Option<&str>,
-    trace_context: Option<TraceContext>,
-    user_message: &str,
-    state: &AgenticLoopState,
-    model_name: Option<&str>,
-    turn_started_at: chrono::DateTime<chrono::Utc>,
-    terminal_offset_ms: u64,
-) -> Result<TraceEventPersistOutcome, String> {
-    persist_server_loop_core_events_impl(
-        tx,
-        user_id,
-        session_id,
-        run_id,
-        parent_run_id,
-        parent_event_id,
-        agent_id,
-        parent_agent_id,
-        trace_context,
-        user_message,
-        state,
-        model_name,
-        turn_started_at,
-        terminal_offset_ms,
-    )
-    .await
-}
-
-async fn persist_server_loop_core_events_impl(
+async fn persist_server_loop_core_events_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
@@ -3284,36 +3257,7 @@ pub(crate) fn build_tool_trace_events(
 
 /// Transactional variant: uses the provided transaction for all writes.
 /// The caller owns commit/rollback.
-pub(crate) async fn persist_server_loop_trace_events_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    parent_run_id: Option<&str>,
-    agent_id: Option<&str>,
-    parent_agent_id: Option<&str>,
-    trace_context: Option<TraceContext>,
-    state: &AgenticLoopState,
-    model_name: Option<&str>,
-    turn_started_at: chrono::DateTime<chrono::Utc>,
-) -> Result<TraceEventPersistOutcome, String> {
-    persist_server_loop_trace_events_impl(
-        tx,
-        user_id,
-        session_id,
-        run_id,
-        parent_run_id,
-        agent_id,
-        parent_agent_id,
-        trace_context,
-        state,
-        model_name,
-        turn_started_at,
-    )
-    .await
-}
-
-async fn persist_server_loop_trace_events_impl(
+async fn persist_server_loop_trace_events_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
@@ -3939,19 +3883,6 @@ mod tests {
         .expect_err("a mismatched durable terminal must remain ambiguous");
 
         assert!(error.contains("terminal event receipt mismatch"));
-    }
-
-    #[test]
-    fn exact_terminal_replay_is_authoritative() {
-        let expected = resolved_terminal_fixture();
-        let resolved = classify_authoritative_terminal_resolution(
-            AtomicRunTerminalSettlementResolution::Exact(expected.clone()),
-        )
-        .expect("an exact terminal replay is idempotent")
-        .expect("replay returns the committed terminal");
-
-        assert_eq!(resolved, expected);
-        assert_eq!(resolved.last_event_idx, 7);
     }
 
     #[test]
@@ -6139,6 +6070,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
+        for with_buffer in [false, true] {
+            assert_canonical_terminal_replay(with_buffer).await;
+        }
+    }
+
+    async fn assert_canonical_terminal_replay(with_buffer: bool) {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -6166,6 +6103,11 @@ mod tests {
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
+        if with_buffer {
+            state.turn_event_buffer = Some(
+                astra_services::session_journal::TurnEventBuffer::begin_turn(Some(&session_id), 1),
+            );
+        }
         let terminal_events = vec![
             json!({
                 "event_type": "text_done",
@@ -6176,40 +6118,90 @@ mod tests {
                 "data": { "status": astra_core::STATUS_COMPLETED }
             }),
         ];
-        let commit = persist_server_loop_canonical_terminal_settlement(
-            &pool,
-            CanonicalLoopAppend {
-                user_id: &user_id,
-                session_id: &session_id,
-                run_id: &run_id,
-                expected_owner_generation: Some(authority.owner_generation),
-                owner_lease_duration: Some(Duration::from_secs(45)),
-                parent_run_id: None,
-                parent_event_id: None,
-                agent_id: Some("root-agent"),
-                parent_agent_id: None,
-                trace_context: None,
-                user_message: "produce an answer",
-                model_name: Some("test-model"),
-                include_terminal_assistant: true,
-            },
-            &state,
-            CanonicalTerminalSettlement {
-                expected_statuses: &[astra_core::STATUS_RUNNING],
-                expected_owner_generation: authority.owner_generation,
-                status: astra_core::STATUS_COMPLETED,
-                waiting_for: None,
-                error_message: None,
-                events: &terminal_events,
-                prompt_tokens: 37,
-                completion_tokens: 17,
-                tool_calls: 6,
-            },
-        )
-        .await
-        .expect("commit canonical terminal settlement");
+        let append = || CanonicalLoopAppend {
+            user_id: &user_id,
+            session_id: &session_id,
+            run_id: &run_id,
+            expected_owner_generation: Some(authority.owner_generation),
+            owner_lease_duration: Some(Duration::from_secs(45)),
+            parent_run_id: None,
+            parent_event_id: None,
+            agent_id: Some("root-agent"),
+            parent_agent_id: None,
+            trace_context: None,
+            user_message: "produce an answer",
+            model_name: Some("test-model"),
+            include_terminal_assistant: true,
+        };
+        let settlement = CanonicalTerminalSettlement {
+            expected_statuses: &[astra_core::STATUS_RUNNING],
+            expected_owner_generation: authority.owner_generation,
+            status: astra_core::STATUS_COMPLETED,
+            waiting_for: None,
+            error_message: None,
+            events: &terminal_events,
+            prompt_tokens: 37,
+            completion_tokens: 17,
+            tool_calls: 6,
+        };
+        let commit =
+            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+                .await
+                .expect("commit canonical terminal settlement");
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
+
+        // Exercise the same authoritative resolver used after a lost COMMIT
+        // acknowledgement, including its receipt and canonical-evidence checks.
+        let request_append = append();
+        let receipts = DatabaseRunStateStore::new(pool.clone())
+            .resolve_atomic_terminal_settlement(
+                atomic_terminal_request(&request_append, settlement),
+                None,
+            )
+            .await
+            .expect("read committed terminal receipts");
+        let receipts = classify_authoritative_terminal_resolution(receipts)
+            .unwrap()
+            .expect("terminal was committed")
+            .event_receipts;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let (_, resolved) = resolve_existing_atomic_terminal_settlement(
+            &pool,
+            &append(),
+            &state,
+            settlement,
+            Some(&receipts),
+        )
+        .await
+        .expect("delayed lost-ack resolution retains the original capture")
+        .expect("commit must remain authoritative");
+        assert_eq!(resolved.committed_events, terminal_events);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let replay =
+            persist_server_loop_canonical_terminal_settlement(&pool, append(), &state, settlement)
+                .await
+                .expect("delayed terminal replay is idempotent");
+        assert_eq!(replay.terminal_events, commit.terminal_events);
+        assert_eq!(
+            replay.terminal_assistant_source_event_id,
+            commit.terminal_assistant_source_event_id
+        );
+
+        // Freezing time must not accept changed content under the same identity.
+        state.final_text = "conflicting answer".into();
+        let error = resolve_existing_atomic_terminal_settlement(
+            &pool,
+            &append(),
+            &state,
+            settlement,
+            Some(&receipts),
+        )
+        .await
+        .err()
+        .expect("changed capture must still conflict");
+        assert!(error.contains("conflicts with replay"), "{error}");
 
         let canonical_event_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
