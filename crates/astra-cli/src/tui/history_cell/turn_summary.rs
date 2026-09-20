@@ -139,18 +139,32 @@ impl TurnSummaryCell {
             ]));
         }
 
-        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
-            let provider_tokens = tin
+        let usage_observed = self.tokens_in.is_some()
+            || self.tokens_out.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some();
+        if usage_observed {
+            let provider_tokens = self
+                .tokens_in
+                .unwrap_or(0)
                 .saturating_add(self.cache_read_tokens.unwrap_or(0))
                 .saturating_add(self.cache_creation_tokens.unwrap_or(0))
-                .saturating_add(tout);
+                .saturating_add(self.tokens_out.unwrap_or(0));
             sections.push(Section::primary(vec![
                 Span::styled(fmt_tokens(provider_tokens), value),
-                Span::styled(" tokens", label),
+                Span::styled(
+                    if self.usage_partial {
+                        " tokens known"
+                    } else {
+                        " tokens"
+                    },
+                    label,
+                ),
             ]));
         }
 
-        if let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
+        if !self.usage_partial
+            && let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
             && cache_read > 0
         {
             let total_input = cache_read
@@ -432,15 +446,30 @@ mod tests {
             "primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("99% cached"),
-            "measured cache rate should remain visible: {out}"
+            out.contains("100.3k tokens known"),
+            "known primary usage should remain visible: {out}"
         );
+        assert!(!out.contains("cached"), "partial cache rate leaked: {out}");
         for diagnostic in ["Jev", "request_judgment", "usage not fully attributed"] {
             assert!(
                 !out.contains(diagnostic),
                 "diagnostic {diagnostic:?} leaked into {out}"
             );
         }
+    }
+
+    #[test]
+    fn partial_input_without_output_remains_visible() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            usage_partial: true,
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(
+            out.contains("1.2k tokens known"),
+            "known input missing: {out}"
+        );
     }
 
     #[test]

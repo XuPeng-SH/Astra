@@ -153,6 +153,7 @@ pub(crate) fn format_primary_usage_summary(
     cache_read_tokens: Option<u64>,
     cache_creation_tokens: Option<u64>,
     observed: bool,
+    complete: bool,
 ) -> Option<String> {
     let has_lane = tokens_in.is_some()
         || tokens_out.is_some()
@@ -171,7 +172,9 @@ pub(crate) fn format_primary_usage_summary(
         .saturating_add(cache_read_tokens.unwrap_or(0))
         .saturating_add(cache_creation_tokens.unwrap_or(0));
     let mut summary = format!("{} tokens", format_token_count(total));
-    if let (Some(fresh), Some(cache_read)) = (tokens_in, cache_read_tokens) {
+    if !complete {
+        summary.push_str(" known");
+    } else if let (Some(fresh), Some(cache_read)) = (tokens_in, cache_read_tokens) {
         let input_total = fresh
             .saturating_add(cache_read)
             .saturating_add(cache_creation_tokens.unwrap_or(0));
@@ -226,6 +229,7 @@ fn primary_usage_summary(result: &StreamResult) -> Option<String> {
         projection.cache_read_tokens,
         projection.cache_creation_tokens,
         projection.observed,
+        projection.complete,
     )
 }
 
@@ -531,6 +535,24 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_primary_metrics_are_wired_through_as_known_usage() {
+        let state = crate::cli::session::session_state::SessionState::default();
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.usage_attribution.primary =
+            Some(crate::cli::stream::streaming_types::AttributedTokenUsage {
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(20),
+            });
+        result.usage_attribution.primary_complete = false;
+
+        let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
+        assert!(parts.contains(&"1.0k tokens known".to_string()));
+        assert!(!parts.iter().any(|part| part.contains("cached")));
+    }
+
+    #[test]
     fn primary_attempt_without_usage_is_not_presented_as_zero() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.model = Some("deepseek-flash".into());
@@ -552,9 +574,25 @@ mod tests {
     #[test]
     fn explicit_zero_cache_lane_renders_zero_percent() {
         assert_eq!(
-            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true)
+            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true, true)
                 .as_deref(),
             Some("109 tokens · 0% cached")
+        );
+    }
+
+    #[test]
+    fn incomplete_primary_usage_is_labeled_known_and_hides_cache_rate() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(100),
+                Some(20),
+                Some(900),
+                Some(0),
+                true,
+                false,
+            )
+            .as_deref(),
+            Some("1.0k tokens known")
         );
     }
 
