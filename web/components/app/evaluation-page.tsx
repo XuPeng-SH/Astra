@@ -29,6 +29,7 @@ import { WebApiError } from '@/lib/api/errors';
 
 type PrimaryModel = Awaited<ReturnType<typeof listModels>>['items'][number];
 const defaultExpected = '{\n  "ok": true\n}';
+type ComparisonKind = 'skill' | 'skill_routing_judgment';
 type SavedEvaluationReference = {
   version: 2;
   ownerId: string;
@@ -64,7 +65,9 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
   const [primaryModels, setPrimaryModels] = useState<PrimaryModel[]>([]);
   const [judgmentModels, setJudgmentModels] = useState<EvaluationModel[]>([]);
   const [skillName, setSkillName] = useState('');
-  const [versionId, setVersionId] = useState('');
+  const [comparisonKind, setComparisonKind] = useState<ComparisonKind>('skill');
+  const [baselineVersionId, setBaselineVersionId] = useState('');
+  const [candidateVersionId, setCandidateVersionId] = useState('');
   const [primaryOfferingId, setPrimaryOfferingId] = useState('');
   const [judgmentOfferingId, setJudgmentOfferingId] = useState('');
   const [workspaceEnabled, setWorkspaceEnabled] = useState(false);
@@ -212,7 +215,8 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
   useEffect(() => {
     if (!skillName) {
       setVersions([]);
-      setVersionId('');
+      setBaselineVersionId('');
+      setCandidateVersionId('');
       return;
     }
     let active = true;
@@ -220,7 +224,9 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       .then((payload) => {
         if (!active) return;
         setVersions(payload);
-        setVersionId((current) => current || payload.find((version) => version.status === 'published')?.version_id || '');
+        const published = payload.filter((version) => version.status === 'published');
+        setBaselineVersionId((current) => current || published[0]?.version_id || '');
+        setCandidateVersionId((current) => current || published[1]?.version_id || published[0]?.version_id || '');
       })
       .catch((reason: unknown) => {
         if (active) setError(reason instanceof Error ? reason.message : 'Failed to load Skill revisions.');
@@ -369,8 +375,8 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       await retryPendingSubmission();
       return;
     }
-    if (!skillName || !versionId || !primaryOfferingId) {
-      setError('Select a pinned published Skill revision and a primary Offering first.');
+    if (!skillName || !baselineVersionId || (comparisonKind === 'skill' && !candidateVersionId) || !primaryOfferingId) {
+      setError('Select the pinned published Skill revisions and a primary Offering first.');
       return;
     }
     let expected: unknown;
@@ -399,10 +405,10 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
     const payload: Record<string, unknown> = {
       submission_idempotency_key: `web-skill-routing-${crypto.randomUUID()}`,
       target: {
-        kind: 'skill_routing_judgment',
+        kind: comparisonKind,
         skill_name: skillName,
-        baseline: { revision_id: versionId },
-        candidate: { revision_id: versionId },
+        baseline: { revision_id: baselineVersionId },
+        candidate: { revision_id: comparisonKind === 'skill' ? candidateVersionId : baselineVersionId },
       },
       case: {
         case_id: caseId.trim() || 'routing-case',
@@ -410,13 +416,15 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
         verifier_config: { expected },
       },
       model_offering_id: primaryOfferingId,
-      ...(judgmentOfferingId ? { judgment_model_offering_id: judgmentOfferingId } : {}),
+      ...(comparisonKind === 'skill_routing_judgment' && judgmentOfferingId
+        ? { judgment_model_offering_id: judgmentOfferingId }
+        : {}),
       max_concurrency: 1,
       max_wall_time_secs: wall,
       ...(workspace ? { workspace } : {}),
     };
     await executeIntent(payload);
-  }, [caseId, edgeExecutorId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, sourceCommit, versionId, wallTimeSecs, workspaceEnabled, workspaceTools]);
+  }, [baselineVersionId, candidateVersionId, caseId, comparisonKind, edgeExecutorId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, sourceCommit, wallTimeSecs, workspaceEnabled, workspaceTools]);
 
   const resumeSavedComparison = useCallback(async () => {
     if (!savedIntent) return;
@@ -456,7 +464,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
     return (
       <div className="h-full overflow-y-auto overscroll-contain px-8 py-8">
         <div className="mx-auto max-w-5xl">
-          <PageHeader title="Evaluation" description="Compare a pinned Skill with and without the frozen judgment decision point." />
+          <PageHeader title="Evaluation" description="Compare pinned Skill revisions or measure a frozen routing judgment." />
           <div className="mt-8">
             {error ? (
               <Card>
@@ -476,7 +484,8 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
     );
   }
 
-  const selectedVersion = publishedVersions.find((version) => version.version_id === versionId);
+  const selectedBaseline = publishedVersions.find((version) => version.version_id === baselineVersionId);
+  const selectedCandidate = publishedVersions.find((version) => version.version_id === candidateVersionId);
   const coverage = report?.manifest.coverage;
 
   return (
@@ -484,7 +493,7 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       <div className="mx-auto max-w-6xl">
         <PageHeader
           title="Evaluation"
-          description="Compare a pinned published Skill with and without the frozen Skill routing judgment."
+          description="Compare two pinned Skill revisions, or isolate the effect of a frozen routing judgment."
           action={<Button variant="ghost" leadingIcon={RefreshCw} onClick={loadCatalog} disabled={busy}>Refresh catalog</Button>}
         />
 
@@ -493,25 +502,36 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
             <div className="flex items-start gap-3">
               <span className="flex size-9 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent"><Scale className="size-4" /></span>
               <div>
-                <h2 className="text-base font-semibold">Skill routing comparison</h2>
-                <p className="mt-1 text-sm leading-6 text-text-secondary">The server freezes the exact Skill, primary model, judgment Offering, verifier, and runtime conditions before either trial starts.</p>
+                <h2 className="text-base font-semibold">Skill comparison</h2>
+                <p className="mt-1 text-sm leading-6 text-text-secondary">The server freezes the exact Skill revisions, model, verifier, and runtime conditions before either trial starts.</p>
               </div>
             </div>
 
             <div className="mt-6 grid gap-4 sm:grid-cols-2">
-              <SelectField label="Skill" value={skillName} onChange={(value) => { setSkillName(value); setVersionId(''); }} disabled={busy}>
+              <SelectField label="Comparison" value={comparisonKind} onChange={(value) => setComparisonKind(value as ComparisonKind)} disabled={busy}>
+                <option value="skill">Skill revisions</option>
+                <option value="skill_routing_judgment">Routing judgment</option>
+              </SelectField>
+              <SelectField label="Skill" value={skillName} onChange={(value) => { setSkillName(value); setBaselineVersionId(''); setCandidateVersionId(''); }} disabled={busy}>
                 {sources.map((source) => <option key={source.skill_name} value={source.skill_name}>{source.skill_name}</option>)}
               </SelectField>
-              <SelectField label="Pinned published revision" value={versionId} onChange={setVersionId} disabled={busy || publishedVersions.length === 0}>
+              <SelectField label="Baseline revision" value={baselineVersionId} onChange={setBaselineVersionId} disabled={busy || publishedVersions.length === 0}>
                 {publishedVersions.map((version) => <option key={version.version_id} value={version.version_id}>{version.version} · {version.version_id}</option>)}
               </SelectField>
+              {comparisonKind === 'skill' ? (
+                <SelectField label="Candidate revision" value={candidateVersionId} onChange={setCandidateVersionId} disabled={busy || publishedVersions.length === 0}>
+                  {publishedVersions.map((version) => <option key={version.version_id} value={version.version_id}>{version.version} · {version.version_id}</option>)}
+                </SelectField>
+              ) : null}
               <SelectField label="Primary Offering" value={primaryOfferingId} onChange={setPrimaryOfferingId} disabled={busy}>
                 {primaryModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
               </SelectField>
-              <SelectField label={<>Judgment Offering <span className="font-normal text-text-muted">optional</span></>} value={judgmentOfferingId} onChange={setJudgmentOfferingId} disabled={busy}>
-                <option value="">Use configured default</option>
-                {judgmentModels.map((model) => <option key={model.offering_id} value={model.offering_id}>{model.name} · {model.provider}</option>)}
-              </SelectField>
+              {comparisonKind === 'skill_routing_judgment' ? (
+                <SelectField label={<>Judgment Offering <span className="font-normal text-text-muted">optional</span></>} value={judgmentOfferingId} onChange={setJudgmentOfferingId} disabled={busy}>
+                  <option value="">Use configured default</option>
+                  {judgmentModels.map((model) => <option key={model.offering_id} value={model.offering_id}>{model.name} · {model.provider}</option>)}
+                </SelectField>
+              ) : null}
             </div>
 
             <div className="mt-5 rounded-control border border-border bg-surface-muted p-4">
@@ -554,9 +574,9 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
               <label className="text-sm font-medium">Max wall time per trial
                 <Input type="number" min={1} value={wallTimeSecs} onChange={(event) => setWallTimeSecs(event.target.value)} disabled={busy} className="mt-1.5 w-40" />
               </label>
-              <Button leadingIcon={Play} onClick={runComparison} disabled={busy || Boolean(pendingSubmission) || !selectedVersion || !message.trim()}>{busy ? 'Running…' : 'Run comparison'}</Button>
+              <Button leadingIcon={Play} onClick={runComparison} disabled={busy || Boolean(pendingSubmission) || !selectedBaseline || (comparisonKind === 'skill' && !selectedCandidate) || !message.trim()}>{busy ? 'Running…' : 'Run comparison'}</Button>
             </div>
-            <p className="mt-4 text-xs leading-5 text-text-muted">Jev is an enhancement when selected or configured. If it is unavailable, the candidate keeps the basic Skill path and the report cannot establish a Jev benefit.</p>
+            {comparisonKind === 'skill_routing_judgment' ? <p className="mt-4 text-xs leading-5 text-text-muted">Jev is an enhancement when selected or configured. If it is unavailable, the candidate keeps the basic Skill path and the report cannot establish a Jev benefit.</p> : null}
             {pendingSubmission ? (
               <div className="mt-3 rounded-control border border-border bg-surface-muted p-3 text-xs leading-5 text-text-secondary">
                 <p>A submitted comparison is awaiting confirmation. The lookup uses its original submission identity and does not resend the current form.</p>
