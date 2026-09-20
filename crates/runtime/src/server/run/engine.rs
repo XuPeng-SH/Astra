@@ -34,7 +34,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -80,7 +80,6 @@ const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
 const RUN_RECOVERY_MAX_CONCURRENCY: usize = 8;
 const RUN_RECOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED];
-const PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT: Duration = Duration::from_secs(5);
 // Lease release only shortens the recovery TTL; it is not a correctness
 // commit. Never let a stalled database release leave one detached task per
 // completed run behind indefinitely.
@@ -275,11 +274,63 @@ pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
+    owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
 }
 
 pub(crate) struct RunOwnerLeaseHeartbeat {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     _join: tokio::task::JoinHandle<()>,
+    authority: Arc<RunOwnerLeaseAuthority>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RunOwnerLeaseKey {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    owner_generation: u64,
+}
+
+/// Process-local mirror of the exact durable owner-lease safety window.
+///
+/// The heartbeat is the sole owner of this deadline. Provider-boundary
+/// authorization reads it instead of starting an unrelated fixed timeout,
+/// so a slow metadata write may use the lease time that is actually left but
+/// can never authorize work after the local executor has fenced itself.
+struct RunOwnerLeaseAuthority {
+    state: tokio::sync::watch::Sender<RunOwnerLeaseState>,
+}
+
+#[derive(Clone, Copy)]
+struct RunOwnerLeaseState {
+    deadline: tokio::time::Instant,
+    active: bool,
+}
+
+impl RunOwnerLeaseAuthority {
+    fn new(deadline: tokio::time::Instant) -> Self {
+        let (state, _) = tokio::sync::watch::channel(RunOwnerLeaseState {
+            deadline,
+            active: true,
+        });
+        Self { state }
+    }
+
+    fn refresh(&self, deadline: tokio::time::Instant) {
+        self.state.send_modify(|state| state.deadline = deadline);
+    }
+
+    fn current_state(&self) -> RunOwnerLeaseState {
+        *self.state.borrow()
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<RunOwnerLeaseState> {
+        self.state.subscribe()
+    }
+
+    fn deactivate(&self) {
+        self.state.send_modify(|state| state.active = false);
+    }
 }
 
 /// Exact execution-owner epoch created with a durable run start. This is
@@ -290,8 +341,24 @@ pub struct RunExecutionAuthority {
     pub owner_generation: u64,
 }
 
+/// Evidence returned by the activation renewal and consumed exactly once when
+/// the owner heartbeat starts. For durable stores, the deadline is anchored
+/// to the activation request start so a delayed acknowledgement cannot grant
+/// the local executor more time than the renewed database lease.
+#[derive(Debug)]
+pub(crate) struct ConfirmedExecutionAuthority {
+    owner_lease_fence_deadline: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExecutionAuthorityConfirmation {
+    Confirmed(ConfirmedExecutionAuthority),
+    Superseded,
+}
+
 impl Drop for RunOwnerLeaseHeartbeat {
     fn drop(&mut self) {
+        self.authority.deactivate();
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -838,6 +905,7 @@ impl RunEngine {
             store,
             projection_store: None,
             metrics_registry: None,
+            owner_lease_authorities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -914,6 +982,68 @@ impl RunEngine {
         self.store.owner_lease_duration()
     }
 
+    fn owner_lease_authority(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_owner_generation: u64,
+    ) -> Result<Arc<RunOwnerLeaseAuthority>, String> {
+        let key = RunOwnerLeaseKey {
+            user_id: user_id.to_string(),
+            session_id: expected_session_id.to_string(),
+            run_id: run_id.to_string(),
+            owner_generation: expected_owner_generation,
+        };
+        let authority = self
+            .owner_lease_authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                format!(
+                    "run {run_id} has no active process-local owner-lease authority at generation {expected_owner_generation}"
+                )
+            })?;
+        let state = authority.current_state();
+        if !state.active {
+            return Err(format!(
+                "run {run_id} owner-lease authority is no longer active at generation {expected_owner_generation}"
+            ));
+        }
+        if state.deadline <= tokio::time::Instant::now() {
+            return Err(format!(
+                "run {run_id} owner-lease authority expired before provider-boundary authorization at generation {expected_owner_generation}"
+            ));
+        }
+        Ok(authority)
+    }
+
+    fn validate_owner_lease_state(
+        run_id: &str,
+        expected_owner_generation: u64,
+        state: RunOwnerLeaseState,
+    ) -> Result<(), String> {
+        if !state.active {
+            return Err(format!(
+                "run {run_id} owner-lease authority is no longer active at generation {expected_owner_generation}"
+            ));
+        }
+        if state.deadline <= tokio::time::Instant::now() {
+            return Err(format!(
+                "run {run_id} owner-lease authority expired before provider-boundary authorization at generation {expected_owner_generation}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn owner_lease_deadline_error(run_id: &str, expected_owner_generation: u64) -> String {
+        format!(
+            "provider-boundary execution authorization reached the owner-lease safety deadline for run {run_id} at generation {expected_owner_generation}"
+        )
+    }
+
     /// Start renewing the store owner's active-run lease until the returned
     /// guard is dropped. Stores without shared owner leases return `None`.
     pub(crate) fn start_owner_lease_heartbeat(
@@ -922,16 +1052,20 @@ impl RunEngine {
         expected_session_id: String,
         run_id: String,
         expected_owner_generation: u64,
+        confirmed_authority: ConfirmedExecutionAuthority,
         execution_lease_lost: Arc<AtomicBool>,
         execution_cancel_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> Option<RunOwnerLeaseHeartbeat> {
+        let initial_fence_deadline = confirmed_authority.owner_lease_fence_deadline?;
         let interval = self
             .store
-            .owner_lease_renewal_interval()?
+            .owner_lease_renewal_interval()
+            .expect("durable activation evidence requires a renewal interval")
             .max(Duration::from_millis(1));
         let lease_duration = self
             .store
-            .owner_lease_duration()?
+            .owner_lease_duration()
+            .expect("durable activation evidence requires a lease duration")
             .max(Duration::from_millis(1));
         // Fence before the database TTL can expire. This leaves one renewal
         // interval as skew/scheduling margin and makes a hung renewal future
@@ -939,10 +1073,23 @@ impl RunEngine {
         let fence_window = lease_duration
             .saturating_sub(interval)
             .max(Duration::from_millis(1));
+        let key = RunOwnerLeaseKey {
+            user_id: user_id.clone(),
+            session_id: expected_session_id.clone(),
+            run_id: run_id.clone(),
+            owner_generation: expected_owner_generation,
+        };
+        let authority = Arc::new(RunOwnerLeaseAuthority::new(initial_fence_deadline));
+        self.owner_lease_authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), Arc::downgrade(&authority));
+        let authorities = Arc::clone(&self.owner_lease_authorities);
+        let heartbeat_authority = Arc::clone(&authority);
         let engine = self.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
-            let mut fence_deadline = tokio::time::Instant::now() + fence_window;
+            let mut fence_deadline = initial_fence_deadline;
             let mut next_renewal = tokio::time::Instant::now();
             let mut ownership_lost = false;
             loop {
@@ -983,6 +1130,7 @@ impl RunEngine {
                         // prevents a delayed response from extending local
                         // execution beyond durable authority.
                         fence_deadline = renewal_started_at + fence_window;
+                        heartbeat_authority.refresh(fence_deadline);
                         next_renewal = now + interval;
                     }
                     Ok(false) => {
@@ -1005,6 +1153,20 @@ impl RunEngine {
                         );
                         next_renewal = (tokio::time::Instant::now() + interval).min(fence_deadline);
                     }
+                }
+            }
+
+            heartbeat_authority.deactivate();
+            {
+                let mut registered = authorities
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if registered.get(&key).is_some_and(|registered| {
+                    registered
+                        .upgrade()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &heartbeat_authority))
+                }) {
+                    registered.remove(&key);
                 }
             }
 
@@ -1048,6 +1210,7 @@ impl RunEngine {
         Some(RunOwnerLeaseHeartbeat {
             stop_tx: Some(stop_tx),
             _join: join,
+            authority,
         })
     }
 
@@ -1061,22 +1224,29 @@ impl RunEngine {
         run_id: &str,
         expected_owner_generation: u64,
         cancel_token: &tokio_util::sync::CancellationToken,
-    ) -> Result<bool, String> {
+    ) -> Result<ExecutionAuthorityConfirmation, String> {
         let Some(lease_duration) = self.store.owner_lease_duration() else {
-            return Ok(true);
+            return Ok(ExecutionAuthorityConfirmation::Confirmed(
+                ConfirmedExecutionAuthority {
+                    owner_lease_fence_deadline: None,
+                },
+            ));
         };
         let renewal_interval = self
             .store
             .owner_lease_renewal_interval()
             .unwrap_or_else(|| lease_duration / 3)
             .max(Duration::from_millis(1));
-        // Activation is the first lease renewal, so it must use the same
-        // lease-derived deadline as later renewals. A shorter generic database
-        // timeout can reject a healthy owner while its durable lease remains
-        // valid under load.
-        let activation_wait = renewal_interval
-            .min(lease_duration)
+        // Activation is the first lease renewal. Use the same safety window
+        // as the heartbeat: the durable lease duration minus one renewal
+        // interval reserved for scheduling/clock skew. A generic database or
+        // one-interval timeout can reject a healthy owner while its original
+        // durable lease is still valid under load.
+        let activation_wait = lease_duration
+            .saturating_sub(renewal_interval)
             .max(Duration::from_millis(1));
+        let activation_started_at = tokio::time::Instant::now();
+        let owner_lease_fence_deadline = activation_started_at + activation_wait;
         let renew = self.store.renew_owner_lease(
             user_id,
             expected_session_id,
@@ -1089,8 +1259,19 @@ impl RunEngine {
             _ = cancel_token.cancelled() => Err(format!(
                 "durable execution authority activation was cancelled for run {run_id}"
             )),
-            result = tokio::time::timeout(activation_wait, renew) => match result {
-                Ok(result) => result,
+            result = tokio::time::timeout_at(owner_lease_fence_deadline, renew) => match result {
+                Ok(Ok(true)) if tokio::time::Instant::now() < owner_lease_fence_deadline => {
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(
+                        ConfirmedExecutionAuthority {
+                            owner_lease_fence_deadline: Some(owner_lease_fence_deadline),
+                        },
+                    ))
+                }
+                Ok(Ok(true)) => Err(format!(
+                    "durable execution authority activation acknowledgement arrived after the lease safety deadline for run {run_id}; durable recovery owns the unactivated row"
+                )),
+                Ok(Ok(false)) => Ok(ExecutionAuthorityConfirmation::Superseded),
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err(format!(
                     "durable execution authority activation timed out after {}ms for run {run_id}; durable recovery owns the unactivated row",
                     activation_wait.as_millis()
@@ -3821,29 +4002,57 @@ impl UserIntentProvider for RunEngine {
                     .to_string(),
             );
         };
-        let max_wait = self
-            .store
-            .owner_lease_duration()
-            .unwrap_or(PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT)
-            .min(PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT)
-            .max(Duration::from_millis(1));
-        let outcome = tokio::time::timeout(
-            max_wait,
+        let authorization =
             self.store
                 .authorize_execution_boundary(RunExecutionBoundaryAuthorizationRequest {
                     user_id,
                     run_id,
                     expected_session_id,
                     expected_owner_generation,
-                }),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "provider-boundary execution authorization timed out after {}ms for run {run_id}",
-                max_wait.as_millis()
-            )
-        })??;
+                });
+        let outcome = if self.store.owner_lease_duration().is_some() {
+            let authority = self.owner_lease_authority(
+                user_id,
+                expected_session_id,
+                run_id,
+                expected_owner_generation,
+            )?;
+            let mut lease_updates = authority.subscribe();
+            tokio::pin!(authorization);
+            loop {
+                let state = *lease_updates.borrow_and_update();
+                Self::validate_owner_lease_state(run_id, expected_owner_generation, state)?;
+                tokio::select! {
+                    biased;
+                    changed = lease_updates.changed() => {
+                        changed.map_err(|_| {
+                            format!(
+                                "run {run_id} owner-lease authority closed during provider-boundary authorization at generation {expected_owner_generation}"
+                            )
+                        })?;
+                    }
+                    _ = tokio::time::sleep_until(state.deadline) => {
+                        let current = authority.current_state();
+                        if !current.active || current.deadline <= state.deadline {
+                            return Err(Self::owner_lease_deadline_error(
+                                run_id,
+                                expected_owner_generation,
+                            ));
+                        }
+                    }
+                    result = &mut authorization => {
+                        Self::validate_owner_lease_state(
+                            run_id,
+                            expected_owner_generation,
+                            authority.current_state(),
+                        )?;
+                        break result?;
+                    }
+                }
+            }
+        } else {
+            authorization.await?
+        };
         Ok(match outcome {
             RunExecutionBoundaryAuthorization::Authorized => {
                 ProviderBoundaryAuthorization::Authorized
@@ -4328,6 +4537,23 @@ mod tests {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
     }
 
+    fn test_confirmed_execution_authority(engine: &RunEngine) -> ConfirmedExecutionAuthority {
+        let owner_lease_fence_deadline = engine.owner_lease_duration().map(|lease_duration| {
+            let renewal_interval = engine
+                .store
+                .owner_lease_renewal_interval()
+                .unwrap_or_else(|| lease_duration / 3)
+                .max(Duration::from_millis(1));
+            tokio::time::Instant::now()
+                + lease_duration
+                    .saturating_sub(renewal_interval)
+                    .max(Duration::from_millis(1))
+        });
+        ConfirmedExecutionAuthority {
+            owner_lease_fence_deadline,
+        }
+    }
+
     async fn transition_typed_cancellation(
         engine: &RunEngine,
         user_id: &str,
@@ -4567,13 +4793,16 @@ mod tests {
     async fn owner_lease_heartbeat_is_disabled_when_store_has_no_interval() {
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let engine = test_engine();
+        let confirmed = test_confirmed_execution_authority(&engine);
         assert!(
-            test_engine()
+            engine
                 .start_owner_lease_heartbeat(
                     "user-1".to_string(),
                     "session-1".to_string(),
                     "run-1".to_string(),
                     0,
+                    confirmed,
                     lease_lost,
                     cancel,
                 )
@@ -4597,6 +4826,7 @@ mod tests {
                 "session-1".to_string(),
                 "run-1".to_string(),
                 0,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4633,6 +4863,173 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn provider_boundary_uses_the_active_heartbeat_safety_deadline() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(10)),
+        );
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "run-1".to_string(),
+                7,
+                test_confirmed_execution_authority(&engine),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio_util::sync::CancellationToken::new()),
+            )
+            .expect("heartbeat-enabled store");
+
+        let authority = engine
+            .owner_lease_authority("user-1", "session-1", "run-1", 7)
+            .expect("active heartbeat authority");
+        assert_eq!(
+            authority
+                .current_state()
+                .deadline
+                .duration_since(tokio::time::Instant::now()),
+            Duration::from_secs(20),
+            "provider authorization must use lease duration minus one renewal interval"
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            engine
+                .owner_lease_authority("user-1", "session-1", "run-1", 8)
+                .err()
+                .expect("wrong generation must be rejected"),
+            "run run-1 has no active process-local owner-lease authority at generation 8"
+        );
+        drop(guard);
+        assert!(
+            engine
+                .owner_lease_authority("user-1", "session-1", "run-1", 7)
+                .err()
+                .expect("inactive authority must be rejected")
+                .contains("no longer active"),
+            "dropping the heartbeat must fence provider authorization immediately"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_boundary_wait_tracks_heartbeat_refreshes() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(10))
+                .with_provider_authorization_delay(Duration::from_secs(25)),
+        );
+        let engine = RunEngine::new(store.clone());
+        let execution = engine
+            .start_run("run-1", "user-1", "session-1")
+            .await
+            .expect("run start");
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "run-1".to_string(),
+                execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio_util::sync::CancellationToken::new()),
+            )
+            .expect("heartbeat-enabled store");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if store.lease_renewals() >= 1 {
+                break;
+            }
+        }
+        assert_eq!(store.lease_renewals(), 1);
+        let authorization = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                UserIntentProvider::authorize_provider_boundary(
+                    &engine,
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
+                        execution.owner_generation,
+                    ),
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if store.lease_renewals() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(store.lease_renewals(), 2);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !authorization.is_finished(),
+            "a successful heartbeat must extend the provider authorization wait"
+        );
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            authorization.await.expect("authorization task").unwrap(),
+            ProviderBoundaryAuthorization::Authorized
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_boundary_wait_fails_closed_when_heartbeat_stops() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(10))
+                .with_provider_authorization_delay(Duration::from_secs(25)),
+        );
+        let engine = RunEngine::new(store);
+        let execution = engine
+            .start_run("run-1", "user-1", "session-1")
+            .await
+            .expect("run start");
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "run-1".to_string(),
+                execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio_util::sync::CancellationToken::new()),
+            )
+            .expect("heartbeat-enabled store");
+        let authorization = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                UserIntentProvider::authorize_provider_boundary(
+                    &engine,
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
+                        execution.owner_generation,
+                    ),
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        drop(guard);
+        let error = authorization
+            .await
+            .expect("authorization task")
+            .expect_err("stopped heartbeat must fence provider authorization");
+        assert!(error.contains("no longer active"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stalled_owner_lease_release_is_bounded_and_dropped() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
@@ -4641,12 +5038,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-release-pending".to_string(),
                 0,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4682,12 +5081,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 7,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4710,12 +5111,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 3,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -4762,7 +5165,7 @@ mod tests {
 
         tokio::task::yield_now().await;
         assert_eq!(store.lease_renewals(), 1);
-        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::time::advance(Duration::from_millis(20)).await;
         let error = task
             .await
             .expect("activation task")
@@ -4810,11 +5213,103 @@ mod tests {
         assert_eq!(store.lease_renewals(), 1);
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(
-            task.await
-                .expect("activation task")
-                .expect("renewal within the lease-derived deadline"),
+            matches!(
+                task.await
+                    .expect("activation task")
+                    .expect("renewal within the lease-derived deadline"),
+                ExecutionAuthorityConfirmation::Confirmed(_)
+            ),
             "a renewal slower than the generic five-second database budget must still activate"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_activation_ack_does_not_reset_the_first_heartbeat_fence() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(10))
+                .with_lease_renewal_behavior(LeaseRenewalBehavior::DelayedFirstThenPending(
+                    Duration::from_secs(15),
+                )),
+        );
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("activation-handoff", "user-1", "session-1")
+            .await
+            .expect("durable admission");
+        let activation_started_at = tokio::time::Instant::now();
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let activation = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .confirm_execution_authority(
+                        "user-1",
+                        "session-1",
+                        "activation-handoff",
+                        authority.owner_generation,
+                        cancel.as_ref(),
+                    )
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 1);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let confirmed = match activation
+            .await
+            .expect("activation task")
+            .expect("activation within safety window")
+        {
+            ExecutionAuthorityConfirmation::Confirmed(confirmed) => confirmed,
+            ExecutionAuthorityConfirmation::Superseded => panic!("activation was superseded"),
+        };
+        assert_eq!(
+            confirmed.owner_lease_fence_deadline,
+            Some(activation_started_at + Duration::from_secs(20)),
+            "the activation request start, not its acknowledgement, owns the first fence"
+        );
+
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "activation-handoff".to_string(),
+                authority.owner_generation,
+                confirmed,
+                lease_lost.clone(),
+                cancel.clone(),
+            )
+            .expect("heartbeat-enabled store");
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 2);
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_cancelled());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(lease_lost.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
+        assert!(
+            tokio::time::Instant::now() < activation_started_at + Duration::from_secs(30),
+            "local execution must be fenced before the durable lease TTL"
+        );
+        assert!(
+            engine
+                .owner_lease_authority(
+                    "user-1",
+                    "session-1",
+                    "activation-handoff",
+                    authority.owner_generation,
+                )
+                .is_err(),
+            "the provider-boundary authority must be inactive at the inherited fence"
+        );
+        drop(guard);
     }
 
     #[tokio::test]
@@ -4876,12 +5371,14 @@ mod tests {
         );
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = RunEngine::new(store.clone())
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
                 "run-1".to_string(),
                 3,
+                test_confirmed_execution_authority(&engine),
                 lease_lost.clone(),
                 cancel.clone(),
             )
@@ -5245,6 +5742,7 @@ mod tests {
         Refuse,
         Pending,
         Delayed(Duration),
+        DelayedFirstThenPending(Duration),
     }
 
     #[derive(Clone, Copy)]
@@ -5272,6 +5770,7 @@ mod tests {
         lease_duration: Option<Duration>,
         lease_renewal_behavior: LeaseRenewalBehavior,
         lease_release_behavior: LeaseReleaseBehavior,
+        provider_authorization_delay: Option<Duration>,
         lease_renewals: AtomicUsize,
         lease_releases: AtomicUsize,
         active_lease_releases: AtomicUsize,
@@ -5291,6 +5790,7 @@ mod tests {
                 lease_duration: None,
                 lease_renewal_behavior: LeaseRenewalBehavior::Renew,
                 lease_release_behavior: LeaseReleaseBehavior::Succeed,
+                provider_authorization_delay: None,
                 lease_renewals: AtomicUsize::new(0),
                 lease_releases: AtomicUsize::new(0),
                 active_lease_releases: AtomicUsize::new(0),
@@ -5317,6 +5817,11 @@ mod tests {
 
         fn with_lease_release_behavior(mut self, behavior: LeaseReleaseBehavior) -> Self {
             self.lease_release_behavior = behavior;
+            self
+        }
+
+        fn with_provider_authorization_delay(mut self, delay: Duration) -> Self {
+            self.provider_authorization_delay = Some(delay);
             self
         }
 
@@ -5748,7 +6253,7 @@ mod tests {
             _expected_owner_generation: u64,
             _expected_statuses: &[&str],
         ) -> Result<bool, String> {
-            self.lease_renewals.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.lease_renewals.fetch_add(1, Ordering::SeqCst);
             match self.lease_renewal_behavior {
                 LeaseRenewalBehavior::Renew => Ok(true),
                 LeaseRenewalBehavior::Refuse => Ok(false),
@@ -5759,7 +6264,24 @@ mod tests {
                     tokio::time::sleep(delay).await;
                     Ok(true)
                 }
+                LeaseRenewalBehavior::DelayedFirstThenPending(delay) if attempt == 0 => {
+                    tokio::time::sleep(delay).await;
+                    Ok(true)
+                }
+                LeaseRenewalBehavior::DelayedFirstThenPending(_) => {
+                    std::future::pending::<Result<bool, String>>().await
+                }
             }
+        }
+
+        async fn authorize_execution_boundary(
+            &self,
+            request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
+        ) -> Result<astra_services::runs::RunExecutionBoundaryAuthorization, String> {
+            if let Some(delay) = self.provider_authorization_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.inner.authorize_execution_boundary(request).await
         }
 
         async fn release_owner_lease(
