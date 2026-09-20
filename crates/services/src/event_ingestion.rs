@@ -24,6 +24,7 @@
 //!   before it consumes channel capacity reserved for critical audit facts.
 //! - **Graceful shutdown**: flush remaining buffer on drop
 
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -45,13 +46,17 @@ pub const MIN_INGESTION_CHANNEL_CAPACITY: usize = 1;
 pub const MAX_INGESTION_CHANNEL_CAPACITY: usize = 10_000;
 pub const MIN_INGESTION_RETRIES: u32 = 1;
 pub const MAX_INGESTION_RETRIES: u32 = 8;
+pub const MIN_INGESTION_SESSION_CONCURRENCY: usize = 1;
+pub const MAX_INGESTION_SESSION_CONCURRENCY: usize = 32;
 pub const DEFAULT_INGESTION_BATCH_SIZE: usize = 100;
 pub const DEFAULT_INGESTION_FLUSH_INTERVAL_SECS: u64 = 1;
 pub const DEFAULT_INGESTION_CHANNEL_CAPACITY: usize = 5_000;
 pub const DEFAULT_INGESTION_RETRIES: u32 = 3;
+pub const DEFAULT_INGESTION_SESSION_CONCURRENCY: usize = MAX_INGESTION_SESSION_CONCURRENCY;
 const MAX_SHUTDOWN_DRAIN_PENDING_YIELDS: usize = 64;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
 const TELEMETRY_CHANNEL_RESERVE_DIVISOR: usize = 10;
+const MIN_SHARED_POOL_CONNECTION_RESERVE: usize = 2;
 
 /// Configuration for the ingestion worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +69,9 @@ pub struct IngestionConfig {
     pub channel_capacity: usize,
     /// Max retries per batch on transient errors.
     pub max_retries: u32,
+    /// Maximum owner/session transactions this worker may execute at once.
+    /// The worker also leaves a small reserve in the shared SQL pool.
+    pub max_concurrent_session_flushes: usize,
     /// When true, replace user-content fields (`content`) on outgoing
     /// IngestionEvents with a privacy marker (`<redacted: len=N sha=...>`)
     /// instead of the raw text. Default: `true` so cloud ingestion is
@@ -78,6 +86,7 @@ impl Default for IngestionConfig {
             flush_interval_secs: DEFAULT_INGESTION_FLUSH_INTERVAL_SECS,
             channel_capacity: DEFAULT_INGESTION_CHANNEL_CAPACITY,
             max_retries: DEFAULT_INGESTION_RETRIES,
+            max_concurrent_session_flushes: DEFAULT_INGESTION_SESSION_CONCURRENCY,
             redact_content: true,
         }
     }
@@ -99,6 +108,10 @@ impl IngestionConfig {
         self.max_retries = self
             .max_retries
             .clamp(MIN_INGESTION_RETRIES, MAX_INGESTION_RETRIES);
+        self.max_concurrent_session_flushes = self.max_concurrent_session_flushes.clamp(
+            MIN_INGESTION_SESSION_CONCURRENCY,
+            MAX_INGESTION_SESSION_CONCURRENCY,
+        );
         self
     }
 }
@@ -860,9 +873,17 @@ pub struct IngestionStats {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct IngestionBatchOutcome {
+    events_resolved: usize,
     events_dropped_permanent: usize,
+    retry_events: Vec<IngestionEvent>,
+    retry_errors: Vec<String>,
+}
+
+struct IngestionSessionAttempt {
+    events: Vec<IngestionEvent>,
+    result: Result<IngestionBatchOutcome, String>,
 }
 
 /// Convert ISO 8601 / RFC 3339 timestamp to MySQL DATETIME(6) format.
@@ -1260,6 +1281,7 @@ impl EventIngestionWorker {
             batch_size = config.batch_size,
             flush_interval_secs = config.flush_interval_secs,
             channel_capacity = config.channel_capacity,
+            max_concurrent_session_flushes = config.max_concurrent_session_flushes,
             "event ingestion worker spawned"
         );
 
@@ -1292,6 +1314,18 @@ impl EventIngestionWorker {
         if let Ok(mut s) = self.stats.lock() {
             s.events_received += 1;
         }
+    }
+
+    fn session_flush_concurrency(&self) -> usize {
+        let pool_max = self.pool.options().get_max_connections() as usize;
+        let pool_budget = pool_max
+            .saturating_sub(MIN_SHARED_POOL_CONNECTION_RESERVE)
+            .max(1);
+        let automatic_budget = (pool_max / 4).max(1);
+        self.config
+            .max_concurrent_session_flushes
+            .min(pool_budget)
+            .min(automatic_budget)
     }
 
     fn drain_available_channel_events(&mut self, buffer: &mut Vec<IngestionEvent>) -> usize {
@@ -1400,57 +1434,77 @@ impl EventIngestionWorker {
             return;
         }
 
-        let batch: Vec<IngestionEvent> = std::mem::take(buffer);
-        let count = batch.len();
+        let mut pending = std::mem::take(buffer);
+        let mut events_resolved = 0_usize;
+        let mut events_dropped_permanent = 0_usize;
 
         for attempt in 0..self.config.max_retries {
-            match self.insert_batch(&batch).await {
-                Ok(outcome) => {
-                    if let Ok(mut s) = self.stats.lock() {
-                        s.events_flushed += count as u64;
-                        s.flush_count += 1;
-                        if outcome.events_dropped_permanent > 0 {
-                            s.events_dropped_permanent += outcome.events_dropped_permanent as u64;
-                            s.errors += 1;
-                            s.last_error = Some(format!(
-                                "dropped {} permanently invalid ingestion events",
-                                outcome.events_dropped_permanent
-                            ));
-                        }
-                    }
-                    return;
-                }
-                Err(e) => {
-                    if attempt + 1 < self.config.max_retries {
-                        let delay = std::time::Duration::from_millis(500 * (1 << attempt));
-                        tracing::debug!(
-                            target: "astra_services::event_ingestion",
-                            attempt = attempt + 1,
-                            max_retries = self.config.max_retries,
-                            event_count = count,
-                            error = %e,
-                            "batch flush retry after transient error"
-                        );
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        if let Ok(mut s) = self.stats.lock() {
-                            s.errors += 1;
-                            s.last_error = Some(format!(
-                                "batch flush failed after {} retries: {e}",
-                                self.config.max_retries
-                            ));
-                        }
-                        tracing::warn!(
-                            target: "astra_services::event_ingestion",
-                            event_count = count,
-                            max_retries = self.config.max_retries,
-                            error = %e,
-                            "batch flush failed after retries; retaining batch for retry"
-                        );
-                        buffer.extend(batch);
-                        return;
-                    }
-                }
+            let outcome = self.insert_batch(pending).await;
+            events_resolved = events_resolved.saturating_add(outcome.events_resolved);
+            events_dropped_permanent =
+                events_dropped_permanent.saturating_add(outcome.events_dropped_permanent);
+            pending = outcome.retry_events;
+            if pending.is_empty() {
+                self.record_flush_outcome(events_resolved, events_dropped_permanent, None);
+                return;
+            }
+            let error = outcome.retry_errors.join("; ");
+            if attempt + 1 < self.config.max_retries {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                tracing::debug!(
+                    target: "astra_services::event_ingestion",
+                    attempt = attempt + 1,
+                    max_retries = self.config.max_retries,
+                    event_count = pending.len(),
+                    error = %error,
+                    "session-group flush retry after transient error"
+                );
+                tokio::time::sleep(delay).await;
+            } else {
+                self.record_flush_outcome(
+                    events_resolved,
+                    events_dropped_permanent,
+                    Some(format!(
+                        "batch flush failed after {} retries for unresolved session groups: {error}",
+                        self.config.max_retries
+                    )),
+                );
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    event_count = pending.len(),
+                    max_retries = self.config.max_retries,
+                    error = %error,
+                    "session-group flush failed after retries; retaining unresolved groups"
+                );
+                buffer.extend(pending);
+                return;
+            }
+        }
+    }
+
+    fn record_flush_outcome(
+        &self,
+        events_resolved: usize,
+        events_dropped_permanent: usize,
+        retry_error: Option<String>,
+    ) {
+        if let Ok(mut stats) = self.stats.lock() {
+            if events_resolved > 0 {
+                stats.events_flushed = stats.events_flushed.saturating_add(events_resolved as u64);
+                stats.flush_count = stats.flush_count.saturating_add(1);
+            }
+            if events_dropped_permanent > 0 {
+                stats.events_dropped_permanent = stats
+                    .events_dropped_permanent
+                    .saturating_add(events_dropped_permanent as u64);
+                stats.errors = stats.errors.saturating_add(1);
+                stats.last_error = Some(format!(
+                    "dropped {events_dropped_permanent} permanently invalid ingestion events"
+                ));
+            }
+            if let Some(error) = retry_error {
+                stats.errors = stats.errors.saturating_add(1);
+                stats.last_error = Some(error);
             }
         }
     }
@@ -1461,205 +1515,228 @@ impl EventIngestionWorker {
         if buffer.is_empty() {
             return;
         }
-        let batch: Vec<IngestionEvent> = std::mem::take(buffer);
-        let count = batch.len();
-        match self.insert_batch(&batch).await {
-            Ok(outcome) => {
-                if let Ok(mut s) = self.stats.lock() {
-                    s.events_flushed += count as u64;
-                    s.flush_count += 1;
-                    if outcome.events_dropped_permanent > 0 {
-                        s.events_dropped_permanent += outcome.events_dropped_permanent as u64;
-                        s.errors += 1;
-                        s.last_error = Some(format!(
-                            "dropped {} permanently invalid ingestion events",
-                            outcome.events_dropped_permanent
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                if let Ok(mut s) = self.stats.lock() {
-                    s.errors += 1;
-                    s.last_error = Some(format!("shutdown flush failed: {e}"));
-                }
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    event_count = count,
-                    error = %e,
-                    "shutdown flush failed (single attempt)"
-                );
-            }
+        let batch = std::mem::take(buffer);
+        let outcome = self.insert_batch(batch).await;
+        let retry_error = (!outcome.retry_events.is_empty()).then(|| {
+            format!(
+                "shutdown flush failed with {} events unresolved: {}",
+                outcome.retry_events.len(),
+                outcome.retry_errors.join("; ")
+            )
+        });
+        self.record_flush_outcome(
+            outcome.events_resolved,
+            outcome.events_dropped_permanent,
+            retry_error,
+        );
+        if !outcome.retry_events.is_empty() {
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                event_count = outcome.retry_events.len(),
+                "shutdown flush left session groups unresolved (single attempt)"
+            );
         }
     }
 
-    async fn insert_batch(
+    async fn insert_batch(&self, events: Vec<IngestionEvent>) -> IngestionBatchOutcome {
+        if events.is_empty() {
+            return IngestionBatchOutcome::default();
+        }
+
+        let mut grouped_events =
+            std::collections::BTreeMap::<(String, String), Vec<IngestionEvent>>::new();
+        for event in events {
+            grouped_events
+                .entry((event.user_id.clone(), event.session_id.clone()))
+                .or_default()
+                .push(event);
+        }
+
+        let concurrency = self.session_flush_concurrency();
+        let attempts = stream::iter(grouped_events.into_values().map(|events| async move {
+            let result = self.insert_session_group(&events).await;
+            IngestionSessionAttempt { events, result }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut outcome = IngestionBatchOutcome::default();
+        for attempt in attempts {
+            match attempt.result {
+                Ok(session_outcome) => {
+                    outcome.events_resolved = outcome
+                        .events_resolved
+                        .saturating_add(session_outcome.events_resolved);
+                    outcome.events_dropped_permanent = outcome
+                        .events_dropped_permanent
+                        .saturating_add(session_outcome.events_dropped_permanent);
+                }
+                Err(error) => {
+                    outcome.retry_events.extend(attempt.events);
+                    outcome.retry_errors.push(error);
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn insert_session_group(
         &self,
         events: &[IngestionEvent],
     ) -> Result<IngestionBatchOutcome, String> {
-        if events.is_empty() {
-            return Ok(IngestionBatchOutcome::default());
+        let first = events
+            .first()
+            .ok_or_else(|| "event_ingestion.session_group: empty event group".to_string())?;
+        let user_id = first.user_id.as_str();
+        let session_id = first.session_id.as_str();
+        if events
+            .iter()
+            .any(|event| event.user_id != user_id || event.session_id != session_id)
+        {
+            return Err("event_ingestion.session_group: mixed owner/session identity".to_string());
         }
 
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| format!("begin tx: {e}"))?;
-
-        let mut grouped_events =
-            std::collections::BTreeMap::<(&str, &str), Vec<&IngestionEvent>>::new();
-        for event in events {
-            grouped_events
-                .entry((event.user_id.as_str(), event.session_id.as_str()))
-                .or_default()
-                .push(event);
+            .map_err(|e| format!("begin tx for {user_id}/{session_id}: {e}"))?;
+        let session_event_count = events.len();
+        if let Err(error) =
+            crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
+        {
+            if !matches!(error, sqlx::Error::RowNotFound) {
+                return Err(format!(
+                    "session admission check for {user_id}/{session_id}: {error}"
+                ));
+            }
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                user_id = %user_id,
+                session_id = %session_id,
+                event_count = session_event_count,
+                "dropping ingestion events rejected by durable session admission"
+            );
+            return Ok(IngestionBatchOutcome {
+                events_resolved: session_event_count,
+                events_dropped_permanent: session_event_count,
+                ..Default::default()
+            });
         }
 
         let mut rows_inserted = 0_i64;
-        let mut outcome = IngestionBatchOutcome::default();
         let mut inserted_session_end_sessions =
             std::collections::BTreeSet::<(String, String)>::new();
-        for ((user_id, session_id), session_events) in grouped_events {
-            let session_event_count = session_events.len();
-            // BTreeMap iteration provides one deterministic lock order for
-            // the shared session-child admission protocol.
-            if let Err(error) =
-                crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
-            {
-                if !matches!(error, sqlx::Error::RowNotFound) {
-                    return Err(format!(
-                        "session admission check for {user_id}/{session_id}: {error}"
-                    ));
-                }
-                outcome.events_dropped_permanent = outcome
-                    .events_dropped_permanent
-                    .checked_add(session_event_count)
-                    .ok_or_else(|| {
-                        "event_ingestion.events_dropped_permanent: dropped event total overflow"
-                            .to_string()
-                    })?;
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    user_id = %user_id,
-                    session_id = %session_id,
-                    event_count = session_event_count,
-                    "dropping ingestion events rejected by durable session admission"
-                );
-                continue;
+        let mut plain_events = Vec::new();
+        let mut plain_session_end_events = Vec::new();
+        let mut parented_events = Vec::new();
+        for event in events {
+            if ingestion_event_has_parent_edges(event) {
+                parented_events.push(event);
+            } else if event.event_type == SESSION_END_EVENT_TYPE {
+                plain_session_end_events.push(event);
+            } else {
+                plain_events.push(event);
             }
+        }
 
-            let mut plain_events = Vec::new();
-            let mut plain_session_end_events = Vec::new();
-            let mut parented_events = Vec::new();
-            for event in session_events {
-                if ingestion_event_has_parent_edges(event) {
-                    parented_events.push(event);
-                } else if event.event_type == SESSION_END_EVENT_TYPE {
-                    plain_session_end_events.push(event);
-                } else {
-                    plain_events.push(event);
-                }
-            }
-
-            let mut session_rows_inserted = 0_i64;
-            if !plain_events.is_empty() {
-                let plain_event_rows = plain_events
-                    .iter()
-                    .map(|event| IngestionEventInsertValues::from_event(event))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                    "INSERT IGNORE INTO agent_events \
+        let mut session_rows_inserted = 0_i64;
+        if !plain_events.is_empty() {
+            let plain_event_rows = plain_events
+                .iter()
+                .map(|event| IngestionEventInsertValues::from_event(event))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT IGNORE INTO agent_events \
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
                       created_at, parent_event_id, causal_chain_id, \
                       tool_call_id, meta_tool_name, meta_duration_ms, \
                       token_input, token_output, token_total) ",
-                );
-                builder.push_values(plain_event_rows.iter(), |mut row, values| {
-                    let event = values.event;
-                    row.push_bind(&event.event_id)
-                        .push_bind(&event.session_id)
-                        .push_bind(&event.user_id)
-                        .push_bind(&event.event_type)
-                        .push_bind(&event.content)
-                        .push_bind(&values.token_usage_json)
-                        .push_bind(&event.llm_model_used)
-                        .push_bind(&values.skill_name)
-                        .push_bind(&values.metadata_json)
-                        .push_bind(&values.created_at)
-                        .push_bind(&event.parent_event_id)
-                        .push_bind(&event.causal_chain_id)
-                        .push_bind(&values.tool_call_id)
-                        .push_bind(&values.meta_tool_name)
-                        .push_bind(values.meta_duration_ms)
-                        .push_bind(values.token_input)
-                        .push_bind(values.token_output)
-                        .push_bind(values.token_total);
-                });
-                builder.push(matrixone_null_shape_comment(
-                    plain_event_rows
-                        .iter()
-                        .flat_map(IngestionEventInsertValues::nullable_shape),
-                ));
+            );
+            builder.push_values(plain_event_rows.iter(), |mut row, values| {
+                let event = values.event;
+                row.push_bind(&event.event_id)
+                    .push_bind(&event.session_id)
+                    .push_bind(&event.user_id)
+                    .push_bind(&event.event_type)
+                    .push_bind(&event.content)
+                    .push_bind(&values.token_usage_json)
+                    .push_bind(&event.llm_model_used)
+                    .push_bind(&values.skill_name)
+                    .push_bind(&values.metadata_json)
+                    .push_bind(&values.created_at)
+                    .push_bind(&event.parent_event_id)
+                    .push_bind(&event.causal_chain_id)
+                    .push_bind(&values.tool_call_id)
+                    .push_bind(&values.meta_tool_name)
+                    .push_bind(values.meta_duration_ms)
+                    .push_bind(values.token_input)
+                    .push_bind(values.token_output)
+                    .push_bind(values.token_total);
+            });
+            builder.push(matrixone_null_shape_comment(
+                plain_event_rows
+                    .iter()
+                    .flat_map(IngestionEventInsertValues::nullable_shape),
+            ));
 
-                let insert_result = builder
-                    .build()
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
-                add_inserted_rows(
-                    &mut session_rows_inserted,
-                    insert_result.rows_affected(),
-                    "event_ingestion.batch_insert",
-                )?;
-            }
+            let insert_result = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
+            add_inserted_rows(
+                &mut session_rows_inserted,
+                insert_result.rows_affected(),
+                "event_ingestion.batch_insert",
+            )?;
+        }
 
-            for event in plain_session_end_events.into_iter().chain(parented_events) {
-                let values = IngestionEventInsertValues::from_event(event)?;
-                let insert_sql = matrixone_statement_with_null_shape(
-                    "INSERT IGNORE INTO agent_events \
+        for event in plain_session_end_events.into_iter().chain(parented_events) {
+            let values = IngestionEventInsertValues::from_event(event)?;
+            let insert_sql = matrixone_statement_with_null_shape(
+                "INSERT IGNORE INTO agent_events \
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
                       created_at, parent_event_id, causal_chain_id, \
                       tool_call_id, meta_tool_name, meta_duration_ms, \
                       token_input, token_output, token_total) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    values.nullable_shape(),
-                );
-                let insert_result = bind_ingestion_event(sqlx::query(&insert_sql), &values)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
-                if insert_result.rows_affected() == 0 {
-                    continue;
-                }
-                add_inserted_rows(
-                    &mut session_rows_inserted,
-                    insert_result.rows_affected(),
-                    "event_ingestion.single_insert",
-                )?;
-                if event.event_type == SESSION_END_EVENT_TYPE {
-                    inserted_session_end_sessions
-                        .insert((event.user_id.clone(), event.session_id.clone()));
-                }
-                if ingestion_event_has_parent_edges(event) {
-                    crate::storage::insert_agent_event_edges(
-                        &mut *tx,
-                        &event.user_id,
-                        &event.session_id,
-                        &event.event_id,
-                        event.parent_event_id.as_deref(),
-                        &event.parent_event_ids,
-                    )
-                    .await
-                    .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
-                }
-            }
-
-            if session_rows_inserted == 0 {
+                values.nullable_shape(),
+            );
+            let insert_result = bind_ingestion_event(sqlx::query(&insert_sql), &values)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
+            if insert_result.rows_affected() == 0 {
                 continue;
             }
+            add_inserted_rows(
+                &mut session_rows_inserted,
+                insert_result.rows_affected(),
+                "event_ingestion.single_insert",
+            )?;
+            if event.event_type == SESSION_END_EVENT_TYPE {
+                inserted_session_end_sessions
+                    .insert((event.user_id.clone(), event.session_id.clone()));
+            }
+            if ingestion_event_has_parent_edges(event) {
+                crate::storage::insert_agent_event_edges(
+                    &mut *tx,
+                    &event.user_id,
+                    &event.session_id,
+                    &event.event_id,
+                    event.parent_event_id.as_deref(),
+                    &event.parent_event_ids,
+                )
+                .await
+                .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+            }
+        }
+
+        if session_rows_inserted > 0 {
             crate::storage::add_agent_session_event_count_after_admission(
                 &mut tx,
                 session_id,
@@ -1730,7 +1807,10 @@ impl EventIngestionWorker {
 
         tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
 
-        Ok(outcome)
+        Ok(IngestionBatchOutcome {
+            events_resolved: session_event_count,
+            ..Default::default()
+        })
     }
 }
 
@@ -1780,6 +1860,10 @@ mod tests {
         );
         assert_eq!(config.channel_capacity, DEFAULT_INGESTION_CHANNEL_CAPACITY);
         assert_eq!(config.max_retries, DEFAULT_INGESTION_RETRIES);
+        assert_eq!(
+            config.max_concurrent_session_flushes,
+            DEFAULT_INGESTION_SESSION_CONCURRENCY
+        );
         assert!(
             config.redact_content,
             "redact_content default must be true for privacy-safe cloud ingestion"
@@ -1801,6 +1885,7 @@ mod tests {
             flush_interval_secs: 0,
             channel_capacity: 0,
             max_retries: 0,
+            max_concurrent_session_flushes: 0,
             ..Default::default()
         }
         .normalized();
@@ -1808,12 +1893,17 @@ mod tests {
         assert_eq!(zero.flush_interval_secs, MIN_INGESTION_FLUSH_INTERVAL_SECS);
         assert_eq!(zero.channel_capacity, MIN_INGESTION_CHANNEL_CAPACITY);
         assert_eq!(zero.max_retries, MIN_INGESTION_RETRIES);
+        assert_eq!(
+            zero.max_concurrent_session_flushes,
+            MIN_INGESTION_SESSION_CONCURRENCY
+        );
 
         let huge = IngestionConfig {
             batch_size: usize::MAX,
             flush_interval_secs: u64::MAX,
             channel_capacity: usize::MAX,
             max_retries: u32::MAX,
+            max_concurrent_session_flushes: usize::MAX,
             ..Default::default()
         }
         .normalized();
@@ -1821,6 +1911,10 @@ mod tests {
         assert_eq!(huge.flush_interval_secs, MAX_INGESTION_FLUSH_INTERVAL_SECS);
         assert_eq!(huge.channel_capacity, MAX_INGESTION_CHANNEL_CAPACITY);
         assert_eq!(huge.max_retries, MAX_INGESTION_RETRIES);
+        assert_eq!(
+            huge.max_concurrent_session_flushes,
+            MAX_INGESTION_SESSION_CONCURRENCY
+        );
     }
 
     #[test]

@@ -279,6 +279,20 @@ that ID; semantic readers reconcile equivalent observation identities, while
 generic trace readers must not assume annotation-changing retries are unique.
 The shared ingestion queue is bounded and prioritizes critical audit traffic;
 it does not promise per-owner telemetry fairness or complete trace capture.
+One flush partitions accepted facts by authenticated `(owner, session)` and
+commits each partition in its own transaction. Per worker, active partition
+transactions are capped by the configured ceiling, one quarter of the pool,
+and the pool maximum minus a two-connection reserve. Each term has a minimum
+of one so one-connection test or emergency pools can still make progress; that
+small-pool exception cannot reserve foreground capacity. Event rows, causal
+edges, the exact session counter delta, inserted session-end effects, and
+config-version projections share that partition transaction. A blocked or
+retryable partition therefore cannot retain locks for, roll back, or replay an
+unrelated session. Successful and permanently rejected partitions leave the
+retry set immediately; only unresolved partitions retain their already-
+accounted queue payloads. This per-worker cap limits connection amplification
+but is not a shared-pool reservation or a fairness guarantee across workers or
+server processes.
 
 Request-classification observations use the existing `trace_span` envelope
 with name `semantic_judgment` and a bounded typed JSON string in
