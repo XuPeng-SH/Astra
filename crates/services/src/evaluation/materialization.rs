@@ -1329,6 +1329,7 @@ mod tests {
                     content: None,
                 },
                 skill_name: Some("sample-skill".to_string()),
+                judgment_policy: super::super::experiment::EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-a".to_string(),

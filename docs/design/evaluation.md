@@ -96,8 +96,18 @@ measure whether those decisions improve downstream
 task outcomes, together with their added latency and all physical-attempt costs.
 A judgment comparison must freeze the Offering, question contract, thresholds
 and invocation policy; confidence or a successful judgment call alone is not
-evidence of improved agent behavior. This is a target beyond the current
-instruction-only profile.
+evidence of improved agent behavior. The supported `SkillRoutingJudgment`
+adapter is the first concrete judgment comparison: it runs the same
+owner-scoped pinned Skill
+once with the candidate auto-route decision point and once with that decision
+point disabled. The baseline and candidate therefore differ in one causal
+factor. The candidate stores either an exact typed-judgment Offering plus its
+`skill_auto_route` generation policy, or an explicit unavailable reason. A
+missing default route keeps the basic Skill path executable; it does not count
+as evidence that the enhancement was evaluated successfully. An explicitly
+selected Offering is re-admitted at prepare time, so selecting Jev is
+Jev-only and selecting an ordinary typed-judgment Offering is the explicit LLM
+substitute.
 
 The initial planned isolation profile is `prompt_only_private`: the task input
 and declared read-only resources are frozen, external side effects are
@@ -179,22 +189,27 @@ identity before resolving new configuration. The same backbone consumers use
 the frozen values; live provider admission and actual provider outcomes remain
 external execution evidence rather than guarantees of identical model output.
 
-The current profile admits a chat-capable primary Offering and does not freeze
-an independent judgment Offering. Isolated trials therefore cannot resolve the
-live admin judgment route; adding judgment comparisons requires an explicit
-frozen route and policy contract first.
+The ordinary Prompt and Skill targets admit a chat-capable primary Offering and
+do not add a judgment call. `SkillRoutingJudgment` freezes an independent typed
+judgment Offering and its auxiliary generation policy; it never resolves the
+live admin route during an isolated trial. Broader judgment comparisons still
+need their own explicit target adapter and frozen question contract.
 
 Every experiment requires `measurement_profile: "instruction-only.v1"`.
 This immutable version defines the required task, tool, context, provider,
 safety, reliability, and cost metrics and their units. Missing or unsupported
 profiles are rejected. Submission retries return the frozen specification.
-Reports enumerate gaps for every planned trial and metric,
-including trials without observations. Numeric measurements and textual basis
-labels alone do not prove scoped assessment or complete collection. Existing
-token measurements are reported subtotals with unknown request/lane coverage,
-not complete cost. Metrics without a trusted assessment or complete collector
-receipts remain gaps; freezing a profile does not imply verifier execution or
-a monetary estimate.
+Reports enumerate gaps for every planned trial and metric, including trials
+without observations. Numeric measurements and textual basis labels alone do
+not prove scoped assessment or complete collection. The canonical run
+accounting event supplies requested/executed tool counts, tool validity as
+`successful_requested / requested`, and attempted policy denials; a trial with
+no requested tool call has no tool-validity ratio. The physical inference
+ledger supplies prompt/completion usage, fallback count, latency, provider
+binding, and cost only when every logical invocation, physical attempt, exact
+usage fact, terminal state, and frozen route pricing snapshot is covered.
+Missing prices or usage remain gaps. Freezing a profile does not imply
+verifier execution or a monetary estimate.
 
 The prepare API requires `case.verifier_config.expected` for the
 `json_value_equals` verifier version `1`. The server records the implementation
@@ -270,7 +285,10 @@ The generic control-plane API exposes five owner-authenticated operations:
   baseline/candidate text or two owner-scoped published Skill revisions, one
   fixed case, a model Offering, and bounded budget), resolves trusted model and
   Skill facts, computes the server-owned hashes/profile, and idempotently
-  freezes the resulting first-adapter plan. Concrete Edge selection is made
+  freezes the resulting first-adapter plan. A `SkillRoutingJudgment` request
+  must use the same Skill revision on both arms; it may provide an exact
+  `judgment_model_offering_id`, otherwise the configured judgment Offering is
+  captured at prepare time. Concrete Edge selection is made
   per trial at start time so the baseline and candidate can use independent
   owner-scoped instances; the experiment fingerprint contains no mutable
   executor or checkout identity;

@@ -7,14 +7,17 @@
 //! for calling this store at the canonical admission and settlement fences.
 
 use super::assessment::{
-    ComparisonArm, EvidenceAvailability, EvidenceRef, Measurement, MeasurementStatus,
+    ComparisonArm, EvidenceAvailability, EvidenceKind, EvidenceRef, Measurement, MeasurementStatus,
     TrialObservation, TrialStatus,
 };
 use super::durable::{
     DatabaseEvaluationPlanStore, EvaluationPersistenceError, EvaluationTrialBindingRecord,
     is_duplicate_key,
 };
-use super::experiment::{EvaluationTargetKind, ExperimentSpec, SnapshotEnvelope};
+use super::experiment::{
+    EvaluationTargetKind, ExperimentSpec, FrozenSkillRoutingPolicy, SnapshotEnvelope,
+};
+use crate::session_journal::ToolOutcomeSummary;
 use astra_core::composite_snapshot::CompositeSnapshot;
 use astra_core::{SharedPool, canonical_json_string};
 use serde::{Deserialize, Serialize};
@@ -55,7 +58,7 @@ impl EvaluationSkillRevision {
 /// Metadata injected only by a trusted evaluation entrypoint. It is not a
 /// client wire field and is deliberately separate from the prompt so the
 /// experiment identity cannot perturb prompt caching or model context.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationRunAdmission {
     pub experiment_id: String,
@@ -67,6 +70,9 @@ pub struct EvaluationRunAdmission {
     /// revision material instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_revision: Option<EvaluationSkillRevision>,
+    /// The exact candidate judgment variant selected for this trial. It is
+    /// absent for baseline arms and non-judgment targets.
+    pub judgment_policy: Option<FrozenSkillRoutingPolicy>,
     /// A caller may provide receipts from a trusted external materializer.
     /// The runtime adapter fills this list before execution when
     /// it can prove the frozen Context/Policy hashes locally.
@@ -91,6 +97,9 @@ impl EvaluationRunAdmission {
                     "skill revision content_hash must match revision_content_hash".to_string(),
                 );
             }
+        }
+        if let Some(judgment_policy) = &self.judgment_policy {
+            judgment_policy.validate()?;
         }
         validate_receipt_ids(&self.receipt_ids).map_err(|error| error.to_string())?;
         if let Some(envelope) = &self.snapshot_envelope {
@@ -143,7 +152,7 @@ pub struct EvaluationObservationRecord {
 /// Bounded discovery metadata for status/projection repair. Admission carries
 /// its original generation and event index; settlement refers to the requested
 /// terminal generation. This marker alone never authorizes cross-generation writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EvaluationAdmissionMarker {
     pub admission: EvaluationRunAdmission,
     pub admission_run_generation: u64,
@@ -763,7 +772,7 @@ pub(crate) fn validate_admission_for_trial(
     }
     match (&spec.target.kind, &admission.skill_revision) {
         (EvaluationTargetKind::Prompt, None) => {}
-        (EvaluationTargetKind::Skill, Some(skill))
+        (EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment, Some(skill))
             if Some(skill.skill_name.as_str()) == spec.target.skill_name.as_deref()
                 && skill.revision_id == revision.revision_id
                 && skill.content_hash == revision.content_hash => {}
@@ -772,6 +781,29 @@ pub(crate) fn validate_admission_for_trial(
                 "durable admission revision identity differs from frozen target".into(),
             ));
         }
+    }
+    let expected_judgment_policy = match (
+        &spec.target.kind,
+        &spec.target.judgment_policy,
+        &binding.trial.arm,
+    ) {
+        (EvaluationTargetKind::Prompt | EvaluationTargetKind::Skill, _, _) => None,
+        (
+            EvaluationTargetKind::SkillRoutingJudgment,
+            super::experiment::EvaluationJudgmentPolicy::SkillRouting { candidate },
+            ComparisonArm::Candidate,
+        ) => Some(candidate.as_ref()),
+        (EvaluationTargetKind::SkillRoutingJudgment, _, ComparisonArm::Baseline) => None,
+        _ => {
+            return Err(EvaluationExecutionError::Conflict(
+                "frozen Skill judgment policy is invalid for the trial arm".into(),
+            ));
+        }
+    };
+    if admission.judgment_policy.as_ref() != expected_judgment_policy {
+        return Err(EvaluationExecutionError::Conflict(
+            "durable admission judgment policy differs from the frozen trial".into(),
+        ));
     }
     if let Some(envelope) = &admission.snapshot_envelope {
         envelope
@@ -1549,6 +1581,7 @@ pub fn terminal_run_observation(
     tool_calls: Option<u32>,
     evidence: Vec<EvidenceRef>,
 ) -> TrialObservation {
+    let run_completed = matches!(&status, TrialStatus::Completed);
     let measurement = |name: &str, value: Option<f64>, unit: &str| Measurement {
         name: name.to_string(),
         value,
@@ -1579,9 +1612,152 @@ pub fn terminal_run_observation(
                 "tokens",
             ),
             measurement("tool_calls", tool_calls.map(|value| value as f64), "calls"),
+            measurement("run_completed", Some(run_completed as u8 as f64), "boolean"),
         ],
         evidence,
     }
+}
+
+/// Merge the canonical physical inference ledger into a terminal observation.
+/// Existing run-accounting token values remain visible when the ledger is
+/// partial; complete ledger values replace that subtotal and unlock cost
+/// metrics only when every physical attempt and pricing snapshot is covered.
+pub fn apply_inference_evidence(
+    observation: &mut TrialObservation,
+    evidence: &crate::inference_execution::EvaluationInferenceEvidence,
+) {
+    let basis = format!(
+        "evaluation_inference_evidence.v{}:{}{}",
+        evidence.schema_version,
+        evidence.evidence_fingerprint,
+        if evidence.complete {
+            ":complete"
+        } else {
+            ":partial"
+        }
+    );
+    let set_measurement =
+        |observation: &mut TrialObservation, name: &str, value: Option<f64>, unit: &str| {
+            let Some(value) = value else { return };
+            let measurement = Measurement {
+                name: name.to_string(),
+                value: Some(value),
+                unit: unit.to_string(),
+                status: MeasurementStatus::Observed,
+                basis: Some(basis.clone()),
+            };
+            if let Some(existing) = observation
+                .measurements
+                .iter_mut()
+                .find(|existing| existing.name == name)
+            {
+                *existing = measurement;
+            } else {
+                observation.measurements.push(measurement);
+            }
+        };
+    set_measurement(
+        observation,
+        "prompt_tokens",
+        evidence.prompt_tokens.map(|value| value as f64),
+        "tokens",
+    );
+    set_measurement(
+        observation,
+        "completion_tokens",
+        evidence.completion_tokens.map(|value| value as f64),
+        "tokens",
+    );
+    set_measurement(
+        observation,
+        "provider_fallback_count",
+        evidence.provider_fallback_count.map(|value| value as f64),
+        "calls",
+    );
+    set_measurement(
+        observation,
+        "latency_ms",
+        evidence.latency_ms.map(|value| value as f64),
+        "milliseconds",
+    );
+    set_measurement(
+        observation,
+        "estimated_cost_usd",
+        evidence.estimated_cost_usd,
+        "USD",
+    );
+    set_measurement(
+        observation,
+        "provider_binding_match",
+        evidence
+            .provider_binding_match
+            .map(|value| if value { 1.0 } else { 0.0 }),
+        "boolean",
+    );
+    observation.evidence.push(EvidenceRef {
+        evidence_id: format!("inference-evidence:{}", evidence.run_id),
+        kind: EvidenceKind::Trace,
+        availability: EvidenceAvailability::Available,
+        content_hash: Some(evidence.evidence_fingerprint.clone()),
+        locator: Some(format!(
+            "inference://{}/{}/{}",
+            evidence.owner_user_id, evidence.session_id, evidence.run_id
+        )),
+    });
+}
+
+/// Merge the canonical run-accounting tool summary into a terminal
+/// observation. The ratio is deliberately over requested calls: policy
+/// rejections and other non-executed requests remain visible in the
+/// denominator. With no requested call there is no tool-validity ratio.
+pub fn apply_tool_outcome_evidence(
+    observation: &mut TrialObservation,
+    outcomes: &ToolOutcomeSummary,
+) {
+    if !outcomes.is_consistent() {
+        return;
+    }
+    let basis = Some("canonical_run_accounting".to_string());
+    let set_measurement =
+        |observation: &mut TrialObservation, name: &str, value: Option<f64>, unit: &str| {
+            let Some(value) = value else { return };
+            let measurement = Measurement {
+                name: name.to_string(),
+                value: Some(value),
+                unit: unit.to_string(),
+                status: MeasurementStatus::Observed,
+                basis: basis.clone(),
+            };
+            if let Some(existing) = observation
+                .measurements
+                .iter_mut()
+                .find(|existing| existing.name == name)
+            {
+                *existing = measurement;
+            } else {
+                observation.measurements.push(measurement);
+            }
+        };
+    set_measurement(
+        observation,
+        "tool_calls",
+        Some(outcomes.executed as f64),
+        "calls",
+    );
+    let tool_validity_rate =
+        (outcomes.requested > 0).then(|| outcomes.succeeded as f64 / outcomes.requested as f64);
+    set_measurement(
+        observation,
+        "tool_validity_rate",
+        tool_validity_rate,
+        "ratio",
+    );
+    set_measurement(
+        observation,
+        "policy_violation_count",
+        outcomes.policy_denied.map(|count| count as f64),
+        "violations",
+    );
 }
 
 #[cfg(test)]
@@ -1648,6 +1824,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_accounting_projects_requested_validity_and_policy_denial() {
+        let mut observation = terminal_run_observation(
+            "fingerprint".into(),
+            "trial".into(),
+            "case".into(),
+            ComparisonArm::Baseline,
+            0,
+            TrialStatus::Completed,
+            None,
+            None,
+            None,
+            vec![],
+        );
+        let outcomes = ToolOutcomeSummary {
+            requested: 2,
+            executed: 1,
+            succeeded: 1,
+            failed: 0,
+            rejected: 1,
+            reused: 0,
+            suppressed: 0,
+            deferred: 0,
+            policy_denied: Some(1),
+        };
+        apply_tool_outcome_evidence(&mut observation, &outcomes);
+
+        let measurement = |name: &str| {
+            observation
+                .measurements
+                .iter()
+                .find(|item| item.name == name)
+                .expect("projected measurement")
+        };
+        assert_eq!(measurement("tool_calls").value, Some(1.0));
+        assert_eq!(measurement("tool_validity_rate").value, Some(0.5));
+        assert_eq!(measurement("policy_violation_count").value, Some(1.0));
+        for name in ["tool_calls", "tool_validity_rate", "policy_violation_count"] {
+            assert_eq!(
+                measurement(name).basis.as_deref(),
+                Some("canonical_run_accounting")
+            );
+        }
+    }
+
+    #[test]
     fn context_fingerprint_excludes_revision_but_changes_with_input() {
         let first = prompt_context_fingerprint("hello", &[], &[], None);
         let second = prompt_context_fingerprint("hello", &[], &[], None);
@@ -1701,6 +1922,7 @@ mod tests {
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
             skill_revision: None,
+            judgment_policy: None,
             receipt_ids: vec![],
             snapshot_envelope: None,
         };

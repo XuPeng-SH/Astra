@@ -8,10 +8,15 @@
 
 use super::assessment::ComparisonArm;
 use astra_core::composite_snapshot::CompositeSnapshot;
+use astra_turn_types::InferencePurpose;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use uuid::Uuid;
+
+use crate::models::ModelExecutionProjection;
+
+pub const JUDGMENT_POLICY_SCHEMA_VERSION: u32 = 1;
 
 pub const EXPERIMENT_SCHEMA_VERSION: u32 = 1;
 pub const SNAPSHOT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -24,11 +29,109 @@ const MAX_TRIALS: u64 = 100_000;
 pub enum EvaluationTargetKind {
     Prompt,
     Skill,
+    /// Compare the same pinned Skill with and without the frozen skill-routing
+    /// judgment decision point.
+    SkillRoutingJudgment,
     ToolPolicy,
     ModelProvider,
     MemoryPolicy,
     Workflow,
     Other,
+}
+
+/// Provider-neutral frozen judgment material for one evaluation candidate.
+/// The model projection contains no credentials; runtime re-admits the exact
+/// Offering and rejects route drift before dispatch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FrozenSkillRoutingPolicy {
+    Available {
+        schema_version: u32,
+        model: Box<ModelExecutionProjection>,
+        auxiliary_policy: astra_turn_types::auxiliary_execution::AuxiliaryGenerationPolicy,
+    },
+    /// The enhancement was requested at prepare time but no usable judgment
+    /// Offering was available. The candidate remains executable through the
+    /// baseline path and the missing enhancement stays visible in the spec.
+    Unavailable { schema_version: u32, reason: String },
+}
+
+impl FrozenSkillRoutingPolicy {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            schema_version: JUDGMENT_POLICY_SCHEMA_VERSION,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Available {
+                schema_version,
+                model,
+                auxiliary_policy,
+            } => {
+                if *schema_version != JUDGMENT_POLICY_SCHEMA_VERSION
+                    || model.schema_version != 1
+                    || model.offering_id.trim().is_empty()
+                    || model.model_name.trim().is_empty()
+                    || model.provider.trim().is_empty()
+                    || model.private_route_and_overrides_digest.trim().is_empty()
+                    || !astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment
+                        .supported_by(&model.provider)
+                    || auxiliary_policy.schema_version
+                        != astra_turn_types::auxiliary_execution::AUXILIARY_GENERATION_POLICY_VERSION
+                    || auxiliary_policy.operation_id != "skill_auto_route"
+                    || auxiliary_policy.purpose != InferencePurpose::Introspection
+                    || auxiliary_policy.max_output_tokens == 0
+                {
+                    return Err("frozen Skill routing judgment policy is invalid".into());
+                }
+                Ok(())
+            }
+            Self::Unavailable {
+                schema_version,
+                reason,
+            } => {
+                if *schema_version != JUDGMENT_POLICY_SCHEMA_VERSION
+                    || reason.trim().is_empty()
+                    || reason.len() > 512
+                {
+                    return Err("unavailable Skill routing judgment policy is invalid".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Frozen comparison-level judgment policy. Baseline deliberately has no new
+/// decision point; only the candidate carries the optional enhancement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvaluationJudgmentPolicy {
+    Disabled,
+    SkillRouting {
+        candidate: Box<FrozenSkillRoutingPolicy>,
+    },
+}
+
+impl EvaluationJudgmentPolicy {
+    pub fn validate_for(&self, target_kind: &EvaluationTargetKind) -> Result<(), String> {
+        match (target_kind, self) {
+            (EvaluationTargetKind::Prompt | EvaluationTargetKind::Skill, Self::Disabled) => Ok(()),
+            (EvaluationTargetKind::SkillRoutingJudgment, Self::SkillRouting { candidate }) => {
+                candidate.validate()
+            }
+            (EvaluationTargetKind::SkillRoutingJudgment, Self::Disabled) => {
+                Err("SkillRoutingJudgment targets require a candidate judgment policy".into())
+            }
+            (_, Self::Disabled) => Ok(()),
+            (_, Self::SkillRouting { .. }) => {
+                Err("Skill routing judgment policy is unsupported for this target kind".into())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +146,7 @@ pub struct RevisionRef {
     pub content: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationTarget {
     pub kind: EvaluationTargetKind,
@@ -52,6 +155,7 @@ pub struct EvaluationTarget {
     /// Owner-scoped Skill name for the instruction-only Skill adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_name: Option<String>,
+    pub judgment_policy: EvaluationJudgmentPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,14 +467,29 @@ impl ExperimentSpec {
         validate_revision("baseline", &self.target.baseline)?;
         validate_revision("candidate", &self.target.candidate)?;
         match (&self.target.kind, self.target.skill_name.as_deref()) {
-            (EvaluationTargetKind::Skill, Some(name)) if !name.trim().is_empty() => {}
-            (EvaluationTargetKind::Skill, _) => {
+            (
+                EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment,
+                Some(name),
+            ) if !name.trim().is_empty() => {}
+            (EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment, _) => {
                 return Err("Skill targets require an owner-scoped skill_name".to_string());
             }
             (EvaluationTargetKind::Prompt, Some(_)) => {
                 return Err("Prompt targets must not carry skill_name".to_string());
             }
             (_, _) => {}
+        }
+        self.target
+            .judgment_policy
+            .validate_for(&self.target.kind)?;
+        if self.target.kind == EvaluationTargetKind::SkillRoutingJudgment
+            && (self.target.baseline != self.target.candidate
+                || self.target.baseline.content.is_some()
+                || self.target.candidate.content.is_some())
+        {
+            return Err(
+                "SkillRoutingJudgment targets must compare the same pinned Skill revision".into(),
+            );
         }
         if self.cases.is_empty() {
             return Err("at least one evaluation case is required".to_string());
@@ -933,6 +1052,7 @@ mod tests {
                     content: None,
                 },
                 skill_name: Some("sample-skill".to_string()),
+                judgment_policy: EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-a".to_string(),
@@ -1066,6 +1186,27 @@ mod tests {
             original.spec_fingerprint().unwrap(),
             changed.spec_fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn skill_routing_judgment_is_an_aa_comparison_with_explicit_availability() {
+        let mut routing = spec(TrialOrder::BaselineFirst);
+        routing.target.kind = EvaluationTargetKind::SkillRoutingJudgment;
+        routing.target.candidate = routing.target.baseline.clone();
+        routing.target.judgment_policy = EvaluationJudgmentPolicy::SkillRouting {
+            candidate: Box::new(FrozenSkillRoutingPolicy::unavailable(
+                "judgment_offering_unconfigured",
+            )),
+        };
+        routing.validate().unwrap();
+
+        let mut missing_policy = routing.clone();
+        missing_policy.target.judgment_policy = EvaluationJudgmentPolicy::Disabled;
+        assert!(missing_policy.validate().is_err());
+
+        let mut changed_revision = routing;
+        changed_revision.target.candidate.revision_id = "skill-v2".into();
+        assert!(changed_revision.validate().is_err());
     }
 
     #[test]

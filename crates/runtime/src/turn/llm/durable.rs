@@ -2859,7 +2859,9 @@ impl DurableInferenceLedger {
                 upstream_model_name,
                 provider,
             ))
-            .map_err(|error| service_error("planning", error))?;
+            .map_err(|error| service_error("planning", error))?
+            .with_pricing_snapshot(self.admitted_execution.pricing.as_ref())
+            .map_err(|error| service_error("pricing snapshot", error))?;
             // Reserve reconciliation capacity before durable invocation
             // admission and therefore before any provider I/O. A recovered
             // invocation releases this exact slot before reserving the next
@@ -4834,6 +4836,7 @@ mod tests {
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
+            pricing: None,
             header_overrides: std::collections::HashMap::new(),
             completions_url_override: None,
             request_timeout_ms: None,

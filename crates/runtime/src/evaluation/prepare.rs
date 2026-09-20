@@ -11,7 +11,8 @@ use crate::AppState;
 use astra_core::{ErrorResponse, error_response, error_response_coded};
 use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError,
-    EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse, EvaluationTargetKind,
+    EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse,
+    EvaluationJudgmentPolicy, EvaluationTargetKind, FrozenSkillRoutingPolicy,
     PreparedSkillIdentity, build_prepared_experiment_spec, prepared_experiment_id,
     prepared_request_matches_spec,
 };
@@ -125,7 +126,10 @@ pub async fn prepare_experiment(
     )
     .await?;
 
-    let skill = if request.target.kind == EvaluationTargetKind::Skill {
+    let skill = if matches!(
+        request.target.kind,
+        EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment
+    ) {
         let skill_name = request.target.skill_name.as_deref().ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
@@ -208,6 +212,58 @@ pub async fn prepare_experiment(
         None
     };
 
+    let judgment_policy = if request.target.kind == EvaluationTargetKind::SkillRoutingJudgment {
+        let admitted_judgment =
+            if let Some(offering_id) = request.judgment_model_offering_id.as_deref() {
+                crate::server::model_execution_admission::admit_model_execution(
+                    &state.model_service,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment,
+                    owner_user_id,
+                    &ModelSelection {
+                        offering_id: offering_id.to_string(),
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(Some)?
+            } else {
+                astra_services::admin_config::resolve_judgment_offering(
+                    state.admin.config_service.as_ref(),
+                    state.model_service.as_ref(),
+                    owner_user_id,
+                )
+                .await?
+            };
+        let frozen = match admitted_judgment {
+            Some(admitted) => {
+                astra_services::models::validate_model_execution_purpose(
+                    &admitted,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment,
+                )
+                .map_err(|(_, body)| error_response(StatusCode::BAD_REQUEST, body.0.detail))?;
+                crate::turn::execution_config::freeze_skill_routing_policy(
+                    &admitted,
+                    &state.fernet_encryptor,
+                )
+                .map_err(|detail| {
+                    error_response_coded(
+                        StatusCode::CONFLICT,
+                        detail,
+                        "evaluation_judgment_policy_unavailable",
+                    )
+                })?
+            }
+            None => FrozenSkillRoutingPolicy::unavailable("judgment_offering_unconfigured"),
+        };
+        EvaluationJudgmentPolicy::SkillRouting {
+            candidate: Box::new(frozen),
+        }
+    } else {
+        EvaluationJudgmentPolicy::Disabled
+    };
+
     let execution_config =
         crate::turn::execution_config::PreparedExecutionInputs::freeze_for_prepare(
             &admitted,
@@ -228,6 +284,7 @@ pub async fn prepare_experiment(
         &request,
         &execution_config,
         skill.as_ref(),
+        judgment_policy,
     )
     .map_err(map_bootstrap_error)?;
     let experiment = match plan_store

@@ -338,8 +338,9 @@ impl DatabaseEvaluationProjectionStore {
 mod tests {
     use super::*;
     use crate::evaluation::experiment::{
-        DataIsolation, EvaluationBudget, EvaluationCase, EvaluationTarget, EvaluationTargetKind,
-        ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef, TrialOrder, TrialUnit,
+        DataIsolation, EvaluationBudget, EvaluationCase, EvaluationJudgmentPolicy,
+        EvaluationTarget, EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation,
+        RevisionRef, TrialOrder, TrialUnit,
     };
     use crate::evaluation::{EvidenceRef, TrialStatus};
 
@@ -368,6 +369,7 @@ mod tests {
                     content: None,
                 },
                 skill_name: None,
+                judgment_policy: EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case".to_string(),

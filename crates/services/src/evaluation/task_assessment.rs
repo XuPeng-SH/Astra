@@ -629,6 +629,7 @@ mod tests {
             &request,
             &crate::evaluation::test_support::execution_config("model", "openai", "case"),
             None,
+            super::super::experiment::EvaluationJudgmentPolicy::Disabled,
         )
         .unwrap();
         let trial = spec.plan_trials().unwrap().remove(0);

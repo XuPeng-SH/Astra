@@ -510,6 +510,7 @@ mod tests {
                     content: None,
                 },
                 skill_name: None,
+                judgment_policy: crate::evaluation::EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-1".to_string(),

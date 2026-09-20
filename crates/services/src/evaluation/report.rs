@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 4;
-pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v5";
+pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v6";
 const MAX_REPORT_LABEL_BYTES: usize = 256;
 
 pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
@@ -283,6 +283,21 @@ pub fn build_report_artifact(
             {
                 continue;
             }
+            if measurement.is_some_and(|item| {
+                item.unit == unit
+                    && item.status == super::assessment::MeasurementStatus::Observed
+                    && item.basis.as_deref().is_some_and(|basis| {
+                        basis.starts_with("evaluation_inference_evidence.v")
+                            || basis == "canonical_evaluation_materialization"
+                            || (metric == "run_completed" && basis == "canonical_run_settlement")
+                            || (matches!(
+                                metric,
+                                "tool_calls" | "tool_validity_rate" | "policy_violation_count"
+                            ) && basis == "canonical_run_accounting")
+                    })
+            }) {
+                continue;
+            }
             let reason = match measurement {
                 None => "required measurement is missing",
                 Some(item) if item.unit != unit => {
@@ -422,6 +437,7 @@ mod tests {
                     content: None,
                 },
                 skill_name: None,
+                judgment_policy: super::super::experiment::EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case".to_string(),

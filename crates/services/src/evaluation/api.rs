@@ -24,6 +24,11 @@ pub struct EvaluationExperimentPrepareRequest {
     pub target: EvaluationPrepareTarget,
     pub case: EvaluationPrepareCase,
     pub model_offering_id: String,
+    /// Optional exact typed-judgment Offering for a SkillRoutingJudgment
+    /// target. When omitted, the server freezes the configured judgment
+    /// Offering (if one exists) at prepare time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_model_offering_id: Option<String>,
     pub max_concurrency: u16,
     pub max_wall_time_secs: u64,
 }

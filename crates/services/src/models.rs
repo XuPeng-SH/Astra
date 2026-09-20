@@ -635,6 +635,9 @@ pub struct ResolvedActiveLlmModel {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
+    /// Pricing admitted with the Offering. `None` means the owner did not
+    /// publish a billable price, so historical cost must remain unknown.
+    pub pricing: Option<PricingData>,
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
@@ -782,6 +785,10 @@ pub struct AdmittedModelExecution {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
+    /// Secret-free pricing captured with the Offering admission. It is copied
+    /// into the canonical inference route so later catalog edits cannot
+    /// rewrite historical cost evidence.
+    pub pricing: Option<PricingData>,
     pub cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-derived reasoning control contract. Inference adapters use this
     /// capability fact rather than model-name heuristics when selecting a
@@ -810,6 +817,7 @@ impl AdmittedModelExecution {
             api_key: offering.model.api_key,
             base_url: offering.model.base_url,
             provider: offering.model.provider,
+            pricing: offering.model.pricing.clone(),
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
             fixed_temperature: offering.model.fixed_temperature,
@@ -841,6 +849,7 @@ impl AdmittedModelExecution {
             api_key: String::new(),
             base_url: String::new(),
             provider,
+            pricing: None,
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
@@ -1207,6 +1216,13 @@ fn build_resolved_active_llm_from_row(
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let provider: String = row.try_get("provider").map_err(|e| e.to_string())?;
+    let pricing_json: String = row
+        .try_get("pricing_json")
+        .map_err(|e| format!("invalid infra_llm_models.pricing: {e}"))?;
+    let pricing: PricingData = parse_json_column("pricing_json", &pricing_json)?;
+    if !pricing.is_valid() {
+        return Err("invalid infra_llm_models.pricing values".to_string());
+    }
     let api_key = encryptor
         .decrypt(&encrypted)
         .map_err(|e| format!("Decrypt: {e}"))?;
@@ -1289,6 +1305,7 @@ fn build_resolved_active_llm_from_row(
         api_key,
         base_url,
         provider,
+        pricing: Some(pricing),
         fallback_chain,
         tags,
         request_body_overrides,
@@ -1801,6 +1818,7 @@ pub async fn revalidate_admitted_model_execution(
                     "invalid user_llm_models.provider: {error}"
                 ))
             })?,
+            pricing: None,
             cache_capability: None,
             thinking_capability,
             fixed_temperature: None,
@@ -6104,6 +6122,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             base_url: "http://127.0.0.1:18080".to_string(),
             provider: "openai".to_string(),
+            pricing: None,
             fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
@@ -6845,6 +6864,7 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             provider: "anthropic".into(),
+            pricing: None,
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
@@ -6869,6 +6889,7 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.anthropic.com".into(),
             provider: "anthropic".into(),
+            pricing: None,
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,

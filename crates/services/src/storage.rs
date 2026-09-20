@@ -2887,6 +2887,35 @@ async fn verify_inference_invocation_schema_contract(
     )))
 }
 
+async fn verify_inference_route_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let row = query(
+        "SELECT DATA_TYPE, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'inference_routes'
+           AND COLUMN_NAME = 'pricing_json'",
+    )
+    .bind(database)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Err(sqlx::Error::Protocol(
+            "obsolete core schema table inference_routes requires pricing_json; rebuild the pre-release table before startup".into(),
+        ));
+    };
+    let data_type: String = row.try_get("DATA_TYPE")?;
+    let nullable: String = row.try_get("IS_NULLABLE")?;
+    if !data_type.eq_ignore_ascii_case("json") || nullable != "YES" {
+        return Err(sqlx::Error::Protocol(format!(
+            "obsolete core schema table inference_routes has pricing_json {data_type} {nullable}; expected nullable JSON"
+        )));
+    }
+    Ok(())
+}
+
 async fn verify_inference_provider_attempt_schema_contract(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -5417,6 +5446,7 @@ async fn ensure_core_schema_while_leased(
             execution_placement VARCHAR(32) NOT NULL,
             access_kind VARCHAR(32) NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            pricing_json JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind

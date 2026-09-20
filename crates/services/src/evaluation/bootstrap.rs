@@ -11,9 +11,9 @@ use super::api::{
 use super::durable::{EvaluationExperimentRecord, EvaluationTrialBindingRecord};
 use super::execution::{EvaluationRunAdmission, EvaluationSkillRevision};
 use super::experiment::{
-    DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
-    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
-    TrialOrder,
+    DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase,
+    EvaluationJudgmentPolicy, EvaluationTarget, EvaluationTargetKind, ExperimentSpec,
+    FrozenConditions, FrozenSkillRoutingPolicy, MemoryIsolation, RevisionRef, TrialOrder,
 };
 use super::{
     EvaluationPolicyFingerprintInput, content_fingerprint, evaluation_policy_fingerprint,
@@ -101,7 +101,12 @@ pub fn prepared_request_matches_spec(
         EvaluationTargetKind::Prompt => {
             if spec.target.kind != EvaluationTargetKind::Prompt
                 || request.target.skill_name.is_some()
+                || request.judgment_model_offering_id.is_some()
                 || spec.target.skill_name.is_some()
+                || !matches!(
+                    &spec.target.judgment_policy,
+                    EvaluationJudgmentPolicy::Disabled
+                )
                 || request.target.baseline.content.as_deref()
                     != spec.target.baseline.content.as_deref()
                 || request.target.candidate.content.as_deref()
@@ -114,7 +119,37 @@ pub fn prepared_request_matches_spec(
             if spec.target.kind != EvaluationTargetKind::Skill
                 || request.target.baseline.content.is_some()
                 || request.target.candidate.content.is_some()
+                || request.judgment_model_offering_id.is_some()
                 || request.target.skill_name.as_deref() != spec.target.skill_name.as_deref()
+                || !matches!(
+                    &spec.target.judgment_policy,
+                    EvaluationJudgmentPolicy::Disabled
+                )
+            {
+                return false;
+            }
+        }
+        EvaluationTargetKind::SkillRoutingJudgment => {
+            let offering_matches = match (
+                request.judgment_model_offering_id.as_deref(),
+                &spec.target.judgment_policy,
+            ) {
+                (Some(requested), EvaluationJudgmentPolicy::SkillRouting { candidate }) => {
+                    matches!(
+                        candidate.as_ref(),
+                        FrozenSkillRoutingPolicy::Available { model, .. }
+                            if model.offering_id == requested
+                    )
+                }
+                (None, EvaluationJudgmentPolicy::SkillRouting { .. }) => true,
+                _ => false,
+            };
+            if spec.target.kind != EvaluationTargetKind::SkillRoutingJudgment
+                || request.target.baseline.content.is_some()
+                || request.target.candidate.content.is_some()
+                || request.target.skill_name.as_deref() != spec.target.skill_name.as_deref()
+                || request.target.baseline.revision_id != request.target.candidate.revision_id
+                || !offering_matches
             {
                 return false;
             }
@@ -144,7 +179,7 @@ pub enum EvaluationBootstrapError {
     Unsupported(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationTrialStartPlan {
     pub experiment_id: String,
     pub trial_id: String,
@@ -162,6 +197,18 @@ pub struct EvaluationTrialStartPlan {
     pub admission: EvaluationRunAdmission,
 }
 
+fn judgment_policy_for_trial(
+    target: &EvaluationTarget,
+    arm: &super::ComparisonArm,
+) -> Option<FrozenSkillRoutingPolicy> {
+    match (&target.judgment_policy, arm) {
+        (EvaluationJudgmentPolicy::SkillRouting { candidate }, super::ComparisonArm::Candidate) => {
+            Some(candidate.as_ref().clone())
+        }
+        _ => None,
+    }
+}
+
 /// Convert authenticated user intent plus trusted model/Skill facts into the
 /// immutable first adapter spec. Hashes and policy identities are produced
 /// here, never by a client or a second runtime implementation.
@@ -171,6 +218,7 @@ pub fn build_prepared_experiment_spec(
     request: &EvaluationExperimentPrepareRequest,
     execution_config: &super::execution_config::EvaluationExecutionConfig,
     skill: Option<&PreparedSkillIdentity>,
+    judgment_policy: EvaluationJudgmentPolicy,
 ) -> Result<ExperimentSpec, EvaluationBootstrapError> {
     if experiment_id.trim().is_empty() {
         return Err(EvaluationBootstrapError::InvalidInput(
@@ -186,6 +234,13 @@ pub fn build_prepared_experiment_spec(
         return Err(EvaluationBootstrapError::InvalidInput(format!(
             "case.message exceeds the {MAX_MESSAGE_BYTES} byte limit"
         )));
+    }
+    if request.target.kind != EvaluationTargetKind::SkillRoutingJudgment
+        && request.judgment_model_offering_id.is_some()
+    {
+        return Err(EvaluationBootstrapError::InvalidInput(
+            "judgment_model_offering_id is only valid for SkillRoutingJudgment targets".to_string(),
+        ));
     }
     if request.max_concurrency == 0 || request.max_concurrency > MAX_CONCURRENCY {
         return Err(EvaluationBootstrapError::InvalidInput(format!(
@@ -209,7 +264,12 @@ pub fn build_prepared_experiment_spec(
         ));
     }
     let input_content_hash = prompt_context_fingerprint(&request.case.message, &[], &[], None);
-    let target = build_prepared_target(&request.target, input_content_hash.as_str(), skill)?;
+    let target = build_prepared_target(
+        &request.target,
+        input_content_hash.as_str(),
+        skill,
+        judgment_policy,
+    )?;
     let resolved_model_selection = crate::runs::ResolvedModelSelection {
         offering_id: model.offering_id.clone(),
         model_name: model.model_name.clone(),
@@ -275,6 +335,7 @@ fn build_prepared_target(
     target: &EvaluationPrepareTarget,
     _input_content_hash: &str,
     skill: Option<&PreparedSkillIdentity>,
+    judgment_policy: EvaluationJudgmentPolicy,
 ) -> Result<EvaluationTarget, EvaluationBootstrapError> {
     match &target.kind {
         EvaluationTargetKind::Prompt => {
@@ -306,9 +367,10 @@ fn build_prepared_target(
                     content: Some(candidate),
                 },
                 skill_name: None,
+                judgment_policy,
             })
         }
-        EvaluationTargetKind::Skill => {
+        EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment => {
             if target.baseline.content.is_some() || target.candidate.content.is_some() {
                 return Err(EvaluationBootstrapError::InvalidInput(
                     "Skill preparation uses owner-scoped revision IDs, not inline content"
@@ -328,8 +390,25 @@ fn build_prepared_target(
                     "resolved Skill revisions do not match the requested identity".to_string(),
                 ));
             }
+            if target.kind == EvaluationTargetKind::Skill
+                && !matches!(judgment_policy, EvaluationJudgmentPolicy::Disabled)
+            {
+                return Err(EvaluationBootstrapError::InvalidInput(
+                    "Skill targets require a disabled judgment policy".to_string(),
+                ));
+            }
+            if target.kind == EvaluationTargetKind::SkillRoutingJudgment
+                && !matches!(
+                    judgment_policy,
+                    EvaluationJudgmentPolicy::SkillRouting { .. }
+                )
+            {
+                return Err(EvaluationBootstrapError::InvalidInput(
+                    "SkillRoutingJudgment targets require a candidate judgment policy".to_string(),
+                ));
+            }
             Ok(EvaluationTarget {
-                kind: EvaluationTargetKind::Skill,
+                kind: target.kind.clone(),
                 baseline: RevisionRef {
                     revision_id: skill.baseline_revision_id.clone(),
                     content_hash: skill.baseline_content_hash.clone(),
@@ -341,6 +420,7 @@ fn build_prepared_target(
                     content: None,
                 },
                 skill_name: Some(skill.skill_name.clone()),
+                judgment_policy,
             })
         }
         other => Err(EvaluationBootstrapError::Unsupported(format!(
@@ -475,7 +555,7 @@ pub fn prepare_trial_start(
             }
             (Some(content), None)
         }
-        EvaluationTargetKind::Skill => {
+        EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment => {
             if request.revision_content.is_some() {
                 return Err(EvaluationBootstrapError::InvalidInput(
                     "Skill evaluation does not accept revision_content".to_string(),
@@ -580,6 +660,7 @@ pub fn prepare_trial_start(
         "skill_name": skill_revision.as_ref().map(|revision| &revision.skill_name),
         "execution_time_budget_secs": execution_time_budget_secs,
         "edge_executor_id": edge_executor_id,
+        "judgment_policy": judgment_policy_for_trial(&experiment.spec.target, &trial.trial.arm),
     });
     let request_fingerprint = format!(
         "{:x}",
@@ -591,6 +672,7 @@ pub fn prepare_trial_start(
         input_content_hash: trial.trial.input_content_hash.clone(),
         revision_content_hash: revision.content_hash.clone(),
         skill_revision,
+        judgment_policy: judgment_policy_for_trial(&experiment.spec.target, &trial.trial.arm),
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     };
@@ -643,6 +725,7 @@ mod tests {
                     content: Some(candidate.clone()),
                 },
                 skill_name: None,
+                judgment_policy: EvaluationJudgmentPolicy::Disabled,
             },
             cases: vec![EvaluationCase {
                 case_id: "case-1".to_string(),
@@ -831,6 +914,7 @@ mod tests {
                 },
             },
             model_offering_id: "model-1".to_string(),
+            judgment_model_offering_id: None,
             max_concurrency: 2,
             max_wall_time_secs: 30,
         }
@@ -848,6 +932,7 @@ mod tests {
             &request,
             &prepared_config(),
             None,
+            EvaluationJudgmentPolicy::Disabled,
         )
         .expect("prepared spec");
         assert_eq!(spec.plan_trials().expect("trials").len(), 2);
@@ -856,7 +941,14 @@ mod tests {
         let mut wrong_model = prepared_config();
         wrong_model.model.offering_id = "other-model".into();
         assert!(matches!(
-            build_prepared_experiment_spec("owner-1", "evx_prepare", &request, &wrong_model, None),
+            build_prepared_experiment_spec(
+                "owner-1",
+                "evx_prepare",
+                &request,
+                &wrong_model,
+                None,
+                EvaluationJudgmentPolicy::Disabled,
+            ),
             Err(EvaluationBootstrapError::Conflict(_))
         ));
         assert_eq!(
@@ -913,6 +1005,7 @@ mod tests {
             &request,
             &prepared_config(),
             None,
+            EvaluationJudgmentPolicy::Disabled,
         )
         .expect("prepared spec");
         let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
@@ -980,6 +1073,7 @@ mod tests {
                 candidate_revision_id: "cand".to_string(),
                 candidate_content_hash: content_fingerprint("candidate skill").to_string(),
             }),
+            EvaluationJudgmentPolicy::Disabled,
         )
         .expect("prepared Skill spec");
         assert_eq!(spec.target.skill_name.as_deref(), Some("reviewer"));
@@ -1009,6 +1103,7 @@ mod tests {
                 candidate_revision_id: "cand".to_string(),
                 candidate_content_hash: content_fingerprint("candidate skill").to_string(),
             }),
+            EvaluationJudgmentPolicy::Disabled,
         )
         .expect("prepared Skill spec");
         let spec_fingerprint = spec.spec_fingerprint().expect("fingerprint");
@@ -1066,8 +1161,15 @@ mod tests {
         let mut same = request.clone();
         same.target.candidate.revision_id = same.target.baseline.revision_id.clone();
         let model = prepared_config();
-        let same_spec = build_prepared_experiment_spec("owner-1", "evx_same", &same, &model, None)
-            .expect("A/A is a valid controlled comparison");
+        let same_spec = build_prepared_experiment_spec(
+            "owner-1",
+            "evx_same",
+            &same,
+            &model,
+            None,
+            EvaluationJudgmentPolicy::Disabled,
+        )
+        .expect("A/A is a valid controlled comparison");
         assert_eq!(
             same_spec.target.baseline.revision_id,
             same_spec.target.candidate.revision_id
@@ -1089,6 +1191,7 @@ mod tests {
                     candidate_revision_id: "cand".to_string(),
                     candidate_content_hash: "sha256:cand".to_string(),
                 }),
+                EvaluationJudgmentPolicy::Disabled,
             ),
             Err(EvaluationBootstrapError::InvalidInput(_))
         ));
@@ -1117,6 +1220,7 @@ mod tests {
             &request,
             &prepared_config(),
             None,
+            EvaluationJudgmentPolicy::Disabled,
         )
         .expect("spec");
         assert!(prepared_request_matches_spec(&request, &spec));

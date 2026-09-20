@@ -8,7 +8,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use crate::turn::llm::client::{LlmTransport, OwnedLlmExecutionRoute};
 use astra_services::evaluation::{
     EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION, EVALUATION_RUNTIME_CONTRACT_VERSION,
-    EvaluationExecutionConfig, FrozenRoundBudget, InstructionOnlyRuntimeConfig,
+    EvaluationExecutionConfig, FrozenRoundBudget, FrozenSkillRoutingPolicy,
+    InstructionOnlyRuntimeConfig, JUDGMENT_POLICY_SCHEMA_VERSION,
 };
 use astra_services::{AdmittedModelExecution, auth::FernetTokenEncryptor};
 use astra_turn_types::InferencePurpose;
@@ -28,6 +29,7 @@ pub(crate) struct FrozenEvaluationInputs {
     pub transport: Arc<LlmTransport>,
     pub admitted: AdmittedModelExecution,
     pub case_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+    pub judgment_policy: Option<FrozenSkillRoutingPolicy>,
 }
 
 /// Existing auxiliary operation limits, shared by admission and host consumers.
@@ -60,6 +62,29 @@ fn admitted_execution_route(admitted: &AdmittedModelExecution) -> OwnedLlmExecut
         completions_url_override: admitted.completions_url_override.clone(),
         request_timeout: admitted.request_timeout_ms.map(Duration::from_millis),
     }
+}
+
+/// Freeze the optional candidate-only Skill routing decision point from the
+/// exact typed-judgment Offering admitted at prepare time.
+pub(crate) fn freeze_skill_routing_policy(
+    admitted: &AdmittedModelExecution,
+    encryptor: &FernetTokenEncryptor,
+) -> Result<FrozenSkillRoutingPolicy, String> {
+    let model = admitted.freeze_projection(encryptor)?;
+    let route = admitted_execution_route(admitted);
+    let auxiliary_policy = crate::turn::llm::summary_client::resolve_auxiliary_generation_policy(
+        "skill_auto_route",
+        SKILL_AUTO_ROUTE_MAX_OUTPUT_TOKENS,
+        InferencePurpose::Introspection,
+        &route,
+    )?;
+    let policy = FrozenSkillRoutingPolicy::Available {
+        schema_version: JUDGMENT_POLICY_SCHEMA_VERSION,
+        model: Box::new(model),
+        auxiliary_policy,
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 
 fn validate_auxiliary_coverage(config: &EvaluationExecutionConfig) -> Result<(), String> {
@@ -266,9 +291,14 @@ impl PreparedExecutionInputs {
         admitted: &AdmittedModelExecution,
         encryptor: &FernetTokenEncryptor,
         case_id: &str,
+        judgment_policy: Option<&FrozenSkillRoutingPolicy>,
     ) -> Result<Self, String> {
         frozen.validate()?;
         validate_auxiliary_coverage(frozen)?;
+        let judgment_policy = judgment_policy.cloned();
+        if let Some(policy) = &judgment_policy {
+            policy.validate()?;
+        }
         let case_budget = frozen
             .runtime
             .round_budget_by_case
@@ -303,6 +333,7 @@ impl PreparedExecutionInputs {
                 transport,
                 admitted: admitted.clone(),
                 case_budget,
+                judgment_policy,
             })),
             static_sections: Arc::new(frozen.static_sections.clone()),
             summary_templates: frozen.summary_templates.clone(),
@@ -331,7 +362,10 @@ mod tests {
     use astra_services::session_journal::{
         JournalDirGuard, JournalEvent, JournalWriter, journal_file_path_for_user,
     };
-    use astra_turn_types::prompt_sections::{CacheScope, PromptTokenBucket};
+    use astra_turn_types::{
+        InferencePurpose,
+        prompt_sections::{CacheScope, PromptTokenBucket},
+    };
 
     fn evaluation_fixture() -> (
         astra_services::evaluation::EvaluationExecutionConfig,
@@ -380,7 +414,7 @@ mod tests {
         for enabled in [false, true] {
             config.prompt_cache_enabled = enabled;
             let inputs =
-                PreparedExecutionInputs::from_frozen(&config, &admitted, &encryptor, "case")
+                PreparedExecutionInputs::from_frozen(&config, &admitted, &encryptor, "case", None)
                     .unwrap();
             assert_eq!(inputs.prompt_cache_enabled, enabled);
         }
@@ -394,7 +428,8 @@ mod tests {
             .header_overrides
             .insert("authorization".into(), "Bearer rotated".into());
         let inputs =
-            PreparedExecutionInputs::from_frozen(&config, &admitted, &encryptor, "case").unwrap();
+            PreparedExecutionInputs::from_frozen(&config, &admitted, &encryptor, "case", None)
+                .unwrap();
         let super::PreparedExecutionPolicy::Evaluation(material) = &inputs.policy else {
             panic!("frozen branch must never construct a normal runtime config")
         };
@@ -452,26 +487,83 @@ mod tests {
 
     #[test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    fn skill_routing_judgment_freezes_jev_capability_and_trial_policy() {
+        let (config, admitted, encryptor) = evaluation_fixture();
+        let policy = super::freeze_skill_routing_policy(&admitted, &encryptor).unwrap();
+        let super::FrozenSkillRoutingPolicy::Available {
+            model,
+            auxiliary_policy,
+            ..
+        } = &policy
+        else {
+            panic!("an admitted typed-judgment route must be available")
+        };
+        assert_eq!(model.offering_id, admitted.offering_id);
+        assert_eq!(model.provider, admitted.provider);
+        assert_eq!(auxiliary_policy.operation_id, "skill_auto_route");
+        assert_eq!(auxiliary_policy.purpose, InferencePurpose::Introspection);
+
+        let inputs = PreparedExecutionInputs::from_frozen(
+            &config,
+            &admitted,
+            &encryptor,
+            "case",
+            Some(&policy),
+        )
+        .unwrap();
+        let super::PreparedExecutionPolicy::Evaluation(material) = &inputs.policy else {
+            panic!("frozen branch must preserve the candidate judgment policy")
+        };
+        assert_eq!(material.judgment_policy.as_ref(), Some(&policy));
+
+        let jev = astra_services::AdmittedModelExecution::from_endpoint(
+            "jev-offering".into(),
+            "jev-1.13.0".into(),
+            "typesafe".into(),
+            "https://jev.example/v1".into(),
+            "Bearer test".into(),
+            Some(30_000),
+            64_000,
+        );
+        let jev_policy = super::freeze_skill_routing_policy(&jev, &encryptor).unwrap();
+        assert!(matches!(
+            jev_policy,
+            super::FrozenSkillRoutingPolicy::Available { model, .. }
+                if model.provider == "typesafe"
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     fn frozen_material_rejects_behavior_proxy_gate_case_and_policy_drift() {
         let (config, admitted, encryptor) = evaluation_fixture();
         let mut changed = admitted.clone();
         changed.max_completion_tokens = Some(16_000);
         assert!(
-            PreparedExecutionInputs::from_frozen(&config, &changed, &encryptor, "case").is_err()
+            PreparedExecutionInputs::from_frozen(&config, &changed, &encryptor, "case", None)
+                .is_err()
         );
         assert!(
-            PreparedExecutionInputs::from_frozen(&config, &admitted, &encryptor, "missing-case")
-                .is_err()
+            PreparedExecutionInputs::from_frozen(
+                &config,
+                &admitted,
+                &encryptor,
+                "missing-case",
+                None,
+            )
+            .is_err()
         );
         let mut changed = config.clone();
         changed.private_proxy_binding_digest = "wrong-binding".into();
         assert!(
-            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case").is_err()
+            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case", None)
+                .is_err()
         );
         let mut changed = config.clone();
         changed.auxiliary_policies.pop();
         assert!(
-            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case").is_err()
+            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case", None)
+                .is_err()
         );
         let mut changed = config.clone();
         changed.pre_turn_compaction_gate = match config.pre_turn_compaction_gate {
@@ -479,15 +571,17 @@ mod tests {
             _ => super::AuxiliaryCallGate::Allowed,
         };
         assert!(
-            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case").is_err()
+            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case", None)
+                .is_err()
         );
         let mut changed = config.clone();
         changed.work_admission_gate = match config.work_admission_gate {
             super::WorkAdmissionGate::Allowed => super::WorkAdmissionGate::Disabled,
             _ => super::WorkAdmissionGate::Allowed,
         };
-        let error = PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case")
-            .expect_err("Work gate drift must fail independently of optional compaction gate");
+        let error =
+            PreparedExecutionInputs::from_frozen(&changed, &admitted, &encryptor, "case", None)
+                .expect_err("Work gate drift must fail independently of optional compaction gate");
         assert!(error.contains("Work admission gate"), "{error}");
     }
 

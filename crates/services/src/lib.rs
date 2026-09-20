@@ -207,9 +207,9 @@ pub use evaluation::{
     MaterializationReceiptError, MaterializationReceiptRecord, MaterializationReceiptRequest,
     MaterializationValidationError, Measurement, MeasurementStatus, MemoryIsolation, RevisionRef,
     SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialObservation, TrialOrder, TrialStatus,
-    TrialUnit, TrustedMaterializerContext, UnconfiguredEvaluationService,
-    build_comparison_for_plan, build_report_artifact, content_fingerprint,
-    evaluation_component_idempotency_key, prompt_context_fingerprint,
+    TrialUnit, TrustedMaterializerContext, UnconfiguredEvaluationService, apply_inference_evidence,
+    apply_tool_outcome_evidence, build_comparison_for_plan, build_report_artifact,
+    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
     prompt_only_snapshot_envelope, prompt_policy_fingerprint, render_markdown,
     required_components_for_spec, terminal_run_observation, validate_receipt_set,
 };
@@ -227,7 +227,8 @@ pub use harness::{
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use inference_execution::{
-    AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
+    AuxiliaryExecutionAttemptFact, EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,
+    EvaluationInferenceEvidence, InferenceCanonicalTransitionReceipt,
     InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
     InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
     InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
@@ -237,7 +238,7 @@ pub use inference_execution::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_existing_inference_operation_ids_for_route,
+    load_evaluation_inference_evidence, load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
     load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt,

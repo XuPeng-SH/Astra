@@ -52,7 +52,8 @@ use astra_services::evaluation::{
     DatabaseMaterializationReceiptStore, EvaluationObservationRequest,
     EvaluationPolicyFingerprintInput, EvaluationRunAdmission, EvaluationSkillRevision,
     EvidenceAvailability, EvidenceKind, EvidenceRef, MaterializationComponentKind,
-    MaterializationOutcome, MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
+    MaterializationOutcome, MaterializationReceiptRequest, Measurement, MeasurementStatus,
+    TrialStatus, TrustedMaterializerContext, apply_inference_evidence, apply_tool_outcome_evidence,
     content_fingerprint, evaluation_component_idempotency_key, evaluation_policy_fingerprint,
     prompt_context_fingerprint, prompt_only_snapshot_envelope, terminal_run_observation,
 };
@@ -8204,7 +8205,8 @@ impl AgenticRunLifecycleService {
                 }
                 None
             }
-            astra_services::evaluation::EvaluationTargetKind::Skill => {
+            astra_services::evaluation::EvaluationTargetKind::Skill
+            | astra_services::evaluation::EvaluationTargetKind::SkillRoutingJudgment => {
                 let Some(skill_revision) = admission.skill_revision.as_ref() else {
                     return Err(evaluation_preflight_error(
                         StatusCode::BAD_REQUEST,
@@ -8638,6 +8640,7 @@ impl AgenticRunLifecycleService {
                 input_content_hash: admission.input_content_hash.clone(),
                 revision_content_hash: admission.revision_content_hash.clone(),
                 skill_revision: admission.skill_revision.clone(),
+                judgment_policy: admission.judgment_policy.clone(),
                 receipt_ids,
                 snapshot_envelope: Some(envelope),
             },
@@ -8901,7 +8904,18 @@ impl AgenticRunLifecycleService {
                     "cache_read_tokens": 0,
                     "cache_creation_tokens": 0,
                     "completion_tokens": 0,
-                    "tool_call_count": 0,
+                "tool_call_count": 0,
+                    "tool_outcomes": {
+                        "requested": 0,
+                        "executed": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "rejected": 0,
+                        "reused": 0,
+                        "suppressed": 0,
+                        "deferred": 0,
+                        "policy_denied": 0,
+                    },
                     "usage_available": false,
                     "usage_scope": "run_total",
                 },
@@ -11163,6 +11177,7 @@ impl AgenticRunLifecycleService {
             admitted,
             &self.encryptor,
             &binding.trial.case_id,
+            admission.judgment_policy.as_ref(),
         )
         .map_err(|error| {
             evaluation_preflight_error(
@@ -12776,6 +12791,21 @@ impl AgenticRunLifecycleService {
         work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
         execution_inputs: &crate::turn::execution_config::PreparedExecutionInputs,
     ) -> server_loop_host::ServerAgenticLoopHost {
+        let skill_auto_route_policy = match &execution_inputs.policy {
+            crate::turn::execution_config::PreparedExecutionPolicy::Evaluation(frozen) => {
+                if matches!(
+                    frozen.judgment_policy,
+                    Some(astra_services::evaluation::FrozenSkillRoutingPolicy::Available { .. })
+                ) {
+                    astra_services::runs::SkillAutoRouteExecutionPolicy::Auto
+                } else {
+                    astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled
+                }
+            }
+            crate::turn::execution_config::PreparedExecutionPolicy::Normal(_) => {
+                request.execution_policy.skill_auto_route
+            }
+        };
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
             self.encryptor.clone(),
@@ -12800,7 +12830,7 @@ impl AgenticRunLifecycleService {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(Some(Self::effective_requested_interaction_mode(request)))
         .with_turn_intent_policy(request.execution_policy.turn_intent)
-        .with_skill_auto_route_policy(request.execution_policy.skill_auto_route)
+        .with_skill_auto_route_policy(skill_auto_route_policy)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
         .with_plan_authoring_active(plan_authoring_active)
@@ -15704,7 +15734,7 @@ async fn persist_evaluation_observation_after_settlement(
             })
         })
         .flatten();
-    let (prompt_tokens, completion_tokens, tool_calls) = accounting_index
+    let (prompt_tokens, completion_tokens, tool_calls, tool_outcomes) = accounting_index
         .and_then(|index| canonical_events.get(index))
         .map(|event| {
             let data = event.get("data").unwrap_or(&Value::Null);
@@ -15712,6 +15742,16 @@ async fn persist_evaluation_observation_after_settlement(
                 .get("usage_available")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let tool_outcomes = data
+                .get("tool_outcomes")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<astra_services::session_journal::ToolOutcomeSummary>(
+                        value,
+                    )
+                    .ok()
+                })
+                .filter(|outcomes| outcomes.is_consistent());
             (
                 usage_available
                     .then(|| data.get("prompt_tokens").and_then(Value::as_u64))
@@ -15722,9 +15762,10 @@ async fn persist_evaluation_observation_after_settlement(
                 data.get("tool_call_count")
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok()),
+                tool_outcomes,
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
     let evidence_index = if let Some(terminal_event_idx) = recovery_terminal_event_idx {
         let Some(index) = canonical_events.iter().position(|event| {
             event.get("index").and_then(Value::as_i64) == Some(terminal_event_idx)
@@ -15791,7 +15832,7 @@ async fn persist_evaluation_observation_after_settlement(
             locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
         });
     }
-    let observation = terminal_run_observation(
+    let mut observation = terminal_run_observation(
         experiment.spec_fingerprint.clone(),
         binding.trial.trial_id.clone(),
         binding.trial.case_id.clone(),
@@ -15803,6 +15844,46 @@ async fn persist_evaluation_observation_after_settlement(
         tool_calls,
         evidence,
     );
+    if let Some(tool_outcomes) = tool_outcomes.as_ref() {
+        apply_tool_outcome_evidence(&mut observation, tool_outcomes);
+    }
+    if admission.snapshot_envelope.is_some() && !admission.receipt_ids.is_empty() {
+        observation.measurements.push(Measurement {
+            name: "context_snapshot_match".to_string(),
+            value: Some(1.0),
+            unit: "boolean".to_string(),
+            status: MeasurementStatus::Observed,
+            basis: Some("canonical_evaluation_materialization".to_string()),
+        });
+    }
+    match astra_services::load_evaluation_inference_evidence(
+        pool,
+        owner_user_id,
+        session_id,
+        run_id,
+        &experiment.spec.conditions.model_binding,
+        &experiment.spec.conditions.provider_binding,
+    )
+    .await
+    {
+        Ok(inference) => apply_inference_evidence(&mut observation, &inference),
+        Err(error) => {
+            tracing::warn!(
+                owner_user_id,
+                session_id,
+                run_id,
+                %error,
+                "evaluation inference evidence could not be projected into the observation"
+            );
+            observation.evidence.push(EvidenceRef {
+                evidence_id: format!("inference-evidence:{run_id}"),
+                kind: EvidenceKind::Trace,
+                availability: EvidenceAvailability::Missing,
+                content_hash: None,
+                locator: Some(format!("inference://{owner_user_id}/{session_id}/{run_id}")),
+            });
+        }
+    }
     let request = EvaluationObservationRequest {
         session_id: session_id.to_string(),
         execution_run_id: run_id.to_string(),
@@ -17199,12 +17280,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             )
                             .await;
                             return match failed {
-                                Ok(ExecutionAuthorityConfirmation::Superseded) => Err(
-                                    error_response(
+                                Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                                    Err(error_response(
                                         StatusCode::CONFLICT,
                                         "durable evaluation authority expired before activation",
-                                    ),
-                                ),
+                                    ))
+                                }
                                 Err(error) => Err(error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     format!(
@@ -26903,6 +26984,7 @@ mod observation_repair_tests {
             input_content_hash: "input".into(),
             revision_content_hash: "revision".into(),
             skill_revision: None,
+            judgment_policy: None,
             receipt_ids: Vec::new(),
             snapshot_envelope: None,
         };

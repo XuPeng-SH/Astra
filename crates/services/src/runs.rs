@@ -28771,6 +28771,7 @@ mod tests {
                     &request,
                     &crate::evaluation::test_support::execution_config("model", "openai", "case"),
                     None,
+                    crate::evaluation::EvaluationJudgmentPolicy::Disabled,
                 )
                 .unwrap();
                 let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
@@ -28793,6 +28794,7 @@ mod tests {
                     input_content_hash: experiment.spec.cases[0].input_content_hash.clone(),
                     revision_content_hash: experiment.spec.target.baseline.content_hash.clone(),
                     skill_revision: None,
+                    judgment_policy: None,
                     receipt_ids: vec![],
                     snapshot_envelope: None,
                 }
@@ -38171,6 +38173,7 @@ mod tests {
                 api_key: "provider-api-secret".to_string(),
                 base_url: "https://models.example.com/v1".to_string(),
                 provider: "openai".to_string(),
+                pricing: None,
                 cache_capability: None,
                 thinking_capability: None,
                 fixed_temperature: None,

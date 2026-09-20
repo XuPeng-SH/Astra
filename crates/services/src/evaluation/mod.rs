@@ -42,18 +42,20 @@ pub use execution::{
     DatabaseEvaluationObservationStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
     EvaluationAdmissionMarker, EvaluationExecutionError, EvaluationObservationRecord,
     EvaluationObservationRequest, EvaluationPolicyFingerprintInput, EvaluationRunAdmission,
-    EvaluationSkillRevision, content_fingerprint, evaluation_component_idempotency_key,
-    evaluation_policy_fingerprint, prompt_context_fingerprint, prompt_only_snapshot_envelope,
-    prompt_policy_fingerprint, terminal_run_observation,
+    EvaluationSkillRevision, apply_inference_evidence, apply_tool_outcome_evidence,
+    content_fingerprint, evaluation_component_idempotency_key, evaluation_policy_fingerprint,
+    prompt_context_fingerprint, prompt_only_snapshot_envelope, prompt_policy_fingerprint,
+    terminal_run_observation,
 };
 pub use execution_config::{
     EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION, EVALUATION_RUNTIME_CONTRACT_VERSION,
     EvaluationExecutionConfig, FrozenRoundBudget, InstructionOnlyRuntimeConfig,
 };
 pub use experiment::{
-    DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
-    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
-    SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
+    DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase,
+    EvaluationJudgmentPolicy, EvaluationTarget, EvaluationTargetKind, ExperimentSpec,
+    FrozenConditions, FrozenSkillRoutingPolicy, JUDGMENT_POLICY_SCHEMA_VERSION, MemoryIsolation,
+    RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
 };
 pub use materialization::{
     DatabaseMaterializationReceiptStore, MATERIALIZATION_RECEIPT_SCHEMA_VERSION,

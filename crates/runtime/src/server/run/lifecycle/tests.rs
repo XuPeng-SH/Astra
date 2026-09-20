@@ -151,6 +151,7 @@ fn evaluation_skill_invocation_evidence_requires_the_admitted_revision() {
         input_content_hash: revision.content_hash.clone(),
         revision_content_hash: revision.content_hash.clone(),
         skill_revision: Some(revision.clone()),
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     };
@@ -2683,6 +2684,7 @@ fn test_resolved_model_offering_for(
             thinking_capability: None,
             context_window: Some(128_000),
             max_completion_tokens: Some(16_384),
+            pricing: None,
             request_headers: None,
         },
     }
@@ -8904,6 +8906,7 @@ async fn evaluation_edge_start_intent_is_resolved_only_at_canonical_binding() {
         input_content_hash: "sha256:input".to_string(),
         revision_content_hash: "sha256:revision".to_string(),
         skill_revision: None,
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -10683,6 +10686,7 @@ async fn evaluation_memory_isolation_preserves_ordinary_request_dependencies() {
         input_content_hash: content_fingerprint("input"),
         revision_content_hash: content_fingerprint("revision"),
         skill_revision: None,
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -10822,6 +10826,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
                 content: None,
             },
             skill_name: None,
+            judgment_policy: astra_services::evaluation::EvaluationJudgmentPolicy::Disabled,
         },
         cases: vec![astra_services::evaluation::EvaluationCase {
             case_id: "case-runtime".to_string(),
@@ -10883,6 +10888,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         input_content_hash: trial.trial.input_content_hash.clone(),
         revision_content_hash: revision_hash,
         skill_revision: None,
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -11069,6 +11075,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         input_content_hash: cancel_trial.trial.input_content_hash.clone(),
         revision_content_hash: content_fingerprint("Candidate revision text"),
         skill_revision: None,
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -11191,6 +11198,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             input_content_hash: recovery_trial.trial.input_content_hash.clone(),
             revision_content_hash: recovery_spec.target.baseline.content_hash.clone(),
             skill_revision: None,
+            judgment_policy: None,
             receipt_ids: Vec::new(),
             snapshot_envelope: None,
         })
@@ -12010,6 +12018,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
                 content: None,
             },
             skill_name: Some(skill_name.clone()),
+            judgment_policy: astra_services::evaluation::EvaluationJudgmentPolicy::Disabled,
         },
         cases: vec![astra_services::evaluation::EvaluationCase {
             case_id: "case-skill-runtime".to_string(),
@@ -12071,6 +12080,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         input_content_hash: trial.trial.input_content_hash.clone(),
         revision_content_hash: baseline_skill.content_hash.clone(),
         skill_revision: Some(skill_revision.clone()),
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -12193,6 +12203,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         input_content_hash: candidate_trial.trial.input_content_hash.clone(),
         revision_content_hash: candidate_skill.content_hash.clone(),
         skill_revision: Some(candidate_skill_revision.clone()),
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -17715,6 +17726,7 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         input_content_hash: content_fingerprint(&evaluation.message),
         revision_content_hash: content_fingerprint("revision"),
         skill_revision: None,
+        judgment_policy: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -24555,7 +24567,7 @@ fn shared_assembly_consumes_frozen_execution_policy_without_resolving_defaults()
     frozen.runtime.max_consecutive_empty_name += 4;
     frozen.session_current_date = "1999-12-31".into();
     let inputs =
-        PreparedExecutionInputs::from_frozen(&frozen, &admitted, &encryptor, "frozen-case")
+        PreparedExecutionInputs::from_frozen(&frozen, &admitted, &encryptor, "frozen-case", None)
             .expect("rebind exact frozen inputs");
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();

@@ -77,5 +77,43 @@ cost, and missing provider, context, tool, safety, or reliability evidence stays
 visible. Use the report's evidence references when reviewing a comparison;
 neither a completed Run nor a confident final answer establishes overall success.
 
+The report's tool metrics come from the durable run-accounting event. Tool
+validity is successful requested calls divided by requested calls; a run with
+no requested call has no validity ratio. Policy violations count attempted calls
+rejected by the explicit policy/safety boundary. Cost comes from every physical
+inference attempt and remains unavailable when usage, terminal state, or the
+admitted route price is missing.
+
 See the [Evaluation contract](../design/evaluation.md) for persistence,
 isolation, and evidence ownership.
+
+## Compare the Skill routing judgment
+
+To measure the value of the auto-route decision point itself, use the same
+published Skill revision on both arms:
+
+```json
+{
+  "submission_idempotency_key": "compare-skill-routing-001",
+  "target": {
+    "kind": "skill_routing_judgment",
+    "skill_name": "review-changes",
+    "baseline": {"revision_id": "PINNED_VERSION_ID"},
+    "candidate": {"revision_id": "PINNED_VERSION_ID"}
+  },
+  "case": {
+    "case_id": "routing-case",
+    "message": "Review the current branch and report the findings.",
+    "verifier_config": {"expected": {"ok": true}}
+  },
+  "model_offering_id": "PRIMARY_OFFERING_ID",
+  "judgment_model_offering_id": "JEV_OFFERING_ID",
+  "max_concurrency": 1,
+  "max_wall_time_secs": 120
+}
+```
+
+Omit `judgment_model_offering_id` to use the configured judgment Offering,
+which is frozen during prepare. If no default judgment Offering is available,
+the candidate records an unavailable enhancement and keeps the basic Skill
+path; that candidate must not be interpreted as a successful Jev comparison.

@@ -47,6 +47,7 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
                 content: None,
             },
             skill_name: Some("sample-skill".to_string()),
+            judgment_policy: astra_services::evaluation::EvaluationJudgmentPolicy::Disabled,
         },
         cases: vec![EvaluationCase {
             case_id: "case-a".to_string(),
@@ -144,6 +145,7 @@ fn evaluation_run_record(
                 content_hash: revision.content_hash.clone(),
             }
         }),
+        judgment_policy: None,
         receipt_ids: vec![],
         snapshot_envelope: None,
     };
@@ -672,6 +674,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
                 revision_id: "skill-v1".into(),
                 content_hash: experiment.spec.target.baseline.content_hash.clone(),
             }),
+            judgment_policy: None,
             receipt_ids: vec![
                 context_receipt.receipt_id.clone(),
                 policy_receipt.receipt_id.clone(),
@@ -871,6 +874,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             revision_id: "skill-v2".into(),
             content_hash: experiment.spec.target.candidate.content_hash.clone(),
         }),
+        judgment_policy: None,
         receipt_ids: receipt_ids_b.clone(),
         snapshot_envelope: Some(envelope_b.clone()),
     };

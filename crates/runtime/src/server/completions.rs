@@ -511,6 +511,7 @@ mod tests {
                     } else {
                         4_096
                     }),
+                    pricing: None,
                     request_headers: (self.provider != "typesafe").then(|| {
                         serde_json::Map::from_iter([(
                             "x-offering-route".into(),

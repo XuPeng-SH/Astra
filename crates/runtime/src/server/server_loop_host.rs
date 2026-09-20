@@ -11753,6 +11753,9 @@ impl ServerAgenticLoopHost {
         &self,
         operation_id: &str,
     ) -> Result<ResolvedJudgmentRoute, JudgmentClientUnavailable> {
+        let PreparedExecutionPolicy::Normal(runtime) = &self.execution_inputs.policy else {
+            return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+        };
         let Some(pool) = &self.shared_pool else {
             tracing::debug!(
                 operation_id,
@@ -11793,12 +11796,7 @@ impl ServerAgenticLoopHost {
             None,
             Some(pool.get()),
             Some(&execution),
-            match &self.execution_inputs.policy {
-                PreparedExecutionPolicy::Normal(runtime) => runtime,
-                PreparedExecutionPolicy::Evaluation(_) => {
-                    return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
-                }
-            },
+            runtime,
         )
         .await
         .map_err(|error| {
@@ -11817,6 +11815,7 @@ impl ServerAgenticLoopHost {
         operation_id: &str,
         max_output_tokens: usize,
         route: &ResolvedJudgmentRoute,
+        purpose: astra_turn_types::InferencePurpose,
         selection_identity: bool,
     ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
     {
@@ -11840,8 +11839,9 @@ impl ServerAgenticLoopHost {
                 max_output_tokens,
                 state,
                 operation_id,
-                astra_turn_types::InferencePurpose::ToolResultRerank,
+                purpose,
                 Some(&route.execution),
+                None,
             )
             .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
         let client = if selection_identity {
@@ -11916,15 +11916,83 @@ impl ServerAgenticLoopHost {
         if let Some(client) = self.test_judgment_clients.pop_front() {
             return Ok(client);
         }
-        let PreparedExecutionPolicy::Normal(_) = &self.execution_inputs.policy else {
-            return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
-        };
+        if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
+            if operation_id != "skill_auto_route" {
+                return Err(JudgmentClientUnavailable::DurableMaterialUnavailable);
+            }
+            let Some(astra_services::evaluation::FrozenSkillRoutingPolicy::Available {
+                model,
+                auxiliary_policy,
+                ..
+            }) = frozen.judgment_policy.as_ref()
+            else {
+                tracing::debug!(
+                    operation_id,
+                    "frozen evaluation judgment policy is unavailable; no inference dispatched"
+                );
+                return Err(JudgmentClientUnavailable::NoOffering);
+            };
+            let Some(model_service) = self.model_service.as_ref() else {
+                return Err(JudgmentClientUnavailable::RouteUnavailable);
+            };
+            let execution = model_service
+                .admit_model_offering(self.user_id.clone(), model.offering_id.clone())
+                .await
+                .map_err(|(_, _)| JudgmentClientUnavailable::RouteUnavailable)?;
+            if astra_services::models::validate_model_execution_purpose(
+                &execution,
+                astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment,
+            )
+            .is_err()
+                || execution
+                    .freeze_projection(self.encryptor.as_ref())
+                    .ok()
+                    .as_ref()
+                    != Some(model.as_ref())
+            {
+                tracing::warn!(
+                    operation_id,
+                    offering_id = %model.offering_id,
+                    "frozen judgment Offering no longer matches the admitted route"
+                );
+                return Err(JudgmentClientUnavailable::RouteUnavailable);
+            }
+            if execution
+                .max_completion_tokens
+                .is_some_and(|cap| max_output_tokens > cap as usize)
+            {
+                tracing::warn!(
+                    operation_id,
+                    model_name = %execution.model_name,
+                    configured_max_completion_tokens = ?execution.max_completion_tokens,
+                    required_output_tokens = max_output_tokens,
+                    "frozen judgment route cannot emit a complete typed answer; no provider request dispatched"
+                );
+                return Err(JudgmentClientUnavailable::OutputBudget);
+            }
+            let route =
+                resolved_admitted_llm_config(&execution, frozen.config.context_budget.clone());
+            return self
+                .durable_summary_client_for_execution(
+                    &route,
+                    max_output_tokens,
+                    state,
+                    operation_id,
+                    astra_turn_types::InferencePurpose::Introspection,
+                    Some(&execution),
+                    Some(auxiliary_policy.clone()),
+                )
+                .map(|client| Box::new(client) as Box<_>)
+                .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
+        }
+
         let route = self.resolve_judgment_route(operation_id).await?;
         self.judgment_summary_client_for_route(
             state,
             operation_id,
             max_output_tokens,
             &route,
+            astra_turn_types::InferencePurpose::Introspection,
             selection_identity,
         )
     }
@@ -12006,6 +12074,7 @@ impl ServerAgenticLoopHost {
             operation_id,
             purpose,
             self.admitted_model_execution.as_ref(),
+            None,
         )
     }
 
@@ -12017,6 +12086,7 @@ impl ServerAgenticLoopHost {
         operation_id: &str,
         purpose: astra_turn_types::InferencePurpose,
         execution: Option<&astra_services::AdmittedModelExecution>,
+        policy_override: Option<astra_turn_types::auxiliary_execution::AuxiliaryGenerationPolicy>,
     ) -> Option<RuntimeSummaryClient> {
         let authority = match self.inference_run_authority(state) {
             Ok(authority) => authority,
@@ -12079,8 +12149,10 @@ impl ServerAgenticLoopHost {
             }
         };
         let route = config.execution_route();
-        let policy =
-            self.resolved_auxiliary_policy(operation_id, max_output_tokens, purpose, &route);
+        let policy = policy_override.map_or_else(
+            || self.resolved_auxiliary_policy(operation_id, max_output_tokens, purpose, &route),
+            Ok,
+        );
         Some(RuntimeSummaryClient::new_with_resolved_policy(
             transport,
             route,
@@ -19612,7 +19684,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         let service_ctx = skill_auto_route_service_context(ctx);
 
-        let judged = if let Some(judge) = self.skill_auto_route_judge.as_ref() {
+        let injected_judge = match &self.execution_inputs.policy {
+            PreparedExecutionPolicy::Normal(_) => self.skill_auto_route_judge.as_ref(),
+            // Evaluation judgment must use the exact frozen Offering. Test or
+            // runtime injection cannot replace the experiment's decision
+            // function without changing its identity.
+            PreparedExecutionPolicy::Evaluation(_) => None,
+        };
+        let judged = if let Some(judge) = injected_judge {
             judge.judge(&service_ctx).await
         } else {
             if self.execution_inputs.pre_turn_compaction_gate != AuxiliaryCallGate::Allowed {
@@ -20814,6 +20893,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             &operation_id,
                             output_budget,
                             route,
+                            astra_turn_types::InferencePurpose::ToolResultRerank,
                             true,
                         )
                     } else {
@@ -24989,8 +25069,16 @@ mod tests {
             }));
         }
         let mut llm_cfg = summary_test_config(String::new());
-        llm_cfg.context_window = Some(4_000);
-        llm_cfg.max_completion_tokens = Some(256);
+        let context_window = Some(2_000);
+        let max_completion_tokens = Some(256);
+        llm_cfg.context_window = context_window;
+        llm_cfg.max_completion_tokens = max_completion_tokens;
+        llm_cfg.context_budget = crate::turn::execution_config::resolve_context_budget(
+            &astra_config::runtime_config::RuntimeConfig::default(),
+            context_window,
+            max_completion_tokens,
+            crate::prompts::CompactConfig::default(),
+        );
 
         let (wire, _output_tokens, boundary) = host
             .assemble_llm_messages_with_final_budget(
@@ -46637,6 +46725,7 @@ mod tests {
                 thinking_capability: None,
                 context_window: Some(64_000),
                 max_completion_tokens: Some(8_192),
+                pricing: None,
                 request_headers: Some(serde_json::Map::from_iter([(
                     "x-provider-mode".to_string(),
                     Value::String("coding".to_string()),
@@ -46675,9 +46764,14 @@ mod tests {
             .unwrap();
         policy.max_output_tokens = 733;
         let expected_policy = policy.clone();
-        let inputs =
-            PreparedExecutionInputs::from_frozen(&frozen, &admitted, encryptor.as_ref(), "case")
-                .unwrap();
+        let inputs = PreparedExecutionInputs::from_frozen(
+            &frozen,
+            &admitted,
+            encryptor.as_ref(),
+            "case",
+            None,
+        )
+        .unwrap();
         let PreparedExecutionPolicy::Evaluation(material) = &inputs.policy else {
             unreachable!()
         };
