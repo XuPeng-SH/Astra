@@ -257,32 +257,22 @@ pub struct BashInvocationOwner {
 }
 
 impl BashInvocationOwner {
+    #[cfg(target_os = "linux")]
     pub(crate) fn prepare_supervised(
         target_program: &str,
         target_args: &[String],
     ) -> std::io::Result<(std::process::Command, Self)> {
-        #[cfg(target_os = "linux")]
-        {
-            let (command, supervisor) = InvocationSupervisor::prepare(target_program, target_args)?;
-            Ok((
-                command,
-                Self {
-                    process_scope: CgroupGuard {
-                        cg_path: None,
-                        procs_path: None,
-                    },
-                    supervisor: Some(supervisor),
+        let (command, supervisor) = InvocationSupervisor::prepare(target_program, target_args)?;
+        Ok((
+            command,
+            Self {
+                process_scope: CgroupGuard {
+                    cg_path: None,
+                    procs_path: None,
                 },
-            ))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (target_program, target_args);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "invocation supervisor requires Linux",
-            ))
-        }
+                supervisor: Some(supervisor),
+            },
+        ))
     }
 
     /// Prepare the actual child command and its ownership boundary. Call

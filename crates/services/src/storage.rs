@@ -9254,10 +9254,29 @@ mod tests {
                     nullable: false,
                 },
             ),
+            (
+                "terminal_attempt_id".to_string(),
+                ObservedColumnShape {
+                    data_type: "varchar".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: true,
+                },
+            ),
         ]
         .into_iter()
         .collect();
         assert!(inference_invocation_schema_mismatches(&exact).is_empty());
+
+        let mut missing_terminal_attempt = exact.clone();
+        missing_terminal_attempt.remove("terminal_attempt_id");
+        assert!(!inference_invocation_schema_mismatches(&missing_terminal_attempt).is_empty());
+
+        let mut required_terminal_attempt = exact.clone();
+        required_terminal_attempt
+            .get_mut("terminal_attempt_id")
+            .unwrap()
+            .nullable = false;
+        assert!(!inference_invocation_schema_mismatches(&required_terminal_attempt).is_empty());
 
         let mut nullable = exact.clone();
         nullable.get_mut("admission_token").unwrap().nullable = true;
