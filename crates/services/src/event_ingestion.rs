@@ -38,8 +38,8 @@ use tokio::sync::{Semaphore, mpsc};
 
 pub mod measurement;
 use measurement::{
-    DeliveryObservation, IngestionDeliveryTerminal, IngestionDeliveryToken,
-    IngestionMeasurementPhase, IngestionRejectionReason, IngestionUnknownReason,
+    DeliveryGuard, IngestionDeliveryTerminal, IngestionDeliveryToken, IngestionMeasurementPhase,
+    IngestionRejectionReason, IngestionUnknownReason,
 };
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
@@ -250,7 +250,7 @@ fn stable_json_digest<T: Serialize>(value: &T) -> Result<String, String> {
 pub struct IngestionQueueReservation {
     history_work: Option<Arc<astra_core::history_work::QueueBytesReservation>>,
     admission: Option<IngestionAdmissionLease>,
-    observation: Option<DeliveryObservation>,
+    observation: Option<Arc<DeliveryGuard>>,
 }
 
 impl std::fmt::Debug for IngestionQueueReservation {
@@ -316,15 +316,16 @@ fn ingestion_queue_reservation(
     }
 }
 
-fn delivery_observation(event: &IngestionEvent) -> Option<&DeliveryObservation> {
+fn delivery_observation(event: &IngestionEvent) -> Option<&DeliveryGuard> {
     event
         .history_work_queue_reservation
         .as_ref()?
         .observation
         .as_ref()
+        .map(Arc::as_ref)
 }
 
-fn reject_observation(observation: Option<&DeliveryObservation>, reason: IngestionRejectionReason) {
+fn reject_observation(observation: Option<&DeliveryGuard>, reason: IngestionRejectionReason) {
     if let Some(observation) = observation {
         observation.finish(IngestionDeliveryTerminal::Rejected(reason));
     }
@@ -901,7 +902,7 @@ impl IngestionSender {
         self.enqueue_inner(event, Some(token.into_observation()));
     }
 
-    fn enqueue_inner(&self, mut event: IngestionEvent, observation: Option<DeliveryObservation>) {
+    fn enqueue_inner(&self, mut event: IngestionEvent, observation: Option<Arc<DeliveryGuard>>) {
         if let Some(observation) = &observation {
             observation.mark(IngestionMeasurementPhase::Submitted);
         }
@@ -911,7 +912,7 @@ impl IngestionSender {
             let available_slots = self.tx.capacity();
             if reserve_slots > 0 && available_slots <= reserve_slots {
                 reject_observation(
-                    observation.as_ref(),
+                    observation.as_deref(),
                     IngestionRejectionReason::TelemetryHeadroom,
                 );
                 let dropped = self.record_drop_before_acceptance(priority);
@@ -930,7 +931,7 @@ impl IngestionSender {
             Ok(bytes) => bytes,
             Err(error) => {
                 reject_observation(
-                    observation.as_ref(),
+                    observation.as_deref(),
                     IngestionRejectionReason::Serialization,
                 );
                 let dropped = self.record_drop_before_acceptance(priority);
@@ -948,7 +949,7 @@ impl IngestionSender {
             Ok(lease) => lease,
             Err(rejection) => {
                 reject_observation(
-                    observation.as_ref(),
+                    observation.as_deref(),
                     IngestionRejectionReason::ResidentLimit,
                 );
                 let dropped = self.record_drop_before_acceptance(priority);
@@ -968,7 +969,7 @@ impl IngestionSender {
         let mut reservation = ingestion_queue_reservation(bytes, lease);
         if let Some(observation) = &observation {
             observation.mark(IngestionMeasurementPhase::ResidentAdmitted);
-            reservation.observation = Some(observation.clone());
+            reservation.observation = Some(Arc::clone(observation));
         }
         event.history_work_queue_reservation = Some(reservation);
         event.ingestion_enqueued_at = Some(std::time::Instant::now());
@@ -1013,7 +1014,7 @@ impl IngestionSender {
                             );
                             self.record_drop_before_acceptance(priority);
                             reject_observation(
-                                observation.as_ref(),
+                                observation.as_deref(),
                                 IngestionRejectionReason::DeferredLimit,
                             );
                             return;
@@ -1034,7 +1035,7 @@ impl IngestionSender {
                                     permit.send(event);
                                 }
                                 Err(_) => {
-                                reject_observation(observation.as_ref(), IngestionRejectionReason::ChannelClosed);
+                                reject_observation(observation.as_deref(), IngestionRejectionReason::ChannelClosed);
                                 let n = overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 dropped_before_acceptance_count
                                     .fetch_add(1, Ordering::Relaxed);
@@ -1054,7 +1055,7 @@ impl IngestionSender {
                     }
                     Err(_) => {
                         reject_observation(
-                            observation.as_ref(),
+                            observation.as_deref(),
                             IngestionRejectionReason::NoRuntime,
                         );
                         tracing::warn!(
@@ -1069,7 +1070,7 @@ impl IngestionSender {
             }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 reject_observation(
-                    observation.as_ref(),
+                    observation.as_deref(),
                     IngestionRejectionReason::ChannelClosed,
                 );
                 let priority = event.priority();
@@ -1571,7 +1572,6 @@ struct IngestionSessionQueue {
     pending: VecDeque<IngestionEvent>,
     retry_head: Option<Vec<IngestionEvent>>,
     retry_attempts: u32,
-    ready: bool,
     in_flight: bool,
     flush_deadline: Option<tokio::time::Instant>,
     retry_deadline: Option<tokio::time::Instant>,
@@ -1580,7 +1580,6 @@ struct IngestionSessionQueue {
 #[derive(Default)]
 struct FairSessionReadyQueue {
     owners: VecDeque<String>,
-    owner_present: HashSet<String>,
     sessions: HashMap<String, VecDeque<IngestionSessionKey>>,
     session_present: HashSet<IngestionSessionKey>,
 }
@@ -1591,24 +1590,24 @@ impl FairSessionReadyQueue {
             return;
         }
         let owner = key.user_id.clone();
+        let new_owner = !self.sessions.contains_key(&owner);
         self.sessions
             .entry(owner.clone())
             .or_default()
             .push_back(key);
-        if self.owner_present.insert(owner.clone()) {
+        if new_owner {
             self.owners.push_back(owner);
         }
     }
 
     fn pop(&mut self) -> Option<IngestionSessionKey> {
         let owner = self.owners.pop_front()?;
-        self.owner_present.remove(&owner);
         let queue = self.sessions.get_mut(&owner)?;
         let key = queue.pop_front()?;
         self.session_present.remove(&key);
         if queue.is_empty() {
             self.sessions.remove(&owner);
-        } else if self.owner_present.insert(owner.clone()) {
+        } else {
             self.owners.push_back(owner);
         }
         Some(key)
@@ -1616,6 +1615,10 @@ impl FairSessionReadyQueue {
 
     fn is_empty(&self) -> bool {
         self.session_present.is_empty()
+    }
+
+    fn contains(&self, key: &IngestionSessionKey) -> bool {
+        self.session_present.contains(key)
     }
 }
 
@@ -2363,7 +2366,6 @@ impl EventIngestionWorker {
             && queue.retry_deadline.is_none()
             && (draining || queue.pending.len() >= self.config.batch_size)
         {
-            queue.ready = true;
             ready.push(key);
         }
     }
@@ -2377,7 +2379,7 @@ impl EventIngestionWorker {
     ) {
         let mut promoted = Vec::new();
         for (key, queue) in sessions.iter_mut() {
-            if queue.in_flight || queue.ready {
+            if queue.in_flight || ready.contains(key) {
                 continue;
             }
             if draining || queue.retry_deadline.is_some_and(|deadline| deadline <= now) {
@@ -2388,7 +2390,6 @@ impl EventIngestionWorker {
             let flush_due = queue.flush_deadline.is_some_and(|deadline| deadline <= now);
             let has_work = queue.retry_head.is_some() || !queue.pending.is_empty();
             if has_work && !retry_waiting && (draining || queue.retry_head.is_some() || flush_due) {
-                queue.ready = true;
                 promoted.push(key.clone());
             }
         }
@@ -2409,7 +2410,6 @@ impl EventIngestionWorker {
             let Some(queue) = sessions.get_mut(&key) else {
                 continue;
             };
-            queue.ready = false;
             if queue.in_flight || queue.retry_deadline.is_some() {
                 continue;
             }
@@ -2466,7 +2466,6 @@ impl EventIngestionWorker {
         &self,
         sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
         ready: &mut FairSessionReadyQueue,
-        enqueued_at: &mut HashMap<(String, String), VecDeque<tokio::time::Instant>>,
         completion: IngestionAttemptCompletion,
         now: tokio::time::Instant,
         draining: bool,
@@ -2486,7 +2485,7 @@ impl EventIngestionWorker {
                     }
                 }
                 terminal_events = completion.events.len();
-                self.record_terminal_latencies(&completion.events, enqueued_at, now);
+                self.record_terminal_latencies(&completion.events, now);
                 queue.retry_attempts = 0;
                 self.record_flush_outcome(
                     outcome.events_resolved,
@@ -2502,7 +2501,7 @@ impl EventIngestionWorker {
                         ));
                     }
                     terminal_events = completion.events.len();
-                    self.record_terminal_latencies(&completion.events, enqueued_at, now);
+                    self.record_terminal_latencies(&completion.events, now);
                     if let Ok(mut stats) = self.stats.lock() {
                         stats.events_abandoned_shutdown = stats
                             .events_abandoned_shutdown
@@ -2546,7 +2545,6 @@ impl EventIngestionWorker {
                 || queue.pending.len() >= self.config.batch_size
                 || queue.flush_deadline.is_some_and(|deadline| deadline <= now))
         {
-            queue.ready = true;
             ready.push(completion.key.clone());
         }
         if !queue.in_flight && queue.retry_head.is_none() && queue.pending.is_empty() {
@@ -2555,22 +2553,12 @@ impl EventIngestionWorker {
         terminal_events
     }
 
-    fn record_terminal_latencies(
-        &self,
-        events: &[IngestionEvent],
-        enqueued_at: &mut HashMap<(String, String), VecDeque<tokio::time::Instant>>,
-        now: tokio::time::Instant,
-    ) {
+    fn record_terminal_latencies(&self, events: &[IngestionEvent], now: tokio::time::Instant) {
         let mut latencies = Vec::with_capacity(events.len());
         for event in events {
-            let identity = (event.user_id.clone(), event.event_id.clone());
-            let accepted = enqueued_at.get_mut(&identity).and_then(VecDeque::pop_front);
-            if enqueued_at.get(&identity).is_some_and(VecDeque::is_empty) {
-                enqueued_at.remove(&identity);
-            }
-            if let Some(accepted) = accepted {
+            if let Some(enqueued_at) = event.ingestion_enqueued_at {
                 let micros = now
-                    .duration_since(accepted)
+                    .saturating_duration_since(tokio::time::Instant::from_std(enqueued_at))
                     .as_micros()
                     .min(u64::MAX as u128) as u64;
                 latencies.push(micros);
@@ -2595,11 +2583,12 @@ impl EventIngestionWorker {
 
     fn next_scheduler_deadline(
         sessions: &BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
+        ready: &FairSessionReadyQueue,
     ) -> Option<tokio::time::Instant> {
         sessions
-            .values()
-            .filter(|queue| !queue.in_flight && !queue.ready)
-            .filter_map(|queue| {
+            .iter()
+            .filter(|(key, queue)| !queue.in_flight && !ready.contains(key))
+            .filter_map(|(_, queue)| {
                 if queue.retry_head.is_some() {
                     queue.retry_deadline
                 } else {
@@ -2613,7 +2602,6 @@ impl EventIngestionWorker {
         let mut sessions = BTreeMap::new();
         let mut ready = FairSessionReadyQueue::default();
         let mut in_flight = FuturesUnordered::<IngestionAttemptFuture>::new();
-        let mut enqueued_at = HashMap::new();
         let mut draining = false;
         let mut channel_drained = false;
 
@@ -2642,7 +2630,7 @@ impl EventIngestionWorker {
                 break;
             }
 
-            let wake = Self::next_scheduler_deadline(&sessions)
+            let wake = Self::next_scheduler_deadline(&sessions, &ready)
                 .unwrap_or_else(|| now + tokio::time::Duration::from_secs(3600));
             let deadline = tokio::time::sleep_until(wake);
             tokio::pin!(deadline);
@@ -2657,7 +2645,6 @@ impl EventIngestionWorker {
                     self.complete_scheduled_attempt(
                         &mut sessions,
                         &mut ready,
-                        &mut enqueued_at,
                         completion,
                         tokio::time::Instant::now(),
                         draining,
@@ -2667,21 +2654,17 @@ impl EventIngestionWorker {
                 _ = self.scheduler_notify.notified() => {}
                 event = self.rx.recv(), if !channel_drained => {
                     match event {
-                        Some(event) => {
+                        Some(mut event) => {
+                            // Sender paths normally stamp this before channel admission. Keep
+                            // the scheduler's historical fallback for direct test/internal
+                            // producers while retaining one timestamp on the event for retries.
+                            event
+                                .ingestion_enqueued_at
+                                .get_or_insert_with(std::time::Instant::now);
                             self.enqueue_scheduled_event(
                                 &mut sessions,
                                 &mut ready,
-                                {
-                                let event_enqueued_at = event
-                                    .ingestion_enqueued_at
-                                    .map(tokio::time::Instant::from_std)
-                                    .unwrap_or_else(tokio::time::Instant::now);
-                                enqueued_at
-                                    .entry((event.user_id.clone(), event.event_id.clone()))
-                                    .or_insert_with(VecDeque::new)
-                                    .push_back(event_enqueued_at);
-                                    event
-                                },
+                                event,
                                 tokio::time::Instant::now(),
                                 draining,
                             )
@@ -3643,8 +3626,9 @@ mod tests {
                 ..Default::default()
             },
         )]);
+        let ready = FairSessionReadyQueue::default();
         assert_eq!(
-            EventIngestionWorker::next_scheduler_deadline(&sessions),
+            EventIngestionWorker::next_scheduler_deadline(&sessions, &ready),
             Some(retry_deadline),
             "an expired tail deadline must not spin the scheduler or starve intake during retry backoff"
         );
@@ -5522,11 +5506,9 @@ mod tests {
             },
         )]);
         let mut ready = FairSessionReadyQueue::default();
-        let mut enqueued_at = HashMap::new();
         worker.complete_scheduled_attempt(
             &mut sessions,
             &mut ready,
-            &mut enqueued_at,
             IngestionAttemptCompletion {
                 key: key.clone(),
                 events,
@@ -5553,6 +5535,34 @@ mod tests {
             s.errors, 1,
             "max_retries=1 exhausts the first retry burst and records one scheduler error"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_latency_uses_the_timestamp_carried_by_a_retry_clone() {
+        let (_tx, rx) = mpsc::channel(1);
+        let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
+        let worker = EventIngestionWorker {
+            rx,
+            pool: dummy_pool(),
+            config: IngestionConfig::default().normalized(),
+            stats: Arc::clone(&stats),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            scheduler_notify: Arc::new(tokio::sync::Notify::new()),
+            db_limiter: IngestionDbLimiter::new(1),
+        };
+        let mut event = test_event("latency", "session", "turn");
+        event.ingestion_enqueued_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("test timestamp should be representable"),
+        );
+        let retry = event.clone();
+
+        worker.record_terminal_latencies(&[retry], tokio::time::Instant::now());
+
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.enqueue_to_terminal_latency_samples, 1);
+        assert!(stats.enqueue_to_terminal_percentile_ms(0.95).is_some());
     }
 
     #[tokio::test]

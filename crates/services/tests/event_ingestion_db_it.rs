@@ -429,6 +429,30 @@ async fn assert_session_event_count(
     );
 }
 
+async fn event_count(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, event_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+        .bind(user_id)
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .expect("query owner-scoped event count")
+}
+
+async fn wait_for_event(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    event_id: &str,
+    failure: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while event_count(pool, user_id, event_id).await != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(failure);
+}
+
 async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str) {
     let _ = sqlx::query(
         "DELETE FROM observation_identity_collisions \
@@ -443,22 +467,11 @@ async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_
         .bind(session_id)
         .execute(pool)
         .await;
-    let event_rows =
-        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_all(pool)
-            .await;
-    if let Ok(event_rows) = event_rows {
-        for row in event_rows {
-            let event_id: String = row.get("event_id");
-            let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
-                .bind(&event_id)
-                .bind(user_id)
-                .execute(pool)
-                .await;
-        }
-    }
+    let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
         .bind(user_id)
@@ -579,32 +592,15 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
         ))
         .await;
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let visible: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&healthy_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check healthy event visibility");
-            if visible == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("healthy session must commit while the unrelated fence remains held");
+    wait_for_event(
+        &pool,
+        &user_id,
+        &healthy_event,
+        "healthy session must commit while the unrelated fence remains held",
+    )
+    .await;
 
-    let blocked_visible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&blocked_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check blocked event visibility");
+    let blocked_visible: i64 = event_count(&pool, &user_id, &blocked_event).await;
     assert_eq!(blocked_visible, 0);
 
     fence_holder
@@ -618,13 +614,7 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
         .expect("worker shutdown after fence release")
         .expect("worker task");
 
-    let blocked_visible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&blocked_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check blocked event after release");
+    let blocked_visible: i64 = event_count(&pool, &user_id, &blocked_event).await;
     assert_eq!(blocked_visible, 1);
     {
         let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
@@ -688,32 +678,15 @@ async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked()
             "late_healthy",
         ))
         .await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let visible: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&late_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check late event visibility");
-            if visible == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("late session must commit without waiting for the blocked transaction");
+    wait_for_event(
+        &pool,
+        &user_id,
+        &late_event,
+        "late session must commit without waiting for the blocked transaction",
+    )
+    .await;
 
-    let blocked_visible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&blocked_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check blocked event visibility");
+    let blocked_visible: i64 = event_count(&pool, &user_id, &blocked_event).await;
     assert_eq!(blocked_visible, 0);
 
     fence_holder
@@ -782,45 +755,22 @@ async fn session_flush_concurrency_is_bounded_to_two_transactions() {
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let healthy_visible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&event_c)
-            .fetch_one(&pool)
-            .await
-            .expect("check third group before a slot is released");
+    let healthy_visible: i64 = event_count(&pool, &user_id, &event_c).await;
     assert_eq!(
         healthy_visible, 0,
         "a third session transaction must wait for one of the two bounded slots"
     );
 
     fence_a.rollback().await.expect("release session A fence");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let visible: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&event_c)
-            .fetch_one(&pool)
-            .await
-            .expect("check third group after a slot is released");
-            if visible == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the third group must progress while session B remains blocked");
+    wait_for_event(
+        &pool,
+        &user_id,
+        &event_c,
+        "the third group must progress while session B remains blocked",
+    )
+    .await;
 
-    let blocked_b_visible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&event_b)
-            .fetch_one(&pool)
-            .await
-            .expect("check session B remains blocked");
+    let blocked_b_visible: i64 = event_count(&pool, &user_id, &event_b).await;
     assert_eq!(blocked_b_visible, 0);
 
     fence_b.rollback().await.expect("release session B fence");
@@ -903,24 +853,13 @@ async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaki
             "timeout_healthy",
         ))
         .await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let visible: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&healthy_event)
-            .fetch_one(&pool)
-            .await
-            .expect("check healthy event after blocked-attempt deadlines");
-            if visible == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("healthy session must progress after both blocked attempts time out");
+    wait_for_event(
+        &pool,
+        &user_id,
+        &healthy_event,
+        "healthy session must progress after both blocked attempts time out",
+    )
+    .await;
     {
         let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats);
         assert_eq!(snapshot.db_attempts_current, 0, "{snapshot:?}");
@@ -1645,20 +1584,8 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
     .fetch_one(&pool)
     .await
     .expect("count rejected config projection");
-    let rejected_event_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&version_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count rejected config event");
-    let healthy_event_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&healthy_event)
-            .fetch_one(&pool)
-            .await
-            .expect("count healthy peer event");
+    let rejected_event_rows: i64 = event_count(&pool, &user_id, &version_id).await;
+    let healthy_event_rows: i64 = event_count(&pool, &user_id, &healthy_event).await;
     assert_eq!(config_rows, 0);
     assert_eq!(rejected_event_rows, 0);
     assert_eq!(healthy_event_rows, 1);
@@ -1713,14 +1640,7 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let healthy_rows: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&healthy_event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("check healthy peer visibility");
+            let healthy_rows: i64 = event_count(&pool, &user_id, &healthy_event_id).await;
             let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats).clone();
             if healthy_rows == 1 && snapshot.errors == 1 {
                 assert_eq!(snapshot.events_flushed, 1, "{snapshot:?}");
@@ -1733,13 +1653,7 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
     .await
     .expect("healthy group must commit while only the malformed group is retained");
 
-    let failing_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
-            .bind(&user_id)
-            .bind(&failing_event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count malformed event rows");
+    let failing_rows: i64 = event_count(&pool, &user_id, &failing_event_id).await;
     assert_eq!(failing_rows, 0);
     assert_session_event_count(&pool, &user_id, &failing_session, 0).await;
     assert_session_event_count(&pool, &user_id, &healthy_session, 1).await;

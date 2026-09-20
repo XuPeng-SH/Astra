@@ -24040,8 +24040,6 @@ async fn db_explain_publication_is_discoverable_and_readable() {
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
-    const SAMPLES: usize = 12;
-
     let pool = setup_lifecycle_run_db_it().await;
     let user = "explain-discovery-perf-it";
     let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
@@ -24157,83 +24155,11 @@ async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
     );
     assert_eq!(fetches.discovery, 1);
     assert_eq!(fetches.recovery, 0);
-    assert!(
-        serde_json::to_string(&edge_profile)
-            .expect("serialize Explain discovery profile")
-            .contains(&handle)
-    );
-
-    let baseline_started = std::time::Instant::now();
-    let (_, baseline_fetches) =
-        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(async {
-            for _ in 0..SAMPLES {
-                assert!(
-                    !crate::server::explain_analyze_artifact::snapshot_missing(
-                        Some(&pool),
-                        user,
-                        &session,
-                        &run,
-                    )
-                    .await
-                    .expect("baseline existence read")
-                );
-                let notice = crate::server::explain_analyze_artifact::context_notice_for_run(
-                    Some(&pool),
-                    user,
-                    &session,
-                    &run,
-                    generation,
-                )
-                .await
-                .expect("baseline notice read")
-                .expect("baseline notice");
-                assert_eq!(notice, expected_notice);
-            }
-        })
-        .await;
-    let baseline = baseline_started.elapsed();
-    assert_eq!(baseline_fetches.total, SAMPLES * 2);
-    assert_eq!(baseline_fetches.discovery, SAMPLES * 2);
-    assert_eq!(baseline_fetches.recovery, 0);
-
-    let optimized_started = std::time::Instant::now();
-    let (_, optimized_fetches) =
-        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(async {
-            for _ in 0..SAMPLES {
-                let discovery =
-                    crate::server::explain_analyze_artifact::discover_context_notice_for_run(
-                        Some(&pool),
-                        user,
-                        &session,
-                        &run,
-                        generation,
-                    )
-                    .await
-                    .expect("optimized discovery");
-                match discovery {
-                    crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(
-                        notice,
-                    ) => assert_eq!(notice, expected_notice),
-                    crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing => {
-                        panic!("valid benchmark snapshot disappeared")
-                    }
-                }
-            }
-        })
-        .await;
-    let optimized = optimized_started.elapsed();
-    assert_eq!(optimized_fetches.total, SAMPLES);
-    assert_eq!(optimized_fetches.discovery, SAMPLES);
-    assert_eq!(optimized_fetches.recovery, 0);
-    println!(
-        "PERF_RESULT benchmark=explain_existing_snapshot_discovery payload_bytes={} samples={SAMPLES} baseline_two_reads_us={} optimized_one_read_us={}",
-        integrity_bytes.len(),
-        baseline.as_micros(),
-        optimized.as_micros(),
-    );
-    assert!(
-        optimized < baseline.saturating_mul(2),
-        "one-read discovery regressed by more than 2x: baseline={baseline:?}, optimized={optimized:?}"
+    assert_eq!(
+        edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS),
+        Some(&json!([expected_notice])),
+        "one-read discovery must preserve the exact model-facing notice"
     );
 
     sqlx::query(
@@ -24342,16 +24268,18 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
             .unwrap()
             .is_none()
     );
-    assert!(
-        crate::server::explain_analyze_artifact::snapshot_missing(
+    assert!(matches!(
+        crate::server::explain_analyze_artifact::discover_context_notice_for_run(
             Some(&pool),
             user_id,
             &session_id,
             &run_id,
+            paused.run_generation,
         )
         .await
-        .unwrap()
-    );
+        .unwrap(),
+        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing
+    ));
 
     let previous_failure = astra_turn_types::ArtifactPublicationV1 {
         schema_version: 1,
@@ -24396,14 +24324,16 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
     assert_eq!(durable.status, STATUS_COMPLETED);
     assert!(durable.waiting_for.is_none());
     assert!(
-        !crate::server::explain_analyze_artifact::snapshot_missing(
+        matches!(crate::server::explain_analyze_artifact::discover_context_notice_for_run(
             Some(&pool),
             user_id,
             &session_id,
             &run_id,
+            durable.run_generation,
         )
         .await
-        .unwrap(),
+        .unwrap(), crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice)
+            if notice.contains("status=complete")),
         "resume must publish without executing or waiting for discovery"
     );
     let handle =

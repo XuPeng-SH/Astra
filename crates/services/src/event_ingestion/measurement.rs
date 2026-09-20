@@ -57,9 +57,8 @@ pub enum IngestionMeasurementPhase {
 }
 
 /// Timing and retry progress captured for one ingestion delivery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestionDeliveryProgress {
-    pub started_at: Instant,
     pub submitted_at: Option<Instant>,
     pub resident_admitted_at: Option<Instant>,
     pub deferred_at: Option<Instant>,
@@ -73,25 +72,6 @@ pub struct IngestionDeliveryProgress {
     pub commit_was_uncertain: bool,
 }
 
-impl IngestionDeliveryProgress {
-    fn started_now() -> Self {
-        Self {
-            started_at: Instant::now(),
-            submitted_at: None,
-            resident_admitted_at: None,
-            deferred_at: None,
-            channel_accepted_at: None,
-            worker_received_at: None,
-            first_dispatched_at: None,
-            attempt_count: 0,
-            limiter_wait: Duration::ZERO,
-            pool_wait: Duration::ZERO,
-            transaction_time: Duration::ZERO,
-            commit_was_uncertain: false,
-        }
-    }
-}
-
 /// The terminal report for one observed ingestion delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestionDeliveryReport {
@@ -102,20 +82,9 @@ pub struct IngestionDeliveryReport {
 }
 
 /// A non-blocking producer for opt-in ingestion delivery measurements.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IngestionMeasurementSink {
     tx: mpsc::Sender<IngestionDeliveryReport>,
-}
-
-impl fmt::Debug for IngestionMeasurementSink {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IngestionMeasurementSink")
-            .field("capacity", &self.tx.capacity())
-            .field("max_capacity", &self.tx.max_capacity())
-            .field("closed", &self.tx.is_closed())
-            .finish()
-    }
 }
 
 impl IngestionMeasurementSink {
@@ -124,7 +93,7 @@ impl IngestionMeasurementSink {
     /// As with [`mpsc::channel`], `capacity` must be greater than zero.
     pub fn bounded(capacity: usize) -> (Self, IngestionMeasurementReceiver) {
         let (tx, rx) = mpsc::channel(capacity);
-        (Self { tx }, IngestionMeasurementReceiver { rx })
+        (Self { tx }, rx)
     }
 
     /// Start observing one delivery without waiting for report capacity.
@@ -150,47 +119,14 @@ impl IngestionMeasurementSink {
         });
 
         Ok((
-            IngestionDeliveryToken {
-                observation: DeliveryObservation { guard },
-            },
+            IngestionDeliveryToken { observation: guard },
             IngestionDeliveryProbe { state },
         ))
     }
 }
 
 /// Receives terminal reports from an [`IngestionMeasurementSink`].
-pub struct IngestionMeasurementReceiver {
-    rx: mpsc::Receiver<IngestionDeliveryReport>,
-}
-
-impl fmt::Debug for IngestionMeasurementReceiver {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IngestionMeasurementReceiver")
-            .field("len", &self.rx.len())
-            .field("capacity", &self.rx.capacity())
-            .field("max_capacity", &self.rx.max_capacity())
-            .field("closed", &self.rx.is_closed())
-            .finish()
-    }
-}
-
-impl IngestionMeasurementReceiver {
-    /// Wait for the next terminal delivery report.
-    pub async fn recv(&mut self) -> Option<IngestionDeliveryReport> {
-        self.rx.recv().await
-    }
-
-    /// Receive a terminal report without waiting.
-    pub fn try_recv(&mut self) -> Result<IngestionDeliveryReport, mpsc::error::TryRecvError> {
-        self.rx.try_recv()
-    }
-
-    /// Prevent new observations while allowing already-reserved reports to drain.
-    pub fn close(&mut self) {
-        self.rx.close();
-    }
-}
+pub type IngestionMeasurementReceiver = mpsc::Receiver<IngestionDeliveryReport>;
 
 /// Failure to reserve bounded measurement capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +137,7 @@ pub enum MeasurementUnavailable {
 
 /// Non-clone handoff proving that one delivery owns a measurement reservation.
 pub struct IngestionDeliveryToken {
-    observation: DeliveryObservation,
+    observation: Arc<DeliveryGuard>,
 }
 
 impl fmt::Debug for IngestionDeliveryToken {
@@ -213,7 +149,7 @@ impl fmt::Debug for IngestionDeliveryToken {
 }
 
 impl IngestionDeliveryToken {
-    pub(super) fn into_observation(self) -> DeliveryObservation {
+    pub(super) fn into_observation(self) -> Arc<DeliveryGuard> {
         self.observation
     }
 }
@@ -238,65 +174,48 @@ impl IngestionDeliveryProbe {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct DeliveryObservation {
-    guard: Arc<DeliveryGuard>,
-}
-
-impl fmt::Debug for DeliveryObservation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DeliveryObservation")
-            .finish_non_exhaustive()
-    }
-}
-
-impl DeliveryObservation {
+impl DeliveryGuard {
     pub(super) fn mark(&self, phase: IngestionMeasurementPhase) {
-        self.guard.state.mark(phase);
+        self.state.mark(phase);
     }
 
     pub(super) fn start_attempt(&self) {
-        self.guard.state.start_attempt();
+        self.state.start_attempt();
     }
 
     pub(super) fn add_limiter_wait(&self, duration: Duration) {
-        self.guard.state.add_limiter_wait(duration);
+        self.state.add_limiter_wait(duration);
     }
 
     pub(super) fn add_pool_wait(&self, duration: Duration) {
-        self.guard.state.add_pool_wait(duration);
+        self.state.add_pool_wait(duration);
     }
 
     pub(super) fn add_transaction_time(&self, duration: Duration) {
-        self.guard.state.add_transaction_time(duration);
+        self.state.add_transaction_time(duration);
     }
 
     pub(super) fn commit_started(&self) {
-        self.guard.state.commit_started();
+        self.state.commit_started();
     }
 
     pub(super) fn commit_acknowledged(&self) {
-        self.guard.state.commit_acknowledged();
+        self.state.commit_acknowledged();
     }
 
     pub(super) fn commit_failed(&self) {
-        self.guard.state.commit_failed();
-    }
-
-    pub(super) fn finish(&self, terminal: IngestionDeliveryTerminal) {
-        self.guard.finish(terminal);
+        self.state.commit_failed();
     }
 }
 
-struct DeliveryGuard {
+pub(super) struct DeliveryGuard {
     key: IngestionDeliveryKey,
     state: Arc<DeliveryState>,
     permit: Mutex<Option<mpsc::OwnedPermit<IngestionDeliveryReport>>>,
 }
 
 impl DeliveryGuard {
-    fn finish(&self, terminal: IngestionDeliveryTerminal) {
+    pub(super) fn finish(&self, terminal: IngestionDeliveryTerminal) {
         let Some((terminal_at, progress)) = self.state.finish() else {
             return;
         };
@@ -347,7 +266,7 @@ impl DeliveryState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(DeliveryStateInner {
-                progress: IngestionDeliveryProgress::started_now(),
+                progress: IngestionDeliveryProgress::default(),
                 commit_in_progress: false,
                 finished: false,
             }),
@@ -356,6 +275,13 @@ impl DeliveryState {
 
     fn snapshot(&self) -> IngestionDeliveryProgress {
         recover_mutex_lock(&self.inner).progress.clone()
+    }
+
+    fn update(&self, update: impl FnOnce(&mut DeliveryStateInner)) {
+        let mut inner = recover_mutex_lock(&self.inner);
+        if !inner.finished {
+            update(&mut inner);
+        }
     }
 
     fn mark(&self, phase: IngestionMeasurementPhase) {
@@ -376,57 +302,45 @@ impl DeliveryState {
     }
 
     fn start_attempt(&self) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if inner.finished {
-            return;
-        }
-        inner.progress.attempt_count = inner.progress.attempt_count.saturating_add(1);
+        self.update(|inner| {
+            inner.progress.attempt_count = inner.progress.attempt_count.saturating_add(1);
+        });
     }
 
     fn add_limiter_wait(&self, duration: Duration) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if inner.finished {
-            return;
-        }
-        inner.progress.limiter_wait = inner.progress.limiter_wait.saturating_add(duration);
+        self.update(|inner| {
+            inner.progress.limiter_wait = inner.progress.limiter_wait.saturating_add(duration);
+        });
     }
 
     fn add_pool_wait(&self, duration: Duration) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if inner.finished {
-            return;
-        }
-        inner.progress.pool_wait = inner.progress.pool_wait.saturating_add(duration);
+        self.update(|inner| {
+            inner.progress.pool_wait = inner.progress.pool_wait.saturating_add(duration);
+        });
     }
 
     fn add_transaction_time(&self, duration: Duration) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if inner.finished {
-            return;
-        }
-        inner.progress.transaction_time = inner.progress.transaction_time.saturating_add(duration);
+        self.update(|inner| {
+            inner.progress.transaction_time =
+                inner.progress.transaction_time.saturating_add(duration);
+        });
     }
 
     fn commit_started(&self) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if !inner.finished {
-            inner.commit_in_progress = true;
-        }
+        self.update(|inner| inner.commit_in_progress = true);
     }
 
     fn commit_acknowledged(&self) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if !inner.finished {
-            inner.commit_in_progress = false;
-        }
+        self.update(|inner| inner.commit_in_progress = false);
     }
 
     fn commit_failed(&self) {
-        let mut inner = recover_mutex_lock(&self.inner);
-        if !inner.finished && inner.commit_in_progress {
-            inner.commit_in_progress = false;
-            inner.progress.commit_was_uncertain = true;
-        }
+        self.update(|inner| {
+            if inner.commit_in_progress {
+                inner.commit_in_progress = false;
+                inner.progress.commit_was_uncertain = true;
+            }
+        });
     }
 
     fn finish(&self) -> Option<(Instant, IngestionDeliveryProgress)> {
