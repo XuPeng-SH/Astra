@@ -113,7 +113,7 @@ pub(crate) fn print_turn_status_line(
 }
 
 fn compact_completion_parts(
-    state: &SessionState,
+    _state: &SessionState,
     result: &StreamResult,
     elapsed: Duration,
 ) -> Vec<String> {
@@ -123,17 +123,9 @@ fn compact_completion_parts(
         format!("{:.1}s", elapsed.as_secs_f64())
     };
 
-    let mut parts = vec![elapsed_str];
-    if let Some(model) = result
-        .usage_attribution
-        .primary_model
-        .as_ref()
-        .or(state.model.as_ref())
-    {
-        parts.push(format!("with {model}"));
-    }
+    let mut parts = vec![format!("{elapsed_str} total")];
     if let Some(ttft_ms) = result.ttft_ms.filter(|ttft_ms| *ttft_ms > 0) {
-        parts.push(format!("first response {}", format_duration_ms(ttft_ms)));
+        parts.push(format!("ttft {}", format_duration_ms(ttft_ms)));
     }
     if let Some(usage) = primary_usage_summary(result) {
         parts.push(usage);
@@ -161,7 +153,6 @@ pub(crate) fn format_primary_usage_summary(
     cache_read_tokens: Option<u64>,
     cache_creation_tokens: Option<u64>,
     observed: bool,
-    complete: bool,
 ) -> Option<String> {
     let has_lane = tokens_in.is_some()
         || tokens_out.is_some()
@@ -180,14 +171,10 @@ pub(crate) fn format_primary_usage_summary(
         .saturating_add(cache_read_tokens.unwrap_or(0))
         .saturating_add(cache_creation_tokens.unwrap_or(0));
     let mut summary = format!("{} tokens", format_token_count(total));
-    if !complete {
-        summary.push_str(" (partial)");
-    } else if let (Some(fresh), Some(cache_read), Some(cache_creation)) =
-        (tokens_in, cache_read_tokens, cache_creation_tokens)
-    {
+    if let (Some(fresh), Some(cache_read)) = (tokens_in, cache_read_tokens) {
         let input_total = fresh
             .saturating_add(cache_read)
-            .saturating_add(cache_creation);
+            .saturating_add(cache_creation_tokens.unwrap_or(0));
         if input_total > 0 {
             let cached_percent = ((u128::from(cache_read) * 100) / u128::from(input_total)) as u64;
             summary.push_str(&format!(" · {cached_percent}% cached"));
@@ -239,7 +226,6 @@ fn primary_usage_summary(result: &StreamResult) -> Option<String> {
         projection.cache_read_tokens,
         projection.cache_creation_tokens,
         projection.observed,
-        projection.complete,
     )
 }
 
@@ -511,8 +497,7 @@ mod tests {
         assert_eq!(
             compact_completion_parts(&state, &result, Duration::from_millis(8_500)),
             vec![
-                "8.5s".to_string(),
-                "with deepseek-flash".to_string(),
+                "8.5s total".to_string(),
                 "main usage unavailable".to_string(),
                 "1 tool".to_string()
             ]
@@ -538,9 +523,8 @@ mod tests {
         assert_eq!(
             compact_completion_parts(&state, &result, Duration::from_millis(5_200)),
             vec![
-                "5.2s".to_string(),
-                "with deepseek-flash".to_string(),
-                "first response 1.2s".to_string(),
+                "5.2s total".to_string(),
+                "ttft 1.2s".to_string(),
                 "1.0k tokens · 90% cached".to_string(),
             ]
         );
@@ -568,7 +552,7 @@ mod tests {
     #[test]
     fn explicit_zero_cache_lane_renders_zero_percent() {
         assert_eq!(
-            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true, true,)
+            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true)
                 .as_deref(),
             Some("109 tokens · 0% cached")
         );

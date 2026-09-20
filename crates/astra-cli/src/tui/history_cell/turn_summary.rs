@@ -3,14 +3,14 @@
 //! Shape:
 //!
 //! ```text
-//!   8.5s · with deepseek-flash · 1 tool
+//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · $0.014 spent)
 //! ```
 //!
-//! The summary is a user-facing completion marker, not a telemetry report.
-//! It answers how long the turn took, when the first response arrived, which
-//! primary model answered, the primary token/cache result, and whether
-//! material tools ran. Auxiliary judgment and session totals remain structured
-//! evidence for Explain Analyze rather than being dumped into every chat turn.
+//! The summary intentionally stays in product language rather than
+//! exposing raw telemetry grammar. Lower-value details such as
+//! per-direction token arrows are omitted so the band reads like a
+//! calm recap instead of an engineering dashboard. Sections that
+//! don't apply to this turn are elided.
 //!
 //! Persists as [`TurnEvent::TurnSummary`]. Never live.
 
@@ -20,7 +20,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
-use crate::cli::turn::turn_reporting::format_primary_usage_summary;
 use crate::tui::turn_event::TurnEvent;
 
 #[derive(Debug, Clone, Default)]
@@ -122,41 +121,50 @@ impl HistoryCell for TurnSummaryCell {
 impl TurnSummaryCell {
     fn sections(&self, label: Style, value: Style) -> Vec<Section> {
         let mut sections: Vec<Section> = Vec::new();
+        let mut secondary_parts: Vec<Vec<Span<'static>>> = Vec::new();
+
         if let Some(elapsed) = self.elapsed_ms {
-            sections.push(Section::primary(vec![Span::styled(
-                fmt_duration_ms(elapsed),
-                value,
-            )]));
-        }
-
-        if let Some(model) = self.model_name.as_deref() {
             sections.push(Section::primary(vec![
-                Span::styled("with ", label),
-                Span::styled(model.to_string(), value),
+                Span::styled(fmt_duration_ms(elapsed), value),
+                Span::styled(" total", label),
             ]));
         }
 
-        if let Some(ttft) = self.ttft_ms.filter(|ttft| *ttft > 0) {
+        if let Some(ttft) = self.ttft_ms
+            && ttft > 0
+        {
             sections.push(Section::primary(vec![
-                Span::styled("first response ", label),
-                Span::styled(fmt_duration_ms(ttft), value),
+                Span::styled("ttft ", label),
+                Span::styled(fmt_ms(ttft), value),
             ]));
         }
 
-        let usage_observed = self.tokens_in.is_some()
-            || self.tokens_out.is_some()
-            || self.cache_read_tokens.is_some()
-            || self.cache_creation_tokens.is_some()
-            || self.usage_partial;
-        if let Some(usage) = format_primary_usage_summary(
-            self.tokens_in,
-            self.tokens_out,
-            self.cache_read_tokens,
-            self.cache_creation_tokens,
-            usage_observed,
-            !self.usage_partial,
-        ) {
-            sections.push(Section::primary(vec![Span::styled(usage, value)]));
+        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
+            let provider_tokens = tin
+                .saturating_add(self.cache_read_tokens.unwrap_or(0))
+                .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+                .saturating_add(tout);
+            sections.push(Section::primary(vec![
+                Span::styled(fmt_tokens(provider_tokens), value),
+                Span::styled(" tokens", label),
+            ]));
+        }
+
+        if let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
+            && cache_read > 0
+        {
+            let total_input = cache_read
+                .saturating_add(fresh_input)
+                .saturating_add(self.cache_creation_tokens.unwrap_or(0));
+            let pct = if total_input == 0 {
+                0
+            } else {
+                ((cache_read as f64 / total_input as f64) * 100.0).round() as u32
+            };
+            sections.push(Section::primary(vec![
+                Span::styled(format!("{pct}%"), value),
+                Span::styled(" cached", label),
+            ]));
         }
 
         if self.tools > 0 {
@@ -164,6 +172,43 @@ impl TurnSummaryCell {
                 Span::styled(self.tools.to_string(), value),
                 Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
             ]));
+        }
+
+        let current_provider_tokens = self
+            .tokens_in
+            .unwrap_or(0)
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+            .saturating_add(self.tokens_out.unwrap_or(0));
+        let cumulative_tokens = self
+            .cumulative_tokens
+            .filter(|c| *c > current_provider_tokens)
+            .map(|c| Span::styled(fmt_tokens(c), value));
+
+        if let Some(cost) = self.cumulative_cost_usd
+            && cost > 0.0
+        {
+            secondary_parts.push(vec![
+                Span::styled(fmt_cost(cost), value),
+                Span::styled(" spent", label),
+            ]);
+        }
+
+        if cumulative_tokens.is_some() || !secondary_parts.is_empty() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled("(", label));
+            if let Some(tokens) = cumulative_tokens {
+                spans.push(tokens);
+                spans.push(Span::styled(" overall", label));
+            } else {
+                spans.push(Span::styled("Overall", label));
+            }
+            for part in secondary_parts {
+                spans.push(Span::styled(" · ", label));
+                spans.extend(part);
+            }
+            spans.push(Span::styled(")", label));
+            sections.push(Section::secondary(spans));
         }
 
         sections
@@ -192,6 +237,35 @@ fn fmt_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Sub-turn ttft: ms below 1s, decimal seconds above.
+fn fmt_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fmt_cost(usd: f64) -> String {
+    if usd >= 1.0 {
+        format!("${usd:.2}")
+    } else if usd >= 0.01 {
+        format!("${usd:.3}")
+    } else {
+        format!("${usd:.4}")
+    }
+}
+
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
@@ -202,11 +276,22 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 #[derive(Debug, Clone)]
 struct Section {
     spans: Vec<Span<'static>>,
+    secondary: bool,
 }
 
 impl Section {
     fn primary(spans: Vec<Span<'static>>) -> Self {
-        Self { spans }
+        Self {
+            spans,
+            secondary: false,
+        }
+    }
+
+    fn secondary(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            secondary: true,
+        }
     }
 }
 
@@ -282,10 +367,18 @@ mod tests {
     #[test]
     fn full_summary_contains_only_user_facing_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["16s", "first response", "1.8s", "23.6k tokens", "tools"] {
+        for seg in [
+            "16s total",
+            "ttft",
+            "1.8s",
+            "23.6k tokens",
+            "tools",
+            "overall",
+            "spent",
+        ] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
-        for diagnostic in ["ttft", "cached", "overall", "spent"] {
+        for diagnostic in ["first response", "with ", "request_judgment"] {
             assert!(
                 !out.contains(diagnostic),
                 "diagnostic section {diagnostic:?} leaked into {out}"
@@ -315,7 +408,10 @@ mod tests {
         let mut c = mk_full();
         c.model_name = Some("deepseek-flash".into());
         let out = render(&c, 120);
-        assert!(out.contains("with deepseek-flash"), "model missing: {out}");
+        assert!(
+            !out.contains("with deepseek-flash"),
+            "unexpected model decoration: {out}"
+        );
     }
 
     #[test]
@@ -336,16 +432,10 @@ mod tests {
             "primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("partial"),
-            "partial state should remain visible: {out}"
+            out.contains("99% cached"),
+            "measured cache rate should remain visible: {out}"
         );
-        for diagnostic in [
-            "cached",
-            "Jev",
-            "request_judgment",
-            "usage not fully attributed",
-            "overall",
-        ] {
+        for diagnostic in ["Jev", "request_judgment", "usage not fully attributed"] {
             assert!(
                 !out.contains(diagnostic),
                 "diagnostic {diagnostic:?} leaked into {out}"
@@ -379,6 +469,8 @@ mod tests {
         c.cache_creation_tokens = None;
         c.elapsed_ms = None;
         c.tools = 0;
+        c.cumulative_tokens = None;
+        c.cumulative_cost_usd = None;
         let out = render(&c, 120);
         assert!(out.trim().is_empty(), "diagnostic-only cell leaked: {out}");
     }
