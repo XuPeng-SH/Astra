@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v90";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-20-v91";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2835,6 +2835,23 @@ fn inference_invocation_schema_mismatches(
             ));
         }
     }
+    let Some(terminal_attempt_id) = columns.get("terminal_attempt_id") else {
+        reasons.push("missing nullable column terminal_attempt_id".to_string());
+        return reasons;
+    };
+    if !terminal_attempt_id
+        .data_type
+        .eq_ignore_ascii_case("varchar")
+        || terminal_attempt_id.character_maximum_length != Some(64)
+        || !terminal_attempt_id.nullable
+    {
+        reasons.push(format!(
+            "column terminal_attempt_id has type {}({:?}) nullable={}, expected nullable varchar(64)",
+            terminal_attempt_id.data_type,
+            terminal_attempt_id.character_maximum_length,
+            terminal_attempt_id.nullable
+        ));
+    }
     reasons
 }
 
@@ -2850,7 +2867,7 @@ async fn verify_inference_invocation_schema_contract(
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
            AND COLUMN_NAME IN ('admission_token', 'owner_token', 'owner_generation',
                                'owner_lease_expires_at', 'usage_status',
-                               'provider_delivery_state')",
+                               'provider_delivery_state', 'terminal_attempt_id')",
     )
     .bind(database)
     .bind(table)
@@ -3779,32 +3796,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "evaluation_trial_bindings",
-        "run_generation",
-        "ALTER TABLE evaluation_trial_bindings ADD COLUMN run_generation BIGINT NULL",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_experiments",
-        "idx_eval_experiments_owner_updated",
-        &["owner_user_id", "updated_at"],
-        "ALTER TABLE evaluation_experiments ADD INDEX idx_eval_experiments_owner_updated (owner_user_id, updated_at)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_trial_bindings",
-        "uq_eval_trial_run",
-        &["owner_user_id", "run_id"],
-        "ALTER TABLE evaluation_trial_bindings ADD UNIQUE INDEX uq_eval_trial_run (owner_user_id, run_id)",
-    )
-    .await?;
     core_schema_create!(
         pool,
         "evaluation_materialization_receipts",
@@ -3846,39 +3837,6 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "evaluation_materialization_receipts",
-        "component_base_snapshot_ref",
-        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN component_base_snapshot_ref VARCHAR(2048) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "evaluation_materialization_receipts",
-        "execution_run_id",
-        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN execution_run_id VARCHAR(128) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "evaluation_materialization_receipts",
-        "execution_run_generation",
-        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN execution_run_generation BIGINT NULL",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_materialization_receipts",
-        "uq_eval_materialization_idempotency",
-        &["owner_user_id", "idempotency_key"],
-        "ALTER TABLE evaluation_materialization_receipts ADD UNIQUE INDEX uq_eval_materialization_idempotency (owner_user_id, idempotency_key)",
-    )
     .await?;
     core_schema_create!(
         pool,
@@ -3927,34 +3885,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_trial_observations",
-        "uq_eval_observation_trial",
-        &["owner_user_id", "trial_id"],
-        "ALTER TABLE evaluation_trial_observations ADD UNIQUE INDEX uq_eval_observation_trial (owner_user_id, trial_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_trial_observations",
-        "uq_eval_observation_idempotency",
-        &["owner_user_id", "idempotency_key"],
-        "ALTER TABLE evaluation_trial_observations ADD UNIQUE INDEX uq_eval_observation_idempotency (owner_user_id, idempotency_key)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "evaluation_trial_observations",
-        "idx_eval_observation_owner_experiment",
-        &["owner_user_id", "experiment_id", "created_at", "observation_id"],
-        "ALTER TABLE evaluation_trial_observations ADD INDEX idx_eval_observation_owner_experiment (owner_user_id, experiment_id, created_at, observation_id)",
-    )
-    .await?;
-
     core_schema_create!(
         pool,
         "agent_session_execution_slots",
@@ -5487,6 +5417,7 @@ async fn ensure_core_schema_while_leased(
             purpose VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
+            terminal_attempt_id VARCHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
             provider_delivery_state VARCHAR(32) NOT NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,

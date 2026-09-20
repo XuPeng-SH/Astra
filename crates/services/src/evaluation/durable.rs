@@ -493,11 +493,13 @@ impl DatabaseEvaluationPlanStore {
         Ok(record)
     }
 
-    async fn load_experiment_by_submission(
+    pub async fn load_experiment_by_submission(
         &self,
         owner_user_id: &str,
         submission_idempotency_key: &str,
     ) -> Result<Option<EvaluationExperimentRecord>, EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        validate_submission_key(submission_idempotency_key)?;
         let experiment_id = sqlx::query_scalar::<_, String>(
             "SELECT experiment_id
              FROM evaluation_experiments

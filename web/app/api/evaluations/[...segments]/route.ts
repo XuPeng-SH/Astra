@@ -31,6 +31,9 @@ function runtimePath(segments: string[], method: HttpMethod) {
   if (segments.length === 2 && segments[1] === 'prepare' && method === 'POST') {
     return '/evaluation/experiments/prepare';
   }
+  if (segments.length === 3 && segments[1] === 'by-submission' && method === 'GET') {
+    return `/evaluation/experiments/by-submission/${encodedSegments([segments[2]])}`;
+  }
   if (segments.length === 2 && method === 'GET') {
     return `/evaluation/experiments/${encodedSegments([segments[1]])}`;
   }
@@ -62,14 +65,21 @@ async function handle(request: NextRequest, method: HttpMethod, context: RouteCo
     });
     const hasBody = !(segments.length === 5 && segments[4] === 'assess');
     const json = method === 'POST' && hasBody ? await request.json() : undefined;
-    return NextResponse.json(
-      await runtime.request(path, {
-        method,
-        auth: 'required',
-        operation: `${method} ${path}`,
-        ...(json === undefined ? {} : { json }),
-      }),
-    );
+    const upstream = await runtime.fetchResponse(path, {
+      method,
+      auth: 'required',
+      operation: `${method} ${path}`,
+      ...(json === undefined ? {} : { json }),
+    });
+    const headers = new Headers();
+    const contentType = upstream.headers.get('content-type');
+    if (contentType) {
+      headers.set('content-type', contentType);
+    }
+    return new NextResponse(upstream.body, {
+      status: upstream.status,
+      headers,
+    });
   } catch (error) {
     return NextResponse.json(
       { error: runtimeErrorDetail(error, 'Evaluation control plane is unavailable.') },

@@ -78,6 +78,10 @@ async fn run_experiment(
 
     let mut trials = prepared.trials;
     trials.sort_by_key(|binding| binding.trial.sequence);
+    let trial_ids = trials
+        .iter()
+        .map(|binding| binding.trial_id.clone())
+        .collect::<Vec<_>>();
     for binding in trials {
         let trial_id = binding.trial_id.clone();
         if binding.binding_status == "planned" {
@@ -105,9 +109,18 @@ async fn run_experiment(
             .await
             .map_err(|error| {
                 format!(
-                    "evaluation {experiment_id} stopped at trial {trial_id}: {error}; resume with `astra evaluation show {experiment_id}` or `astra evaluation report {experiment_id}`"
+                    "evaluation {experiment_id} stopped at trial {trial_id}: {error}; resume with `astra evaluation run {}` using the same intent file",
+                    args.intent.display()
                 )
             })?;
+        try_assess_trial(api, token, &experiment_id, &trial_id).await?;
+    }
+
+    // Observation is the arm-order barrier. Assessments are a read/verify
+    // phase and may still be pending while the next arm runs; waiting here
+    // preserves the frozen baseline-first execution order without serializing
+    // unrelated verifier work.
+    for trial_id in trial_ids {
         assess_trial(
             api,
             token,
@@ -126,6 +139,25 @@ async fn run_experiment(
         .await
         .map_err(map_thin_err)?;
     print_json_or_raw(&report);
+    Ok(())
+}
+
+async fn try_assess_trial(
+    api: &ThinClient,
+    token: &str,
+    experiment_id: &str,
+    trial_id: &str,
+) -> Result<(), String> {
+    let path = paths::evaluation_trial_assess(experiment_id, trial_id)
+        .ok_or_else(|| format!("invalid evaluation trial identity: {trial_id}"))?;
+    let body = api
+        .post_bearer_path_empty_text(token, &path)
+        .await
+        .map_err(map_thin_err)?;
+    let result: TaskAssessmentResult = decode_json(&body, "assessment")?;
+    if let TaskAssessmentResult::Recorded(record) = result {
+        eprintln!("  assessed {} → {:?}", trial_id, record.outcome);
+    }
     Ok(())
 }
 
@@ -172,8 +204,13 @@ async fn wait_for_terminal_trial(
             .find(|trial| trial.binding.trial_id == trial_id)
             .ok_or_else(|| format!("server projection omitted trial {trial_id}"))?;
         match trial.lifecycle {
-            EvaluationTrialLifecycle::Observed
-            | EvaluationTrialLifecycle::TerminalAwaitingObservation => return Ok(()),
+            EvaluationTrialLifecycle::Observed => return Ok(()),
+            EvaluationTrialLifecycle::TerminalAwaitingObservation => {
+                // A terminal Run may still be waiting for its durable
+                // observation. Repair that boundary before allowing the next
+                // arm to start.
+                try_assess_trial(api, token, experiment_id, trial_id).await?;
+            }
             EvaluationTrialLifecycle::Unavailable => {
                 return Err(format!(
                     "trial became unavailable (run status: {:?})",

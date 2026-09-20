@@ -55,8 +55,8 @@ use crate::turn::agentic_loop::execution_phase::{
 use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
-    TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
-    complete_turn_phase, context_manifest_identity_from_result,
+    SkillAutoRouteJudgmentOutcome, TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind,
+    TurnPhaseOutcome, TurnPhaseReceipt, complete_turn_phase, context_manifest_identity_from_result,
     interaction_scoped_tool_restrictions,
 };
 use crate::turn::execution_config::PreparedExecutionPolicy;
@@ -4242,6 +4242,9 @@ pub struct ServerAgenticLoopHost {
     /// the configured auxiliary LLM path; failure is non-fatal and leaves
     /// pre-routing disabled for that turn.
     skill_auto_route_judge: Option<Arc<dyn SkillAutoRouteJudge>>,
+    /// One durable classification for the evaluation Skill adapter. Normal
+    /// runs do not project this process-local value into evaluation evidence.
+    evaluation_judgment_outcome: Option<SkillAutoRouteJudgmentOutcome>,
 }
 
 struct ExecutionHandoffContext {
@@ -7229,6 +7232,7 @@ impl ServerAgenticLoopHostBuilder {
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
             turn_intent_judge: None,
             skill_auto_route_judge: None,
+            evaluation_judgment_outcome: None,
         }
     }
 
@@ -11577,6 +11581,20 @@ impl ServerAgenticLoopHost {
 
     pub fn set_skill_auto_route_judge(&mut self, judge: Arc<dyn SkillAutoRouteJudge>) {
         self.skill_auto_route_judge = Some(judge);
+    }
+
+    fn record_evaluation_judgment_outcome(&mut self, outcome: SkillAutoRouteJudgmentOutcome) {
+        if matches!(
+            self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        ) && self.evaluation_judgment_outcome.is_none()
+        {
+            self.evaluation_judgment_outcome = Some(outcome);
+        }
+    }
+
+    fn take_evaluation_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
+        self.evaluation_judgment_outcome.take()
     }
 
     async fn resolve_llm_config_for_state(
@@ -19199,6 +19217,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         false
     }
 
+    fn allows_skill_auto_route_without_turn_intent(&self) -> bool {
+        matches!(
+            &self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        )
+    }
+
+    fn take_skill_auto_route_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
+        self.take_evaluation_judgment_outcome()
+    }
+
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
         self.work_admission_explain_admission = None;
         *self
@@ -19670,6 +19699,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &AgenticLoopState,
         ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
+        let evaluation = matches!(
+            &self.execution_inputs.policy,
+            PreparedExecutionPolicy::Evaluation(_)
+        );
         if self.skill_auto_route_policy == SkillAutoRouteExecutionPolicy::Disabled {
             tracing::info!(
                 target: "astra::skill_auto_route_judge",
@@ -19677,9 +19710,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 status = "disabled",
                 "skill auto-route skipped by request policy"
             );
+            if evaluation {
+                self.record_evaluation_judgment_outcome(SkillAutoRouteJudgmentOutcome::Disabled);
+            }
             return None;
         }
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
+            if evaluation {
+                self.record_evaluation_judgment_outcome(
+                    SkillAutoRouteJudgmentOutcome::NotDispatched {
+                        reason: "empty_query_or_catalog".to_string(),
+                    },
+                );
+            }
             return None;
         }
         let service_ctx = skill_auto_route_service_context(ctx);
@@ -19701,19 +19744,56 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     reason = self.execution_inputs.pre_turn_compaction_gate.as_str(),
                     "skill auto-route judge skipped by capacity policy"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::NotDispatched {
+                            reason: "capacity_policy".to_string(),
+                        },
+                    );
+                }
                 return None;
             }
             let request = match astra_services::skill_auto_route_judgment_request(&service_ctx) {
                 Ok(request) => request,
                 Err(error) => {
                     tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
+                    if evaluation {
+                        self.record_evaluation_judgment_outcome(
+                            SkillAutoRouteJudgmentOutcome::NotDispatched {
+                                reason: "invalid_request".to_string(),
+                            },
+                        );
+                    }
                     return None;
                 }
             };
-            let client = self
+            let client = match self
                 .judgment_summary_client(state, "skill_auto_route", &request)
                 .await
-                .ok()?;
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    if evaluation {
+                        self.record_evaluation_judgment_outcome(
+                            SkillAutoRouteJudgmentOutcome::NotDispatched {
+                                reason: match error {
+                                    JudgmentClientUnavailable::NoOffering => "no_offering",
+                                    JudgmentClientUnavailable::InvalidRequest => "invalid_request",
+                                    JudgmentClientUnavailable::OutputBudget => "output_budget",
+                                    JudgmentClientUnavailable::RouteUnavailable => {
+                                        "route_unavailable"
+                                    }
+                                    JudgmentClientUnavailable::DurableMaterialUnavailable => {
+                                        "durable_material_unavailable"
+                                    }
+                                }
+                                .to_string(),
+                            },
+                        );
+                    }
+                    return None;
+                }
+            };
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
         };
@@ -19725,15 +19805,36 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     skill_name,
                     "skill auto-route judged"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::Selected {
+                            skill_name: skill_name.clone(),
+                        },
+                    );
+                }
                 Some(SkillAutoRouteDecision { skill_name })
             }
-            Ok(None) => None,
+            Ok(None) => {
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::Negative,
+                    );
+                }
+                None
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "astra::skill_auto_route_judge",
                     error = %error,
                     "skill auto-route judge unavailable; proceeding without pre-route"
                 );
+                if evaluation {
+                    self.record_evaluation_judgment_outcome(
+                        SkillAutoRouteJudgmentOutcome::Failed {
+                            reason: "provider_or_decode_failure".to_string(),
+                        },
+                    );
+                }
                 None
             }
         }

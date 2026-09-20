@@ -49,6 +49,8 @@ pub enum FrozenSkillRoutingPolicy {
         schema_version: u32,
         model: Box<ModelExecutionProjection>,
         auxiliary_policy: astra_turn_types::auxiliary_execution::AuxiliaryGenerationPolicy,
+        judgment_contract_version: u32,
+        judgment_contract_fingerprint: String,
     },
     /// The enhancement was requested at prepare time but no usable judgment
     /// Offering was available. The candidate remains executable through the
@@ -64,12 +66,18 @@ impl FrozenSkillRoutingPolicy {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    /// Validate the serialized shape and the identity of a frozen historical
+    /// policy. This deliberately does not consult the current routing
+    /// implementation: a report must remain readable after the Jev contract
+    /// evolves.
+    pub fn validate_historical(&self) -> Result<(), String> {
         match self {
             Self::Available {
                 schema_version,
                 model,
                 auxiliary_policy,
+                judgment_contract_version,
+                judgment_contract_fingerprint,
             } => {
                 if *schema_version != JUDGMENT_POLICY_SCHEMA_VERSION
                     || model.schema_version != 1
@@ -77,13 +85,14 @@ impl FrozenSkillRoutingPolicy {
                     || model.model_name.trim().is_empty()
                     || model.provider.trim().is_empty()
                     || model.private_route_and_overrides_digest.trim().is_empty()
-                    || !astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment
-                        .supported_by(&model.provider)
                     || auxiliary_policy.schema_version
                         != astra_turn_types::auxiliary_execution::AUXILIARY_GENERATION_POLICY_VERSION
                     || auxiliary_policy.operation_id != "skill_auto_route"
                     || auxiliary_policy.purpose != InferencePurpose::Introspection
                     || auxiliary_policy.max_output_tokens == 0
+                    || *judgment_contract_version == 0
+                    || judgment_contract_fingerprint.trim().is_empty()
+                    || judgment_contract_fingerprint.len() > 128
                 {
                     return Err("frozen Skill routing judgment policy is invalid".into());
                 }
@@ -103,6 +112,32 @@ impl FrozenSkillRoutingPolicy {
             }
         }
     }
+
+    /// Validate that a frozen policy can be executed by this build. New
+    /// admissions use this stricter check; historical report readers use
+    /// [`Self::validate_historical`] instead.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_historical()?;
+        if let Self::Available {
+            model,
+            auxiliary_policy,
+            judgment_contract_version,
+            judgment_contract_fingerprint,
+            ..
+        } = self
+            && (!astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment
+                .supported_by(&model.provider)
+                || auxiliary_policy.max_output_tokens
+                    != crate::skill_auto_route_judge::SKILL_AUTO_ROUTE_SINGLE_SKILL_OUTPUT_TOKENS
+                || *judgment_contract_version
+                    != crate::skill_auto_route_judge::SKILL_AUTO_ROUTE_JUDGMENT_CONTRACT_VERSION
+                || judgment_contract_fingerprint
+                    != &crate::skill_auto_route_judge::skill_auto_route_judgment_contract_fingerprint())
+        {
+            return Err("frozen Skill routing judgment policy does not match the current implementation".into());
+        }
+        Ok(())
+    }
 }
 
 /// Frozen comparison-level judgment policy. Baseline deliberately has no new
@@ -121,7 +156,7 @@ impl EvaluationJudgmentPolicy {
         match (target_kind, self) {
             (EvaluationTargetKind::Prompt | EvaluationTargetKind::Skill, Self::Disabled) => Ok(()),
             (EvaluationTargetKind::SkillRoutingJudgment, Self::SkillRouting { candidate }) => {
-                candidate.validate()
+                candidate.validate_historical()
             }
             (EvaluationTargetKind::SkillRoutingJudgment, Self::Disabled) => {
                 Err("SkillRoutingJudgment targets require a candidate judgment policy".into())
@@ -616,6 +651,17 @@ impl ExperimentSpec {
             return Err(
                 "budget max_wall_time_secs exceeds the supported duration range".to_string(),
             );
+        }
+        Ok(())
+    }
+
+    /// Validate a newly prepared specification against the current executable
+    /// judgment contract. Persisted specifications use [`Self::validate`],
+    /// which is intentionally historical and stable.
+    pub fn validate_for_current_execution(&self) -> Result<(), String> {
+        self.validate()?;
+        if let EvaluationJudgmentPolicy::SkillRouting { candidate } = &self.target.judgment_policy {
+            candidate.validate()?;
         }
         Ok(())
     }

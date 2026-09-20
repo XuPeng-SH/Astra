@@ -93,6 +93,19 @@ export type EvaluationReport = {
     };
     report_content_hash: string;
     artifact_fingerprint: string;
+    judgment?: {
+      operation_id: string;
+      candidate_policy: unknown;
+      trials: Array<{
+        trial_id: string;
+        status: string | null;
+        skill_name?: string;
+        reason?: string;
+        evidence_available: boolean;
+      }>;
+      missing_trial_ids: string[];
+      coverage_incomplete: boolean;
+    } | null;
   };
   report: {
     conclusion: string;
@@ -129,6 +142,12 @@ export function getEvaluationExperiment(experimentId: string) {
   );
 }
 
+export function getEvaluationExperimentBySubmission(submissionIdempotencyKey: string) {
+  return requestJson<{ experiment_id: string }>(
+    `/api/evaluations/experiments/by-submission/${encodeURIComponent(submissionIdempotencyKey)}`,
+  );
+}
+
 export function startEvaluationTrial(experimentId: string, trialId: string) {
   return requestJson<{ run_id: string; session_id: string; status: string }>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}/trials/${encodeURIComponent(trialId)}/start`,
@@ -137,7 +156,12 @@ export function startEvaluationTrial(experimentId: string, trialId: string) {
 }
 
 export function assessEvaluationTrial(experimentId: string, trialId: string) {
-  return requestJson<{ status: 'pending' | 'recorded'; assessment?: { outcome: string } }>(
+  return requestJson<{
+    status: 'pending' | 'recorded';
+    assessment?: {
+      outcome: { status: 'pass' | 'fail' | 'unavailable'; reason?: string };
+    };
+  }>(
     `/api/evaluations/experiments/${encodeURIComponent(experimentId)}/trials/${encodeURIComponent(trialId)}/assess`,
     { method: 'POST' },
   );
@@ -173,8 +197,11 @@ export async function runPreparedEvaluation(
       if (!current) {
         throw new Error(`Evaluation projection omitted trial ${trial.trial_id}.`);
       }
-      if (current.lifecycle === 'observed' || current.lifecycle === 'terminal_awaiting_observation') {
+      if (current.lifecycle === 'observed') {
         break;
+      }
+      if (current.lifecycle === 'terminal_awaiting_observation') {
+        await assessEvaluationTrial(experimentId, trial.trial_id);
       }
       if (current.lifecycle === 'unavailable' || current.lifecycle === 'planned') {
         throw new Error(`Trial ${trial.trial_id} became ${current.lifecycle}.`);
@@ -184,11 +211,13 @@ export async function runPreparedEvaluation(
       }
       await new Promise((resolve) => window.setTimeout(resolve, options.pollMs ?? 500));
     }
+    await assessEvaluationTrial(experimentId, trial.trial_id);
+  }
+
+  for (const trial of trials) {
     while (true) {
       const assessment = await assessEvaluationTrial(experimentId, trial.trial_id);
-      if (assessment.status === 'recorded') {
-        break;
-      }
+      if (assessment.status === 'recorded') break;
       if (Date.now() >= deadline) {
         throw new Error(`Assessment wait deadline exceeded at trial ${trial.trial_id}.`);
       }

@@ -10,11 +10,13 @@ import { PageHeader } from '@/components/ui/page-header';
 import { Textarea } from '@/components/ui/textarea';
 import {
   getEvaluationExperiment,
+  getEvaluationExperimentBySubmission,
   listEvaluationModels,
   listPersonalSkillSources,
   listPersonalSkillVersions,
   prepareEvaluation,
   runPreparedEvaluation,
+  type EvaluationPrepareResponse,
   type EvaluationModel,
   type EvaluationProjection,
   type EvaluationReport,
@@ -25,6 +27,24 @@ import { listModels } from '@/lib/api/models';
 
 type PrimaryModel = Awaited<ReturnType<typeof listModels>>['items'][number];
 const defaultExpected = '{\n  "ok": true\n}';
+type SavedEvaluationReference = {
+  version: 2;
+  ownerId: string;
+  runtimeKey: string;
+  experimentId: string;
+};
+
+type PendingEvaluationSubmission = {
+  version: 1;
+  ownerId: string;
+  runtimeKey: string;
+  submissionIdempotencyKey: string;
+};
+
+type EvaluationPageProps = {
+  ownerId: string;
+  runtimeKey: string;
+};
 
 function statusTone(value: string) {
   if (value === 'observed' || value === 'recorded' || value === 'pass') {
@@ -36,7 +56,7 @@ function statusTone(value: string) {
   return 'border-border bg-surface-muted text-text-secondary';
 }
 
-export function EvaluationPage() {
+export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
   const [sources, setSources] = useState<PersonalSkillSource[]>([]);
   const [versions, setVersions] = useState<PersonalSkillVersion[]>([]);
   const [primaryModels, setPrimaryModels] = useState<PrimaryModel[]>([]);
@@ -56,6 +76,11 @@ export function EvaluationPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Choose a published Skill revision to begin.');
+  const [savedIntent, setSavedIntent] = useState<SavedEvaluationReference | null>(null);
+  const [pendingSubmission, setPendingSubmission] = useState<PendingEvaluationSubmission | null>(null);
+  const [savedIntentLoaded, setSavedIntentLoaded] = useState(false);
+  const savedIntentKey = `astra:evaluation:skill-routing:v2:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}`;
+  const pendingSubmissionKey = `${savedIntentKey}:pending`;
 
   const publishedVersions = useMemo(
     () => versions.filter((version) => version.status === 'published'),
@@ -66,19 +91,33 @@ export function EvaluationPage() {
     setLoading(true);
     setError(null);
     try {
-      const [skillPayload, primaryPayload, judgmentPayload] = await Promise.all([
+      const [skillResult, primaryResult, judgmentResult] = await Promise.allSettled([
         listPersonalSkillSources(),
         listModels(),
         listEvaluationModels(),
       ]);
-      const availableSources = skillPayload.filter((source) => source.status !== 'deleted');
-      setSources(availableSources);
-      setPrimaryModels(primaryPayload.items);
-      setJudgmentModels(judgmentPayload.items.filter((model) => model.is_active));
-      setSkillName((current) => current || availableSources[0]?.skill_name || '');
-      setPrimaryOfferingId((current) => current || primaryPayload.items[0]?.id || '');
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Failed to load Evaluation catalog.');
+      const errors: string[] = [];
+      if (skillResult.status === 'fulfilled') {
+        const availableSources = skillResult.value.filter((source) => source.status !== 'deleted');
+        setSources(availableSources);
+        setSkillName((current) => current || availableSources[0]?.skill_name || '');
+      } else {
+        errors.push(skillResult.reason instanceof Error ? skillResult.reason.message : 'Skill catalog unavailable.');
+      }
+      if (primaryResult.status === 'fulfilled') {
+        setPrimaryModels(primaryResult.value.items);
+        setPrimaryOfferingId((current) => current || primaryResult.value.items[0]?.id || '');
+      } else {
+        errors.push(primaryResult.reason instanceof Error ? primaryResult.reason.message : 'Primary model catalog unavailable.');
+      }
+      if (judgmentResult.status === 'fulfilled') {
+        setJudgmentModels(judgmentResult.value.items.filter((model) => model.is_active));
+      } else {
+        errors.push(judgmentResult.reason instanceof Error ? judgmentResult.reason.message : 'Judgment model catalog unavailable.');
+      }
+      if (errors.length > 0) {
+        setError(`Some Evaluation catalog data is unavailable: ${errors.join(' ')}`);
+      }
     } finally {
       setLoading(false);
     }
@@ -87,6 +126,82 @@ export function EvaluationPage() {
   useEffect(() => {
     void loadCatalog();
   }, [loadCatalog]);
+
+  useEffect(() => {
+    let active = true;
+    const recoverSavedSubmission = async () => {
+      try {
+        window.localStorage.removeItem('astra:evaluation:skill-routing:v1');
+        const savedRaw = window.localStorage.getItem(savedIntentKey);
+        if (savedRaw) {
+          const parsed: unknown = JSON.parse(savedRaw);
+          if (
+            parsed &&
+            typeof parsed === 'object' &&
+            (parsed as { version?: unknown }).version === 2 &&
+            (parsed as { ownerId?: unknown }).ownerId === ownerId &&
+            (parsed as { runtimeKey?: unknown }).runtimeKey === runtimeKey &&
+            typeof (parsed as { experimentId?: unknown }).experimentId === 'string'
+          ) {
+            if (active) {
+              setSavedIntent(parsed as SavedEvaluationReference);
+              setStatus('A saved comparison is available to resume.');
+            }
+          } else {
+            window.localStorage.removeItem(savedIntentKey);
+          }
+        }
+        if (active) setSavedIntentLoaded(true);
+
+        const pendingRaw = window.localStorage.getItem(pendingSubmissionKey);
+        if (!pendingRaw) return;
+        const pending: unknown = JSON.parse(pendingRaw);
+        if (
+          !pending ||
+          typeof pending !== 'object' ||
+          (pending as { version?: unknown }).version !== 1 ||
+          (pending as { ownerId?: unknown }).ownerId !== ownerId ||
+          (pending as { runtimeKey?: unknown }).runtimeKey !== runtimeKey ||
+          typeof (pending as { submissionIdempotencyKey?: unknown }).submissionIdempotencyKey !== 'string'
+        ) {
+          window.localStorage.removeItem(pendingSubmissionKey);
+          return;
+        }
+        if (active) setPendingSubmission(pending as PendingEvaluationSubmission);
+        try {
+          const record = await getEvaluationExperimentBySubmission(
+            (pending as PendingEvaluationSubmission).submissionIdempotencyKey,
+          );
+          if (!active) return;
+          if (window.localStorage.getItem(pendingSubmissionKey) !== pendingRaw) return;
+          const saved: SavedEvaluationReference = {
+            version: 2,
+            ownerId,
+            runtimeKey,
+            experimentId: record.experiment_id,
+          };
+          setSavedIntent(saved);
+          window.localStorage.setItem(savedIntentKey, JSON.stringify(saved));
+          window.localStorage.removeItem(pendingSubmissionKey);
+          setPendingSubmission(null);
+          setStatus('A submitted comparison was recovered and is ready to resume.');
+        } catch {
+          if (active) {
+            setStatus('A comparison submission is awaiting confirmation; retrying will reuse its submission identity.');
+          }
+        }
+      } catch {
+        window.localStorage.removeItem(savedIntentKey);
+        window.localStorage.removeItem(pendingSubmissionKey);
+      } finally {
+        if (active) setSavedIntentLoaded(true);
+      }
+    };
+    void recoverSavedSubmission();
+    return () => {
+      active = false;
+    };
+  }, [ownerId, pendingSubmissionKey, runtimeKey, savedIntentKey]);
 
   useEffect(() => {
     if (!skillName) {
@@ -117,51 +232,89 @@ export function EvaluationPage() {
     setStatus('Choose a published Skill revision to begin.');
   }, []);
 
-  const runComparison = useCallback(async () => {
+  const retryPendingSubmission = useCallback(async () => {
+    if (!pendingSubmission) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const record = await getEvaluationExperimentBySubmission(pendingSubmission.submissionIdempotencyKey);
+      const saved: SavedEvaluationReference = {
+        version: 2,
+        ownerId,
+        runtimeKey,
+        experimentId: record.experiment_id,
+      };
+      setSavedIntent(saved);
+      setPendingSubmission(null);
+      window.localStorage.setItem(savedIntentKey, JSON.stringify(saved));
+      window.localStorage.removeItem(pendingSubmissionKey);
+      setStatus('A submitted comparison was recovered and is ready to resume.');
+    } catch (reason) {
+      setStatus(reason instanceof Error ? reason.message : 'The pending submission is not confirmed yet; retry the lookup.');
+    } finally {
+      setBusy(false);
+    }
+  }, [ownerId, pendingSubmission, pendingSubmissionKey, runtimeKey, savedIntentKey]);
+
+  const discardPendingSubmission = useCallback(() => {
+    setPendingSubmission(null);
+    try {
+      window.localStorage.removeItem(pendingSubmissionKey);
+    } catch {
+      // The in-memory state still prevents this page from reusing the key.
+    }
+    setStatus('Pending submission discarded; the next comparison will use a new submission identity.');
+  }, [pendingSubmissionKey]);
+
+  const executeIntent = useCallback(async (payload: Record<string, unknown>) => {
     setError(null);
     setReport(null);
-    if (!skillName || !versionId || !primaryOfferingId) {
-      setError('Select a Skill revision and a primary Offering first.');
-      return;
-    }
-    let expected: unknown;
-    try {
-      expected = JSON.parse(expectedJson);
-    } catch (reason) {
-      setError(`Expected JSON is invalid: ${reason instanceof Error ? reason.message : String(reason)}`);
-      return;
-    }
-    const wall = Number(wallTimeSecs);
-    if (!Number.isSafeInteger(wall) || wall < 1) {
-      setError('Wall time must be a positive whole number of seconds.');
-      return;
-    }
     setBusy(true);
     resetResult();
     let currentExperimentId: string | null = null;
     try {
+      const submissionIdempotencyKey = payload.submission_idempotency_key;
+      if (typeof submissionIdempotencyKey === 'string') {
+        try {
+          window.localStorage.setItem(
+            pendingSubmissionKey,
+            JSON.stringify({
+              version: 1,
+              ownerId,
+              runtimeKey,
+              submissionIdempotencyKey,
+            } satisfies PendingEvaluationSubmission),
+          );
+          setPendingSubmission({
+            version: 1,
+            ownerId,
+            runtimeKey,
+            submissionIdempotencyKey,
+          });
+        } catch {
+          // The server-side idempotency key remains authoritative.
+        }
+      }
       setStatus('Freezing Skill, model, judgment policy, and task criterion…');
-      const prepared = await prepareEvaluation({
-        submission_idempotency_key: `web-skill-routing-${crypto.randomUUID()}`,
-        target: {
-          kind: 'skill_routing_judgment',
-          skill_name: skillName,
-          baseline: { revision_id: versionId },
-          candidate: { revision_id: versionId },
-        },
-        case: {
-          case_id: caseId.trim() || 'routing-case',
-          message: message.trim(),
-          verifier_config: { expected },
-        },
-        model_offering_id: primaryOfferingId,
-        ...(judgmentOfferingId ? { judgment_model_offering_id: judgmentOfferingId } : {}),
-        max_concurrency: 1,
-        max_wall_time_secs: wall,
-      });
+      const prepared = await prepareEvaluation(payload);
       currentExperimentId = prepared.experiment.experiment_id;
       setExperimentId(currentExperimentId);
+      const saved: SavedEvaluationReference = {
+        version: 2,
+        ownerId,
+        runtimeKey,
+        experimentId: currentExperimentId,
+      };
+      setSavedIntent(saved);
+      setPendingSubmission(null);
+      try {
+        window.localStorage.setItem(savedIntentKey, JSON.stringify(saved));
+        window.localStorage.removeItem(pendingSubmissionKey);
+      } catch {
+        // The server-side experiment identity remains the recovery authority.
+      }
       setStatus(`Prepared ${prepared.trials.length} trials; running the baseline arm first…`);
+      const wall = Number(payload.max_wall_time_secs);
       const finalReport = await runPreparedEvaluation(prepared, {
         waitSecs: wall * prepared.trials.length + 60,
         onProjection: (next) => {
@@ -179,23 +332,102 @@ export function EvaluationPage() {
     } finally {
       setBusy(false);
     }
-  }, [caseId, expectedJson, judgmentOfferingId, message, primaryOfferingId, resetResult, skillName, versionId, wallTimeSecs]);
+  }, [ownerId, pendingSubmissionKey, resetResult, runtimeKey, savedIntentKey]);
 
-  if (loading) {
+  const runComparison = useCallback(async () => {
+    setError(null);
+    if (pendingSubmission) {
+      await retryPendingSubmission();
+      return;
+    }
+    if (!skillName || !versionId || !primaryOfferingId) {
+      setError('Select a Skill revision and a primary Offering first.');
+      return;
+    }
+    let expected: unknown;
+    try {
+      expected = JSON.parse(expectedJson);
+    } catch (reason) {
+      setError(`Expected JSON is invalid: ${reason instanceof Error ? reason.message : String(reason)}`);
+      return;
+    }
+    const wall = Number(wallTimeSecs);
+    if (!Number.isSafeInteger(wall) || wall < 1) {
+      setError('Wall time must be a positive whole number of seconds.');
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      submission_idempotency_key: `web-skill-routing-${crypto.randomUUID()}`,
+      target: {
+        kind: 'skill_routing_judgment',
+        skill_name: skillName,
+        baseline: { revision_id: versionId },
+        candidate: { revision_id: versionId },
+      },
+      case: {
+        case_id: caseId.trim() || 'routing-case',
+        message: message.trim(),
+        verifier_config: { expected },
+      },
+      model_offering_id: primaryOfferingId,
+      ...(judgmentOfferingId ? { judgment_model_offering_id: judgmentOfferingId } : {}),
+      max_concurrency: 1,
+      max_wall_time_secs: wall,
+    };
+    await executeIntent(payload);
+  }, [caseId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, versionId, wallTimeSecs]);
+
+  const resumeSavedComparison = useCallback(async () => {
+    if (!savedIntent) return;
+    setError(null);
+    setBusy(true);
+    setExperimentId(savedIntent.experimentId);
+    try {
+      setStatus(`Resuming experiment ${savedIntent.experimentId} from its durable plan…`);
+      const current = await getEvaluationExperiment(savedIntent.experimentId);
+      setProjection(current);
+      const prepared: EvaluationPrepareResponse = {
+        experiment: current.experiment,
+        trials: current.trials.map((trial) => trial.binding),
+        adapter_profile_version: 'persisted-evaluation-plan',
+      };
+      const finalReport = await runPreparedEvaluation(prepared, {
+        waitSecs: 600,
+        onProjection: setProjection,
+      });
+      setReport(finalReport);
+      setProjection(await getEvaluationExperiment(savedIntent.experimentId));
+      setStatus('Evaluation report is ready.');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Saved Evaluation resume failed.');
+      setStatus(`Experiment ${savedIntent.experimentId} remains available for review.`);
+    } finally {
+      setBusy(false);
+    }
+  }, [savedIntent]);
+
+  if (!savedIntentLoaded || (loading && !savedIntent && !pendingSubmission)) {
     return <div className="flex h-full items-center justify-center text-sm text-text-secondary">Loading Evaluation catalog…</div>;
   }
 
-  if (sources.length === 0) {
+  if (sources.length === 0 && !savedIntent && !pendingSubmission) {
     return (
       <div className="h-full overflow-y-auto overscroll-contain px-8 py-8">
         <div className="mx-auto max-w-5xl">
           <PageHeader title="Evaluation" description="Compare a pinned Skill with and without the frozen judgment decision point." />
           <div className="mt-8">
-            <EmptyState
-              icon={Scale}
-              title="No personal Skills available"
-              description="Publish an instruction-only Skill in Harnesses first, then return here to evaluate its behavior."
-            />
+            {error ? (
+              <Card>
+                <div className="flex gap-2 rounded-control border border-danger/30 bg-danger/10 p-3 text-sm text-danger"><AlertTriangle className="mt-0.5 size-4 shrink-0" /><span>{error}</span></div>
+                <Button variant="ghost" leadingIcon={RefreshCw} onClick={loadCatalog} className="mt-4">Retry catalog</Button>
+              </Card>
+            ) : (
+              <EmptyState
+                icon={Scale}
+                title="No personal Skills available"
+                description="Publish an instruction-only Skill in Harnesses first, then return here to evaluate its behavior."
+              />
+            )}
           </div>
         </div>
       </div>
@@ -258,9 +490,19 @@ export function EvaluationPage() {
               <label className="text-sm font-medium">Max wall time per trial
                 <Input type="number" min={1} value={wallTimeSecs} onChange={(event) => setWallTimeSecs(event.target.value)} disabled={busy} className="mt-1.5 w-40" />
               </label>
-              <Button leadingIcon={Play} onClick={runComparison} disabled={busy || !selectedVersion || !message.trim()}>{busy ? 'Running…' : 'Run comparison'}</Button>
+              <Button leadingIcon={Play} onClick={runComparison} disabled={busy || Boolean(pendingSubmission) || !selectedVersion || !message.trim()}>{busy ? 'Running…' : 'Run comparison'}</Button>
             </div>
             <p className="mt-4 text-xs leading-5 text-text-muted">Jev is an enhancement when selected or configured. If it is unavailable, the candidate keeps the basic Skill path and the report cannot establish a Jev benefit.</p>
+            {pendingSubmission ? (
+              <div className="mt-3 rounded-control border border-border bg-surface-muted p-3 text-xs leading-5 text-text-secondary">
+                <p>A submitted comparison is awaiting confirmation. The lookup uses its original submission identity and does not resend the current form.</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button variant="ghost" onClick={retryPendingSubmission} disabled={busy}>Check pending submission</Button>
+                  <Button variant="ghost" onClick={discardPendingSubmission} disabled={busy}>Start a new comparison</Button>
+                </div>
+              </div>
+            ) : null}
+            {savedIntent ? <Button variant="ghost" onClick={resumeSavedComparison} disabled={busy} className="mt-3">Resume saved comparison</Button> : null}
           </Card>
 
           <div className="space-y-5">

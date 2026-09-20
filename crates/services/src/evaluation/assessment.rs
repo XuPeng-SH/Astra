@@ -96,6 +96,30 @@ pub enum TrialStatus {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentExecutionStatus {
+    Disabled,
+    Unavailable,
+    NotDispatched,
+    Negative,
+    Selected,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgmentExecutionObservation {
+    pub operation_id: String,
+    pub status: JudgmentExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrialObservation {
@@ -107,6 +131,8 @@ pub struct TrialObservation {
     pub status: TrialStatus,
     pub measurements: Vec<Measurement>,
     pub evidence: Vec<EvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment: Option<JudgmentExecutionObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +439,7 @@ mod tests {
                 content_hash: None,
                 locator: Some(case_id.to_string()),
             }],
+            judgment: None,
         }
     }
 
@@ -575,6 +602,7 @@ mod tests {
                 content_hash: Some("sha256:evidence".to_string()),
                 locator: Some(trial.trial_id.clone()),
             }],
+            judgment: None,
         }
     }
 

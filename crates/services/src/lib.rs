@@ -385,9 +385,11 @@ pub use session_handoff::{
 };
 pub use session_identity::{MAX_PERSISTED_SESSION_ID_BYTES, validate_persisted_session_id};
 pub use skill_auto_route_judge::{
+    SKILL_AUTO_ROUTE_JUDGMENT_CONTRACT_VERSION, SKILL_AUTO_ROUTE_SINGLE_SKILL_OUTPUT_TOKENS,
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
     SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
-    skill_auto_route_judge_messages, skill_auto_route_judgment_request,
+    skill_auto_route_judge_messages, skill_auto_route_judgment_contract_fingerprint,
+    skill_auto_route_judgment_request,
 };
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,

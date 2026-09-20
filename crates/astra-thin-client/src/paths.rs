@@ -44,6 +44,12 @@ pub fn evaluation_experiment(experiment_id: &str) -> Option<String> {
 }
 
 #[inline]
+pub fn evaluation_experiment_by_submission(submission_idempotency_key: &str) -> Option<String> {
+    is_safe_path_segment(submission_idempotency_key)
+        .then(|| format!("{EVALUATION_EXPERIMENTS}/by-submission/{submission_idempotency_key}"))
+}
+
+#[inline]
 pub fn evaluation_report(experiment_id: &str) -> Option<String> {
     evaluation_experiment(experiment_id).map(|path| format!("{path}/report"))
 }

@@ -33,7 +33,8 @@ pub(crate) struct FrozenEvaluationInputs {
 }
 
 /// Existing auxiliary operation limits, shared by admission and host consumers.
-pub(crate) const SKILL_AUTO_ROUTE_MAX_OUTPUT_TOKENS: usize = 64;
+pub(crate) const SKILL_AUTO_ROUTE_MAX_OUTPUT_TOKENS: usize =
+    astra_services::skill_auto_route_judge::SKILL_AUTO_ROUTE_SINGLE_SKILL_OUTPUT_TOKENS;
 pub(crate) const PRE_TURN_COMPACTION_MAX_OUTPUT_TOKENS: usize = 4_096;
 
 fn proxy_binding_digest(
@@ -82,6 +83,10 @@ pub(crate) fn freeze_skill_routing_policy(
         schema_version: JUDGMENT_POLICY_SCHEMA_VERSION,
         model: Box::new(model),
         auxiliary_policy,
+        judgment_contract_version:
+            astra_services::skill_auto_route_judge::SKILL_AUTO_ROUTE_JUDGMENT_CONTRACT_VERSION,
+        judgment_contract_fingerprint:
+            astra_services::skill_auto_route_judge::skill_auto_route_judgment_contract_fingerprint(),
     };
     policy.validate()?;
     Ok(policy)

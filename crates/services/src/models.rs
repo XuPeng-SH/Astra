@@ -100,6 +100,27 @@ fn validate_pricing_data(pricing: &PricingData) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse the pricing snapshot used for historical accounting.
+///
+/// The public catalog type keeps serde defaults for request ergonomics, but a
+/// persisted route must distinguish an explicitly published zero price from
+/// `{}` or a partial object. Missing required rates therefore become
+/// `None`, while malformed or invalid values fail closed.
+pub fn parse_pricing_snapshot(raw: &str) -> Result<Option<PricingData>, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid pricing JSON snapshot: {error}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("pricing snapshot must be a JSON object".to_string());
+    };
+    if !object.contains_key("prompt") || !object.contains_key("completion") {
+        return Ok(None);
+    }
+    let pricing: PricingData = serde_json::from_value(value)
+        .map_err(|error| format!("invalid pricing JSON snapshot: {error}"))?;
+    validate_pricing_data(&pricing)?;
+    Ok(Some(pricing))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct QuirksData {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1219,10 +1240,7 @@ fn build_resolved_active_llm_from_row(
     let pricing_json: String = row
         .try_get("pricing_json")
         .map_err(|e| format!("invalid infra_llm_models.pricing: {e}"))?;
-    let pricing: PricingData = parse_json_column("pricing_json", &pricing_json)?;
-    if !pricing.is_valid() {
-        return Err("invalid infra_llm_models.pricing values".to_string());
-    }
+    let pricing = parse_pricing_snapshot(&pricing_json)?;
     let api_key = encryptor
         .decrypt(&encrypted)
         .map_err(|e| format!("Decrypt: {e}"))?;
@@ -1305,7 +1323,7 @@ fn build_resolved_active_llm_from_row(
         api_key,
         base_url,
         provider,
-        pricing: Some(pricing),
+        pricing,
         fallback_chain,
         tags,
         request_body_overrides,
@@ -6741,6 +6759,21 @@ mod tests {
         let p: PricingData = serde_json::from_str("{}").unwrap();
         assert_eq!(p.prompt, 0.0);
         assert_eq!(p.completion, 0.0);
+    }
+
+    #[test]
+    fn pricing_snapshot_requires_explicit_billable_rates() {
+        assert_eq!(parse_pricing_snapshot("{}").unwrap(), None);
+        assert_eq!(
+            parse_pricing_snapshot(r#"{"prompt":0,"completion":0}"#).unwrap(),
+            Some(PricingData {
+                prompt: 0.0,
+                completion: 0.0,
+                cache_read: None,
+                cache_write: None,
+            })
+        );
+        assert!(parse_pricing_snapshot(r#"{"prompt":null,"completion":0}"#).is_err());
     }
 
     #[test]

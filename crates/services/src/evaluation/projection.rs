@@ -471,6 +471,7 @@ mod tests {
                 status: TrialStatus::Completed,
                 measurements: Vec::new(),
                 evidence: Vec::new(),
+                judgment: None,
             },
             materialization_receipt_ids: Vec::new(),
             request_fingerprint:
@@ -537,6 +538,7 @@ mod tests {
                     content_hash: None,
                     locator: None,
                 }],
+                judgment: None,
             },
             materialization_receipt_ids: Vec::new(),
             request_fingerprint:

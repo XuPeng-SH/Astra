@@ -85,7 +85,10 @@ pub struct EvaluationRunAdmission {
 }
 
 impl EvaluationRunAdmission {
-    pub fn validate_shape(&self) -> Result<(), String> {
+    /// Validate the durable shape without consulting the current judgment
+    /// implementation. Historical observation repair must keep working after
+    /// a Jev contract evolves.
+    pub fn validate_historical_shape(&self) -> Result<(), String> {
         validate_id("experiment_id", &self.experiment_id, MAX_ID_BYTES)?;
         validate_id("trial_id", &self.trial_id, MAX_ID_BYTES)?;
         validate_hash("input_content_hash", &self.input_content_hash)?;
@@ -99,11 +102,22 @@ impl EvaluationRunAdmission {
             }
         }
         if let Some(judgment_policy) = &self.judgment_policy {
-            judgment_policy.validate()?;
+            judgment_policy.validate_historical()?;
         }
         validate_receipt_ids(&self.receipt_ids).map_err(|error| error.to_string())?;
         if let Some(envelope) = &self.snapshot_envelope {
             envelope.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validate a new/current admission against the implementation that will
+    /// execute it. Historical readers must use
+    /// [`Self::validate_historical_shape`] instead.
+    pub fn validate_shape(&self) -> Result<(), String> {
+        self.validate_historical_shape()?;
+        if let Some(judgment_policy) = &self.judgment_policy {
+            judgment_policy.validate()?;
         }
         Ok(())
     }
@@ -667,7 +681,7 @@ async fn load_admission_tx(
                 }
             })?;
         admission
-            .validate_shape()
+            .validate_historical_shape()
             .map_err(EvaluationExecutionError::Conflict)?;
         let admission_run_generation = if event_type == "run_started" {
             event.pointer("/data/owner_generation")
@@ -738,7 +752,7 @@ fn validate_admission_for_observation(
             "admission generation differs from observation".into(),
         ));
     }
-    validate_admission_for_trial(
+    validate_historical_admission_for_trial(
         spec,
         binding,
         owner_user_id,
@@ -754,9 +768,50 @@ pub(crate) fn validate_admission_for_trial(
     session_id: &str,
     admission: &EvaluationRunAdmission,
 ) -> Result<(), EvaluationExecutionError> {
-    admission
-        .validate_shape()
-        .map_err(EvaluationExecutionError::InvalidInput)?;
+    validate_admission_for_trial_with_policy_validation(
+        spec,
+        binding,
+        owner_user_id,
+        session_id,
+        admission,
+        false,
+    )
+}
+
+fn validate_historical_admission_for_trial(
+    spec: &ExperimentSpec,
+    binding: &EvaluationTrialBindingRecord,
+    owner_user_id: &str,
+    session_id: &str,
+    admission: &EvaluationRunAdmission,
+) -> Result<(), EvaluationExecutionError> {
+    validate_admission_for_trial_with_policy_validation(
+        spec,
+        binding,
+        owner_user_id,
+        session_id,
+        admission,
+        true,
+    )
+}
+
+fn validate_admission_for_trial_with_policy_validation(
+    spec: &ExperimentSpec,
+    binding: &EvaluationTrialBindingRecord,
+    owner_user_id: &str,
+    session_id: &str,
+    admission: &EvaluationRunAdmission,
+    historical: bool,
+) -> Result<(), EvaluationExecutionError> {
+    if historical {
+        admission
+            .validate_historical_shape()
+            .map_err(EvaluationExecutionError::InvalidInput)?;
+    } else {
+        admission
+            .validate_shape()
+            .map_err(EvaluationExecutionError::InvalidInput)?;
+    }
     let revision = match binding.trial.arm {
         ComparisonArm::Baseline => &spec.target.baseline,
         ComparisonArm::Candidate => &spec.target.candidate,
@@ -1612,9 +1667,34 @@ pub fn terminal_run_observation(
                 "tokens",
             ),
             measurement("tool_calls", tool_calls.map(|value| value as f64), "calls"),
+            measurement("context_snapshot_match", None, "boolean"),
             measurement("run_completed", Some(run_completed as u8 as f64), "boolean"),
         ],
         evidence,
+        judgment: None,
+    }
+}
+
+/// Mark the Context requirement only after the canonical lifecycle has
+/// durably recorded the exact frozen Context proof immediately before provider
+/// execution. A missing proof remains missing; it is never converted to false
+/// or inferred from a snapshot declaration.
+pub fn apply_context_evidence(observation: &mut TrialObservation) {
+    let measurement = Measurement {
+        name: "context_snapshot_match".to_string(),
+        value: Some(1.0),
+        unit: "boolean".to_string(),
+        status: MeasurementStatus::Observed,
+        basis: Some("canonical_evaluation_context".to_string()),
+    };
+    if let Some(existing) = observation
+        .measurements
+        .iter_mut()
+        .find(|existing| existing.name == measurement.name)
+    {
+        *existing = measurement;
+    } else {
+        observation.measurements.push(measurement);
     }
 }
 
@@ -1866,6 +1946,42 @@ mod tests {
                 Some("canonical_run_accounting")
             );
         }
+    }
+
+    #[test]
+    fn context_measurement_requires_the_canonical_context_proof() {
+        let mut observation = terminal_run_observation(
+            "fingerprint".into(),
+            "trial".into(),
+            "case".into(),
+            ComparisonArm::Baseline,
+            0,
+            TrialStatus::Completed,
+            None,
+            None,
+            None,
+            vec![],
+        );
+        let context = observation
+            .measurements
+            .iter()
+            .find(|item| item.name == "context_snapshot_match")
+            .expect("Context requirement is always represented");
+        assert_eq!(context.status, MeasurementStatus::Missing);
+        assert_eq!(context.value, None);
+
+        apply_context_evidence(&mut observation);
+        let context = observation
+            .measurements
+            .iter()
+            .find(|item| item.name == "context_snapshot_match")
+            .expect("Context measurement remains present");
+        assert_eq!(context.status, MeasurementStatus::Observed);
+        assert_eq!(context.value, Some(1.0));
+        assert_eq!(
+            context.basis.as_deref(),
+            Some("canonical_evaluation_context")
+        );
     }
 
     #[test]

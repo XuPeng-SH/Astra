@@ -326,7 +326,7 @@ pub fn build_prepared_experiment_spec(
         measurement_profile:
             crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
     };
-    spec.validate()
+    spec.validate_for_current_execution()
         .map_err(EvaluationBootstrapError::InvalidInput)?;
     Ok(spec)
 }

@@ -25,8 +25,9 @@ pub use api::{
 };
 pub use assessment::{
     ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport,
-    EvidenceAvailability, EvidenceKind, EvidenceRef, Measurement, MeasurementStatus,
-    TrialObservation, TrialStatus, build_comparison_for_plan, render_markdown,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, JudgmentExecutionObservation,
+    JudgmentExecutionStatus, Measurement, MeasurementStatus, TrialObservation, TrialStatus,
+    build_comparison_for_plan, render_markdown,
 };
 pub use bootstrap::{
     EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError, EvaluationTrialStartPlan,
@@ -42,10 +43,10 @@ pub use execution::{
     DatabaseEvaluationObservationStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
     EvaluationAdmissionMarker, EvaluationExecutionError, EvaluationObservationRecord,
     EvaluationObservationRequest, EvaluationPolicyFingerprintInput, EvaluationRunAdmission,
-    EvaluationSkillRevision, apply_inference_evidence, apply_tool_outcome_evidence,
-    content_fingerprint, evaluation_component_idempotency_key, evaluation_policy_fingerprint,
-    prompt_context_fingerprint, prompt_only_snapshot_envelope, prompt_policy_fingerprint,
-    terminal_run_observation,
+    EvaluationSkillRevision, apply_context_evidence, apply_inference_evidence,
+    apply_tool_outcome_evidence, content_fingerprint, evaluation_component_idempotency_key,
+    evaluation_policy_fingerprint, prompt_context_fingerprint, prompt_only_snapshot_envelope,
+    prompt_policy_fingerprint, terminal_run_observation,
 };
 pub use execution_config::{
     EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION, EVALUATION_RUNTIME_CONTRACT_VERSION,
@@ -70,8 +71,9 @@ pub use projection::{
 };
 pub use report::{
     EVALUATION_REPORT_RENDERER_VERSION, EVALUATION_REPORT_SCHEMA_VERSION, EvaluationReportArtifact,
-    EvaluationReportCoverage, EvaluationReportManifest, EvaluationReportObservationRef,
-    build_report_artifact, validate_report_label,
+    EvaluationReportCoverage, EvaluationReportJudgmentSummary, EvaluationReportJudgmentTrial,
+    EvaluationReportManifest, EvaluationReportObservationRef, build_report_artifact,
+    validate_report_label,
 };
 pub use service::EvaluationService;
 pub use types::*;

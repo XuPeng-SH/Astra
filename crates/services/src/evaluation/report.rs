@@ -5,9 +5,13 @@
 //! observation. The same facts and renderer version therefore produce the
 //! same content identity across TUI, Web, and Server readers.
 
-use super::assessment::{ComparisonReport, build_comparison_for_plan, render_markdown};
+use super::assessment::{
+    ComparisonArm, ComparisonReport, JudgmentExecutionStatus, TrialObservation,
+    build_comparison_for_plan, render_markdown,
+};
 use super::durable::EvaluationExperimentRecord;
 use super::execution::{EvaluationObservationRecord, content_fingerprint};
+use super::experiment::{EvaluationJudgmentPolicy, EvaluationTargetKind, FrozenSkillRoutingPolicy};
 use super::task_assessment::TaskAssessmentRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,6 +31,69 @@ pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn build_judgment_summary(
+    spec: &super::experiment::ExperimentSpec,
+    observations: &[TrialObservation],
+) -> Result<Option<EvaluationReportJudgmentSummary>, String> {
+    if spec.target.kind != EvaluationTargetKind::SkillRoutingJudgment {
+        return Ok(None);
+    }
+    let EvaluationJudgmentPolicy::SkillRouting { candidate } = &spec.target.judgment_policy else {
+        return Err("Skill routing target is missing its frozen judgment policy".to_string());
+    };
+    candidate.validate_historical()?;
+    let candidate_trial_ids = spec
+        .plan_trials()
+        .map_err(|error| format!("invalid frozen evaluation plan: {error}"))?
+        .into_iter()
+        .filter(|trial| trial.arm == ComparisonArm::Candidate)
+        .map(|trial| trial.trial_id)
+        .collect::<Vec<_>>();
+    let mut trials = Vec::with_capacity(candidate_trial_ids.len());
+    let mut missing_trial_ids = Vec::new();
+    for trial_id in candidate_trial_ids {
+        let observation = observations.iter().find(|item| item.trial_id == trial_id);
+        let judgment = observation.and_then(|item| item.judgment.as_ref());
+        if judgment.is_none() {
+            missing_trial_ids.push(trial_id.clone());
+        }
+        let evidence_available = judgment
+            .and_then(|item| item.evidence_id.as_ref())
+            .is_some_and(|evidence_id| {
+                observation.is_some_and(|item| {
+                    item.evidence.iter().any(|evidence| {
+                        evidence.evidence_id == *evidence_id
+                            && evidence.availability
+                                == super::assessment::EvidenceAvailability::Available
+                    })
+                })
+            });
+        trials.push(EvaluationReportJudgmentTrial {
+            trial_id,
+            status: judgment.map(|item| item.status.clone()),
+            skill_name: judgment.and_then(|item| item.skill_name.clone()),
+            reason: judgment.and_then(|item| item.reason.clone()),
+            evidence_available,
+        });
+    }
+    let coverage_incomplete = !missing_trial_ids.is_empty()
+        || trials.iter().any(|trial| {
+            matches!(
+                trial.status,
+                None | Some(JudgmentExecutionStatus::Unavailable)
+                    | Some(JudgmentExecutionStatus::NotDispatched)
+                    | Some(JudgmentExecutionStatus::Failed)
+            ) || !trial.evidence_available
+        });
+    Ok(Some(EvaluationReportJudgmentSummary {
+        operation_id: "skill_auto_route".to_string(),
+        candidate_policy: (**candidate).clone(),
+        trials,
+        missing_trial_ids,
+        coverage_incomplete,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +135,26 @@ pub struct EvaluationMetricGap {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct EvaluationReportJudgmentTrial {
+    pub trial_id: String,
+    pub status: Option<JudgmentExecutionStatus>,
+    pub skill_name: Option<String>,
+    pub reason: Option<String>,
+    pub evidence_available: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationReportJudgmentSummary {
+    pub operation_id: String,
+    pub candidate_policy: FrozenSkillRoutingPolicy,
+    pub trials: Vec<EvaluationReportJudgmentTrial>,
+    pub missing_trial_ids: Vec<String>,
+    pub coverage_incomplete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationReportManifest {
     pub schema_version: u32,
     pub owner_user_id: String,
@@ -77,6 +164,7 @@ pub struct EvaluationReportManifest {
     pub assessment_refs: Vec<EvaluationReportAssessmentRef>,
     pub renderer_version: String,
     pub coverage: EvaluationReportCoverage,
+    pub judgment: Option<EvaluationReportJudgmentSummary>,
     pub report_content_hash: String,
     /// Identity of the complete report artifact, including coverage and the
     /// exact evidence references that produced the rendered content.
@@ -238,6 +326,7 @@ pub fn build_report_artifact(
             "Paired observations exist, but unavailable trial status evidence limits the conclusion; do not claim a complete improvement.".to_string()
         };
     }
+    let judgment = build_judgment_summary(&experiment.spec, &report.observations)?;
     let observation_refs = observation_refs_by_id.into_values().collect::<Vec<_>>();
     let mut markdown = render_markdown(&report);
     markdown.push_str("\n## Task criteria\n\n| Trial | Criterion result |\n| --- | --- |\n");
@@ -262,6 +351,41 @@ pub fn build_report_artifact(
             None => "Not assessed",
         };
         markdown.push_str(&format!("| `{trial_id}` | {result} |\n"));
+    }
+    if let Some(judgment) = judgment.as_ref() {
+        markdown.push_str(
+            "\n## Judgment coverage\n\nThe candidate's frozen `skill_auto_route` decision is reported separately from task criteria and run metrics.\n\n",
+        );
+        markdown.push_str(
+            "| Trial | Judgment status | Evidence | Detail |\n| --- | --- | --- | --- |\n",
+        );
+        for trial in &judgment.trials {
+            let status = trial
+                .status
+                .as_ref()
+                .map(|value| format!("{value:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "missing".to_string());
+            let evidence = if trial.evidence_available {
+                "available"
+            } else {
+                "missing"
+            };
+            let detail = trial
+                .skill_name
+                .as_deref()
+                .or(trial.reason.as_deref())
+                .unwrap_or("");
+            markdown.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                trial.trial_id, status, evidence, detail
+            ));
+        }
+        if !judgment.missing_trial_ids.is_empty() {
+            markdown.push_str(&format!(
+                "\nMissing judgment outcomes: {}.\n",
+                judgment.missing_trial_ids.join(", ")
+            ));
+        }
     }
     let mut metric_gaps = Vec::new();
     for trial_id in &planned_trial_ids {
@@ -289,6 +413,8 @@ pub fn build_report_artifact(
                     && item.basis.as_deref().is_some_and(|basis| {
                         basis.starts_with("evaluation_inference_evidence.v")
                             || basis == "canonical_evaluation_materialization"
+                            || (metric == "context_snapshot_match"
+                                && basis == "canonical_evaluation_context")
                             || (metric == "run_completed" && basis == "canonical_run_settlement")
                             || (matches!(
                                 metric,
@@ -355,6 +481,9 @@ pub fn build_report_artifact(
         unavailable_trial_ids,
         evidence_incomplete: !metric_gaps.is_empty()
             || !report.unavailable.is_empty()
+            || judgment
+                .as_ref()
+                .is_some_and(|value| value.coverage_incomplete)
             || evidence_incomplete,
         metric_gaps,
     };
@@ -366,6 +495,7 @@ pub fn build_report_artifact(
         "observation_refs": observation_refs.clone(),
         "assessment_refs": assessment_refs.clone(),
         "coverage": coverage.clone(),
+        "judgment": judgment.clone(),
     });
     let report_content_hash = content_fingerprint(
         &serde_json::to_string(&report_payload)
@@ -381,6 +511,7 @@ pub fn build_report_artifact(
             "observation_refs": observation_refs.clone(),
             "assessment_refs": assessment_refs.clone(),
             "coverage": coverage.clone(),
+            "judgment": judgment.clone(),
         }))
         .map_err(|error| format!("serialize report artifact identity: {error}"))?,
     );
@@ -394,6 +525,7 @@ pub fn build_report_artifact(
             assessment_refs,
             renderer_version: EVALUATION_REPORT_RENDERER_VERSION.to_string(),
             coverage,
+            judgment,
             report_content_hash,
             artifact_fingerprint,
             artifact_reference: None,
@@ -528,6 +660,7 @@ mod tests {
                         content_hash: Some(format!("sha256:{}", "a".repeat(64))),
                         locator: Some(format!("run://run-{index}")),
                     }],
+                    judgment: None,
                 },
                 materialization_receipt_ids: vec![format!("receipt-{index}")],
                 request_fingerprint: format!("sha256:{}", "b".repeat(64)),

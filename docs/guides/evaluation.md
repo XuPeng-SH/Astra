@@ -31,7 +31,11 @@ server freeze the value configured for the authenticated user, including a Jev
 Offering from `.models.yaml`; choosing an Offering freezes that exact value.
 The page only displays server projections and report coverage, so an
 interrupted browser run remains durable and can be resumed through the CLI
-with the same intent; the page displays the experiment ID for that review.
+or Web page. The browser keeps only the owner/runtime-scoped experiment
+reference and, while `prepare` is in flight, its submission idempotency key;
+if the prepare response is lost, the page resolves that key on the server
+before offering resume. Prompt and verifier content are not browser recovery
+state.
 
 ## Prepare the comparison
 
@@ -106,7 +110,8 @@ validity is successful requested calls divided by requested calls; a run with
 no requested call has no validity ratio. Policy violations count attempted calls
 rejected by the explicit policy/safety boundary. Cost comes from every physical
 inference attempt and remains unavailable when usage, terminal state, or the
-admitted route price is missing.
+admitted route price is missing. Provider fallback count remains unknown until
+the ledger records an explicit transition fact.
 
 See the [Evaluation contract](../design/evaluation.md) for persistence,
 isolation, and evidence ownership.

@@ -128,6 +128,21 @@ pub async fn prepare_experiment_handler(
     Ok((StatusCode::OK, Json(response)))
 }
 
+pub async fn get_experiment_by_submission_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(submission_idempotency_key): Path<String>,
+) -> Result<Json<EvaluationExperimentRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let store = DatabaseEvaluationPlanStore::new(evaluation_pool(&state)?);
+    let record = store
+        .load_experiment_by_submission(&user.user_id, &submission_idempotency_key)
+        .await
+        .map_err(map_evaluation_persistence_error)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Evaluation submission not found"))?;
+    Ok(Json(record))
+}
+
 pub async fn start_trial_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

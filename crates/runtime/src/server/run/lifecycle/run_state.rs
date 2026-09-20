@@ -415,6 +415,7 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                         | "run_waiting"
                         | "run_finished"
                         | "evaluation_skill_invoked"
+                        | "evaluation_judgment"
                         // Keep reasoning/thinking completion markers, not raw
                         // chain-of-thought content or incremental deltas.
                         | "reasoning_done"
@@ -517,6 +518,8 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "reasoning_done"
                 | "thinking_done"
                 | "evaluation_skill_invoked"
+                | "evaluation_context_admitted"
+                | "evaluation_judgment"
         )
     )
 }

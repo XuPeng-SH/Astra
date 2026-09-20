@@ -51,10 +51,11 @@ use astra_services::evaluation::{
     DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
     DatabaseMaterializationReceiptStore, EvaluationObservationRequest,
     EvaluationPolicyFingerprintInput, EvaluationRunAdmission, EvaluationSkillRevision,
-    EvidenceAvailability, EvidenceKind, EvidenceRef, MaterializationComponentKind,
-    MaterializationOutcome, MaterializationReceiptRequest, Measurement, MeasurementStatus,
-    TrialStatus, TrustedMaterializerContext, apply_inference_evidence, apply_tool_outcome_evidence,
-    content_fingerprint, evaluation_component_idempotency_key, evaluation_policy_fingerprint,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, JudgmentExecutionObservation,
+    JudgmentExecutionStatus, MaterializationComponentKind, MaterializationOutcome,
+    MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
+    apply_inference_evidence, apply_tool_outcome_evidence, content_fingerprint,
+    evaluation_component_idempotency_key, evaluation_policy_fingerprint,
     prompt_context_fingerprint, prompt_only_snapshot_envelope, terminal_run_observation,
 };
 use astra_services::runs::{
@@ -15677,6 +15678,53 @@ async fn revalidate_evaluation_before_provider(
     Ok(())
 }
 
+/// Persist the last Context proof before the shared agentic loop can cross the
+/// provider boundary. This event is the durable join between frozen Context
+/// identity and actual execution admission; the run's immutable request keeps
+/// the proof valid for the loop that follows it.
+async fn admit_evaluation_context_before_provider(
+    run_engine: &RunEngine,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: &EvaluationRunAdmission,
+) -> Result<(), String> {
+    let envelope = admission
+        .snapshot_envelope
+        .as_ref()
+        .ok_or_else(|| "evaluation admission has no snapshot envelope".to_string())?;
+    let event = json!({
+        "event_type": "evaluation_context_admitted",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-context-admitted:{run_id}:{run_generation}"),
+        "data": {
+            "schema_version": astra_services::evaluation::EVALUATION_EXECUTION_SCHEMA_VERSION,
+            "trial_id": admission.trial_id,
+            "input_content_hash": admission.input_content_hash,
+            "context_snapshot_hash": envelope.context_snapshot_hash,
+            "policy_snapshot_hash": envelope.policy_snapshot_hash,
+            "snapshot_id": envelope.snapshot_id,
+            "snapshot_fingerprint": envelope.snapshot_fingerprint,
+        },
+    });
+    let appended = run_engine
+        .append_events_if_current_generation_and_status(
+            owner_user_id,
+            session_id,
+            run_id,
+            run_generation,
+            &[STATUS_RUNNING],
+            std::slice::from_ref(&event),
+        )
+        .await?;
+    if appended {
+        Ok(())
+    } else {
+        Err("evaluation Context authority changed before provider admission".to_string())
+    }
+}
+
 async fn persist_evaluation_observation_after_settlement(
     run_engine: &RunEngine,
     pool: Option<&SharedPool>,
@@ -15805,6 +15853,44 @@ async fn persist_evaluation_observation_after_settlement(
             .map(content_fingerprint),
         locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
     }];
+    let context_event = evidence_index.and_then(|index| {
+        canonical_events[..=index].iter().find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_context_admitted")
+                && event
+                    .get("run_generation")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|generation| {
+                        generation == run_generation || generation == admission_run_generation
+                    })
+                && event.pointer("/data/trial_id").and_then(Value::as_str)
+                    == Some(binding.trial_id.as_str())
+                && event
+                    .pointer("/data/input_content_hash")
+                    .and_then(Value::as_str)
+                    == Some(binding.trial.input_content_hash.as_str())
+                && event
+                    .pointer("/data/context_snapshot_hash")
+                    .and_then(Value::as_str)
+                    == Some(experiment.spec.conditions.context_snapshot_hash.as_str())
+                && event
+                    .pointer("/data/policy_snapshot_hash")
+                    .and_then(Value::as_str)
+                    == Some(experiment.spec.conditions.tool_policy_hash.as_str())
+        })
+    });
+    let context_evidence_id = format!("context-evidence:{run_id}:{admission_run_generation}");
+    let context_event_json = context_event.map(serde_json::to_string).transpose()?;
+    evidence.push(EvidenceRef {
+        evidence_id: context_evidence_id,
+        kind: EvidenceKind::Trace,
+        availability: if context_event_json.is_some() {
+            EvidenceAvailability::Available
+        } else {
+            EvidenceAvailability::Missing
+        },
+        content_hash: context_event_json.as_deref().map(content_fingerprint),
+        locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+    });
     if let Some(skill_revision) = admission.skill_revision.as_ref() {
         let skill_event = evidence_index.and_then(|index| {
             canonical_events[..=index].iter().find(|event| {
@@ -15847,14 +15933,82 @@ async fn persist_evaluation_observation_after_settlement(
     if let Some(tool_outcomes) = tool_outcomes.as_ref() {
         apply_tool_outcome_evidence(&mut observation, tool_outcomes);
     }
-    if admission.snapshot_envelope.is_some() && !admission.receipt_ids.is_empty() {
-        observation.measurements.push(Measurement {
-            name: "context_snapshot_match".to_string(),
-            value: Some(1.0),
-            unit: "boolean".to_string(),
-            status: MeasurementStatus::Observed,
-            basis: Some("canonical_evaluation_materialization".to_string()),
-        });
+    if context_event_json.is_some() {
+        astra_services::evaluation::apply_context_evidence(&mut observation);
+    }
+    if let Some(policy) = admission.judgment_policy.as_ref() {
+        match policy {
+            astra_services::evaluation::FrozenSkillRoutingPolicy::Unavailable {
+                reason, ..
+            } => {
+                observation.judgment = Some(JudgmentExecutionObservation {
+                    operation_id: "skill_auto_route".to_string(),
+                    status: JudgmentExecutionStatus::Unavailable,
+                    skill_name: None,
+                    reason: Some(reason.clone()),
+                    evidence_id: None,
+                });
+            }
+            astra_services::evaluation::FrozenSkillRoutingPolicy::Available { .. } => {
+                let judgment_event = evidence_index.and_then(|index| {
+                    canonical_events[..=index].iter().find(|event| {
+                        event.get("event_type").and_then(Value::as_str)
+                            == Some("evaluation_judgment")
+                            && event.get("run_generation").and_then(Value::as_u64)
+                                == Some(admission_run_generation)
+                            && event.pointer("/data/operation_id").and_then(Value::as_str)
+                                == Some("skill_auto_route")
+                    })
+                });
+                let judgment_evidence_id =
+                    format!("judgment-evidence:{run_id}:{admission_run_generation}");
+                let judgment_event_json = judgment_event.map(serde_json::to_string).transpose()?;
+                observation.evidence.push(EvidenceRef {
+                    evidence_id: judgment_evidence_id.clone(),
+                    kind: EvidenceKind::Trace,
+                    availability: if judgment_event_json.is_some() {
+                        EvidenceAvailability::Available
+                    } else {
+                        EvidenceAvailability::Missing
+                    },
+                    content_hash: judgment_event_json.as_deref().map(content_fingerprint),
+                    locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+                });
+                observation.judgment = Some(match judgment_event {
+                    Some(event) => {
+                        let data = event.get("data").unwrap_or(&Value::Null);
+                        let status = match data.get("status").and_then(Value::as_str) {
+                            Some("disabled") => JudgmentExecutionStatus::Disabled,
+                            Some("not_dispatched") => JudgmentExecutionStatus::NotDispatched,
+                            Some("negative") => JudgmentExecutionStatus::Negative,
+                            Some("selected") => JudgmentExecutionStatus::Selected,
+                            Some("failed") => JudgmentExecutionStatus::Failed,
+                            _ => JudgmentExecutionStatus::Failed,
+                        };
+                        JudgmentExecutionObservation {
+                            operation_id: "skill_auto_route".to_string(),
+                            status,
+                            skill_name: data
+                                .get("skill_name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            reason: data
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            evidence_id: Some(judgment_evidence_id.clone()),
+                        }
+                    }
+                    None => JudgmentExecutionObservation {
+                        operation_id: "skill_auto_route".to_string(),
+                        status: JudgmentExecutionStatus::NotDispatched,
+                        skill_name: None,
+                        reason: Some("no_durable_judgment_outcome".to_string()),
+                        evidence_id: Some(judgment_evidence_id.clone()),
+                    },
+                });
+            }
+        }
     }
     match astra_services::load_evaluation_inference_evidence(
         pool,
@@ -15866,22 +16020,47 @@ async fn persist_evaluation_observation_after_settlement(
     )
     .await
     {
+        Ok(inference) if inference.settlement_pending => {
+            tracing::debug!(
+                owner_user_id,
+                session_id,
+                run_id,
+                "evaluation inference settlement is still pending; observation remains repairable"
+            );
+            return Ok(EvaluationObservationRepairOutcome::NotReady);
+        }
         Ok(inference) => apply_inference_evidence(&mut observation, &inference),
+        Err(error)
+            if matches!(
+                error.kind,
+                astra_services::ServiceErrorKind::Persistence
+                    | astra_services::ServiceErrorKind::Network
+                    | astra_services::ServiceErrorKind::ConflictTransient
+                    | astra_services::ServiceErrorKind::Internal
+            ) =>
+        {
+            tracing::warn!(
+                owner_user_id,
+                session_id,
+                run_id,
+                %error,
+                "evaluation inference evidence storage is temporarily unavailable; observation remains repairable"
+            );
+            return Err(EvaluationObservationRepairError::StorageUnavailable);
+        }
         Err(error) => {
             tracing::warn!(
                 owner_user_id,
                 session_id,
                 run_id,
                 %error,
-                "evaluation inference evidence could not be projected into the observation"
+                "evaluation inference evidence failed its integrity check"
             );
-            observation.evidence.push(EvidenceRef {
-                evidence_id: format!("inference-evidence:{run_id}"),
-                kind: EvidenceKind::Trace,
-                availability: EvidenceAvailability::Missing,
-                content_hash: None,
-                locator: Some(format!("inference://{owner_user_id}/{session_id}/{run_id}")),
-            });
+            return Err(EvaluationObservationRepairError::Execution(
+                astra_services::evaluation::EvaluationExecutionError::Conflict(format!(
+                    "inference evidence integrity failure: {error}"
+                )),
+            ));
         }
     }
     let request = EvaluationObservationRequest {
@@ -15950,6 +16129,47 @@ fn evaluation_skill_invocation_event(
             "invoked_at_turn": invocation.invoked_at_turn,
             "reentry_count": invocation.reentry_count,
         },
+    }))
+}
+
+fn evaluation_judgment_event(
+    admission: Option<&EvaluationRunAdmission>,
+    outcome: Option<crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome>,
+    run_id: &str,
+    run_generation: u64,
+) -> Option<Value> {
+    let admission = admission?;
+    admission.judgment_policy.as_ref()?;
+    let outcome = outcome?;
+    let mut data = serde_json::Map::new();
+    data.insert("operation_id".to_string(), json!("skill_auto_route"));
+    match outcome {
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Disabled => {
+            data.insert("status".to_string(), json!("disabled"));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::NotDispatched {
+            reason,
+        } => {
+            data.insert("status".to_string(), json!("not_dispatched"));
+            data.insert("reason".to_string(), json!(reason));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Negative => {
+            data.insert("status".to_string(), json!("negative"));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Selected { skill_name } => {
+            data.insert("status".to_string(), json!("selected"));
+            data.insert("skill_name".to_string(), json!(skill_name));
+        }
+        crate::turn::agentic_loop::host::SkillAutoRouteJudgmentOutcome::Failed { reason } => {
+            data.insert("status".to_string(), json!("failed"));
+            data.insert("reason".to_string(), json!(reason));
+        }
+    }
+    Some(json!({
+        "event_type": "evaluation_judgment",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-judgment:{run_id}:{run_generation}"),
+        "data": Value::Object(data),
     }))
 }
 
@@ -16247,19 +16467,36 @@ impl AgenticRunLifecycleService {
                 // receipt set immediately before entering the agentic loop,
                 // so an expired or recovered evaluation never reaches the
                 // provider boundary.
-                if let Some(admission) = bg_eval_admission.as_ref()
-                    && let Err(error) = revalidate_evaluation_before_provider(
-                        &run_engine,
-                        bg_shared_pool.as_ref(),
-                        &bg_user_id,
-                        &bg_session_id,
-                        &bg_run_id,
-                        execution_owner_generation,
-                        admission,
-                        request.admitted_execution_deadline,
-                    )
-                    .await
-                {
+                let evaluation_provider_preflight_error =
+                    if let Some(admission) = bg_eval_admission.as_ref() {
+                        match revalidate_evaluation_before_provider(
+                            &run_engine,
+                            bg_shared_pool.as_ref(),
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                            admission,
+                            request.admitted_execution_deadline,
+                        )
+                        .await
+                        {
+                            Ok(()) => admit_evaluation_context_before_provider(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                execution_owner_generation,
+                                admission,
+                            )
+                            .await
+                            .err(),
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(error) = evaluation_provider_preflight_error {
                     drop(execution_permit);
                     park_server_root_mailbox(&mut loop_state).await;
                     let committed = Self::fail_started_run_before_spawn_with_handles(
@@ -16397,6 +16634,14 @@ impl AgenticRunLifecycleService {
                 if let Some(event) = evaluation_skill_invocation_event(
                     bg_eval_admission.as_ref(),
                     &loop_state,
+                    &bg_run_id,
+                    execution_owner_generation,
+                ) {
+                    events.push(event);
+                }
+                if let Some(event) = evaluation_judgment_event(
+                    bg_eval_admission.as_ref(),
+                    host.take_skill_auto_route_judgment_outcome(),
                     &bg_run_id,
                     execution_owner_generation,
                 ) {

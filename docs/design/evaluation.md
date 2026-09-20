@@ -205,9 +205,11 @@ not prove scoped assessment or complete collection. The canonical run
 accounting event supplies requested/executed tool counts, tool validity as
 `successful_requested / requested`, and attempted policy denials; a trial with
 no requested tool call has no tool-validity ratio. The physical inference
-ledger supplies prompt/completion usage, fallback count, latency, provider
-binding, and cost only when every logical invocation, physical attempt, exact
-usage fact, terminal state, and frozen route pricing snapshot is covered.
+ledger supplies prompt/completion usage, latency, provider binding, and cost
+only when every logical invocation, physical attempt, exact usage fact, terminal
+state, and frozen route pricing snapshot is covered. Provider fallback count
+remains a visible metric gap until the ledger records an explicit transition
+fact.
 Missing prices or usage remain gaps. Freezing a profile does not imply
 verifier execution or a monetary estimate.
 
@@ -296,6 +298,10 @@ The generic control-plane API exposes five owner-authenticated operations:
   for trusted/internal callers that already have a complete `ExperimentSpec`;
 * `GET /evaluation/experiments/{experiment_id}` reads a consistent projection
   of the plan, binding, canonical Run status, and terminal observations; and
+* `GET /evaluation/experiments/by-submission/{submission_idempotency_key}` is
+  an owner-scoped recovery lookup for a lost prepare response. It returns the
+  already registered experiment identity and never accepts new execution
+  input; and
 * `GET /evaluation/experiments/{experiment_id}/report` returns the structured
   comparison, deterministic Markdown, coverage, observation references, and
   content/artifact fingerprints.

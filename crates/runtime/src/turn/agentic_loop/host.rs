@@ -191,6 +191,20 @@ pub struct SkillAutoRouteDecision {
     pub skill_name: String,
 }
 
+/// Durable classification of the one optional Skill auto-route boundary.
+///
+/// The loop records this separately from the selected Skill so a report can
+/// distinguish a deliberate negative decision, an unavailable judge, and a
+/// judge that was never dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillAutoRouteJudgmentOutcome {
+    Disabled,
+    NotDispatched { reason: String },
+    Negative,
+    Selected { skill_name: String },
+    Failed { reason: String },
+}
+
 pub struct SkillAutoRouteJudgeContext<'a> {
     pub query: &'a str,
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
@@ -800,6 +814,14 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Evaluation's fixed Skill adapter has already admitted the query and
+    /// one owner-scoped catalog entry. It may run its frozen judgment without
+    /// fabricating a mutable Work/TurnIntent decision. Ordinary hosts keep the
+    /// stricter producer-owned intent requirement.
+    fn allows_skill_auto_route_without_turn_intent(&self) -> bool {
+        false
+    }
+
     /// Optional semantic judge for pre-routing directly into one skill.
     ///
     /// Hosts may override this only when they have an explicit structured
@@ -810,6 +832,13 @@ pub trait AgenticLoopHost: Send {
         _state: &AgenticLoopState,
         _ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
+        None
+    }
+
+    /// Drain the durable outcome of the optional Skill auto-route judgment.
+    /// The lifecycle owner turns it into a canonical run event before
+    /// settlement. Hosts without this boundary return no outcome.
+    fn take_skill_auto_route_judgment_outcome(&mut self) -> Option<SkillAutoRouteJudgmentOutcome> {
         None
     }
 
