@@ -10813,8 +10813,10 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             allow_tools: request.allow_tools.as_deref(),
             enabled_tools: request.enabled_tools.as_deref(),
             runtime_profile: request.runtime_profile.as_ref(),
+            workspace_execution: None,
         },
-    );
+    )
+    .unwrap();
     let experiment_id = format!("eval-runtime-exp-{}", Uuid::new_v4());
     let spec = astra_services::evaluation::ExperimentSpec {
         schema_version: 1,
@@ -12006,8 +12008,10 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             allow_tools: request.allow_tools.as_deref(),
             enabled_tools: request.enabled_tools.as_deref(),
             runtime_profile: request.runtime_profile.as_ref(),
+            workspace_execution: None,
         },
-    );
+    )
+    .unwrap();
     let experiment_id = format!("eval-skill-exp-{}", Uuid::new_v4());
     let spec = astra_services::evaluation::ExperimentSpec {
         schema_version: 1,

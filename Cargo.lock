@@ -537,6 +537,7 @@ name = "astra-sandbox"
 version = "0.2.7"
 dependencies = [
  "astra-core",
+ "astra-runtime-env",
  "astra-skills",
  "libc",
  "nix 0.31.3",

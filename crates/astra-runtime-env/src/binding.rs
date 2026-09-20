@@ -703,6 +703,9 @@ pub struct RuntimeEnvironmentAdvertisement {
     pub binding: RunBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_source: Option<WorkspaceSourceIdentity>,
+    /// Actual provider capability; ordinary workspace providers make no claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_confinement: Option<crate::WorkspaceConfinementContract>,
 }
 
 impl RuntimeEnvironmentAdvertisement {
@@ -713,6 +716,7 @@ impl RuntimeEnvironmentAdvertisement {
             schema_version: Self::SCHEMA_VERSION,
             binding,
             workspace_source: None,
+            workspace_confinement: None,
         }
     }
 }
@@ -744,6 +748,7 @@ mod tests {
             value["binding"]["capabilities"]["runtime"]["runtime_has_shell"],
             true
         );
+        assert!(value.get("workspace_confinement").is_none());
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
         assert!(
             value["binding"]["tool_surface"].get("admissions").is_none(),

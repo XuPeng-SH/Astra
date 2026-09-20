@@ -90,7 +90,7 @@ pub fn prepared_request_matches_spec(
     {
         return false;
     }
-    if prepared_workspace(request).ok().as_ref() != Some(&spec.conditions.workspace_execution) {
+    if !workspace_intent_matches(request, spec.conditions.workspace_execution.as_ref()) {
         return false;
     }
     let case = &spec.cases[0];
@@ -201,22 +201,38 @@ pub struct EvaluationTrialStartPlan {
     pub admission: EvaluationRunAdmission,
 }
 
+fn workspace_intent_matches(
+    request: &EvaluationExperimentPrepareRequest,
+    prepared: Option<&FrozenWorkspaceExecution>,
+) -> bool {
+    match (request.workspace.as_ref(), prepared) {
+        (None, None) => true,
+        (Some(intent), Some(frozen)) => {
+            let mut tools = intent.tool_names.clone();
+            tools.sort();
+            intent.edge_executor_id == frozen.edge_executor_id
+                && intent.source_commit.to_ascii_lowercase() == frozen.source_commit
+                && tools == frozen.tool_names
+        }
+        _ => false,
+    }
+}
+
 fn prepared_workspace(
     request: &EvaluationExperimentPrepareRequest,
+    prepared: Option<&FrozenWorkspaceExecution>,
 ) -> Result<Option<FrozenWorkspaceExecution>, EvaluationBootstrapError> {
-    request
-        .workspace
-        .as_ref()
-        .map(|workspace| {
-            FrozenWorkspaceExecution {
-                edge_executor_id: workspace.edge_executor_id.clone(),
-                source_commit: workspace.source_commit.clone(),
-                tool_names: workspace.tool_names.clone(),
-            }
-            .normalized()
-            .map_err(EvaluationBootstrapError::InvalidInput)
-        })
+    let prepared = prepared
+        .cloned()
+        .map(FrozenWorkspaceExecution::normalized)
         .transpose()
+        .map_err(EvaluationBootstrapError::InvalidInput)?;
+    if !workspace_intent_matches(request, prepared.as_ref()) {
+        return Err(EvaluationBootstrapError::Conflict(
+            "workspace intent requires matching server-prepared confinement capability".into(),
+        ));
+    }
+    Ok(prepared)
 }
 
 fn judgment_policy_for_trial(
@@ -231,11 +247,11 @@ fn judgment_policy_for_trial(
     }
 }
 
-/// Convert authenticated user intent plus trusted model/Skill facts into the
+/// Convert authenticated user intent plus trusted model/Skill/workspace facts into the
 /// immutable first adapter spec. Hashes and policy identities are produced
 /// here, never by a client or a second runtime implementation.
 pub fn build_prepared_experiment_spec(
-    _owner_user_id: &str,
+    workspace: Option<&FrozenWorkspaceExecution>,
     experiment_id: &str,
     request: &EvaluationExperimentPrepareRequest,
     execution_config: &super::execution_config::EvaluationExecutionConfig,
@@ -296,7 +312,7 @@ pub fn build_prepared_experiment_spec(
         offering_id: model.offering_id.clone(),
         model_name: model.model_name.clone(),
     };
-    let workspace_execution = prepared_workspace(request)?;
+    let workspace_execution = prepared_workspace(request, workspace)?;
     let execution_policy = crate::runs::ExecutionPolicyRequest::default();
     let tool_policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
         model_binding: &model.offering_id,
@@ -313,7 +329,9 @@ pub fn build_prepared_experiment_spec(
             .map(|workspace| workspace.tool_names.as_slice()),
         enabled_tools: None,
         runtime_profile: None,
-    });
+        workspace_execution: workspace_execution.as_ref(),
+    })
+    .map_err(EvaluationBootstrapError::InvalidInput)?;
     let spec = ExperimentSpec {
         schema_version: EXPERIMENT_SCHEMA_VERSION,
         experiment_id: experiment_id.to_string(),
@@ -985,7 +1003,7 @@ mod tests {
         }
         .into();
         let spec = build_prepared_experiment_spec(
-            "owner-1",
+            None,
             "evx_prepare",
             &request,
             &prepared_config(),
@@ -1000,7 +1018,7 @@ mod tests {
         wrong_model.model.offering_id = "other-model".into();
         assert!(matches!(
             build_prepared_experiment_spec(
-                "owner-1",
+                None,
                 "evx_prepare",
                 &request,
                 &wrong_model,
@@ -1052,8 +1070,124 @@ mod tests {
                 allow_tools: None,
                 enabled_tools: None,
                 runtime_profile: None,
+                workspace_execution: None,
             })
+            .unwrap()
         );
+    }
+
+    fn frozen_workspace_fixture() -> FrozenWorkspaceExecution {
+        FrozenWorkspaceExecution {
+            edge_executor_id: "edge-a".into(),
+            source_commit: "a".repeat(40),
+            tool_names: vec!["read_file".into()],
+            confinement: serde_json::from_value(json!({
+                "profile_id": astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE,
+                "toolchain_manifest": {
+                    "schema_version": 1,
+                    "inputs": [{"guest_mount_path": "/usr/bin", "content_digest": format!("sha256:{}", "a".repeat(64))}],
+                    "launcher_digest": format!("sha256:{}", "b".repeat(64)),
+                    "supervisor_digest": format!("sha256:{}", "c".repeat(64))
+                }
+            })).unwrap(),
+        }
+    }
+
+    #[test]
+    fn workspace_freeze_requires_capability_and_retries_preserve_original_contract() {
+        let mut request = prepared_request(EvaluationTargetKind::Prompt);
+        let workspace = frozen_workspace_fixture();
+        request.workspace = Some(super::super::api::EvaluationPrepareWorkspace {
+            edge_executor_id: workspace.edge_executor_id.clone(),
+            source_commit: workspace.source_commit.to_ascii_uppercase(),
+            tool_names: workspace.tool_names.clone(),
+        });
+        let build = |facts: Option<&FrozenWorkspaceExecution>| {
+            build_prepared_experiment_spec(
+                facts,
+                "evx_confined",
+                &request,
+                &prepared_config(),
+                None,
+                EvaluationJudgmentPolicy::Disabled,
+            )
+        };
+        assert!(build(None).is_err());
+        let original = build(Some(&workspace)).unwrap();
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let mut changed = workspace.clone();
+        changed.confinement.toolchain_manifest.launcher_digest =
+            format!("sha256:{}", "d".repeat(64));
+        let replacement = build(Some(&changed)).unwrap();
+        assert_ne!(
+            original.spec_fingerprint().unwrap(),
+            replacement.spec_fingerprint().unwrap()
+        );
+        assert_ne!(
+            original.conditions.tool_policy_hash,
+            replacement.conditions.tool_policy_hash
+        );
+        // Retry matching has no live facts input: both offline and changed
+        // providers replay exactly the stored snapshot.
+        assert!(prepared_request_matches_spec(&request, &original));
+        assert_eq!(serde_json::to_vec(&original).unwrap(), original_bytes);
+        assert_eq!(
+            original.conditions.workspace_execution.as_ref(),
+            Some(&workspace)
+        );
+        changed.edge_executor_id = "edge-other".into();
+        assert!(build(Some(&changed)).is_err());
+        let mut different_intent = request.clone();
+        different_intent.workspace.as_mut().unwrap().source_commit = "e".repeat(40);
+        assert!(!prepared_request_matches_spec(&different_intent, &original));
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy.as_object_mut().unwrap().remove("confinement");
+        assert!(serde_json::from_value::<FrozenWorkspaceExecution>(legacy).is_err());
+
+        let mut reordered = workspace.clone();
+        reordered
+            .confinement
+            .toolchain_manifest
+            .inputs
+            .push(astra_runtime_env::ToolchainInput {
+                guest_mount_path: "/usr/lib".into(),
+                content_digest: format!("sha256:{}", "e".repeat(64)),
+            });
+        let first = build(Some(&reordered)).unwrap();
+        reordered.confinement.toolchain_manifest.inputs.reverse();
+        let second = build(Some(&reordered)).unwrap();
+        assert_eq!(
+            first.spec_fingerprint().unwrap(),
+            second.spec_fingerprint().unwrap()
+        );
+        assert_eq!(
+            first.conditions.tool_policy_hash,
+            second.conditions.tool_policy_hash
+        );
+        // Direct Rust construction need not pass through Prepare. Storage
+        // deserialization normalizes the manifest, so hashing must do so too.
+        let execution_policy = crate::runs::ExecutionPolicyRequest::default();
+        let fingerprint = |workspace: &FrozenWorkspaceExecution| {
+            evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
+                model_binding: "model",
+                provider_binding: "provider",
+                cache_policy: "default",
+                resolved_model_selection: None,
+                admitted_provider: "provider",
+                admitted_cache_capability: None,
+                execution_policy: &execution_policy,
+                allow_skills: None,
+                allow_skill_sources: None,
+                allow_tools: None,
+                enabled_tools: None,
+                runtime_profile: None,
+                workspace_execution: Some(workspace),
+            })
+            .unwrap()
+        };
+        let restored: FrozenWorkspaceExecution =
+            serde_json::from_slice(&serde_json::to_vec(&reordered).unwrap()).unwrap();
+        assert_eq!(fingerprint(&reordered), fingerprint(&restored));
     }
 
     #[test]
@@ -1064,8 +1198,9 @@ mod tests {
             source_commit: "a".repeat(40),
             tool_names: vec!["read_file".to_string()],
         });
+        let workspace = frozen_workspace_fixture();
         let spec = build_prepared_experiment_spec(
-            "owner-1",
+            Some(&workspace),
             "evx_edge",
             &request,
             &prepared_config(),
@@ -1112,6 +1247,10 @@ mod tests {
         .expect("trial Edge selection");
         assert_eq!(plan.edge_executor_id.as_deref(), Some("edge-a"));
         assert_eq!(
+            plan.workspace_execution,
+            experiment.spec.conditions.workspace_execution
+        );
+        assert_eq!(
             plan.workspace_execution
                 .as_ref()
                 .map(|workspace| workspace.tool_names.as_slice()),
@@ -1137,7 +1276,7 @@ mod tests {
         request.target.baseline.content = None;
         request.target.candidate.content = None;
         let spec = build_prepared_experiment_spec(
-            "owner-1",
+            None,
             "evx_skill",
             &request,
             &prepared_config(),
@@ -1167,7 +1306,7 @@ mod tests {
         request.target.candidate.content = None;
         let model = prepared_config();
         let spec = build_prepared_experiment_spec(
-            "owner-1",
+            None,
             "evx_skill_start",
             &request,
             &model,
@@ -1237,7 +1376,7 @@ mod tests {
         same.target.candidate.revision_id = same.target.baseline.revision_id.clone();
         let model = prepared_config();
         let same_spec = build_prepared_experiment_spec(
-            "owner-1",
+            None,
             "evx_same",
             &same,
             &model,
@@ -1255,7 +1394,7 @@ mod tests {
         skill.target.skill_name = Some("reviewer".to_string());
         assert!(matches!(
             build_prepared_experiment_spec(
-                "owner-1",
+                None,
                 "evx_inline",
                 &skill,
                 &model,
@@ -1290,7 +1429,7 @@ mod tests {
     fn prepared_retry_matches_frozen_user_intent_without_dynamic_facts() {
         let request = prepared_request(EvaluationTargetKind::Prompt);
         let spec = build_prepared_experiment_spec(
-            "owner-1",
+            None,
             "evx_replay",
             &request,
             &prepared_config(),

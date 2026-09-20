@@ -164,6 +164,7 @@ impl EvaluationWorkspaceLease {
             &self.user_id,
             self.edge_agent_id.as_deref()?,
             astra_server_types::edge_connection_pool::EdgeWorkspaceFinalizationRequest {
+                connection_generation: self.connection_generation?,
                 workspace_dir: self.workspace_dir.as_deref()?,
                 source_commit: &self.source_commit,
                 verifier_command,
@@ -8641,7 +8642,11 @@ impl AgenticRunLifecycleService {
             allow_tools: request.allow_tools.as_deref(),
             enabled_tools: request.enabled_tools.as_deref(),
             runtime_profile: request.runtime_profile.as_ref(),
-        });
+            workspace_execution: workspace_policy,
+        })
+        .map_err(|detail| {
+            evaluation_preflight_error(StatusCode::CONFLICT, "evaluation_policy_mismatch", &detail)
+        })?;
         if policy_hash != experiment.spec.conditions.tool_policy_hash {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
@@ -10959,6 +10964,7 @@ impl AgenticRunLifecycleService {
             .snapshot_evaluation_workspace(
                 user_id,
                 &workspace_policy.edge_executor_id,
+                connected.generation,
                 request_root,
                 std::time::Duration::from_secs(15),
             )
@@ -10986,63 +10992,19 @@ impl AgenticRunLifecycleService {
                 "the live Edge workspace is dirty or no longer matches the frozen source",
             ));
         }
-        let capabilities = record.capabilities.ok_or_else(|| {
+        crate::evaluation::workspace::validate_frozen_workspace_capability(
+            user_id,
+            workspace_policy,
+            &connected,
+            &record,
+        )
+        .map_err(|detail| {
             evaluation_preflight_error(
-                StatusCode::PRECONDITION_FAILED,
-                "evaluation_workspace_materialization_unavailable",
-                "the selected Edge has no authenticated workspace capability proof",
-            )
-        })?;
-        let advertisement = serde_json::from_value::<
-            astra_runtime_env::RuntimeEnvironmentAdvertisement,
-        >(capabilities)
-        .map_err(|error| {
-            tracing::warn!(
-                owner_id = %user_id,
-                executor_id = %workspace_policy.edge_executor_id,
-                error = %error,
-                "evaluation Edge capability proof could not be decoded"
-            );
-            evaluation_preflight_error(
-                StatusCode::PRECONDITION_FAILED,
-                "evaluation_workspace_materialization_unavailable",
-                "the selected Edge capability proof is invalid",
-            )
-        })?;
-        let source = advertisement.workspace_source.as_ref().ok_or_else(|| {
-            evaluation_preflight_error(
-                StatusCode::PRECONDITION_FAILED,
-                "evaluation_workspace_materialization_unavailable",
-                "the selected Edge has no authenticated source checkout proof",
-            )
-        })?;
-        if advertisement.schema_version
-            != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
-            || !advertisement.binding.executor.is_edge_agent()
-            || advertisement.binding.executor.executor_id != workspace_policy.edge_executor_id
-            || !matches!(
-                advertisement.binding.workspace.kind,
-                astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace
-            )
-            || advertisement.binding.workspace.cwd.as_deref() != Some(base_root)
-            || advertisement.binding.workspace.authority
-                != astra_runtime_env::WorkspaceAuthority::ReadWrite
-            || !source.is_valid()
-            || !workspace_policy.tool_names.iter().all(|tool_name| {
-                advertisement
-                    .binding
-                    .tool_surface
-                    .tool_names
-                    .iter()
-                    .any(|advertised| advertised == tool_name)
-            })
-        {
-            return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_workspace_materialization_mismatch",
-                "the live Edge capability proof does not match the frozen workspace policy",
-            ));
-        }
+                &detail,
+            )
+        })?;
         let trial_materialization = format!(
             "{materialization_id}-{:x}",
             Sha256::digest(request_root.as_bytes())
@@ -11221,10 +11183,33 @@ impl AgenticRunLifecycleService {
                 "the selected Edge has no live WebSocket connection",
             )
         })?;
+        let connected = pool
+            .find_user_edge_by_agent_and_workspace(user_id, executor_id, None)
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge connection is no longer live",
+                )
+            })?;
+        crate::evaluation::workspace::validate_frozen_workspace_capability(
+            user_id,
+            workspace_policy,
+            &connected,
+            &record,
+        )
+        .map_err(|detail| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                &detail,
+            )
+        })?;
         let prepared = pool
             .prepare_evaluation_workspace(
                 user_id,
                 executor_id,
+                connected.generation,
                 workspace_key,
                 &workspace_policy.source_commit,
                 std::time::Duration::from_secs(60),

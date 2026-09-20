@@ -1511,12 +1511,15 @@ pub struct EvaluationPolicyFingerprintInput<'a> {
     pub allow_tools: Option<&'a [String]>,
     pub enabled_tools: Option<&'a [String]>,
     pub runtime_profile: Option<&'a crate::runs::RuntimeProfileRequest>,
+    pub workspace_execution: Option<&'a super::experiment::FrozenWorkspaceExecution>,
 }
 
 /// Build the exact redacted policy identity consumed by the canonical Run
 /// evaluation preflight. Prepare and Run must use this one shape; a separate
 /// hand-written hash would make every prepared trial unavailable at start.
-pub fn evaluation_policy_fingerprint(input: &EvaluationPolicyFingerprintInput<'_>) -> String {
+pub fn evaluation_policy_fingerprint(
+    input: &EvaluationPolicyFingerprintInput<'_>,
+) -> Result<String, String> {
     let policy_facts = serde_json::json!({
         "model_binding": input.model_binding,
         "provider_binding": input.provider_binding,
@@ -1531,7 +1534,14 @@ pub fn evaluation_policy_fingerprint(input: &EvaluationPolicyFingerprintInput<'_
         "enabled_tools": input.enabled_tools,
         "runtime_profile": input.runtime_profile,
     });
-    prompt_policy_fingerprint(&policy_facts)
+    let execution_policy_fingerprint = prompt_policy_fingerprint(&policy_facts);
+    Ok(match input.workspace_execution {
+        Some(workspace) => prompt_policy_fingerprint(&serde_json::json!({
+            "execution_policy_fingerprint": execution_policy_fingerprint,
+            "workspace_execution": workspace.clone().normalized()?,
+        })),
+        None => execution_policy_fingerprint,
+    })
 }
 
 pub fn content_fingerprint(content: &str) -> String {

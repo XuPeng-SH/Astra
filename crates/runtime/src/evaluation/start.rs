@@ -261,6 +261,15 @@ mod tests {
             execution_time_budget_secs: 30,
             edge_executor_id: Some("edge-a".to_string()),
             workspace_execution: Some(astra_services::evaluation::FrozenWorkspaceExecution {
+                confinement: serde_json::from_value(serde_json::json!({
+                    "profile_id": astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE,
+                    "toolchain_manifest": {
+                        "schema_version": 1,
+                        "inputs": [{"guest_mount_path": "/usr/bin", "content_digest": format!("sha256:{}", "a".repeat(64))}],
+                        "launcher_digest": format!("sha256:{}", "b".repeat(64)),
+                        "supervisor_digest": format!("sha256:{}", "c".repeat(64))
+                    }
+                })).unwrap(),
                 edge_executor_id: "edge-a".to_string(),
                 source_commit: "a".repeat(40),
                 tool_names: vec!["read_file".to_string()],

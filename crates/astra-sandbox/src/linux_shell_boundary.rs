@@ -43,7 +43,7 @@ pub struct ShellLaunchReceipt {
 impl ShellLaunchPlan {
     /// Freeze this identity alongside the explicit system/toolchain manifest.
     /// Protected workspace directories are explicit launch inputs.
-    pub const PROFILE_ID: &'static str = "linux_restricted_root_x86_64_v1";
+    pub const PROFILE_ID: &'static str = astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE;
 
     /// Consume the plan into the target command and its independent setup
     /// receipt. stdin defaults to /dev/null, stdout/stderr to pipes. Only pipes
@@ -283,29 +283,12 @@ pub(crate) fn prepare(
     for path in &boundary.read_only_paths {
         // Mount destinations cannot overlap each other or private guest roots.
         // Refuse broad ambient roots even when explicitly supplied.
-        if [
-            "/", "/usr", "/etc", "/home", "/root", "/run", "/var", "/tmp", "/opt",
-        ]
-        .iter()
-        .any(|p| path == Path::new(p))
-            || [
-                "/workspace",
-                "/home",
-                "/tmp",
-                "/proc",
-                "/dev",
-                "/run",
-                "/etc",
-                "/root",
-                "/var",
-                "/bin",
-                "/sbin",
-                "/lib",
-                "/lib64",
-            ]
-            .iter()
-            .any(|p| path.starts_with(p))
-            || path.starts_with(&boundary.workspace)
+        let destination = path
+            .to_str()
+            .ok_or_else(|| invalid("toolchain path is not UTF-8"))?;
+        astra_runtime_env::validate_confined_toolchain_mount(destination)
+            .map_err(|message| invalid(&message))?;
+        if path.starts_with(&boundary.workspace)
             || boundary.workspace.starts_with(path)
             || roots
                 .iter()

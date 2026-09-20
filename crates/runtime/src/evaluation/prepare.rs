@@ -7,6 +7,7 @@
 
 use axum::{Json, http::StatusCode};
 
+use super::workspace::freeze_workspace_capability;
 use crate::AppState;
 use astra_core::{ErrorResponse, error_response, error_response_coded};
 use astra_services::evaluation::{
@@ -72,6 +73,44 @@ fn map_skill_error(error: PersonalSkillError) -> (StatusCode, Json<ErrorResponse
     }
 }
 
+async fn resolve_workspace_capability(
+    state: &AppState,
+    owner_user_id: &str,
+    request: &EvaluationExperimentPrepareRequest,
+) -> Result<
+    Option<astra_services::evaluation::FrozenWorkspaceExecution>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let Some(intent) = request.workspace.as_ref() else {
+        return Ok(None);
+    };
+    let unavailable = |detail: &str| {
+        error_response_coded(
+            StatusCode::PRECONDITION_FAILED,
+            detail,
+            "evaluation_workspace_confinement_unavailable",
+        )
+    };
+    let pool = &state.edge_connection_pool;
+    let connected = pool
+        .find_user_edge_by_agent_and_workspace(owner_user_id, &intent.edge_executor_id, None)
+        .ok_or_else(|| unavailable("selected Edge is not connected for this owner"))?;
+    let record = state
+        .execution
+        .edge_registry_service
+        .find_by_user_agent_and_workspace(owner_user_id, &intent.edge_executor_id, None)
+        .await
+        .map_err(|_| unavailable("selected Edge registry is unavailable"))?
+        .ok_or_else(|| unavailable("selected Edge is not registered for this owner"))?;
+    let current = pool
+        .find_user_edge_by_agent_and_workspace(owner_user_id, &intent.edge_executor_id, None)
+        .filter(|current| current.generation == connected.generation)
+        .ok_or_else(|| unavailable("selected Edge connection changed during preparation"))?;
+    freeze_workspace_capability(owner_user_id, intent, &current, &record)
+        .map(Some)
+        .map_err(|detail| unavailable(&detail))
+}
+
 pub async fn prepare_experiment(
     state: &AppState,
     owner_user_id: &str,
@@ -112,6 +151,10 @@ pub async fn prepare_experiment(
         Err(astra_services::evaluation::EvaluationPersistenceError::NotFound(_)) => {}
         Err(error) => return Err(map_persistence_error(error)),
     }
+
+    // Exact durable retries above return their original snapshot without
+    // consulting today's live capability or replacing the frozen toolchain.
+    let workspace = resolve_workspace_capability(state, owner_user_id, &request).await?;
 
     let admitted = crate::server::model_execution_admission::admit_model_execution(
         &state.model_service,
@@ -279,7 +322,7 @@ pub async fn prepare_experiment(
             )
         })?;
     let spec = build_prepared_experiment_spec(
-        owner_user_id,
+        workspace.as_ref(),
         &experiment_id,
         &request,
         &execution_config,

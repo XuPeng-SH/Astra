@@ -889,7 +889,7 @@ mod tests {
             "model_offering_id":"model", "max_concurrency":1,"max_wall_time_secs":30
         })).unwrap();
         let spec = build_prepared_experiment_spec(
-            "owner",
+            None,
             "experiment",
             &request,
             &crate::evaluation::test_support::execution_config("model", "openai", "case"),

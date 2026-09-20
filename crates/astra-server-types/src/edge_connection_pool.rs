@@ -225,9 +225,16 @@ struct PendingWorkspaceOperation {
     sender: oneshot::Sender<EdgeWorkspaceOperationResult>,
 }
 
+struct WorkspaceOperationTarget<'a> {
+    user_id: &'a str,
+    edge_agent_id: &'a str,
+    generation: u64,
+}
+
 /// Frozen workspace and verifier inputs for one finalization operation.
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeWorkspaceFinalizationRequest<'a> {
+    pub connection_generation: u64,
     pub workspace_dir: &'a str,
     pub source_commit: &'a str,
     pub verifier_command: &'a str,
@@ -813,13 +820,17 @@ impl EdgeConnectionPool {
         &self,
         user_id: &str,
         edge_agent_id: &str,
+        connection_generation: u64,
         workspace_key: &str,
         source_commit: &str,
         timeout: Duration,
     ) -> Option<EdgeWorkspaceOperationResult> {
         self.request_workspace_operation(
-            user_id,
-            edge_agent_id,
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: connection_generation,
+            },
             timeout,
             None,
             false,
@@ -839,12 +850,16 @@ impl EdgeConnectionPool {
         &self,
         user_id: &str,
         edge_agent_id: &str,
+        connection_generation: u64,
         workspace_dir: &str,
         timeout: Duration,
     ) -> Option<EdgeWorkspaceOperationResult> {
         self.request_workspace_operation(
-            user_id,
-            edge_agent_id,
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: connection_generation,
+            },
             timeout,
             None,
             false,
@@ -872,8 +887,11 @@ impl EdgeConnectionPool {
             .saturating_add(timeout.as_millis());
         let deadline_unix_ms = u64::try_from(deadline_unix_ms).ok()?;
         self.request_workspace_operation(
-            user_id,
-            edge_agent_id,
+            WorkspaceOperationTarget {
+                user_id,
+                edge_agent_id,
+                generation: request.connection_generation,
+            },
             timeout,
             Some(cancel_token),
             true,
@@ -922,8 +940,7 @@ impl EdgeConnectionPool {
 
     async fn request_workspace_operation<F>(
         &self,
-        user_id: &str,
-        edge_agent_id: &str,
+        target: WorkspaceOperationTarget<'_>,
         timeout: Duration,
         cancel_token: Option<&CancellationToken>,
         cancel_finalize: bool,
@@ -933,10 +950,10 @@ impl EdgeConnectionPool {
         F: FnOnce(String, u64) -> EdgeServerMessage,
     {
         let deadline = tokio::time::Instant::now() + timeout;
-        let key = pool_key(user_id, edge_agent_id);
+        let key = pool_key(target.user_id, target.edge_agent_id);
         let (generation, sender) = {
             let entry = self.connections.get(&key)?;
-            if entry.sender.is_closed() {
+            if entry.sender.is_closed() || entry.generation != target.generation {
                 return None;
             }
             (entry.generation, entry.sender.clone())
@@ -1510,6 +1527,48 @@ mod tests {
         assert!(pool.has_connected_edge("user-1"));
         assert!(!pool.has_connected_edge("user-2"));
         assert_eq!(pool.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_operations_reject_replacement_connection_before_dispatch() {
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let expected = pool.register("owner", "edge", None, None, old_tx);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        assert_ne!(pool.register("owner", "edge", None, None, new_tx), expected);
+        let timeout = Duration::from_secs(1);
+        assert!(
+            pool.prepare_evaluation_workspace(
+                "owner", "edge", expected, "trial", "commit", timeout,
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            pool.snapshot_evaluation_workspace("owner", "edge", expected, "/workspace", timeout,)
+                .await
+                .is_none()
+        );
+        assert!(
+            pool.finalize_evaluation_workspace(
+                "owner",
+                "edge",
+                EdgeWorkspaceFinalizationRequest {
+                    connection_generation: expected,
+                    workspace_dir: "/workspace",
+                    source_commit: "commit",
+                    verifier_command: "true",
+                    verifier_timeout_secs: 1,
+                },
+                timeout,
+                &CancellationToken::new(),
+            )
+            .await
+            .is_none()
+        );
+        assert!(old_rx.try_recv().is_err());
+        assert!(new_rx.try_recv().is_err());
+        assert!(pool.workspace_operations.is_empty());
     }
 
     #[test]

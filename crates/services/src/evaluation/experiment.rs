@@ -214,6 +214,7 @@ pub struct EvaluationCase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenWorkspaceExecution {
+    pub confinement: astra_runtime_env::WorkspaceConfinementContract,
     pub edge_executor_id: String,
     pub source_commit: String,
     pub tool_names: Vec<String>,
@@ -221,6 +222,7 @@ pub struct FrozenWorkspaceExecution {
 
 impl FrozenWorkspaceExecution {
     pub fn validate(&self) -> Result<(), String> {
+        self.confinement.validate()?;
         if !astra_runtime_env::is_valid_provider_id(&self.edge_executor_id) {
             return Err("workspace edge_executor_id is invalid".to_string());
         }
@@ -265,6 +267,7 @@ impl FrozenWorkspaceExecution {
     }
 
     pub fn normalized(mut self) -> Result<Self, String> {
+        self.confinement = self.confinement.normalized()?;
         self.source_commit = self.source_commit.to_ascii_lowercase();
         self.tool_names.sort();
         self.validate()?;
@@ -765,7 +768,13 @@ impl ExperimentSpec {
     /// this to reject reusing an experiment ID for a different definition.
     pub fn spec_fingerprint(&self) -> Result<String, String> {
         self.validate()?;
-        let canonical = serde_json::to_vec(self)
+        let mut normalized = self.clone();
+        normalized.conditions.workspace_execution = normalized
+            .conditions
+            .workspace_execution
+            .map(FrozenWorkspaceExecution::normalized)
+            .transpose()?;
+        let canonical = serde_json::to_vec(&normalized)
             .map_err(|error| format!("failed to encode experiment specification: {error}"))?;
         let digest = Sha256::digest(canonical);
         Ok(format!("sha256:{digest:x}"))

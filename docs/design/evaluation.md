@@ -434,7 +434,15 @@ shared Git metadata means it is not an Eval isolation receipt.
 
 Status: the first workspace-backed adapter is now explicit in the prepare
 request. It freezes one authenticated Edge executor, one full Git source
-commit, and one sorted built-in tool allowlist into the experiment conditions.
+commit, one sorted built-in tool allowlist, and the authenticated confinement
+contract into the experiment conditions. The contract identifies the supported
+Linux profile and all declared read-only toolchain inputs, launcher, and supervisor
+by content digest. Prepare and Run admission share capability checks and policy
+fingerprinting; a changed live contract cannot replace the frozen inputs. Exact
+submission retries return the stored experiment without resolving a new capability.
+Missing confinement capability rejects new workspace preparations. Ordinary Edge
+registration makes no confinement claim; dedicated provider deployment and
+execution-receipt integration remain required before advertising this capability.
 The canonical Session binding still resolves the owner's active registration;
 it rejects owner mismatch, an unavailable registration, a missing
 materialization/root, or root/materialization drift before execution. The Edge
