@@ -58,3 +58,15 @@ pub use sync_process::{SyncProcessError, SyncProcessOutput, run_sync_process};
 
 mod shell_process_boundary;
 pub use shell_process_boundary::ShellProcessBoundary;
+
+#[cfg(target_os = "linux")]
+mod linux_shell_boundary;
+#[cfg(target_os = "linux")]
+mod shell_seccomp;
+#[cfg(target_os = "linux")]
+pub use linux_shell_boundary::{ShellLaunchPlan, ShellLaunchReceipt};
+
+#[cfg(target_os = "linux")]
+pub use process_isolation::{
+    ConfinedOutput, ShellConfinementEvidence, execute_confined_with_cancel,
+};

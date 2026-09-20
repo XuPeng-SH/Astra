@@ -6,15 +6,51 @@ use std::path::{Path, PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct ShellProcessBoundary {
     pub workspace: PathBuf,
+    /// Provisioned private directory on macOS. Linux launch plans use fresh
+    /// tmpfs at /home/sandbox and never expose this host directory.
     pub home: PathBuf,
+    /// Provisioned private directory on macOS. Linux uses fresh /tmp tmpfs.
     pub temp: PathBuf,
-    /// Explicit additional toolchain inputs. Never inferred from the user's HOME.
+    /// Explicit toolchain inputs, never inferred from the user's HOME. This is
+    /// the complete Linux system/toolchain manifest; macOS adds its system roots.
     pub read_only_paths: Vec<PathBuf>,
 }
 
 impl ShellProcessBoundary {
-    /// Resolve and validate paths immediately before launch. No directory is
-    /// created here; provisioning and ownership belong to the caller.
+    /// Prepare the Linux restricted-root target. The returned plan owns mount
+    /// and policy descriptors; it never spawns, waits, or settles processes.
+    /// `read_only_paths` is the complete explicit system/toolchain manifest
+    /// (normally /usr/bin and /usr/lib, plus /usr/lib64 where present).
+    /// HOME and temporary storage are fresh tmpfs mounts, not host directories.
+    /// This first profile accepts only the workspace root as cwd, avoiding a
+    /// second, raceable lookup of a mutable workspace subdirectory.
+    #[cfg(target_os = "linux")]
+    pub fn launch_plan(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+    ) -> std::io::Result<crate::ShellLaunchPlan> {
+        self.launch_plan_with_protected_paths(cwd, program, args, &[])
+    }
+
+    /// Protect evaluator-owned directories within the writable workspace.
+    /// Each source is pinned relative to the selected workspace handle.
+    #[cfg(target_os = "linux")]
+    pub fn launch_plan_with_protected_paths(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        protected_paths: &[PathBuf],
+    ) -> std::io::Result<crate::ShellLaunchPlan> {
+        crate::linux_shell_boundary::prepare(self, cwd, program, args, protected_paths)
+    }
+
+    /// Resolve path admission for the provisioned-directory representation.
+    /// This is not race-safe launch enforcement; Linux callers must prepare a
+    /// launch_plan, which pins inputs and uses fresh anonymous HOME/TMP mounts.
+    /// No directory is created here; provisioning belongs to the caller.
     pub fn validate(&self, cwd: &Path) -> Result<Self, String> {
         fn directory(path: &Path) -> Result<PathBuf, String> {
             let path = path
@@ -30,18 +66,29 @@ impl ShellProcessBoundary {
             return Err("filesystem root cannot be a confined workspace".into());
         }
         let cwd = directory(cwd)?;
-        let home = directory(&self.home)?;
-        let temp = directory(&self.temp)?;
-        if !cwd.starts_with(&workspace)
-            || home == workspace
-            || temp == workspace
-            || !home.starts_with(&workspace)
-            || !temp.starts_with(&workspace)
-            || home.starts_with(&temp)
-            || temp.starts_with(&home)
-        {
-            return Err("cwd must be in the workspace; private HOME and TMP must be separate directories within it".into());
-        }
+        #[cfg(target_os = "linux")]
+        let (home, temp) = {
+            if cwd != workspace {
+                return Err("restricted profile requires workspace-root cwd".into());
+            }
+            (PathBuf::from("/home/sandbox"), PathBuf::from("/tmp"))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (home, temp) = {
+            let home = directory(&self.home)?;
+            let temp = directory(&self.temp)?;
+            if !cwd.starts_with(&workspace)
+                || home == workspace
+                || temp == workspace
+                || !home.starts_with(&workspace)
+                || !temp.starts_with(&workspace)
+                || home.starts_with(&temp)
+                || temp.starts_with(&home)
+            {
+                return Err("cwd must be in the workspace; private HOME and TMP must be separate directories within it".into());
+            }
+            (home, temp)
+        };
         let read_only_paths = self
             .read_only_paths
             .iter()
@@ -90,19 +137,24 @@ impl ShellProcessBoundary {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (program, args);
-            Err("this host does not support the selected shell process boundary".into())
+            Err("tuple wrapping is unsupported on this host; Linux requires launch_plan and setup evidence".into())
         }
     }
 
     /// A fresh environment, independent of user overlays and credential stores.
     pub fn environment(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        #[cfg(target_os = "linux")]
+        let (home, temp) = (Path::new("/home/sandbox"), Path::new("/tmp"));
+        #[cfg(not(target_os = "linux"))]
+        let (home, temp) = (self.home.as_path(), self.temp.as_path());
         vec![
             ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
-            ("HOME", self.home.as_os_str().into()),
-            ("TMPDIR", self.temp.as_os_str().into()),
-            ("TMP", self.temp.as_os_str().into()),
-            ("TEMP", self.temp.as_os_str().into()),
+            ("HOME", home.as_os_str().into()),
+            ("TMPDIR", temp.as_os_str().into()),
+            ("TMP", temp.as_os_str().into()),
+            ("TEMP", temp.as_os_str().into()),
             ("LC_ALL", "C".into()),
+            ("TZ", "UTC".into()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
             ("GIT_TERMINAL_PROMPT", "0".into()),
@@ -155,6 +207,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn rejects_shared_private_directories() {
         let root = tempfile::tempdir().unwrap();
@@ -163,6 +216,25 @@ mod tests {
         assert!(boundary.validate(&boundary.workspace).is_err());
         boundary.home = boundary.temp.clone();
         assert!(boundary.validate(&boundary.workspace).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_validation_uses_private_guest_storage_before_launch_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut boundary = fixture(root.path());
+        boundary.home = root.path().join("unprovisioned-home");
+        boundary.temp = root.path().join("unprovisioned-temp");
+        let boundary = boundary.validate(&boundary.workspace).unwrap();
+        assert_eq!(boundary.home, Path::new("/home/sandbox"));
+        assert_eq!(boundary.temp, Path::new("/tmp"));
+        let plan = boundary.launch_plan(&boundary.workspace, "/bin/true", &[]);
+        #[cfg(target_arch = "x86_64")]
+        assert!(plan.is_ok());
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(matches!(plan, Err(error) if error.kind() == std::io::ErrorKind::Unsupported));
+        assert!(!root.path().join("unprovisioned-home").exists());
+        assert!(!root.path().join("unprovisioned-temp").exists());
     }
 
     #[test]
