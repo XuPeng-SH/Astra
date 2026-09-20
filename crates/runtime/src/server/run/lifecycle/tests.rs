@@ -23867,6 +23867,18 @@ async fn db_explain_publication_is_discoverable_and_readable() {
     let svc = db_backed_test_service(&pool, "explain-publication-it");
     seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
     svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &run,
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain publication request");
+    svc.run_engine
         .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
         .await
         .unwrap();
@@ -23962,6 +23974,323 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         .unwrap()
         .is_err()
     );
+
+    let artifact_id = artifact
+        .strip_prefix("artifact://session/explain-analyze/")
+        .expect("canonical Explain artifact handle");
+    sqlx::query(
+        "UPDATE session_artifacts SET content_json = '{}'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user)
+    .bind(&session)
+    .bind(artifact_id)
+    .execute(pool.get())
+    .await
+    .expect("corrupt the existing Explain snapshot payload");
+    let discovery = crate::server::explain_analyze_artifact::discover_context_notice_for_run(
+        Some(&pool),
+        user,
+        &session,
+        &run,
+        generation,
+    )
+    .await
+    .expect("classify the existing corrupt snapshot");
+    match discovery {
+        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice) => {
+            assert!(notice.contains("unavailable"));
+        }
+        crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing => {
+            panic!("an existing corrupt snapshot must never be classified as missing")
+        }
+    }
+    let mut corrupt_profile = serde_json::Map::new();
+    let (_, corrupt_fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
+            svc.append_latest_explain_artifact_context(user, &session, &mut corrupt_profile),
+        )
+        .await;
+    assert_eq!(
+        corrupt_fetches.total, 1,
+        "an existing corrupt snapshot must not enter recovery"
+    );
+    assert_eq!(corrupt_fetches.discovery, 1);
+    assert_eq!(corrupt_fetches.recovery, 0);
+    assert!(
+        serde_json::to_string(&corrupt_profile)
+            .expect("serialize corrupt Explain profile")
+            .contains("unavailable")
+    );
+    let unchanged_content: String = sqlx::query_scalar(
+        "SELECT content_json FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user)
+    .bind(&session)
+    .bind(artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("reload corrupt Explain snapshot");
+    assert_eq!(unchanged_content, "{}");
+    cleanup_lifecycle_run_fixture(&pool, user, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, user, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_explain_discovery_reads_a_large_existing_snapshot_once() {
+    const SAMPLES: usize = 12;
+
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = "explain-discovery-perf-it";
+    let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
+    let run = Uuid::new_v4().to_string();
+    let svc = db_backed_test_service(&pool, "explain-discovery-perf-it");
+    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    let generation = svc
+        .run_engine
+        .load_run(user, &run)
+        .await
+        .expect("load Explain benchmark run")
+        .expect("Explain benchmark run exists")
+        .run_generation;
+    svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &run,
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain benchmark request");
+    let event = json!({
+        "type":"explain_analyze", "schema_version":1,
+        "event_id":"large-finished", "run_id":run, "turn_id":"turn-1",
+        "node_id":"turn", "producer_id":"server", "clock_domain_id":"clock",
+        "kind":"turn", "label":"Large observed turn",
+        "transition":"finished", "elapsed_ms":10,
+        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"
+    });
+    let handle = crate::server::explain_analyze_artifact::persist_snapshot(
+        Some(&pool),
+        user,
+        &session,
+        &run,
+        "turn-1",
+        generation,
+        &[event],
+    )
+    .await
+    .expect("persist large Explain snapshot")
+    .expect("large Explain snapshot handle");
+    let artifact_id = handle
+        .strip_prefix("artifact://session/explain-analyze/")
+        .expect("canonical Explain benchmark handle");
+    let row = sqlx::query(
+        "SELECT content_json, CAST(metadata AS CHAR) AS metadata_json
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user)
+    .bind(&session)
+    .bind(artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load Explain benchmark payload");
+    let mut content: serde_json::Value = serde_json::from_str(
+        &row.try_get::<String, _>("content_json")
+            .expect("decode Explain benchmark content"),
+    )
+    .expect("parse Explain benchmark content");
+    content["benchmark_padding"] = serde_json::Value::String("x".repeat(256 * 1024));
+    let content_json = serde_json::to_string(&content).expect("serialize padded Explain content");
+    let integrity_bytes =
+        serde_json::to_vec_pretty(&content).expect("serialize Explain integrity bytes");
+    let mut metadata: serde_json::Value = serde_json::from_str(
+        &row.try_get::<String, _>("metadata_json")
+            .expect("decode Explain benchmark metadata"),
+    )
+    .expect("parse Explain benchmark metadata");
+    metadata["size_bytes"] = json!(integrity_bytes.len());
+    let checksum = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&integrity_bytes))
+    };
+    metadata["checksum_sha256"] = json!(checksum);
+    sqlx::query(
+        "UPDATE session_artifacts SET content_json = ?, metadata = ?
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&content_json)
+    .bind(metadata.to_string())
+    .bind(user)
+    .bind(&session)
+    .bind(artifact_id)
+    .execute(pool.get())
+    .await
+    .expect("store padded valid Explain benchmark payload");
+
+    let expected_notice = crate::server::explain_analyze_artifact::context_notice_for_run(
+        Some(&pool),
+        user,
+        &session,
+        &run,
+        generation,
+    )
+    .await
+    .expect("validate padded Explain snapshot")
+    .expect("readable padded Explain notice");
+    assert!(expected_notice.contains(&handle));
+    assert!(expected_notice.contains("status=complete"));
+    let mut edge_profile = serde_json::Map::new();
+    let (_, fetches) = crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
+        svc.append_latest_explain_artifact_context(user, &session, &mut edge_profile),
+    )
+    .await;
+    assert_eq!(
+        fetches.total, 1,
+        "existing snapshot discovery must fetch once"
+    );
+    assert_eq!(fetches.discovery, 1);
+    assert_eq!(fetches.recovery, 0);
+    assert!(
+        serde_json::to_string(&edge_profile)
+            .expect("serialize Explain discovery profile")
+            .contains(&handle)
+    );
+
+    let baseline_started = std::time::Instant::now();
+    let (_, baseline_fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(async {
+            for _ in 0..SAMPLES {
+                assert!(
+                    !crate::server::explain_analyze_artifact::snapshot_missing(
+                        Some(&pool),
+                        user,
+                        &session,
+                        &run,
+                    )
+                    .await
+                    .expect("baseline existence read")
+                );
+                let notice = crate::server::explain_analyze_artifact::context_notice_for_run(
+                    Some(&pool),
+                    user,
+                    &session,
+                    &run,
+                    generation,
+                )
+                .await
+                .expect("baseline notice read")
+                .expect("baseline notice");
+                assert_eq!(notice, expected_notice);
+            }
+        })
+        .await;
+    let baseline = baseline_started.elapsed();
+    assert_eq!(baseline_fetches.total, SAMPLES * 2);
+    assert_eq!(baseline_fetches.discovery, SAMPLES * 2);
+    assert_eq!(baseline_fetches.recovery, 0);
+
+    let optimized_started = std::time::Instant::now();
+    let (_, optimized_fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(async {
+            for _ in 0..SAMPLES {
+                let discovery =
+                    crate::server::explain_analyze_artifact::discover_context_notice_for_run(
+                        Some(&pool),
+                        user,
+                        &session,
+                        &run,
+                        generation,
+                    )
+                    .await
+                    .expect("optimized discovery");
+                match discovery {
+                    crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(
+                        notice,
+                    ) => assert_eq!(notice, expected_notice),
+                    crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing => {
+                        panic!("valid benchmark snapshot disappeared")
+                    }
+                }
+            }
+        })
+        .await;
+    let optimized = optimized_started.elapsed();
+    assert_eq!(optimized_fetches.total, SAMPLES);
+    assert_eq!(optimized_fetches.discovery, SAMPLES);
+    assert_eq!(optimized_fetches.recovery, 0);
+    println!(
+        "PERF_RESULT benchmark=explain_existing_snapshot_discovery payload_bytes={} samples={SAMPLES} baseline_two_reads_us={} optimized_one_read_us={}",
+        integrity_bytes.len(),
+        baseline.as_micros(),
+        optimized.as_micros(),
+    );
+    assert!(
+        optimized < baseline.saturating_mul(2),
+        "one-read discovery regressed by more than 2x: baseline={baseline:?}, optimized={optimized:?}"
+    );
+
+    sqlx::query(
+        "DELETE FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user)
+    .bind(&session)
+    .bind(artifact_id)
+    .execute(pool.get())
+    .await
+    .expect("remove Explain benchmark snapshot for recovery path");
+    svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &run,
+            json!({"event_type":"explain_analyze", "data":{
+                "schema_version":1, "event_id":"recovered-finished", "run_id":run,
+                "turn_id":"turn-1", "node_id":"turn", "producer_id":"server",
+                "clock_domain_id":"clock", "kind":"turn", "label":"Recovered turn",
+                "transition":"finished", "elapsed_ms":10, "start_elapsed_ms":0,
+                "duration_ms":10, "outcome":"completed"
+            }}),
+        )
+        .await
+        .expect("append recoverable Explain fact");
+    svc.run_engine
+        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
+        .await
+        .expect("complete recoverable Explain run");
+    svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &run,
+            json!({"event_type":"run_finished", "data":{}}),
+        )
+        .await
+        .expect("append recoverable terminal event");
+    let mut recovered_profile = serde_json::Map::new();
+    let (_, recovery_fetches) =
+        crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
+            svc.append_latest_explain_artifact_context(user, &session, &mut recovered_profile),
+        )
+        .await;
+    assert_eq!(
+        recovery_fetches.total, 3,
+        "genuine absence should use two discovery reads plus recovery's guarded existence read"
+    );
+    assert_eq!(recovery_fetches.discovery, 2);
+    assert_eq!(recovery_fetches.recovery, 1);
+    let recovered_profile =
+        serde_json::to_string(&recovered_profile).expect("serialize recovered Explain profile");
+    assert!(recovered_profile.contains("artifact://session/explain-analyze/"));
+    assert!(!recovered_profile.contains("capture is unavailable"));
+
     cleanup_lifecycle_run_fixture(&pool, user, &run).await;
     crate::server::run::cleanup_run_session_fixture(&pool, user, &session).await;
 }

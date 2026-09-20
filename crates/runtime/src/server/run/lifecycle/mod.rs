@@ -11515,31 +11515,48 @@ impl AgenticRunLifecycleService {
         let Some((run_id, owner_generation)) = run else {
             return;
         };
-        if crate::server::explain_analyze_artifact::snapshot_missing(
-            self.shared_pool.as_ref(),
-            user_id,
-            session_id,
-            &run_id,
-        )
-        .await
-            == Ok(true)
-            && let Ok(Some(durable)) = self.run_engine.load_run(user_id, &run_id).await
-            && durable.session_id == session_id
-            && durable.run_generation == owner_generation
-        {
-            self.publish_recovered_explain(&durable).await;
-        }
-        match crate::server::explain_analyze_artifact::context_notice_for_run(
+        let discovery = crate::server::explain_analyze_artifact::discover_context_notice_for_run(
             self.shared_pool.as_ref(),
             user_id,
             session_id,
             &run_id,
             owner_generation,
         )
-        .await
-        {
-            Ok(Some(notice)) => Self::append_runtime_required_prompt_text(edge_profile, notice),
-            Ok(None) => {}
+        .await;
+        match discovery {
+            Ok(crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Notice(notice)) => {
+                Self::append_runtime_required_prompt_text(edge_profile, notice)
+            }
+            Ok(crate::server::explain_analyze_artifact::ContextNoticeDiscovery::Missing) => {
+                if let Ok(Some(durable)) = self.run_engine.load_run(user_id, &run_id).await
+                    && durable.session_id == session_id
+                    && durable.run_generation == owner_generation
+                {
+                    self.publish_recovered_explain(&durable).await;
+                }
+                match crate::server::explain_analyze_artifact::context_notice_for_run(
+                    self.shared_pool.as_ref(),
+                    user_id,
+                    session_id,
+                    &run_id,
+                    owner_generation,
+                )
+                .await
+                {
+                    Ok(Some(notice)) => {
+                        Self::append_runtime_required_prompt_text(edge_profile, notice)
+                    }
+                    Ok(None) => {}
+                    Err(error) => Self::append_runtime_required_prompt_text(
+                        edge_profile,
+                        crate::server::explain_analyze_artifact::unavailable_context_notice(
+                            &format!(
+                                "the server could not read Explain Analyze run {run_id}: {error}"
+                            ),
+                        ),
+                    ),
+                }
+            }
             Err(error) => Self::append_runtime_required_prompt_text(
                 edge_profile,
                 crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
