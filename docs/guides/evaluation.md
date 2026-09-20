@@ -110,8 +110,13 @@ validity is successful requested calls divided by requested calls; a run with
 no requested call has no validity ratio. Policy violations count attempted calls
 rejected by the explicit policy/safety boundary. Cost comes from every physical
 inference attempt and remains unavailable when usage, terminal state, or the
-admitted route price is missing. Provider fallback count remains unknown until
-the ledger records an explicit transition fact.
+admitted route price is missing. A provider-mismatched attempt is not counted as
+priced because the current price snapshot is route-scoped. Provider fallback
+count comes from the provider identity on every physical attempt compared with
+its admitted invocation route; incomplete route identity leaves it unknown.
+The current frozen adapter does not switch providers, so zero proves route
+consistency for that run and does not claim that a Jev-to-LLM fallback chain is
+enabled.
 
 See the [Evaluation contract](../design/evaluation.md) for persistence,
 isolation, and evidence ownership.

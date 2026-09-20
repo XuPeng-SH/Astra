@@ -125,9 +125,10 @@ impl DatabaseEvaluationPlanStore {
         self.pool.clone()
     }
 
-    /// Evaluation sessions retain their Run and inference evidence until the
-    /// experiment has been reviewed. Session lifecycle code uses this single
-    /// owner-scoped query to suppress destructive close governance.
+    /// Evaluation sessions retain their Run and inference evidence while a
+    /// trial binding remains active. Session lifecycle code uses this single
+    /// owner-scoped query to suppress destructive close governance; the current
+    /// durable API has no release operation.
     pub async fn session_has_bound_trial(
         &self,
         owner_user_id: &str,

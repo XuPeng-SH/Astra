@@ -9249,6 +9249,9 @@ pub async fn load_evaluation_inference_evidence(
     let mut exact_usage_attempt_count = 0_usize;
     let mut primary_routes = Vec::new();
     let mut primary_route_coverage_complete = !routes_truncated;
+    let mut provider_fallback_count = 0_u64;
+    let mut fallback_coverage_complete =
+        !(invocations_truncated || attempts_truncated || routes_truncated);
     let mut seen_reasons = BTreeMap::<String, ()>::new();
 
     let add_reason =
@@ -9333,6 +9336,15 @@ pub async fn load_evaluation_inference_evidence(
                 format!("provider_delivery_unknown:{}", invocation.invocation_id),
             );
         }
+        let route_provider = invocation.provider.as_deref().or_else(|| {
+            fallback_coverage_complete = false;
+            add_reason(
+                &mut reasons,
+                &mut seen_reasons,
+                format!("provider_route_unproven:{}", invocation.invocation_id),
+            );
+            None
+        });
         if invocation.purpose == InferencePurpose::PrimaryAgent.as_str()
             || invocation.purpose == InferencePurpose::SubAgent.as_str()
         {
@@ -9418,6 +9430,34 @@ pub async fn load_evaluation_inference_evidence(
         let mut invocation_terminal_at = None;
         let mut invocation_latency_valid = true;
         for attempt in attempts {
+            let provider_matches_route =
+                route_provider.is_some_and(|route_provider| attempt.provider == route_provider);
+            if let Some(route_provider) = route_provider
+                && attempt.provider != route_provider
+            {
+                if !checked_add_evidence_total(
+                    &mut provider_fallback_count,
+                    1,
+                    "provider_fallback_count",
+                ) {
+                    fallback_coverage_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        "provider_fallback_count_overflow".to_string(),
+                    );
+                }
+                // The route stores the admitted pricing snapshot. A
+                // fallback attempt has no attempt-scoped price here, so
+                // aggregating its cost from the original route would be
+                // false precision.
+                pricing_complete = false;
+                add_reason(
+                    &mut reasons,
+                    &mut seen_reasons,
+                    format!("fallback_attempt_pricing_unbound:{}", attempt.attempt_id),
+                );
+            }
             let pricing = attempt
                 .pricing_json
                 .as_deref()
@@ -9430,6 +9470,10 @@ pub async fn load_evaluation_inference_evidence(
                     ))
                 })?
                 .flatten();
+            let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
+                || pricing.as_ref().is_some_and(|pricing| {
+                    pricing.cache_read.is_none() && pricing.cache_write.is_none()
+                });
             if attempt.status == "started" {
                 settlement_pending = true;
                 topology_complete = false;
@@ -9452,10 +9496,6 @@ pub async fn load_evaluation_inference_evidence(
             }
             if attempt.usage_status == "provider_exact" {
                 exact_usage_attempt_count = exact_usage_attempt_count.saturating_add(1);
-                let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
-                    || pricing.as_ref().is_some_and(|pricing| {
-                        pricing.cache_read.is_none() && pricing.cache_write.is_none()
-                    });
                 if !cache_lanes_known {
                     pricing_complete = false;
                     add_reason(
@@ -9509,12 +9549,27 @@ pub async fn load_evaluation_inference_evidence(
                     format!("usage_{}:{}", attempt.usage_status, attempt.attempt_id),
                 );
             }
-            let cache_lanes_known = attempt.provider_protocol != "typesafe_systemone"
-                || pricing.as_ref().is_some_and(|pricing| {
-                    pricing.cache_read.is_none() && pricing.cache_write.is_none()
-                });
-            if pricing.is_some() && cache_lanes_known {
+            let estimated_cost = (provider_matches_route && cache_lanes_known)
+                .then(|| {
+                    pricing.as_ref()?.estimated_cost_usd(
+                        attempt.fresh_input_tokens,
+                        attempt.output_tokens,
+                        attempt.cache_read_tokens,
+                        attempt.cache_creation_tokens,
+                    )
+                })
+                .flatten();
+            if let Some(cost) = estimated_cost {
                 priced_attempt_count = priced_attempt_count.saturating_add(1);
+                estimated_cost_usd += cost;
+                if !estimated_cost_usd.is_finite() {
+                    pricing_complete = false;
+                    add_reason(
+                        &mut reasons,
+                        &mut seen_reasons,
+                        "inference_cost_overflow".to_string(),
+                    );
+                }
             } else {
                 pricing_complete = false;
                 add_reason(
@@ -9522,25 +9577,7 @@ pub async fn load_evaluation_inference_evidence(
                     &mut seen_reasons,
                     format!("pricing_unavailable:{}", attempt.attempt_id),
                 );
-            }
-            if cache_lanes_known && let Some(pricing) = pricing {
-                if let Some(cost) = pricing.estimated_cost_usd(
-                    attempt.fresh_input_tokens,
-                    attempt.output_tokens,
-                    attempt.cache_read_tokens,
-                    attempt.cache_creation_tokens,
-                ) {
-                    estimated_cost_usd += cost;
-                    if !estimated_cost_usd.is_finite() {
-                        pricing_complete = false;
-                        add_reason(
-                            &mut reasons,
-                            &mut seen_reasons,
-                            "inference_cost_overflow".to_string(),
-                        );
-                    }
-                } else {
-                    pricing_complete = false;
+                if provider_matches_route && cache_lanes_known && pricing.is_some() {
                     add_reason(
                         &mut reasons,
                         &mut seen_reasons,
@@ -9684,10 +9721,13 @@ pub async fn load_evaluation_inference_evidence(
         completion_tokens: (complete
             || (!evidence_truncated && topology_complete && usage_complete))
             .then_some(completion_tokens),
-        // Complete evidence proves every primary attempt stayed on the
-        // frozen provider route. That is the only case where zero fallback
-        // calls is an honest count.
-        provider_fallback_count: (complete && provider_binding_match == Some(true)).then_some(0),
+        // Count every physical attempt whose provider differs from its
+        // logical invocation route. Missing route identity keeps the count
+        // unavailable; a complete zero is therefore evidence, not a default.
+        provider_fallback_count: (topology_complete
+            && fallback_coverage_complete
+            && !evidence_truncated)
+            .then_some(provider_fallback_count),
         latency_ms: (topology_complete && latency_complete && !evidence_truncated)
             .then_some(total_latency_ms),
         estimated_cost_usd: (complete && pricing_complete).then_some(estimated_cost_usd),

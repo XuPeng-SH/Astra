@@ -214,11 +214,15 @@ accounting event supplies requested/executed tool counts, tool validity as
 no requested tool call has no tool-validity ratio. The physical inference
 ledger supplies prompt/completion usage, latency, provider binding, and cost
 only when every logical invocation, physical attempt, exact usage fact, terminal
-state, and frozen route pricing snapshot is covered. Provider fallback count
-remains a visible metric gap until the ledger records an explicit transition
-fact.
-Missing prices or usage remain gaps. Freezing a profile does not imply
-verifier execution or a monetary estimate.
+state, and frozen route pricing snapshot is covered. Provider fallback count is
+derived from the same ledger by comparing every physical attempt with its
+logical invocation route; a missing route identity keeps that metric unavailable.
+A provider-mismatched attempt is not counted as priced because the current
+snapshot is route-scoped, so its cost remains unavailable. Missing prices or
+usage remain gaps. Freezing a profile does not imply verifier execution or a
+monetary estimate. The current frozen adapter does not switch providers, so a
+complete zero proves route consistency for that run; it does not claim that a
+Jev-to-LLM fallback chain is enabled.
 
 The prepare API requires `case.verifier_config.expected` for the
 `json_value_equals` verifier version `1`. The server records the implementation
@@ -405,8 +409,9 @@ without changing its fact or identity contract.
 
 An evaluation Session with a bound trial retains its Run and inference
 evidence. Session close skips ordinary post-session governance for that
-boundary, and hard deletion returns a conflict until the bound experiment has
-been reviewed and released.
+boundary, and hard deletion returns a conflict while the bound experiment is
+retained. The current durable API has no release operation yet, so deletion
+cannot clear this boundary through a reviewed state.
 
 ## Local workspace evaluation delivery boundary
 
