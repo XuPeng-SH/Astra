@@ -9976,45 +9976,20 @@ pub(crate) async fn run_tui_session(
                                         .as_ref()
                                         .ok()
                                         .and_then(|usage| usage.clone());
-                                    let primary_usage = turn_usage
-                                        .as_ref()
-                                        .and_then(|usage| usage.usage_attribution.primary);
-                                    let unclassified_overall = turn_usage.as_ref().is_some_and(|usage| {
-                                        !usage.usage_attribution.has_auxiliary()
-                                            && usage.usage_attribution.primary.is_none()
-                                            && usage.has_values()
-                                    });
-                                    let turn_fresh_input =
-                                        primary_usage
-                                            .and_then(|usage| usage.fresh_input_tokens)
-                                            .or_else(|| {
-                                                unclassified_overall.then_some(
-                                                    turn_usage.as_ref()?.prompt_tokens,
-                                                )
-                                            });
-                                    let turn_completion =
-                                        primary_usage
-                                            .and_then(|usage| usage.output_tokens)
-                                            .or_else(|| {
-                                                unclassified_overall.then_some(
-                                                    turn_usage.as_ref()?.completion_tokens,
-                                                )
-                                            });
-                                    let turn_cache_read =
-                                        primary_usage
-                                            .and_then(|usage| usage.cache_read_tokens)
-                                            .or_else(|| {
-                                                unclassified_overall.then_some(
-                                                    turn_usage.as_ref()?.cache_read_tokens,
-                                                )
-                                            });
-                                    let turn_cache_creation = primary_usage
-                                        .and_then(|usage| usage.cache_creation_tokens);
-                                    let turn_cache_creation = turn_cache_creation.or_else(|| {
-                                        unclassified_overall.then_some(
-                                            turn_usage.as_ref()?.cache_creation_tokens,
-                                        )
-                                    });
+                                    let primary_usage = turn_usage.as_ref().map_or_else(
+                                        Default::default,
+                                            |usage| {
+                                            crate::cli::turn::turn_reporting::project_primary_usage(
+                                                &usage.usage_attribution,
+                                                usage.usage_observed,
+                                            )
+                                        },
+                                    );
+                                    let turn_fresh_input = primary_usage.fresh_input_tokens;
+                                    let turn_completion = primary_usage.output_tokens;
+                                    let turn_cache_read = primary_usage.cache_read_tokens;
+                                    let turn_cache_creation =
+                                        primary_usage.cache_creation_tokens;
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -10043,13 +10018,11 @@ pub(crate) async fn run_tui_session(
                                             ttft_ms,
                                             tokens_in: turn_fresh_input,
                                             tokens_out: turn_completion,
-                                            // Retain cache lanes in the
-                                            // structured turn event for
-                                            // diagnostics/replay. The default
-                                            // completion marker intentionally
-                                            // does not render them.
-                                            cache_read_tokens: turn_cache_read
-                                                .filter(|tokens| *tokens > 0),
+                                            // Preserve an explicitly reported
+                                            // zero cache lane. `None` means
+                                            // unreported and must not be
+                                            // rewritten to zero.
+                                            cache_read_tokens: turn_cache_read,
                                             cache_creation_tokens: turn_cache_creation,
                                             model_name: turn_usage.as_ref().and_then(|usage| {
                                                 usage
@@ -10060,14 +10033,11 @@ pub(crate) async fn run_tui_session(
                                             auxiliary_summary: turn_usage.as_ref().and_then(
                                                 |usage| usage.usage_attribution.auxiliary_summary(),
                                             ),
-                                            usage_partial: turn_usage.as_ref().is_some_and(|usage| {
-                                                let attribution = &usage.usage_attribution;
-                                                unclassified_overall
-                                                    || attribution.primary.is_some()
-                                                        && !attribution.primary_complete
-                                                    || attribution.has_auxiliary()
-                                                        && attribution.primary.is_none()
-                                            }),
+                                            usage_partial: turn_usage
+                                                .as_ref()
+                                                .is_some_and(|_| {
+                                                    primary_usage.observed && !primary_usage.complete
+                                                }),
                                             tools: turn_tool_count,
                                             cumulative_tokens: turn_usage.as_ref().map(|_| {
                                                 state

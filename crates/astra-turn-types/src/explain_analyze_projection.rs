@@ -46,6 +46,25 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub conflicted: bool,
 }
 
+/// Capture coverage for one physical Explain Analyze execution scope.
+///
+/// A logical turn can contain more than one scope when execution is retried,
+/// resumed, or otherwise creates a new clock domain. A terminal node in one
+/// scope therefore cannot establish coverage for another scope. Consumers
+/// should use this projection instead of aggregating terminal/snapshot facts
+/// with global `any`/`all` checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainAnalyzeScopeCoverageV1 {
+    pub run_id: String,
+    pub turn_id: String,
+    pub clock_domain_id: String,
+    pub provider_attempt_observed: bool,
+    pub turn_observed: bool,
+    pub terminal_turn_observed: bool,
+    pub turn_conflicted: bool,
+    pub auxiliary_snapshot_observed: bool,
+}
+
 /// Whether all known facts are internally consistent. `Unknown` also covers a
 /// graph whose cycle check has not yet been finalized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +409,55 @@ impl ExplainAnalyzeGraphV1 {
 
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
+    }
+
+    /// Return capture coverage grouped by the producer's physical execution
+    /// scope. The grouping identity is the complete `(run, turn, clock)`
+    /// tuple; a prior scope must never satisfy a later scope's terminal or
+    /// auxiliary snapshot requirement.
+    pub fn execution_scope_coverage(&self) -> Vec<ExplainAnalyzeScopeCoverageV1> {
+        let mut coverage =
+            BTreeMap::<(String, String, String), ExplainAnalyzeScopeCoverageV1>::new();
+        for node in &self.nodes {
+            if !matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::Turn | ExplainAnalyzeNodeKindV1::ProviderAttempt
+            ) {
+                continue;
+            }
+            let key = (
+                node.run_id.clone(),
+                node.turn_id.clone(),
+                node.clock_domain_id.clone(),
+            );
+            let entry = coverage
+                .entry(key)
+                .or_insert_with(|| ExplainAnalyzeScopeCoverageV1 {
+                    run_id: node.run_id.clone(),
+                    turn_id: node.turn_id.clone(),
+                    clock_domain_id: node.clock_domain_id.clone(),
+                    provider_attempt_observed: false,
+                    turn_observed: false,
+                    terminal_turn_observed: false,
+                    turn_conflicted: false,
+                    auxiliary_snapshot_observed: false,
+                });
+            match node.kind {
+                ExplainAnalyzeNodeKindV1::ProviderAttempt => {
+                    entry.provider_attempt_observed = true;
+                }
+                ExplainAnalyzeNodeKindV1::Turn => {
+                    entry.turn_observed = true;
+                    entry.terminal_turn_observed |= node.terminal_observed;
+                    entry.turn_conflicted |= node.conflicted;
+                    entry.auxiliary_snapshot_observed |= node.terminal_observed
+                        && !node.conflicted
+                        && node.auxiliary_usage.is_some();
+                }
+                _ => unreachable!("scope coverage only admits turn/provider nodes"),
+            }
+        }
+        coverage.into_values().collect()
     }
 
     /// Return roots in first-seen order. Nodes with unresolved parents are

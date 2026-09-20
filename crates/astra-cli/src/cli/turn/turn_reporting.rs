@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crate::cli::session::session_state::SessionState;
-use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::{StreamResult, UsageAttribution};
 use astra_services::session_journal;
 use astra_turn_core::evaluation::TurnEvaluation;
 use crossterm::style::Stylize;
@@ -132,6 +132,12 @@ fn compact_completion_parts(
     {
         parts.push(format!("with {model}"));
     }
+    if let Some(ttft_ms) = result.ttft_ms.filter(|ttft_ms| *ttft_ms > 0) {
+        parts.push(format!("first response {}", format_duration_ms(ttft_ms)));
+    }
+    if let Some(usage) = primary_usage_summary(result) {
+        parts.push(usage);
+    }
     if result.tool_calls_count > 0 {
         parts.push(format!(
             "{} tool{}",
@@ -144,6 +150,115 @@ fn compact_completion_parts(
         ));
     }
     parts
+}
+
+/// Compact, user-facing primary-model usage. Auxiliary calls and session
+/// lifetime totals belong to Explain Analyze; they must not be folded into
+/// this per-turn marker.
+pub(crate) fn format_primary_usage_summary(
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    observed: bool,
+    complete: bool,
+) -> Option<String> {
+    let has_lane = tokens_in.is_some()
+        || tokens_out.is_some()
+        || cache_read_tokens.is_some()
+        || cache_creation_tokens.is_some();
+    if !observed && !has_lane {
+        return None;
+    }
+    if !has_lane {
+        return Some("main usage unavailable".to_string());
+    }
+
+    let total = tokens_in
+        .unwrap_or(0)
+        .saturating_add(tokens_out.unwrap_or(0))
+        .saturating_add(cache_read_tokens.unwrap_or(0))
+        .saturating_add(cache_creation_tokens.unwrap_or(0));
+    let mut summary = format!("{} tokens", format_token_count(total));
+    if !complete {
+        summary.push_str(" (partial)");
+    } else if let (Some(fresh), Some(cache_read), Some(cache_creation)) =
+        (tokens_in, cache_read_tokens, cache_creation_tokens)
+    {
+        let input_total = fresh
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation);
+        if input_total > 0 {
+            let cached_percent = ((u128::from(cache_read) * 100) / u128::from(input_total)) as u64;
+            summary.push_str(&format!(" · {cached_percent}% cached"));
+        }
+    }
+    Some(summary)
+}
+
+/// The only usage facts eligible for the compact primary-model summary. Raw
+/// counters without attribution remain observable, but are deliberately not
+/// presented as belonging to the selected model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrimaryUsageProjection {
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub observed: bool,
+    pub complete: bool,
+}
+
+pub(crate) fn project_primary_usage(
+    attribution: &UsageAttribution,
+    raw_usage_observed: bool,
+) -> PrimaryUsageProjection {
+    let primary = attribution.primary;
+    PrimaryUsageProjection {
+        fresh_input_tokens: primary.and_then(|usage| usage.fresh_input_tokens),
+        cache_read_tokens: primary.and_then(|usage| usage.cache_read_tokens),
+        cache_creation_tokens: primary.and_then(|usage| usage.cache_creation_tokens),
+        output_tokens: primary.and_then(|usage| usage.output_tokens),
+        observed: attribution.has_observed_state() || raw_usage_observed,
+        complete: primary.is_some() && attribution.primary_complete,
+    }
+}
+
+fn primary_usage_summary(result: &StreamResult) -> Option<String> {
+    let attribution = &result.usage_attribution;
+    let raw_has_values = result.prompt_tokens > 0
+        || result.completion_tokens > 0
+        || result.cache_read_tokens > 0
+        || result.cache_creation_tokens > 0;
+    let capture_observed =
+        result.token_usage_coverage.attempts > 0 || result.token_usage_coverage.unavailable > 0;
+    let projection = project_primary_usage(attribution, raw_has_values || capture_observed);
+    format_primary_usage_summary(
+        projection.fresh_input_tokens,
+        projection.output_tokens,
+        projection.cache_read_tokens,
+        projection.cache_creation_tokens,
+        projection.observed,
+        projection.complete,
+    )
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// A typed terminal result owns the user-visible completion state.  The raw
@@ -384,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_completion_parts_do_not_dump_telemetry() {
+    fn unclassified_overall_is_not_presented_as_primary_usage() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.model = Some("deepseek-flash".into());
         let mut result = crate::tests::stub_stream_result("answer");
@@ -392,15 +507,70 @@ mod tests {
         result.cache_read_tokens = 75_000;
         result.completion_tokens = 9;
         result.tool_calls_count = 1;
-        result.usage_attribution.auxiliary_capture_unavailable = true;
 
         assert_eq!(
             compact_completion_parts(&state, &result, Duration::from_millis(8_500)),
             vec![
                 "8.5s".to_string(),
                 "with deepseek-flash".to_string(),
+                "main usage unavailable".to_string(),
                 "1 tool".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn complete_primary_metrics_show_cache_rate_but_not_auxiliary_details() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("deepseek-flash".into());
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.ttft_ms = Some(1_250);
+        result.usage_attribution.primary =
+            Some(crate::cli::stream::streaming_types::AttributedTokenUsage {
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(9),
+            });
+        result.usage_attribution.primary_complete = true;
+        result.usage_attribution.primary_model = Some("deepseek-flash".into());
+
+        assert_eq!(
+            compact_completion_parts(&state, &result, Duration::from_millis(5_200)),
+            vec![
+                "5.2s".to_string(),
+                "with deepseek-flash".to_string(),
+                "first response 1.2s".to_string(),
+                "1.0k tokens · 90% cached".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_attempt_without_usage_is_not_presented_as_zero() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("deepseek-flash".into());
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.usage_attribution.primary_attempts = 1;
+        result.usage_attribution.primary_model = Some("deepseek-flash".into());
+
+        assert!(
+            compact_completion_parts(&state, &result, Duration::from_millis(900))
+                .contains(&"main usage unavailable".to_string())
+        );
+        assert!(
+            !compact_completion_parts(&state, &result, Duration::from_millis(900))
+                .iter()
+                .any(|part| part.contains("tokens"))
+        );
+    }
+
+    #[test]
+    fn explicit_zero_cache_lane_renders_zero_percent() {
+        assert_eq!(
+            super::format_primary_usage_summary(Some(100), Some(9), Some(0), Some(0), true, true,)
+                .as_deref(),
+            Some("109 tokens · 0% cached")
         );
     }
 

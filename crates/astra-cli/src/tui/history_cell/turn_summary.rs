@@ -7,10 +7,10 @@
 //! ```
 //!
 //! The summary is a user-facing completion marker, not a telemetry report.
-//! It answers how long the turn took, which primary model answered, and
-//! whether material tools ran. Token lanes, cache ratios, auxiliary judgment,
-//! and session totals remain structured evidence for Explain Analyze rather
-//! than being dumped into every chat turn.
+//! It answers how long the turn took, when the first response arrived, which
+//! primary model answered, the primary token/cache result, and whether
+//! material tools ran. Auxiliary judgment and session totals remain structured
+//! evidence for Explain Analyze rather than being dumped into every chat turn.
 //!
 //! Persists as [`TurnEvent::TurnSummary`]. Never live.
 
@@ -20,14 +20,15 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
+use crate::cli::turn::turn_reporting::format_primary_usage_summary;
 use crate::tui::turn_event::TurnEvent;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnSummaryCell {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
-    /// Structured provider metrics retained for diagnostics/replay. They are
-    /// intentionally not rendered in the default completion marker.
+    /// Structured primary-provider metrics retained for diagnostics/replay and
+    /// rendered in a compact form in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     /// Cached input alongside the fresh `tokens_in`.
@@ -133,6 +134,29 @@ impl TurnSummaryCell {
                 Span::styled("with ", label),
                 Span::styled(model.to_string(), value),
             ]));
+        }
+
+        if let Some(ttft) = self.ttft_ms.filter(|ttft| *ttft > 0) {
+            sections.push(Section::primary(vec![
+                Span::styled("first response ", label),
+                Span::styled(fmt_duration_ms(ttft), value),
+            ]));
+        }
+
+        let usage_observed = self.tokens_in.is_some()
+            || self.tokens_out.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.usage_partial;
+        if let Some(usage) = format_primary_usage_summary(
+            self.tokens_in,
+            self.tokens_out,
+            self.cache_read_tokens,
+            self.cache_creation_tokens,
+            usage_observed,
+            !self.usage_partial,
+        ) {
+            sections.push(Section::primary(vec![Span::styled(usage, value)]));
         }
 
         if self.tools > 0 {
@@ -258,10 +282,10 @@ mod tests {
     #[test]
     fn full_summary_contains_only_user_facing_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["16s", "tools"] {
+        for seg in ["16s", "first response", "1.8s", "23.6k tokens", "tools"] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
-        for diagnostic in ["ttft", "tokens", "cached", "overall", "spent"] {
+        for diagnostic in ["ttft", "cached", "overall", "spent"] {
             assert!(
                 !out.contains(diagnostic),
                 "diagnostic section {diagnostic:?} leaked into {out}"
@@ -307,8 +331,15 @@ mod tests {
             ..Default::default()
         };
         let out = render(&c, 120);
+        assert!(
+            out.contains("tokens"),
+            "primary usage should remain visible: {out}"
+        );
+        assert!(
+            out.contains("partial"),
+            "partial state should remain visible: {out}"
+        );
         for diagnostic in [
-            "tokens",
             "cached",
             "Jev",
             "request_judgment",
@@ -341,7 +372,11 @@ mod tests {
     #[test]
     fn usage_summary_is_empty_when_only_diagnostics_are_present() {
         let mut c = mk_full();
+        c.ttft_ms = None;
+        c.tokens_in = None;
+        c.tokens_out = None;
         c.cache_read_tokens = None;
+        c.cache_creation_tokens = None;
         c.elapsed_ms = None;
         c.tools = 0;
         let out = render(&c, 120);

@@ -158,6 +158,9 @@ pub(crate) struct TurnUsage {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) usage_attribution: UsageAttribution,
+    /// A provider usage attempt or unavailable capture was observed even if
+    /// no numeric lane survived into the attribution projection.
+    pub(crate) usage_observed: bool,
 }
 
 impl TurnUsage {
@@ -168,12 +171,16 @@ impl TurnUsage {
             cache_read_tokens: result.cache_read_tokens,
             cache_creation_tokens: result.cache_creation_tokens,
             usage_attribution: result.usage_attribution.clone(),
+            usage_observed: false,
         };
-        (result.token_usage_coverage.attempts > 0
+        let usage_observed = result.token_usage_coverage.attempts > 0
             || result.token_usage_coverage.unavailable > 0
             || usage.has_values()
-            || usage.usage_attribution.has_observed_state())
-        .then_some(usage)
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
     }
 
     pub(crate) fn from_partial(partial: &crate::PartialTurnData) -> Option<Self> {
@@ -183,12 +190,16 @@ impl TurnUsage {
             cache_read_tokens: partial.cache_read_tokens,
             cache_creation_tokens: partial.cache_creation_tokens,
             usage_attribution: partial.usage_attribution.clone(),
+            usage_observed: false,
         };
-        (partial.token_usage_coverage.attempts > 0
+        let usage_observed = partial.token_usage_coverage.attempts > 0
             || partial.token_usage_coverage.unavailable > 0
             || usage.has_values()
-            || usage.usage_attribution.has_observed_state())
-        .then_some(usage)
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
     }
 
     pub(crate) fn has_values(&self) -> bool {

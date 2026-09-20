@@ -2,4 +2,4 @@
 source: crates/astra-cli/src/tui/history_cell/turn_summary.rs
 expression: "render(&mk_full(), 120)"
 ---
-  16s · 2 tools
+  16s · first response 1.8s · 23.6k tokens · 2 tools

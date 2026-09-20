@@ -1155,10 +1155,19 @@ pub(crate) async fn stream_chat_sse(
         // prefix. Repair that projection from the accumulated canonical facts
         // before the caller publishes TurnError; otherwise the prefix can be
         // frozen as a complete local report or disappear silently.
-        if p.explain != crate::ExplainMode::Off
-            && (!state.telemetry.explain_analyze_events.is_empty()
-                || state.telemetry.explain_analyze_degraded)
-        {
+        // This failure path has already crossed the normal logical-turn
+        // settlement boundary. Keep the capture verdict independent from the
+        // presentation choice below: Explain Off must not turn the same
+        // incomplete evidence into a complete persisted attribution.
+        let explain_analyze_repair_needed = !state.telemetry.explain_analyze_events.is_empty()
+            || state.telemetry.explain_analyze_degraded;
+        let effective_explain_analyze_degraded = explain_analyze_repair_needed;
+        if p.explain != crate::ExplainMode::Off && explain_analyze_repair_needed {
+            // The snapshot below deliberately carries a degraded delivery
+            // marker because the logical turn failed before its normal
+            // settlement boundary. Use that same effective fact when
+            // building usage attribution; otherwise a raw `false` telemetry
+            // flag can make the persisted partial result look complete.
             let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
                 events: state.telemetry.explain_analyze_events.clone(),
                 // A logical failure leaves coverage/settlement unresolved even
@@ -1207,7 +1216,7 @@ pub(crate) async fn stream_chat_sse(
                 .current_model_identity()
                 .or(p.model)
                 .map(ToOwned::to_owned),
-            state.telemetry.explain_analyze_degraded,
+            effective_explain_analyze_degraded,
         );
         return Err(crate::TurnFailure {
             error,

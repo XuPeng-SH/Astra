@@ -113,6 +113,10 @@ pub(crate) struct UsageAttribution {
     pub(crate) primary_complete: bool,
     pub(crate) primary_attempts: u32,
     pub(crate) primary_model: Option<String>,
+    /// Explain delivery or settlement was degraded. This is independent of
+    /// whether any numeric lane survived and must remain visible to turn
+    /// settlement consumers.
+    pub(crate) capture_degraded: bool,
     pub(crate) auxiliary: Option<AttributedTokenUsage>,
     pub(crate) auxiliary_complete: bool,
     /// The runtime emitted an auxiliary snapshot, but its facts were
@@ -163,14 +167,19 @@ impl UsageAttribution {
             }
         }
 
-        let auxiliary_observed = graph
-            .nodes()
+        let scope_coverage = graph.execution_scope_coverage();
+        let auxiliary_observed = scope_coverage
             .iter()
-            .any(|node| node.auxiliary_usage.is_some());
-        let terminal_turn_observed = graph.nodes().iter().any(|node| {
-            node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn && node.terminal_observed
-        });
-        let auxiliary_capture_missing = terminal_turn_observed && !auxiliary_observed;
+            .any(|scope| scope.auxiliary_snapshot_observed);
+        // Every observed physical scope must close its own Turn boundary and
+        // carry its own auxiliary snapshot. A completed earlier scope cannot
+        // prove coverage for a resumed or retried later scope.
+        let auxiliary_capture_missing = !scope_coverage.is_empty()
+            && scope_coverage.iter().any(|scope| {
+                !scope.terminal_turn_observed
+                    || scope.turn_conflicted
+                    || !scope.auxiliary_snapshot_observed
+            });
         let auxiliary_attempts = graph.auxiliary_attempts();
         let mut auxiliary_accumulator = UsageLaneAccumulator::default();
         let mut auxiliary_sources = BTreeSet::new();
@@ -214,9 +223,10 @@ impl UsageAttribution {
         Self {
             primary: primary_accumulator.finish(),
             primary_complete: primary_attempts > 0
-                && primary_accumulator_complete(&graph, explain_analyze_degraded),
+                && primary_accumulator_complete(&graph, &scope_coverage, explain_analyze_degraded),
             primary_attempts,
             primary_model,
+            capture_degraded: explain_analyze_degraded,
             auxiliary,
             auxiliary_complete: auxiliary_observed
                 && !explain_analyze_degraded
@@ -224,6 +234,11 @@ impl UsageAttribution {
                 && !auxiliary_capture_missing
                 && !auxiliary_capture_conflicted
                 && !auxiliary_capture_truncated
+                && scope_coverage.iter().all(|scope| {
+                    scope.terminal_turn_observed
+                        && !scope.turn_conflicted
+                        && scope.auxiliary_snapshot_observed
+                })
                 && auxiliary_attempts.iter().all(|attempt| {
                     matches!(
                         attempt.usage_status,
@@ -257,6 +272,7 @@ impl UsageAttribution {
             || self.primary_complete
             || self.primary_attempts > 0
             || self.primary_model.is_some()
+            || self.capture_degraded
             || self.has_auxiliary()
             || self.auxiliary_complete
             || !self.auxiliary_sources.is_empty()
@@ -329,14 +345,13 @@ impl UsageAttribution {
 
 fn primary_accumulator_complete(
     graph: &astra_turn_types::ExplainAnalyzeGraphV1,
+    scope_coverage: &[astra_turn_types::ExplainAnalyzeScopeCoverageV1],
     explain_analyze_degraded: bool,
 ) -> bool {
-    let terminal_turn_observed = graph.nodes().iter().any(|node| {
-        node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
-            && node.terminal_observed
-            && !node.conflicted
-    });
-    terminal_turn_observed
+    !scope_coverage.is_empty()
+        && scope_coverage
+            .iter()
+            .all(|scope| scope.terminal_turn_observed && !scope.turn_conflicted)
         && !explain_analyze_degraded
         && graph.diagnostics().is_empty()
         && graph
@@ -1260,6 +1275,53 @@ mod usage_attribution_tests {
     }
 
     #[test]
+    fn later_scope_without_terminal_cannot_inherit_prior_completion() {
+        let first_primary = finished_primary(
+            "primary-first",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(10),
+            }),
+        );
+        let first_terminal = auxiliary_event(true, Vec::new());
+        let mut second_started = started_primary("primary-second");
+        let mut second_primary = finished_primary(
+            "primary-second",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(120),
+                cache_read_tokens: Some(880),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(11),
+            }),
+        );
+        // A retry/resume can keep the logical turn id while opening a new
+        // physical clock scope. The second provider request finished, but
+        // the executor exited before the second Turn terminal was emitted.
+        second_started.clock_domain_id = "clock-2".into();
+        second_primary.clock_domain_id = "clock-2".into();
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[
+                started_primary("primary-first"),
+                first_primary,
+                first_terminal,
+                second_started,
+                second_primary,
+            ],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(!attribution.primary_complete);
+        assert!(attribution.auxiliary_capture_missing);
+        assert!(!attribution.auxiliary_complete);
+    }
+
+    #[test]
     fn partial_auxiliary_capture_keeps_known_lanes_and_association() {
         let exact = auxiliary_attempt(
             "aux-exact",
@@ -1323,6 +1385,19 @@ mod usage_attribution_tests {
                 .auxiliary_summary()
                 .is_some_and(|summary| summary.contains("capture partial"))
         );
+    }
+
+    #[test]
+    fn degraded_capture_is_retained_without_numeric_usage() {
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary")],
+            Some("deepseek-flash".into()),
+            true,
+        );
+
+        assert!(attribution.capture_degraded);
+        assert!(attribution.has_observed_state());
+        assert!(!attribution.primary_complete);
     }
 
     #[test]

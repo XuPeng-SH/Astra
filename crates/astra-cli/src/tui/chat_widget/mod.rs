@@ -188,8 +188,8 @@ pub(crate) enum WireEvent {
 pub(crate) struct TurnStats {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
-    /// Structured provider metrics carried for diagnostics/replay. The
-    /// default completion marker deliberately does not render these lanes.
+    /// Structured primary-provider metrics carried for diagnostics/replay and
+    /// rendered compactly in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     /// Of the `tokens_in` total, how many were served from the provider's
