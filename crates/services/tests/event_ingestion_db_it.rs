@@ -20,6 +20,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 mod common;
+#[path = "event_ingestion/ingestion_process.rs"]
+mod ingestion_process;
 
 const TEST_USER_ID: &str = "test-user";
 

@@ -121,6 +121,11 @@ impl MatrixCloudRuntime {
     /// Wire owner-neutral ingestion and sync infrastructure to an existing
     /// [`SharedPool`]. Request-owned services are bound later from authenticated
     /// run context; the process root never invents a user principal.
+    ///
+    /// Construct once per process-owned pool and share this runtime behind
+    /// `Arc`; runs and delegated executions clone its ingestion sender. Calling
+    /// `attach` again for the same pool creates another independent ingestion
+    /// budget rather than sharing the original worker's limit.
     pub fn attach(shared_pool: SharedPool, _profile: &str) -> Self {
         let edge_agent_id: Arc<str> = std::env::var("ASTRA_EDGE_AGENT_ID")
             .unwrap_or_else(|_| "astra-server".into())

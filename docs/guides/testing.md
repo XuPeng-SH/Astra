@@ -262,6 +262,17 @@ and that releasing the fences drains each delivery exactly once. Run it with
 shared_limiter_workers_recover_from_fences_without_blocking_foreground -- --ignored --exact`.
 This is same-process fault isolation, not cluster-wide admission or throughput.
 
+The ignored `ingestion_process::cross_process_identity_and_delete_fence` test
+in the same binary starts two real child processes with independent SQL pools.
+It holds a durable Session fence while an unrelated Session progresses, then
+requires an identical event submitted by both processes to produce one insert
+and one replay with one session increment and one parent edge. A subsequent
+write after canonical Session deletion must be rejected without resurrection.
+The parent uses bounded IPC waits and kills/reaps its children on assertion
+failure. This proves durable cross-process correctness, not cluster throughput.
+Select this parent test explicitly; `ingestion_process::child` is only its
+internal subprocess entrypoint. Credentials remain in environment/local `.env`.
+
 The optional ingestion probe exercises the production ingestion queue and a
 shared SQL pool with 100 synthetic owners and 1,000 Sessions. It is deliberately
 separate from ordinary integration CI. Use Python 3.11 or newer, the pinned Rust
