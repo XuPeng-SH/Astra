@@ -23117,6 +23117,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 (event_index, false, true)
             }
             AtomicRunGuidanceAdmission::Duplicate { event_index } => (event_index, true, false),
+            AtomicRunGuidanceAdmission::EvaluationFrozen => {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "Evaluation inputs are frozen. Cancel this trial and prepare a new experiment to change its input.",
+                    "evaluation_input_frozen",
+                ));
+            }
             AtomicRunGuidanceAdmission::IdentityConflict => {
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,

@@ -3,7 +3,7 @@ import { WebApiError } from '@/lib/api/errors';
 export type RequestJsonInit = RequestInit & { timeoutMs?: number };
 
 export async function requestJson<T>(path: string, init: RequestJsonInit = {}): Promise<T> {
-  const { timeoutMs = 30_000, signal: externalSignal, ...requestInit } = init;
+  const { timeoutMs = 0, signal: externalSignal, ...requestInit } = init;
   const controller = new AbortController();
   const abortFromCaller = () => controller.abort();
   if (externalSignal?.aborted) {
@@ -25,16 +25,16 @@ export async function requestJson<T>(path: string, init: RequestJsonInit = {}): 
       },
     });
 
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { error?: string; detail?: string };
-      detail = body.error ?? body.detail ?? detail;
-    } catch {
-      // Preserve the HTTP status.
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const body = (await response.json()) as { error?: string; detail?: string };
+        detail = body.error ?? body.detail ?? detail;
+      } catch {
+        // Preserve the HTTP status.
+      }
+      throw new WebApiError(response.status, detail);
     }
-    throw new WebApiError(response.status, detail);
-  }
 
     return (await response.json()) as T;
   } finally {

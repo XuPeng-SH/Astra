@@ -974,6 +974,7 @@ pub(crate) async fn hard_delete_session_rows(
         })?;
 
     ensure_no_live_work_recovery_points(tx, session_id, user_id).await?;
+    ensure_evaluation_evidence_retained(tx, session_id, user_id).await?;
 
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or
@@ -1327,6 +1328,7 @@ async fn mark_session_deleting(
     .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
 
     ensure_no_live_work_recovery_points(&mut tx, session_id, user_id).await?;
+    ensure_evaluation_evidence_retained(&mut tx, session_id, user_id).await?;
 
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)
@@ -1425,22 +1427,25 @@ async fn ensure_no_live_work_recovery_points(
 }
 
 async fn ensure_evaluation_evidence_retained(
-    pool: &Pool<MySql>,
+    tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let bound_trials: i64 = query_scalar(
-        "SELECT COUNT(*) FROM evaluation_trial_bindings
-         WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'",
+    // The caller holds the same Session fence used by atomic Run/trial start.
+    // A locking read observes a binding committed while waiting for that fence.
+    let retained: Option<String> = query_scalar(
+        "SELECT trial_id FROM evaluation_trial_bindings
+         WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'
+         LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
-    .fetch_one(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|source| format!("delete_session.check_evaluation_evidence: {source}"))?;
-    if bound_trials > 0 {
+    if let Some(trial_id) = retained {
         return Err(format!(
-            "delete_session.evaluation_evidence_retained: session has {bound_trials} bound evaluation trial(s); review the experiment before deleting the Session"
+            "delete_session.evaluation_evidence_retained: session has bound evaluation trial {trial_id}; review the experiment before deleting the Session"
         ));
     }
     Ok(())
@@ -1487,8 +1492,6 @@ pub(crate) async fn hard_delete_session(
     user_id: &str,
 ) -> Result<SessionHardDeleteOutcome, String> {
     let total_start = Instant::now();
-
-    ensure_evaluation_evidence_retained(pool, session_id, user_id).await?;
 
     // Phase 0: Persist delete intent before destructive cleanup. The session
     // row remains until the database transaction commits, so a crash before

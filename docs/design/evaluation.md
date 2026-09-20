@@ -423,6 +423,15 @@ evidence. Session close skips ordinary post-session governance for that
 boundary, and hard deletion returns a conflict while the bound experiment is
 retained. The current durable API has no release operation yet, so deletion
 cannot clear this boundary through a reviewed state.
+Retention is checked under the same Session fence used by trial start, before
+recording deletion intent and again before deleting rows. A binding committed
+while deletion waits for that fence must therefore retain its evidence.
+
+Bound evaluation Runs reject live guidance at canonical durable admission with
+`evaluation_input_frozen` (HTTP 409). Changing input requires a new experiment;
+cancellation remains available. Web evaluation orchestration supplies explicit
+request deadlines. Shared API requests have no implicit deadline, allowing
+synchronous operations such as Skillify generation to finish.
 
 ## Local workspace evaluation delivery boundary
 

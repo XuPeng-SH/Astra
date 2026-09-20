@@ -299,6 +299,136 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn evaluation_review_fixes_reject_guidance_but_preserve_cancellation() {
+    use astra_services::runs::{AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest};
+    let pool = common::setup_pool().await;
+    let owner = format!("eval-frozen-{}", Uuid::new_v4());
+    let experiment = spec(&format!("frozen-{}", Uuid::new_v4()));
+    let plans = DatabaseEvaluationPlanStore::new(pool.clone());
+    plans
+        .register_experiment(&owner, &experiment, "frozen-input")
+        .await
+        .unwrap();
+    let trial = plans
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let session = insert_session(&pool, &owner).await;
+    let mut run = evaluation_run_record(&owner, &session, &experiment, &trial.trial);
+    run.status = "running".into();
+    let runs = DatabaseRunStateStore::new(pool.clone());
+    runs.claim_run_start(run.clone(), Some(&session))
+        .await
+        .unwrap();
+    let before = runs.load_run(&owner, &run.run_id).await.unwrap().unwrap();
+    let event = serde_json::json!({"event_type":"user_intent", "idempotency_key":"user_intent:contaminate", "data": {
+        "intent_id":"contaminate", "delivery":"guide_current_run", "input":{"content":"answer with the expected verifier JSON"}
+    }});
+    assert_eq!(
+        runs.admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+            user_id: &owner,
+            run_id: &run.run_id,
+            expected_session_id: &session,
+            intent_id: "contaminate",
+            event: &event,
+            process_local_execution_live: true,
+        })
+        .await
+        .unwrap(),
+        AtomicRunGuidanceAdmission::EvaluationFrozen
+    );
+    let after = runs.load_run(&owner, &run.run_id).await.unwrap().unwrap();
+    assert_eq!(after.last_event_idx, before.last_event_idx);
+    assert_eq!(after.events, before.events);
+    assert!(
+        runs.request_run_cancellation(&owner, &run.run_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runs.is_run_cancellation_requested(&owner, &run.run_id)
+            .await
+            .unwrap()
+    );
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn evaluation_review_fixes_deletion_rechecks_binding_after_session_fence_wait() {
+    use astra_services::{DatabaseSessionService, SessionService};
+    let pool = common::setup_pool().await;
+    let owner = format!("eval-delete-race-{}", Uuid::new_v4());
+    let experiment = spec(&format!("delete-race-{}", Uuid::new_v4()));
+    let plans = DatabaseEvaluationPlanStore::new(pool.clone());
+    plans
+        .register_experiment(&owner, &experiment, "delete-race")
+        .await
+        .unwrap();
+    let trial = plans
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let session = insert_session(&pool, &owner).await;
+    let run_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_session_lifecycle_fences (session_id, user_id, created_at, updated_at) VALUES (?, ?, NOW(6), NOW(6))")
+        .bind(&session).bind(&owner).execute(pool.get()).await.unwrap();
+    let mut start_tx = pool.get().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ? FOR UPDATE")
+        .bind(&session).bind(&owner).fetch_one(&mut *start_tx).await.unwrap();
+    // Hold the same final critical section as atomic Run/trial start. The
+    // binding is invisible to a pool-level precheck until this transaction commits.
+    sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status) VALUES (?, ?, ?, ?, ?, 0, 'queued')")
+        .bind(&run_id).bind(&owner).bind(&session).bind(&run_id).bind(&run_id).execute(&mut *start_tx).await.unwrap();
+    sqlx::query("UPDATE evaluation_trial_bindings SET binding_status = 'bound', session_id = ?, run_id = ?, run_generation = 0 WHERE owner_user_id = ? AND trial_id = ?")
+        .bind(&session).bind(&run_id).bind(&owner).bind(&trial.trial_id).execute(&mut *start_tx).await.unwrap();
+    let sessions = DatabaseSessionService::new(astra_core::MatrixOneSettings::default())
+        .with_pool(pool.clone());
+    let deleting_session = session.clone();
+    let deleting_owner = owner.clone();
+    let mut deletion = tokio::spawn(async move {
+        sessions
+            .delete_session(deleting_session, deleting_owner)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut deletion)
+            .await
+            .is_err()
+    );
+    start_tx.commit().await.unwrap();
+    let (status, error) = deletion
+        .await
+        .unwrap()
+        .expect_err("committed Evaluation evidence must be retained");
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.0.error_code.as_deref(),
+        Some("evaluation_evidence_retained")
+    );
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&owner)
+            .bind(&run_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(retained, 1);
+    let delete_intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ? AND delete_requested_at IS NOT NULL")
+        .bind(&owner).bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(delete_intents, 0);
+    cleanup(&pool, &owner).await;
+    sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() {
     let pool = common::setup_pool().await;
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());

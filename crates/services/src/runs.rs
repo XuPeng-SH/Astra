@@ -2855,6 +2855,7 @@ pub enum AtomicRunGuidanceAdmission {
     Duplicate {
         event_index: i64,
     },
+    EvaluationFrozen,
     IdentityConflict,
     Inactive {
         status: String,
@@ -16489,6 +16490,29 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunGuidanceAdmission::Missing);
         };
+
+        let evaluation_bound = sqlx::query_scalar::<_, String>(
+            "SELECT trial_id FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND session_id = ? AND run_id = ?
+               AND binding_status = 'bound' LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.user_id)
+        .bind(request.expected_session_id)
+        .bind(request.run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "admit_run_guidance_evaluation_binding",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        if evaluation_bound.is_some() {
+            tx.rollback().await.map_err(|source| source.to_string())?;
+            return Ok(AtomicRunGuidanceAdmission::EvaluationFrozen);
+        }
 
         // Retry identity is authoritative before status/liveness. A client
         // must be able to reconcile a lost successful response after the run
