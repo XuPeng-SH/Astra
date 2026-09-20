@@ -2289,6 +2289,45 @@ pub struct ConfinedOutput {
     pub confinement: ShellConfinementEvidence,
 }
 
+#[cfg(target_os = "linux")]
+impl ConfinedOutput {
+    /// Portable projection shared by model tools and evaluator-owned verifiers.
+    pub fn execution_evidence(&self) -> astra_runtime_env::ShellExecutionEvidence {
+        use astra_runtime_env::{
+            ShellExecutionEvidence, ShellScopeOwnership, ShellSettlementEvidence,
+            ShellSetupEvidence,
+        };
+        let ShellConfinementEvidence::LinuxRestrictedRootV1 { receipt } = &self.confinement;
+        let process = &self.process;
+        ShellExecutionEvidence {
+            schema_version: 1,
+            profile: crate::ShellLaunchPlan::PROFILE_ID.into(),
+            execution_started: process.execution_started,
+            setup: match receipt {
+                Ok(code) => ShellSetupEvidence::Verified { exit_code: *code },
+                Err(_) => ShellSetupEvidence::Unverified {
+                    reason_code: "setup_or_exec_unverified".into(),
+                },
+            },
+            settlement: ShellSettlementEvidence {
+                scope_settled: process.scope_settled,
+                ownership: process.scope_ownership.map(|owner| match owner {
+                    ScopeOwnership::InvocationCgroup => ShellScopeOwnership::InvocationCgroup,
+                    ScopeOwnership::InvocationSupervisor => {
+                        ShellScopeOwnership::InvocationSupervisor
+                    }
+                    ScopeOwnership::ForegroundProcessGroup => {
+                        ShellScopeOwnership::ForegroundProcessGroup
+                    }
+                }),
+                descendants_terminated: process.descendants_terminated,
+            },
+            timed_out: process.timed_out,
+            cancelled: process.cancelled,
+        }
+    }
+}
+
 /// Execute a single-use plan prepared by `ShellProcessBoundary`. The plan fixes
 /// the trusted toolchain manifest, protected direct workspace children, guest
 /// cwd and environment. Only resource limits, timeout and output limits are read

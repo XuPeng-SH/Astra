@@ -1933,7 +1933,27 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
     execute_bash_with_observation(ctx, args, workdir, || async {
-        execute_bash_with_filesystem_boundary_inner(ctx, args, read_only_paths, workdir).await
+        execute_bash_with_filesystem_boundary_inner(ctx, args, read_only_paths, workdir, None).await
+    })
+    .await
+}
+
+pub(crate) async fn execute_bash_with_process_boundary_at_workdir(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    boundary: &astra_sandbox::ShellProcessBoundary,
+    protected_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_with_filesystem_boundary_inner(
+            ctx,
+            args,
+            protected_paths,
+            workdir,
+            Some(boundary),
+        )
+        .await
     })
     .await
 }
@@ -1943,7 +1963,26 @@ async fn execute_bash_with_filesystem_boundary_inner(
     args: &Value,
     read_only_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
+    boundary: Option<&astra_sandbox::ShellProcessBoundary>,
 ) -> ToolResult {
+    if boundary.is_some()
+        && (ctx.detach_shell_handle.is_some()
+            || [
+                "env",
+                "environment",
+                "detach",
+                "run_in_background",
+                "ready_check",
+                "background_ttl",
+                "stdin",
+            ]
+            .iter()
+            .any(|field| args.get(*field).is_some()))
+    {
+        return ToolResult::error(
+            "SANDBOX_DENIED: restricted shell does not support environment overlays, detach, background service routes, or stdin".into(),
+        );
+    }
     let workspace_root = ctx.workspace_root.as_path();
     let command = match args.get("command").and_then(Value::as_str) {
         Some(command) if !command.trim().is_empty() => command,
@@ -1995,6 +2034,18 @@ async fn execute_bash_with_filesystem_boundary_inner(
     }
 
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
+    if let Some(boundary) = boundary {
+        return execute_restricted_bash(
+            ctx,
+            command,
+            timeout_secs,
+            boundary,
+            read_only_paths,
+            workdir,
+            source_preimages,
+        )
+        .await;
+    }
     let boundary_root = match workspace_root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
@@ -2063,6 +2114,15 @@ async fn execute_bash_with_filesystem_boundary_inner(
             source_preimages,
         );
     }
+    map_isolated_bash_output(command, output, source_preimages)
+}
+
+fn map_isolated_bash_output(
+    command: &str,
+    output: astra_sandbox::IsolatedOutput,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    let rendered = output.combined_output();
     let scope_settled = output.scope_settled;
     let scope_ownership = output.scope_ownership;
     let descendants_terminated = output.descendants_terminated;
@@ -2140,6 +2200,130 @@ async fn execute_bash_with_filesystem_boundary_inner(
         false,
         descendants_terminated,
     )
+}
+
+// Setup verification is deliberately independent of the process owner's facts.
+// This metadata is plumbing evidence, not an Evaluation admission receipt.
+async fn execute_restricted_bash(
+    ctx: &crate::ToolContext,
+    command: &str,
+    timeout_secs: f64,
+    boundary: &astra_sandbox::ShellProcessBoundary,
+    protected_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            ctx,
+            command,
+            timeout_secs,
+            boundary,
+            protected_paths,
+            workdir,
+        );
+        attach_source_preimage(
+            ToolResult::error("SANDBOX_DENIED: restricted shell requires Linux".into()),
+            source_preimages,
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Recheck the prepared directory after observation acquisition. The
+        // provider must still own the allocation exclusively through launch.
+        let current = resolve_bash_workdir(&boundary.workspace, &serde_json::json!({}));
+        if !current
+            .as_ref()
+            .is_ok_and(|root| root.identity() == workdir.identity())
+        {
+            return attach_source_preimage(
+                ToolResult::error(
+                    "SANDBOX_DENIED: restricted shell requires the pinned workspace-root workdir"
+                        .into(),
+                ),
+                source_preimages,
+            );
+        }
+        let mut argv = Vec::new();
+        if should_enable_pipefail(command) {
+            argv.extend(["-o".to_string(), "pipefail".to_string()]);
+        }
+        argv.extend(["-c".to_string(), command.to_string()]);
+        let plan = boundary.launch_plan_with_protected_paths(
+            workdir.path(),
+            "/bin/bash",
+            &argv,
+            protected_paths,
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                return attach_source_preimage(
+                    ToolResult::error(format!(
+                        "SANDBOX_DENIED: restricted shell preparation failed: {error}"
+                    )),
+                    source_preimages,
+                );
+            }
+        };
+        let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
+            ctx.workspace_root.clone(),
+            Vec::new(),
+        );
+        config.timeout = Duration::from_secs_f64(timeout_secs);
+        config.max_output_bytes = per_tool_output_limit("bash");
+        let output =
+            astra_sandbox::execute_confined_with_cancel(plan, &config, ctx.cancel_token.as_deref())
+                .await;
+        map_confined_bash_output(command, output, source_preimages)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_confined_bash_output(
+    command: &str,
+    output: astra_sandbox::ConfinedOutput,
+    source_preimages: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    let receipt = output.execution_evidence();
+    let verified = matches!(
+        receipt.setup,
+        astra_runtime_env::ShellSetupEvidence::Verified { .. }
+    );
+    let authoritative = receipt.settlement.scope_settled
+        && matches!(
+            receipt.settlement.ownership,
+            Some(
+                astra_runtime_env::ShellScopeOwnership::InvocationCgroup
+                    | astra_runtime_env::ShellScopeOwnership::InvocationSupervisor
+            )
+        );
+    let started = receipt.execution_started;
+    let interrupted = receipt.timed_out || receipt.cancelled;
+    let evidence = serde_json::to_value(receipt).expect("shell evidence serializes");
+    let process = output.process;
+    let mut result = map_isolated_bash_output(command, process, source_preimages);
+    if !verified || !authoritative {
+        result.is_error = true;
+        if !interrupted {
+            result = result.with_exit_semantics(ExitSemantics::ExecutionError);
+        }
+        result = result.with_result_class(crate::exit_semantics::CommandResultClass::Inconclusive);
+        result.output.push_str(
+            "\nRestricted shell setup/exec verification or authoritative settlement is incomplete.",
+        );
+    }
+    let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
+    if !verified {
+        fields.remove("exit_code");
+    }
+    fields.insert(
+        INTERNAL_EXECUTION_STARTED_FIELD.to_string(),
+        Value::Bool(started),
+    );
+    fields.insert("shell_confinement".to_string(), evidence);
+    result
 }
 
 fn attach_scope_settled(
@@ -9058,5 +9242,88 @@ mod workdir_tests {
             "pinned"
         );
         assert!(!outside.path().join("marker").exists());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod restricted_evidence_tests {
+    use super::*;
+
+    fn output(
+        receipt: Result<i32, String>,
+        started: bool,
+        settled: bool,
+    ) -> astra_sandbox::ConfinedOutput {
+        astra_sandbox::ConfinedOutput {
+            process: astra_sandbox::IsolatedOutput {
+                stdout: "captured".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                execution_started: started,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: true,
+                cgroup_active: false,
+                scope_settled: settled,
+                scope_ownership: Some(astra_sandbox::ScopeOwnership::InvocationSupervisor),
+                descendants_terminated: true,
+            },
+            confinement: astra_sandbox::ShellConfinementEvidence::LinuxRestrictedRootV1 { receipt },
+        }
+    }
+
+    #[test]
+    fn setup_and_settlement_are_independent() {
+        for (receipt, started, settled, error) in [
+            (Ok(0), true, true, false),
+            (Ok(0), true, false, true),
+            (Err("missing receipt".into()), true, true, true),
+            (Err("spawn refused".into()), false, false, true),
+        ] {
+            let verified = receipt.is_ok();
+            let result = map_confined_bash_output("true", output(receipt, started, settled), None);
+            assert_eq!(result.is_error, error);
+            let fields = result.metadata.unwrap();
+            assert_eq!(fields.contains_key("exit_code"), verified);
+            assert_eq!(fields[INTERNAL_EXECUTION_STARTED_FIELD], started);
+            assert_eq!(
+                fields["shell_confinement"]["settlement"]["scope_settled"],
+                settled
+            );
+            assert_eq!(
+                fields["shell_confinement"]["setup"]["status"],
+                if verified { "verified" } else { "unverified" }
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_and_timeout_keep_settlement_without_verifier_exit() {
+        for cancelled in [false, true] {
+            let mut raw = output(Err("interrupted".into()), true, true);
+            raw.process.cancelled = cancelled;
+            raw.process.timed_out = !cancelled;
+            let result = map_confined_bash_output("true", raw, None);
+            assert!(result.is_error);
+            assert_eq!(
+                result.exit_semantics,
+                Some(if cancelled {
+                    ExitSemantics::Cancelled
+                } else {
+                    ExitSemantics::TimedOut
+                })
+            );
+            let fields = result.metadata.unwrap();
+            assert!(!fields.contains_key("exit_code"));
+            assert_eq!(
+                fields["shell_confinement"]["settlement"]["ownership"],
+                "invocation_supervisor"
+            );
+        }
+        let mut raw = output(Ok(0), true, true);
+        raw.process.scope_ownership = Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup);
+        assert!(map_confined_bash_output("true", raw, None).is_error);
     }
 }

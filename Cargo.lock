@@ -738,6 +738,7 @@ dependencies = [
  "astra-core",
  "astra-memoria",
  "astra-prompts",
+ "astra-runtime-env",
  "astra-sandbox",
  "astra-services",
  "astra-turn-types",

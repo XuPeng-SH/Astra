@@ -145,6 +145,7 @@ pub struct DefaultToolExecutor {
     convergence_authority: Arc<str>,
     bash_cache_ttl: std::time::Duration,
     filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
+    shell_process_boundary: Option<astra_sandbox::ShellProcessBoundary>,
     native_file_access: Option<Result<crate::fs_ops::FileAuthority, String>>,
 }
 
@@ -243,6 +244,7 @@ impl DefaultToolExecutor {
             convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
             filesystem_write_boundary: None,
+            shell_process_boundary: None,
             native_file_access: None,
         }
     }
@@ -345,6 +347,21 @@ impl DefaultToolExecutor {
         self
     }
 
+    /// Select restricted Linux shell launches with an explicit toolchain manifest.
+    /// No read roots are inferred and no ordinary-shell fallback is permitted.
+    /// Native files retain the same protected-path authority as managed tools.
+    /// The provider owns exclusive allocation, immutable inputs, private staging,
+    /// and supervisor entrypoint dispatch; this does not admit an Evaluation run.
+    pub fn with_shell_process_boundary(
+        mut self,
+        boundary: astra_sandbox::ShellProcessBoundary,
+        protected_paths: Vec<std::path::PathBuf>,
+    ) -> Self {
+        self = self.with_filesystem_write_boundary(protected_paths);
+        self.shell_process_boundary = Some(boundary);
+        self
+    }
+
     /// Require the process sandbox to create an isolated network namespace.
     /// Evaluation workspaces use this together with the filesystem boundary;
     /// namespace unavailability therefore rejects execution rather than
@@ -436,7 +453,12 @@ impl ToolExecutor for DefaultToolExecutor {
                 return unsupported_managed_tool(name);
             }
             match access {
-                Ok(access) if access.matches_root(&self.ctx.workspace_root) => {}
+                Ok(access)
+                    if access.matches_root(&self.ctx.workspace_root)
+                        && self
+                            .shell_process_boundary
+                            .as_ref()
+                            .is_none_or(|boundary| access.matches_root(&boundary.workspace)) => {}
                 Ok(_) => {
                     return ToolResult::error(
                         "SANDBOX_DENIED: pinned workspace root was replaced".into(),
@@ -943,6 +965,9 @@ impl DefaultToolExecutor {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        if self.shell_process_boundary.is_some() {
+            return None;
+        }
         let command = args.get("command")?.as_str()?.to_string();
         // Readonly classifier: only commands whose output depends
         // solely on fs + env may hit the cache. Anything with side
@@ -1015,6 +1040,16 @@ impl DefaultToolExecutor {
         }
         match name {
             // ── Shell operations ─────────────────────────────────────
+            "bash" if self.shell_process_boundary.is_some() => {
+                crate::shell_ops::execute_bash_with_process_boundary_at_workdir(
+                    &self.ctx,
+                    args,
+                    self.shell_process_boundary.as_ref().expect("selected boundary"),
+                    self.filesystem_write_boundary.as_deref().unwrap_or(&[]),
+                    bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                )
+                .await
+            }
             "bash" => match &self.filesystem_write_boundary {
                 Some(paths) => {
                     crate::shell_ops::execute_bash_with_filesystem_boundary_at_workdir(
@@ -1298,6 +1333,58 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_shell_rejects_unsupported_routes_and_never_caches() {
+        let (root, exec) = test_executor();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let boundary = astra_sandbox::ShellProcessBoundary {
+            workspace: root.path().to_path_buf(),
+            home: root.path().join("unused-home"),
+            temp: root.path().join("unused-temp"),
+            read_only_paths: Vec::new(),
+        };
+        let exec = exec.with_shell_process_boundary(boundary.clone(), Vec::new());
+        let args = serde_json::json!({"command": "pwd"});
+        let workdir = crate::shell_ops::resolve_bash_workdir(root.path(), &args).unwrap();
+        assert!(exec.bash_cache_key(&args, &workdir).is_none());
+        for args in [
+            serde_json::json!({"command": "touch escaped", "workdir": "nested"}),
+            serde_json::json!({"command": "touch escaped", "env": {}}),
+            serde_json::json!({"command": "touch escaped", "detach": true}),
+            serde_json::json!({"command": "touch escaped", "run_in_background": true}),
+        ] {
+            assert!(exec.execute("bash", &args).await.is_error);
+        }
+        for name in ["run_script", "worktree", "grep", "glob"] {
+            assert!(exec.execute(name, &serde_json::json!({})).await.is_error);
+        }
+        // Invalid explicit toolchain inputs must not fall back even though
+        // the same command is executable by an ordinary host shell.
+        let mut invalid = boundary.clone();
+        invalid.read_only_paths = vec![root.path().join("missing-toolchain")];
+        let refused = exec
+            .clone()
+            .with_shell_process_boundary(invalid, Vec::new());
+        let result = refused
+            .execute("bash", &serde_json::json!({"command": "touch escaped"}))
+            .await;
+        assert!(result.is_error);
+        assert!(!root.path().join("escaped").exists());
+        assert!(!root.path().join("nested/escaped").exists());
+        let outside = TempDir::new().unwrap();
+        let mut mismatch = boundary;
+        mismatch.workspace = outside.path().to_path_buf();
+        let exec = exec.with_shell_process_boundary(mismatch, Vec::new());
+        assert!(exec.execute("bash", &args).await.is_error);
+        assert!(
+            exec.execute("read_file", &serde_json::json!({"path": "missing"}))
+                .await
+                .output
+                .contains("SANDBOX_DENIED")
+        );
     }
 
     #[cfg(unix)]

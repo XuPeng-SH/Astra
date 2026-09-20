@@ -156,6 +156,16 @@ from `BashInvocationOwner` settlement. A missing or invalid launcher receipt
 cannot supply a verifier exit code, even if the launcher process exits normally.
 Cancellation and timeout retain settlement facts without claiming verifier success.
 
+`DefaultToolExecutor::with_shell_process_boundary` selects this launcher while
+retaining canonical tool admission, native file authority, source observation,
+and cancellation. This mode disables Bash read caching and refuses environment
+overlays, stdin, detach/background execution, unsupported helper tools, and
+non-root workdirs. A refused or failed launch never falls back to ordinary Bash.
+Tool metadata carries `shell_confinement`, the shared `ShellExecutionEvidence`
+projection of actual setup and process-settlement facts. Its verified exit-code
+accessor rejects missing setup, weak process-group ownership, incomplete
+settlement, timeout, cancellation, and unknown profiles or schema versions.
+
 This primitive requires trusted, exclusive allocation and immutable toolchain
 inputs from its provider. It does not itself establish those properties, persist
 an Evaluation receipt, or upgrade existing namespace-only callers. Evaluation

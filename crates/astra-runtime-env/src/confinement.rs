@@ -9,6 +9,69 @@ use sha2::{Digest, Sha256};
 
 pub const WORKSPACE_CONFINEMENT_PROFILE: &str = "linux_restricted_root_x86_64_v1";
 
+/// Actual per-launch evidence. A configured profile alone is never a receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellExecutionEvidence {
+    pub schema_version: u32,
+    pub profile: String,
+    pub execution_started: bool,
+    pub setup: ShellSetupEvidence,
+    pub settlement: ShellSettlementEvidence,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellSetupEvidence {
+    Verified { exit_code: i32 },
+    Unverified { reason_code: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSettlementEvidence {
+    pub scope_settled: bool,
+    pub ownership: Option<ShellScopeOwnership>,
+    pub descendants_terminated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellScopeOwnership {
+    InvocationCgroup,
+    InvocationSupervisor,
+    ForegroundProcessGroup,
+}
+
+impl ShellExecutionEvidence {
+    /// A verifier outcome is usable only after verified setup and authoritative
+    /// settlement. Preserve incomplete receipts for diagnosis, never score them.
+    pub fn verified_exit_code(&self) -> Option<i32> {
+        if self.schema_version != 1
+            || self.profile != WORKSPACE_CONFINEMENT_PROFILE
+            || !self.execution_started
+            || !self.settlement.scope_settled
+            || !matches!(
+                self.settlement.ownership,
+                Some(
+                    ShellScopeOwnership::InvocationCgroup
+                        | ShellScopeOwnership::InvocationSupervisor
+                )
+            )
+            || self.timed_out
+            || self.cancelled
+        {
+            return None;
+        }
+        match self.setup {
+            ShellSetupEvidence::Verified { exit_code } => Some(exit_code),
+            ShellSetupEvidence::Unverified { .. } => None,
+        }
+    }
+}
+
 /// Pure guest-path rules shared by the frozen contract and the Linux launcher.
 pub fn validate_confined_toolchain_mount(path: &str) -> Result<(), String> {
     if !path.starts_with('/')
@@ -148,6 +211,54 @@ impl WorkspaceConfinementContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifier_receipt_requires_setup_and_authoritative_settlement() {
+        let receipt = ShellExecutionEvidence {
+            schema_version: 1,
+            profile: WORKSPACE_CONFINEMENT_PROFILE.into(),
+            execution_started: true,
+            setup: ShellSetupEvidence::Verified { exit_code: 7 },
+            settlement: ShellSettlementEvidence {
+                scope_settled: true,
+                ownership: Some(ShellScopeOwnership::InvocationSupervisor),
+                descendants_terminated: false,
+            },
+            timed_out: false,
+            cancelled: false,
+        };
+        let persisted: ShellExecutionEvidence =
+            serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+        assert_eq!(persisted.verified_exit_code(), Some(7));
+        for mutation in 0..9 {
+            let mut incomplete = receipt.clone();
+            match mutation {
+                0 => incomplete.schema_version = 2,
+                1 => incomplete.profile = "unknown".into(),
+                2 => incomplete.execution_started = false,
+                3 => {
+                    incomplete.setup = ShellSetupEvidence::Unverified {
+                        reason_code: "setup_or_exec_unverified".into(),
+                    }
+                }
+                4 => incomplete.settlement.scope_settled = false,
+                5 => {
+                    incomplete.settlement.ownership =
+                        Some(ShellScopeOwnership::ForegroundProcessGroup)
+                }
+                6 => incomplete.settlement.ownership = None,
+                7 => incomplete.timed_out = true,
+                _ => incomplete.cancelled = true,
+            }
+            assert_eq!(incomplete.verified_exit_code(), None, "mutation {mutation}");
+        }
+        let mut missing = serde_json::to_value(&receipt).unwrap();
+        missing["settlement"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scope_settled");
+        assert!(serde_json::from_value::<ShellExecutionEvidence>(missing).is_err());
+    }
 
     fn contract() -> WorkspaceConfinementContract {
         WorkspaceConfinementContract {
