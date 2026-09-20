@@ -23,6 +23,74 @@ const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_WINDOW_BYTES: usize = 8 * 1024;
 const MAX_WINDOW_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+tokio::task_local! {
+    static ARTIFACT_FETCHES: ArtifactFetchCounters;
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct ArtifactFetchCounters {
+    total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    discovery: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    recovery: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactFetchCounts {
+    pub(crate) total: usize,
+    pub(crate) discovery: usize,
+    pub(crate) recovery: usize,
+}
+
+#[cfg(test)]
+pub(crate) async fn count_explain_artifact_fetches<F>(future: F) -> (F::Output, ArtifactFetchCounts)
+where
+    F: std::future::Future,
+{
+    let counters = ArtifactFetchCounters::default();
+    let output = ARTIFACT_FETCHES.scope(counters.clone(), future).await;
+    let load = |counter: &std::sync::atomic::AtomicUsize| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    (
+        output,
+        ArtifactFetchCounts {
+            total: load(&counters.total),
+            discovery: load(&counters.discovery),
+            recovery: load(&counters.recovery),
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactFetchPurpose {
+    Discovery,
+    Recovery,
+}
+
+#[cfg(test)]
+fn record_artifact_fetch(purpose: ArtifactFetchPurpose) {
+    ARTIFACT_FETCHES
+        .try_with(|counters| {
+            use std::sync::atomic::Ordering;
+            counters.total.fetch_add(1, Ordering::Relaxed);
+            match purpose {
+                ArtifactFetchPurpose::Discovery => {
+                    counters.discovery.fetch_add(1, Ordering::Relaxed);
+                }
+                ArtifactFetchPurpose::Recovery => {
+                    counters.recovery.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(test))]
+fn record_artifact_fetch(_purpose: ArtifactFetchPurpose) {}
+
 /// The run is the immutable observation identity.  A run may be resumed by
 /// another owner generation, but it must never publish a second logical
 /// Explain artifact under a different ID.  The exact turn and generation are
@@ -37,6 +105,21 @@ fn artifact_id(run_id: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+async fn load_snapshot_artifact(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+    purpose: ArtifactFetchPurpose,
+) -> Result<Option<StoredSessionArtifact>, String> {
+    record_artifact_fetch(purpose);
+    DatabaseSessionArtifactStore::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .load_json_artifact(user_id, session_id, artifact_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Repair a missing snapshot only from the exact, completed durable run.
 /// Paused captures are still mutable and must not acquire an immutable report.
 pub(crate) async fn recover_completed_snapshot(
@@ -47,12 +130,16 @@ pub(crate) async fn recover_completed_snapshot(
         return Ok(None);
     }
     let Some(pool) = pool else { return Ok(None) };
-    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
     let id = artifact_id(&run.run_id);
-    if let Some(existing) = store
-        .load_json_artifact(&run.user_id, &run.session_id, &id)
-        .await
-        .map_err(|error| format!("check recovered Explain artifact: {error}"))?
+    if let Some(existing) = load_snapshot_artifact(
+        pool,
+        &run.user_id,
+        &run.session_id,
+        &id,
+        ArtifactFetchPurpose::Recovery,
+    )
+    .await
+    .map_err(|error| format!("check recovered Explain artifact: {error}"))?
     {
         let status = validate_snapshot_payload(
             &existing,
@@ -101,21 +188,6 @@ pub(crate) fn artifact_handle(artifact_id: &str) -> String {
     format!("{ARTIFACT_URI_PREFIX}{artifact_id}")
 }
 
-pub(crate) async fn snapshot_missing(
-    pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-) -> Result<bool, String> {
-    let Some(pool) = pool else { return Ok(false) };
-    DatabaseSessionArtifactStore::new(pool.settings().clone())
-        .with_pool(pool.clone())
-        .load_json_artifact(user_id, session_id, &artifact_id(run_id))
-        .await
-        .map(|artifact| artifact.is_none())
-        .map_err(|error| error.to_string())
-}
-
 fn artifact_id_from_handle(handle: &str) -> Option<&str> {
     let id = handle.strip_prefix(ARTIFACT_URI_PREFIX)?;
     (!id.is_empty()
@@ -124,6 +196,25 @@ fn artifact_id_from_handle(handle: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
     .then_some(id)
+}
+
+#[cfg(test)]
+pub(crate) async fn snapshot_missing(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+) -> Result<bool, String> {
+    let Some(pool) = pool else { return Ok(false) };
+    load_snapshot_artifact(
+        pool,
+        user_id,
+        session_id,
+        &artifact_id(run_id),
+        ArtifactFetchPurpose::Discovery,
+    )
+    .await
+    .map(|artifact| artifact.is_none())
 }
 
 struct CapturedExplainEvents {
@@ -654,6 +745,11 @@ pub(crate) fn unavailable_context_notice(reason: &str) -> String {
     )
 }
 
+pub(crate) enum ContextNoticeDiscovery {
+    Missing,
+    Notice(String),
+}
+
 /// Return the short, model-facing discovery notice for one authoritative
 /// Explain run. The caller resolves the latest requested Explain run from the
 /// durable run ledger; this function never falls back to an older artifact.
@@ -664,26 +760,56 @@ pub(crate) async fn context_notice_for_run(
     expected_run_id: &str,
     expected_owner_generation: u64,
 ) -> Result<Option<String>, String> {
+    Ok(Some(
+        match discover_context_notice_for_run(
+            pool,
+            user_id,
+            session_id,
+            expected_run_id,
+            expected_owner_generation,
+        )
+        .await?
+        {
+            ContextNoticeDiscovery::Missing => unavailable_context_notice(&format!(
+                "no artifact was published for Explain run {expected_run_id}"
+            )),
+            ContextNoticeDiscovery::Notice(notice) => notice,
+        },
+    ))
+}
+
+/// Read and validate the exact authoritative Explain snapshot once.
+///
+/// Only physical absence is returned as `Missing`. Corrupt, expired, or
+/// identity-mismatched snapshots become an unavailable notice so callers must
+/// not recover over an existing artifact and hide its integrity failure.
+pub(crate) async fn discover_context_notice_for_run(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    expected_run_id: &str,
+    expected_owner_generation: u64,
+) -> Result<ContextNoticeDiscovery, String> {
     let Some(pool) = pool else {
-        return Ok(Some(unavailable_context_notice(
+        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
             "server Explain Analyze artifact storage is not configured",
         )));
     };
-    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
     let artifact_id = artifact_id(expected_run_id);
-    let Some(artifact) = store
-        .load_json_artifact(user_id, session_id, &artifact_id)
-        .await
-        .map_err(|error| {
-            format!("load Explain Analyze artifact for run {expected_run_id}: {error}")
-        })?
+    let Some(artifact) = load_snapshot_artifact(
+        pool,
+        user_id,
+        session_id,
+        &artifact_id,
+        ArtifactFetchPurpose::Discovery,
+    )
+    .await
+    .map_err(|error| format!("load Explain Analyze artifact for run {expected_run_id}: {error}"))?
     else {
-        return Ok(Some(unavailable_context_notice(&format!(
-            "no artifact was published for Explain run {expected_run_id}"
-        ))));
+        return Ok(ContextNoticeDiscovery::Missing);
     };
     if artifact.artifact_kind != ARTIFACT_KIND {
-        return Ok(Some(unavailable_context_notice(
+        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
             "the stored artifact kind does not match Explain Analyze",
         )));
     }
@@ -694,7 +820,11 @@ pub(crate) async fn context_notice_for_run(
         Some(expected_owner_generation),
     ) {
         Ok(status) => status,
-        Err(error) => return Ok(Some(unavailable_context_notice(&error))),
+        Err(error) => {
+            return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
+                &error,
+            )));
+        }
     };
     if status == "unavailable" {
         let reason = artifact
@@ -702,7 +832,9 @@ pub(crate) async fn context_notice_for_run(
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("the server did not publish readable Explain Analyze facts");
-        return Ok(Some(unavailable_context_notice(reason)));
+        return Ok(ContextNoticeDiscovery::Notice(unavailable_context_notice(
+            reason,
+        )));
     }
     let handle = artifact_handle(&artifact.artifact_id);
     let size = artifact
@@ -711,7 +843,7 @@ pub(crate) async fn context_notice_for_run(
         .and_then(|metadata| metadata.get("size_bytes"))
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    Ok(Some(format!(
+    Ok(ContextNoticeDiscovery::Notice(format!(
         "[Explain Analyze artifact discovery]\nExplain Analyze artifact · type={ARTIFACT_TYPE} · content={CONTENT_TYPE} · storage={STORAGE} · status={status} · size={size} bytes\nHandle: {handle}\nIf the user asks about the previous/latest Explain Analyze run, call introspect(artifact=\"{handle}\", offset=0, max_bytes=65536) before drawing conclusions. The handle is server-session scoped and the bounded reader is the model-facing authority; a local TUI/Edge rendered path is only a human presentation copy. If the artifact is partial or the reader reports unavailable, state that limitation and do not infer missing timing or token facts."
     )))
 }

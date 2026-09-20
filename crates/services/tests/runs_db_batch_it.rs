@@ -1646,3 +1646,106 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
         .execute(pool.get())
         .await;
 }
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_identity() {
+    let (pool, store) = setup().await;
+    let suffix = uuid::Uuid::new_v4();
+    let user_id = format!("explain-discovery-user-{suffix}");
+    let session_id = format!("explain-discovery-session-{suffix}");
+    let older_root = format!("explain-older-{suffix}");
+    let newer_root = format!("explain-newer-{suffix}");
+    let child = format!("explain-child-{suffix}");
+
+    for run_id in [&older_root, &newer_root, &child] {
+        let mut run = durable_run_record(run_id.clone(), user_id.clone(), session_id.clone());
+        run.checkpoint_json = Some("x".repeat(512 * 1024));
+        if run_id == &child {
+            run.depth = 1;
+            run.parent_run_id = Some(newer_root.clone());
+            run.root_run_id = Some(newer_root.clone());
+            run.ancestor_path = Some(format!("{newer_root}/{child}"));
+        }
+        insert_run_fixture(&pool, store.as_ref(), run).await;
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                run_id,
+                make_event(
+                    "run_started",
+                    json!({"data": {"explain_analyze_requested": true}}),
+                ),
+            )
+            .await
+            .expect("append Explain request marker");
+    }
+    sqlx::query(
+        "UPDATE agent_runs SET updated_at = CASE run_id
+             WHEN ? THEN '2026-01-01 00:00:00.000000'
+             WHEN ? THEN '2026-01-02 00:00:00.000000'
+             ELSE '2026-01-03 00:00:00.000000' END
+         WHERE user_id = ? AND run_id IN (?, ?, ?)",
+    )
+    .bind(&older_root)
+    .bind(&newer_root)
+    .bind(&user_id)
+    .bind(&older_root)
+    .bind(&newer_root)
+    .bind(&child)
+    .execute(pool.get())
+    .await
+    .expect("set deterministic Explain ordering");
+
+    assert_eq!(
+        store
+            .find_latest_explain_analyze_root(&user_id, &session_id)
+            .await
+            .expect("discover latest Explain root"),
+        Some((newer_root.clone(), 1)),
+        "newer root must win even when a child has the newest timestamp"
+    );
+    assert_eq!(
+        store
+            .find_latest_explain_analyze_root("not-the-owner", &session_id)
+            .await
+            .expect("wrong owner lookup"),
+        None
+    );
+
+    sqlx::query("UPDATE agent_runs SET run_generation = -1 WHERE user_id = ? AND run_id = ?")
+        .bind(&user_id)
+        .bind(&newer_root)
+        .execute(pool.get())
+        .await
+        .expect("seed invalid stored generation");
+    let error = store
+        .find_latest_explain_analyze_root(&user_id, &session_id)
+        .await
+        .expect_err("negative generation must fail closed");
+    assert!(error.contains("run_generation") || error.contains("negative"));
+
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id IN (?, ?, ?)")
+        .bind(&user_id)
+        .bind(&older_root)
+        .bind(&newer_root)
+        .bind(&child)
+        .execute(pool.get())
+        .await
+        .expect("clean Explain events");
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id IN (?, ?, ?)")
+        .bind(&user_id)
+        .bind(&older_root)
+        .bind(&newer_root)
+        .bind(&child)
+        .execute(pool.get())
+        .await
+        .expect("clean Explain runs");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean Explain session");
+}
