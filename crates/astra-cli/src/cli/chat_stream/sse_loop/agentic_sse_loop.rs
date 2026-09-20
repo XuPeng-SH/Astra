@@ -17,7 +17,7 @@ use astra_turn_core::{
 use crossterm::style::Stylize;
 use serde_json::Value;
 
-use crate::cli::stream::streaming_types::AppliedStreamUserIntent;
+use crate::cli::stream::streaming_types::{AppliedStreamUserIntent, UsageAttribution};
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 use astra_config::runtime_config::ExplainReportFormat;
 
@@ -39,6 +39,7 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) total_cache_creation: u64,
     pub(crate) total_completion: u64,
     pub(crate) current_session_id: Option<&'a str>,
+    pub(crate) usage_attribution: &'a UsageAttribution,
 }
 
 pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
@@ -58,6 +59,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         total_cache_creation,
         total_completion,
         current_session_id,
+        usage_attribution,
     } = ctx;
 
     let mut explain_artifact_error = None;
@@ -103,7 +105,11 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    let model_tag = model.unwrap_or("auto");
+    let model_tag = usage_attribution
+        .primary_model
+        .as_deref()
+        .or(model)
+        .unwrap_or("auto");
     let session_tag = session_id_footer_abbrev(current_session_id);
     if verbose_mode && !quiet {
         // `↑` is the full billable input: fresh + cache-read + cache-creation.
@@ -119,7 +125,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         eprintln!(
             "{}",
             format!(
-                "  ⏱ {:.1}s  ↓ {}  ↑ {}  model: {}  session: {}",
+                "  ⏱ {:.1}s  ↓ {}  ↑ {}  overall · main: {}  auxiliary: {}  session: {}",
                 elapsed,
                 if has_any_usage {
                     format_token_count_compact(total_completion)
@@ -132,6 +138,9 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                     "?".to_string()
                 },
                 model_tag,
+                usage_attribution
+                    .auxiliary_summary()
+                    .unwrap_or_else(|| "none".to_string()),
                 session_tag,
             )
             .dim()
@@ -148,6 +157,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) completion_tokens: u64,
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
+    pub(crate) usage_attribution: UsageAttribution,
     pub(crate) tool_calls_count: u32,
     pub(crate) tool_ledger_aggregate:
         astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate,
@@ -272,7 +282,14 @@ pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<Strin
     // An interruption without provider text already uses this same safe
     // notice as its only visible text. Publish a separate lifecycle row only
     // when there is distinct partial assistant content to preserve.
-    (!assistant_text.is_empty() && assistant_text != notice.trim()).then_some(notice)
+    if assistant_text.is_empty() || assistant_text == notice.trim() {
+        return None;
+    }
+    if result.interruption_kind.as_deref() == Some("execution_incomplete") {
+        Some(format!("Partial answer shown. {notice}"))
+    } else {
+        Some(notice)
+    }
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -285,6 +302,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         completion_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        usage_attribution,
         tool_calls_count,
         tool_ledger_aggregate,
         first_surface_report,
@@ -396,6 +414,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         completion_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        usage_attribution,
         tool_calls_count,
         tool_ledger_aggregate,
         visible_tools: report.visible_tools,
@@ -436,6 +455,7 @@ mod tests {
     use super::{
         StreamResultBuild, build_stream_result, partial_interruption_notice, resolved_tool_metrics,
     };
+    use crate::cli::stream::streaming_types::UsageAttribution;
     use astra_pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;
@@ -479,6 +499,7 @@ mod tests {
             completion_tokens: 500,
             cache_read_tokens: 800,
             cache_creation_tokens: 100,
+            usage_attribution: UsageAttribution::default(),
             tool_calls_count: 3,
             tool_ledger_aggregate: succeeded_aggregate(3),
             first_surface_report: None,
@@ -611,7 +632,7 @@ mod tests {
         ctx.interruption = Some(serde_json::json!({
             "kind": "execution_incomplete",
             "resumable": true,
-            "user_message": "The requested execution did not complete. Progress is saved. Continue this session to resume.",
+            "user_message": "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work.",
             "error_detail": "persistent unresolved tool outcome after bounded reconciliation"
         }));
 
@@ -624,7 +645,7 @@ mod tests {
         assert_eq!(
             partial_interruption_notice(&result).as_deref(),
             Some(
-                "The requested execution did not complete. Progress is saved. Continue this session to resume."
+                "Partial answer shown. Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
             )
         );
         assert!(!result.full_text.contains("persistent unresolved"));

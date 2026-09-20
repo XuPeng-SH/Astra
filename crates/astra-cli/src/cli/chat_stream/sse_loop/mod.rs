@@ -43,6 +43,7 @@ use crate::{
 use crate::cli::chat_stream::ChatTurnParams;
 use crate::cli::chat_stream::params::StreamEvent;
 use crate::cli::session::session_runtime::{self, ServerDefaultModel};
+use crate::cli::stream::streaming_types::UsageAttribution;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     partial_interruption_notice, resolved_tool_metrics,
@@ -1200,6 +1201,14 @@ pub(crate) async fn stream_chat_sse(
         let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
             &state.stall.tool_call_records,
         );
+        let usage_attribution = UsageAttribution::from_explain_analyze_events(
+            &state.telemetry.explain_analyze_events,
+            state
+                .current_model_identity()
+                .or(p.model)
+                .map(ToOwned::to_owned),
+            state.telemetry.explain_analyze_degraded,
+        );
         return Err(crate::TurnFailure {
             error,
             partial: crate::PartialTurnData {
@@ -1211,6 +1220,7 @@ pub(crate) async fn stream_chat_sse(
                 completion_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
                 cache_creation_tokens: state.total_cache_creation,
+                usage_attribution,
                 tool_calls_count,
                 llm_rounds: Some(state.llm_rounds_completed),
                 token_usage_coverage: state.token_usage_coverage(),
@@ -1270,6 +1280,15 @@ pub(crate) async fn stream_chat_sse(
     }
     finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
 
+    let usage_attribution = UsageAttribution::from_explain_analyze_events(
+        &state.telemetry.explain_analyze_events,
+        state
+            .current_model_identity()
+            .or(p.model)
+            .map(ToOwned::to_owned),
+        state.telemetry.explain_analyze_degraded,
+    );
+
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
         explain_report_format: p.explain_report_format,
@@ -1286,6 +1305,7 @@ pub(crate) async fn stream_chat_sse(
         total_cache_creation: state.total_cache_creation,
         total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
+        usage_attribution: &usage_attribution,
     });
 
     // `turn_intent` is populated only by the strict LLM judge. Preserve
@@ -1332,6 +1352,7 @@ pub(crate) async fn stream_chat_sse(
         completion_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
+        usage_attribution,
         tool_calls_count: state.total_tool_calls,
         tool_ledger_aggregate,
         first_surface_report: state.telemetry.first_selection_report,

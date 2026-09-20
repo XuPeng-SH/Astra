@@ -9975,16 +9975,46 @@ pub(crate) async fn run_tui_session(
                                     let turn_usage = turn_result
                                         .as_ref()
                                         .ok()
-                                        .and_then(|usage| *usage);
-                                    let turn_fresh_input = turn_usage.map(|usage| {
-                                        usage
-                                            .prompt_tokens
-                                            .saturating_add(usage.cache_creation_tokens)
+                                        .and_then(|usage| usage.clone());
+                                    let primary_usage = turn_usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.usage_attribution.primary);
+                                    let unclassified_overall = turn_usage.as_ref().is_some_and(|usage| {
+                                        !usage.usage_attribution.has_auxiliary()
+                                            && usage.usage_attribution.primary.is_none()
+                                            && usage.has_values()
                                     });
+                                    let turn_fresh_input =
+                                        primary_usage
+                                            .and_then(|usage| usage.fresh_input_tokens)
+                                            .or_else(|| {
+                                                unclassified_overall.then_some(
+                                                    turn_usage.as_ref()?.prompt_tokens,
+                                                )
+                                            });
                                     let turn_completion =
-                                        turn_usage.map(|usage| usage.completion_tokens);
+                                        primary_usage
+                                            .and_then(|usage| usage.output_tokens)
+                                            .or_else(|| {
+                                                unclassified_overall.then_some(
+                                                    turn_usage.as_ref()?.completion_tokens,
+                                                )
+                                            });
                                     let turn_cache_read =
-                                        turn_usage.map(|usage| usage.cache_read_tokens);
+                                        primary_usage
+                                            .and_then(|usage| usage.cache_read_tokens)
+                                            .or_else(|| {
+                                                unclassified_overall.then_some(
+                                                    turn_usage.as_ref()?.cache_read_tokens,
+                                                )
+                                            });
+                                    let turn_cache_creation = primary_usage
+                                        .and_then(|usage| usage.cache_creation_tokens);
+                                    let turn_cache_creation = turn_cache_creation.or_else(|| {
+                                        unclassified_overall.then_some(
+                                            turn_usage.as_ref()?.cache_creation_tokens,
+                                        )
+                                    });
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -10022,8 +10052,26 @@ pub(crate) async fn run_tui_session(
                                             // caching provider, etc.).
                                             cache_read_tokens: turn_cache_read
                                                 .filter(|tokens| *tokens > 0),
+                                            cache_creation_tokens: turn_cache_creation,
+                                            model_name: turn_usage.as_ref().and_then(|usage| {
+                                                usage
+                                                    .usage_attribution
+                                                    .primary_model
+                                                    .clone()
+                                            }),
+                                            auxiliary_summary: turn_usage.as_ref().and_then(
+                                                |usage| usage.usage_attribution.auxiliary_summary(),
+                                            ),
+                                            usage_partial: turn_usage.as_ref().is_some_and(|usage| {
+                                                let attribution = &usage.usage_attribution;
+                                                unclassified_overall
+                                                    || attribution.primary.is_some()
+                                                        && !attribution.primary_complete
+                                                    || attribution.has_auxiliary()
+                                                        && attribution.primary.is_none()
+                                            }),
                                             tools: turn_tool_count,
-                                            cumulative_tokens: turn_usage.map(|_| {
+                                            cumulative_tokens: turn_usage.as_ref().map(|_| {
                                                 state
                                                     .total_prompt_tokens
                                                     .saturating_add(state.total_completion_tokens)
@@ -10033,6 +10081,7 @@ pub(crate) async fn run_tui_session(
                                                     .saturating_add(state.total_cache_read_tokens)
                                             }),
                                             cumulative_cost_usd: turn_usage
+                                                .as_ref()
                                                 .map(|_| state.total_session_cost),
                                         };
                                         if let Some(ev) = chat_widget::translate(

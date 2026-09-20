@@ -3,7 +3,7 @@
 //! Shape:
 //!
 //! ```text
-//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · $0.014 spent)
+//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · main deepseek · Jev ...)
 //! ```
 //!
 //! The summary intentionally stays in product language rather than
@@ -31,6 +31,10 @@ pub(crate) struct TurnSummaryCell {
     /// Cached input alongside the fresh `tokens_in`. Drives both total provider
     /// traffic and the cache-rate band.
     pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub model_name: Option<String>,
+    pub auxiliary_summary: Option<String>,
+    pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -47,6 +51,10 @@ impl TurnSummaryCell {
                 tokens_in,
                 tokens_out,
                 cache_read_tokens,
+                cache_creation_tokens,
+                model_name,
+                auxiliary_summary,
+                usage_partial,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -56,6 +64,10 @@ impl TurnSummaryCell {
                 tokens_in,
                 tokens_out,
                 cache_read_tokens,
+                cache_creation_tokens,
+                model_name,
+                auxiliary_summary,
+                usage_partial,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -94,6 +106,10 @@ impl HistoryCell for TurnSummaryCell {
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
             cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            model_name: self.model_name.clone(),
+            auxiliary_summary: self.auxiliary_summary.clone(),
+            usage_partial: self.usage_partial,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
             cumulative_cost_usd: self.cumulative_cost_usd,
@@ -122,20 +138,38 @@ impl TurnSummaryCell {
             ]));
         }
 
-        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
-            let provider_tokens = tin
+        let has_known_provider_lane = self.tokens_in.is_some()
+            || self.tokens_out.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some();
+        if has_known_provider_lane {
+            let provider_tokens = self
+                .tokens_in
+                .unwrap_or(0)
                 .saturating_add(self.cache_read_tokens.unwrap_or(0))
-                .saturating_add(tout);
+                .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+                .saturating_add(self.tokens_out.unwrap_or(0));
             sections.push(Section::primary(vec![
                 Span::styled(fmt_tokens(provider_tokens), value),
-                Span::styled(" tokens", label),
+                Span::styled(
+                    if self.usage_partial {
+                        " tokens known"
+                    } else {
+                        " tokens"
+                    },
+                    label,
+                ),
             ]));
         }
 
-        if let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
+        if !self.usage_partial
+            && let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
+            && let Some(cache_creation) = self.cache_creation_tokens.or(Some(0))
             && cache_read > 0
         {
-            let total_input = cache_read.saturating_add(fresh_input);
+            let total_input = cache_read
+                .saturating_add(fresh_input)
+                .saturating_add(cache_creation);
             let pct = if total_input == 0 {
                 0
             } else {
@@ -154,10 +188,24 @@ impl TurnSummaryCell {
             ]));
         }
 
+        if let Some(model) = self.model_name.as_deref() {
+            secondary_parts.push(vec![
+                Span::styled("main ", label),
+                Span::styled(model.to_string(), value),
+            ]);
+        }
+        if let Some(auxiliary) = self.auxiliary_summary.as_deref() {
+            secondary_parts.push(vec![Span::styled(auxiliary.to_string(), value)]);
+        }
+        if self.usage_partial {
+            secondary_parts.push(vec![Span::styled("usage not fully attributed", label)]);
+        }
+
         let current_provider_tokens = self
             .tokens_in
             .unwrap_or(0)
             .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
             .saturating_add(self.tokens_out.unwrap_or(0));
         let cumulative_tokens = self
             .cumulative_tokens
@@ -330,6 +378,10 @@ mod tests {
             tokens_in: Some(23_200),
             tokens_out: Some(408),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            usage_partial: false,
             tools: 2,
             cumulative_tokens: Some(145_000),
             cumulative_cost_usd: Some(0.014),
@@ -396,6 +448,46 @@ mod tests {
             !out.contains("1.5k tokens"),
             "fresh-only billing tokens must not masquerade as provider traffic: {out}"
         );
+    }
+
+    #[test]
+    fn partial_usage_keeps_known_tokens_but_hides_exact_cache_rate() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            tokens_out: Some(300),
+            cache_read_tokens: Some(98_800),
+            cache_creation_tokens: None,
+            usage_partial: true,
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(
+            out.contains("100.3k tokens known"),
+            "known lanes missing: {out}"
+        );
+        assert!(
+            !out.contains("cached"),
+            "cache rate must be unavailable: {out}"
+        );
+        assert!(
+            out.contains("usage not fully attributed"),
+            "coverage missing: {out}"
+        );
+    }
+
+    #[test]
+    fn partial_usage_hides_cache_rate_even_when_all_input_lanes_are_known() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            tokens_out: Some(300),
+            cache_read_tokens: Some(98_800),
+            cache_creation_tokens: Some(0),
+            usage_partial: true,
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(!out.contains("cached"), "partial cache rate leaked: {out}");
+        assert!(out.contains("usage not fully attributed"));
     }
 
     #[test]

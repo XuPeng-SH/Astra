@@ -4899,6 +4899,8 @@ struct ExplainAnalyzeProviderAttemptObserver<'a> {
     sender: Option<ServerEventSender>,
     model_round_node_id: Option<String>,
     model_round_index: u32,
+    model_name: String,
+    wire_model_name: Option<String>,
     spans: std::sync::Mutex<HashMap<u32, ExplainAnalyzeProviderAttemptSpan>>,
 }
 
@@ -4909,6 +4911,8 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
         sender: Option<ServerEventSender>,
         model_round_node_id: Option<String>,
         model_round_index: u32,
+        model_name: impl Into<String>,
+        wire_model_name: Option<String>,
     ) -> Self {
         Self {
             inner,
@@ -4916,6 +4920,8 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
             sender,
             model_round_node_id,
             model_round_index,
+            model_name: model_name.into(),
+            wire_model_name,
             spans: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -5024,12 +5030,20 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             return;
         };
         let started_at = Instant::now();
+        let model_label = match self
+            .wire_model_name
+            .as_deref()
+            .filter(|wire_model| *wire_model != self.model_name)
+        {
+            Some(wire_model) => format!("{} → {}", self.model_name, wire_model),
+            None => self.model_name.clone(),
+        };
         let node = ExplainAnalyzeNode::new(
             context,
             format!("{parent_node_id}/physical/{attempt_index}"),
             Some(parent_node_id.clone()),
             astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt,
-            "Model request",
+            bounded_explain_analyze_label("Model request ·", &model_label),
             started_at,
             Some(self.model_round_index),
             Some(attempt_index),
@@ -19457,6 +19471,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 self.event_tx.clone(),
                 model_round_node_id,
                 state.current_round_index,
+                llm_cfg.model_name.clone(),
+                llm_cfg.wire_model_name.clone(),
             );
             self.complete_request_preparation_phase_with_context(
                 state,

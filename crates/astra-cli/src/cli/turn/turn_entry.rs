@@ -11,6 +11,7 @@ use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_
 use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::streaming_types::UsageAttribution;
 use astra_services::session_journal::{
     JournalWriter, SessionExecutionLease, SessionExecutionLeaseError,
 };
@@ -150,12 +151,13 @@ pub(crate) struct TurnContext<'a> {
 /// canonical StreamResult/partial failure rather than inferred by subtracting
 /// session-lifetime counters, which may be refreshed or advanced by another
 /// executor while the turn is running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnUsage {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
+    pub(crate) usage_attribution: UsageAttribution,
 }
 
 impl TurnUsage {
@@ -165,6 +167,7 @@ impl TurnUsage {
             completion_tokens: result.completion_tokens,
             cache_read_tokens: result.cache_read_tokens,
             cache_creation_tokens: result.cache_creation_tokens,
+            usage_attribution: result.usage_attribution.clone(),
         };
         (result.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
     }
@@ -175,11 +178,12 @@ impl TurnUsage {
             completion_tokens: partial.completion_tokens,
             cache_read_tokens: partial.cache_read_tokens,
             cache_creation_tokens: partial.cache_creation_tokens,
+            usage_attribution: partial.usage_attribution.clone(),
         };
         (partial.token_usage_coverage.provider_reported > 0 || usage.has_values()).then_some(usage)
     }
 
-    fn has_values(self) -> bool {
+    pub(crate) fn has_values(&self) -> bool {
         self.prompt_tokens > 0
             || self.completion_tokens > 0
             || self.cache_read_tokens > 0
