@@ -15306,8 +15306,8 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<(String, u64)>, String> {
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs runs \
+        let row = sqlx::query(
+            "SELECT runs.run_id, runs.run_generation FROM agent_runs runs \
              WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 \
                AND EXISTS ( \
                    SELECT 1 FROM agent_run_events events \
@@ -15316,9 +15316,8 @@ impl RunStateStore for DatabaseRunStateStore {
                      AND JSON_UNQUOTE(JSON_EXTRACT(events.payload_json, '$.data.explain_analyze_requested')) = 'true' \
                ) \
              ORDER BY runs.updated_at DESC, runs.created_at DESC, runs.run_id DESC \
-             LIMIT 1"
-        );
-        let row = sqlx::query(&sql)
+             LIMIT 1",
+        )
             .bind(user_id)
             .bind(session_id)
             .fetch_optional(self.pool.get())
@@ -15329,8 +15328,12 @@ impl RunStateStore for DatabaseRunStateStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let run = run_record_from_row(row).map_err(|error| error.to_string())?;
-        Ok(Some((run.run_id, run.run_generation)))
+        let operation = "find_latest_explain_analyze_root";
+        let run_id = run_row_string(&row, operation, "agent_runs", "run_id")
+            .map_err(|error| error.to_string())?;
+        let run_generation = run_row_u64(&row, operation, "agent_runs", "run_generation")
+            .map_err(|error| error.to_string())?;
+        Ok(Some((run_id, run_generation)))
     }
 
     async fn load_latest_terminal_cancellation_origin(
