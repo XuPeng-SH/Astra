@@ -3585,7 +3585,20 @@ impl DesiredStateConvergenceTracker {
         args: &serde_json::Value,
         workspace_root: &Path,
     ) -> bool {
-        let Some(target) = full_read_file_normalized_target(name, args, workspace_root) else {
+        self.requires_snapshot_lease_with_access(authority, name, args, workspace_root, None)
+    }
+
+    pub(crate) fn requires_snapshot_lease_with_access(
+        &self,
+        authority: &str,
+        name: &str,
+        args: &serde_json::Value,
+        workspace_root: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) -> bool {
+        let Some(target) =
+            full_read_file_normalized_target_with_access(name, args, workspace_root, access)
+        else {
             return false;
         };
         recover_mutex(&self.pending)
@@ -3600,7 +3613,20 @@ impl DesiredStateConvergenceTracker {
         args: &serde_json::Value,
         workspace_root: &Path,
     ) {
-        let Some(target) = full_read_file_normalized_target(name, args, workspace_root) else {
+        self.consume_snapshot_with_access(authority, name, args, workspace_root, None)
+    }
+
+    pub(crate) fn consume_snapshot_with_access(
+        &self,
+        authority: &str,
+        name: &str,
+        args: &serde_json::Value,
+        workspace_root: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) {
+        let Some(target) =
+            full_read_file_normalized_target_with_access(name, args, workspace_root, access)
+        else {
             return;
         };
         let key = (authority.to_string(), target);
@@ -3644,12 +3670,42 @@ pub fn project_typed_workspace_convergence(
     targeted_observer: bool,
     strong_snapshot_authority: bool,
 ) -> Result<TypedWorkspaceConvergenceProjection, &'static str> {
-    let convergence_receipt = typed_workspace_desired_state_convergence_receipt_for(
+    project_typed_workspace_convergence_with_access(
+        tracker,
+        authority,
+        name,
+        args,
+        workspace_root,
+        is_error,
+        desired_state,
+        convergence_allowed,
+        targeted_observer,
+        strong_snapshot_authority,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_typed_workspace_convergence_with_access(
+    tracker: &DesiredStateConvergenceTracker,
+    authority: Option<&str>,
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    desired_state: Option<&WorkspaceFileStateIdentity>,
+    convergence_allowed: bool,
+    targeted_observer: bool,
+    strong_snapshot_authority: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Result<TypedWorkspaceConvergenceProjection, &'static str> {
+    let convergence_receipt = typed_workspace_desired_state_convergence_receipt_for_with_access(
         name,
         args,
         workspace_root,
         is_error,
         convergence_allowed.then_some(desired_state).flatten(),
+        access,
     );
     if let Some(receipt) = convergence_receipt.as_ref() {
         let authority = authority
@@ -3667,19 +3723,26 @@ pub fn project_typed_workspace_convergence(
         let authority = authority
             .filter(|authority| !authority.trim().is_empty())
             .ok_or("desired-state observation requires non-empty live run/turn authority")?;
-        let receipt = typed_workspace_observation_snapshot_receipt_for(
+        let receipt = typed_workspace_observation_snapshot_receipt_for_with_access(
             name,
             args,
             workspace_root,
             is_error,
             strong_snapshot_authority,
+            access,
         );
         if receipt.is_some() {
-            tracker.consume_snapshot(authority, name, args, workspace_root);
+            tracker.consume_snapshot_with_access(authority, name, args, workspace_root, access);
         }
         receipt
     } else {
-        typed_workspace_observation_receipt_for(name, args, workspace_root, is_error)
+        typed_workspace_observation_receipt_for_with_access(
+            name,
+            args,
+            workspace_root,
+            is_error,
+            access,
+        )
     };
 
     Ok(TypedWorkspaceConvergenceProjection {
@@ -3848,6 +3911,24 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
     is_error: bool,
     desired_state: Option<&WorkspaceFileStateIdentity>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_desired_state_convergence_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        desired_state,
+        None,
+    )
+}
+
+pub(crate) fn typed_workspace_desired_state_convergence_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    desired_state: Option<&WorkspaceFileStateIdentity>,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if is_error
         || desired_state.is_none()
         || name != "write_file"
@@ -3858,7 +3939,7 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
     {
         return None;
     }
-    let target = normalized_bound_target_identity(name, args, workspace_root)?;
+    let target = normalized_bound_target_identity_with_access(name, args, workspace_root, access)?;
     let invocation_target = raw_invocation_target_identity(name, args)?;
     let desired_state = desired_state?.clone();
     let request = workspace_file_state_identity(args.get("content")?.as_str()?.as_bytes());
@@ -3866,7 +3947,11 @@ pub fn typed_workspace_desired_state_convergence_receipt_for(
         return None;
     }
     let normalized_path = target.get("path")?.as_str()?;
-    if stable_bounded_file_state_identity(&workspace_root.join(normalized_path))? != desired_state {
+    if stable_bounded_file_state_identity_with_access(
+        &workspace_root.join(normalized_path),
+        access,
+    )? != desired_state
+    {
         return None;
     }
     Some(serde_json::Map::from_iter([
@@ -3968,10 +4053,11 @@ fn structured_targets_are_bound(
     found
 }
 
-fn normalized_bound_target_identity(
+fn normalized_bound_target_identity_with_access(
     name: &str,
     args: &serde_json::Value,
     workspace_root: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
 ) -> Option<serde_json::Value> {
     let object = args.as_object()?;
     let keys: &[&str] = if name == "lsp" {
@@ -3994,8 +4080,12 @@ fn normalized_bound_target_identity(
             continue;
         };
         let raw = raw.as_str()?;
-        let resolved = crate::fs_ops::resolve_path_sandboxed(workspace_root, raw, &[]).ok()?;
-        let relative = crate::fs_ops::relative_to_workspace_root(workspace_root, &resolved)?;
+        let relative = if let Some(access) = access {
+            access.observation_target(Path::new(raw)).ok()?
+        } else {
+            let resolved = crate::fs_ops::resolve_path_sandboxed(workspace_root, raw, &[]).ok()?;
+            crate::fs_ops::relative_to_workspace_root(workspace_root, &resolved)?
+        };
         let normalized = normalized_relative_target(&relative)?;
         if normalized_target
             .as_ref()
@@ -4244,6 +4334,16 @@ pub fn typed_workspace_observation_receipt_for(
     workspace_root: &Path,
     is_error: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_observation_receipt_for_with_access(name, args, workspace_root, is_error, None)
+}
+
+pub(crate) fn typed_workspace_observation_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if is_error
         || !is_typed_workspace_observer(name)
         || (name == "lsp"
@@ -4281,12 +4381,17 @@ pub fn typed_workspace_observation_receipt_for(
             continue;
         };
         let path = value.as_str()?;
-        if crate::fs_ops::resolve_path_sandboxed(workspace_root, path, &[]).is_err() {
+        if if let Some(access) = access {
+            access.observation_open(Path::new(path)).is_err()
+        } else {
+            crate::fs_ops::resolve_path_sandboxed(workspace_root, path, &[]).is_err()
+        } {
             return None;
         }
     }
     let mut receipt = typed_workspace_observation_receipt();
-    if let Some(target) = normalized_bound_target_identity(name, args, workspace_root)
+    if let Some(target) =
+        normalized_bound_target_identity_with_access(name, args, workspace_root, access)
         && let Some(value) = receipt.get_mut(OBSERVATION_RECEIPT_FIELD)
         && let Some(object) = value.as_object_mut()
     {
@@ -4311,18 +4416,43 @@ pub fn typed_workspace_observation_snapshot_receipt_for(
     is_error: bool,
     snapshot_authority: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_observation_snapshot_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        snapshot_authority,
+        None,
+    )
+}
+
+pub(crate) fn typed_workspace_observation_snapshot_receipt_for_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    snapshot_authority: bool,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if !snapshot_authority {
         return None;
     }
-    let mut receipt =
-        typed_workspace_observation_receipt_for(name, args, workspace_root, is_error)?;
+    let mut receipt = typed_workspace_observation_receipt_for_with_access(
+        name,
+        args,
+        workspace_root,
+        is_error,
+        access,
+    )?;
     let value = receipt
         .get_mut(OBSERVATION_RECEIPT_FIELD)?
         .as_object_mut()?;
     let normalized_path =
         validated_target_identity(&serde_json::Value::Object(value.clone()))?.to_string();
-    let observed_state =
-        stable_bounded_file_state_identity(&workspace_root.join(&normalized_path))?;
+    let observed_state = stable_bounded_file_state_identity_with_access(
+        &workspace_root.join(&normalized_path),
+        access,
+    )?;
     value.insert(
         "observed_state".to_string(),
         serde_json::to_value(observed_state).ok()?,
@@ -4334,9 +4464,19 @@ pub fn typed_workspace_observation_snapshot_receipt_for(
     Some(receipt)
 }
 
-fn stable_bounded_file_state_identity(path: &Path) -> Option<WorkspaceFileStateIdentity> {
-    fn capture(path: &Path) -> Option<WorkspaceFileStateIdentity> {
-        let mut file = fs::File::open(path).ok()?;
+fn stable_bounded_file_state_identity_with_access(
+    path: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<WorkspaceFileStateIdentity> {
+    fn capture(
+        path: &Path,
+        access: Option<&crate::fs_ops::FileAccess>,
+    ) -> Option<WorkspaceFileStateIdentity> {
+        let mut file = if let Some(access) = access {
+            access.observation_open(path).ok()?
+        } else {
+            fs::File::open(path).ok()?
+        };
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() || metadata.len() > MAX_CONVERGENCE_SNAPSHOT_BYTES {
             return None;
@@ -4362,8 +4502,8 @@ fn stable_bounded_file_state_identity(path: &Path) -> Option<WorkspaceFileStateI
         })
     }
 
-    let first = capture(path)?;
-    let second = capture(path)?;
+    let first = capture(path, access)?;
+    let second = capture(path, access)?;
     (first == second).then_some(second)
 }
 
@@ -4432,6 +4572,15 @@ pub fn full_read_file_normalized_target(
     args: &serde_json::Value,
     workspace_root: &Path,
 ) -> Option<String> {
+    full_read_file_normalized_target_with_access(name, args, workspace_root, None)
+}
+
+pub(crate) fn full_read_file_normalized_target_with_access(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    access: Option<&crate::fs_ops::FileAccess>,
+) -> Option<String> {
     if name != "read_file"
         || args.get("start_line").is_some()
         || args.get("end_line").is_some()
@@ -4439,7 +4588,7 @@ pub fn full_read_file_normalized_target(
     {
         return None;
     }
-    normalized_bound_target_identity(name, args, workspace_root)
+    normalized_bound_target_identity_with_access(name, args, workspace_root, access)
         .and_then(|target| target.get("path")?.as_str().map(ToString::to_string))
 }
 

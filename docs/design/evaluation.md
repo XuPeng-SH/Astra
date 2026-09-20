@@ -459,6 +459,27 @@ canonical tool-dispatch channel throughout execution. An independently running
 User Runner retains its own lifecycle; the TUI may disconnect and reconnect
 through the existing observation APIs.
 
+The current Linux workspace adapter has not yet demonstrated this full isolation
+contract. Its mount wrapper retains readable host files, namespace isolation does
+not block pathname Unix sockets exposed through mounted directories. Managed
+native file operations now reject host temporary paths, but shell integration
+and persisted proof of the complete confinement profile remain pending. A
+successful namespace probe or read-only root mount is therefore insufficient
+evidence of confidentiality or external-side-effect isolation. The coding E2E
+must prove these boundaries before this adapter can be considered complete.
+
+Confinement belongs to the shared `ShellProcessBoundary`; process ownership and
+settlement remain with `BashInvocationOwner`. Linux restricted execution must
+expose only the selected workspace and declared read-only system/toolchain
+inputs, allocate private HOME/TMP outside the captured source tree, and block
+host IPC access. Native file operations need the same authority through pinned,
+descriptor-relative access, including batch and rollback paths. The verifier
+uses fresh private storage and protects its replay Git metadata. Frozen profile
+and toolchain identities, successful setup, and authoritative process settlement
+must be carried in materialization and terminal evidence; launcher failure is
+not a verifier exit result. These are required implementation and acceptance
+conditions, not guarantees established by the existing namespace booleans.
+
 The first workspace delivery covers one repository, one fixed case, and two
 serial arms starting from the same verified source snapshot. Each arm has its
 own Session, execution directory, and writable Git metadata. Worktree separation
@@ -530,6 +551,20 @@ advance. An executor must carry the returned generation into the canonical Run
 admission/fencing CAS and refuse to start if it changed.
 
 ### Local shell confinement implementation status
+
+Managed Edge native file operations use a retained workspace directory authority.
+Linux opens reject symlinks, magic links, and mount crossings; prepared mutations
+retain parent identities through validation, commit, and cleanup. Staged files
+live outside the guest workspace in host-private storage on the same filesystem;
+workspace-visible staging labels never authorize commit or cleanup. The provider
+must keep that storage inaccessible to untrusted executions. Operation state is
+fresh for each invocation and shared with its evidence projection.
+Protected directories retain object identity across renames. Unsupported delegated
+tools are denied before dispatch, and native edits do not launch formatters.
+These operations use the shared workspace observation and desired-state
+convergence receipts: a full read can confirm a write, while a repeated unchanged
+write does not advance the workspace generation. This native file boundary does
+not establish shell confinement or an Evaluation materialization receipt.
 
 The CLI executor has an opt-in, immutable host shell boundary, independent of
 permission-mode and Skill-policy changes. On macOS it wraps foreground process

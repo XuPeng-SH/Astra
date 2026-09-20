@@ -2536,7 +2536,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                                         "astra-edge/0.1",
                                                         Duration::from_secs(30),
                                                     )
-                                                    .with_filesystem_write_boundary(Vec::new())
+                                                    .with_filesystem_write_boundary(vec![workspace_override.join(".git")])
                                                     .with_network_isolation(),
                                                 )
                                             })
