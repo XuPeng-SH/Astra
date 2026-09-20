@@ -454,6 +454,7 @@ async fn perf_benchmark_5_manifest_build_under_100ms() {
         persisted == 1,
         "PERF-5 manifest must be persisted exactly once, got {persisted}"
     );
+    println!("PERF_RESULT benchmark=manifest_single_write items=1 elapsed_ms={elapsed_ms}");
     assert!(
         elapsed_ms < 100,
         "PERF-5 manifest build/write must complete in <100ms, got {elapsed_ms}ms"
@@ -619,6 +620,10 @@ async fn perf_benchmark_6_manifest_batches_across_users_and_sessions() {
         wrong_owner_count, 0,
         "PERF-6 must not cross owner boundaries"
     );
+    println!(
+        "PERF_RESULT benchmark=manifest_multi_session_write users={} sessions={WRITERS} items_per_manifest={ITEMS_PER_MANIFEST} total_items={expected} elapsed_ms={elapsed_ms}",
+        users.len(),
+    );
     assert!(
         elapsed_ms < 10_000,
         "PERF-6 {WRITERS} multi-user/session manifest writes must complete in <10s, got {elapsed_ms}ms"
@@ -726,6 +731,9 @@ async fn perf_benchmark_7_latest_manifest_reads_are_owner_scoped() {
     .try_get::<i64, _>("c")
     .unwrap_or_default();
     assert_eq!(wrong_owner, 0, "PERF-7 must not read another owner");
+    println!(
+        "PERF_RESULT benchmark=manifest_latest_read history_rows={MANIFESTS} preferred_ms={preferred_ms} fallback_ms={fallback_ms}"
+    );
     assert!(
         preferred_ms < 50 && fallback_ms < 50,
         "PERF-7 latest reads must stay under 50ms: preferred={preferred_ms}ms fallback={fallback_ms}ms"
